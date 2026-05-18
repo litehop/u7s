@@ -61,35 +61,62 @@ pub fn generate_tls(_args: &Args) -> anyhow::Result<TlsMaterial> {
     })
 }
 
+/// Typed builder for a minimal kubeconfig.
+/// Serialised to YAML manually — no serde_yaml dependency required.
+struct Kubeconfig {
+    server: String,
+    ca_data: String,
+    cert_data: String,
+    key_data: String,
+}
+
+impl Kubeconfig {
+    fn new(server: &str, tls: &TlsMaterial) -> Self {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        Kubeconfig {
+            server: server.to_owned(),
+            ca_data: b64.encode(&tls.ca_cert_der),
+            cert_data: b64.encode(&tls.admin_cert_der),
+            key_data: b64.encode(&tls.admin_key_pem),
+        }
+    }
+
+    fn to_yaml(&self) -> String {
+        format!(
+            "apiVersion: v1\n\
+             kind: Config\n\
+             clusters:\n\
+             - cluster:\n\
+             \x20   server: {server}\n\
+             \x20   certificate-authority-data: {ca_data}\n\
+             \x20 name: u7s\n\
+             contexts:\n\
+             - context:\n\
+             \x20   cluster: u7s\n\
+             \x20   user: admin\n\
+             \x20 name: u7s\n\
+             current-context: u7s\n\
+             users:\n\
+             - name: admin\n\
+             \x20 user:\n\
+             \x20   client-certificate-data: {cert_data}\n\
+             \x20   client-key-data: {key_data}\n",
+            server = self.server,
+            ca_data = self.ca_data,
+            cert_data = self.cert_data,
+            key_data = self.key_data,
+        )
+    }
+}
+
+/// Write a kubeconfig to `path`.
+/// The default path ("./kubeconfig") is write-only on first run — it is not
+/// a read fixture. The file is generated fresh from the in-memory TLS material
+/// each time the server starts.
 pub fn write_kubeconfig(path: &str, tls: &TlsMaterial) -> anyhow::Result<()> {
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    let ca_data   = b64.encode(&tls.ca_cert_der);
-    let cert_data = b64.encode(&tls.admin_cert_der);
-    let key_data  = b64.encode(&tls.admin_key_pem);
-
-    let kubeconfig = format!(r#"apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://127.0.0.1:6443
-    certificate-authority-data: {ca_data}
-  name: u7s
-contexts:
-- context:
-    cluster: u7s
-    user: admin
-  name: u7s
-current-context: u7s
-users:
-- name: admin
-  user:
-    client-certificate-data: {cert_data}
-    client-key-data: {key_data}
-"#);
-
-    std::fs::write(path, kubeconfig)?;
+    let kc = Kubeconfig::new("https://127.0.0.1:6443", tls);
+    std::fs::write(path, kc.to_yaml())?;
     tracing::info!("kubeconfig written to {path}");
     Ok(())
 }
