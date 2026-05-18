@@ -36,11 +36,31 @@ fn rm(kind: &str, namespaced: bool, has_status: bool) -> ResourceMeta {
         kind: kind.to_string(),
         namespaced,
         has_status_subresource: has_status,
+        create_or_update: false,
+    }
+}
+
+fn rm_cou(kind: &str, namespaced: bool) -> ResourceMeta {
+    ResourceMeta {
+        kind: kind.to_string(),
+        namespaced,
+        has_status_subresource: false,
+        create_or_update: true,
     }
 }
 
 fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     let mut m = HashMap::new();
+
+    // core/v1 — cluster-scoped
+    m.insert(rk("", "v1", "nodes"),           rm("Node",           false, true));
+
+    // core/v1 — namespaced
+    m.insert(rk("", "v1", "services"),        rm("Service",        true,  false));
+    m.insert(rk("", "v1", "serviceaccounts"), rm("ServiceAccount", true,  false));
+    m.insert(rk("", "v1", "configmaps"),      rm("ConfigMap",      true,  false));
+    m.insert(rk("", "v1", "secrets"),         rm("Secret",         true,  false));
+    m.insert(rk("", "v1", "events"),          rm_cou("Event",      true));
 
     // apps/v1
     m.insert(rk("apps", "v1", "deployments"),   rm("Deployment",  true,  true));

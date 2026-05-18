@@ -66,17 +66,71 @@ pub struct ApiResourceList {
     pub resources: &'static [ApiResource],
 }
 
-static PODS_VERBS: &[&str] = &["create", "delete", "get", "list", "patch", "update"];
+static CORE_VERBS: &[&str] = &["create", "delete", "get", "list", "patch", "update"];
 static PODS_SHORT_NAMES: &[&str] = &["po"];
+static NODES_SHORT_NAMES: &[&str] = &["no"];
+static SERVICES_SHORT_NAMES: &[&str] = &["svc"];
+static SERVICE_ACCOUNTS_SHORT_NAMES: &[&str] = &["sa"];
+static CONFIG_MAPS_SHORT_NAMES: &[&str] = &["cm"];
 
-static V1_RESOURCES: &[ApiResource] = &[ApiResource {
-    name: "pods",
-    singular_name: "pod",
-    namespaced: true,
-    kind: "Pod",
-    verbs: PODS_VERBS,
-    short_names: Some(PODS_SHORT_NAMES),
-}];
+static V1_RESOURCES: &[ApiResource] = &[
+    ApiResource {
+        name: "configmaps",
+        singular_name: "configmap",
+        namespaced: true,
+        kind: "ConfigMap",
+        verbs: CORE_VERBS,
+        short_names: Some(CONFIG_MAPS_SHORT_NAMES),
+    },
+    ApiResource {
+        name: "events",
+        singular_name: "event",
+        namespaced: true,
+        kind: "Event",
+        verbs: CORE_VERBS,
+        short_names: None,
+    },
+    ApiResource {
+        name: "nodes",
+        singular_name: "node",
+        namespaced: false,
+        kind: "Node",
+        verbs: CORE_VERBS,
+        short_names: Some(NODES_SHORT_NAMES),
+    },
+    ApiResource {
+        name: "pods",
+        singular_name: "pod",
+        namespaced: true,
+        kind: "Pod",
+        verbs: CORE_VERBS,
+        short_names: Some(PODS_SHORT_NAMES),
+    },
+    ApiResource {
+        name: "secrets",
+        singular_name: "secret",
+        namespaced: true,
+        kind: "Secret",
+        verbs: CORE_VERBS,
+        short_names: None,
+    },
+    ApiResource {
+        name: "serviceaccounts",
+        singular_name: "serviceaccount",
+        namespaced: true,
+        kind: "ServiceAccount",
+        verbs: CORE_VERBS,
+        short_names: Some(SERVICE_ACCOUNTS_SHORT_NAMES),
+    },
+    ApiResource {
+        name: "services",
+        singular_name: "service",
+        namespaced: true,
+        kind: "Service",
+        verbs: CORE_VERBS,
+        short_names: Some(SERVICES_SHORT_NAMES),
+    },
+];
 
 impl ApiResourceList {
     pub fn v1() -> Self {
@@ -103,11 +157,11 @@ pub struct ResourceKey {
 #[derive(Debug, Clone)]
 pub struct ResourceMeta {
     pub kind: String,
-    // Reserved for Phase 2 routing and status subresource support.
     #[allow(dead_code)]
     pub namespaced: bool,
-    #[allow(dead_code)]
     pub has_status_subresource: bool,
+    /// If true, POST behaves as createOrUpdate: if the object already exists, replace it.
+    pub create_or_update: bool,
 }
 
 // ---------------------------------------------------------------------------
