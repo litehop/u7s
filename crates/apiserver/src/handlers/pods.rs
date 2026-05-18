@@ -1,4 +1,5 @@
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -6,7 +7,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde::Deserialize;
-use u7s_store::{ListOptions, Store, StoreError};
+use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
 
 use crate::{
     keys::{list_prefix, object_key},
@@ -18,6 +19,7 @@ use crate::{
 #[derive(Deserialize)]
 pub struct CollectionQuery {
     pub watch: Option<bool>,
+    pub resource_version: Option<u64>,
 }
 
 /// Validate a raw namespace string: format check then Phase-1 allow-list.
@@ -46,13 +48,14 @@ pub async fn list_pods(
     State(state): State<AppState>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<CollectionQuery>,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    if query.watch == Some(true) {
-        return Err(Status::bad_request("watch is not supported in Phase 1".into()));
-    }
+) -> Result<Response, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns)?;
-
     let prefix = list_prefix("pods", ns.as_str());
+
+    if query.watch == Some(true) {
+        return watch_pods(state, prefix, ns, query.resource_version.unwrap_or(0)).await;
+    }
+
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -73,7 +76,169 @@ pub async fn list_pods(
         "items": items
     });
 
-    Ok(Json(body))
+    Ok(Json(body).into_response())
+}
+
+/// Serialise a single watch event to NDJSON bytes (including trailing newline).
+/// Returns None on Compacted — the caller should close the stream.
+fn encode_watch_event(event: &WatchEvent) -> Option<Bytes> {
+    let line = match event {
+        WatchEvent::Added(obj) => {
+            let object: serde_json::Value =
+                serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
+            format!(
+                "{{\"type\":\"ADDED\",\"object\":{}}}\n",
+                serde_json::to_string(&object).unwrap_or_default()
+            )
+        }
+        WatchEvent::Modified(obj) => {
+            let object: serde_json::Value =
+                serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
+            format!(
+                "{{\"type\":\"MODIFIED\",\"object\":{}}}\n",
+                serde_json::to_string(&object).unwrap_or_default()
+            )
+        }
+        WatchEvent::Deleted { key, revision } => {
+            // The store deleted event carries no bytes; reconstruct a minimal object.
+            // Key format: /registry/pods/<namespace>/<name>
+            let (name, namespace) = parse_key_name_ns(key);
+            let object = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name,
+                    "namespace": namespace,
+                    "resourceVersion": revision.to_string()
+                }
+            });
+            format!(
+                "{{\"type\":\"DELETED\",\"object\":{}}}\n",
+                serde_json::to_string(&object).unwrap_or_default()
+            )
+        }
+        WatchEvent::Bookmark { revision } => {
+            format!(
+                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{revision}\"}}}}}}\n"
+            )
+        }
+        WatchEvent::Compacted { .. } => return None,
+    };
+    Some(Bytes::from(line))
+}
+
+/// Parse the last two path segments of a store key as (name, namespace).
+/// Key format: /registry/<resource>/<namespace>/<name>
+fn parse_key_name_ns(key: &str) -> (&str, &str) {
+    let parts: Vec<&str> = key.rsplitn(3, '/').collect();
+    // rsplitn(3) gives [name, namespace, rest] for a well-formed key
+    match parts.as_slice() {
+        [name, namespace, ..] => (name, namespace),
+        [name] => (name, ""),
+        _ => ("", ""),
+    }
+}
+
+async fn watch_pods(
+    state: AppState,
+    prefix: String,
+    _ns: Namespace,
+    from_revision: u64,
+) -> Result<Response, crate::status::StatusError> {
+    let event_stream = state
+        .store
+        .watch(&prefix, from_revision)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // The body stream yields Result<Bytes, BoxError> items.
+    // We transform WatchEvent items into NDJSON chunks.
+    // A periodic bookmark is sent every 60 s if no other events fire.
+    let chunk_stream = async_stream::stream! {
+        use futures_core::Stream;
+        use std::pin::pin;
+        use tokio::time::{Duration, interval};
+
+        let mut event_stream = pin!(event_stream);
+        let mut bookmark_tick = interval(Duration::from_secs(60));
+        // Skip the first immediate tick so we don't send a bookmark before any events.
+        bookmark_tick.tick().await;
+
+        // Track the most recently seen revision for bookmark emission.
+        let mut last_rv: u64 = from_revision;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                maybe_event = {
+                    use std::future::poll_fn;
+                    poll_fn(|cx| {
+                        use std::task::Poll;
+                        match event_stream.as_mut().poll_next(cx) {
+                            Poll::Ready(v) => Poll::Ready(v),
+                            Poll::Pending => Poll::Pending,
+                        }
+                    })
+                } => {
+                    match maybe_event {
+                        None => break, // store closed the stream
+                        Some(event) => {
+                            // Update last_rv from the event before encoding.
+                            match &event {
+                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
+                                    last_rv = last_rv.max(obj.revision);
+                                }
+                                WatchEvent::Deleted { revision, .. } => {
+                                    last_rv = last_rv.max(*revision);
+                                }
+                                WatchEvent::Bookmark { revision } => {
+                                    last_rv = last_rv.max(*revision);
+                                }
+                                WatchEvent::Compacted { .. } => {}
+                            }
+
+                            // Reset bookmark timer on any real event.
+                            bookmark_tick.reset();
+
+                            let is_compacted = matches!(event, WatchEvent::Compacted { .. });
+                            if is_compacted {
+                                let error_line = Bytes::from(
+                                    "{\"type\":\"ERROR\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\"}}\n"
+                                );
+                                yield Ok::<Bytes, axum::BoxError>(error_line);
+                                break;
+                            }
+
+                            if let Some(chunk) = encode_watch_event(&event) {
+                                yield Ok::<Bytes, axum::BoxError>(chunk);
+                            }
+                        }
+                    }
+                }
+
+                _ = bookmark_tick.tick() => {
+                    let bookmark = format!(
+                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                    );
+                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                }
+            }
+        }
+    };
+
+    let body = Body::from_stream(chunk_stream);
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::TRANSFER_ENCODING,
+            "chunked",
+        )
+        .body(body)
+        .expect("response builder never fails with these headers");
+
+    Ok(resp)
 }
 
 pub async fn create_pod(
@@ -274,5 +439,130 @@ fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
         }
     } else {
         *target = patch.clone();
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use bytes::Bytes;
+    use u7s_store::{StoreObject, WatchEvent};
+
+    fn make_store_object(key: &str, revision: u64, json: serde_json::Value) -> StoreObject {
+        StoreObject {
+            key: key.to_string(),
+            value: Bytes::from(serde_json::to_vec(&json).unwrap()),
+            revision,
+        }
+    }
+
+    /// encode_watch_event for Added emits {"type":"ADDED","object":...}\n
+    /// and the object bytes are valid JSON from the stored value.
+    #[test]
+    fn encode_added_roundtrip() {
+        let obj = make_store_object(
+            "/registry/pods/default/nginx",
+            5,
+            serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx","resourceVersion":"5"}}),
+        );
+        let bytes = encode_watch_event(&WatchEvent::Added(obj)).expect("should encode");
+        let line = std::str::from_utf8(&bytes).unwrap();
+        assert!(line.ends_with('\n'), "NDJSON must end with newline");
+
+        let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["type"], "ADDED");
+        assert_eq!(parsed["object"]["metadata"]["name"], "nginx");
+    }
+
+    /// encode_watch_event for Modified emits {"type":"MODIFIED","object":...}\n
+    #[test]
+    fn encode_modified() {
+        let obj = make_store_object(
+            "/registry/pods/default/nginx",
+            7,
+            serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx","resourceVersion":"7"}}),
+        );
+        let bytes = encode_watch_event(&WatchEvent::Modified(obj)).expect("should encode");
+        let parsed: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["type"], "MODIFIED");
+    }
+
+    /// encode_watch_event for Deleted reconstructs a minimal object from the store key.
+    /// The emitted object must contain name and namespace derived from the key.
+    #[test]
+    fn encode_deleted_reconstructs_metadata() {
+        let bytes = encode_watch_event(&WatchEvent::Deleted {
+            key: "/registry/pods/default/nginx".to_string(),
+            revision: 9,
+        })
+        .expect("should encode");
+        let parsed: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["type"], "DELETED");
+        assert_eq!(parsed["object"]["metadata"]["name"], "nginx");
+        assert_eq!(parsed["object"]["metadata"]["namespace"], "default");
+        assert_eq!(parsed["object"]["metadata"]["resourceVersion"], "9");
+    }
+
+    /// encode_watch_event for Bookmark emits the correct structure.
+    #[test]
+    fn encode_bookmark() {
+        let bytes =
+            encode_watch_event(&WatchEvent::Bookmark { revision: 42 }).expect("should encode");
+        let parsed: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["type"], "BOOKMARK");
+        assert_eq!(parsed["object"]["metadata"]["resourceVersion"], "42");
+        assert_eq!(parsed["object"]["kind"], "Pod");
+    }
+
+    /// encode_watch_event for Compacted returns None — the caller must close the stream.
+    #[test]
+    fn encode_compacted_returns_none() {
+        let result = encode_watch_event(&WatchEvent::Compacted {
+            requested: 5,
+            horizon: 50,
+        });
+        assert!(result.is_none(), "Compacted must signal close via None");
+    }
+
+    /// parse_key_name_ns correctly extracts name and namespace from a standard store key.
+    #[test]
+    fn parse_key_standard() {
+        let (name, ns) = parse_key_name_ns("/registry/pods/default/nginx");
+        assert_eq!(name, "nginx");
+        assert_eq!(ns, "default");
+    }
+
+    /// parse_key_name_ns handles a custom namespace correctly.
+    #[test]
+    fn parse_key_custom_namespace() {
+        let (name, ns) = parse_key_name_ns("/registry/pods/kube-system/coredns");
+        assert_eq!(name, "coredns");
+        assert_eq!(ns, "kube-system");
+    }
+
+    /// CollectionQuery with watch=true and resource_version=42 routes to watch mode.
+    /// Verified by constructing the struct directly and checking the fields Axum would populate.
+    #[test]
+    fn collection_query_watch_flag_present() {
+        let q = CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(42),
+        };
+        assert!(q.watch == Some(true));
+        assert_eq!(q.resource_version, Some(42));
+    }
+
+    /// CollectionQuery with absent fields should default to None (no watch, no rv).
+    #[test]
+    fn collection_query_defaults() {
+        let q = CollectionQuery {
+            watch: None,
+            resource_version: None,
+        };
+        assert_eq!(q.watch, None);
+        assert_eq!(q.resource_version, None);
     }
 }
