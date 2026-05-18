@@ -90,6 +90,54 @@ impl ApiResourceList {
 }
 
 // ---------------------------------------------------------------------------
+// Resource registry types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceKey {
+    pub group: String,   // "" for core group
+    pub version: String,
+    pub plural: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceMeta {
+    pub kind: String,
+    // Reserved for Phase 2 routing and status subresource support.
+    #[allow(dead_code)]
+    pub namespaced: bool,
+    #[allow(dead_code)]
+    pub has_status_subresource: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Non-core group discovery wire types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct GroupVersionForDiscovery {
+    #[serde(rename = "groupVersion")]
+    pub group_version: String,
+    pub version: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct APIGroup {
+    pub name: String,
+    pub versions: Vec<GroupVersionForDiscovery>,
+    #[serde(rename = "preferredVersion")]
+    pub preferred_version: GroupVersionForDiscovery,
+}
+
+#[derive(Debug, Serialize)]
+pub struct APIGroupList {
+    pub kind: &'static str,
+    #[serde(rename = "apiVersion")]
+    pub api_version: &'static str,
+    pub groups: Vec<APIGroup>,
+}
+
+// ---------------------------------------------------------------------------
 // Namespace domain type
 // ---------------------------------------------------------------------------
 
