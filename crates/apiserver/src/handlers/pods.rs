@@ -10,7 +10,7 @@ use serde::Deserialize;
 use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
 
 use crate::{
-    keys::{list_prefix, object_key},
+    keys::{cluster_object_key, list_prefix, object_key},
     state::AppState,
     status::Status,
     types::{Namespace, Object},
@@ -22,12 +22,21 @@ pub struct CollectionQuery {
     pub resource_version: Option<u64>,
 }
 
-/// Validate a raw namespace string: format check then Phase-1 allow-list.
-/// Returns 400 on invalid format, 404 for unsupported namespaces.
-fn parse_namespace(raw: &str) -> Result<Namespace, crate::status::StatusError> {
+/// Validate a raw namespace string: format check then store lookup.
+/// Returns 400 on invalid format, 404 if namespace does not exist.
+async fn parse_namespace(
+    raw: &str,
+    state: &AppState,
+) -> Result<Namespace, crate::status::StatusError> {
     let ns = Namespace::parse(raw).map_err(Status::bad_request)?;
-    // Phase 1: only "default" is supported.
-    if ns.as_str() != "default" {
+    let key = cluster_object_key("namespaces", ns.as_str());
+    let exists = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .is_some();
+    if !exists {
         return Err(Status::not_found(ns.as_str(), "Namespace"));
     }
     Ok(ns)
@@ -49,7 +58,7 @@ pub async fn list_pods(
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<CollectionQuery>,
 ) -> Result<Response, crate::status::StatusError> {
-    let ns = parse_namespace(&raw_ns)?;
+    let ns = parse_namespace(&raw_ns, &state).await?;
     let prefix = list_prefix("pods", ns.as_str());
 
     if query.watch == Some(true) {
@@ -246,7 +255,7 @@ pub async fn create_pod(
     Path((raw_ns,)): Path<(String,)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ns = parse_namespace(&raw_ns)?;
+    let ns = parse_namespace(&raw_ns, &state).await?;
 
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -277,7 +286,7 @@ pub async fn get_pod(
     State(state): State<AppState>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
-    let ns = parse_namespace(&raw_ns)?;
+    let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
     let stored = state
@@ -300,7 +309,7 @@ pub async fn replace_pod(
     Path((raw_ns, name)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ns = parse_namespace(&raw_ns)?;
+    let ns = parse_namespace(&raw_ns, &state).await?;
 
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -339,7 +348,7 @@ pub async fn delete_pod(
     State(state): State<AppState>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ns = parse_namespace(&raw_ns)?;
+    let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
     state
@@ -377,7 +386,7 @@ pub async fn patch_pod(
         )));
     }
 
-    let ns = parse_namespace(&raw_ns)?;
+    let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
     let stored = state

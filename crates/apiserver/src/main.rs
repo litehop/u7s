@@ -74,6 +74,21 @@ fn build_router(store: Arc<SqliteStore>) -> Router {
         .route("/apis",                    get(handlers::discovery::api_group_list))
         .route("/apis/:group/:version",    get(handlers::discovery::api_group_resources))
 
+        // Namespaces — collection
+        .route(
+            "/api/v1/namespaces",
+            get(handlers::namespaces::list_namespaces).post(handlers::namespaces::create_namespace),
+        )
+
+        // Namespaces — named resource
+        .route(
+            "/api/v1/namespaces/:name",
+            get(handlers::namespaces::get_namespace)
+                .put(handlers::namespaces::replace_namespace)
+                .patch(handlers::namespaces::patch_namespace)
+                .delete(handlers::namespaces::delete_namespace),
+        )
+
         // Pods — collection
         .route(
             "/api/v1/namespaces/:ns/pods",

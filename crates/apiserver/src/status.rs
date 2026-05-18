@@ -76,6 +76,17 @@ impl Status {
         )
     }
 
+    pub fn unprocessable_entity(message: String) -> StatusError {
+        StatusError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Status {
+                kind: "Status", api_version: "v1", status: "Failure",
+                message,
+                reason: "Invalid", code: 422,
+            },
+        )
+    }
+
     pub fn internal(message: String) -> StatusError {
         StatusError(
             StatusCode::INTERNAL_SERVER_ERROR,
