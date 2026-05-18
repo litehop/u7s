@@ -1,32 +1,35 @@
 # Dashboard
 
-2026-05-19 00:30 UTC+2
+2026-05-19 00:45 UTC+2
 Resume: open Claude Code at /Users/balint.erdos/u7s (mayor session e87d5896)
-Open beads: 3 open (mayor-vvs, mayor-h6n, mayor-s6z — PR #3 open, CI running)
+Open beads: 0 open, 0 in-progress (14 total closed)
 
 ## What needs the operator now
 
-**ACTION: Review [PR #3](https://github.com/valerauko/u7s/pull/3)** — API surface change
-- Typed discovery response models, Namespace newtype, kubeconfig cleanup
-- CI is running (first real GH Actions run) — mayor will merge on green once you approve
-- All 3 beads: mayor-vvs, mayor-h6n, mayor-s6z
+**Ready to file Phase 2 beads.** Backlog is empty. Say the word and mayor will
+audit the Phase 2 specs and file a batch of implementation beads.
+
+Alternatively: are there more Phase 1 cleanup items, or other priorities first?
 
 ## In-flight
 
-- PR #3 open, CI in-progress
+Nothing. All worktrees clean.
 
 ## Forward-looking
 
-1. PR #3 CI green + operator approval → merge → file Phase 2 beads
-2. Phase 2: watch protocol, ring buffer, controllers, scheduler
-3. Add apiserver integration tests (kubectl smoke tests per testing strategy)
+Phase 2 scope (from specs in ai/prompts/):
+- Watch protocol (list+watch, resource version tracking)
+- Ring buffer for watch events
+- Node controller, Pod controller
+- Scheduler (assign pods to nodes)
+- Apiserver integration tests (kubectl smoke tests)
 
 ## Recent progress
 
-- **PR #1 merged** — Phase 1: u7s-store + u7s-apiserver
-- **PR #2 merged** — GH Actions CI, git pre-push hook, Claude Code push gate
-- **PR #3 open** — apiserver typed models, Namespace type, kubeconfig cleanup
-- 11 beads closed, 3 in-flight
+- **PR #1** — Phase 1: u7s-store + u7s-apiserver
+- **PR #2** — GH Actions CI, git hooks, Claude Code push gate (CI now running on all PRs)
+- **PR #3** — Typed API models, Namespace newtype, kubeconfig cleanup (first green CI run)
+- 14 beads closed total, 0 open
 
 ## Active loops
 
