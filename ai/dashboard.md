@@ -6,41 +6,32 @@ Open beads: 0
 
 ## What needs the operator now
 
-**Phase 2 is fully complete.** No open beads, no open PRs, no in-flight workers.
+**DECISION PHASE — backlog is cold.** No open beads, no open PRs, no workers. Mayor is idle until Phase 3 scope is defined.
 
-**Operator decision needed**: What is Phase 3? Options:
-- File Phase 3 beads (scheduler, controller-manager, kubelet shim, conformance testing)
-- Run sonobuoy/kube-bench against the current API surface to find gaps
-- Stand up a real cluster with external kube-scheduler and exercise kubectl end-to-end
+To resume: file Phase 3 beads, or say "run a Phase 3 audit" and the mayor will dispatch a read-only audit worker to surface gaps.
+
+Known Phase 3 candidates (from architectural decisions):
+- `crates/scheduler` skeleton (DB-04 deferred)
+- Controller-manager SA token provisioning (DB-05 deferred)
+- Conformance testing (sonobuoy / kube-bench) — API surface may now be ready
+- kubectl end-to-end smoke tests against a live cluster
 
 ## Forward-looking
 
-Nothing is unblocked because there are no open beads. Phase 3 scope needs operator input before any work can start.
-
-Known Phase 3 candidates (from architectural decisions memory):
-- `crates/scheduler` — scheduler skeleton (DB-04: deferred to Phase 3)
-- Controller manager SA token provisioning (DB-05: deferred to Phase 3)
-- Conformance testing (sonobuoy) once API surface is stable
+Nothing is in flight. Dispatch resumes as soon as beads exist. The push phase is over; this is the natural pause between phases.
 
 ## Recent progress
 
-Phase 2 complete — 12 PRs merged:
+Phase 2 fully complete — 12 PRs merged, 29/29 beads closed, all worktrees removed.
 
-| PR | Feature |
-|----|---------|
-| #4–#7 | Store watch, generic handler, merge patch, RBAC index |
-| #8–#12 | Field selector, pod watch, namespace CRUD, generic cluster, auth middleware |
-| #13–#15 | Core resources, SSRR/SSAR reviews, SA TokenRequest JWT |
+| Wave | PRs | Highlights |
+|------|-----|------------|
+| Wave 1 | #4–#7 | Store watch, generic handler, merge patch, RBAC index |
+| Wave 2 | #8–#12 | Field selector, pod watch, namespace CRUD, generic cluster, auth middleware |
+| Wave 3 | #13–#15 | Core resources, SSRR/SSAR, SA TokenRequest JWT |
 
-All worktrees removed. Main is clean at `f4f5c61`.
+Main is clean at `68a3020`. No stale branches, no stale worktrees.
 
-## Active loops
+## Stance (reasserted)
 
-| Job ID   | Cadence | Purpose                         |
-|----------|---------|---------------------------------|
-| 79fd6852 | 60m     | Re-read bootstrap + stance      |
-| a9e40a02 | 15m     | Dispatch ready beads            |
-| 91601c59 | 30m     | Cluster same-surface beads      |
-| a89b03d9 | 60m     | Worktree hygiene sweep          |
-| 031ac23c | 30m     | Merge green PRs                 |
-| d3785920 | 10m     | Update this dashboard           |
+Pre-alpha/greenfield: break freely, no backward compat, delete dead code. Correctness first, then performance (hard RSS/latency targets). kubectl-compatible API surface. Minimal dependencies — resist adding crates. Mayor merges on green CI; flags security/API surface/architecture PRs for operator review first.
