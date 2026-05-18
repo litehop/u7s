@@ -19,7 +19,7 @@ use u7s_store::SqliteStore;
 
 use auth::AuthLayer;
 use state::AppState;
-use tls::{generate_tls, write_kubeconfig};
+use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
 
 #[derive(Parser)]
 struct Args {
@@ -39,6 +39,15 @@ struct Args {
     /// RBAC grants it.
     #[arg(long)]
     token_auth_file: Option<String>,
+
+    /// Path to the RSA private key used to sign service-account JWTs.
+    /// Generated on first run; loaded on subsequent starts to keep tokens valid.
+    #[arg(long, default_value = "./sa.key")]
+    sa_key: String,
+
+    /// Path to write the RSA public key (companion to --sa-key).
+    #[arg(long, default_value = "./sa.pub")]
+    sa_pub: String,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -69,14 +78,31 @@ async fn main() -> anyhow::Result<()> {
         None => std::collections::HashMap::new(),
     };
 
-    // 7. Build app state (shared with the auth layer).
-    let state = AppState::new(Arc::clone(&store));
+    // 7. Load or generate the SA signing key.
+    let sa_encoding_key = match load_or_generate_sa_keys(&args.sa_key, &args.sa_pub) {
+        Ok(sa_keys) => {
+            match jsonwebtoken::EncodingKey::from_rsa_pem(&sa_keys.private_key_pem) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    tracing::error!("failed to load SA signing key: {e}");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("SA key gen/load failed: {e}");
+            None
+        }
+    };
 
-    // 8. Build axum router and attach the auth tower layer.
+    // 8. Build app state (shared with the auth layer).
+    let state = AppState::new(Arc::clone(&store), sa_encoding_key);
+
+    // 9. Build axum router and attach the auth tower layer.
     let app = build_router(state.clone())
         .layer(AuthLayer::new(Arc::clone(&state.rbac_index), token_map));
 
-    // 9. Bind TLS listener and serve.
+    // 10. Bind TLS listener and serve.
     let listener = TcpListener::bind(&args.listen).await?;
     serve_tls(listener, app, tls_material.server_config).await?;
     Ok(())
@@ -184,6 +210,12 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
             post(handlers::authorization::self_subject_rules_review),
+        )
+
+        // ServiceAccounts — token subresource (TokenRequest API)
+        .route(
+            "/api/v1/namespaces/:ns/serviceaccounts/:name/token",
+            axum::routing::post(handlers::tokens::create_token),
         )
 
         // Generic cluster-scoped resources — collection
