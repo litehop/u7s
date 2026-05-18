@@ -1,34 +1,32 @@
 # Dashboard
 
-2026-05-19 00:20 UTC+2
+2026-05-19 00:30 UTC+2
 Resume: open Claude Code at /Users/balint.erdos/u7s (mayor session e87d5896)
-Open beads: 3 open (mayor-vvs, mayor-h6n, mayor-s6z — all in-flight with worker)
+Open beads: 3 open (mayor-vvs, mayor-h6n, mayor-s6z — PR #3 open, CI running)
 
 ## What needs the operator now
 
-**Nothing urgent.** Worker running on `worker/apiserver-cleanup`. Await PR then review.
-
-Note: PRs touching API types/handlers are flagged for operator review per merge policy.
+**ACTION: Review [PR #3](https://github.com/valerauko/u7s/pull/3)** — API surface change
+- Typed discovery response models, Namespace newtype, kubeconfig cleanup
+- CI is running (first real GH Actions run) — mayor will merge on green once you approve
+- All 3 beads: mayor-vvs, mayor-h6n, mayor-s6z
 
 ## In-flight
 
-- **worker/apiserver-cleanup** — cluster of 3 P2 beads, all `crates/apiserver/`:
-  - `mayor-vvs`: typed API models + Into/From (replaces raw json!() in discovery.rs)
-  - `mayor-h6n`: Namespace newtype with validation (replaces raw String in pods.rs)
-  - `mayor-s6z`: kubeconfig path default + typed serialisation
+- PR #3 open, CI in-progress
 
 ## Forward-looking
 
-1. Worker returns → mayor reviews PR (API surface change, needs operator eye)
-2. After merge: file Phase 2 beads (watch, ring buffer, controllers, scheduler)
-3. Consider CI badge in README once GH Actions first run completes
+1. PR #3 CI green + operator approval → merge → file Phase 2 beads
+2. Phase 2: watch protocol, ring buffer, controllers, scheduler
+3. Add apiserver integration tests (kubectl smoke tests per testing strategy)
 
 ## Recent progress
 
 - **PR #1 merged** — Phase 1: u7s-store + u7s-apiserver
 - **PR #2 merged** — GH Actions CI, git pre-push hook, Claude Code push gate
-- 11 beads closed total
-- Memory profiling findings in ai/findings/rust-memory-profiling.md
+- **PR #3 open** — apiserver typed models, Namespace type, kubeconfig cleanup
+- 11 beads closed, 3 in-flight
 
 ## Active loops
 
