@@ -1,35 +1,31 @@
 # Dashboard
 
-2026-05-18 22:40 UTC+2
+2026-05-18 23:10 UTC+2
 Resume: open Claude Code at /Users/balint.erdos/u7s (mayor session e87d5896)
-Open beads: 0 open, 0 in-progress
+Open beads: 0 open, 0 in-progress (8 total closed)
 
 ## What needs the operator now
 
-**ACTION: Review and approve [PR #1](https://github.com/valerauko/u7s/pull/1)**
-- `feat(phase-1): u7s-store + u7s-apiserver`
-- cargo build clean, 8/8 store tests pass, no CI configured yet
-- Touches core API surface — flagged for operator review per merge policy
-- Say "merge it" and mayor will squash-merge immediately
+**No blocking decisions.** Phase 1 is merged. Mayor will now file Phase 2 beads.
+
+Note: you mentioned code organisational issues in PR #1 — file those as beads or describe them and I'll create cleanup tasks for Phase 2 workers to address.
 
 ## In-flight
 
-- PR #1 awaiting operator approval
-- Memory profiling findings written to `ai/findings/rust-memory-profiling.md`
-  (key: SQLite bundled malloc invisible to Rust profilers; use Instruments + RSS polling)
+Nothing. Phase 1 merged (PR #1, squash). Worktree cleaned up.
 
 ## Forward-looking
 
-1. Operator approves PR #1 → mayor merges → pulls main
-2. File Phase 2 beads: watch protocol, ring buffer, controllers, scheduler
-3. Dispatch Phase 2 workers in parallel clusters
+1. File Phase 2 beads: watch protocol, ring buffer, node/pod controllers, scheduler
+2. Dispatch Phase 2 workers in parallel (disjoint surfaces)
+3. Set up CI (cargo test on push) — no checks currently configured
+4. Code organisational cleanup from PR #1 review (awaiting your description)
 
 ## Recent progress
 
-- 8 beads closed total (7 specs/prompts + mayor-qd4 Phase 1)
-- Phase 1 implemented: u7s-store (SQLite, WAL, optimistic concurrency) + u7s-apiserver (axum, TLS, pods CRUD)
-- Memory profiling research complete (ai/findings/)
-- All 6 mayor loops running
+- **PR #1 merged** — feat(phase-1): u7s-store + u7s-apiserver (squash, --admin, no CI)
+- 8 beads closed total (specs, ADRs, Phase 1)
+- Memory profiling findings in ai/findings/ (key: use Instruments + RSS polling; SQLite malloc invisible to Rust profilers)
 
 ## Active loops
 
