@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use u7s_store::SqliteStore;
 
+use crate::rbac::RbacIndex;
 use crate::types::{ResourceKey, ResourceMeta};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<SqliteStore>,
     pub resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
+    pub rbac_index: Arc<RbacIndex>,
 }
 
 impl AppState {
@@ -16,6 +18,7 @@ impl AppState {
         AppState {
             store,
             resource_registry: Arc::new(registry),
+            rbac_index: Arc::new(RbacIndex::new()),
         }
     }
 }
