@@ -32,10 +32,20 @@ impl ObjectKey {
     }
 }
 
-/// Options for a list operation. Phase 1: only prefix is used.
+/// Filters a list to objects where a dot-separated JSON field equals a value.
+#[derive(Debug, Clone)]
+pub struct FieldSelector {
+    /// Dot-separated JSON path, e.g. "spec.nodeName".
+    pub field: String,
+    /// Expected value, e.g. "node-01".
+    pub value: String,
+}
+
+/// Options for a list operation.
 #[derive(Debug, Default)]
 pub struct ListOptions {
-    // Reserved for Phase 2+ (label selectors, pagination).
+    /// If set, filter results to objects where the named field equals the given value.
+    pub field_selector: Option<FieldSelector>,
 }
 
 /// Result of a list operation.
@@ -164,6 +174,10 @@ impl SqliteStore {
             );
 
             INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
+
+            CREATE INDEX IF NOT EXISTS idx_pods_nodename
+            ON objects (json_extract(value, '$.spec.nodeName'))
+            WHERE key LIKE '/registry/pods/%';
         ")?;
 
         let write_conn = Arc::new(Mutex::new(write_conn));
@@ -369,31 +383,104 @@ fn prefix_upper_bound(prefix: &str) -> String {
     String::new() // no upper bound needed
 }
 
-fn list_sync(conn: &Connection, prefix: &str) -> Result<ListResponse> {
+fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<ListResponse> {
     conn.execute_batch("BEGIN DEFERRED")?;
 
     let upper = prefix_upper_bound(prefix);
 
-    let items: Vec<StoreObject> = if upper.is_empty() {
-        let mut stmt = conn.prepare("SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC")?;
-        let rows = stmt.query_map(params![prefix], |r| {
-            Ok(StoreObject {
-                key:      r.get(0)?,
-                value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                revision: r.get(2)?,
-            })
-        })?.collect::<rusqlite::Result<_>>()?;
-        rows
-    } else {
-        let mut stmt = conn.prepare("SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC")?;
-        let rows = stmt.query_map(params![prefix, upper], |r| {
-            Ok(StoreObject {
-                key:      r.get(0)?,
-                value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                revision: r.get(2)?,
-            })
-        })?.collect::<rusqlite::Result<_>>()?;
-        rows
+    let items: Vec<StoreObject> = match &opts.field_selector {
+        // Indexed fast-path: spec.nodeName on pods — uses the partial index.
+        Some(FieldSelector { field, value })
+            if field == "spec.nodeName" && prefix.starts_with("/registry/pods/") =>
+        {
+            let like_prefix = format!("{}%", prefix);
+            let sql = "SELECT key, value, revision FROM objects \
+                       WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
+                       ORDER BY revision ASC";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(params![like_prefix, value], |r| {
+                Ok(StoreObject {
+                    key:      r.get(0)?,
+                    value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                    revision: r.get(2)?,
+                })
+            })?.collect::<rusqlite::Result<_>>()?;
+            rows
+        }
+
+        // Generic field selector: full scan + in-memory filter.
+        Some(FieldSelector { field, value }) => {
+            let raw: Vec<StoreObject> = if upper.is_empty() {
+                let mut stmt = conn.prepare(
+                    "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
+                )?;
+                let rows = stmt.query_map(params![prefix], |r| {
+                    Ok(StoreObject {
+                        key:      r.get(0)?,
+                        value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                        revision: r.get(2)?,
+                    })
+                })?.collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC",
+                )?;
+                let rows = stmt.query_map(params![prefix, upper], |r| {
+                    Ok(StoreObject {
+                        key:      r.get(0)?,
+                        value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                        revision: r.get(2)?,
+                    })
+                })?.collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
+
+            // Walk the dot-separated path in the parsed JSON and compare to expected value.
+            let path_parts: Vec<&str> = field.split('.').collect();
+            raw.into_iter().filter(|obj| {
+                let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
+                    return false;
+                };
+                let mut cur = &parsed;
+                for part in &path_parts {
+                    match cur.get(part) {
+                        Some(next) => cur = next,
+                        None => return false,
+                    }
+                }
+                cur.as_str().is_some_and(|s| s == value)
+            }).collect()
+        }
+
+        // No field selector: return all objects under prefix.
+        None => {
+            if upper.is_empty() {
+                let mut stmt = conn.prepare(
+                    "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
+                )?;
+                let rows = stmt.query_map(params![prefix], |r| {
+                    Ok(StoreObject {
+                        key:      r.get(0)?,
+                        value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                        revision: r.get(2)?,
+                    })
+                })?.collect::<rusqlite::Result<_>>()?;
+                rows
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC",
+                )?;
+                let rows = stmt.query_map(params![prefix, upper], |r| {
+                    Ok(StoreObject {
+                        key:      r.get(0)?,
+                        value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                        revision: r.get(2)?,
+                    })
+                })?.collect::<rusqlite::Result<_>>()?;
+                rows
+            }
+        }
     };
 
     let snapshot_revision: u64 = conn.query_row(
@@ -426,12 +513,12 @@ impl Store for SqliteStore {
         }).await?
     }
 
-    async fn list(&self, prefix: &str, _opts: ListOptions) -> Result<ListResponse> {
+    async fn list(&self, prefix: &str, opts: ListOptions) -> Result<ListResponse> {
         let conn = self.read_conn.clone();
         let prefix = prefix.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            list_sync(&conn, &prefix)
+            list_sync(&conn, &prefix, &opts)
         }).await?
     }
 
@@ -581,6 +668,21 @@ mod tests {
             },
             "spec": {
                 "nodeName": "test-node",
+                "containers": [{"name": "nginx", "image": "nginx:latest"}]
+            }
+        }).to_string())
+    }
+
+    fn pod_json_with_node(name: &str, node: &str) -> Bytes {
+        Bytes::from(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": name,
+                "namespace": "default"
+            },
+            "spec": {
+                "nodeName": node,
                 "containers": [{"name": "nginx", "image": "nginx:latest"}]
             }
         }).to_string())
@@ -806,5 +908,78 @@ mod tests {
             matches!(&ev2, WatchEvent::Modified(obj) if obj.revision == rv2),
             "expected Modified for update, got {:?}", ev2
         );
+    }
+
+    // --- Field selector tests ---
+
+    #[tokio::test]
+    async fn test_field_selector_nodename() {
+        // Verifies that the indexed fast-path (spec.nodeName on pods) returns only
+        // pods assigned to the requested node, exercising the partial SQLite index.
+        let store = make_store();
+
+        store.put("/registry/pods/default/pod-a", pod_json_with_node("pod-a", "node-1"), Some(0))
+            .await.expect("create pod-a");
+        store.put("/registry/pods/default/pod-b", pod_json_with_node("pod-b", "node-2"), Some(0))
+            .await.expect("create pod-b");
+        store.put("/registry/pods/default/pod-c", pod_json_with_node("pod-c", "node-1"), Some(0))
+            .await.expect("create pod-c");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "spec.nodeName".to_string(),
+                value: "node-1".to_string(),
+            }),
+        };
+        let resp = store.list("/registry/pods/", opts).await.expect("list");
+
+        assert_eq!(resp.items.len(), 2, "should return exactly the 2 pods on node-1");
+        let keys: Vec<&str> = resp.items.iter().map(|o| o.key.as_str()).collect();
+        assert!(keys.contains(&"/registry/pods/default/pod-a"));
+        assert!(keys.contains(&"/registry/pods/default/pod-c"));
+        assert!(!keys.contains(&"/registry/pods/default/pod-b"), "pod-b is on node-2, must be excluded");
+    }
+
+    #[tokio::test]
+    async fn test_field_selector_fallback() {
+        // Verifies the in-memory filter path for non-indexed fields.
+        // metadata.namespace is not indexed; the code must fall back to a full scan + filter.
+        let store = make_store();
+
+        store.put("/registry/pods/default/pod-a", pod_json_with_node("pod-a", "node-1"), Some(0))
+            .await.expect("create pod-a");
+        store.put("/registry/pods/other/pod-b", Bytes::from(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod-b", "namespace": "other" },
+            "spec": { "nodeName": "node-2", "containers": [] }
+        }).to_string()), Some(0)).await.expect("create pod-b");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "metadata.namespace".to_string(),
+                value: "default".to_string(),
+            }),
+        };
+        let resp = store.list("/registry/pods/", opts).await.expect("list");
+
+        assert_eq!(resp.items.len(), 1, "only pod-a is in namespace default");
+        assert_eq!(resp.items[0].key, "/registry/pods/default/pod-a");
+    }
+
+    #[tokio::test]
+    async fn test_field_selector_none() {
+        // Verifies that field_selector: None preserves the existing list behavior exactly.
+        let store = make_store();
+
+        store.put("/registry/pods/default/alpha", pod_json("alpha"), Some(0)).await.expect("create alpha");
+        store.put("/registry/pods/default/beta",  pod_json("beta"),  Some(0)).await.expect("create beta");
+        store.put("/registry/pods/other/gamma",   pod_json("gamma"), Some(0)).await.expect("create gamma");
+
+        let resp = store.list("/registry/pods/default/", ListOptions::default()).await.expect("list");
+        assert_eq!(resp.items.len(), 2, "default() must behave identically to before this change");
+        let keys: Vec<&str> = resp.items.iter().map(|o| o.key.as_str()).collect();
+        assert!(keys.contains(&"/registry/pods/default/alpha"));
+        assert!(keys.contains(&"/registry/pods/default/beta"));
     }
 }
