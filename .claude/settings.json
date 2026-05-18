@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | python3 -c \"import sys,json; print(json.load(sys.stdin).get('command',''))\" 2>/dev/null); case \"$cmd\" in \"git push\"*) cargo test --workspace --quiet && cargo clippy --workspace --quiet -- -D warnings ;; esac"
+          }
+        ]
+      }
+    ],
     "PreCompact": [
       {
         "hooks": [
