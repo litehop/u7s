@@ -203,15 +203,12 @@ pub async fn patch_pod(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if content_type.contains("application/strategic-merge-patch+json") {
-        return Err(Status::bad_request(
-            "strategic merge patch not supported in Phase 1; use kubectl replace instead of kubectl apply".into(),
-        ));
-    }
+    let is_smp = content_type.contains("application/strategic-merge-patch+json");
+    let is_jmp = content_type.contains("application/merge-patch+json");
 
-    if !content_type.contains("application/merge-patch+json") {
+    if !is_smp && !is_jmp {
         return Err(Status::unsupported_media_type(format!(
-            "unsupported media type '{content_type}'; use application/merge-patch+json"
+            "unsupported media type '{content_type}'; use application/merge-patch+json or application/strategic-merge-patch+json"
         )));
     }
 
@@ -231,7 +228,12 @@ pub async fn patch_pod(
     let patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    json_merge_patch(&mut current_obj.body, &patch);
+    if is_smp {
+        crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
+            .map_err(|e| Status::bad_request(e.to_string()))?;
+    } else {
+        json_merge_patch(&mut current_obj.body, &patch);
+    }
 
     // Extract expected revision from current object (after patch may have changed it)
     let expected_revision = match current_obj.resource_version() {
