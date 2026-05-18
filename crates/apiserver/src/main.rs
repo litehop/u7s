@@ -1,5 +1,6 @@
 mod handlers;
 mod keys;
+mod patch;
 mod state;
 mod status;
 mod tls;
