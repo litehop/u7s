@@ -12,7 +12,7 @@ use crate::{
     keys::{list_prefix, object_key},
     state::AppState,
     status::Status,
-    types::Object,
+    types::{Namespace, Object},
 };
 
 #[derive(Deserialize)]
@@ -20,57 +20,49 @@ pub struct CollectionQuery {
     pub watch: Option<bool>,
 }
 
-#[derive(Deserialize)]
-pub struct NsParams {
-    pub ns: String,
-}
-
-#[derive(Deserialize)]
-pub struct NsNameParams {
-    pub ns: String,
-    pub name: String,
-}
-
-fn validate_namespace(ns: &str) -> Result<(), crate::status::StatusError> {
-    if ns != "default" {
-        return Err(Status::bad_request(format!(
-            "only the 'default' namespace is supported in Phase 1; got '{ns}'"
-        )));
+/// Validate a raw namespace string: format check then Phase-1 allow-list.
+/// Returns 400 on invalid format, 404 for unsupported namespaces.
+fn parse_namespace(raw: &str) -> Result<Namespace, crate::status::StatusError> {
+    let ns = Namespace::parse(raw).map_err(Status::bad_request)?;
+    // Phase 1: only "default" is supported.
+    if ns.as_str() != "default" {
+        return Err(Status::not_found(ns.as_str(), "Namespace"));
     }
-    Ok(())
+    Ok(ns)
 }
 
 fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusError {
     match err {
         StoreError::NotFound { .. } => Status::not_found(name, "Pod"),
         StoreError::AlreadyExists { .. } => Status::already_exists(name, "Pod"),
-        StoreError::RevisionMismatch { expected, current } => {
-            Status::conflict(format!(
-                "Pod \"{name}\" cannot be updated: resource version mismatch (expected {expected}, current {current})"
-            ))
-        }
+        StoreError::RevisionMismatch { expected, current } => Status::conflict(format!(
+            "Pod \"{name}\" cannot be updated: resource version mismatch (expected {expected}, current {current})"
+        )),
         other => Status::internal(other.to_string()),
     }
 }
 
 pub async fn list_pods(
     State(state): State<AppState>,
-    Path(NsParams { ns }): Path<NsParams>,
+    Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<CollectionQuery>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     if query.watch == Some(true) {
         return Err(Status::bad_request("watch is not supported in Phase 1".into()));
     }
-    validate_namespace(&ns)?;
+    let ns = parse_namespace(&raw_ns)?;
 
-    let prefix = list_prefix("pods", &ns);
-    let resp = state.store.list(&prefix, ListOptions::default()).await
+    let prefix = list_prefix("pods", ns.as_str());
+    let resp = state
+        .store
+        .list(&prefix, ListOptions::default())
+        .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
-        let parsed: serde_json::Value = serde_json::from_slice(&obj.value)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(parsed);
     }
 
@@ -86,24 +78,29 @@ pub async fn list_pods(
 
 pub async fn create_pod(
     State(state): State<AppState>,
-    Path(NsParams { ns }): Path<NsParams>,
+    Path((raw_ns,)): Path<(String,)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_namespace(&ns)?;
+    let ns = parse_namespace(&raw_ns)?;
 
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let name = obj.name()
+    let name = obj
+        .name()
         .filter(|n| !n.is_empty())
         .ok_or_else(|| Status::bad_request("metadata.name is required".into()))?
         .to_string();
 
     // Ensure namespace is set in the stored object
-    obj.body["metadata"]["namespace"] = serde_json::Value::String("default".to_string());
+    obj.body["metadata"]["namespace"] =
+        serde_json::Value::String(ns.as_str().to_owned());
 
-    let key = object_key("pods", "default", &name);
-    let new_rv = state.store.put(&key, obj.to_bytes(), Some(0)).await
+    let key = object_key("pods", ns.as_str(), &name);
+    let new_rv = state
+        .store
+        .put(&key, obj.to_bytes(), Some(0))
+        .await
         .map_err(|e| store_err_to_status(e, &name))?;
 
     obj.set_resource_version(new_rv);
@@ -113,12 +110,15 @@ pub async fn create_pod(
 
 pub async fn get_pod(
     State(state): State<AppState>,
-    Path(NsNameParams { ns, name }): Path<NsNameParams>,
+    Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
-    validate_namespace(&ns)?;
+    let ns = parse_namespace(&raw_ns)?;
 
-    let key = object_key("pods", "default", &name);
-    let stored = state.store.get(&key).await
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, "Pod"))?;
 
@@ -126,15 +126,16 @@ pub async fn get_pod(
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         stored.value,
-    ).into_response())
+    )
+        .into_response())
 }
 
 pub async fn replace_pod(
     State(state): State<AppState>,
-    Path(NsNameParams { ns, name }): Path<NsNameParams>,
+    Path((raw_ns, name)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_namespace(&ns)?;
+    let ns = parse_namespace(&raw_ns)?;
 
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -150,15 +151,18 @@ pub async fn replace_pod(
         None | Some("") => None,
         Some("0") => Some(0),
         Some(rv) => {
-            let parsed = rv.parse::<u64>().map_err(|_| {
-                Status::bad_request(format!("invalid resourceVersion: {rv}"))
-            })?;
+            let parsed = rv
+                .parse::<u64>()
+                .map_err(|_| Status::bad_request(format!("invalid resourceVersion: {rv}")))?;
             Some(parsed)
         }
     };
 
-    let key = object_key("pods", "default", &name);
-    let new_rv = state.store.put(&key, obj.to_bytes(), expected_revision).await
+    let key = object_key("pods", ns.as_str(), &name);
+    let new_rv = state
+        .store
+        .put(&key, obj.to_bytes(), expected_revision)
+        .await
         .map_err(|e| store_err_to_status(e, &name))?;
 
     obj.set_resource_version(new_rv);
@@ -168,12 +172,15 @@ pub async fn replace_pod(
 
 pub async fn delete_pod(
     State(state): State<AppState>,
-    Path(NsNameParams { ns, name }): Path<NsNameParams>,
+    Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_namespace(&ns)?;
+    let ns = parse_namespace(&raw_ns)?;
 
-    let key = object_key("pods", "default", &name);
-    state.store.delete(&key, None).await
+    let key = object_key("pods", ns.as_str(), &name);
+    state
+        .store
+        .delete(&key, None)
+        .await
         .map_err(|e| store_err_to_status(e, &name))?;
 
     Ok(Json(serde_json::json!({
@@ -186,7 +193,7 @@ pub async fn delete_pod(
 
 pub async fn patch_pod(
     State(state): State<AppState>,
-    Path(NsNameParams { ns, name }): Path<NsNameParams>,
+    Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -198,28 +205,31 @@ pub async fn patch_pod(
 
     if content_type.contains("application/strategic-merge-patch+json") {
         return Err(Status::bad_request(
-            "strategic merge patch not supported in Phase 1; use kubectl replace instead of kubectl apply".into()
+            "strategic merge patch not supported in Phase 1; use kubectl replace instead of kubectl apply".into(),
         ));
     }
 
     if !content_type.contains("application/merge-patch+json") {
-        return Err(Status::unsupported_media_type(
-            format!("unsupported media type '{content_type}'; use application/merge-patch+json")
-        ));
+        return Err(Status::unsupported_media_type(format!(
+            "unsupported media type '{content_type}'; use application/merge-patch+json"
+        )));
     }
 
-    validate_namespace(&ns)?;
+    let ns = parse_namespace(&raw_ns)?;
 
-    let key = object_key("pods", "default", &name);
-    let stored = state.store.get(&key).await
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, "Pod"))?;
 
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let patch: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     json_merge_patch(&mut current_obj.body, &patch);
 
@@ -235,7 +245,10 @@ pub async fn patch_pod(
         }
     };
 
-    let new_rv = state.store.put(&key, current_obj.to_bytes(), expected_revision).await
+    let new_rv = state
+        .store
+        .put(&key, current_obj.to_bytes(), expected_revision)
+        .await
         .map_err(|e| store_err_to_status(e, &name))?;
 
     current_obj.set_resource_version(new_rv);
@@ -249,7 +262,9 @@ fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
             if v.is_null() {
                 t.remove(k);
             } else if v.is_object() {
-                let entry = t.entry(k).or_insert(serde_json::Value::Object(Default::default()));
+                let entry = t
+                    .entry(k)
+                    .or_insert(serde_json::Value::Object(Default::default()));
                 json_merge_patch(entry, v);
             } else {
                 t.insert(k.clone(), v.clone());
