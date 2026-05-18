@@ -2,6 +2,127 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ---------------------------------------------------------------------------
+// API wire types — v1 discovery
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct ServerAddressByClientCIDR {
+    #[serde(rename = "clientCIDR")]
+    pub client_cidr: &'static str,
+    #[serde(rename = "serverAddress")]
+    pub server_address: &'static str,
+}
+
+/// Wire representation of `/api` response.
+#[derive(Debug, Serialize)]
+pub struct APIVersions {
+    pub kind: &'static str,
+    #[serde(rename = "apiVersion")]
+    pub api_version: &'static str,
+    pub versions: &'static [&'static str],
+    #[serde(rename = "serverAddressByClientCIDRs")]
+    pub server_address_by_client_cidrs: &'static [ServerAddressByClientCIDR],
+}
+
+static SERVER_ADDRESS_BY_CLIENT_CIDRS: &[ServerAddressByClientCIDR] = &[
+    ServerAddressByClientCIDR {
+        client_cidr: "0.0.0.0/0",
+        server_address: "https://127.0.0.1:6443",
+    },
+];
+
+impl APIVersions {
+    pub fn v1() -> Self {
+        APIVersions {
+            kind: "APIVersions",
+            api_version: "v1",
+            versions: &["v1"],
+            server_address_by_client_cidrs: SERVER_ADDRESS_BY_CLIENT_CIDRS,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiResource {
+    pub name: &'static str,
+    #[serde(rename = "singularName")]
+    pub singular_name: &'static str,
+    pub namespaced: bool,
+    pub kind: &'static str,
+    pub verbs: &'static [&'static str],
+    #[serde(rename = "shortNames", skip_serializing_if = "Option::is_none")]
+    pub short_names: Option<&'static [&'static str]>,
+}
+
+/// Wire representation of `/api/v1` response.
+#[derive(Debug, Serialize)]
+pub struct ApiResourceList {
+    pub kind: &'static str,
+    #[serde(rename = "apiVersion")]
+    pub api_version: &'static str,
+    #[serde(rename = "groupVersion")]
+    pub group_version: &'static str,
+    pub resources: &'static [ApiResource],
+}
+
+static PODS_VERBS: &[&str] = &["create", "delete", "get", "list", "patch", "update"];
+static PODS_SHORT_NAMES: &[&str] = &["po"];
+
+static V1_RESOURCES: &[ApiResource] = &[ApiResource {
+    name: "pods",
+    singular_name: "pod",
+    namespaced: true,
+    kind: "Pod",
+    verbs: PODS_VERBS,
+    short_names: Some(PODS_SHORT_NAMES),
+}];
+
+impl ApiResourceList {
+    pub fn v1() -> Self {
+        ApiResourceList {
+            kind: "APIResourceList",
+            api_version: "v1",
+            group_version: "v1",
+            resources: V1_RESOURCES,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Namespace domain type
+// ---------------------------------------------------------------------------
+
+/// Validated namespace name. Only `[a-z0-9-]+` is accepted.
+/// In Phase 1, only `"default"` is a valid namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Namespace(pub String);
+
+impl Namespace {
+    /// Parse and validate a raw namespace string.
+    /// Returns `Err` with a human-readable message on failure.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            return Err(format!("invalid namespace name '{raw}': must match [a-z0-9-]+"));
+        }
+        Ok(Namespace(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Namespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kubernetes object store type
+// ---------------------------------------------------------------------------
+
 /// Every Kubernetes object in memory.
 /// Body is kept as a serde_json::Value for cheap pass-through.
 /// Accessors parse individual fields on demand.

@@ -25,7 +25,9 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:6443")]
     listen: String,
 
-    #[arg(long, default_value = "./kubeconfig.yaml")]
+    /// Output path for the generated kubeconfig. Write-only on first run —
+    /// not a read fixture. Generated fresh from TLS material each startup.
+    #[arg(long, default_value = "./kubeconfig")]
     kubeconfig: String,
 }
 
