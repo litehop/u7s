@@ -1,6 +1,7 @@
 mod handlers;
 mod keys;
 mod patch;
+mod rbac;
 mod state;
 mod status;
 mod tls;
