@@ -18,6 +18,7 @@ use crate::{
 #[derive(Deserialize)]
 pub struct CollectionQuery {
     pub watch: Option<bool>,
+    pub label_selector: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +63,48 @@ fn check_watch(query: &CollectionQuery) -> Result<(), crate::status::StatusError
         return Err(Status::bad_request("watch is not supported in Phase 1".into()));
     }
     Ok(())
+}
+
+/// Parse a label selector string of the form `key=value,key2=value2` into key-value pairs.
+/// Only simple equality selectors are supported. Returns an error on malformed input.
+fn parse_label_selector(selector: &str) -> Result<Vec<(&str, &str)>, crate::status::StatusError> {
+    let mut pairs = Vec::new();
+    for part in selector.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let mut it = part.splitn(2, '=');
+        let key = it.next().unwrap_or("").trim();
+        let val = it.next().ok_or_else(|| {
+            Status::bad_request(format!("invalid label selector '{part}': expected key=value"))
+        })?.trim();
+        if key.is_empty() {
+            return Err(Status::bad_request(format!("invalid label selector '{part}': empty key")));
+        }
+        pairs.push((key, val));
+    }
+    Ok(pairs)
+}
+
+/// Filter `items` by label selector pairs. Keeps only items where all key=value pairs match
+/// the object's `metadata.labels` map.
+fn apply_label_selector(
+    items: Vec<serde_json::Value>,
+    pairs: &[(&str, &str)],
+) -> Vec<serde_json::Value> {
+    if pairs.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|item| {
+            let labels = &item["metadata"]["labels"];
+            pairs.iter().all(|(k, v)| {
+                labels.get(*k).and_then(|lv| lv.as_str()) == Some(*v)
+            })
+        })
+        .collect()
 }
 
 fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
@@ -207,6 +250,13 @@ pub async fn list_resource(
         items.push(v);
     }
 
+    let items = if let Some(ref sel) = query.label_selector {
+        let pairs = parse_label_selector(sel)?;
+        apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
+
     let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
     Ok(Json(body))
 }
@@ -250,11 +300,19 @@ pub async fn create_resource(
         .to_string();
 
     let key = group_object_key(&group, &plural, None, &name);
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), Some(0))
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+    let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
+    let new_rv = match result {
+        Ok(rv) => rv,
+        Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
+            // createOrUpdate: replace existing object unconditionally.
+            state
+                .store
+                .put(&key, obj.to_bytes(), None)
+                .await
+                .map_err(|e| store_err(e, &name, &meta.kind))?
+        }
+        Err(e) => return Err(store_err(e, &name, &meta.kind)),
+    };
 
     obj.set_resource_version(new_rv);
     Ok((StatusCode::CREATED, Json(obj.body)))
@@ -429,6 +487,13 @@ pub async fn list_namespaced_resource(
         items.push(v);
     }
 
+    let items = if let Some(ref sel) = query.label_selector {
+        let pairs = parse_label_selector(sel)?;
+        apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
+
     let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
     Ok(Json(body))
 }
@@ -474,11 +539,19 @@ pub async fn create_namespaced_resource(
     obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), Some(0))
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+    let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
+    let new_rv = match result {
+        Ok(rv) => rv,
+        Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
+            // createOrUpdate: replace existing object unconditionally.
+            state
+                .store
+                .put(&key, obj.to_bytes(), None)
+                .await
+                .map_err(|e| store_err(e, &name, &meta.kind))?
+        }
+        Err(e) => return Err(store_err(e, &name, &meta.kind)),
+    };
 
     obj.set_resource_version(new_rv);
     Ok((StatusCode::CREATED, Json(obj.body)))
@@ -824,6 +897,197 @@ pub async fn patch_namespaced_resource_status(
 }
 
 // ---------------------------------------------------------------------------
+// Core group (group="", version="v1") handler wrappers for /api/v1/... routes
+// ---------------------------------------------------------------------------
+//
+// These inject the fixed (group, version) = ("", "v1") into the generic handlers
+// so the router can use simpler path patterns like /api/v1/:resource.
+
+pub async fn core_list_resource(
+    State(state): State<AppState>,
+    Path(plural): Path<String>,
+    Query(query): Query<CollectionQuery>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    list_resource(
+        State(state),
+        Path(("".into(), "v1".into(), plural)),
+        Query(query),
+    )
+    .await
+}
+
+pub async fn core_get_resource(
+    State(state): State<AppState>,
+    Path((plural, name)): Path<(String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    get_resource(State(state), Path(("".into(), "v1".into(), plural, name))).await
+}
+
+pub async fn core_create_resource(
+    State(state): State<AppState>,
+    Path(plural): Path<String>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    create_resource(State(state), Path(("".into(), "v1".into(), plural)), body).await
+}
+
+pub async fn core_replace_resource(
+    State(state): State<AppState>,
+    Path((plural, name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    replace_resource(State(state), Path(("".into(), "v1".into(), plural, name)), body).await
+}
+
+pub async fn core_delete_resource(
+    State(state): State<AppState>,
+    Path((plural, name)): Path<(String, String)>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    delete_resource(State(state), Path(("".into(), "v1".into(), plural, name))).await
+}
+
+pub async fn core_patch_resource(
+    State(state): State<AppState>,
+    Path((plural, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    patch_resource(State(state), Path(("".into(), "v1".into(), plural, name)), headers, body).await
+}
+
+pub async fn core_get_resource_status(
+    State(state): State<AppState>,
+    Path((plural, name)): Path<(String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    get_resource_status(State(state), Path(("".into(), "v1".into(), plural, name))).await
+}
+
+pub async fn core_put_resource_status(
+    State(state): State<AppState>,
+    Path((plural, name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    put_resource_status(State(state), Path(("".into(), "v1".into(), plural, name)), body).await
+}
+
+pub async fn core_patch_resource_status(
+    State(state): State<AppState>,
+    Path((plural, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    patch_resource_status(
+        State(state),
+        Path(("".into(), "v1".into(), plural, name)),
+        headers,
+        body,
+    )
+    .await
+}
+
+pub async fn core_list_namespaced_resource(
+    State(state): State<AppState>,
+    Path((ns, plural)): Path<(String, String)>,
+    Query(query): Query<CollectionQuery>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    list_namespaced_resource(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural)),
+        Query(query),
+    )
+    .await
+}
+
+pub async fn core_get_namespaced_resource(
+    State(state): State<AppState>,
+    Path((ns, plural, name)): Path<(String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    get_namespaced_resource(State(state), Path(("".into(), "v1".into(), ns, plural, name))).await
+}
+
+pub async fn core_create_namespaced_resource(
+    State(state): State<AppState>,
+    Path((ns, plural)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    create_namespaced_resource(State(state), Path(("".into(), "v1".into(), ns, plural)), body).await
+}
+
+pub async fn core_replace_namespaced_resource(
+    State(state): State<AppState>,
+    Path((ns, plural, name)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    replace_namespaced_resource(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural, name)),
+        body,
+    )
+    .await
+}
+
+pub async fn core_delete_namespaced_resource(
+    State(state): State<AppState>,
+    Path((ns, plural, name)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    delete_namespaced_resource(State(state), Path(("".into(), "v1".into(), ns, plural, name))).await
+}
+
+pub async fn core_patch_namespaced_resource(
+    State(state): State<AppState>,
+    Path((ns, plural, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    patch_namespaced_resource(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural, name)),
+        headers,
+        body,
+    )
+    .await
+}
+
+pub async fn core_get_namespaced_resource_status(
+    State(state): State<AppState>,
+    Path((ns, plural, name)): Path<(String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    get_namespaced_resource_status(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural, name)),
+    )
+    .await
+}
+
+pub async fn core_put_namespaced_resource_status(
+    State(state): State<AppState>,
+    Path((ns, plural, name)): Path<(String, String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    put_namespaced_resource_status(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural, name)),
+        body,
+    )
+    .await
+}
+
+pub async fn core_patch_namespaced_resource_status(
+    State(state): State<AppState>,
+    Path((ns, plural, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    patch_namespaced_resource_status(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural, name)),
+        headers,
+        body,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // Shared helper
 // ---------------------------------------------------------------------------
 
@@ -846,4 +1110,122 @@ fn validate_patch_content_type(headers: &HeaderMap) -> Result<(), crate::status:
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item_with_labels(labels: &[(&str, &str)]) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for (k, v) in labels {
+            map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        }
+        serde_json::json!({ "metadata": { "labels": map } })
+    }
+
+    /// Unwrap a Result whose Err type doesn't impl Debug.
+    fn ok<T>(r: Result<T, crate::status::StatusError>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(_) => panic!("expected Ok but got Err"),
+        }
+    }
+
+    // -- parse_label_selector --
+
+    #[test]
+    fn parse_single_pair() {
+        let pairs = ok(parse_label_selector("app=frontend"));
+        assert_eq!(pairs, vec![("app", "frontend")]);
+    }
+
+    #[test]
+    fn parse_multiple_pairs() {
+        let pairs = ok(parse_label_selector("app=frontend,env=prod"));
+        assert_eq!(pairs, vec![("app", "frontend"), ("env", "prod")]);
+    }
+
+    #[test]
+    fn parse_empty_selector_returns_empty() {
+        let pairs = ok(parse_label_selector(""));
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn parse_missing_equals_is_error() {
+        // no '=' present — must fail because label selectors require key=value
+        assert!(parse_label_selector("app").is_err());
+    }
+
+    #[test]
+    fn parse_empty_key_is_error() {
+        assert!(parse_label_selector("=val").is_err());
+    }
+
+    #[test]
+    fn parse_value_may_be_empty() {
+        // key= is valid — value is empty string
+        let pairs = ok(parse_label_selector("app="));
+        assert_eq!(pairs, vec![("app", "")]);
+    }
+
+    // -- apply_label_selector --
+
+    #[test]
+    fn filter_matches_all_present_labels() {
+        let items = vec![
+            item_with_labels(&[("app", "frontend"), ("env", "prod")]),
+            item_with_labels(&[("app", "backend"), ("env", "prod")]),
+        ];
+        let pairs = vec![("app", "frontend"), ("env", "prod")];
+        let result = apply_label_selector(items, &pairs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["metadata"]["labels"]["app"], "frontend");
+    }
+
+    #[test]
+    fn filter_removes_items_missing_label() {
+        let items = vec![
+            item_with_labels(&[("app", "frontend")]),
+            item_with_labels(&[]),
+        ];
+        let pairs = vec![("app", "frontend")];
+        let result = apply_label_selector(items, &pairs);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn filter_empty_pairs_returns_all() {
+        let items = vec![
+            item_with_labels(&[("a", "1")]),
+            item_with_labels(&[("b", "2")]),
+        ];
+        let result = apply_label_selector(items, &[]);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn filter_no_match_returns_empty() {
+        let items = vec![item_with_labels(&[("app", "backend")])];
+        let pairs = vec![("app", "frontend")];
+        let result = apply_label_selector(items, &pairs);
+        assert!(result.is_empty());
+    }
+
+    // -- build_list_response --
+
+    #[test]
+    fn core_group_api_version_is_version_only() {
+        // For core group (group=""), apiVersion should be just "v1", not "/v1".
+        let body = build_list_response("Node", "", "v1", 0, vec![]);
+        assert_eq!(body["apiVersion"], "v1");
+        assert_eq!(body["kind"], "NodeList");
+    }
+
+    #[test]
+    fn non_core_group_api_version_includes_group() {
+        let body = build_list_response("Deployment", "apps", "v1", 0, vec![]);
+        assert_eq!(body["apiVersion"], "apps/v1");
+    }
 }
