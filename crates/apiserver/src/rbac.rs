@@ -180,7 +180,7 @@ impl Default for RbacIndex {
 // --- helpers ---
 
 fn extract_last_segment(key: &str) -> String {
-    key.split('/').filter(|s| !s.is_empty()).next_back().unwrap_or("").to_owned()
+    key.split('/').rfind(|s| !s.is_empty()).unwrap_or("").to_owned()
 }
 
 /// Extract namespace from key segments like .../namespaces/<ns>/roles/<name>
