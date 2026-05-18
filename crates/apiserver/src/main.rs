@@ -10,7 +10,7 @@ mod types;
 
 use std::sync::Arc;
 
-use axum::{Router, routing::get};
+use axum::{Router, routing::{get, post}};
 use tower_service::Service;
 use clap::Parser;
 use tokio::net::TcpListener;
@@ -174,6 +174,16 @@ fn build_router(state: AppState) -> Router {
             get(handlers::generic::core_get_namespaced_resource_status)
                 .put(handlers::generic::core_put_namespaced_resource_status)
                 .patch(handlers::generic::core_patch_namespaced_resource_status),
+        )
+
+        // Authorization reviews (specific paths before generic catch-all)
+        .route(
+            "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+            post(handlers::authorization::self_subject_access_review),
+        )
+        .route(
+            "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+            post(handlers::authorization::self_subject_rules_review),
         )
 
         // Generic cluster-scoped resources — collection

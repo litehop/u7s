@@ -130,6 +130,55 @@ impl RbacIndex {
         }
     }
 
+    /// Return all PolicyRules that apply to the caller in the given namespace.
+    ///
+    /// Includes rules from cluster bindings (always) and namespace bindings
+    /// whose namespace matches `namespace`.  If the caller is in system:masters,
+    /// returns a single wildcard rule instead of enumerating.
+    pub fn enumerate_rules(
+        &self,
+        username: &str,
+        groups: &[String],
+        namespace: &str,
+    ) -> Vec<PolicyRule> {
+        // system:masters fast path.
+        if groups.iter().any(|g| g == "system:masters") {
+            return vec![PolicyRule {
+                api_groups: vec!["*".to_owned()],
+                resources: vec!["*".to_owned()],
+                verbs: vec!["*".to_owned()],
+                resource_names: vec![],
+            }];
+        }
+
+        let inner = self.inner.read().unwrap();
+        let mut rules: Vec<PolicyRule> = Vec::new();
+
+        // Cluster bindings apply in any namespace.
+        for (_, binding) in &inner.cluster_bindings {
+            if !subject_matches(binding, username, groups) {
+                continue;
+            }
+            let r = resolve_cluster_role_rules(&inner, &binding.role_ref);
+            rules.extend_from_slice(r);
+        }
+
+        // Namespace bindings scoped to the requested namespace.
+        for (_, binding) in &inner.namespace_bindings {
+            let binding_ns = binding.namespace.as_deref().unwrap_or("");
+            if binding_ns != namespace {
+                continue;
+            }
+            if !subject_matches(binding, username, groups) {
+                continue;
+            }
+            let r = resolve_role_rules(&inner, &binding.role_ref, namespace);
+            rules.extend_from_slice(r);
+        }
+
+        rules
+    }
+
     pub fn is_allowed(&self, req: &AuthzRequest<'_>) -> bool {
         // system:masters unconditional bypass
         if req.groups.iter().any(|g| g == "system:masters") {
