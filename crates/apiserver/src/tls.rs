@@ -4,6 +4,56 @@ use std::sync::Arc;
 
 use crate::Args;
 
+// ---------------------------------------------------------------------------
+// SA signing key — RSA 2048, persisted across restarts
+// ---------------------------------------------------------------------------
+
+/// RSA key pair used for signing service-account JWTs.
+pub struct SaKeys {
+    /// PEM-encoded PKCS#8 private key — used to construct an EncodingKey.
+    pub private_key_pem: Vec<u8>,
+}
+
+/// Load `sa.key` from disk, or generate a fresh RSA-2048 key and write it.
+///
+/// The public key (`sa.pub`) is derived from the private key; we write it
+/// for operator convenience but never read it back (we re-derive it from
+/// the private key at startup).
+///
+/// Design: load-or-generate ensures tokens minted before a restart remain
+/// valid after restart, because the signing key stays constant.
+pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow::Result<SaKeys> {
+    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+    use rsa::RsaPrivateKey;
+
+    // If the private key already exists, load it.
+    if std::path::Path::new(sa_key_path).exists() {
+        let pem = std::fs::read(sa_key_path)?;
+        tracing::info!("loaded SA signing key from {sa_key_path}");
+        return Ok(SaKeys { private_key_pem: pem });
+    }
+
+    // Generate a new 2048-bit RSA key.
+    tracing::info!("generating new SA signing key → {sa_key_path}");
+    let mut rng = rsa::rand_core::OsRng;
+    let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
+
+    let private_pem = private_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| anyhow::anyhow!("PKCS#8 encode error: {e}"))?;
+
+    let public_pem = private_key
+        .to_public_key()
+        .to_public_key_pem(LineEnding::LF)
+        .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
+
+    std::fs::write(sa_key_path, private_pem.as_bytes())?;
+    std::fs::write(sa_pub_path, public_pem.as_bytes())?;
+    tracing::info!("SA signing key written to {sa_key_path}");
+
+    Ok(SaKeys { private_key_pem: private_pem.as_bytes().to_vec() })
+}
+
 pub struct TlsMaterial {
     /// DER-encoded CA certificate (written into kubeconfig).
     pub ca_cert_der: Vec<u8>,

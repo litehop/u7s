@@ -10,15 +10,18 @@ pub struct AppState {
     pub store: Arc<SqliteStore>,
     pub resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
     pub rbac_index: Arc<RbacIndex>,
+    /// RSA signing key for service-account JWTs. None when SA key is unavailable.
+    pub sa_key: Option<Arc<jsonwebtoken::EncodingKey>>,
 }
 
 impl AppState {
-    pub fn new(store: Arc<SqliteStore>) -> Self {
+    pub fn new(store: Arc<SqliteStore>, sa_key: Option<jsonwebtoken::EncodingKey>) -> Self {
         let registry = build_registry();
         AppState {
             store,
             resource_registry: Arc::new(registry),
             rbac_index: Arc::new(RbacIndex::new()),
+            sa_key: sa_key.map(Arc::new),
         }
     }
 }
