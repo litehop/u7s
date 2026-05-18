@@ -1,0 +1,8 @@
+
+# Mayor Method working files
+ai/findings/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

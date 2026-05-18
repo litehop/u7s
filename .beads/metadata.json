@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "mayor",
+  "project_id": "c52508dd-4ed5-4fbc-8d31-c0422ac6274a"
+}
