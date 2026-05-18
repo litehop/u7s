@@ -1,3 +1,4 @@
+mod auth;
 mod handlers;
 mod keys;
 mod patch;
@@ -16,6 +17,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use u7s_store::SqliteStore;
 
+use auth::AuthLayer;
 use state::AppState;
 use tls::{generate_tls, write_kubeconfig};
 
@@ -31,6 +33,12 @@ struct Args {
     /// not a read fixture. Generated fresh from TLS material each startup.
     #[arg(long, default_value = "./kubeconfig")]
     kubeconfig: String,
+
+    /// Path to a bearer-token auth file (token,user,uid,group,...).
+    /// Optional. When absent, only anonymous access is permitted unless
+    /// RBAC grants it.
+    #[arg(long)]
+    token_auth_file: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -52,19 +60,29 @@ async fn main() -> anyhow::Result<()> {
     // 5. Write kubeconfig.
     write_kubeconfig(&args.kubeconfig, &tls_material)?;
 
-    // 6. Build axum router.
-    let app = build_router(Arc::clone(&store));
+    // 6. Load optional static token map.
+    let token_map = match &args.token_auth_file {
+        Some(path) => {
+            tracing::info!("loading token auth file: {path}");
+            auth::load_token_file(path)?
+        }
+        None => std::collections::HashMap::new(),
+    };
 
-    // 7. Bind TLS listener and serve.
+    // 7. Build app state (shared with the auth layer).
+    let state = AppState::new(Arc::clone(&store));
+
+    // 8. Build axum router and attach the auth tower layer.
+    let app = build_router(state.clone())
+        .layer(AuthLayer::new(Arc::clone(&state.rbac_index), token_map));
+
+    // 9. Bind TLS listener and serve.
     let listener = TcpListener::bind(&args.listen).await?;
     serve_tls(listener, app, tls_material.server_config).await?;
     Ok(())
 }
 
-fn build_router(store: Arc<SqliteStore>) -> Router {
-
-    let state = AppState::new(store);
-
+fn build_router(state: AppState) -> Router {
     Router::new()
         // Core discovery
         .route("/api",    get(handlers::discovery::api_versions))
