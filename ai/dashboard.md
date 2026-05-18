@@ -1,32 +1,38 @@
 # Dashboard
 
 2026-05-19 UTC+2
-Phase 2 complete. Resume: open Claude Code at /Users/balint.erdos/u7s (new mayor session)
+Resume: open Claude Code at /Users/balint.erdos/u7s (new mayor session)
+Open beads: 0
 
 ## What needs the operator now
 
-Nothing. Phase 2 is fully merged and main is clean.
+**Phase 2 is fully complete.** No open beads, no open PRs, no in-flight workers.
 
-Phase 3 planning is the logical next step. Key remaining work identified in beads — run `bd ready` to see unblocked issues.
+**Operator decision needed**: What is Phase 3? Options:
+- File Phase 3 beads (scheduler, controller-manager, kubelet shim, conformance testing)
+- Run sonobuoy/kube-bench against the current API surface to find gaps
+- Stand up a real cluster with external kube-scheduler and exercise kubectl end-to-end
 
-## Phase 2 — completed
+## Forward-looking
 
-All PRs merged to main, all worktrees removed, all branches deleted.
+Nothing is unblocked because there are no open beads. Phase 3 scope needs operator input before any work can start.
 
-| PR | Feature | Beads closed |
-|----|---------|--------------|
-| #4 | Store watch infrastructure | mayor-lzc |
-| #5 | Generic resource handler + discovery | mayor-cgy, mayor-ihi |
-| #6 | Strategic merge patch | mayor-qu2 |
-| #7 | RBAC index | mayor-q3h |
-| #8 | Field selector + SQLite index | mayor-0on |
-| #9 | Pod watch streaming | mayor-hoo |
-| #10 | Namespace CRUD | mayor-tgg |
-| #11 | Generic cluster + status + soft-delete | mayor-8pq, mayor-cbj, mayor-13x |
-| #12 | Auth middleware (tower layer) | mayor-kmo |
-| #13 | Core resources (Nodes/Services/SAs/etc) | mayor-4mi |
-| #14 | SelfSubjectAccessReview + RulesReview | mayor-b12 |
-| #15 | SA TokenRequest API (JWT minting) | mayor-e51 |
+Known Phase 3 candidates (from architectural decisions memory):
+- `crates/scheduler` — scheduler skeleton (DB-04: deferred to Phase 3)
+- Controller manager SA token provisioning (DB-05: deferred to Phase 3)
+- Conformance testing (sonobuoy) once API surface is stable
+
+## Recent progress
+
+Phase 2 complete — 12 PRs merged:
+
+| PR | Feature |
+|----|---------|
+| #4–#7 | Store watch, generic handler, merge patch, RBAC index |
+| #8–#12 | Field selector, pod watch, namespace CRUD, generic cluster, auth middleware |
+| #13–#15 | Core resources, SSRR/SSAR reviews, SA TokenRequest JWT |
+
+All worktrees removed. Main is clean at `f4f5c61`.
 
 ## Active loops
 
