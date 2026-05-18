@@ -6,4 +6,4 @@ Each file should be structured like an AI Skill: front matter describing scope, 
 
 | File | Contents |
 |------|----------|
-| _(none yet)_ | _(add entries as the mayor contributes)_ |
+| [project-stance.md](project-stance.md) | Project posture, constraints, merge policy, and worker preamble to inject in every dispatch |
