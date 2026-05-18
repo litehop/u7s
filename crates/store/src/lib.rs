@@ -1,8 +1,10 @@
 use bytes::Bytes;
 use rusqlite::{Connection, OptionalExtension, params};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 /// A single stored Kubernetes object.
 #[derive(Debug, Clone)]
@@ -60,9 +62,32 @@ pub enum StoreError {
 
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
+
+    #[error("compacted: requested revision {requested} is below compaction horizon {horizon}")]
+    Compacted { requested: u64, horizon: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Internal event broadcast after every write.
+#[derive(Debug)]
+pub struct InternalEvent {
+    pub prefix: String,
+    pub key: String,
+    pub revision: u64,
+    pub value: Option<Bytes>, // None = deleted
+    pub is_create: bool,      // true if key did not exist before this put
+}
+
+/// Public watch event for consumers.
+#[derive(Debug, Clone)]
+pub enum WatchEvent {
+    Added(StoreObject),
+    Modified(StoreObject),
+    Deleted { key: String, revision: u64 },
+    Bookmark { revision: u64 },
+    Compacted { requested: u64, horizon: u64 },
+}
 
 pub trait Store: Send + Sync + 'static {
     /// Get a single object by exact key. Returns None if not found.
@@ -91,7 +116,18 @@ pub trait Store: Send + Sync + 'static {
     /// Delete an object. Same optimistic concurrency semantics as put.
     /// Returns the new global revision on success (the deletion revision).
     fn delete(&self, key: &str, expected_revision: Option<u64>) -> impl std::future::Future<Output = Result<u64>> + Send;
+
+    /// Watch objects under prefix starting from (exclusive) from_revision.
+    /// Yields historical events from the ring buffer then live broadcast events.
+    fn watch(
+        &self,
+        prefix: &str,
+        from_revision: u64,
+    ) -> impl std::future::Future<Output = Result<impl futures_core::Stream<Item = WatchEvent> + Send + 'static>> + Send;
 }
+
+const RING_CAPACITY: usize = 1000;
+const BROADCAST_CAPACITY: usize = 512;
 
 pub struct SqliteStore {
     /// Single write connection. Mutex ensures serial access across spawn_blocking calls.
@@ -101,6 +137,13 @@ pub struct SqliteStore {
     /// For Phase 1 with one vCPU, a single read connection is sufficient.
     /// For :memory: databases, this is the same connection as write_conn.
     read_conn: Arc<Mutex<Connection>>,
+    /// Broadcast channel for live events after writes.
+    tx: broadcast::Sender<Arc<InternalEvent>>,
+    /// Ring buffer of recent events for replay.
+    /// std::sync::RwLock so push_event can write synchronously from async context.
+    ring: Arc<RwLock<VecDeque<Arc<InternalEvent>>>>,
+    /// Lowest revision still in the ring buffer (revision of oldest entry + 1).
+    compaction_horizon: Arc<AtomicU64>,
 }
 
 impl SqliteStore {
@@ -134,10 +177,35 @@ impl SqliteStore {
             Arc::new(Mutex::new(open_conn(db_path)?))
         };
 
+        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let ring = Arc::new(RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)));
+        let compaction_horizon = Arc::new(AtomicU64::new(0));
+
         Ok(Self {
             write_conn,
             read_conn,
+            tx,
+            ring,
+            compaction_horizon,
         })
+    }
+
+    fn push_event(&self, event: Arc<InternalEvent>) {
+        // Write to ring buffer synchronously using std::sync::RwLock.
+        // This avoids a spawned task race between write and watch replay.
+        {
+            let mut guard = self.ring.write().expect("ring poisoned");
+            guard.push_back(Arc::clone(&event));
+            if guard.len() > RING_CAPACITY {
+                guard.pop_front();
+                // Update compaction horizon to the revision of the oldest remaining entry.
+                if let Some(oldest) = guard.front() {
+                    self.compaction_horizon.store(oldest.revision, Ordering::Relaxed);
+                }
+            }
+        }
+        // Best-effort broadcast; lagging receivers are dropped automatically.
+        let _ = self.tx.send(event);
     }
 }
 
@@ -163,12 +231,13 @@ fn stamp_resource_version(value: &Bytes, revision: u64) -> Result<Bytes> {
 }
 
 // Full write procedure — runs inside spawn_blocking.
+// Returns (new_revision, stamped_value, is_create).
 fn put_sync(
     conn: &Connection,
     key: &str,
     value: Bytes,
     expected_revision: Option<u64>,
-) -> Result<(u64, Bytes)> {
+) -> Result<(u64, Bytes, bool)> {
     // 1. Begin exclusive write transaction.
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
@@ -178,6 +247,8 @@ fn put_sync(
         params![key],
         |r| r.get(0),
     ).optional()?;
+
+    let is_create = stored.is_none();
 
     // 3. Optimistic concurrency check.
     match (stored, expected_revision) {
@@ -222,7 +293,7 @@ fn put_sync(
     )?;
 
     conn.execute_batch("COMMIT")?;
-    Ok((new_revision, stamped_value))
+    Ok((new_revision, stamped_value, is_create))
 }
 
 fn delete_sync(
@@ -336,6 +407,15 @@ fn list_sync(conn: &Connection, prefix: &str) -> Result<ListResponse> {
     Ok(ListResponse { items, revision: snapshot_revision })
 }
 
+/// Derive the key prefix from a full key (e.g. "/registry/pods/default/nginx" → "/registry/pods/").
+/// For ring-buffer events we store the prefix directly on the event.
+fn key_prefix(key: &str) -> String {
+    // We store the full key on InternalEvent; the prefix field is the watch prefix.
+    // For broadcasting, we use the key itself and let watch() filter by starts_with.
+    // The prefix field on InternalEvent is populated by the caller.
+    key.to_string()
+}
+
 impl Store for SqliteStore {
     async fn get(&self, key: &str) -> Result<Option<StoreObject>> {
         let conn = self.read_conn.clone();
@@ -357,27 +437,135 @@ impl Store for SqliteStore {
 
     async fn put(&self, key: &str, value: Bytes, expected_revision: Option<u64>) -> Result<u64> {
         let conn = self.write_conn.clone();
-        let key = key.to_string();
-        tokio::task::spawn_blocking(move || {
+        let key_str = key.to_string();
+        let (revision, stamped_value, is_create) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let (revision, _stamped) = put_sync(&conn, &key, value, expected_revision)?;
-            Ok::<_, StoreError>(revision)
-        }).await?
+            put_sync(&conn, &key_str, value, expected_revision)
+        }).await??;
+
+        self.push_event(Arc::new(InternalEvent {
+            prefix: key_prefix(key),
+            key: key.to_string(),
+            revision,
+            value: Some(stamped_value),
+            is_create,
+        }));
+
+        Ok(revision)
     }
 
     async fn delete(&self, key: &str, expected_revision: Option<u64>) -> Result<u64> {
         let conn = self.write_conn.clone();
-        let key = key.to_string();
-        tokio::task::spawn_blocking(move || {
+        let key_str = key.to_string();
+        let revision = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            delete_sync(&conn, &key, expected_revision)
-        }).await?
+            delete_sync(&conn, &key_str, expected_revision)
+        }).await??;
+
+        self.push_event(Arc::new(InternalEvent {
+            prefix: key_prefix(key),
+            key: key.to_string(),
+            revision,
+            value: None,
+            is_create: false,
+        }));
+
+        Ok(revision)
+    }
+
+    async fn watch(
+        &self,
+        prefix: &str,
+        from_revision: u64,
+    ) -> Result<impl futures_core::Stream<Item = WatchEvent> + Send + 'static> {
+        // Subscribe FIRST to avoid missing events between replay and live.
+        let mut rx = self.tx.subscribe();
+
+        let horizon = self.compaction_horizon.load(Ordering::Relaxed);
+
+        // Collect ring buffer snapshot while holding read lock (std::sync::RwLock — synchronous).
+        let replayed: Vec<Arc<InternalEvent>> = {
+            let guard = self.ring.read().expect("ring poisoned");
+            guard
+                .iter()
+                .filter(|e| e.key.starts_with(prefix) && e.revision > from_revision)
+                .cloned()
+                .collect()
+        };
+
+        let prefix_owned = prefix.to_string();
+
+        let stream = async_stream::stream! {
+            // Yield compacted event if from_revision is before the horizon.
+            if from_revision > 0 && from_revision < horizon {
+                yield WatchEvent::Compacted { requested: from_revision, horizon };
+                return;
+            }
+
+            // Replay historical events from ring buffer.
+            let mut last_replayed = from_revision;
+            for event in &replayed {
+                last_replayed = last_replayed.max(event.revision);
+                yield internal_to_watch(event);
+            }
+
+            // Forward live broadcast events, skipping already-replayed revisions.
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if !event.key.starts_with(&prefix_owned) {
+                            continue;
+                        }
+                        // Deduplicate: skip if already covered by replay.
+                        if event.revision <= last_replayed {
+                            continue;
+                        }
+                        yield internal_to_watch(&event);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // We lost n messages; yield compacted to signal the gap.
+                        let current_horizon = n; // approximate
+                        yield WatchEvent::Compacted { requested: from_revision, horizon: current_horizon };
+                        return;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Sender dropped; stop stream.
+                        return;
+                    }
+                }
+            }
+        };
+
+        Ok(stream)
+    }
+}
+
+fn internal_to_watch(event: &InternalEvent) -> WatchEvent {
+    match &event.value {
+        Some(value) => {
+            let obj = StoreObject {
+                key: event.key.clone(),
+                value: value.clone(),
+                revision: event.revision,
+            };
+            if event.is_create {
+                WatchEvent::Added(obj)
+            } else {
+                WatchEvent::Modified(obj)
+            }
+        }
+        None => WatchEvent::Deleted {
+            key: event.key.clone(),
+            revision: event.revision,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_core::Stream;
+    use std::pin::Pin;
 
     fn make_store() -> SqliteStore {
         SqliteStore::new(":memory:").expect("open in-memory db")
@@ -511,5 +699,112 @@ mod tests {
         // Unconditional overwrite
         let rv2 = store.put(key, value, None).await.expect("unconditional overwrite");
         assert!(rv2 > rv1);
+    }
+
+    // Helper: pull next event from a pinned stream with a timeout.
+    async fn next_event(
+        stream: &mut Pin<Box<dyn Stream<Item = WatchEvent> + Send>>,
+    ) -> Option<WatchEvent> {
+        use std::future::poll_fn;
+        use tokio::time::{Duration, timeout};
+        timeout(
+            Duration::from_secs(2),
+            poll_fn(|cx| {
+                use std::task::Poll;
+                stream.as_mut().poll_next(cx)
+            }),
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    #[tokio::test]
+    async fn watch_added_event() {
+        // Put an object, subscribe watch from revision 0, verify ADDED event.
+        let store = make_store();
+        let key = "/registry/pods/default/nginx";
+
+        let rv = store.put(key, pod_json("nginx"), Some(0)).await.expect("create");
+
+        // Watch from before the put; ring buffer should have the event.
+        let stream = store.watch("/registry/pods/default/", 0).await.expect("watch");
+        let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
+
+        let event = next_event(&mut stream).await.expect("should get event");
+        assert!(
+            matches!(&event, WatchEvent::Added(obj) if obj.key == key && obj.revision == rv),
+            "expected Added, got {:?}", event
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_deleted_event() {
+        // Put then delete; watch from revision 0 should yield Added then Deleted.
+        let store = make_store();
+        let key = "/registry/pods/default/nginx";
+
+        let _rv1 = store.put(key, pod_json("nginx"), Some(0)).await.expect("create");
+        let rv2 = store.delete(key, None).await.expect("delete");
+
+        let stream = store.watch("/registry/pods/default/", 0).await.expect("watch");
+        let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
+
+        // First event is Added from the put.
+        let ev1 = next_event(&mut stream).await.expect("added event");
+        assert!(matches!(ev1, WatchEvent::Added(_)), "expected Added, got {:?}", ev1);
+
+        // Second event is Deleted from the delete.
+        let ev2 = next_event(&mut stream).await.expect("deleted event");
+        assert!(
+            matches!(&ev2, WatchEvent::Deleted { key: k, revision: r } if k == key && *r == rv2),
+            "expected Deleted, got {:?}", ev2
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_compacted() {
+        // Watch with a very old (non-zero) revision should yield a Compacted event
+        // when from_revision < compaction_horizon.
+        let store = make_store();
+
+        // Manually advance the compaction horizon by simulating a full ring.
+        // We set compaction_horizon directly to simulate compaction having occurred.
+        store.compaction_horizon.store(50, Ordering::Relaxed);
+
+        // Request from revision 10, which is below horizon 50.
+        let stream = store.watch("/registry/pods/", 10).await.expect("watch");
+        let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
+
+        let event = next_event(&mut stream).await.expect("should get compacted event");
+        assert!(
+            matches!(event, WatchEvent::Compacted { requested: 10, horizon: 50 }),
+            "expected Compacted, got {:?}", event
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_is_create_flag() {
+        // First put → is_create=true (Added); second put (same key) → is_create=false (Modified).
+        let store = make_store();
+        let key = "/registry/pods/default/nginx";
+
+        let rv1 = store.put(key, pod_json("nginx"), Some(0)).await.expect("create");
+        let rv2 = store.put(key, pod_json("nginx-v2"), Some(rv1)).await.expect("update");
+
+        let stream = store.watch("/registry/pods/default/", 0).await.expect("watch");
+        let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
+
+        let ev1 = next_event(&mut stream).await.expect("first event");
+        assert!(
+            matches!(&ev1, WatchEvent::Added(obj) if obj.revision == rv1),
+            "expected Added for create, got {:?}", ev1
+        );
+
+        let ev2 = next_event(&mut stream).await.expect("second event");
+        assert!(
+            matches!(&ev2, WatchEvent::Modified(obj) if obj.revision == rv2),
+            "expected Modified for update, got {:?}", ev2
+        );
     }
 }
