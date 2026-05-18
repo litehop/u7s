@@ -1,31 +1,34 @@
 # Dashboard
 
-2026-05-18 23:10 UTC+2
+2026-05-19 00:20 UTC+2
 Resume: open Claude Code at /Users/balint.erdos/u7s (mayor session e87d5896)
-Open beads: 0 open, 0 in-progress (8 total closed)
+Open beads: 3 open (mayor-vvs, mayor-h6n, mayor-s6z — all in-flight with worker)
 
 ## What needs the operator now
 
-**No blocking decisions.** Phase 1 is merged. Mayor will now file Phase 2 beads.
+**Nothing urgent.** Worker running on `worker/apiserver-cleanup`. Await PR then review.
 
-Note: you mentioned code organisational issues in PR #1 — file those as beads or describe them and I'll create cleanup tasks for Phase 2 workers to address.
+Note: PRs touching API types/handlers are flagged for operator review per merge policy.
 
 ## In-flight
 
-Nothing. Phase 1 merged (PR #1, squash). Worktree cleaned up.
+- **worker/apiserver-cleanup** — cluster of 3 P2 beads, all `crates/apiserver/`:
+  - `mayor-vvs`: typed API models + Into/From (replaces raw json!() in discovery.rs)
+  - `mayor-h6n`: Namespace newtype with validation (replaces raw String in pods.rs)
+  - `mayor-s6z`: kubeconfig path default + typed serialisation
 
 ## Forward-looking
 
-1. File Phase 2 beads: watch protocol, ring buffer, node/pod controllers, scheduler
-2. Dispatch Phase 2 workers in parallel (disjoint surfaces)
-3. Set up CI (cargo test on push) — no checks currently configured
-4. Code organisational cleanup from PR #1 review (awaiting your description)
+1. Worker returns → mayor reviews PR (API surface change, needs operator eye)
+2. After merge: file Phase 2 beads (watch, ring buffer, controllers, scheduler)
+3. Consider CI badge in README once GH Actions first run completes
 
 ## Recent progress
 
-- **PR #1 merged** — feat(phase-1): u7s-store + u7s-apiserver (squash, --admin, no CI)
-- 8 beads closed total (specs, ADRs, Phase 1)
-- Memory profiling findings in ai/findings/ (key: use Instruments + RSS polling; SQLite malloc invisible to Rust profilers)
+- **PR #1 merged** — Phase 1: u7s-store + u7s-apiserver
+- **PR #2 merged** — GH Actions CI, git pre-push hook, Claude Code push gate
+- 11 beads closed total
+- Memory profiling findings in ai/findings/rust-memory-profiling.md
 
 ## Active loops
 
