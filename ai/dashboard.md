@@ -1,36 +1,41 @@
 # Dashboard
 
-2026-05-19 01:30 UTC+2
+2026-05-19 UTC+2
 Resume: open Claude Code at /Users/balint.erdos/u7s (mayor session e87d5896)
-Open beads: 15 open, 4 in-flight with workers
+Open beads: 10 open, 5 in-flight with workers
 
 ## What needs the operator now
 
-Nothing urgent. 4 workers running. Mayor will review PRs as they land.
-PRs touching API surface will be flagged for your review before merge.
+**Question**: The `rbac-middleware` worker changed `build_router(Arc<SqliteStore>)` → `build_router(AppState)` to expose `rbac_index` to the tower layer. This is a reasonable refactor but touches the main function signature. Flagging per API-surface policy — no action needed, just awareness.
 
-## In-flight workers (4 parallel, disjoint surfaces)
+PRs #8–#12 are in CI. Mayor will merge in safe order (#8 field-selector → #9 watch → #10 namespaces → #11 generic-cluster → #12 rbac-middleware) rebasing as needed for conflicts.
 
-| Worker | Bead(s) | Surface |
-|--------|---------|---------|
-| `worker/p2-store-watch` | mayor-lzc | `crates/store/src/lib.rs` — broadcast, ring buffer, WatchEvent stream |
-| `worker/p2-generic-handler` | mayor-cgy, mayor-ihi | `main.rs`, `keys.rs`, `types.rs`, new `handlers/generic.rs` — generic CRUD + non-core discovery |
-| `worker/p2-smp` | mayor-qu2 | `handlers/pods.rs`, new `patch.rs` — strategic merge patch |
-| `worker/p2-rbac-index` | mayor-q3h | new `rbac.rs` — RBAC index, wildcard matching, system:masters bypass |
+## In-flight workers (5 parallel, PRs open)
+
+| PR | Branch | Beads | Surface |
+|----|--------|-------|---------|
+| #8 | `worker/p2-field-selector` | mayor-0on | `crates/store/src/lib.rs` — field selector index |
+| #9 | `worker/p2-watch` | mayor-hoo | `handlers/pods.rs` — chunked watch streaming |
+| #10 | `worker/p2-namespaces` | mayor-tgg | `handlers/namespaces.rs` (new), `main.rs` (ns routes), `pods.rs` |
+| #11 | `worker/p2-generic-cluster` | mayor-8pq, mayor-cbj, mayor-13x | `handlers/generic.rs`, `pods.rs`, `main.rs` (status/binding routes) |
+| #12 | `worker/p2-rbac-middleware` | mayor-kmo | `auth.rs` (new), `main.rs` (tower layer), `state.rs` |
 
 ## Forward-looking
 
-After these 4 land (in merge order to avoid main.rs conflicts):
-1. Merge store watch (no conflicts) → unblocks P2-02 watch HTTP handler, P2-12 field selector
-2. Merge generic handler → unblocks P2-09 namespaces, P2-10 core resources, P2-11 status subresource, P2-13 binding, P2-15 soft-delete
-3. Merge RBAC index → dispatch P2-06 RBAC middleware (touches main.rs — after generic handler lands)
-4. Merge SMP (no ordering constraint with others)
+Merge order (safe): #8 → #9 → #10 → #11 → #12 (rebase each on updated main)
+
+After these 5 land:
+- Unblocked: mayor-4mi (P2-10 core resources: Nodes/Services/etc) — blocked on namespaces (#10)
+- Unblocked: mayor-b12 (P2-14 SelfSubjectAccessReview) — blocked on rbac-middleware (#12)
+- Unblocked: mayor-e51 (P2-07 SA JWT minting) — blocked on rbac-middleware (#12)
 
 ## Recent progress
 
-- **PR #1–#3 merged** — Phase 1, CI/hooks, apiserver cleanup
-- 14 beads closed before Phase 2; 15 new Phase 2 beads filed
-- All 5 architectural decisions recorded (DB-01 through DB-05)
+- **PR #4 merged** — store watch infrastructure (P2-01)
+- **PR #5 merged** — generic resource handler + non-core discovery (P2-03, P2-08)
+- **PR #6 merged** — strategic merge patch (P2-04)
+- **PR #7 merged** — RBAC index (P2-05)
+- Phase 2 beads mayor-lzc, mayor-cgy, mayor-ihi, mayor-qu2, mayor-q3h all closed
 
 ## Active loops
 
