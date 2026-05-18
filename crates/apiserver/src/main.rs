@@ -104,6 +104,12 @@ fn build_router(store: Arc<SqliteStore>) -> Router {
                 .patch(handlers::pods::patch_pod),
         )
 
+        // Pods — binding subresource (scheduler write path)
+        .route(
+            "/api/v1/namespaces/:ns/pods/:name/binding",
+            axum::routing::post(handlers::pods::bind_pod),
+        )
+
         // Generic cluster-scoped resources — collection
         .route(
             "/apis/:group/:version/:resource",
@@ -134,6 +140,22 @@ fn build_router(store: Arc<SqliteStore>) -> Router {
                 .put(handlers::generic::replace_namespaced_resource)
                 .delete(handlers::generic::delete_namespaced_resource)
                 .patch(handlers::generic::patch_namespaced_resource),
+        )
+
+        // Generic cluster-scoped — status subresource
+        .route(
+            "/apis/:group/:version/:resource/:name/status",
+            get(handlers::generic::get_resource_status)
+                .put(handlers::generic::put_resource_status)
+                .patch(handlers::generic::patch_resource_status),
+        )
+
+        // Generic namespaced — status subresource
+        .route(
+            "/apis/:group/:version/namespaces/:ns/:resource/:name/status",
+            get(handlers::generic::get_namespaced_resource_status)
+                .put(handlers::generic::put_namespaced_resource_status)
+                .patch(handlers::generic::patch_namespaced_resource_status),
         )
 
         .with_state(state)

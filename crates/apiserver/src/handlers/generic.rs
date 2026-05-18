@@ -124,7 +124,7 @@ fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
 
     if has_finalizers {
         // Soft delete: stamp deletionTimestamp.
-        let now = chrono_or_fake_ts();
+        let now = utc_now_rfc3339();
         obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(now);
         Some(obj.body.clone())
     } else {
@@ -132,11 +132,53 @@ fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
     }
 }
 
-/// Returns an RFC3339 timestamp. We don't have chrono, so we use a fixed string
-/// that signals "now" in tests. In production this is an approximation.
-fn chrono_or_fake_ts() -> String {
-    // Without chrono, use a recognisable sentinel. This is Phase 1 / pre-alpha.
-    "1970-01-01T00:00:00Z".to_string()
+/// Returns the current UTC time formatted as RFC3339 (`YYYY-MM-DDThh:mm:ssZ`).
+/// Uses only `std::time` — no chrono dependency.
+fn utc_now_rfc3339() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400; // days since 1970-01-01
+
+    // Gregorian calendar computation — correct for dates within reasonable range.
+    let (year, month, day) = days_to_ymd(days);
+
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    // 400-year cycle = 146097 days
+    let n400 = days / 146097;
+    days %= 146097;
+    let n100 = (days / 36524).min(3);
+    days -= n100 * 36524;
+    let n4 = days / 1461;
+    days %= 1461;
+    let n1 = (days / 365).min(3);
+    days -= n1 * 365;
+
+    let year = n400 * 400 + n100 * 100 + n4 * 4 + n1 + 1970;
+    let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+    let month_days: &[u64] = if leap {
+        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 0u64;
+    for (i, &md) in month_days.iter().enumerate() {
+        if days < md {
+            month = i as u64 + 1;
+            break;
+        }
+        days -= md;
+    }
+    (year, month, days + 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +277,14 @@ pub async fn replace_resource(
         )));
     }
 
+    // Strip status from the incoming body on the main endpoint when the resource
+    // has a dedicated status subresource (clients must use /status for that).
+    if meta.has_status_subresource {
+        if let Some(map) = obj.body.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
     let key = group_object_key(&group, &plural, None, &name);
@@ -314,10 +364,33 @@ pub async fn patch_resource(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value =
+    let mut patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
+    // Strip status from the patch on the main endpoint for resources with a status subresource.
+    if meta.has_status_subresource {
+        if let Some(map) = patch.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
     merge_patch(&mut current.body, &patch);
+
+    // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+    let deletion_ts_set = current.body["metadata"]["deletionTimestamp"].is_string();
+    let finalizers_empty = current.body["metadata"]["finalizers"]
+        .as_array()
+        .map(|arr| arr.is_empty())
+        .unwrap_or(true);
+
+    if deletion_ts_set && finalizers_empty {
+        state
+            .store
+            .delete(&key, None)
+            .await
+            .map_err(|e| store_err(e, &name, &meta.kind))?;
+        return Ok(Json(current.body));
+    }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -428,6 +501,14 @@ pub async fn replace_namespaced_resource(
         )));
     }
 
+    // Strip status from the incoming body on the main endpoint when the resource
+    // has a dedicated status subresource.
+    if meta.has_status_subresource {
+        if let Some(map) = obj.body.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
@@ -505,10 +586,231 @@ pub async fn patch_namespaced_resource(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    let mut patch: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    // Strip status from the patch on the main endpoint for resources with a status subresource.
+    if meta.has_status_subresource {
+        if let Some(map) = patch.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
+    merge_patch(&mut current.body, &patch);
+
+    // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+    let deletion_ts_set = current.body["metadata"]["deletionTimestamp"].is_string();
+    let finalizers_empty = current.body["metadata"]["finalizers"]
+        .as_array()
+        .map(|arr| arr.is_empty())
+        .unwrap_or(true);
+
+    if deletion_ts_set && finalizers_empty {
+        state
+            .store
+            .delete(&key, None)
+            .await
+            .map_err(|e| store_err(e, &name, &meta.kind))?;
+        return Ok(Json(current.body));
+    }
+
+    let expected_rv = parse_resource_version(current.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err(e, &name, &meta.kind))?;
+
+    current.set_resource_version(new_rv);
+    Ok(Json(current.body))
+}
+
+// ---------------------------------------------------------------------------
+// Status subresource handlers
+// ---------------------------------------------------------------------------
+//
+// GET    /apis/:group/:version/:resource/:name/status
+// PUT    /apis/:group/:version/:resource/:name/status
+// PATCH  /apis/:group/:version/:resource/:name/status
+//
+// GET    /apis/:group/:version/namespaces/:ns/:resource/:name/status
+// PUT    /apis/:group/:version/namespaces/:ns/:resource/:name/status
+// PATCH  /apis/:group/:version/namespaces/:ns/:resource/:name/status
+//
+// TODO: register in main.rs — see PR for worker/p2-generic-cluster
+
+// -- cluster-scoped --
+
+pub async fn get_resource_status(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    // Same as get_resource; status is embedded in the object.
+    get_resource(State(state), Path((group, version, plural, name))).await
+}
+
+pub async fn put_resource_status(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let meta = lookup(&state, &group, &version, &plural)?.clone();
+
+    let incoming = Object::from_bytes(&body)
+        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let key = group_object_key(&group, &plural, None, &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    // Replace only the status field; leave spec and metadata (except resourceVersion) untouched.
+    match &incoming.body["status"] {
+        serde_json::Value::Null => { current.body.as_object_mut().map(|m| m.remove("status")); }
+        v => { current.body["status"] = v.clone(); }
+    }
+
+    let expected_rv = parse_resource_version(current.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err(e, &name, &meta.kind))?;
+
+    current.set_resource_version(new_rv);
+    Ok(Json(current.body))
+}
+
+pub async fn patch_resource_status(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    validate_patch_content_type(&headers)?;
+
+    let key = group_object_key(&group, &plural, None, &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
     let patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    merge_patch(&mut current.body, &patch);
+    // Only merge the status portion of the patch.
+    if let Some(status_patch) = patch.get("status") {
+        let entry = current
+            .body
+            .as_object_mut()
+            .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
+        if let Some(entry) = entry {
+            merge_patch(entry, status_patch);
+        }
+    }
+
+    let expected_rv = parse_resource_version(current.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err(e, &name, &meta.kind))?;
+
+    current.set_resource_version(new_rv);
+    Ok(Json(current.body))
+}
+
+// -- namespaced --
+
+pub async fn get_namespaced_resource_status(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    // Same as get_namespaced_resource; status is embedded in the object.
+    get_namespaced_resource(State(state), Path((group, version, ns, plural, name))).await
+}
+
+pub async fn put_namespaced_resource_status(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let meta = lookup(&state, &group, &version, &plural)?.clone();
+
+    let incoming = Object::from_bytes(&body)
+        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let key = group_object_key(&group, &plural, Some(&ns), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    match &incoming.body["status"] {
+        serde_json::Value::Null => { current.body.as_object_mut().map(|m| m.remove("status")); }
+        v => { current.body["status"] = v.clone(); }
+    }
+
+    let expected_rv = parse_resource_version(current.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err(e, &name, &meta.kind))?;
+
+    current.set_resource_version(new_rv);
+    Ok(Json(current.body))
+}
+
+pub async fn patch_namespaced_resource_status(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    validate_patch_content_type(&headers)?;
+
+    let key = group_object_key(&group, &plural, Some(&ns), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let patch: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    if let Some(status_patch) = patch.get("status") {
+        let entry = current
+            .body
+            .as_object_mut()
+            .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
+        if let Some(entry) = entry {
+            merge_patch(entry, status_patch);
+        }
+    }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
