@@ -85,7 +85,7 @@ This is the mechanism that prevents two controllers from concurrently overwritin
 ```sql
 -- One row per live Kubernetes object.
 -- 'key' is the full /registry/... path.
--- 'value' is the serialized object bytes (JSON or MsgPack).
+-- 'value' is the serialized object bytes (JSON).
 -- 'revision' is the global revision at which this version was written.
 CREATE TABLE IF NOT EXISTS objects (
     key      TEXT    NOT NULL PRIMARY KEY,
@@ -93,22 +93,8 @@ CREATE TABLE IF NOT EXISTS objects (
     revision INTEGER NOT NULL
 ) WITHOUT ROWID;
 
--- Append-only event log. Each write (put or delete) appends one row.
--- 'revision' is the primary key — it IS the global monotonic counter.
--- 'key' identifies which object changed.
--- 'value' is NULL for deletes (tombstone).
--- 'is_delete' avoids ambiguity when value could legitimately be empty.
-CREATE TABLE IF NOT EXISTS events (
-    revision INTEGER NOT NULL PRIMARY KEY,   -- autoincrement gives global order
-    key      TEXT    NOT NULL,
-    value    BLOB,                           -- NULL on delete
-    is_delete INTEGER NOT NULL DEFAULT 0    -- 1 = delete tombstone
-);
-
--- Single-row table holding the current revision.
--- Updated atomically in the same transaction as every write.
--- Redundant with MAX(revision) FROM events, but avoids a full-table scan
--- on startup and on every read that needs the current revision.
+-- Single-row table holding the current global revision counter.
+-- Incremented atomically in the same transaction as every write.
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT NOT NULL PRIMARY KEY,
     value TEXT NOT NULL
@@ -125,9 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_pods_nodename
 
 **Why `WITHOUT ROWID` on objects:** The `key` column is a text primary key. `WITHOUT ROWID` stores rows in a B-tree keyed directly by `key`, making prefix scans (`LIKE '/registry/pods/%'`) and exact lookups O(log n) without a secondary index. The downside is that updates require a full row replacement, which is acceptable — objects are small (typically 1–10 KB).
 
-**Why a separate `events` table:** The event log is append-only. SQLite's autoincrement rowid on `events` provides the global monotonic counter without a separate sequence object. The current revision is always `MAX(revision)` from `events`, which SQLite can serve from the index root in O(1). The `meta` table caches this to avoid even that cost on the write path's read of the current revision.
-
-**Subtle point:** `events` is the source of truth for revision ordering. `objects.revision` is a denormalized cache of "the revision at which this object was last written." Do not read `objects.revision` to determine ordering — use `events.revision`.
+**Why no `events` table:** All writes to the store go through a single in-process code path. Watch fan-out happens via an in-memory broadcast channel fired synchronously after each committed write (see §8). Watch resumption is served from an in-memory ring buffer (bounded `VecDeque`), not from the DB. This eliminates a second write per mutation, removes the serde round-trip on the watch path, and allows the write handler to pass already-deserialized event context directly to watchers — including diff information for partial updates. The only persistent state that matters for watch semantics is `objects.revision` (the high-water mark), which is already in the `objects` table.
 
 ### 3.2 WAL Mode Configuration
 
@@ -153,7 +137,7 @@ PRAGMA wal_autocheckpoint = 1000; -- Checkpoint after 1000 WAL pages (~4 MB defa
 
 ### 3.3 Resource Version Implementation
 
-The global revision counter is the `events.revision` column, which is an `INTEGER PRIMARY KEY` (SQLite autoincrement alias). SQLite guarantees that each `INSERT INTO events` gets a revision strictly greater than all previous rows, even across restarts (SQLite persists the max rowid).
+The global revision counter lives in the `meta` table (`key='revision'`, value is a stringified `u64`). Every write increments it atomically in the same transaction and stamps the object row with the new value.
 
 Write procedure (single transaction):
 
@@ -165,50 +149,40 @@ SELECT revision FROM objects WHERE key = ?1;
 
 -- 2. If expected_revision check fails: ROLLBACK; return RevisionMismatch.
 
--- 3. Write the object.
-INSERT INTO objects (key, value, revision) VALUES (?1, ?2, 0)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value, revision = excluded.revision;
--- revision is set after the events insert; see step 5.
+-- 3. Increment the global revision counter.
+UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision';
 
--- 4. Append to the event log. The autoincrement gives us the new revision.
-INSERT INTO events (key, value, is_delete) VALUES (?1, ?2, 0);
-
--- 5. Update the object's revision to match the event's revision.
-UPDATE objects SET revision = last_insert_rowid() WHERE key = ?1;
-
--- 6. Update meta table.
-UPDATE meta SET value = CAST(last_insert_rowid() AS TEXT) WHERE key = 'revision';
+-- 4. Write the object, stamped with the new revision.
+INSERT INTO objects (key, value, revision)
+    VALUES (?1, ?2, CAST((SELECT value FROM meta WHERE key = 'revision') AS INTEGER))
+ON CONFLICT(key) DO UPDATE
+    SET value = excluded.value, revision = excluded.revision;
 
 COMMIT;
+-- After COMMIT: read the new revision from the stamped object or the meta row,
+-- then fire the in-memory broadcast (see §8).
 ```
-
-**Subtle point:** Steps 4 and 5 must happen in this order. The `last_insert_rowid()` call is connection-scoped; it returns the rowid from the most recent INSERT on this connection. This is safe within a single transaction.
 
 **BEGIN IMMEDIATE:** Acquires a write lock immediately rather than upgrading from a read lock (which can deadlock in WAL mode). Always use `BEGIN IMMEDIATE` for write transactions.
 
-### 3.4 Watch Resumption Query
+**On restart:** Read `MAX(revision) FROM objects` (or `meta.revision`) to restore the in-memory counter and re-populate the ring buffer via `Store::list` of recent objects. The ring buffer will be empty on cold start; clients that reconnect with a stale `resourceVersion` not in the buffer receive 410 Gone and relist — the defined Kubernetes recovery path.
 
-Watch resumption is a query against the `events` table:
+### 3.4 Watch Resumption
 
-```sql
-SELECT revision, key, value, is_delete
-FROM events
-WHERE revision > ?1
-ORDER BY revision ASC;
-```
+Watch resumption is served from an **in-memory ring buffer** — a `VecDeque<Arc<InternalEvent>>` bounded at a configurable depth (default: 1000 events). No DB query is needed for replay.
 
-This query is covered by the primary key index on `events.revision` — it is an O(log n + k) B-tree scan where k is the number of events since the requested revision.
+**Why no DB-backed replay:** All writes go through a single in-process code path. The ring buffer is always authoritative and always ahead of or equal to what a DB event log would contain. Eliminating the DB read on the watch path removes a `spawn_blocking` call, a SQL query, and a deserialization step from the latency-sensitive reconnect path.
 
-**Polling vs. notification:** SQLite has no built-in pub/sub. The watch mechanism works as follows:
+**Watch mechanism:**
 
-1. The write path holds a `tokio::sync::broadcast::Sender<InternalEvent>` per store instance.
-2. After committing a write transaction, the writer sends to the broadcast channel (in-memory, no disk I/O).
-3. Watch subscribers hold a `Receiver`. On receiving a broadcast event, they filter by prefix and forward to the HTTP response stream.
-4. For watch resumption (catching up from an old revision), the subscriber first replays from the `events` table (SQL query above), then switches to the broadcast channel.
+1. The write path holds a `tokio::sync::broadcast::Sender<Arc<InternalEvent>>` per store instance.
+2. After `COMMIT`, the writer pushes `Arc<InternalEvent>` onto the ring buffer (under a `RwLock`) and then sends the same `Arc` to the broadcast channel. One allocation, shared across all consumers.
+3. A new `Store::watch(prefix, from_revision)` call: subscribe to the broadcast channel first, then replay the ring buffer from `from_revision`. The subscribe-before-replay ordering prevents the missed-event race.
+4. Live events arrive via the broadcast receiver; filter by prefix; forward to the HTTP response stream.
 
-The replay-then-live-feed transition requires care to avoid missing events or delivering duplicates. See §8 for the full mechanism.
+**410 Gone:** If `from_revision` is below the ring buffer's oldest entry (i.e., the client is too far behind), return `StoreError::Compacted`. The API server converts this to a watch event of type `ERROR` with HTTP status 410. The client relists.
 
-**SQLite update hook alternative:** SQLite provides a C-level update hook (`sqlite3_update_hook`). `rusqlite` exposes this. The hook fires synchronously in the writer thread after each row change. This could be used to notify watch subscribers without polling. However, it fires before `COMMIT`, which means the change is not yet visible to readers. Using the broadcast channel after `COMMIT` is simpler and correct. Skip the update hook.
+**Ring buffer sizing:** 1000 events at ~2 KB each ≈ 2 MB peak. Adjust via config. On a quiescent cluster this is negligible; under Argo CD sync bursts (hundreds of objects) it provides ample headroom before eviction.
 
 ### 3.5 List Consistency
 
@@ -865,24 +839,23 @@ The client (kubectl, Argo CD, controller) receives the 410 and relists. This is 
 ### Phase 2: Watch (Controllers Need Watch)
 
 **Add:**
-- `events` table and `meta` table.
-- Global revision counter: every write increments and stamps the object.
+- `meta` table and global revision counter: every write increments and stamps the object.
+- In-memory ring buffer (`VecDeque<Arc<InternalEvent>>`, capacity 1000).
 - Broadcast channel and `InternalEvent`.
-- `Store::watch` with replay-then-live mechanism.
+- `Store::watch` with subscribe-before-replay mechanism.
 - Optimistic concurrency: `expected_revision` enforcement.
-- `Store::delete` with tombstone event.
-- Event log compaction background task (last 1000 events).
+- `Store::delete` (stores a tombstone value in `objects`, broadcasts `DELETED` event, then removes the row).
 
-**Acceptance:** A watch subscriber receives `ADDED`/`MODIFIED`/`DELETED` events in order. Reconnecting with the last `resourceVersion` replays missed events. A stale `resourceVersion` triggers 410 Gone.
+**Acceptance:** A watch subscriber receives `ADDED`/`MODIFIED`/`DELETED` events in order. Reconnecting with the last `resourceVersion` replays missed events from the ring buffer. A `resourceVersion` below the ring buffer horizon triggers 410 Gone.
 
-**Implementation time estimate:** 3–5 days. The replay/live transition and deduplication are the hard parts.
+**Implementation time estimate:** 2–3 days. The subscribe-before-replay ordering and delete tombstone handling are the subtleties.
 
 ### Phase 3: RBAC, ServiceAccount Tokens
 
 **Add:**
 - Field selector index for `spec.nodeName` on Pods (SQLite: partial index with `json_extract`; LMDB: no built-in, filter in Rust after prefix scan).
 - Pagination: `continue` token cursor in `Store::list` (add `limit` and `start_after_key` parameters).
-- Watch ring buffer: the in-memory buffer described in architecture.md §4.2. Complement the DB-backed event log with an in-memory `VecDeque<Arc<InternalEvent>>` bounded at 1000 events. Serve watch resumption from the ring buffer when possible (faster than DB); fall back to DB when the ring buffer doesn't cover the requested revision.
+- Ring buffer depth tuning: expose `watch_buffer_depth` config option (default 1000). Increase if high-churn workloads cause frequent 410 Gone → relist cycles.
 
 **What does NOT need to change in the store:** RBAC objects are stored exactly like any other object. The RBAC index (api-server.md §7) is an in-memory structure built from watch events — the store just delivers those events.
 

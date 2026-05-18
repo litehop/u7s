@@ -7,16 +7,17 @@
 
 ## 1. Decision Summary
 
-**Recommendation: containerd via CRI gRPC.**
+**Recommendation: CRI-O + crun.**
 
-containerd is battle-tested, has the widest image compatibility, and is implemented by the same CRI gRPC protocol that upstream Kubernetes uses. The node agent's integration cost is bounded: generate Rust gRPC stubs from the CRI proto files, implement the `ContainerRuntime` trait, done. Direct OCI is substantially more implementation surface for a saving of ~35 MB RSS per node — a worthwhile trade only if node RSS proves to be the active constraint.
+CRI-O is purpose-built for CRI with no bundled extras (no snapshotter plugin system, no image build support, no containerd-shim model). The decisive practical factor: containerd spawns a `containerd-shim-runc-v2` process per pod sandbox that persists for the pod's lifetime. On a node running 20 pods that is 20 additional processes, each consuming 5–10 MB RSS — 100–200 MB of overhead that accumulates invisibly and is absent from idle benchmarks. CRI-O does not use persistent shims: it execs `crun` directly and the runtime process exits after container start. This makes CRI-O's RSS profile flat with pod count, not linear.
+
+`crun` (written in C, not Go) adds no Go runtime overhead and starts containers faster than `runc`. The combination of CRI-O + crun is the default in OpenShift/OKD and is well-tested in production.
+
+The node agent's integration code is **identical** to the containerd path — same CRI gRPC protocol, same Rust `tonic` stubs, only the socket path differs (`/run/crio/crio.sock`). The `ContainerRuntime` trait defined in §6 makes any future swap a one-line config change.
 
 **What would cause this recommendation to change:**
-- Node RSS budget collapses to the point where 35–50 MB for containerd is genuinely unacceptable (i.e., workload containers plus node agent plus containerd exceed available memory on the target node class).
-- A benchmark shows that containerd's gRPC overhead introduces unacceptable pod-start latency on 1-shared-vCPU nodes.
-- CRI-O's resource numbers are validated lower than containerd's by more than ~10 MB idle; at that point CRI-O is a drop-in (same gRPC protocol, no agent code changes).
-
-The `ContainerRuntime` trait defined in §6 makes the swap cheap regardless.
+- A specific image format or registry authentication edge case proves incompatible with CRI-O (rare, but CRI-O has less ecosystem testing than containerd for exotic registries).
+- The target deployment environment ships containerd by default and installing CRI-O is operationally impractical.
 
 ---
 

@@ -127,8 +127,8 @@ See §7 for detailed design.
 
 The node agent does not call container runtimes directly. It calls an abstract `ContainerRuntime` trait (the CRI boundary). Concrete implementations behind this trait:
 
-- **containerd** (via gRPC, CRI protocol) — the primary target
-- **CRI-O** (via the same gRPC protocol) — should work with the same shim
+- **CRI-O + crun** (via gRPC, CRI protocol) — the primary target. CRI-O does not use persistent shim processes; RSS is flat with pod count, not linear. `crun` (C, not Go) has no Go runtime overhead.
+- **containerd** (via the same gRPC protocol) — should work with the same shim; socket path is the only change
 - **Direct runc/crun** — fallback for minimal environments; no CRI gRPC, calls OCI runtime binary directly
 
 The trait surface: `create_sandbox`, `remove_sandbox`, `create_container`, `start_container`, `stop_container`, `remove_container`, `container_status`, `list_containers`. This mirrors the Kubernetes CRI gRPC service surface but expressed as a Rust async trait.
@@ -419,7 +419,7 @@ Deliverables:
 - API server serving `/api/v1/{pods,namespaces,nodes}` with get/list/watch/create/update/patch/delete
 - Storage trait + SQLite implementation (WAL mode, basic schema)
 - Static bearer token auth, no RBAC (allow all)
-- Node agent: registration, pod watch, CRI containerd integration, CNI exec
+- Node agent: registration, pod watch, CRI-O integration, CNI exec
 - `kubectl get pods/nodes/namespaces` works
 - A Pod with `spec.nodeName` manually set runs a container
 
@@ -493,25 +493,23 @@ Deliverables:
 
 ### 9.2 Container Runtime
 
-**containerd (CRI gRPC):**
-- Standard, widely deployed, well-maintained
-- Requires containerd daemon running on each node
-- ~30–50 MB RSS for containerd itself (not counted against u7s control plane budget, but counted against node budget)
-- CRI gRPC protocol is stable; isolation between node agent and runtime is clean
-- **Better if:** you want a battle-tested runtime with broad image support
+**CRI-O + crun (recommended):**
+- Purpose-built for CRI; no plugin system, no image build, no persistent shim processes
+- RSS is flat with pod count: CRI-O execs `crun` per container start and the process exits — no per-pod `containerd-shim` accumulation
+- `crun` is written in C; no Go runtime overhead, fast container start
+- Same gRPC protocol as containerd; node agent code is identical
 
-**CRI-O:**
-- Lighter than containerd for pure CRI usage; no additional features (no image build, no snapshotter plugins)
-- Same gRPC protocol as containerd; the CRI shim code is identical
-- **Better if:** you want a thinner runtime daemon
+**containerd (CRI gRPC):**
+- Battle-tested, widest ecosystem support
+- Spawns a persistent `containerd-shim-runc-v2` per pod sandbox — RSS grows linearly with pod count (~5–10 MB per pod)
+- Use if CRI-O proves incompatible with a specific registry or image format
 
 **Direct runc/crun via OCI spec:**
-- No daemon on the node; the node agent manages container lifecycle directly
-- Significantly reduces node RSS (no containerd/CRI-O daemon)
-- Much more code to implement in the node agent (image pull, layer unpacking, bundle prep)
-- **Better if:** node RSS budget is critical and team is willing to own the OCI layer
+- No daemon; node agent owns the full OCI lifecycle (image pull, layer unpack, bundle prep)
+- Saves ~20–30 MB daemon RSS but adds ~3,000 lines of implementation
+- Only warranted if node RSS budget is critically tight
 
-**Resolution trigger:** Start with containerd (CRI gRPC) for implementation velocity. Revisit direct-runc if node RSS budget proves tight. The CRI trait boundary makes it straightforward to swap.
+**Resolution:** CRI-O + crun. See `container-runtime.md` for the full integration spec.
 
 ### 9.3 Scheduler Design
 
