@@ -61,12 +61,16 @@ async fn main() -> anyhow::Result<()> {
 
 fn build_router(store: Arc<SqliteStore>) -> Router {
 
-    let state = AppState { store };
+    let state = AppState::new(store);
 
     Router::new()
-        // Discovery
-        .route("/api",     get(handlers::discovery::api_versions))
-        .route("/api/v1",  get(handlers::discovery::api_v1_resources))
+        // Core discovery
+        .route("/api",    get(handlers::discovery::api_versions))
+        .route("/api/v1", get(handlers::discovery::api_v1_resources))
+
+        // Non-core group discovery
+        .route("/apis",                    get(handlers::discovery::api_group_list))
+        .route("/apis/:group/:version",    get(handlers::discovery::api_group_resources))
 
         // Pods — collection
         .route(
@@ -81,6 +85,38 @@ fn build_router(store: Arc<SqliteStore>) -> Router {
                 .put(handlers::pods::replace_pod)
                 .delete(handlers::pods::delete_pod)
                 .patch(handlers::pods::patch_pod),
+        )
+
+        // Generic cluster-scoped resources — collection
+        .route(
+            "/apis/:group/:version/:resource",
+            get(handlers::generic::list_resource)
+                .post(handlers::generic::create_resource),
+        )
+
+        // Generic cluster-scoped resources — named
+        .route(
+            "/apis/:group/:version/:resource/:name",
+            get(handlers::generic::get_resource)
+                .put(handlers::generic::replace_resource)
+                .delete(handlers::generic::delete_resource)
+                .patch(handlers::generic::patch_resource),
+        )
+
+        // Generic namespaced resources — collection
+        .route(
+            "/apis/:group/:version/namespaces/:ns/:resource",
+            get(handlers::generic::list_namespaced_resource)
+                .post(handlers::generic::create_namespaced_resource),
+        )
+
+        // Generic namespaced resources — named
+        .route(
+            "/apis/:group/:version/namespaces/:ns/:resource/:name",
+            get(handlers::generic::get_namespaced_resource)
+                .put(handlers::generic::replace_namespaced_resource)
+                .delete(handlers::generic::delete_namespaced_resource)
+                .patch(handlers::generic::patch_namespaced_resource),
         )
 
         .with_state(state)
