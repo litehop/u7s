@@ -676,7 +676,7 @@ pub async fn bind_pod(
     Path((raw_ns, name)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ns = parse_namespace(&raw_ns)?;
+    let ns = parse_namespace(&raw_ns, &state).await?;
 
     let binding: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
