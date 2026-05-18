@@ -351,6 +351,43 @@ pub async fn delete_pod(
     let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
+
+    // Fetch current object to check finalizers.
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let has_finalizers = obj.body["metadata"]["finalizers"]
+        .as_array()
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+
+    if has_finalizers {
+        // Soft delete: stamp deletionTimestamp and write back.
+        obj.body["metadata"]["deletionTimestamp"] =
+            serde_json::Value::String(utc_now_rfc3339());
+        let expected_rv = match obj.resource_version() {
+            None | Some("") => None,
+            Some("0") => Some(0),
+            Some(rv) => Some(rv.parse::<u64>().map_err(|_| {
+                Status::bad_request(format!("invalid resourceVersion: {rv}"))
+            })?),
+        };
+        let new_rv = state
+            .store
+            .put(&key, obj.to_bytes(), expected_rv)
+            .await
+            .map_err(|e| store_err_to_status(e, &name))?;
+        obj.set_resource_version(new_rv);
+        return Ok(Json(obj.body));
+    }
+
     state
         .store
         .delete(&key, None)
@@ -409,6 +446,22 @@ pub async fn patch_pod(
         json_merge_patch(&mut current_obj.body, &patch);
     }
 
+    // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+    let deletion_ts_set = current_obj.body["metadata"]["deletionTimestamp"].is_string();
+    let finalizers_empty = current_obj.body["metadata"]["finalizers"]
+        .as_array()
+        .map(|arr| arr.is_empty())
+        .unwrap_or(true);
+
+    if deletion_ts_set && finalizers_empty {
+        state
+            .store
+            .delete(&key, None)
+            .await
+            .map_err(|e| store_err_to_status(e, &name))?;
+        return Ok(Json(current_obj.body));
+    }
+
     // Extract expected revision from current object (after patch may have changed it)
     let expected_revision = match current_obj.resource_version() {
         None | Some("") => None,
@@ -430,6 +483,44 @@ pub async fn patch_pod(
     current_obj.set_resource_version(new_rv);
 
     Ok(Json(current_obj.body))
+}
+
+/// Returns the current UTC time as an RFC3339 string (`YYYY-MM-DDThh:mm:ssZ`).
+/// Uses only `std::time` — no chrono dependency.
+fn utc_now_rfc3339() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+
+    let (year, month, day) = {
+        let mut d = days;
+        let n400 = d / 146097; d %= 146097;
+        let n100 = (d / 36524).min(3); d -= n100 * 36524;
+        let n4 = d / 1461; d %= 1461;
+        let n1 = (d / 365).min(3); d -= n1 * 365;
+        let year = n400 * 400 + n100 * 100 + n4 * 4 + n1 + 1970;
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let month_days: &[u64] = if leap {
+            &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        } else {
+            &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        };
+        let mut month = 0u64;
+        for (i, &md) in month_days.iter().enumerate() {
+            if d < md { month = i as u64 + 1; break; }
+            d -= md;
+        }
+        (year, month, d + 1)
+    };
+
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -574,4 +665,56 @@ mod watch_tests {
         assert_eq!(q.watch, None);
         assert_eq!(q.resource_version, None);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Binding subresource — POST /api/v1/namespaces/:ns/pods/:name/binding
+// ---------------------------------------------------------------------------
+
+pub async fn bind_pod(
+    State(state): State<AppState>,
+    Path((raw_ns, name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns)?;
+
+    let binding: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let node_name = binding["target"]["name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Status::bad_request("target.name is required".into()))?
+        .to_string();
+
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    obj.body["spec"]["nodeName"] = serde_json::Value::String(node_name);
+
+    let expected_rv = match obj.resource_version() {
+        None | Some("") => None,
+        Some("0") => Some(0),
+        Some(rv) => Some(rv.parse::<u64>().map_err(|_| {
+            Status::bad_request(format!("invalid resourceVersion: {rv}"))
+        })?),
+    };
+
+    let new_rv = state
+        .store
+        .put(&key, obj.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, &name))?;
+
+    obj.set_resource_version(new_rv);
+
+    Ok((StatusCode::CREATED, Json(obj.body)))
 }
