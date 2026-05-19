@@ -4,9 +4,16 @@
 set -euo pipefail
 
 INPUT=$(cat)
-BASE_PATH=$(printf '%s' "$INPUT" | jq -r '.base_path')
-WORKTREE_NAME=$(printf '%s' "$INPUT" | jq -r '.worktree_name')
-BRANCH_NAME=$(printf '%s' "$INPUT" | jq -r '.branch_name')
+
+# Harness provides: cwd (repo root), name (agent ID used as worktree name)
+BASE_PATH=$(printf '%s' "$INPUT" | jq -r '.cwd')
+WORKTREE_NAME=$(printf '%s' "$INPUT" | jq -r '.name')
+BRANCH_NAME="worker/$WORKTREE_NAME"
+
+if [ -z "$BASE_PATH" ] || [ "$BASE_PATH" = "null" ] || [ -z "$WORKTREE_NAME" ] || [ "$WORKTREE_NAME" = "null" ]; then
+  printf 'create-worktree: missing cwd or name. INPUT=%s\n' "$INPUT" >&2
+  exit 1
+fi
 
 WORKTREE_DIR="$BASE_PATH/ai/worktrees/$WORKTREE_NAME"
 
