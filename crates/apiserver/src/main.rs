@@ -183,6 +183,14 @@ fn build_router(state: AppState) -> Router {
             axum::routing::post(handlers::pods::bind_pod),
         )
 
+        // Pods — status subresource
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/status",
+            get(handlers::pods::get_pod_status)
+                .put(handlers::pods::replace_pod_status)
+                .patch(handlers::pods::patch_pod_status),
+        )
+
         // Core group (group="", apiVersion=v1) — cluster-scoped resources (e.g. nodes)
         .route(
             "/api/v1/{resource}",
