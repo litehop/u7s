@@ -34,7 +34,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release -p apiserver
+        run: cargo build --release -p u7s-apiserver
 
       - name: Install kubectl
         run: |
@@ -46,7 +46,7 @@ jobs:
         run: |
           TMPDIR=$(mktemp -d)
           echo "SMOKE_TMPDIR=$TMPDIR" >> "$GITHUB_ENV"
-          ./target/release/apiserver \
+          ./target/release/u7s-apiserver \
             --db "$TMPDIR/state.db" \
             --kubeconfig "$TMPDIR/kubeconfig" \
             --sa-key "$TMPDIR/sa.key" \
