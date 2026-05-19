@@ -311,7 +311,7 @@ mod tests {
         use crate::state::AppState;
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(store, None, None, "https://localhost:6443".into());
+        let state = AppState::new(store, None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
 
         let query = crate::handlers::generic::CollectionQuery {
             watch: Some(true),

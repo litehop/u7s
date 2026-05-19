@@ -1184,22 +1184,31 @@ pub async fn put_namespaced_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
     let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let body = extract_body(&body, ct);
     let incoming = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let key = group_object_key(&group, &plural, Some(&ns), &name);
+    let (key, kind_fallback) = match lookup(&state, &group, &version, &plural) {
+        Ok(meta) => (group_object_key(&group, &plural, Some(&ns), &name), meta.kind.clone()),
+        Err(_) => {
+            // CR fallback: CRs are stored under /registry/cr/<group>/<version>/<plural>/<ns>/<name>
+            let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
+            (cr_key, plural.clone())
+        }
+    };
+
     let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &kind_fallback))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let kind = current.body["kind"].as_str().map(str::to_owned).unwrap_or(kind_fallback);
 
     match &incoming.body["status"] {
         serde_json::Value::Null => { current.body.as_object_mut().map(|m| m.remove("status")); }
@@ -1211,7 +1220,7 @@ pub async fn put_namespaced_resource_status(
         .store
         .put(&key, current.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+        .map_err(|e| store_err(e, &name, &kind))?;
 
     current.set_resource_version(new_rv);
     Ok(Json(current.body))
@@ -1223,19 +1232,27 @@ pub async fn patch_namespaced_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
     let patch_type = detect_patch_type(&headers)?;
 
-    let key = group_object_key(&group, &plural, Some(&ns), &name);
+    let key = match lookup(&state, &group, &version, &plural) {
+        Ok(_) => group_object_key(&group, &plural, Some(&ns), &name),
+        Err(_) => {
+            // CR fallback: CRs are stored under /registry/cr/<group>/<version>/<plural>/<ns>/<name>
+            format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}")
+        }
+    };
+
     let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+        .ok_or_else(|| Status::not_found(&name, &plural))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let kind = current.body["kind"].as_str().map(str::to_owned).unwrap_or_else(|| plural.clone());
 
     let patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
@@ -1262,7 +1279,7 @@ pub async fn patch_namespaced_resource_status(
         .store
         .put(&key, current.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+        .map_err(|e| store_err(e, &name, &kind))?;
 
     current.set_resource_version(new_rv);
     Ok(Json(current.body))
@@ -1717,5 +1734,92 @@ mod tests {
     fn non_core_group_api_version_includes_group() {
         let body = build_list_response("Deployment", "apps", "v1", 0, vec![]);
         assert_eq!(body["apiVersion"], "apps/v1");
+    }
+
+    // -- CR status PUT fallback --
+
+    // Verify that put_namespaced_resource_status works for CRD-backed resources whose group
+    // is not in the static resource registry (e.g. argoproj.io/Application).
+    // The handler must use the CR store key (/registry/cr/<group>/<version>/<plural>/<ns>/<name>)
+    // and write the incoming status field onto the stored object.
+    #[tokio::test]
+    async fn cr_status_put_updates_status_field() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(store.clone(), None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
+
+        // Seed a CR object using the CR store key format (matches cr.rs cr_store_key).
+        let group = "argoproj.io";
+        let version = "v1alpha1";
+        let plural = "applications";
+        let ns = "argocd";
+        let name = "my-app";
+        let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
+
+        let initial = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+                "resourceVersion": "0"
+            },
+            "spec": { "project": "default" }
+        });
+        let initial_bytes = bytes::Bytes::from(serde_json::to_vec(&initial).unwrap());
+        store.put(&cr_key, initial_bytes, None).await.expect("seed CR");
+
+        // Issue a status PUT — group is not in static registry so the CR fallback fires.
+        let put_body = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": { "name": name, "namespace": ns },
+            "status": { "health": { "status": "Healthy" }, "sync": { "status": "Synced" } }
+        });
+        let body_bytes = bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                name.to_string(),
+            )),
+            headers,
+            body_bytes,
+        )
+        .await;
+
+        assert!(result.is_ok(), "CR status PUT must succeed for unregistered group");
+
+        // Verify the status was persisted in the store.
+        let stored = store.get(&cr_key).await.expect("store get").expect("object must exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["health"]["status"],
+            "Healthy",
+            "status.health.status must be persisted after CR status PUT"
+        );
+        assert_eq!(
+            v["status"]["sync"]["status"],
+            "Synced",
+            "status.sync.status must be persisted after CR status PUT"
+        );
+        // spec must be preserved — PUT replaces only status, not the whole object
+        assert_eq!(
+            v["spec"]["project"],
+            "default",
+            "spec must be unchanged after status PUT"
+        );
     }
 }
