@@ -2284,4 +2284,223 @@ mod tests {
             "spec must be unchanged after status PUT"
         );
     }
+
+    // -- Lease PUT: kubelet liveness signal --
+    //
+    // The kubelet keeps a node alive by PUTing a Lease object to
+    // /apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/{nodeName}.
+    // Three cases must work correctly:
+    //   1. First PUT (no resourceVersion) → unconditional create → 200
+    //   2. Second PUT (matching resourceVersion) → conditional update → 200
+    //   3. PUT with stale resourceVersion → 409 Conflict
+    //
+    // These tests exercise `replace_namespaced_resource` end-to-end with an
+    // in-memory store so that regression in the OCC path fails immediately.
+
+    fn make_lease_body(resource_version: Option<&str>) -> bytes::Bytes {
+        let mut meta = serde_json::json!({
+            "name": "worker-node-1",
+            "namespace": "kube-node-lease"
+        });
+        if let Some(rv) = resource_version {
+            meta["resourceVersion"] = serde_json::Value::String(rv.to_string());
+        }
+        let body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": meta,
+            "spec": {
+                "acquireTime": "2026-05-20T00:00:00Z",
+                "holderIdentity": "worker-node-1",
+                "leaseDurationSeconds": 40,
+                "renewTime": "2026-05-20T00:00:00Z"
+            }
+        });
+        bytes::Bytes::from(serde_json::to_vec(&body).unwrap())
+    }
+
+    fn json_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        h
+    }
+
+    /// Kubelet first PUT: no resourceVersion → unconditional write → must succeed.
+    ///
+    /// A kubelet bootstrapping a new node issues a PUT with no resourceVersion.
+    /// parse_resource_version maps this to None → store.put(None) → unconditional
+    /// upsert. If this fails, the kubelet cannot register its liveness signal and
+    /// the node will never become Ready.
+    #[tokio::test]
+    async fn lease_put_without_resource_version_creates_lease() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(None),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "first Lease PUT (no resourceVersion) must succeed — kubelet cannot \
+             become Ready if creation fails"
+        );
+    }
+
+    /// Kubelet renewal PUT: use resourceVersion returned from creation → must succeed.
+    ///
+    /// After the first PUT, the kubelet stores the returned resourceVersion and
+    /// sends it on every subsequent renewal. The store OCC check must pass when
+    /// the version matches. If this fails, lease renewal is broken and the node
+    /// will appear NotReady after the lease duration (40 s by default).
+    #[tokio::test]
+    async fn lease_put_with_matching_resource_version_updates_lease() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // First PUT: create the lease (no resourceVersion).
+        let create_response = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(None),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("first Lease PUT must succeed"))
+        .into_response();
+
+        // Extract resourceVersion from the response body.
+        let body_bytes = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let rv = body["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("response must include metadata.resourceVersion")
+            .to_string();
+
+        // Second PUT: renew the lease with the returned resourceVersion.
+        let renew_result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(Some(&rv)),
+        )
+        .await;
+
+        assert!(
+            renew_result.is_ok(),
+            "Lease renewal PUT with matching resourceVersion must succeed — \
+             mismatched OCC would break kubelet liveness"
+        );
+    }
+
+    /// Stale resourceVersion → 409 Conflict.
+    ///
+    /// If two kubelets (or a buggy kubelet) try to renew the same lease
+    /// concurrently, the one with the stale resourceVersion must be rejected
+    /// with 409 Conflict. Without this check the last writer silently wins
+    /// and the true holder's timestamp is lost, causing false NotReady.
+    #[tokio::test]
+    async fn lease_put_with_stale_resource_version_returns_conflict() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Create the lease.
+        let create_result = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(None),
+        )
+        .await;
+        assert!(create_result.is_ok(), "first Lease PUT must succeed");
+
+        // PUT with a stale (known-wrong) resourceVersion — "999" is higher than
+        // any real revision from a fresh in-memory store.
+        let stale_result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(Some("999")),
+        )
+        .await;
+
+        match stale_result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::CONFLICT,
+                "stale Lease PUT must return 409 Conflict — without OCC check, \
+                 concurrent writers silently corrupt the lease"
+            ),
+            Ok(_) => panic!(
+                "stale Lease PUT must be rejected with 409 Conflict, not succeed"
+            ),
+        }
+    }
 }
