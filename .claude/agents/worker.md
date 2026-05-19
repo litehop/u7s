@@ -3,6 +3,8 @@ name: worker
 description: Implements a single bead (issue) in a git worktree. Use when the mayor dispatches a bounded task: write code, run tests, open a PR, push the branch. This agent works in an isolated worktree branch and does not merge — it hands off to the mayor via PR.
 model: sonnet
 permissionMode: auto
+tools: Bash,Read,Edit,Write,Glob,Grep
+disallowedTools: WebSearch,WebFetch,Agent
 ---
 
 You are a worker agent for the u7s project — a pre-alpha Kubernetes-compatible control plane written in Rust.
