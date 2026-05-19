@@ -158,5 +158,19 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     m.insert(rk("rbac.authorization.k8s.io", "v1", "roles"),               rm("Role",               true,  false));
     m.insert(rk("rbac.authorization.k8s.io", "v1", "rolebindings"),        rm("RoleBinding",        true,  false));
 
+    // networking.k8s.io/v1
+    m.insert(rk("networking.k8s.io", "v1", "networkpolicies"), rm("NetworkPolicy", true,  false));
+    m.insert(rk("networking.k8s.io", "v1", "ingresses"),       rm("Ingress",       true,  true));
+
+    // admissionregistration.k8s.io/v1
+    m.insert(rk("admissionregistration.k8s.io", "v1", "validatingwebhookconfigurations"), rm("ValidatingWebhookConfiguration", false, false));
+    m.insert(rk("admissionregistration.k8s.io", "v1", "mutatingwebhookconfigurations"),   rm("MutatingWebhookConfiguration",   false, false));
+
+    // coordination.k8s.io/v1
+    m.insert(rk("coordination.k8s.io", "v1", "leases"), rm("Lease", true, false));
+
+    // policy/v1
+    m.insert(rk("policy", "v1", "poddisruptionbudgets"), rm("PodDisruptionBudget", true, false));
+
     m
 }
