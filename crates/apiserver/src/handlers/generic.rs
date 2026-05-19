@@ -688,10 +688,13 @@ pub async fn patch_resource(
     }
 
     match patch_type {
-        PatchType::MergePatch => merge_patch(&mut current.body, &patch),
-        PatchType::StrategicMergePatch => {
+        PatchType::Merge => merge_patch(&mut current.body, &patch),
+        PatchType::StrategicMerge => {
             crate::patch::strategic_merge_patch(&mut current.body, &patch)
                 .map_err(|e| Status::bad_request(e.to_string()))?;
+        }
+        PatchType::Json => {
+            apply_json_patch(&mut current.body, &patch)?;
         }
     }
 
@@ -1033,10 +1036,13 @@ pub async fn patch_namespaced_resource(
     }
 
     match patch_type {
-        PatchType::MergePatch => merge_patch(&mut current.body, &patch),
-        PatchType::StrategicMergePatch => {
+        PatchType::Merge => merge_patch(&mut current.body, &patch),
+        PatchType::StrategicMerge => {
             crate::patch::strategic_merge_patch(&mut current.body, &patch)
                 .map_err(|e| Status::bad_request(e.to_string()))?;
+        }
+        PatchType::Json => {
+            apply_json_patch(&mut current.body, &patch)?;
         }
     }
 
@@ -1162,18 +1168,27 @@ pub async fn patch_resource_status(
     let patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    // Only patch the status portion.
-    if let Some(status_patch) = patch.get("status") {
-        let entry = current
-            .body
-            .as_object_mut()
-            .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
-        if let Some(entry) = entry {
-            match patch_type {
-                PatchType::MergePatch => merge_patch(entry, status_patch),
-                PatchType::StrategicMergePatch => {
-                    crate::patch::strategic_merge_patch(entry, status_patch)
-                        .map_err(|e| Status::bad_request(e.to_string()))?;
+    match patch_type {
+        PatchType::Json => {
+            // JSON Patch addresses the full document; operations include the /status prefix.
+            apply_json_patch(&mut current.body, &patch)?;
+        }
+        _ => {
+            // Merge and strategic merge: only patch the status portion.
+            if let Some(status_patch) = patch.get("status") {
+                let entry = current
+                    .body
+                    .as_object_mut()
+                    .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
+                if let Some(entry) = entry {
+                    match patch_type {
+                        PatchType::Merge => merge_patch(entry, status_patch),
+                        PatchType::StrategicMerge => {
+                            crate::patch::strategic_merge_patch(entry, status_patch)
+                                .map_err(|e| Status::bad_request(e.to_string()))?;
+                        }
+                        PatchType::Json => unreachable!(),
+                    }
                 }
             }
         }
@@ -1279,18 +1294,27 @@ pub async fn patch_namespaced_resource_status(
     let patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    // Only patch the status portion.
-    if let Some(status_patch) = patch.get("status") {
-        let entry = current
-            .body
-            .as_object_mut()
-            .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
-        if let Some(entry) = entry {
-            match patch_type {
-                PatchType::MergePatch => merge_patch(entry, status_patch),
-                PatchType::StrategicMergePatch => {
-                    crate::patch::strategic_merge_patch(entry, status_patch)
-                        .map_err(|e| Status::bad_request(e.to_string()))?;
+    match patch_type {
+        PatchType::Json => {
+            // JSON Patch addresses the full document; operations include the /status prefix.
+            apply_json_patch(&mut current.body, &patch)?;
+        }
+        _ => {
+            // Merge and strategic merge: only patch the status portion.
+            if let Some(status_patch) = patch.get("status") {
+                let entry = current
+                    .body
+                    .as_object_mut()
+                    .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
+                if let Some(entry) = entry {
+                    match patch_type {
+                        PatchType::Merge => merge_patch(entry, status_patch),
+                        PatchType::StrategicMerge => {
+                            crate::patch::strategic_merge_patch(entry, status_patch)
+                                .map_err(|e| Status::bad_request(e.to_string()))?;
+                        }
+                        PatchType::Json => unreachable!(),
+                    }
                 }
             }
         }
@@ -1549,8 +1573,9 @@ pub async fn core_patch_namespaced_resource_status(
 
 #[derive(Debug)]
 enum PatchType {
-    MergePatch,
-    StrategicMergePatch,
+    Merge,
+    StrategicMerge,
+    Json,
 }
 
 fn detect_patch_type(headers: &HeaderMap) -> Result<PatchType, crate::status::StatusError> {
@@ -1559,14 +1584,183 @@ fn detect_patch_type(headers: &HeaderMap) -> Result<PatchType, crate::status::St
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if content_type.contains("application/strategic-merge-patch+json") {
-        return Ok(PatchType::StrategicMergePatch);
+        return Ok(PatchType::StrategicMerge);
     }
     if content_type.contains("application/merge-patch+json") {
-        return Ok(PatchType::MergePatch);
+        return Ok(PatchType::Merge);
+    }
+    if content_type.contains("application/json-patch+json") {
+        return Ok(PatchType::Json);
     }
     Err(Status::unsupported_media_type(format!(
-        "unsupported media type '{content_type}'; use application/merge-patch+json or application/strategic-merge-patch+json"
+        "unsupported media type '{content_type}'; use application/merge-patch+json, application/strategic-merge-patch+json, or application/json-patch+json"
     )))
+}
+
+/// Apply a JSON Patch (RFC 6902) to `obj`.
+/// Supports `add`, `remove`, and `replace` operations.
+/// Returns Err(422) for unsupported operations or invalid paths.
+fn apply_json_patch(
+    obj: &mut serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let ops = patch.as_array().ok_or_else(|| {
+        Status::unprocessable_entity("JSON patch must be an array of operations".into())
+    })?;
+
+    for op in ops {
+        let op_str = op["op"].as_str().ok_or_else(|| {
+            Status::unprocessable_entity("each JSON patch operation must have an 'op' field".into())
+        })?;
+        let path = op["path"].as_str().ok_or_else(|| {
+            Status::unprocessable_entity("each JSON patch operation must have a 'path' field".into())
+        })?;
+
+        match op_str {
+            "add" | "replace" => {
+                let value = op.get("value").ok_or_else(|| {
+                    Status::unprocessable_entity(format!("'{op_str}' operation requires a 'value' field"))
+                })?.clone();
+                json_patch_set(obj, path, value)?;
+            }
+            "remove" => {
+                json_patch_remove(obj, path)?;
+            }
+            other => {
+                return Err(Status::unprocessable_entity(format!(
+                    "unsupported JSON patch operation '{other}'; supported: add, remove, replace"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a JSON Pointer (RFC 6901) into path segments.
+fn json_pointer_segments(pointer: &str) -> Vec<String> {
+    if pointer.is_empty() {
+        return vec![];
+    }
+    // Leading '/' is required for non-empty pointers; skip it.
+    let stripped = pointer.strip_prefix('/').unwrap_or(pointer);
+    stripped
+        .split('/')
+        .map(|seg| seg.replace("~1", "/").replace("~0", "~"))
+        .collect()
+}
+
+/// Navigate to the parent of the target, returning a mutable ref to the parent and the final key.
+fn json_patch_navigate_mut<'a>(
+    obj: &'a mut serde_json::Value,
+    segments: &[String],
+) -> Result<(&'a mut serde_json::Value, String), crate::status::StatusError> {
+    if segments.is_empty() {
+        return Err(Status::unprocessable_entity("cannot operate on root document".into()));
+    }
+    let (parents, last) = segments.split_at(segments.len() - 1);
+    let mut cur = obj;
+    for seg in parents {
+        cur = json_navigate_one(cur, seg)?;
+    }
+    Ok((cur, last[0].clone()))
+}
+
+fn json_navigate_one<'a>(
+    node: &'a mut serde_json::Value,
+    seg: &str,
+) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
+    match node {
+        serde_json::Value::Object(map) => {
+            map.get_mut(seg).ok_or_else(|| {
+                Status::unprocessable_entity(format!("path segment '{seg}' not found"))
+            })
+        }
+        serde_json::Value::Array(arr) => {
+            let idx: usize = seg.parse().map_err(|_| {
+                Status::unprocessable_entity(format!("path segment '{seg}' is not a valid array index"))
+            })?;
+            arr.get_mut(idx).ok_or_else(|| {
+                Status::unprocessable_entity(format!("array index {idx} out of bounds"))
+            })
+        }
+        _ => Err(Status::unprocessable_entity(format!(
+            "cannot traverse into non-object/array at segment '{seg}'"
+        ))),
+    }
+}
+
+fn json_patch_set(
+    obj: &mut serde_json::Value,
+    pointer: &str,
+    value: serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let segs = json_pointer_segments(pointer);
+    if segs.is_empty() {
+        *obj = value;
+        return Ok(());
+    }
+    let (parent, key) = json_patch_navigate_mut(obj, &segs)?;
+    match parent {
+        serde_json::Value::Object(map) => {
+            map.insert(key, value);
+        }
+        serde_json::Value::Array(arr) => {
+            if key == "-" {
+                arr.push(value);
+            } else {
+                let idx: usize = key.parse().map_err(|_| {
+                    Status::unprocessable_entity(format!("invalid array index '{key}'"))
+                })?;
+                if idx <= arr.len() {
+                    arr.insert(idx, value);
+                } else {
+                    return Err(Status::unprocessable_entity(format!(
+                        "array index {idx} out of bounds (len {})",
+                        arr.len()
+                    )));
+                }
+            }
+        }
+        _ => {
+            return Err(Status::unprocessable_entity(
+                "cannot set value on non-object/array".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn json_patch_remove(
+    obj: &mut serde_json::Value,
+    pointer: &str,
+) -> Result<(), crate::status::StatusError> {
+    let segs = json_pointer_segments(pointer);
+    let (parent, key) = json_patch_navigate_mut(obj, &segs)?;
+    match parent {
+        serde_json::Value::Object(map) => {
+            map.remove(&key).ok_or_else(|| {
+                Status::unprocessable_entity(format!("path '{pointer}' not found"))
+            })?;
+        }
+        serde_json::Value::Array(arr) => {
+            let idx: usize = key.parse().map_err(|_| {
+                Status::unprocessable_entity(format!("invalid array index '{key}'"))
+            })?;
+            if idx < arr.len() {
+                arr.remove(idx);
+            } else {
+                return Err(Status::unprocessable_entity(format!(
+                    "array index {idx} out of bounds"
+                )));
+            }
+        }
+        _ => {
+            return Err(Status::unprocessable_entity(
+                "cannot remove from non-object/array".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1706,7 +1900,7 @@ mod tests {
         let h = headers_with_content_type("application/merge-patch+json");
         assert!(matches!(
             detect_patch_type(&h),
-            Ok(PatchType::MergePatch)
+            Ok(PatchType::Merge)
         ));
     }
 
@@ -1717,7 +1911,7 @@ mod tests {
         let h = headers_with_content_type("application/strategic-merge-patch+json");
         assert!(matches!(
             detect_patch_type(&h),
-            Ok(PatchType::StrategicMergePatch)
+            Ok(PatchType::StrategicMerge)
         ));
     }
 
@@ -1871,6 +2065,78 @@ mod tests {
     fn non_core_group_api_version_includes_group() {
         let body = build_list_response("Deployment", "apps", "v1", 0, vec![]);
         assert_eq!(body["apiVersion"], "apps/v1");
+    }
+
+    // -- apply_json_patch (RFC 6902) --
+
+    #[test]
+    fn json_patch_add_op_sets_field() {
+        // add must create a new field; used by conformance tests to set spec fields atomically
+        let mut obj = serde_json::json!({"metadata": {"name": "x"}});
+        let patch = serde_json::json!([{"op": "add", "path": "/metadata/label", "value": "v1"}]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert_eq!(obj["metadata"]["label"], "v1");
+    }
+
+    #[test]
+    fn json_patch_remove_op_deletes_field() {
+        // remove must delete an existing field
+        let mut obj = serde_json::json!({"metadata": {"name": "x", "extra": "gone"}});
+        let patch = serde_json::json!([{"op": "remove", "path": "/metadata/extra"}]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert!(obj["metadata"]["extra"].is_null(), "field must be absent after remove");
+    }
+
+    #[test]
+    fn json_patch_replace_op_updates_field() {
+        // replace must overwrite an existing field value
+        let mut obj = serde_json::json!({"spec": {"replicas": 1}});
+        let patch = serde_json::json!([{"op": "replace", "path": "/spec/replicas", "value": 3}]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert_eq!(obj["spec"]["replicas"], 3);
+    }
+
+    #[test]
+    fn json_patch_empty_array_is_noop() {
+        // An empty patch array must leave the document unchanged
+        let mut obj = serde_json::json!({"metadata": {"name": "x"}});
+        let before = obj.clone();
+        ok(apply_json_patch(&mut obj, &serde_json::json!([])));
+        assert_eq!(obj, before);
+    }
+
+    #[test]
+    fn json_patch_invalid_op_returns_422() {
+        // Unsupported operations like 'copy' must return 422 (not 415 or 400)
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "copy", "from": "/a", "path": "/b"}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn json_patch_invalid_path_returns_422() {
+        // Removing a non-existent path must return 422
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "remove", "path": "/nonexistent"}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn json_patch_pointer_unescaping() {
+        // RFC 6901: ~1 decodes to '/', ~0 decodes to '~'
+        let mut obj = serde_json::json!({"a/b": {"c~d": 0}});
+        let patch = serde_json::json!([{"op": "replace", "path": "/a~1b/c~0d", "value": 42}]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert_eq!(obj["a/b"]["c~d"], 42);
+    }
+
+    #[test]
+    fn detect_patch_type_accepts_json_patch() {
+        // application/json-patch+json must now be accepted instead of 415
+        let h = headers_with_content_type("application/json-patch+json");
+        assert!(matches!(detect_patch_type(&h), Ok(PatchType::Json)));
     }
 
     // -- generate_suffix + resolve_name --
