@@ -1,5 +1,21 @@
 {
   "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    },
+    "git": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-git", "--repository", "."]
+    },
+    "rust": {
+      "type": "stdio",
+      "command": "rust-mcp-server",
+      "args": ["--workspace", "/Users/balint.erdos/u7s"]
+    },
     "u7s": {
       "type": "stdio",
       "command": "cargo",
