@@ -113,7 +113,11 @@ pub fn generate_tls(_args: &Args) -> anyhow::Result<TlsMaterial> {
     let admin_cert = admin_params.signed_by(&admin_key, &ca_cert, &ca_key)?;
 
     // --- Build rustls ServerConfig ---
-    let server_cert_chain = vec![CertificateDer::from(server_cert.der().to_vec())];
+    // Include the CA cert in the chain so clients can verify without a system CA store.
+    let server_cert_chain = vec![
+        CertificateDer::from(server_cert.der().to_vec()),
+        CertificateDer::from(ca_cert.der().to_vec()),
+    ];
     let server_key_der = PrivateKeyDer::try_from(server_key.serialize_der())
         .map_err(|e| anyhow::anyhow!("key error: {e}"))?;
     let server_config = ServerConfig::builder()
