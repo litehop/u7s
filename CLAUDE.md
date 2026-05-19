@@ -40,6 +40,9 @@ Conformance > taste. If you genuinely think a convention is harmful, surface it.
 ### Rule 12 — Fail Loud
 "Completed" is wrong if anything was skipped silently. "Tests pass" is wrong if any were skipped. Default to surfacing uncertainty.
 
+### Rule 13 — Prefer Native Tooling
+Use Bash and Rust over Python. Do not introduce Python scripts or Python dependencies. For shell tasks (JSON extraction, text processing), use `jq`, `grep`, `sed`, `awk`. For anything more complex, write a Rust binary or use an existing Rust CLI tool.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
 

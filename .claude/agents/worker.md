@@ -22,6 +22,7 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
 3. **Simplicity first** — minimum code that solves the problem. No abstractions for single-use code.
 4. **Tests verify intent** — unit tests must encode WHY behavior matters, not just WHAT it does.
 5. **Fail loud** — "completed" is wrong if anything was skipped silently.
+6. **Prefer native tooling** — use Bash and Rust, not Python. For shell text processing use `jq`, `grep`, `sed`. Do not introduce Python scripts or dependencies.
 
 ## Workflow
 
