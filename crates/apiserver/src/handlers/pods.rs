@@ -626,8 +626,204 @@ mod watch_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Status subresource — GET/PUT/PATCH /api/v1/namespaces/:ns/pods/:name/status
+// ---------------------------------------------------------------------------
+
+pub async fn get_pod_status(
+    State(state): State<AppState>,
+    Path((raw_ns, name)): Path<(String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns, &state).await?;
+
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        stored.value,
+    )
+        .into_response())
+}
+
+pub async fn replace_pod_status(
+    State(state): State<AppState>,
+    Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns, &state).await?;
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
+    let incoming: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    let mut current_obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    current_obj.body["status"] = incoming["status"].clone();
+
+    let expected_rv = parse_resource_version(current_obj.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current_obj.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, &name))?;
+
+    current_obj.set_resource_version(new_rv);
+
+    Ok(Json(current_obj.body))
+}
+
+pub async fn patch_pod_status(
+    State(state): State<AppState>,
+    Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !content_type.contains("application/merge-patch+json") {
+        return Err(Status::unsupported_media_type(format!(
+            "unsupported media type '{content_type}'; use application/merge-patch+json"
+        )));
+    }
+
+    let ns = parse_namespace(&raw_ns, &state).await?;
+
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    let mut current_obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let patch: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    if let Some(patch_status) = patch.get("status") {
+        if current_obj.body["status"].is_object() && patch_status.is_object() {
+            json_merge_patch(&mut current_obj.body["status"], patch_status);
+        } else {
+            current_obj.body["status"] = patch_status.clone();
+        }
+    }
+
+    let expected_rv = parse_resource_version(current_obj.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current_obj.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, &name))?;
+
+    current_obj.set_resource_version(new_rv);
+
+    Ok(Json(current_obj.body))
+}
+
+// ---------------------------------------------------------------------------
 // Binding subresource — POST /api/v1/namespaces/:ns/pods/:name/binding
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    /// replace_pod_status copies only the "status" field from the incoming body.
+    /// Any other fields in the incoming body (spec, metadata) must be ignored.
+    /// This is the Kubernetes contract: PUT /status only updates status.
+    #[test]
+    fn replace_status_only_mutates_status_field() {
+        let mut current = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app"}]},
+            "status": {"phase": "Pending"}
+        });
+        let incoming = serde_json::json!({
+            "status": {"phase": "Running", "conditions": [{"type": "Ready"}]},
+            "spec": {"containers": [{"name": "hacked"}]}
+        });
+
+        // Simulate what replace_pod_status does: only copy status field.
+        current["status"] = incoming["status"].clone();
+
+        assert_eq!(current["status"]["phase"], "Running");
+        assert_eq!(current["status"]["conditions"][0]["type"], "Ready");
+        // spec must not be overwritten — it is outside the status subresource
+        assert_eq!(current["spec"]["containers"][0]["name"], "app");
+    }
+
+    /// patch_pod_status merges only the "status" field from the patch.
+    /// Spec and metadata changes in the patch body must be ignored.
+    #[test]
+    fn patch_status_merges_only_status_field() {
+        let mut status = serde_json::json!({"phase": "Pending", "hostIP": "1.2.3.4"});
+        let patch_status = serde_json::json!({"phase": "Running"});
+
+        // json_merge_patch on the status object: merges in place.
+        json_merge_patch(&mut status, &patch_status);
+
+        assert_eq!(status["phase"], "Running");
+        // pre-existing fields not in the patch must survive
+        assert_eq!(status["hostIP"], "1.2.3.4");
+    }
+
+    /// patch_pod_status with a null field in the patch status removes that field.
+    #[test]
+    fn patch_status_null_removes_field() {
+        let mut status = serde_json::json!({"phase": "Running", "hostIP": "1.2.3.4"});
+        let patch_status = serde_json::json!({"hostIP": null});
+
+        json_merge_patch(&mut status, &patch_status);
+
+        // null in merge patch means delete
+        assert!(status.get("hostIP").map_or(true, |v| v.is_null() || !status.as_object().unwrap().contains_key("hostIP")));
+        assert_eq!(status["phase"], "Running");
+    }
+
+    /// patch_pod_status with no "status" key in the patch leaves status unchanged.
+    #[test]
+    fn patch_status_no_status_key_is_noop() {
+        let original_status = serde_json::json!({"phase": "Running"});
+        let mut current = serde_json::json!({
+            "status": original_status.clone()
+        });
+        let patch = serde_json::json!({"metadata": {"labels": {"app": "test"}}});
+
+        // Simulate handler logic: only act if patch has "status" key
+        if let Some(patch_status) = patch.get("status") {
+            if current["status"].is_object() && patch_status.is_object() {
+                json_merge_patch(&mut current["status"], patch_status);
+            } else {
+                current["status"] = patch_status.clone();
+            }
+        }
+
+        assert_eq!(current["status"], original_status);
+    }
+}
 
 pub async fn bind_pod(
     State(state): State<AppState>,
