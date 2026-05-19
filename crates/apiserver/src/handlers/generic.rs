@@ -861,12 +861,39 @@ pub async fn core_list_resource(
     Path(plural): Path<String>,
     Query(query): Query<CollectionQuery>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    // Pods are namespaced; the registry has no cluster-scoped "pods" entry.
+    // Handle GET /api/v1/pods by scanning across all namespaces.
+    if plural == "pods" {
+        check_watch(&query)?;
+        let prefix = crate::keys::cluster_list_prefix("pods");
+        let resp = state
+            .store
+            .list(&prefix, ListOptions::default())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut items = Vec::with_capacity(resp.items.len());
+        for obj in &resp.items {
+            let v: serde_json::Value =
+                serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+            items.push(v);
+        }
+        let items = if let Some(ref sel) = query.label_selector {
+            let pairs = parse_label_selector(sel)?;
+            apply_label_selector(items, &pairs)
+        } else {
+            items
+        };
+        let body = build_list_response("Pod", "", "v1", resp.revision, items);
+        return Ok(Json(body).into_response());
+    }
+
     list_resource(
         State(state),
         Path(("".into(), "v1".into(), plural)),
         Query(query),
     )
     .await
+    .map(IntoResponse::into_response)
 }
 
 pub async fn core_get_resource(
