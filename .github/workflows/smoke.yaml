@@ -86,7 +86,18 @@ jobs:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
           WATCH_OUT=$(mktemp)
-          kubectl get namespaces --watch -o json >"$WATCH_OUT" 2>&1 &
+          # Use curl to hit the raw watch endpoint so the server's NDJSON envelope
+          # ({"type":"ADDED","object":{...}}) is preserved in the output.
+          # kubectl get --watch -o json strips the event type field, so ADDED/DELETED
+          # never appear in its output — the curl approach avoids that.
+          CA_CERT="$SMOKE_TMPDIR/ca.crt"
+          kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
+            | base64 -d > "$CA_CERT"
+          curl --silent --no-buffer \
+            --cacert "$CA_CERT" \
+            -H "Authorization: Bearer $SMOKE_TOKEN" \
+            "https://127.0.0.1:6443/api/v1/namespaces?watch=true" \
+            >"$WATCH_OUT" 2>&1 &
           WATCH_PID=$!
 
           # Create namespace — should trigger an ADDED event on the watch stream.
