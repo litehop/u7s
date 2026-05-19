@@ -493,6 +493,81 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
     Ok(ListResponse { items, revision: snapshot_revision })
 }
 
+impl SqliteStore {
+    /// Fetch up to `limit` items with keys matching `prefix`, lexicographically after
+    /// `after_key` (exclusive). Returns `(items, has_more)` where `has_more` is true
+    /// when there are additional items beyond the returned page.
+    ///
+    /// `limit = 0` is not permitted; callers should use `list()` for unbounded listing.
+    pub async fn list_page(
+        &self,
+        prefix: &str,
+        limit: usize,
+        after_key: Option<&str>,
+    ) -> Result<(Vec<PageRow>, bool)> {
+        let conn = self.read_conn.clone();
+        let prefix = prefix.to_string();
+        let after_key = after_key.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            list_page_sync(&conn, &prefix, limit, after_key.as_deref())
+        }).await?
+    }
+}
+
+/// Row type for `list_page`: (key, raw value bytes).
+type PageRow = (String, Vec<u8>);
+
+fn list_page_sync(
+    conn: &Connection,
+    prefix: &str,
+    limit: usize,
+    after_key: Option<&str>,
+) -> Result<(Vec<PageRow>, bool)> {
+    let upper = prefix_upper_bound(prefix);
+    let fetch = (limit + 1) as i64; // fetch one extra to detect has_more
+
+    let rows: Vec<(String, Vec<u8>)> = if upper.is_empty() {
+        if let Some(after) = after_key {
+            let mut stmt = conn.prepare(
+                "SELECT key, value FROM objects WHERE key >= ?1 AND key > ?2 ORDER BY key ASC LIMIT ?3",
+            )?;
+            let r: Vec<_> = stmt.query_map(params![prefix, after, fetch], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?.collect::<rusqlite::Result<_>>()?;
+            r
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT key, value FROM objects WHERE key >= ?1 ORDER BY key ASC LIMIT ?2",
+            )?;
+            let r: Vec<_> = stmt.query_map(params![prefix, fetch], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?.collect::<rusqlite::Result<_>>()?;
+            r
+        }
+    } else if let Some(after) = after_key {
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC LIMIT ?4",
+        )?;
+        let r: Vec<_> = stmt.query_map(params![prefix, &upper, after, fetch], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?.collect::<rusqlite::Result<_>>()?;
+        r
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC LIMIT ?3",
+        )?;
+        let r: Vec<_> = stmt.query_map(params![prefix, &upper, fetch], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?.collect::<rusqlite::Result<_>>()?;
+        r
+    };
+
+    let has_more = rows.len() > limit;
+    let items = rows.into_iter().take(limit).collect();
+    Ok((items, has_more))
+}
+
 impl Store for SqliteStore {
     async fn get(&self, key: &str) -> Result<Option<StoreObject>> {
         let conn = self.read_conn.clone();
@@ -966,6 +1041,62 @@ mod tests {
         let keys: Vec<&str> = resp.items.iter().map(|o| o.key.as_str()).collect();
         assert!(keys.contains(&"/registry/pods/default/alpha"));
         assert!(keys.contains(&"/registry/pods/default/beta"));
+    }
+
+    // --- list_page tests ---
+
+    #[tokio::test]
+    async fn list_page_single_page_all_items() {
+        // When limit >= total items, has_more must be false and all items returned.
+        let store = make_store();
+        store.put("/registry/pods/default/a", pod_json("a"), Some(0)).await.unwrap();
+        store.put("/registry/pods/default/b", pod_json("b"), Some(0)).await.unwrap();
+
+        let (items, has_more) = store.list_page("/registry/pods/default/", 10, None).await.unwrap();
+        assert_eq!(items.len(), 2, "all items should be returned when limit exceeds count");
+        assert!(!has_more, "has_more must be false when all items fit in one page");
+    }
+
+    #[tokio::test]
+    async fn list_page_first_page_has_more() {
+        // When there are more items than limit, has_more must be true.
+        let store = make_store();
+        store.put("/registry/pods/default/a", pod_json("a"), Some(0)).await.unwrap();
+        store.put("/registry/pods/default/b", pod_json("b"), Some(0)).await.unwrap();
+        store.put("/registry/pods/default/c", pod_json("c"), Some(0)).await.unwrap();
+
+        let (items, has_more) = store.list_page("/registry/pods/default/", 2, None).await.unwrap();
+        assert_eq!(items.len(), 2, "first page must contain exactly limit items");
+        assert!(has_more, "has_more must be true when there are items beyond the page");
+        // Keys must be lexicographically ordered
+        assert_eq!(items[0].0, "/registry/pods/default/a");
+        assert_eq!(items[1].0, "/registry/pods/default/b");
+    }
+
+    #[tokio::test]
+    async fn list_page_second_page_via_after_key() {
+        // Continuing from the last key of page 1 must yield the remaining items.
+        let store = make_store();
+        store.put("/registry/pods/default/a", pod_json("a"), Some(0)).await.unwrap();
+        store.put("/registry/pods/default/b", pod_json("b"), Some(0)).await.unwrap();
+        store.put("/registry/pods/default/c", pod_json("c"), Some(0)).await.unwrap();
+
+        let (page1, _) = store.list_page("/registry/pods/default/", 2, None).await.unwrap();
+        let last_key = &page1.last().unwrap().0.clone();
+
+        let (page2, has_more) = store.list_page("/registry/pods/default/", 2, Some(last_key)).await.unwrap();
+        assert_eq!(page2.len(), 1, "last page must contain remaining item(s)");
+        assert!(!has_more, "has_more must be false on the last page");
+        assert_eq!(page2[0].0, "/registry/pods/default/c");
+    }
+
+    #[tokio::test]
+    async fn list_page_empty_prefix() {
+        // Empty store must return empty page with has_more=false.
+        let store = make_store();
+        let (items, has_more) = store.list_page("/registry/pods/default/", 5, None).await.unwrap();
+        assert!(items.is_empty());
+        assert!(!has_more);
     }
 
     #[tokio::test]

@@ -14,6 +14,12 @@ pub struct Status {
 
 pub struct StatusError(pub StatusCode, pub Status);
 
+impl std::fmt::Debug for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StatusError({}, {})", self.0, self.1.code)
+    }
+}
+
 impl IntoResponse for StatusError {
     fn into_response(self) -> Response {
         (self.0, axum::Json(self.1)).into_response()
@@ -83,6 +89,17 @@ impl Status {
                 kind: "Status", api_version: "v1", status: "Failure",
                 message,
                 reason: "Invalid", code: 422,
+            },
+        )
+    }
+
+    pub fn gone(message: String) -> StatusError {
+        StatusError(
+            StatusCode::GONE,
+            Status {
+                kind: "Status", api_version: "v1", status: "Failure",
+                message,
+                reason: "Expired", code: 410,
             },
         )
     }

@@ -23,6 +23,9 @@ pub struct CollectionQuery {
     pub label_selector: Option<String>,
     #[serde(rename = "fieldSelector")]
     pub field_selector: Option<String>,
+    pub limit: Option<usize>,
+    #[serde(rename = "continue")]
+    pub continue_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +327,98 @@ fn apply_field_selector(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Pagination helpers (no external crates)
+// ---------------------------------------------------------------------------
+
+/// base64url encode (RFC 4648 §5): standard alphabet with +→- /→_ and no padding.
+fn base64url_encode(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((data.len() * 4).div_ceil(3));
+    let mut i = 0;
+    while i + 2 < data.len() {
+        let b0 = data[i] as u32;
+        let b1 = data[i + 1] as u32;
+        let b2 = data[i + 2] as u32;
+        let v = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((v >> 18) & 63) as usize] as char);
+        out.push(TABLE[((v >> 12) & 63) as usize] as char);
+        out.push(TABLE[((v >> 6) & 63) as usize] as char);
+        out.push(TABLE[(v & 63) as usize] as char);
+        i += 3;
+    }
+    let rem = data.len() - i;
+    if rem == 1 {
+        let b0 = data[i] as u32;
+        out.push(TABLE[((b0 >> 2) & 63) as usize] as char);
+        out.push(TABLE[((b0 << 4) & 63) as usize] as char);
+    } else if rem == 2 {
+        let b0 = data[i] as u32;
+        let b1 = data[i + 1] as u32;
+        out.push(TABLE[((b0 >> 2) & 63) as usize] as char);
+        out.push(TABLE[(((b0 << 4) | (b1 >> 4)) & 63) as usize] as char);
+        out.push(TABLE[((b1 << 2) & 63) as usize] as char);
+    }
+    out
+}
+
+/// base64url decode: returns None on invalid input.
+fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    let mut table = [255u8; 256];
+    for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4 + 1);
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let v0 = table[bytes[i] as usize];
+        let v1 = table[bytes[i + 1] as usize];
+        let v2 = table[bytes[i + 2] as usize];
+        let v3 = table[bytes[i + 3] as usize];
+        if v0 == 255 || v1 == 255 || v2 == 255 || v3 == 255 {
+            return None;
+        }
+        let v = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | (v3 as u32);
+        out.push(((v >> 16) & 0xFF) as u8);
+        out.push(((v >> 8) & 0xFF) as u8);
+        out.push((v & 0xFF) as u8);
+        i += 4;
+    }
+    let rem = bytes.len() - i;
+    if rem == 2 {
+        let v0 = table[bytes[i] as usize];
+        let v1 = table[bytes[i + 1] as usize];
+        if v0 == 255 || v1 == 255 { return None; }
+        out.push(((((v0 as u32) << 2) | ((v1 as u32) >> 4)) & 0xFF) as u8);
+    } else if rem == 3 {
+        let v0 = table[bytes[i] as usize];
+        let v1 = table[bytes[i + 1] as usize];
+        let v2 = table[bytes[i + 2] as usize];
+        if v0 == 255 || v1 == 255 || v2 == 255 { return None; }
+        let v = ((v0 as u32) << 10) | ((v1 as u32) << 4) | ((v2 as u32) >> 2);
+        out.push(((v >> 8) & 0xFF) as u8);
+        out.push((v & 0xFF) as u8);
+    } else if rem == 1 {
+        return None; // 1 trailing char is always invalid in base64
+    }
+    Some(out)
+}
+
+/// Encode a pagination continue token: base64url("rv:last_key").
+fn encode_continue(rv: u64, last_key: &str) -> String {
+    let raw = format!("{}:{}", rv, last_key);
+    base64url_encode(raw.as_bytes())
+}
+
+/// Decode a pagination continue token. Returns None on malformed input.
+fn decode_continue(token: &str) -> Option<(u64, String)> {
+    let raw = base64url_decode(token)?;
+    let s = String::from_utf8(raw).ok()?;
+    let (rv_str, key) = s.split_once(':')?;
+    Some((rv_str.parse().ok()?, key.to_string()))
+}
+
 pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
     match rv {
         None | Some("") => Ok(None),
@@ -335,22 +430,88 @@ pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::st
     }
 }
 
+/// Fetch items from the store, applying limit/continue pagination if requested.
+///
+/// Returns `(items, snapshot_rv, next_continue)`.
+/// - If `query.limit` is absent or 0, falls back to unbounded `list()`.
+/// - On invalid continue token → HTTP 410 Gone (Kubernetes behaviour).
+/// - `next_continue` is Some when there are more pages.
+async fn list_with_pagination(
+    state: &AppState,
+    prefix: &str,
+    query: &CollectionQuery,
+) -> Result<(Vec<(String, Vec<u8>)>, u64, Option<String>), crate::status::StatusError> {
+    let limit = query.limit.unwrap_or(0);
+
+    if limit == 0 {
+        // No pagination: use existing list path.
+        let resp = state
+            .store
+            .list(prefix, ListOptions::default())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let items = resp.items.into_iter().map(|obj| (obj.key, obj.value.to_vec())).collect();
+        return Ok((items, resp.revision, None));
+    }
+
+    // Decode continue token if present.
+    let after_key: Option<String> = if let Some(ref token) = query.continue_token {
+        let (_rv, key) = decode_continue(token).ok_or_else(|| {
+            Status::gone(
+                "The provided continue parameter is too old to be used in a consistent list call. \
+                 If you are not starting from any given resource version, list to get a new consistent snapshot from now on.".to_string(),
+            )
+        })?;
+        Some(key)
+    } else {
+        None
+    };
+
+    let (rows, has_more) = state
+        .store
+        .list_page(prefix, limit, after_key.as_deref())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // Get the snapshot revision for the metadata.
+    let snapshot_rv = state
+        .store
+        .list(prefix, ListOptions::default())
+        .await
+        .map(|r| r.revision)
+        .unwrap_or(0);
+
+    let next_continue = if has_more {
+        rows.last().map(|(key, _)| encode_continue(snapshot_rv, key))
+    } else {
+        None
+    };
+
+    Ok((rows, snapshot_rv, next_continue))
+}
+
 fn build_list_response(
     kind: &str,
     group: &str,
     version: &str,
     revision: u64,
     items: Vec<serde_json::Value>,
+    continue_token: Option<String>,
 ) -> serde_json::Value {
     let api_version = if group.is_empty() {
         version.to_string()
     } else {
         format!("{}/{}", group, version)
     };
+    let metadata = if let Some(ct) = continue_token {
+        serde_json::json!({ "resourceVersion": revision.to_string(), "continue": ct })
+    } else {
+        serde_json::json!({ "resourceVersion": revision.to_string() })
+    };
     serde_json::json!({
         "kind": format!("{}List", kind),
         "apiVersion": api_version,
-        "metadata": { "resourceVersion": revision.to_string() },
+        "metadata": metadata,
         "items": items
     })
 }
@@ -444,16 +605,12 @@ pub async fn list_resource(
         .await;
     }
 
-    let resp = state
-        .store
-        .list(&prefix, ListOptions::default())
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+    let (raw_items, snapshot_rv, next_continue) = list_with_pagination(&state, &prefix, &query).await?;
 
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
+    let mut items = Vec::with_capacity(raw_items.len());
+    for (_, value) in &raw_items {
         let v: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+            serde_json::from_slice(value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(v);
     }
 
@@ -471,7 +628,7 @@ pub async fn list_resource(
         items
     };
 
-    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
+    let body = build_list_response(&meta.kind, &group, &version, snapshot_rv, items, next_continue);
     Ok(Json(body).into_response())
 }
 
@@ -800,16 +957,12 @@ pub async fn list_namespaced_resource(
         .await;
     }
 
-    let resp = state
-        .store
-        .list(&prefix, ListOptions::default())
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+    let (raw_items, snapshot_rv, next_continue) = list_with_pagination(&state, &prefix, &query).await?;
 
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
+    let mut items = Vec::with_capacity(raw_items.len());
+    for (_, value) in &raw_items {
         let v: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+            serde_json::from_slice(value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(v);
     }
 
@@ -827,7 +980,7 @@ pub async fn list_namespaced_resource(
         items
     };
 
-    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
+    let body = build_list_response(&meta.kind, &group, &version, snapshot_rv, items, next_continue);
     Ok(Json(body).into_response())
 }
 
@@ -1377,15 +1530,11 @@ pub async fn core_list_resource(
             .await
             .map(IntoResponse::into_response);
         }
-        let resp = state
-            .store
-            .list(&prefix, ListOptions::default())
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut items = Vec::with_capacity(resp.items.len());
-        for obj in &resp.items {
+        let (raw_items, snapshot_rv, next_continue) = list_with_pagination(&state, &prefix, &query).await?;
+        let mut items = Vec::with_capacity(raw_items.len());
+        for (_, value) in &raw_items {
             let v: serde_json::Value =
-                serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+                serde_json::from_slice(value).map_err(|e| Status::internal(e.to_string()))?;
             items.push(v);
         }
         let items = if let Some(ref sel) = query.label_selector {
@@ -1400,7 +1549,7 @@ pub async fn core_list_resource(
         } else {
             items
         };
-        let body = build_list_response("Pod", "", "v1", resp.revision, items);
+        let body = build_list_response("Pod", "", "v1", snapshot_rv, items, next_continue);
         return Ok(Json(body).into_response());
     }
 
@@ -1911,14 +2060,14 @@ mod tests {
     #[test]
     fn core_group_api_version_is_version_only() {
         // For core group (group=""), apiVersion should be just "v1", not "/v1".
-        let body = build_list_response("Node", "", "v1", 0, vec![]);
+        let body = build_list_response("Node", "", "v1", 0, vec![], None);
         assert_eq!(body["apiVersion"], "v1");
         assert_eq!(body["kind"], "NodeList");
     }
 
     #[test]
     fn non_core_group_api_version_includes_group() {
-        let body = build_list_response("Deployment", "apps", "v1", 0, vec![]);
+        let body = build_list_response("Deployment", "apps", "v1", 0, vec![], None);
         assert_eq!(body["apiVersion"], "apps/v1");
     }
 
@@ -2020,6 +2169,120 @@ mod tests {
         let result = apply_field_selector(items, &pairs);
         assert_eq!(result.len(), 1, "both conditions must match (AND)");
         assert_eq!(result[0]["metadata"]["name"], "pod-a");
+    }
+
+    // -- base64url + continue token --
+
+    #[test]
+    fn base64url_encode_decode_roundtrip() {
+        // Encoding must be reversible — the token format depends on this invariant
+        let original = b"42:/registry/pods/default/my-pod";
+        let encoded = base64url_encode(original);
+        // Must not contain padding or standard base64 characters
+        assert!(!encoded.contains('='));
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        let decoded = base64url_decode(&encoded).expect("must decode");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn encode_decode_continue_roundtrip() {
+        // Clients send the continue token back verbatim; it must survive round-trip
+        let rv = 42u64;
+        let key = "/registry/pods/default/my-pod";
+        let token = encode_continue(rv, key);
+        let (rv2, key2) = decode_continue(&token).expect("must decode");
+        assert_eq!(rv2, rv);
+        assert_eq!(key2, key);
+    }
+
+    #[test]
+    fn decode_continue_invalid_token_returns_none() {
+        // An invalid/garbage token must return None so the handler can respond 410
+        assert!(decode_continue("not-valid-base64!!!").is_none());
+    }
+
+    #[test]
+    fn decode_continue_missing_colon_returns_none() {
+        // A token with no colon separator (valid base64 but wrong format) must return None
+        let bad = base64url_encode(b"nocolon");
+        assert!(decode_continue(&bad).is_none());
+    }
+
+    // -- list_with_pagination (integration via AppState) --
+
+    #[tokio::test]
+    async fn list_pagination_limit_zero_returns_all() {
+        // limit=0/absent must fall back to unbounded list — pagination is opt-in
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("store"));
+        let state = AppState::new(store.clone(), None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
+
+        let prefix = "/registry/configmaps/default/";
+        for name in &["a", "b", "c"] {
+            let v = bytes::Bytes::from(serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": { "name": name, "namespace": "default" }
+            }).to_string());
+            store.put(&format!("{prefix}{name}"), v, Some(0)).await.unwrap();
+        }
+
+        let query = CollectionQuery { limit: Some(0), ..Default::default() };
+        let (items, _rv, next) = list_with_pagination(&state, prefix, &query).await.unwrap();
+        assert_eq!(items.len(), 3, "limit=0 must return all items");
+        assert!(next.is_none(), "limit=0 must not produce a continue token");
+    }
+
+    #[tokio::test]
+    async fn list_pagination_multi_page() {
+        // Clients must be able to page through all items using continue tokens
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("store"));
+        let state = AppState::new(store.clone(), None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
+
+        let prefix = "/registry/configmaps/default/";
+        for name in &["a", "b", "c"] {
+            let v = bytes::Bytes::from(serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": { "name": name, "namespace": "default" }
+            }).to_string());
+            store.put(&format!("{prefix}{name}"), v, Some(0)).await.unwrap();
+        }
+
+        // Page 1: limit=2
+        let query1 = CollectionQuery { limit: Some(2), ..Default::default() };
+        let (page1, _rv1, cont1) = list_with_pagination(&state, prefix, &query1).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        let token = cont1.expect("page 1 must have a continue token since there are more items");
+
+        // Page 2: use the continue token
+        let query2 = CollectionQuery { limit: Some(2), continue_token: Some(token), ..Default::default() };
+        let (page2, _rv2, cont2) = list_with_pagination(&state, prefix, &query2).await.unwrap();
+        assert_eq!(page2.len(), 1, "last page has 1 remaining item");
+        assert!(cont2.is_none(), "no more pages after last item");
+    }
+
+    #[tokio::test]
+    async fn list_pagination_invalid_token_returns_410() {
+        // An invalid continue token must be rejected with HTTP 410 Gone
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("store"));
+        let state = AppState::new(store.clone(), None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
+
+        let query = CollectionQuery {
+            limit: Some(10),
+            continue_token: Some("this-is-not-a-valid-token!!!".to_string()),
+            ..Default::default()
+        };
+        let err = list_with_pagination(&state, "/registry/pods/default/", &query).await.unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::GONE, "invalid continue token must yield HTTP 410");
     }
 
     // -- CR status PUT fallback --
