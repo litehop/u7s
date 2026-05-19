@@ -1,27 +1,31 @@
 # Dashboard
 
-2026-05-20T08:15 UTC
+2026-05-20T09:30 UTC
 `bd prime` in a fresh Claude Code session
 Open beads: 1 (mayor-xy2, P3, intentionally deferred)
 
 ## What needs the operator now
 
-**Backlog is empty.** No decisions pending, no blockers.
+**One design decision pending** — how to set up end-to-end testing infrastructure.
 
-`mayor-xy2` (CR schema validation / openAPIV3Schema enforcement) is intentionally deferred for Phase 3 — permissive CR validation is safe for the Argo CD milestone.
+Operator raised two open questions:
+1. **Virtualization approach**: lima VMs (real kubelet + CRI, better fidelity, slower CI) vs KinD containers (faster, but topology differs and some kubelet behaviors won't surface). Mayor recommendation: lima. Operator has not decided yet.
+2. **kubectl version matrix**: aqua (per-project lockfile, zero pollution to system kubectl) is the proposed approach. Needs operator sign-off before filing beads.
 
-**Next direction needed from operator** — candidates:
-1. **Kubelet join attempt** — run a real kubelet against u7s to surface remaining gaps organically
-2. **Sonobuoy conformance** — enumerate API conformance gaps systematically
-3. **Code quality / perf audit** — dispatch a reviewer against recent commits (proto, handlers, inflight, watch)
+`mayor-xy2` (CR schema validation / openAPIV3Schema enforcement) remains intentionally deferred — permissive CR validation is safe for the Argo CD milestone.
 
 ## Forward-looking
 
-Mayor is idle pending operator direction. All loops are running (15m dispatch, 30m merge, 60m hygiene, 10m dashboard, 60m stance reminder). When operator names the next initiative, mayor will file beads and dispatch workers immediately.
+Once operator decides on virtualization + kubectl versioning approach, mayor will:
+1. File beads for e2e test infrastructure (lima setup scripts, aqua lockfile, kubelet join smoke test)
+2. Dispatch workers to implement in sequence (infra first, then kubelet join test)
+3. After kubelet join is green, revisit sonobuoy conformance as the next conformance milestone
+
+No current in-flight workers. All loops running.
 
 ## Recent progress
 
-This session closed 8 beads and merged 7 PRs:
+This session (continuing from prior context) closed 8 beads and merged 7 PRs:
 
 | PR | What | Beads |
 |----|------|-------|
