@@ -1,45 +1,34 @@
 # Dashboard
 
-2026-05-19T08:00 UTC
+2026-05-19T08:15 UTC
 Session: 96473ee9-26b3-4236-b9dc-1d311e5cee69
-Open beads: 1
+Open beads: 1 (deferred)
 
 ## What needs the operator now
 
-Nothing. The board is down to one deferred bead (mayor-xy2, CR schema validation) — intentionally held until Argo CD integration testing reveals a concrete need. Session can HOLD.
+**Decision requested:** Should CI get a smoke integration test (start server, kubectl CRUD, assert) gated on main push? Mayor recommends yes — draft ready on request. kube-bench is not applicable; sonobuoy is premature until watch + resourceVersion are implemented.
 
-## In flight
-
-None.
-
-## Open beads
-
-| Priority | Bead | Title | Notes |
-|----------|------|-------|-------|
-| P3 | mayor-xy2 | CR instance schema validation | Deferred — await Argo CD integration |
+Nothing else needs operator attention.
 
 ## Forward-looking
 
-The natural next step is **Argo CD integration testing** — install Argo CD against the running u7s API server and see what breaks. That will surface concrete gaps to file as beads.
+Board is at HOLD. Only mayor-xy2 (CR schema validation, P3) remains — intentionally deferred until Argo CD integration surfaces a concrete need.
 
-No new beads expected until that integration test runs.
+Natural next actions for the operator to trigger:
+1. **Approve smoke CI job** — unlocks a bead + worker dispatch
+2. **Argo CD integration test** — install Argo CD against u7s, observe failures, file beads from results
+3. **Conformance milestone** — sonobuoy becomes meaningful once watch + resourceVersion land
 
-## Recent progress (this session)
+## Recent progress
 
-**Full CRD support shipped (PRs #23–28):**
+Full CRD support shipped across 6 PRs (#23–28) this session. Audit pass found 4 correctness issues; all shipped same session. 56 beads closed total.
 
-| PR | Title | Beads |
-|----|-------|-------|
-| #23 | feat(crd): CRD CRUD handlers | mayor-crd |
-| #24 | feat(discovery): dynamic discovery from CRDs | mayor-crd |
-| #25 | feat(cr): CR instance handlers + generic fallback | mayor-crd |
-| #26 | fix(crd+discovery): name validation + multi-version served versions | mayor-3jz, mayor-fp8 |
-| #27 | fix(cr): PATCH on CR instances — fallback was missing in patch handlers | mayor-d36 (P1) |
-| #28 | fix(crd+cr): UID generation calls SystemTime::now() once per call | mayor-c6u |
-
-**Loops registered:** 15m dispatch, 30m cluster, 60m hygiene, 30m PR merge, 10m dashboard (all session-only).
-
-**Session totals:** 56 beads closed, PRs #22–28 merged.
+| PR | Title |
+|----|-------|
+| #23–25 | CRD + CR handlers + dynamic discovery |
+| #26 | Name validation + multi-version discovery fix |
+| #27 | PATCH fallback for CR instances (P1) |
+| #28 | UID generation — single SystemTime::now() call |
 
 ## Stance
 
