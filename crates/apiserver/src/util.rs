@@ -3,16 +3,42 @@ use bytes::Bytes;
 use crate::proto;
 
 /// If the request body uses the Kubernetes protobuf encoding, decode it and return the embedded
-/// raw payload (typically JSON). Otherwise return the bytes unchanged.
+/// raw payload as JSON bytes. Otherwise return the bytes unchanged.
+///
+/// kubectl sends core types (Namespace, ConfigMap, …) with contentType="" in the proto envelope
+/// and a proto-encoded object in Unknown.raw. We decode those using type-specific decoders keyed
+/// on the Kind from the envelope TypeMeta. For non-core types (CRDs, CRs), kubectl sends JSON
+/// inside the envelope (or as plain JSON), which passes through unchanged.
 ///
 /// This allows all write handlers to support both `application/json` and
 /// `application/vnd.kubernetes.protobuf` without duplicating decode logic.
 pub fn extract_body(bytes: &Bytes, content_type: &str) -> Bytes {
-    if content_type.starts_with("application/vnd.kubernetes.protobuf") {
-        if let Some(raw) = proto::decode_k8s_proto(bytes) {
-            return Bytes::from(raw);
+    if !content_type.starts_with("application/vnd.kubernetes.protobuf") {
+        return bytes.clone();
+    }
+    let env = match proto::decode_k8s_proto_envelope(bytes) {
+        Some(e) => e,
+        None => return bytes.clone(),
+    };
+    // When contentType is explicitly JSON, raw is JSON — return as-is.
+    if env.content_type == "application/json" {
+        return Bytes::from(env.raw);
+    }
+    // For all other cases (empty or explicit protobuf contentType), raw bytes are proto-encoded.
+    // Try type-specific decoders first.
+    if !env.kind.is_empty() {
+        if let Some(json_val) = proto::decode_core_proto_by_kind(&env.kind, &env.raw) {
+            if let Ok(json_bytes) = serde_json::to_vec(&json_val) {
+                return Bytes::from(json_bytes);
+            }
         }
     }
+    // Fallback: if raw bytes look like JSON (start with '{'), return them directly.
+    // This handles non-core types that send JSON with empty contentType.
+    if env.raw.first() == Some(&b'{') {
+        return Bytes::from(env.raw);
+    }
+    // Cannot decode — return original bytes so the handler reports a meaningful error.
     bytes.clone()
 }
 

@@ -126,21 +126,21 @@ pub async fn create_namespace(
     // using the Namespace-specific decoder.
     let mut obj = if ct.starts_with("application/vnd.kubernetes.protobuf") {
         match proto::decode_k8s_proto_envelope(&body) {
-            Some(env) if env.content_type == "application/json" || env.content_type.is_empty() => {
-                // Inner bytes are JSON — parse normally.
+            Some(env) if env.content_type == "application/json" => {
+                // Inner bytes are explicitly JSON — parse normally.
                 let b = bytes::Bytes::from(env.raw);
                 Object::from_bytes(&b)
                     .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?
             }
             Some(env) => {
-                // Inner bytes are proto-encoded (e.g. contentType = protobuf). Decode using
-                // the Namespace-specific proto decoder.
-                let json_val = proto::decode_namespace_proto(&env.raw).ok_or_else(|| {
-                    Status::bad_request(
-                        "unsupported protobuf body: could not decode as Namespace".into(),
-                    )
-                })?;
-                Object { body: json_val }
+                // Inner bytes are proto-encoded. kubectl sends contentType="" (empty) with a
+                // proto-encoded Namespace in Unknown.raw — not JSON. Decode using the
+                // Namespace-specific proto decoder; fall back to JSON only if proto fails.
+                match proto::decode_namespace_proto(&env.raw) {
+                    Some(json_val) => Object { body: json_val },
+                    None => Object::from_bytes(&bytes::Bytes::from(env.raw))
+                        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?,
+                }
             }
             None => {
                 // Not a valid k8s proto envelope — fall back to raw JSON parse.

@@ -25,6 +25,9 @@ pub struct ProtoEnvelope {
     /// The content type of the raw bytes (field 4), e.g. "application/json" or
     /// "application/vnd.kubernetes.protobuf". Empty string if the field was absent.
     pub content_type: String,
+    /// The Kubernetes kind extracted from the TypeMeta (field 1 of the envelope), e.g.
+    /// "Namespace" or "ConfigMap". Empty string if absent.
+    pub kind: String,
 }
 
 /// Attempt to decode the Kubernetes protobuf envelope and return both the raw payload and its
@@ -39,30 +42,25 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
     let proto_bytes = &body[4..];
     let mut raw: Option<Vec<u8>> = None;
     let mut content_type = String::new();
+    let mut kind = String::new();
     scan_length_delimited_fields(proto_bytes, |field_number, data| {
         match field_number {
+            1 => {
+                // TypeMeta: field 1 = apiVersion (string), field 2 = kind (string)
+                scan_length_delimited_fields(data, |f, d| {
+                    if f == 2 {
+                        kind = String::from_utf8_lossy(d).into_owned();
+                    }
+                });
+            }
             2 => raw = Some(data.to_vec()),
             4 => content_type = String::from_utf8_lossy(data).into_owned(),
             _ => {}
         }
     })?;
-    Some(ProtoEnvelope { raw: raw?, content_type })
+    Some(ProtoEnvelope { raw: raw?, content_type, kind })
 }
 
-/// Attempt to decode a Kubernetes protobuf body and extract the embedded raw payload.
-///
-/// Returns `Some(bytes)` when the body starts with the k8s magic prefix and contains
-/// a decodable `Unknown.raw` field (field 2). Returns `None` otherwise — the caller
-/// should treat the body as-is (e.g. plain JSON).
-pub fn decode_k8s_proto(body: &[u8]) -> Option<Vec<u8>> {
-    // Must start with the 4-byte magic.
-    if body.len() < 4 || &body[..4] != K8S_PROTO_MAGIC {
-        return None;
-    }
-
-    let proto_bytes = &body[4..];
-    extract_field2(proto_bytes)
-}
 
 /// Decode a proto-encoded Namespace object into a `serde_json::Value`.
 ///
@@ -162,6 +160,115 @@ pub fn decode_namespace_proto(data: &[u8]) -> Option<serde_json::Value> {
         "kind": "Namespace",
         "metadata": meta
     }))
+}
+
+/// Decode a proto-encoded ConfigMap object into a `serde_json::Value`.
+///
+/// ConfigMap proto layout (k8s.io/api/core/v1/generated.proto):
+///   field 1 (ObjectMeta, wire 2): metadata
+///   field 2 (map<string,string> data, wire 2 repeated): data entries
+///   field 3 (map<string,string> binaryData, wire 2 repeated): ignored
+///   field 4 (bool immutable, wire 0): ignored
+///
+/// Map entries use the same two-field sub-message format as Namespace labels/annotations:
+///   field 1 = key (string), field 2 = value (string).
+pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let mut meta = serde_json::json!({ "creationTimestamp": null });
+    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut cm_data: Option<serde_json::Map<String, serde_json::Value>> = None;
+
+    scan_length_delimited_fields(data, |field_number, field_data| {
+        match field_number {
+            1 => {
+                // ObjectMeta — same layout as in decode_namespace_proto
+                scan_mixed_fields(field_data, |fn2, wt, fd| {
+                    match (fn2, wt) {
+                        (1, 2) => {
+                            meta["name"] = serde_json::Value::String(String::from_utf8_lossy(fd).into_owned());
+                        }
+                        (2, 2) => {
+                            let s = String::from_utf8_lossy(fd).into_owned();
+                            if !s.is_empty() {
+                                meta["generateName"] = serde_json::Value::String(s);
+                            }
+                        }
+                        (3, 2) => {
+                            let s = String::from_utf8_lossy(fd).into_owned();
+                            if !s.is_empty() {
+                                meta["namespace"] = serde_json::Value::String(s);
+                            }
+                        }
+                        (5, 2) => {
+                            let s = String::from_utf8_lossy(fd).into_owned();
+                            if !s.is_empty() {
+                                meta["uid"] = serde_json::Value::String(s);
+                            }
+                        }
+                        (6, 2) => {
+                            let s = String::from_utf8_lossy(fd).into_owned();
+                            if !s.is_empty() {
+                                meta["resourceVersion"] = serde_json::Value::String(s);
+                            }
+                        }
+                        (11, 2) => {
+                            if let Some((k, v)) = decode_map_entry(fd) {
+                                labels
+                                    .get_or_insert_with(serde_json::Map::new)
+                                    .insert(k, serde_json::Value::String(v));
+                            }
+                        }
+                        (12, 2) => {
+                            if let Some((k, v)) = decode_map_entry(fd) {
+                                annotations
+                                    .get_or_insert_with(serde_json::Map::new)
+                                    .insert(k, serde_json::Value::String(v));
+                            }
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            2 => {
+                // data map entry
+                if let Some((k, v)) = decode_map_entry(field_data) {
+                    cm_data
+                        .get_or_insert_with(serde_json::Map::new)
+                        .insert(k, serde_json::Value::String(v));
+                }
+            }
+            _ => {} // binaryData, immutable: ignored
+        }
+    })?;
+
+    if let Some(l) = labels {
+        meta["labels"] = serde_json::Value::Object(l);
+    }
+    if let Some(a) = annotations {
+        meta["annotations"] = serde_json::Value::Object(a);
+    }
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": meta
+    });
+    if let Some(d) = cm_data {
+        obj["data"] = serde_json::Value::Object(d);
+    }
+    Some(obj)
+}
+
+/// Decode a proto-encoded core Kubernetes object by kind.
+///
+/// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
+/// known types; `None` for unknown kinds or malformed input.
+pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::Value> {
+    match kind {
+        "Namespace" => decode_namespace_proto(raw),
+        "ConfigMap" => decode_configmap_proto(raw),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,59 +385,6 @@ fn decode_map_entry(data: &[u8]) -> Option<(String, String)> {
     Some((key, value))
 }
 
-/// Scan `data` for a length-delimited field with field number 2 (tag byte 0x12) and return its
-/// contents. Unknown fields are skipped using their wire type. Returns `None` if field 2 is not
-/// found or the data is malformed.
-fn extract_field2(mut data: &[u8]) -> Option<Vec<u8>> {
-    while !data.is_empty() {
-        let (tag, rest) = decode_varint(data)?;
-        data = rest;
-
-        let field_number = tag >> 3;
-        let wire_type = tag & 0x7;
-
-        match wire_type {
-            0 => {
-                // varint — consume and discard
-                let (_, rest) = decode_varint(data)?;
-                data = rest;
-            }
-            1 => {
-                // 64-bit — consume 8 bytes
-                if data.len() < 8 {
-                    return None;
-                }
-                data = &data[8..];
-            }
-            2 => {
-                // length-delimited
-                let (len, rest) = decode_varint(data)?;
-                let len = len as usize;
-                data = rest;
-                if data.len() < len {
-                    return None;
-                }
-                if field_number == 2 {
-                    return Some(data[..len].to_vec());
-                }
-                data = &data[len..];
-            }
-            5 => {
-                // 32-bit — consume 4 bytes
-                if data.len() < 4 {
-                    return None;
-                }
-                data = &data[4..];
-            }
-            _ => {
-                // Unknown wire type — bail out.
-                return None;
-            }
-        }
-    }
-
-    None // field 2 not found
-}
 
 /// Decode a protobuf varint from the front of `data`.
 /// Returns `Some((value, remaining))` or `None` if the data is too short or the varint
@@ -398,10 +452,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Tests — decode_k8s_proto
+    // Tests — envelope raw field extraction
     // ---------------------------------------------------------------------------
 
-    /// decode_k8s_proto must extract the embedded JSON from a well-formed protobuf body.
+    /// The envelope decoder must extract raw bytes from a well-formed protobuf body.
     /// This is the primary case kubectl triggers: a write request with
     /// Content-Type: application/vnd.kubernetes.protobuf where Unknown.raw contains JSON.
     #[test]
@@ -409,32 +463,32 @@ mod tests {
         let json = br#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"test"}}"#;
         let proto_body = build_k8s_proto(json);
 
-        let result = decode_k8s_proto(&proto_body).expect("must decode successfully");
-        assert_eq!(result, json, "extracted raw must equal the original JSON payload");
+        let result = decode_k8s_proto_envelope(&proto_body).expect("must decode successfully");
+        assert_eq!(result.raw, json, "extracted raw must equal the original JSON payload");
     }
 
-    /// decode_k8s_proto must return None for a body without the magic prefix.
+    /// The envelope decoder must return None for a body without the magic prefix.
     /// Ensures plain JSON bodies are not misinterpreted as protobuf.
     #[test]
     fn returns_none_for_plain_json_body() {
         let json = br#"{"apiVersion":"v1","kind":"Namespace"}"#;
         assert!(
-            decode_k8s_proto(json).is_none(),
+            decode_k8s_proto_envelope(json).is_none(),
             "plain JSON must not match the protobuf magic prefix"
         );
     }
 
-    /// decode_k8s_proto must return None for an empty body.
+    /// The envelope decoder must return None for an empty body.
     #[test]
     fn returns_none_for_empty_body() {
-        assert!(decode_k8s_proto(&[]).is_none());
+        assert!(decode_k8s_proto_envelope(&[]).is_none());
     }
 
-    /// decode_k8s_proto must return None when the body is only the magic prefix with no proto data.
+    /// The envelope decoder must return None when the body is only the magic prefix with no proto data.
     /// This verifies we don't panic on truncated input.
     #[test]
     fn returns_none_for_magic_only_body() {
-        assert!(decode_k8s_proto(K8S_PROTO_MAGIC).is_none());
+        assert!(decode_k8s_proto_envelope(K8S_PROTO_MAGIC).is_none());
     }
 
     /// A proto body with a different field (field 1 only, no field 2) must return None.
@@ -442,11 +496,12 @@ mod tests {
     #[test]
     fn returns_none_when_field2_absent() {
         let mut body = K8S_PROTO_MAGIC.to_vec();
-        // Only encode field 1 (TypeMeta).
-        body.extend_from_slice(&encode_length_delimited(1, b"some-type-meta"));
+        // Only encode field 1 (TypeMeta with no raw field).
+        let type_meta = encode_length_delimited(2, b"Namespace"); // kind only
+        body.extend_from_slice(&encode_length_delimited(1, &type_meta));
         assert!(
-            decode_k8s_proto(&body).is_none(),
-            "must return None when only field 1 is present"
+            decode_k8s_proto_envelope(&body).is_none(),
+            "must return None when only field 1 (TypeMeta) is present and field 2 (raw) is absent"
         );
     }
 
@@ -466,8 +521,10 @@ mod tests {
         let mut body = K8S_PROTO_MAGIC.to_vec();
         body.extend_from_slice(&proto);
 
-        let result = decode_k8s_proto(&body).expect("must decode field 2 even when other fields are present");
-        assert_eq!(result, json);
+        let result = decode_k8s_proto_envelope(&body).expect("must decode field 2 even when other fields are present");
+        assert_eq!(result.raw, json);
+        assert_eq!(result.content_type, "application/json");
+        assert_eq!(result.kind, "Pod");
     }
 
     /// decode_varint must round-trip a single-byte value.
@@ -625,5 +682,99 @@ mod tests {
         assert_eq!(json["metadata"]["name"], "smoke-test", "name must be extracted from proto");
         assert_eq!(json["kind"], "Namespace");
         assert_eq!(json["apiVersion"], "v1");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_configmap_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_configmap_proto must decode a proto-encoded ConfigMap with name, namespace, and data.
+    /// This is the regression test for the smoke CI failure on `kubectl create configmap`.
+    ///
+    /// kubectl sends ConfigMap as a proto-encoded object in Unknown.raw (contentType=""),
+    /// which must be decoded to JSON before being stored. Previously, the server tried to parse
+    /// the proto bytes as JSON, hitting the "control character found" error at the 0x0a byte.
+    #[test]
+    fn decode_configmap_proto_extracts_name_namespace_and_data() {
+        // Build: ObjectMeta { name: "smoke-cm", namespace: "smoke-test" }
+        let mut obj_meta = encode_length_delimited(1, b"smoke-cm"); // field 1 = name
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"smoke-test")); // field 3 = namespace
+        // data map entry (field 2 of ConfigMap): { key="key", value="value" }
+        let mut data_entry = encode_length_delimited(1, b"key");
+        data_entry.extend_from_slice(&encode_length_delimited(2, b"value"));
+
+        let mut configmap_proto = encode_length_delimited(1, &obj_meta); // ObjectMeta
+        configmap_proto.extend_from_slice(&encode_length_delimited(2, &data_entry)); // data entry
+
+        let result = decode_configmap_proto(&configmap_proto).expect("must decode configmap proto");
+
+        assert_eq!(result["kind"], "ConfigMap");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "smoke-cm");
+        assert_eq!(result["metadata"]["namespace"], "smoke-test");
+        assert_eq!(result["data"]["key"], "value");
+        assert!(result["metadata"]["creationTimestamp"].is_null());
+    }
+
+    /// decode_core_proto_by_kind must dispatch to the correct decoder.
+    /// This verifies that extract_body can decode both Namespace and ConfigMap by kind.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_correctly() {
+        let mut obj_meta = encode_length_delimited(1, b"test-ns"); // name
+        let namespace_proto = encode_length_delimited(1, &obj_meta);
+        let ns_json = decode_core_proto_by_kind("Namespace", &namespace_proto)
+            .expect("Namespace must decode");
+        assert_eq!(ns_json["kind"], "Namespace");
+        assert_eq!(ns_json["metadata"]["name"], "test-ns");
+
+        obj_meta = encode_length_delimited(1, b"test-cm"); // name
+        let configmap_proto = encode_length_delimited(1, &obj_meta);
+        let cm_json = decode_core_proto_by_kind("ConfigMap", &configmap_proto)
+            .expect("ConfigMap must decode");
+        assert_eq!(cm_json["kind"], "ConfigMap");
+        assert_eq!(cm_json["metadata"]["name"], "test-cm");
+
+        // Unknown kind returns None
+        assert!(decode_core_proto_by_kind("Pod", &namespace_proto).is_none());
+    }
+
+    /// Full round-trip for ConfigMap: kubectl create configmap sends a k8s proto envelope
+    /// where Unknown.raw is a proto-encoded ConfigMap and contentType is empty.
+    /// This is the regression test for the smoke CI failure on ConfigMap creation.
+    #[test]
+    fn full_kubectl_create_configmap_smoke_regression() {
+        // Build: ObjectMeta { name: "smoke-cm", namespace: "smoke-test" }
+        let mut obj_meta = encode_length_delimited(1, b"smoke-cm");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"smoke-test"));
+        obj_meta.extend_from_slice(&encode_length_delimited(8, &[])); // creationTimestamp
+
+        let mut data_entry = encode_length_delimited(1, b"key");
+        data_entry.extend_from_slice(&encode_length_delimited(2, b"value"));
+
+        let mut configmap_proto = encode_length_delimited(1, &obj_meta);
+        configmap_proto.extend_from_slice(&encode_length_delimited(2, &data_entry));
+
+        // Wrap in k8s Unknown envelope with empty contentType (as kubectl sends)
+        let type_meta: Vec<u8> = {
+            let mut t = encode_length_delimited(1, b"v1");
+            t.extend_from_slice(&encode_length_delimited(2, b"ConfigMap"));
+            t
+        };
+        let mut unknown = encode_length_delimited(1, &type_meta); // TypeMeta
+        unknown.extend_from_slice(&encode_length_delimited(2, &configmap_proto)); // raw
+        // contentType field 4 is absent (empty = kubectl behavior)
+
+        let mut body = K8S_PROTO_MAGIC.to_vec();
+        body.extend_from_slice(&unknown);
+
+        let env = decode_k8s_proto_envelope(&body).expect("envelope decode must succeed");
+        assert_eq!(env.kind, "ConfigMap");
+        assert_eq!(env.content_type, "", "kubectl sends empty contentType for core types");
+
+        let json = decode_core_proto_by_kind(&env.kind, &env.raw)
+            .expect("ConfigMap proto decode must succeed");
+        assert_eq!(json["kind"], "ConfigMap");
+        assert_eq!(json["metadata"]["name"], "smoke-cm");
+        assert_eq!(json["data"]["key"], "value");
     }
 }
