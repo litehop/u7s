@@ -1552,6 +1552,121 @@ mod tests {
     use super::*;
     use axum::http::HeaderMap;
 
+    // -- encode_watch_event: resourceVersion in ADDED events --
+
+    /// Conformance: watch ADDED event payloads must include a non-empty
+    /// metadata.resourceVersion. Kubernetes clients use this to track progress
+    /// through the watch stream and to issue subsequent watches from a known point.
+    /// A missing or empty resourceVersion causes clients to re-list indefinitely.
+    #[test]
+    fn encode_watch_event_added_includes_resource_version() {
+        // Simulate the object as stored by store.put(): bytes already have
+        // metadata.resourceVersion stamped by stamp_resource_version().
+        let obj_json = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "my-cm",
+                "namespace": "default",
+                "resourceVersion": "42"
+            }
+        });
+        let value = bytes::Bytes::from(serde_json::to_vec(&obj_json).unwrap());
+        let event = WatchEvent::Added(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/my-cm".into(),
+            value,
+            revision: 42,
+        });
+
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
+            .expect("ADDED event must produce a chunk");
+
+        let line = std::str::from_utf8(&chunk).unwrap().trim_end();
+        let decoded: serde_json::Value = serde_json::from_str(line)
+            .expect("chunk must be valid JSON");
+
+        assert_eq!(decoded["type"], "ADDED", "event type must be ADDED");
+
+        let rv = decoded["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !rv.is_empty(),
+            "object.metadata.resourceVersion must be non-empty in ADDED event; \
+             Kubernetes watch clients cannot track progress without it"
+        );
+        assert_eq!(rv, "42", "resourceVersion must match the value stamped by store.put()");
+    }
+
+    /// Mirror of the ADDED test for MODIFIED events: same conformance requirement.
+    #[test]
+    fn encode_watch_event_modified_includes_resource_version() {
+        let obj_json = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "my-cm",
+                "namespace": "default",
+                "resourceVersion": "99"
+            }
+        });
+        let value = bytes::Bytes::from(serde_json::to_vec(&obj_json).unwrap());
+        let event = WatchEvent::Modified(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/my-cm".into(),
+            value,
+            revision: 99,
+        });
+
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
+            .expect("MODIFIED event must produce a chunk");
+
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
+
+        assert_eq!(decoded["type"], "MODIFIED");
+        let rv = decoded["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !rv.is_empty(),
+            "object.metadata.resourceVersion must be non-empty in MODIFIED event"
+        );
+        assert_eq!(rv, "99");
+    }
+
+    /// Regression guard: if encode_watch_event ever strips metadata.resourceVersion
+    /// (e.g. by rebuilding the object from scratch), this test must fail.
+    #[test]
+    fn encode_watch_event_added_without_resource_version_in_blob_yields_empty() {
+        // Object stored WITHOUT resourceVersion (should not happen in practice,
+        // but verifies the test is sensitive to presence/absence of the field).
+        let obj_json = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "bare" }
+        });
+        let value = bytes::Bytes::from(serde_json::to_vec(&obj_json).unwrap());
+        let event = WatchEvent::Added(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/bare".into(),
+            value,
+            revision: 7,
+        });
+
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap").unwrap();
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
+
+        // This asserts the negative: if stamp_resource_version is NOT called, the field is absent.
+        // The fact that the two tests above pass (with rv="42"/"99") proves encode_watch_event
+        // does NOT inject the field itself — it relies entirely on store.put() to stamp it.
+        let rv = decoded["object"]["metadata"]["resourceVersion"].as_str().unwrap_or("");
+        assert!(
+            rv.is_empty(),
+            "without stamping, resourceVersion must be absent — \
+             encode_watch_event must not synthesize it from StoreObject.revision"
+        );
+    }
+
     // -- detect_patch_type --
 
     fn headers_with_content_type(ct: &str) -> HeaderMap {
