@@ -799,10 +799,7 @@ mod tests {
         use tokio::time::{Duration, timeout};
         timeout(
             Duration::from_secs(2),
-            poll_fn(|cx| {
-                use std::task::Poll;
-                stream.as_mut().poll_next(cx)
-            }),
+            poll_fn(|cx| stream.as_mut().poll_next(cx)),
         )
         .await
         .ok()
