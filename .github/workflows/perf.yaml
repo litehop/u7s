@@ -23,3 +23,20 @@ jobs:
         with:
           name: perf-server-log
           path: /tmp/u7s-bench-*/server.log
+
+  bench-rss-load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+
+      - name: RSS load benchmark
+        run: bash scripts/bench-rss-load.sh
+
+      - name: Upload perf results on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: perf-load-server-log
+          path: /tmp/u7s-bench-load-*/server.log

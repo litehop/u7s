@@ -1,5 +1,6 @@
 mod auth;
 mod handlers;
+mod inflight;
 mod keys;
 mod patch;
 mod proto;
@@ -20,6 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use u7s_store::SqliteStore;
 
 use auth::{AuthLayer, PeerCertificate};
+use inflight::InflightLayer;
 use state::AppState;
 use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
 
@@ -123,13 +125,15 @@ async fn main() -> anyhow::Result<()> {
     // 9a. Populate RBAC index from persisted objects before serving.
     state.init().await;
 
-    // 10. Build axum router and attach the auth tower layer.
+    // 10. Build axum router and attach tower layers.
+    //     Order (outermost first): inflight → auth → handler.
     let app = build_router(state.clone())
         .layer(AuthLayer::new(
             Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
-        ));
+        ))
+        .layer(InflightLayer::new());
 
     // 11. Bind TLS listener and serve.
     let listener = TcpListener::bind(&args.listen).await?;
