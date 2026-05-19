@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -8,7 +8,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store, StoreError};
 
-use crate::{state::AppState, status::Status, util::utc_now_rfc3339};
+use crate::{state::AppState, status::Status, util::{extract_body, utc_now_rfc3339}};
 
 const GROUP: &str = "apiextensions.k8s.io";
 const PLURAL: &str = "customresourcedefinitions";
@@ -164,8 +164,11 @@ pub async fn list_crds(
 
 pub async fn create_crd(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut crd = parse_crd(&body)?;
 
     let name = crd.metadata.name.clone();
@@ -218,8 +221,11 @@ pub async fn get_crd(
 pub async fn replace_crd(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut crd = parse_crd(&body)?;
 
     if crd.metadata.name != name {
@@ -418,7 +424,7 @@ mod tests {
         let name = "applications.argoproj.io";
         let body = minimal_crd_bytes(name);
 
-        assert!(create_crd(State(state.clone()), body).await.is_ok(), "create must succeed");
+        assert!(create_crd(State(state.clone()), HeaderMap::new(), body).await.is_ok(), "create must succeed");
 
         let resp = match get_crd(State(state), Path(name.to_string())).await {
             Ok(r) => r,
@@ -435,11 +441,11 @@ mod tests {
         let body = minimal_crd_bytes(name);
 
         assert!(
-            create_crd(State(state.clone()), body.clone()).await.is_ok(),
+            create_crd(State(state.clone()), HeaderMap::new(), body.clone()).await.is_ok(),
             "first create must succeed"
         );
 
-        let err = err_status(create_crd(State(state), body).await);
+        let err = err_status(create_crd(State(state), HeaderMap::new(), body).await);
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 409);
         assert_eq!(json["reason"], "AlreadyExists");
@@ -474,7 +480,7 @@ mod tests {
         let state = make_state();
         let body = minimal_crd_bytes("missing.example.com");
         let err = err_status(
-            replace_crd(State(state), Path("missing.example.com".to_string()), body).await,
+            replace_crd(State(state), Path("missing.example.com".to_string()), HeaderMap::new(), body).await,
         );
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 404);
@@ -514,7 +520,7 @@ mod tests {
             }
         }).to_string());
 
-        let err = err_status(create_crd(State(state), body).await);
+        let err = err_status(create_crd(State(state), HeaderMap::new(), body).await);
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 422, "mismatched name must return 422");
         assert!(
@@ -544,7 +550,7 @@ mod tests {
         }).to_string());
 
         assert!(
-            create_crd(State(state), body).await.is_ok(),
+            create_crd(State(state), HeaderMap::new(), body).await.is_ok(),
             "correct name widgets.example.io must be accepted"
         );
     }

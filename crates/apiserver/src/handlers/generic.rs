@@ -341,7 +341,7 @@ fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
     }
 }
 
-use crate::util::utc_now_rfc3339;
+use crate::util::{extract_body, utc_now_rfc3339};
 
 const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
 
@@ -450,14 +450,18 @@ pub async fn get_resource(
 pub async fn create_resource(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
             return super::cr::create_cr(
                 State(state),
                 Path((group, version, plural)),
+                headers,
                 body,
             )
             .await
@@ -500,14 +504,18 @@ pub async fn create_resource(
 pub async fn replace_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
             return super::cr::replace_cr(
                 State(state),
                 Path((group, version, plural, name)),
+                headers,
                 body,
             )
             .await
@@ -784,14 +792,18 @@ pub async fn get_namespaced_resource(
 pub async fn create_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
             return super::cr::create_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural)),
+                headers,
                 body,
             )
             .await
@@ -836,14 +848,18 @@ pub async fn create_namespaced_resource(
 pub async fn replace_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
             return super::cr::replace_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
+                headers,
                 body,
             )
             .await
@@ -1050,10 +1066,12 @@ pub async fn get_resource_status(
 pub async fn put_resource_status(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let meta = lookup(&state, &group, &version, &plural)?.clone();
-
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let incoming = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -1143,10 +1161,12 @@ pub async fn get_namespaced_resource_status(
 pub async fn put_namespaced_resource_status(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let meta = lookup(&state, &group, &version, &plural)?.clone();
-
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let incoming = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -1288,17 +1308,19 @@ pub async fn core_get_resource(
 pub async fn core_create_resource(
     State(state): State<AppState>,
     Path(plural): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    create_resource(State(state), Path(("".into(), "v1".into(), plural)), body).await
+    create_resource(State(state), Path(("".into(), "v1".into(), plural)), headers, body).await
 }
 
 pub async fn core_replace_resource(
     State(state): State<AppState>,
     Path((plural, name)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    replace_resource(State(state), Path(("".into(), "v1".into(), plural, name)), body).await
+    replace_resource(State(state), Path(("".into(), "v1".into(), plural, name)), headers, body).await
 }
 
 pub async fn core_delete_resource(
@@ -1327,9 +1349,10 @@ pub async fn core_get_resource_status(
 pub async fn core_put_resource_status(
     State(state): State<AppState>,
     Path((plural, name)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    put_resource_status(State(state), Path(("".into(), "v1".into(), plural, name)), body).await
+    put_resource_status(State(state), Path(("".into(), "v1".into(), plural, name)), headers, body).await
 }
 
 pub async fn core_patch_resource_status(
@@ -1370,19 +1393,22 @@ pub async fn core_get_namespaced_resource(
 pub async fn core_create_namespaced_resource(
     State(state): State<AppState>,
     Path((ns, plural)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    create_namespaced_resource(State(state), Path(("".into(), "v1".into(), ns, plural)), body).await
+    create_namespaced_resource(State(state), Path(("".into(), "v1".into(), ns, plural)), headers, body).await
 }
 
 pub async fn core_replace_namespaced_resource(
     State(state): State<AppState>,
     Path((ns, plural, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     replace_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
+        headers,
         body,
     )
     .await
@@ -1424,11 +1450,13 @@ pub async fn core_get_namespaced_resource_status(
 pub async fn core_put_namespaced_resource_status(
     State(state): State<AppState>,
     Path((ns, plural, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     put_namespaced_resource_status(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
+        headers,
         body,
     )
     .await

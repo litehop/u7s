@@ -11,7 +11,7 @@ use crate::{
     handlers::crd::CustomResourceDefinition,
     state::AppState,
     status::Status,
-    util::utc_now_rfc3339,
+    util::{extract_body, utc_now_rfc3339},
 };
 
 const CRD_LIST_PREFIX: &str = "/registry/apiextensions.k8s.io/customresourcedefinitions/";
@@ -202,6 +202,7 @@ pub async fn get_cr(
 pub async fn create_cr(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
@@ -213,6 +214,8 @@ pub async fn create_cr(
         ));
     }
 
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -238,6 +241,7 @@ pub async fn create_cr(
 pub async fn replace_cr(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
@@ -246,6 +250,8 @@ pub async fn replace_cr(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -398,6 +404,7 @@ pub async fn get_cr_namespaced(
 pub async fn create_cr_namespaced(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
@@ -409,6 +416,8 @@ pub async fn create_cr_namespaced(
         ));
     }
 
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -435,6 +444,7 @@ pub async fn create_cr_namespaced(
 pub async fn replace_cr_namespaced(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
@@ -443,6 +453,8 @@ pub async fn replace_cr_namespaced(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -734,7 +746,7 @@ mod tests {
     async fn install_namespaced_crd(state: &AppState) {
         use crate::handlers::crd;
         assert!(
-            crd::create_crd(State(state.clone()), namespaced_crd_bytes()).await.is_ok(),
+            crd::create_crd(State(state.clone()), axum::http::HeaderMap::new(), namespaced_crd_bytes()).await.is_ok(),
             "install namespaced CRD"
         );
     }
@@ -742,7 +754,7 @@ mod tests {
     async fn install_cluster_crd(state: &AppState) {
         use crate::handlers::crd;
         assert!(
-            crd::create_crd(State(state.clone()), cluster_crd_bytes()).await.is_ok(),
+            crd::create_crd(State(state.clone()), axum::http::HeaderMap::new(), cluster_crd_bytes()).await.is_ok(),
             "install cluster CRD"
         );
     }
@@ -781,6 +793,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
             .await
@@ -888,6 +901,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
             .await
@@ -899,6 +913,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group, version, ns.clone(), plural)),
+                axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
             .await,
@@ -946,6 +961,7 @@ mod tests {
             create_cr(
                 State(state.clone()),
                 Path(("example.io".to_string(), "v1".to_string(), "widgets".to_string())),
+                axum::http::HeaderMap::new(),
                 widget_body("my-widget"),
             )
             .await
@@ -985,6 +1001,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
                 app_body("app-one", &ns),
             )
             .await
@@ -1020,6 +1037,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
             .await
@@ -1067,6 +1085,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
             .await
