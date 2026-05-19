@@ -232,6 +232,26 @@ fn atv_string(value: &x509_cert::der::Any) -> Option<String> {
     }
 }
 
+/// Validate a raw bearer token string against the static map and SA JWT key.
+///
+/// Returns `Some(UserInfo)` if the token is recognized, `None` if it is not.
+/// This is exposed for use by the TokenReview handler.
+pub fn authenticate_token(
+    token: &str,
+    token_map: &HashMap<String, UserInfo>,
+    sa_decoding_key: Option<&DecodingKey>,
+) -> Option<UserInfo> {
+    if let Some(info) = token_map.get(token) {
+        return Some(info.clone());
+    }
+    if let Some(key) = sa_decoding_key {
+        if let Some(user) = try_verify_sa_jwt(token, key) {
+            return Some(user);
+        }
+    }
+    None
+}
+
 /// Attempt to decode and verify a bearer token as an RS256 SA JWT.
 /// Returns `Some(UserInfo)` on success, `None` if the token is invalid.
 fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {

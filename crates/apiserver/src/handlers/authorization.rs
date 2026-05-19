@@ -160,6 +160,137 @@ pub async fn self_subject_rules_review(
 }
 
 // ---------------------------------------------------------------------------
+// SubjectAccessReview
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct SubjectAccessReviewRequest {
+    spec: SubjectAccessReviewSpec,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubjectAccessReviewSpec {
+    #[serde(default)]
+    user: String,
+    #[serde(default)]
+    groups: Vec<String>,
+    resource_attributes: Option<ResourceAttributes>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubjectAccessReviewResponse {
+    api_version: &'static str,
+    kind: &'static str,
+    status: AccessReviewStatus,
+}
+
+pub async fn subject_access_review(
+    State(state): State<AppState>,
+    Json(body): Json<SubjectAccessReviewRequest>,
+) -> impl IntoResponse {
+    let spec = body.spec;
+    let allowed = if let Some(attrs) = spec.resource_attributes {
+        let ns = if attrs.namespace.is_empty() { None } else { Some(attrs.namespace.as_str()) };
+        let name = if attrs.name.is_empty() { None } else { Some(attrs.name.as_str()) };
+
+        state.rbac_index.is_allowed(&AuthzRequest {
+            username: &spec.user,
+            groups: &spec.groups,
+            verb: &attrs.verb,
+            api_group: &attrs.group,
+            resource: &attrs.resource,
+            subresource: &attrs.subresource,
+            namespace: ns,
+            name,
+        })
+    } else {
+        false
+    };
+
+    let resp = SubjectAccessReviewResponse {
+        api_version: "authorization.k8s.io/v1",
+        kind: "SubjectAccessReview",
+        status: AccessReviewStatus { allowed },
+    };
+
+    (StatusCode::CREATED, Json(resp))
+}
+
+// ---------------------------------------------------------------------------
+// TokenReview
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct TokenReviewRequest {
+    spec: TokenReviewSpec,
+}
+
+#[derive(Deserialize)]
+struct TokenReviewSpec {
+    #[serde(default)]
+    token: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenReviewResponse {
+    api_version: &'static str,
+    kind: &'static str,
+    status: TokenReviewStatus,
+}
+
+#[derive(Serialize)]
+struct TokenReviewStatus {
+    authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<TokenReviewUser>,
+}
+
+#[derive(Serialize)]
+struct TokenReviewUser {
+    username: String,
+    uid: String,
+    groups: Vec<String>,
+}
+
+pub async fn token_review(
+    State(state): State<AppState>,
+    Json(body): Json<TokenReviewRequest>,
+) -> impl IntoResponse {
+    let token = body.spec.token;
+    let user_info = crate::auth::authenticate_token(
+        &token,
+        &state.token_map,
+        state.sa_decoding_key.as_deref(),
+    );
+
+    let status = match user_info {
+        Some(u) => TokenReviewStatus {
+            authenticated: true,
+            user: Some(TokenReviewUser {
+                username: u.username,
+                uid: u.uid,
+                groups: u.groups,
+            }),
+        },
+        None => TokenReviewStatus {
+            authenticated: false,
+            user: None,
+        },
+    };
+
+    let resp = TokenReviewResponse {
+        api_version: "authentication.k8s.io/v1",
+        kind: "TokenReview",
+        status,
+    };
+
+    (StatusCode::CREATED, Json(resp))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -277,5 +408,113 @@ mod tests {
             namespace: Some("default"),
             name: None,
         }));
+    }
+
+    // ---------------------------------------------------------------------------
+    // SubjectAccessReview tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_subject_access_review_allowed_for_bound_user() {
+        // SubjectAccessReview must honor the `user` field from the request body,
+        // not the calling user's identity. This is the key difference from
+        // SelfSubjectAccessReview — it checks an arbitrary named subject.
+        let idx = Arc::new(make_index_with_cluster_role_binding(
+            json!([{
+                "apiGroups": ["apps"],
+                "resources": ["deployments"],
+                "verbs": ["list"]
+            }]),
+            "argocd-bot",
+        ));
+        let groups: Vec<String> = vec![];
+
+        assert!(
+            idx.is_allowed(&AuthzRequest {
+                username: "argocd-bot",
+                groups: &groups,
+                verb: "list",
+                api_group: "apps",
+                resource: "deployments",
+                subresource: "",
+                namespace: None,
+                name: None,
+            }),
+            "argocd-bot must be allowed to list deployments per its binding"
+        );
+        assert!(
+            !idx.is_allowed(&AuthzRequest {
+                username: "other-user",
+                groups: &groups,
+                verb: "list",
+                api_group: "apps",
+                resource: "deployments",
+                subresource: "",
+                namespace: None,
+                name: None,
+            }),
+            "a different user must not inherit argocd-bot's permissions"
+        );
+    }
+
+    #[test]
+    fn test_subject_access_review_system_masters_group_bypasses_rbac() {
+        // A request whose groups include system:masters must always be allowed,
+        // matching the same bypass used everywhere in the RBAC stack.
+        let idx = Arc::new(RbacIndex::new()); // no bindings at all
+        let groups = vec!["system:masters".to_owned()];
+
+        assert!(
+            idx.is_allowed(&AuthzRequest {
+                username: "any-user",
+                groups: &groups,
+                verb: "delete",
+                api_group: "",
+                resource: "secrets",
+                subresource: "",
+                namespace: Some("kube-system"),
+                name: None,
+            }),
+            "system:masters group must bypass RBAC regardless of bindings"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // TokenReview tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_authenticate_token_static_map_match() {
+        // A token present in the static map must resolve to the correct UserInfo.
+        // This is the primary use-case for TokenReview with --token-auth-file.
+        use crate::auth::{authenticate_token, UserInfo};
+        use std::collections::HashMap;
+
+        let mut map = HashMap::new();
+        map.insert(
+            "argocd-token".to_owned(),
+            UserInfo {
+                username: "argocd-admin".to_owned(),
+                uid: "42".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+            },
+        );
+
+        let result = authenticate_token("argocd-token", &map, None);
+        let user = result.expect("known token must resolve to a user");
+        assert_eq!(user.username, "argocd-admin");
+        assert!(user.groups.contains(&"system:authenticated".to_owned()));
+    }
+
+    #[test]
+    fn test_authenticate_token_unknown_returns_none() {
+        // An unrecognized token must return None — TokenReview will respond with
+        // authenticated: false. A bad token must NEVER return a user.
+        use crate::auth::authenticate_token;
+        use std::collections::HashMap;
+
+        let map = HashMap::new();
+        let result = authenticate_token("unknown-token", &map, None);
+        assert!(result.is_none(), "unrecognized token must not authenticate");
     }
 }

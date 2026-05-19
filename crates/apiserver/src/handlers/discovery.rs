@@ -441,7 +441,7 @@ mod tests {
 
     fn make_state() -> AppState {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        AppState::new(store, None, None, "https://localhost:6443".into())
+        AppState::new(store, None, None, std::collections::HashMap::new(), "https://localhost:6443".into())
     }
 
     fn crd_bytes(group: &str, plural: &str, singular: &str, kind: &str, scope: &str, version: &str) -> Bytes {
