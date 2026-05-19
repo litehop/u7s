@@ -130,7 +130,7 @@ fn parse_key_name_ns(key: &str) -> (&str, &str) {
 
 /// Stream watch events for a given store prefix in NDJSON format.
 /// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
-async fn watch_generic(
+pub(crate) async fn watch_generic(
     state: AppState,
     prefix: String,
     api_version: String,
@@ -370,6 +370,7 @@ pub async fn list_resource(
             return super::cr::list_cr(
                 State(state),
                 Path((group, version, plural)),
+                query,
             )
             .await;
         }
@@ -712,6 +713,7 @@ pub async fn list_namespaced_resource(
             return super::cr::list_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural)),
+                query,
             )
             .await;
         }

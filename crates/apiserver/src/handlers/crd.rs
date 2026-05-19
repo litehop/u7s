@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -138,8 +138,21 @@ fn to_bytes(crd: &CustomResourceDefinition) -> Bytes {
 
 pub async fn list_crds(
     State(state): State<AppState>,
+    Query(query): Query<super::generic::CollectionQuery>,
 ) -> Result<Response, crate::status::StatusError> {
     let prefix = list_prefix();
+
+    if query.watch == Some(true) {
+        return super::generic::watch_generic(
+            state,
+            prefix,
+            API_VERSION.to_string(),
+            KIND.to_string(),
+            query.resource_version.unwrap_or(0),
+        )
+        .await;
+    }
+
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -490,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn list_empty() {
         let state = make_state();
-        let resp = match list_crds(State(state)).await {
+        let resp = match list_crds(State(state), Query(crate::handlers::generic::CollectionQuery { watch: None, resource_version: None, label_selector: None })).await {
             Ok(r) => r,
             Err(_) => panic!("list must succeed"),
         };
@@ -552,6 +565,33 @@ mod tests {
         assert!(
             create_crd(State(state), HeaderMap::new(), body).await.is_ok(),
             "correct name widgets.example.io must be accepted"
+        );
+    }
+
+    // When ?watch=true, list_crds must route to the watch stream (chunked transfer)
+    // rather than returning a normal CustomResourceDefinitionList. This verifies that
+    // clients watching /apis/apiextensions.k8s.io/v1/customresourcedefinitions get a
+    // streaming response.
+    #[tokio::test]
+    async fn list_crds_watch_returns_chunked_stream() {
+        let state = make_state();
+        let query = Query(crate::handlers::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            label_selector: None,
+        });
+
+        let resp = match list_crds(State(state), query).await {
+            Ok(r) => r,
+            Err(_) => panic!("watch must not error"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        // watch_generic always sets transfer-encoding: chunked
+        assert_eq!(
+            resp.headers().get("transfer-encoding").and_then(|v| v.to_str().ok()),
+            Some("chunked"),
+            "watch response must use chunked transfer encoding"
         );
     }
 }
