@@ -230,6 +230,18 @@ fn build_router(state: AppState) -> Router {
                 .patch(handlers::generic::core_patch_namespaced_resource_status),
         )
 
+        // CRDs — cluster-scoped, specific paths before generic catch-all
+        .route(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
+            get(handlers::crd::list_crds).post(handlers::crd::create_crd),
+        )
+        .route(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/:name",
+            get(handlers::crd::get_crd)
+                .put(handlers::crd::replace_crd)
+                .delete(handlers::crd::delete_crd),
+        )
+
         // Authorization reviews (specific paths before generic catch-all)
         .route(
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",

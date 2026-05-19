@@ -1803,6 +1803,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "u7s-controller-manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "u7s-mcp-server"
 version = "0.1.0"
 dependencies = [

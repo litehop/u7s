@@ -22,6 +22,7 @@ pub async fn api_v1_resources() -> Json<ApiResourceList> {
 
 pub async fn api_group_list() -> Json<APIGroupList> {
     let groups = vec![
+        make_group("apiextensions.k8s.io", "v1"),
         make_group("apps", "v1"),
         make_group("authentication.k8s.io", "v1"),
         make_group("authorization.k8s.io", "v1"),
@@ -58,6 +59,7 @@ pub async fn api_group_resources(
     Path((group, version)): Path<(String, String)>,
 ) -> Response {
     let list = match (group.as_str(), version.as_str()) {
+        ("apiextensions.k8s.io", "v1") => apiextensions_v1_resources(),
         ("apps", "v1") => apps_v1_resources(),
         ("authentication.k8s.io", "v1") => authn_v1_resources(),
         ("authorization.k8s.io", "v1") => authz_v1_resources(),
@@ -83,6 +85,24 @@ pub async fn api_group_resources(
 // ---------------------------------------------------------------------------
 // Static resource lists
 // ---------------------------------------------------------------------------
+
+fn apiextensions_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "apiextensions.k8s.io/v1",
+        "resources": [
+            {
+                "name": "customresourcedefinitions",
+                "singularName": "customresourcedefinition",
+                "namespaced": false,
+                "kind": "CustomResourceDefinition",
+                "shortNames": ["crd", "crds"],
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
 
 fn apps_v1_resources() -> serde_json::Value {
     serde_json::json!({
