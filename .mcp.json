@@ -11,6 +11,11 @@
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-git", "--repository", "."]
     },
+    "rust": {
+      "type": "stdio",
+      "command": "rust-mcp-server",
+      "args": ["--workspace", "/Users/balint.erdos/u7s"]
+    },
     "u7s": {
       "type": "stdio",
       "command": "cargo",

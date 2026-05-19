@@ -4,6 +4,7 @@
     "allow": [
       "mcp__github__*",
       "mcp__git__*",
+      "mcp__rust__*",
       "Bash(cargo *)",
       "Bash(bd *)",
       "Bash(git *)",
