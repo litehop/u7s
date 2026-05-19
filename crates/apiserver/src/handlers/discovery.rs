@@ -98,6 +98,15 @@ fn apps_v1_resources() -> serde_json::Value {
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
+                "name": "deployments/scale",
+                "singularName": "",
+                "namespaced": true,
+                "kind": "Scale",
+                "group": "autoscaling",
+                "version": "v1",
+                "verbs": ["get", "patch", "update"]
+            },
+            {
                 "name": "replicasets",
                 "singularName": "replicaset",
                 "namespaced": true,
@@ -105,11 +114,29 @@ fn apps_v1_resources() -> serde_json::Value {
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
+                "name": "replicasets/scale",
+                "singularName": "",
+                "namespaced": true,
+                "kind": "Scale",
+                "group": "autoscaling",
+                "version": "v1",
+                "verbs": ["get", "patch", "update"]
+            },
+            {
                 "name": "statefulsets",
                 "singularName": "statefulset",
                 "namespaced": true,
                 "kind": "StatefulSet",
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "statefulsets/scale",
+                "singularName": "",
+                "namespaced": true,
+                "kind": "Scale",
+                "group": "autoscaling",
+                "version": "v1",
+                "verbs": ["get", "patch", "update"]
             }
         ]
     })
