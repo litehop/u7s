@@ -77,26 +77,26 @@ jobs:
           echo "$CA_DATA" | base64 -d > "$TMPDIR/ca.pem"
           echo "SMOKE_CA_PEM=$TMPDIR/ca.pem" >> "$GITHUB_ENV"
           echo "SMOKE_TOKEN=$SMOKE_TOKEN" >> "$GITHUB_ENV"
-          # Heredoc lines must start at column 0 to produce valid YAML.
-          cat > "$TMPDIR/kubeconfig" <<KUBECFG
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://127.0.0.1:6443
-    certificate-authority-data: $CA_DATA
-  name: u7s
-contexts:
-- context:
-    cluster: u7s
-    user: smoke-admin
-  name: u7s
-current-context: u7s
-users:
-- name: smoke-admin
-  user:
-    token: $SMOKE_TOKEN
-KUBECFG
+          # Write token-based kubeconfig with printf to avoid heredoc/YAML nesting issues.
+          printf '%s\n' \
+            'apiVersion: v1' \
+            'kind: Config' \
+            'clusters:' \
+            '- cluster:' \
+            '    server: https://127.0.0.1:6443' \
+            "    certificate-authority-data: $CA_DATA" \
+            '  name: u7s' \
+            'contexts:' \
+            '- context:' \
+            '    cluster: u7s' \
+            '    user: smoke-admin' \
+            '  name: u7s' \
+            'current-context: u7s' \
+            'users:' \
+            '- name: smoke-admin' \
+            '  user:' \
+            "    token: $SMOKE_TOKEN" \
+            > "$TMPDIR/kubeconfig"
 
       - name: Smoke — namespace CRUD
         env:
