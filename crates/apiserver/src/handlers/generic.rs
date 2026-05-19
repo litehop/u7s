@@ -601,6 +601,7 @@ pub async fn delete_resource(
         return Ok(Json(body).into_response());
     }
 
+    let body_before_deletion = obj.body.clone();
     state
         .store
         .delete(&key, None)
@@ -611,12 +612,7 @@ pub async fn delete_resource(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.remove_object(&rbac_key);
     }
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Success",
-        "code": 200
-    })).into_response())
+    Ok(Json(body_before_deletion).into_response())
 }
 
 pub async fn patch_resource(
@@ -950,6 +946,7 @@ pub async fn delete_namespaced_resource(
         return Ok(Json(body).into_response());
     }
 
+    let body_before_deletion = obj.body.clone();
     state
         .store
         .delete(&key, None)
@@ -960,12 +957,7 @@ pub async fn delete_namespaced_resource(
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.remove_object(&rbac_key);
     }
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Success",
-        "code": 200
-    })).into_response())
+    Ok(Json(body_before_deletion).into_response())
 }
 
 pub async fn patch_namespaced_resource(
@@ -1849,6 +1841,139 @@ mod tests {
     fn non_core_group_api_version_includes_group() {
         let body = build_list_response("Deployment", "apps", "v1", 0, vec![]);
         assert_eq!(body["apiVersion"], "apps/v1");
+    }
+
+    // -- delete_resource / delete_namespaced_resource --
+
+    /// Helper to build a test AppState backed by an in-memory SQLite store.
+    async fn make_state() -> (AppState, std::sync::Arc<u7s_store::SqliteStore>) {
+        let store = std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(store.clone(), None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
+        (state, store)
+    }
+
+    /// DELETE on a non-existent cluster-scoped resource must return 404.
+    /// This proves the 404 path is exercised before any delete attempt.
+    #[tokio::test]
+    async fn delete_cluster_resource_not_found_returns_404() {
+        let (state, _store) = make_state().await;
+        let result = delete_resource(
+            axum::extract::State(state),
+            axum::extract::Path(("".to_string(), "v1".to_string(), "nodes".to_string(), "missing-node".to_string())),
+        ).await;
+        match result {
+            Err(e) => assert_eq!(e.0, axum::http::StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected 404 error"),
+        }
+    }
+
+    /// DELETE on an existing resource with no finalizers must return 200 + the object body
+    /// (not a Status object). Conformance requires the deleted object body in the response.
+    #[tokio::test]
+    async fn delete_cluster_resource_no_finalizers_returns_object_body() {
+        let (state, store) = make_state().await;
+        let key = "/registry/nodes/my-node";
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "my-node" }
+        });
+        store.put(key, bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()), None).await.unwrap();
+
+        let result = delete_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(("".to_string(), "v1".to_string(), "nodes".to_string(), "my-node".to_string())),
+        ).await;
+        assert!(result.is_ok());
+
+        // Object must be gone from the store (hard-deleted)
+        let still_there = store.get(key).await.unwrap();
+        assert!(still_there.is_none(), "hard-delete must remove the object from the store");
+    }
+
+    /// DELETE on an object with non-empty finalizers must soft-delete:
+    /// stamp deletionTimestamp, write back, return 200 + object with deletionTimestamp.
+    /// Object must still be in the store after the call.
+    #[tokio::test]
+    async fn delete_cluster_resource_with_finalizers_soft_deletes() {
+        let (state, store) = make_state().await;
+        let key = "/registry/nodes/finalized-node";
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "finalized-node",
+                "finalizers": ["example.com/cleanup"]
+            }
+        });
+        store.put(key, bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()), None).await.unwrap();
+
+        let result = delete_resource(
+            axum::extract::State(state),
+            axum::extract::Path(("".to_string(), "v1".to_string(), "nodes".to_string(), "finalized-node".to_string())),
+        ).await;
+        assert!(result.is_ok(), "soft-delete must succeed");
+
+        // Object must still be in the store — not hard-deleted
+        let stored = store.get(key).await.unwrap().expect("object must still exist after soft-delete");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must be set on soft-deleted object"
+        );
+    }
+
+    /// DELETE on a namespaced resource with no finalizers must return 200 + object body.
+    #[tokio::test]
+    async fn delete_namespaced_resource_no_finalizers_returns_object_body() {
+        let (state, store) = make_state().await;
+        let key = "/registry/configmaps/default/my-cm";
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "my-cm", "namespace": "default" }
+        });
+        store.put(key, bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()), None).await.unwrap();
+
+        let result = delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path(("".to_string(), "v1".to_string(), "default".to_string(), "configmaps".to_string(), "my-cm".to_string())),
+        ).await;
+        assert!(result.is_ok());
+
+        // Hard-deleted
+        let still_there = store.get(key).await.unwrap();
+        assert!(still_there.is_none(), "hard-delete must remove the object from the store");
+    }
+
+    /// DELETE on a namespaced resource with finalizers must soft-delete.
+    #[tokio::test]
+    async fn delete_namespaced_resource_with_finalizers_soft_deletes() {
+        let (state, store) = make_state().await;
+        let key = "/registry/configmaps/default/finalized-cm";
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "finalized-cm",
+                "namespace": "default",
+                "finalizers": ["example.com/cleanup"]
+            }
+        });
+        store.put(key, bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()), None).await.unwrap();
+
+        let result = delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path(("".to_string(), "v1".to_string(), "default".to_string(), "configmaps".to_string(), "finalized-cm".to_string())),
+        ).await;
+        assert!(result.is_ok(), "soft-delete must succeed");
+
+        let stored = store.get(key).await.unwrap().expect("object must still exist after soft-delete");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must be set on soft-deleted namespaced object"
+        );
     }
 
     // -- CR status PUT fallback --

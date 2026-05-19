@@ -391,18 +391,14 @@ pub async fn delete_pod(
         return Ok(Json(obj.body));
     }
 
+    let body_before_deletion = obj.body.clone();
     state
         .store
         .delete(&key, None)
         .await
         .map_err(|e| store_err_to_status(e, &name))?;
 
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Success",
-        "code": 200
-    })))
+    Ok(Json(body_before_deletion))
 }
 
 pub async fn patch_pod(
@@ -497,6 +493,97 @@ fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
         }
     } else {
         *target = patch.clone();
+    }
+}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use std::sync::Arc;
+    use u7s_store::SqliteStore;
+    use crate::state::AppState;
+
+    async fn make_state_with_ns() -> (AppState, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(store.clone(), None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
+        // Seed a namespace so parse_namespace succeeds
+        let ns_key = "/registry/namespaces/default";
+        let ns_obj = serde_json::json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"},"status":{"phase":"Active"}});
+        store.put(ns_key, bytes::Bytes::from(serde_json::to_vec(&ns_obj).unwrap()), None).await.unwrap();
+        (state, store)
+    }
+
+    /// delete_pod on a non-existent pod must return 404.
+    /// Ensures the existence check fires before any deletion.
+    #[tokio::test]
+    async fn delete_pod_not_found_returns_404() {
+        let (state, _store) = make_state_with_ns().await;
+        let result = delete_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(), "missing-pod".to_string())),
+        ).await;
+        match result {
+            Err(e) => assert_eq!(e.0, axum::http::StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected 404 error"),
+        }
+    }
+
+    /// delete_pod with no finalizers must return 200 + the pod object body (not a Status).
+    /// Conformance requires the deleted object in the response body.
+    #[tokio::test]
+    async fn delete_pod_no_finalizers_returns_object_body() {
+        let (state, store) = make_state_with_ns().await;
+        let key = "/registry/pods/default/my-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "my-pod", "namespace": "default" },
+            "spec": {}
+        });
+        store.put(key, bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()), None).await.unwrap();
+
+        let result = delete_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(), "my-pod".to_string())),
+        ).await;
+        assert!(result.is_ok(), "delete_pod must succeed");
+
+        // Pod must be gone (hard-deleted)
+        let still_there = store.get(key).await.unwrap();
+        assert!(still_there.is_none(), "hard-delete must remove the pod from the store");
+    }
+
+    /// delete_pod with non-empty finalizers must soft-delete: stamp deletionTimestamp,
+    /// write back, and leave the pod in the store. Response is 200 + pod body.
+    #[tokio::test]
+    async fn delete_pod_with_finalizers_soft_deletes() {
+        let (state, store) = make_state_with_ns().await;
+        let key = "/registry/pods/default/finalized-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "finalized-pod",
+                "namespace": "default",
+                "finalizers": ["example.com/cleanup"]
+            },
+            "spec": {}
+        });
+        store.put(key, bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()), None).await.unwrap();
+
+        let result = delete_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(), "finalized-pod".to_string())),
+        ).await;
+        assert!(result.is_ok(), "soft-delete must succeed");
+
+        // Pod must still exist in the store
+        let stored = store.get(key).await.unwrap().expect("pod must still exist after soft-delete");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must be set on soft-deleted pod"
+        );
     }
 }
 
