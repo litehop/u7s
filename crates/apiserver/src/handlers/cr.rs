@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -529,6 +529,147 @@ pub async fn delete_cr_namespaced(
 }
 
 // ---------------------------------------------------------------------------
+// Patch helpers
+// ---------------------------------------------------------------------------
+
+fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
+        for (k, v) in p {
+            if v.is_null() {
+                t.remove(k);
+            } else if v.is_object() {
+                let entry = t
+                    .entry(k)
+                    .or_insert(serde_json::Value::Object(Default::default()));
+                merge_patch(entry, v);
+            } else {
+                t.insert(k.clone(), v.clone());
+            }
+        }
+    } else {
+        *target = patch.clone();
+    }
+}
+
+fn validate_patch_content_type(headers: &HeaderMap) -> Result<(), crate::status::StatusError> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if content_type.contains("application/strategic-merge-patch+json") {
+        return Err(Status::bad_request(
+            "strategic merge patch not supported in Phase 1; use application/merge-patch+json"
+                .into(),
+        ));
+    }
+
+    if !content_type.contains("application/merge-patch+json") {
+        return Err(Status::unsupported_media_type(format!(
+            "unsupported media type '{content_type}'; use application/merge-patch+json"
+        )));
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cluster-scoped CR patch handler
+// ---------------------------------------------------------------------------
+
+pub async fn patch_cr(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_patch_content_type(&headers)?;
+
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+
+    if ctx.namespaced {
+        return Err(Status::not_found(&name, &ctx.kind));
+    }
+
+    let key = cr_store_key(&group, &version, &plural, None, &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    merge_patch(&mut obj, &patch);
+
+    let new_rv = state
+        .store
+        .put(
+            &key,
+            Bytes::from(serde_json::to_vec(&obj).unwrap()),
+            Some(stored.revision),
+        )
+        .await
+        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+
+    obj["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+    Ok(Json(obj))
+}
+
+// ---------------------------------------------------------------------------
+// Namespaced CR patch handler
+// ---------------------------------------------------------------------------
+
+pub async fn patch_cr_namespaced(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_patch_content_type(&headers)?;
+
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+
+    if !ctx.namespaced {
+        return Err(Status::not_found(&name, &ctx.kind));
+    }
+
+    let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    merge_patch(&mut obj, &patch);
+
+    let new_rv = state
+        .store
+        .put(
+            &key,
+            Bytes::from(serde_json::to_vec(&obj).unwrap()),
+            Some(stored.revision),
+        )
+        .await
+        .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+
+    obj["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+    Ok(Json(obj))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -912,5 +1053,129 @@ mod tests {
 
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 404);
+    }
+
+    // PATCH applies the merge patch to the stored CR and returns 200 with the updated object.
+    // This verifies that patch_cr_namespaced correctly mutates the stored value.
+    #[tokio::test]
+    async fn patch_cr_namespaced_applies_merge_patch() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "patch-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!({ "spec": { "color": "red" } }).to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let result = patch_cr_namespaced(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), ns.clone(), plural.clone(), name.clone())),
+            headers,
+            patch_body,
+        )
+        .await;
+        assert!(result.is_ok(), "patch must succeed");
+
+        // Verify the stored value has color: red under spec.
+        let stored_resp = match get_cr_namespaced(
+            State(state.clone()),
+            Path((group, version, ns, plural, name)),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed after patch"),
+        };
+        assert_eq!(stored_resp.status(), StatusCode::OK);
+    }
+
+    // PATCH on a group with no CRD installed must return 404.
+    // This verifies that patch_cr_namespaced correctly propagates CRD-not-found as 404.
+    #[tokio::test]
+    async fn patch_cr_namespaced_returns_404_for_unknown_group() {
+        let state = make_state();
+
+        let patch_body = Bytes::from(serde_json::json!({ "spec": {} }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "unknown.io".to_string(),
+                    "v1".to_string(),
+                    "default".to_string(),
+                    "things".to_string(),
+                    "my-thing".to_string(),
+                )),
+                headers,
+                patch_body,
+            )
+            .await,
+            "expected 404 for unknown group",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404, "unknown CRD must return 404");
+        assert_eq!(json["reason"], "NotFound");
+    }
+
+    // PATCH with Content-Type: application/json must return 415 Unsupported Media Type.
+    // This verifies that the content-type guard fires before any store access.
+    #[tokio::test]
+    async fn patch_cr_namespaced_rejects_wrong_content_type() {
+        let state = make_state();
+
+        let patch_body = Bytes::from(serde_json::json!({ "spec": {} }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let err = expect_err_status(
+            patch_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    "argocd".to_string(),
+                    "applications".to_string(),
+                    "my-app".to_string(),
+                )),
+                headers,
+                patch_body,
+            )
+            .await,
+            "expected 415 for wrong content type",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 415, "wrong content type must return 415");
     }
 }

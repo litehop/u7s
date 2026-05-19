@@ -616,8 +616,20 @@ pub async fn patch_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
     validate_patch_content_type(&headers)?;
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::patch_cr(
+                State(state),
+                Path((group, version, plural, name)),
+                headers,
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
 
     let key = group_object_key(&group, &plural, None, &name);
     let stored = state
@@ -659,7 +671,7 @@ pub async fn patch_resource(
             let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
             state.rbac_index.remove_object(&rbac_key);
         }
-        return Ok(Json(current.body));
+        return Ok(Json(current.body).into_response());
     }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
@@ -674,7 +686,7 @@ pub async fn patch_resource(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &current.body);
     }
-    Ok(Json(current.body))
+    Ok(Json(current.body).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -938,8 +950,20 @@ pub async fn patch_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
     validate_patch_content_type(&headers)?;
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::patch_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural, name)),
+                headers,
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let stored = state
@@ -981,7 +1005,7 @@ pub async fn patch_namespaced_resource(
             let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
             state.rbac_index.remove_object(&rbac_key);
         }
-        return Ok(Json(current.body));
+        return Ok(Json(current.body).into_response());
     }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
@@ -996,7 +1020,7 @@ pub async fn patch_namespaced_resource(
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &current.body);
     }
-    Ok(Json(current.body))
+    Ok(Json(current.body).into_response())
 }
 
 // ---------------------------------------------------------------------------
