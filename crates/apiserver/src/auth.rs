@@ -1,7 +1,8 @@
 // Authentication + Authorization tower middleware layer.
 //
-// Implements static bearer-token authentication (--token-auth-file)
-// and RS256 JWT verification for service-account tokens.
+// Implements static bearer-token authentication (--token-auth-file),
+// RS256 JWT verification for service-account tokens, and x509 client
+// certificate authentication.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -19,6 +20,15 @@ use tower_service::Service;
 
 use crate::rbac::{AuthzRequest, RbacIndex};
 use crate::status::Status;
+
+// ---------------------------------------------------------------------------
+// PeerCertificate — DER bytes of the TLS client certificate leaf cert
+// ---------------------------------------------------------------------------
+
+/// DER-encoded bytes of the leaf client certificate presented during TLS
+/// handshake. Injected into request extensions by `serve_tls` in main.rs.
+#[derive(Clone, Debug)]
+pub struct PeerCertificate(pub Vec<u8>);
 
 // ---------------------------------------------------------------------------
 // UserInfo
@@ -101,12 +111,19 @@ fn authenticate(
     req: &Request<Body>,
     token_map: &HashMap<String, UserInfo>,
     sa_decoding_key: Option<&DecodingKey>,
+    peer_cert: Option<&PeerCertificate>,
 ) -> AuthnResult {
     let auth_header = req.headers().get("authorization");
 
     match auth_header {
         None => {
-            // No Authorization header → anonymous.
+            // No Authorization header — try x509 client cert before anonymous fallback.
+            if let Some(cert) = peer_cert {
+                if let Some(user) = try_verify_client_cert(&cert.0) {
+                    return AuthnResult::Identified(user);
+                }
+            }
+            // No credential at all → anonymous.
             AuthnResult::Identified(UserInfo {
                 username: "system:anonymous".to_owned(),
                 uid: String::new(),
@@ -133,6 +150,85 @@ fn authenticate(
                 AuthnResult::BadToken
             }
         }
+    }
+}
+
+/// Parse a DER-encoded X.509 client certificate and extract subject CN and O
+/// fields as username and groups respectively.
+///
+/// Returns `None` if the certificate cannot be parsed or has no CN field.
+/// The certificate is assumed to already be verified (rustls checked the
+/// signature and chain during TLS handshake).
+pub fn try_verify_client_cert(der: &[u8]) -> Option<UserInfo> {
+    use x509_cert::Certificate;
+    use x509_cert::der::Decode as _;
+
+    let cert = Certificate::from_der(der)
+        .map_err(|e| tracing::debug!("x509 cert parse failed: {e}"))
+        .ok()?;
+
+    let subject = &cert.tbs_certificate.subject;
+
+    let mut username = None;
+    let mut groups = Vec::new();
+
+    // OIDs for subject attributes relevant to Kubernetes auth:
+    //   CN (CommonName)       = 2.5.4.3
+    //   O  (OrganizationName) = 2.5.4.10
+    const OID_CN: &str = "2.5.4.3";
+    const OID_O: &str  = "2.5.4.10";
+
+    for rdn in subject.0.iter() {
+        for atv in rdn.0.iter() {
+            let oid_str = atv.oid.to_string();
+            if oid_str != OID_CN && oid_str != OID_O {
+                continue;
+            }
+            // Decode the Any value as one of the legal string types for subject
+            // attributes.  Try UTF8String first (most common in modern certs),
+            // then PrintableString, then IA5String.
+            let value = atv_string(&atv.value);
+            let Some(value) = value else { continue };
+
+            if oid_str == OID_CN {
+                username = Some(value);
+            } else {
+                groups.push(value);
+            }
+        }
+    }
+
+    let username = username?;
+    tracing::debug!("x509 auth: username={username} groups={groups:?}");
+    Some(UserInfo {
+        username,
+        uid: String::new(),
+        groups,
+    })
+}
+
+/// Decode a DER `Any` value as a UTF-8 string by trying the common string
+/// types used in X.509 subject distinguished names.
+fn atv_string(value: &x509_cert::der::Any) -> Option<String> {
+    use x509_cert::der::{Tag, Tagged as _};
+
+    match value.tag() {
+        Tag::Utf8String => {
+            value.decode_as::<x509_cert::der::asn1::Utf8StringRef<'_>>()
+                .ok()
+                .map(|s| s.as_str().to_owned())
+        }
+        Tag::PrintableString => {
+            value.decode_as::<x509_cert::der::asn1::PrintableStringRef<'_>>()
+                .ok()
+                .map(|s| s.as_str().to_owned())
+        }
+        Tag::Ia5String => {
+            value.decode_as::<x509_cert::der::asn1::Ia5StringRef<'_>>()
+                .ok()
+                .map(|s| s.as_str().to_owned())
+        }
+        _ => None,
     }
 }
 
@@ -362,7 +458,13 @@ where
         }
 
         // 1. Authenticate.
-        let user = match authenticate(&req, &self.token_map, self.sa_decoding_key.as_deref()) {
+        let peer_cert = req.extensions().get::<PeerCertificate>().cloned();
+        let user = match authenticate(
+            &req,
+            &self.token_map,
+            self.sa_decoding_key.as_deref(),
+            peer_cert.as_ref(),
+        ) {
             AuthnResult::Identified(u) => u,
             AuthnResult::BadToken => {
                 return Box::pin(async move { Ok(unauthorized_response()) });
@@ -416,6 +518,25 @@ mod tests {
         b.body(Body::empty()).unwrap()
     }
 
+    /// Generate a DER cert with given CN and org using rcgen.
+    fn make_cert_der(cn: &str, orgs: &[&str]) -> Vec<u8> {
+        use rcgen::{CertificateParams, KeyPair};
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        for org in orgs {
+            params.distinguished_name.push(rcgen::DnType::OrganizationName, *org);
+        }
+        let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
+        cert.der().to_vec()
+    }
+
     // --- authenticate() ---
 
     #[test]
@@ -423,7 +544,7 @@ mod tests {
         // Without an Authorization header, caller must be anonymous.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        let result = authenticate(&req, &map, None);
+        let result = authenticate(&req, &map, None, None);
         match result {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:anonymous");
@@ -446,7 +567,7 @@ mod tests {
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
-        match authenticate(&req, &map, None) {
+        match authenticate(&req, &map, None, None) {
             AuthnResult::Identified(u) => assert_eq!(u.username, "alice"),
             AuthnResult::BadToken => panic!("expected Identified"),
         }
@@ -459,7 +580,7 @@ mod tests {
         // silently downgraded to anonymous access.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer wrong-token"));
-        match authenticate(&req, &map, None) {
+        match authenticate(&req, &map, None, None) {
             AuthnResult::BadToken => {}
             AuthnResult::Identified(_) => panic!("unknown token must not succeed"),
         }
@@ -578,7 +699,7 @@ mod tests {
         let (enc, dec) = test_rsa_keypair();
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
         let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
-        match authenticate(&req, &HashMap::new(), Some(&dec)) {
+        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:serviceaccount:default:my-sa");
                 assert!(
@@ -599,7 +720,7 @@ mod tests {
         let len = token.len();
         token.replace_range(len - 8.., "AAAAAAAA");
         let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
-        match authenticate(&req, &HashMap::new(), Some(&dec)) {
+        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("tampered JWT must not succeed"),
         }
@@ -611,7 +732,7 @@ mod tests {
         let (enc, dec) = test_rsa_keypair();
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", -1);
         let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
-        match authenticate(&req, &HashMap::new(), Some(&dec)) {
+        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("expired JWT must not succeed"),
         }
@@ -625,7 +746,7 @@ mod tests {
         let (_enc2, dec2) = test_rsa_keypair();
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
         let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
-        match authenticate(&req, &HashMap::new(), Some(&dec2)) {
+        match authenticate(&req, &HashMap::new(), Some(&dec2), None) {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("JWT from wrong key must not succeed"),
         }
@@ -643,11 +764,81 @@ mod tests {
         let (enc, dec) = test_rsa_keypair();
         // Use a static token string — not a JWT — to confirm static path fires.
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer static-tok"));
-        match authenticate(&req, &map, Some(&dec)) {
+        match authenticate(&req, &map, Some(&dec), None) {
             AuthnResult::Identified(u) => assert_eq!(u.username, "static-user"),
             AuthnResult::BadToken => panic!("static token must resolve"),
         }
         // Suppress unused warning in test context.
         let _ = enc;
+    }
+
+    // --- x509 client certificate authentication ---
+
+    #[test]
+    fn test_x509_cert_cn_becomes_username() {
+        // The CN field of the subject must become the username.
+        // This is the core Kubernetes x509 auth mapping.
+        let der = make_cert_der("alice", &[]);
+        let user = try_verify_client_cert(&der).expect("must parse cert");
+        assert_eq!(user.username, "alice");
+        assert!(user.groups.is_empty());
+    }
+
+    #[test]
+    fn test_x509_cert_org_becomes_groups() {
+        // The O fields of the subject must become the groups list.
+        // system:masters in O grants cluster-admin equivalent via RBAC.
+        let der = make_cert_der("admin", &["system:masters"]);
+        let user = try_verify_client_cert(&der).expect("must parse cert");
+        assert_eq!(user.username, "admin");
+        assert!(
+            user.groups.contains(&"system:masters".to_owned()),
+            "system:masters must be in groups"
+        );
+    }
+
+    #[test]
+    fn test_x509_cert_no_org_means_empty_groups() {
+        // A cert with no O fields must produce an empty groups list.
+        // The parser must not panic or return an error for a valid cert.
+        let der = make_cert_der("alice", &[]);
+        let user = try_verify_client_cert(&der).expect("must parse cert");
+        assert_eq!(user.username, "alice");
+        assert!(user.groups.is_empty());
+    }
+
+    #[test]
+    fn test_x509_cert_injected_into_authn_no_header() {
+        // When no Authorization header is present but a PeerCertificate is
+        // available, the caller must be identified via x509 — not as anonymous.
+        let der = make_cert_der("alice", &["system:masters"]);
+        let cert = PeerCertificate(der);
+        let map = HashMap::new();
+        let req = make_req(Method::GET, "/api/v1/pods", None);
+        match authenticate(&req, &map, None, Some(&cert)) {
+            AuthnResult::Identified(u) => {
+                assert_eq!(u.username, "alice");
+                assert!(u.groups.contains(&"system:masters".to_owned()));
+            }
+            AuthnResult::BadToken => panic!("valid client cert must identify caller"),
+        }
+    }
+
+    #[test]
+    fn test_x509_auth_does_not_override_bearer_token() {
+        // A bearer token in Authorization must take priority over a client
+        // cert; the caller explicitly chose token auth.
+        let mut map = HashMap::new();
+        map.insert(
+            "tok".to_owned(),
+            UserInfo { username: "bob".to_owned(), uid: "1".to_owned(), groups: vec![] },
+        );
+        let der = make_cert_der("alice", &["system:masters"]);
+        let cert = PeerCertificate(der);
+        let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer tok"));
+        match authenticate(&req, &map, None, Some(&cert)) {
+            AuthnResult::Identified(u) => assert_eq!(u.username, "bob"),
+            AuthnResult::BadToken => panic!("static token must resolve"),
+        }
     }
 }

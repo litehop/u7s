@@ -1,5 +1,6 @@
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
-use rustls::{ServerConfig, pki_types::{CertificateDer, PrivateKeyDer}};
+use rustls::{RootCertStore, ServerConfig, pki_types::{CertificateDer, PrivateKeyDer}};
+use rustls::server::WebPkiClientVerifier;
 use std::sync::Arc;
 
 use crate::Args;
@@ -120,8 +121,18 @@ pub fn generate_tls(_args: &Args) -> anyhow::Result<TlsMaterial> {
     ];
     let server_key_der = PrivateKeyDer::try_from(server_key.serialize_der())
         .map_err(|e| anyhow::anyhow!("key error: {e}"))?;
+
+    // Enable mTLS: request (but don't require) client certs.
+    // Clients that present a cert signed by our CA will be authenticated via x509.
+    // Clients without a cert fall through to other auth mechanisms (tokens, anonymous).
+    let mut root_store = RootCertStore::empty();
+    root_store.add(CertificateDer::from(ca_cert.der().to_vec()))?;
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| anyhow::anyhow!("client verifier: {e}"))?;
     let server_config = ServerConfig::builder()
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_verifier)
         .with_single_cert(server_cert_chain, server_key_der)?;
 
     Ok(TlsMaterial {

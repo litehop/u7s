@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use u7s_store::SqliteStore;
 
-use auth::AuthLayer;
+use auth::{AuthLayer, PeerCertificate};
 use state::AppState;
 use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
 
@@ -337,10 +337,28 @@ async fn serve_tls(
                 Ok(s) => s,
                 Err(e) => { tracing::warn!("TLS accept error: {e}"); return; }
             };
+
+            // Extract the peer certificate once per connection, then share it
+            // across all requests on this connection via an Arc.
+            let peer_cert: Arc<Option<PeerCertificate>> = Arc::new(
+                tls_stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certs| certs.first())
+                    .map(|c| PeerCertificate(c.as_ref().to_vec())),
+            );
+
             let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let service = hyper::service::service_fn(move |req| {
+            let service = hyper::service::service_fn(move |mut req: axum::http::Request<_>| {
+                let peer_cert = Arc::clone(&peer_cert);
                 let mut app = app.clone();
-                async move { Ok::<_, std::convert::Infallible>(app.call(req).await.unwrap()) }
+                async move {
+                    if let Some(cert) = peer_cert.as_ref().as_ref() {
+                        req.extensions_mut().insert(cert.clone());
+                    }
+                    Ok::<_, std::convert::Infallible>(app.call(req).await.unwrap())
+                }
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
