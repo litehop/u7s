@@ -10,6 +10,7 @@ use serde::Deserialize;
 use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
 
 use crate::{
+    handlers::generic::parse_resource_version,
     keys::{cluster_object_key, list_prefix, object_key},
     state::AppState,
     status::Status,
@@ -163,15 +164,18 @@ async fn watch_pods(
     // The body stream yields Result<Bytes, BoxError> items.
     // We transform WatchEvent items into NDJSON chunks.
     // A periodic bookmark is sent every 60 s if no other events fire.
+    // Max watch duration: 5 minutes per the Kubernetes spec default.
     let chunk_stream = async_stream::stream! {
         use futures_core::Stream;
         use std::pin::pin;
-        use tokio::time::{Duration, interval};
+        use tokio::time::{Duration, interval, sleep};
 
         let mut event_stream = pin!(event_stream);
         let mut bookmark_tick = interval(Duration::from_secs(60));
         // Skip the first immediate tick so we don't send a bookmark before any events.
         bookmark_tick.tick().await;
+
+        let mut max_duration = pin!(sleep(Duration::from_secs(5 * 60)));
 
         // Track the most recently seen revision for bookmark emission.
         let mut last_rv: u64 = from_revision;
@@ -231,6 +235,15 @@ async fn watch_pods(
                         "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
                     );
                     yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                }
+
+                _ = &mut max_duration => {
+                    // Max watch duration reached — send a final BOOKMARK and close gracefully.
+                    let bookmark = format!(
+                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                    );
+                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    break;
                 }
             }
         }
@@ -321,16 +334,7 @@ pub async fn replace_pod(
         )));
     }
 
-    let expected_revision = match obj.resource_version() {
-        None | Some("") => None,
-        Some("0") => Some(0),
-        Some(rv) => {
-            let parsed = rv
-                .parse::<u64>()
-                .map_err(|_| Status::bad_request(format!("invalid resourceVersion: {rv}")))?;
-            Some(parsed)
-        }
-    };
+    let expected_revision = parse_resource_version(obj.resource_version())?;
 
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state
@@ -372,13 +376,7 @@ pub async fn delete_pod(
         // Soft delete: stamp deletionTimestamp and write back.
         obj.body["metadata"]["deletionTimestamp"] =
             serde_json::Value::String(utc_now_rfc3339());
-        let expected_rv = match obj.resource_version() {
-            None | Some("") => None,
-            Some("0") => Some(0),
-            Some(rv) => Some(rv.parse::<u64>().map_err(|_| {
-                Status::bad_request(format!("invalid resourceVersion: {rv}"))
-            })?),
-        };
+        let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
             .store
             .put(&key, obj.to_bytes(), expected_rv)
@@ -463,16 +461,7 @@ pub async fn patch_pod(
     }
 
     // Extract expected revision from current object (after patch may have changed it)
-    let expected_revision = match current_obj.resource_version() {
-        None | Some("") => None,
-        Some("0") => Some(0),
-        Some(rv) => {
-            let parsed = rv.parse::<u64>().map_err(|_| {
-                Status::bad_request(format!("invalid resourceVersion in patched object: {rv}"))
-            })?;
-            Some(parsed)
-        }
-    };
+    let expected_revision = parse_resource_version(current_obj.resource_version())?;
 
     let new_rv = state
         .store
@@ -485,43 +474,7 @@ pub async fn patch_pod(
     Ok(Json(current_obj.body))
 }
 
-/// Returns the current UTC time as an RFC3339 string (`YYYY-MM-DDThh:mm:ssZ`).
-/// Uses only `std::time` — no chrono dependency.
-fn utc_now_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-
-    let (year, month, day) = {
-        let mut d = days;
-        let n400 = d / 146097; d %= 146097;
-        let n100 = (d / 36524).min(3); d -= n100 * 36524;
-        let n4 = d / 1461; d %= 1461;
-        let n1 = (d / 365).min(3); d -= n1 * 365;
-        let year = n400 * 400 + n100 * 100 + n4 * 4 + n1 + 1970;
-        let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-        let month_days: &[u64] = if leap {
-            &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        } else {
-            &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        };
-        let mut month = 0u64;
-        for (i, &md) in month_days.iter().enumerate() {
-            if d < md { month = i as u64 + 1; break; }
-            d -= md;
-        }
-        (year, month, d + 1)
-    };
-
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
-}
+use crate::util::utc_now_rfc3339;
 
 fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
     if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
@@ -700,13 +653,7 @@ pub async fn bind_pod(
 
     obj.body["spec"]["nodeName"] = serde_json::Value::String(node_name);
 
-    let expected_rv = match obj.resource_version() {
-        None | Some("") => None,
-        Some("0") => Some(0),
-        Some(rv) => Some(rv.parse::<u64>().map_err(|_| {
-            Status::bad_request(format!("invalid resourceVersion: {rv}"))
-        })?),
-    };
+    let expected_rv = parse_resource_version(obj.resource_version())?;
 
     let new_rv = state
         .store

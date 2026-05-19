@@ -11,7 +11,7 @@ pub struct ServerAddressByClientCIDR {
     #[serde(rename = "clientCIDR")]
     pub client_cidr: &'static str,
     #[serde(rename = "serverAddress")]
-    pub server_address: &'static str,
+    pub server_address: String,
 }
 
 /// Wire representation of `/api` response.
@@ -22,23 +22,19 @@ pub struct APIVersions {
     pub api_version: &'static str,
     pub versions: &'static [&'static str],
     #[serde(rename = "serverAddressByClientCIDRs")]
-    pub server_address_by_client_cidrs: &'static [ServerAddressByClientCIDR],
+    pub server_address_by_client_cidrs: Vec<ServerAddressByClientCIDR>,
 }
 
-static SERVER_ADDRESS_BY_CLIENT_CIDRS: &[ServerAddressByClientCIDR] = &[
-    ServerAddressByClientCIDR {
-        client_cidr: "0.0.0.0/0",
-        server_address: "https://127.0.0.1:6443",
-    },
-];
-
 impl APIVersions {
-    pub fn v1() -> Self {
+    pub fn v1(server_address: String) -> Self {
         APIVersions {
             kind: "APIVersions",
             api_version: "v1",
             versions: &["v1"],
-            server_address_by_client_cidrs: SERVER_ADDRESS_BY_CLIENT_CIDRS,
+            server_address_by_client_cidrs: vec![ServerAddressByClientCIDR {
+                client_cidr: "0.0.0.0/0",
+                server_address,
+            }],
         }
     }
 }
@@ -66,7 +62,7 @@ pub struct ApiResourceList {
     pub resources: &'static [ApiResource],
 }
 
-static CORE_VERBS: &[&str] = &["create", "delete", "get", "list", "patch", "update"];
+static CORE_VERBS: &[&str] = &["create", "delete", "get", "list", "patch", "update", "watch"];
 static PODS_SHORT_NAMES: &[&str] = &["po"];
 static NODES_SHORT_NAMES: &[&str] = &["no"];
 static SERVICES_SHORT_NAMES: &[&str] = &["svc"];
@@ -87,6 +83,14 @@ static V1_RESOURCES: &[ApiResource] = &[
         singular_name: "event",
         namespaced: true,
         kind: "Event",
+        verbs: CORE_VERBS,
+        short_names: None,
+    },
+    ApiResource {
+        name: "namespaces",
+        singular_name: "namespace",
+        namespaced: false,
+        kind: "Namespace",
         verbs: CORE_VERBS,
         short_names: None,
     },

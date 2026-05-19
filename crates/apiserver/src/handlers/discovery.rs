@@ -1,14 +1,15 @@
 use axum::{
-    extract::Path,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 
+use crate::state::AppState;
 use crate::types::{APIGroup, APIGroupList, APIVersions, ApiResourceList, GroupVersionForDiscovery};
 
-pub async fn api_versions() -> Json<APIVersions> {
-    Json(APIVersions::v1())
+pub async fn api_versions(State(state): State<AppState>) -> Json<APIVersions> {
+    Json(APIVersions::v1(state.server_address.clone()))
 }
 
 pub async fn api_v1_resources() -> Json<ApiResourceList> {
@@ -22,6 +23,8 @@ pub async fn api_v1_resources() -> Json<ApiResourceList> {
 pub async fn api_group_list() -> Json<APIGroupList> {
     let groups = vec![
         make_group("apps", "v1"),
+        make_group("authentication.k8s.io", "v1"),
+        make_group("authorization.k8s.io", "v1"),
         make_group("rbac.authorization.k8s.io", "v1"),
     ];
     Json(APIGroupList {
@@ -56,6 +59,8 @@ pub async fn api_group_resources(
 ) -> Response {
     let list = match (group.as_str(), version.as_str()) {
         ("apps", "v1") => apps_v1_resources(),
+        ("authentication.k8s.io", "v1") => authn_v1_resources(),
+        ("authorization.k8s.io", "v1") => authz_v1_resources(),
         ("rbac.authorization.k8s.io", "v1") => rbac_v1_resources(),
         _ => {
             return (
@@ -90,21 +95,54 @@ fn apps_v1_resources() -> serde_json::Value {
                 "singularName": "deployment",
                 "namespaced": true,
                 "kind": "Deployment",
-                "verbs": ["create", "delete", "get", "list", "patch", "update"]
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "replicasets",
                 "singularName": "replicaset",
                 "namespaced": true,
                 "kind": "ReplicaSet",
-                "verbs": ["create", "delete", "get", "list", "patch", "update"]
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "statefulsets",
                 "singularName": "statefulset",
                 "namespaced": true,
                 "kind": "StatefulSet",
-                "verbs": ["create", "delete", "get", "list", "patch", "update"]
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn authn_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "authentication.k8s.io/v1",
+        "resources": []
+    })
+}
+
+fn authz_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "authorization.k8s.io/v1",
+        "resources": [
+            {
+                "name": "selfsubjectaccessreviews",
+                "singularName": "selfsubjectaccessreview",
+                "namespaced": false,
+                "kind": "SelfSubjectAccessReview",
+                "verbs": ["create"]
+            },
+            {
+                "name": "selfsubjectrulesreviews",
+                "singularName": "selfsubjectrulesreview",
+                "namespaced": false,
+                "kind": "SelfSubjectRulesReview",
+                "verbs": ["create"]
             }
         ]
     })
@@ -121,28 +159,28 @@ fn rbac_v1_resources() -> serde_json::Value {
                 "singularName": "clusterrole",
                 "namespaced": false,
                 "kind": "ClusterRole",
-                "verbs": ["create", "delete", "get", "list", "patch", "update"]
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "clusterrolebindings",
                 "singularName": "clusterrolebinding",
                 "namespaced": false,
                 "kind": "ClusterRoleBinding",
-                "verbs": ["create", "delete", "get", "list", "patch", "update"]
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "roles",
                 "singularName": "role",
                 "namespaced": true,
                 "kind": "Role",
-                "verbs": ["create", "delete", "get", "list", "patch", "update"]
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "rolebindings",
                 "singularName": "rolebinding",
                 "namespaced": true,
                 "kind": "RoleBinding",
-                "verbs": ["create", "delete", "get", "list", "patch", "update"]
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
     })

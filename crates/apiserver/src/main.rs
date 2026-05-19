@@ -7,6 +7,7 @@ mod state;
 mod status;
 mod tls;
 mod types;
+mod util;
 
 use std::sync::Arc;
 
@@ -48,6 +49,11 @@ struct Args {
     /// Path to write the RSA public key (companion to --sa-key).
     #[arg(long, default_value = "./sa.pub")]
     sa_pub: String,
+
+    /// Address advertised to clients in /api discovery (e.g. "https://1.2.3.4:6443").
+    /// Defaults to the listen address, substituting 0.0.0.0 with 127.0.0.1.
+    #[arg(long)]
+    advertise_address: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -95,14 +101,32 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 8. Build app state (shared with the auth layer).
-    let state = AppState::new(Arc::clone(&store), sa_encoding_key);
+    // 8. Compute advertised server address.
+    let server_address = match args.advertise_address {
+        Some(addr) => addr,
+        None => {
+            // When listening on 0.0.0.0, default to loopback so local kubectl works.
+            if args.listen.starts_with("0.0.0.0:") {
+                let port = &args.listen["0.0.0.0:".len()..];
+                format!("https://127.0.0.1:{port}")
+            } else {
+                format!("https://{}", args.listen)
+            }
+        }
+    };
+    tracing::info!("advertised server address: {server_address}");
 
-    // 9. Build axum router and attach the auth tower layer.
+    // 9. Build app state (shared with the auth layer).
+    let state = AppState::new(Arc::clone(&store), sa_encoding_key, server_address);
+
+    // 9a. Populate RBAC index from persisted objects before serving.
+    state.init().await;
+
+    // 10. Build axum router and attach the auth tower layer.
     let app = build_router(state.clone())
         .layer(AuthLayer::new(Arc::clone(&state.rbac_index), token_map));
 
-    // 10. Bind TLS listener and serve.
+    // 11. Bind TLS listener and serve.
     let listener = TcpListener::bind(&args.listen).await?;
     serve_tls(listener, app, tls_material.server_config).await?;
     Ok(())
