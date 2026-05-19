@@ -22,6 +22,52 @@ use crate::{
 pub struct CollectionQuery {
     pub watch: Option<bool>,
     pub resource_version: Option<u64>,
+    pub field_selector: Option<String>,
+}
+
+/// Parse a `fieldSelector` query string and test a pod JSON value against it.
+///
+/// Supported selectors (comma-separated):
+///   spec.nodeName=<value>   — include only if pod's spec.nodeName equals value
+///   spec.nodeName!=<value>  — include only if pod's spec.nodeName does not equal value
+///
+/// An empty or absent selector matches everything (pass-through).
+/// Unknown selector terms are ignored (conservative: don't drop pods on unrecognised fields).
+pub fn filter_pods_by_field_selector(pods: Vec<serde_json::Value>, selector: &str) -> Vec<serde_json::Value> {
+    if selector.is_empty() {
+        return pods;
+    }
+    pods.into_iter()
+        .filter(|pod| pod_matches_field_selector(pod, selector))
+        .collect()
+}
+
+fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
+    for term in selector.split(',') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        if let Some((field, value)) = term.split_once("!=") {
+            if field == "spec.nodeName" {
+                let node_name = pod["spec"]["nodeName"].as_str().unwrap_or("");
+                if node_name == value {
+                    return false;
+                }
+            }
+            // Unknown fields: ignore (don't filter out)
+        } else if let Some((field, value)) = term.split_once('=') {
+            if field == "spec.nodeName" {
+                let node_name = pod["spec"]["nodeName"].as_str().unwrap_or("");
+                if node_name != value {
+                    return false;
+                }
+            }
+            // Unknown fields: ignore (don't filter out)
+        }
+        // Unparseable term: ignore
+    }
+    true
 }
 
 /// Validate a raw namespace string: format check then store lookup.
@@ -64,7 +110,14 @@ pub async fn list_pods(
     let prefix = list_prefix("pods", ns.as_str());
 
     if query.watch == Some(true) {
-        return watch_pods(state, prefix, ns, query.resource_version.unwrap_or(0)).await;
+        return watch_pods(
+            state,
+            prefix,
+            ns,
+            query.resource_version.unwrap_or(0),
+            query.field_selector,
+        )
+        .await;
     }
 
     let resp = state
@@ -79,6 +132,12 @@ pub async fn list_pods(
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(parsed);
     }
+
+    let items = if let Some(ref sel) = query.field_selector {
+        filter_pods_by_field_selector(items, sel)
+    } else {
+        items
+    };
 
     let body = serde_json::json!({
         "kind": "PodList",
@@ -155,6 +214,7 @@ async fn watch_pods(
     prefix: String,
     _ns: Namespace,
     from_revision: u64,
+    field_selector: Option<String>,
 ) -> Result<Response, crate::status::StatusError> {
     let event_stream = state
         .store
@@ -166,6 +226,7 @@ async fn watch_pods(
     // We transform WatchEvent items into NDJSON chunks.
     // A periodic bookmark is sent every 60 s if no other events fire.
     // Max watch duration: 5 minutes per the Kubernetes spec default.
+    let field_selector = field_selector.unwrap_or_default();
     let chunk_stream = async_stream::stream! {
         use futures_core::Stream;
         use std::pin::pin;
@@ -224,8 +285,22 @@ async fn watch_pods(
                                 break;
                             }
 
-                            if let Some(chunk) = encode_watch_event(&event) {
-                                yield Ok::<Bytes, axum::BoxError>(chunk);
+                            // Apply fieldSelector: for Added/Modified, check spec.nodeName.
+                            // Deleted events lack full pod data; pass them through so the
+                            // kubelet can clean up resources it was already tracking.
+                            let skip = !field_selector.is_empty() && match &event {
+                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
+                                    let pod: serde_json::Value =
+                                        serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
+                                    !pod_matches_field_selector(&pod, &field_selector)
+                                }
+                                _ => false,
+                            };
+
+                            if !skip {
+                                if let Some(chunk) = encode_watch_event(&event) {
+                                    yield Ok::<Bytes, axum::BoxError>(chunk);
+                                }
                             }
                         }
                     }
@@ -617,6 +692,7 @@ mod watch_tests {
         let q = CollectionQuery {
             watch: Some(true),
             resource_version: Some(42),
+            field_selector: None,
         };
         assert!(q.watch == Some(true));
         assert_eq!(q.resource_version, Some(42));
@@ -628,9 +704,109 @@ mod watch_tests {
         let q = CollectionQuery {
             watch: None,
             resource_version: None,
+            field_selector: None,
         };
         assert_eq!(q.watch, None);
         assert_eq!(q.resource_version, None);
+    }
+}
+
+#[cfg(test)]
+mod field_selector_tests {
+    use super::*;
+
+    fn pod_with_node(node_name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {"nodeName": node_name}
+        })
+    }
+
+    fn pod_without_node() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "default"},
+            "spec": {}
+        })
+    }
+
+    /// Empty selector is a pass-through: all pods must be returned.
+    /// Kubelet depends on this when fieldSelector is absent.
+    #[test]
+    fn empty_selector_passes_all() {
+        let pods = vec![pod_with_node("worker-1"), pod_with_node("worker-2"), pod_without_node()];
+        let result = filter_pods_by_field_selector(pods.clone(), "");
+        assert_eq!(result.len(), pods.len());
+    }
+
+    /// spec.nodeName=worker-1 must include only pods scheduled to worker-1.
+    /// This is the primary kubelet query: it must receive only its own pods.
+    #[test]
+    fn eq_filter_matches_correct_node() {
+        let pods = vec![
+            pod_with_node("worker-1"),
+            pod_with_node("worker-2"),
+            pod_without_node(),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["nodeName"], "worker-1");
+    }
+
+    /// spec.nodeName=worker-1 must not match a pod on a different node.
+    /// If this fails, kubelet on worker-2 receives worker-1's pods and tries to run them.
+    #[test]
+    fn eq_filter_excludes_wrong_node() {
+        let pods = vec![pod_with_node("worker-2"), pod_without_node()];
+        let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1");
+        assert!(result.is_empty());
+    }
+
+    /// spec.nodeName!=worker-1 must exclude pods on worker-1 and include everything else.
+    #[test]
+    fn ne_filter_excludes_matching_node() {
+        let pods = vec![
+            pod_with_node("worker-1"),
+            pod_with_node("worker-2"),
+            pod_without_node(),
+        ];
+        let result = filter_pods_by_field_selector(pods, "spec.nodeName!=worker-1");
+        assert_eq!(result.len(), 2);
+        for pod in &result {
+            assert_ne!(pod["spec"]["nodeName"].as_str().unwrap_or(""), "worker-1");
+        }
+    }
+
+    /// A pod with no spec.nodeName (empty string) must NOT match spec.nodeName=worker-1.
+    /// Kubelet must not receive unscheduled pods — that was the original bug.
+    #[test]
+    fn eq_filter_excludes_unscheduled_pods() {
+        let pods = vec![pod_without_node()];
+        let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1");
+        assert!(result.is_empty(), "unscheduled pods must not reach the kubelet");
+    }
+
+    /// Unknown selector fields must be ignored (pass-through) rather than dropping pods.
+    /// This is the safe default: conservative filtering prevents silent data loss.
+    #[test]
+    fn unknown_field_is_ignored() {
+        let pods = vec![pod_with_node("worker-1"), pod_with_node("worker-2")];
+        let result = filter_pods_by_field_selector(pods.clone(), "metadata.unknown=foo");
+        assert_eq!(result.len(), pods.len());
+    }
+
+    /// Multiple comma-separated selectors are ANDed together.
+    #[test]
+    fn multiple_terms_are_anded() {
+        // Only worker-1 pods should pass spec.nodeName=worker-1,spec.nodeName!=worker-2
+        // (worker-1 != worker-2 is true, so worker-1 passes both)
+        let pods = vec![pod_with_node("worker-1"), pod_with_node("worker-2")];
+        let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1,spec.nodeName!=worker-2");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["spec"]["nodeName"], "worker-1");
     }
 }
 
