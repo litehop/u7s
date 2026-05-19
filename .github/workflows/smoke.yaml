@@ -1,46 +1,27 @@
-name: CI
+name: Smoke test
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 jobs:
-  test:
+  kubectl:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v6.0.2
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Test
-        run: cargo test --workspace
-
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
-
-  smoke:
-    # Only run on main branch pushes — keep PR CI fast.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
-        run: cargo build --release -p u7s-apiserver
+      - uses: Swatinem/rust-cache@v2.9.1
 
       - name: Install kubectl
         run: |
           curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
             -o /usr/local/bin/kubectl
           chmod +x /usr/local/bin/kubectl
+
+      - name: Build release binary
+        run: cargo build --release -p u7s-apiserver
 
       - name: Start apiserver
         env:
@@ -92,7 +73,7 @@ jobs:
             "    token: $SMOKE_TOKEN" \
             > "$TMPDIR/kubeconfig"
 
-      - name: Smoke — namespace CRUD
+      - name: Namespace CRUD
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
@@ -100,7 +81,7 @@ jobs:
           kubectl get namespace smoke-test
           kubectl get namespaces | grep smoke-test
 
-      - name: Smoke — ConfigMap CRUD
+      - name: ConfigMap CRUD
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
@@ -108,7 +89,7 @@ jobs:
           kubectl get configmap smoke-cm --namespace smoke-test
           kubectl get configmaps --namespace smoke-test | grep smoke-cm
 
-      - name: Smoke — CRD create and get
+      - name: CRD create and get
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
@@ -137,7 +118,7 @@ jobs:
           EOF
           kubectl get crd foos.smoke.u7s.dev
 
-      - name: Smoke — CR instance create and get
+      - name: CR instance create and get
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
@@ -163,23 +144,3 @@ jobs:
         with:
           name: smoke-server-log
           path: ${{ env.SMOKE_TMPDIR }}/server.log
-
-  perf:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: RSS benchmark
-        run: bash scripts/bench-rss.sh
-
-      - name: Upload perf results on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: perf-server-log
-          path: /tmp/u7s-bench-*/server.log

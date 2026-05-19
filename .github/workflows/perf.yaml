@@ -1,0 +1,25 @@
+name: Performance
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  bench-rss:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+
+      - name: RSS benchmark
+        run: bash scripts/bench-rss.sh
+
+      - name: Upload perf results on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: perf-server-log
+          path: /tmp/u7s-bench-*/server.log
