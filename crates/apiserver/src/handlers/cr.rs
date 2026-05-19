@@ -139,6 +139,7 @@ fn store_err_cr(err: u7s_store::StoreError, name: &str, kind: &str) -> crate::st
 pub async fn list_cr(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
+    query: super::generic::CollectionQuery,
 ) -> Result<Response, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -150,6 +151,19 @@ pub async fn list_cr(
     }
 
     let prefix = cr_list_prefix(&group, &version, &plural, None);
+
+    if query.watch == Some(true) {
+        let api_version = format!("{group}/{version}");
+        return super::generic::watch_generic(
+            state,
+            prefix,
+            api_version,
+            ctx.kind,
+            query.resource_version.unwrap_or(0),
+        )
+        .await;
+    }
+
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -341,6 +355,7 @@ pub async fn delete_cr(
 pub async fn list_cr_namespaced(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    query: super::generic::CollectionQuery,
 ) -> Result<Response, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -352,6 +367,19 @@ pub async fn list_cr_namespaced(
     }
 
     let prefix = cr_list_prefix(&group, &version, &plural, Some(&ns));
+
+    if query.watch == Some(true) {
+        let api_version = format!("{group}/{version}");
+        return super::generic::watch_generic(
+            state,
+            prefix,
+            api_version,
+            ctx.kind,
+            query.resource_version.unwrap_or(0),
+        )
+        .await;
+    }
+
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -686,6 +714,14 @@ mod tests {
     use std::sync::Arc;
     use u7s_store::SqliteStore;
 
+    fn no_watch_query() -> super::super::generic::CollectionQuery {
+        super::super::generic::CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: None,
+        }
+    }
+
     fn make_state() -> AppState {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         AppState::new(store, None, None, "https://localhost:6443".into())
@@ -827,6 +863,7 @@ mod tests {
                     "default".to_string(),
                     "things".to_string(),
                 )),
+                no_watch_query(),
             )
             .await,
             "expected 404 for unknown group",
@@ -853,6 +890,7 @@ mod tests {
                     "default".to_string(),
                     "widgets".to_string(),
                 )),
+                no_watch_query(),
             )
             .await,
             "cluster-scoped CRD must reject namespaced path",
@@ -876,6 +914,7 @@ mod tests {
                     "v1alpha1".to_string(),
                     "applications".to_string(),
                 )),
+                no_watch_query(),
             )
             .await,
             "namespaced CRD must reject cluster-scoped path",
@@ -1012,6 +1051,7 @@ mod tests {
         let resp = match list_cr_namespaced(
             State(state.clone()),
             Path((group, version, ns, plural)),
+            no_watch_query(),
         )
         .await
         {
@@ -1191,5 +1231,73 @@ mod tests {
 
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 415, "wrong content type must return 415");
+    }
+
+    fn watch_query() -> super::super::generic::CollectionQuery {
+        super::super::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            label_selector: None,
+        }
+    }
+
+    // When ?watch=true, list_cr must route to the watch stream rather than returning
+    // a normal list. A CRD must exist for the request to succeed; without one, find_crd
+    // returns 404 before reaching the watch branch.
+    #[tokio::test]
+    async fn list_cr_watch_returns_chunked_stream() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let resp = match list_cr(
+            State(state.clone()),
+            Path(("example.io".to_string(), "v1".to_string(), "widgets".to_string())),
+            watch_query(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("watch must not error"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        // watch_generic always sets transfer-encoding: chunked — verifies the watch
+        // branch was taken, not the normal list path.
+        assert_eq!(
+            resp.headers().get("transfer-encoding").and_then(|v| v.to_str().ok()),
+            Some("chunked"),
+            "cluster-scoped CR watch must use chunked transfer encoding"
+        );
+    }
+
+    // When ?watch=true, list_cr_namespaced must route to the watch stream for a
+    // namespaced CRD. This verifies the watch branch in the namespaced list handler.
+    #[tokio::test]
+    async fn list_cr_namespaced_watch_returns_chunked_stream() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let resp = match list_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            watch_query(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("watch must not error"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("transfer-encoding").and_then(|v| v.to_str().ok()),
+            Some("chunked"),
+            "namespaced CR watch must use chunked transfer encoding"
+        );
     }
 }

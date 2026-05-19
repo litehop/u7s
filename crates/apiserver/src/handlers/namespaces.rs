@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -74,8 +74,21 @@ fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
 
 pub async fn list_namespaces(
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
+    Query(query): Query<super::generic::CollectionQuery>,
+) -> Result<Response, crate::status::StatusError> {
     let prefix = cluster_list_prefix("namespaces");
+
+    if query.watch == Some(true) {
+        return super::generic::watch_generic(
+            state,
+            prefix,
+            "v1".to_string(),
+            "Namespace".to_string(),
+            query.resource_version.unwrap_or(0),
+        )
+        .await;
+    }
+
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -96,7 +109,7 @@ pub async fn list_namespaces(
         "items": items
     });
 
-    Ok(Json(body))
+    Ok(Json(body).into_response())
 }
 
 pub async fn create_namespace(
@@ -286,5 +299,37 @@ mod tests {
     fn invalid_returns_422() {
         let err = validate_namespace_name("Bad_Name").unwrap_err();
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // When ?watch=true, list_namespaces must route to the watch stream (chunked transfer)
+    // rather than returning a normal NamespaceList JSON. This ensures clients that open
+    // a watch on /api/v1/namespaces actually receive a streaming response.
+    #[tokio::test]
+    async fn list_namespaces_watch_returns_chunked_stream() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+        use crate::state::AppState;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(store, None, None, "https://localhost:6443".into());
+
+        let query = crate::handlers::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            label_selector: None,
+        };
+
+        let resp = match list_namespaces(State(state), Query(query)).await {
+            Ok(r) => r,
+            Err(_) => panic!("watch must not error"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        // watch_generic always sets transfer-encoding: chunked
+        assert_eq!(
+            resp.headers().get("transfer-encoding").and_then(|v| v.to_str().ok()),
+            Some("chunked"),
+            "watch response must use chunked transfer encoding"
+        );
     }
 }
