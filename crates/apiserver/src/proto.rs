@@ -259,6 +259,89 @@ pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
+/// Decode a proto-encoded Node object into a `serde_json::Value`.
+///
+/// Node proto layout (k8s.io/api/core/v1/generated.proto):
+///   field 1 (ObjectMeta, wire 2): metadata
+///   field 2 (NodeSpec, wire 2): spec — treated as opaque, ignored
+///   field 3 (NodeStatus, wire 2): status — treated as opaque, ignored
+///
+/// Only ObjectMeta fields are decoded (same layout as decode_namespace_proto). Spec and status
+/// are represented as empty objects `{}` — the server stores and returns whatever JSON it
+/// receives; the shape of Node spec/status is not validated here.
+pub fn decode_node_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let mut meta = serde_json::json!({ "creationTimestamp": null });
+    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
+
+    scan_length_delimited_fields(data, |field_number, field_data| {
+        if field_number == 1 {
+            // field 1 = ObjectMeta — same layout as decode_namespace_proto
+            scan_mixed_fields(field_data, |fn2, wt, fd| {
+                match (fn2, wt) {
+                    (1, 2) => {
+                        meta["name"] =
+                            serde_json::Value::String(String::from_utf8_lossy(fd).into_owned());
+                    }
+                    (2, 2) => {
+                        let s = String::from_utf8_lossy(fd).into_owned();
+                        if !s.is_empty() {
+                            meta["generateName"] = serde_json::Value::String(s);
+                        }
+                    }
+                    (3, 2) => {
+                        let s = String::from_utf8_lossy(fd).into_owned();
+                        if !s.is_empty() {
+                            meta["namespace"] = serde_json::Value::String(s);
+                        }
+                    }
+                    (5, 2) => {
+                        let s = String::from_utf8_lossy(fd).into_owned();
+                        if !s.is_empty() {
+                            meta["uid"] = serde_json::Value::String(s);
+                        }
+                    }
+                    (6, 2) => {
+                        let s = String::from_utf8_lossy(fd).into_owned();
+                        if !s.is_empty() {
+                            meta["resourceVersion"] = serde_json::Value::String(s);
+                        }
+                    }
+                    (11, 2) => {
+                        if let Some((k, v)) = decode_map_entry(fd) {
+                            labels
+                                .get_or_insert_with(serde_json::Map::new)
+                                .insert(k, serde_json::Value::String(v));
+                        }
+                    }
+                    (12, 2) => {
+                        if let Some((k, v)) = decode_map_entry(fd) {
+                            annotations
+                                .get_or_insert_with(serde_json::Map::new)
+                                .insert(k, serde_json::Value::String(v));
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+        // field 2 (NodeSpec) and field 3 (NodeStatus) are ignored — treated as opaque.
+    })?;
+
+    if let Some(l) = labels {
+        meta["labels"] = serde_json::Value::Object(l);
+    }
+    if let Some(a) = annotations {
+        meta["annotations"] = serde_json::Value::Object(a);
+    }
+
+    Some(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": meta
+    }))
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -267,6 +350,7 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
     match kind {
         "Namespace" => decode_namespace_proto(raw),
         "ConfigMap" => decode_configmap_proto(raw),
+        "Node" => decode_node_proto(raw),
         _ => None,
     }
 }
@@ -736,6 +820,61 @@ mod tests {
 
         // Unknown kind returns None
         assert!(decode_core_proto_by_kind("Pod", &namespace_proto).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_node_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_node_proto must extract ObjectMeta fields from a proto-encoded Node.
+    /// This is the primary fix for kubelet PUT /api/v1/nodes/{name}/status with proto body —
+    /// previously decode_core_proto_by_kind returned None for "Node", causing extract_body to
+    /// return raw proto bytes that serde_json::from_slice then failed to parse as JSON.
+    #[test]
+    fn decode_node_proto_extracts_name() {
+        // Build: Node { metadata: ObjectMeta { name: "node-1" } }
+        let obj_meta = encode_length_delimited(1, b"node-1"); // field 1 = name
+        let node_proto = encode_length_delimited(1, &obj_meta); // Node.field 1 = ObjectMeta
+
+        let result = decode_node_proto(&node_proto).expect("must decode node proto");
+
+        assert_eq!(result["kind"], "Node");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "node-1");
+        assert!(result["metadata"]["creationTimestamp"].is_null());
+    }
+
+    /// decode_node_proto must not panic when field 2 (NodeSpec) is present with content.
+    /// This guards against the common case where kubelet sends a full Node object including spec.
+    #[test]
+    fn decode_node_proto_with_nonempty_spec_does_not_panic() {
+        // Build: Node { metadata: ObjectMeta { name: "node-2" }, spec: <opaque bytes> }
+        let obj_meta = encode_length_delimited(1, b"node-2"); // ObjectMeta.name
+        let mut node_proto = encode_length_delimited(1, &obj_meta); // Node.field 1 = ObjectMeta
+        // field 2 = NodeSpec — encode some opaque bytes that look like a nested proto message
+        let fake_spec = encode_length_delimited(1, b"some-provider-id"); // podCIDR or similar
+        node_proto.extend_from_slice(&encode_length_delimited(2, &fake_spec)); // Node.field 2 = NodeSpec
+
+        let result = decode_node_proto(&node_proto).expect("must not panic on non-empty NodeSpec");
+
+        assert_eq!(result["kind"], "Node");
+        assert_eq!(result["metadata"]["name"], "node-2");
+        // spec is not decoded — the returned JSON only contains metadata
+        assert!(result.get("spec").is_none());
+    }
+
+    /// decode_core_proto_by_kind must dispatch to decode_node_proto for kind="Node".
+    /// This is the dispatch fix that ensures extract_body can handle kubelet Node proto bodies.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_node() {
+        let obj_meta = encode_length_delimited(1, b"test-node");
+        let node_proto = encode_length_delimited(1, &obj_meta);
+
+        let result = decode_core_proto_by_kind("Node", &node_proto)
+            .expect("Node must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "Node");
+        assert_eq!(result["metadata"]["name"], "test-node");
     }
 
     /// Full round-trip for ConfigMap: kubectl create configmap sends a k8s proto envelope
