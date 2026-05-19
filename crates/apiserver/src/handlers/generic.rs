@@ -1,4 +1,5 @@
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -6,7 +7,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde::Deserialize;
-use u7s_store::{ListOptions, Store, StoreError};
+use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
 
 use crate::{
     keys::{group_list_prefix, group_object_key},
@@ -18,6 +19,7 @@ use crate::{
 #[derive(Deserialize)]
 pub struct CollectionQuery {
     pub watch: Option<bool>,
+    pub resource_version: Option<u64>,
     pub label_selector: Option<String>,
 }
 
@@ -58,11 +60,175 @@ fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusEr
     }
 }
 
-fn check_watch(query: &CollectionQuery) -> Result<(), crate::status::StatusError> {
-    if query.watch == Some(true) {
-        return Err(Status::bad_request("watch is not supported in Phase 1".into()));
+/// Serialise a single watch event to NDJSON bytes (including trailing newline).
+/// Returns None on Compacted — the caller should close the stream.
+fn encode_watch_event(event: &WatchEvent, api_version: &str, kind: &str) -> Option<Bytes> {
+    let line = match event {
+        WatchEvent::Added(obj) => {
+            let object: serde_json::Value =
+                serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
+            format!(
+                "{{\"type\":\"ADDED\",\"object\":{}}}\n",
+                serde_json::to_string(&object).unwrap_or_default()
+            )
+        }
+        WatchEvent::Modified(obj) => {
+            let object: serde_json::Value =
+                serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
+            format!(
+                "{{\"type\":\"MODIFIED\",\"object\":{}}}\n",
+                serde_json::to_string(&object).unwrap_or_default()
+            )
+        }
+        WatchEvent::Deleted { key, revision } => {
+            // Reconstruct a minimal tombstone object from the store key.
+            let (name, namespace) = parse_key_name_ns(key);
+            let object = if namespace.is_empty() {
+                serde_json::json!({
+                    "apiVersion": api_version,
+                    "kind": kind,
+                    "metadata": { "name": name, "resourceVersion": revision.to_string() }
+                })
+            } else {
+                serde_json::json!({
+                    "apiVersion": api_version,
+                    "kind": kind,
+                    "metadata": {
+                        "name": name,
+                        "namespace": namespace,
+                        "resourceVersion": revision.to_string()
+                    }
+                })
+            };
+            format!(
+                "{{\"type\":\"DELETED\",\"object\":{}}}\n",
+                serde_json::to_string(&object).unwrap_or_default()
+            )
+        }
+        WatchEvent::Bookmark { revision } => {
+            format!(
+                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{revision}\"}}}}}}\n"
+            )
+        }
+        WatchEvent::Compacted { .. } => return None,
+    };
+    Some(Bytes::from(line))
+}
+
+/// Parse the last two path segments of a store key as (name, namespace).
+/// Key format: /registry/<resource>/<namespace>/<name>  (namespaced)
+///         or: /registry/<group>/<plural>/<name>        (cluster-scoped)
+/// We only need the final segment as name; second-to-last as namespace (may be empty).
+fn parse_key_name_ns(key: &str) -> (&str, &str) {
+    let parts: Vec<&str> = key.rsplitn(3, '/').collect();
+    match parts.as_slice() {
+        [name, namespace, ..] => (name, namespace),
+        [name] => (name, ""),
+        _ => ("", ""),
     }
-    Ok(())
+}
+
+/// Stream watch events for a given store prefix in NDJSON format.
+/// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
+async fn watch_generic(
+    state: AppState,
+    prefix: String,
+    api_version: String,
+    kind: String,
+    from_revision: u64,
+) -> Result<Response, crate::status::StatusError> {
+    let event_stream = state
+        .store
+        .watch(&prefix, from_revision)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let chunk_stream = async_stream::stream! {
+        use futures_core::Stream;
+        use std::pin::pin;
+        use tokio::time::{Duration, interval, sleep};
+
+        let mut event_stream = pin!(event_stream);
+        let mut bookmark_tick = interval(Duration::from_secs(60));
+        bookmark_tick.tick().await; // skip initial immediate tick
+
+        let mut max_duration = pin!(sleep(Duration::from_secs(5 * 60)));
+        let mut last_rv: u64 = from_revision;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                maybe_event = {
+                    use std::future::poll_fn;
+                    poll_fn(|cx| {
+                        use std::task::Poll;
+                        match event_stream.as_mut().poll_next(cx) {
+                            Poll::Ready(v) => Poll::Ready(v),
+                            Poll::Pending => Poll::Pending,
+                        }
+                    })
+                } => {
+                    match maybe_event {
+                        None => break,
+                        Some(event) => {
+                            match &event {
+                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
+                                    last_rv = last_rv.max(obj.revision);
+                                }
+                                WatchEvent::Deleted { revision, .. } => {
+                                    last_rv = last_rv.max(*revision);
+                                }
+                                WatchEvent::Bookmark { revision } => {
+                                    last_rv = last_rv.max(*revision);
+                                }
+                                WatchEvent::Compacted { .. } => {}
+                            }
+
+                            bookmark_tick.reset();
+
+                            if matches!(event, WatchEvent::Compacted { .. }) {
+                                let error_line = Bytes::from(
+                                    "{\"type\":\"ERROR\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\"}}\n"
+                                );
+                                yield Ok::<Bytes, axum::BoxError>(error_line);
+                                break;
+                            }
+
+                            if let Some(chunk) = encode_watch_event(&event, &api_version, &kind) {
+                                yield Ok::<Bytes, axum::BoxError>(chunk);
+                            }
+                        }
+                    }
+                }
+
+                _ = bookmark_tick.tick() => {
+                    let bookmark = format!(
+                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                    );
+                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                }
+
+                _ = &mut max_duration => {
+                    let bookmark = format!(
+                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                    );
+                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    break;
+                }
+            }
+        }
+    };
+
+    let body = Body::from_stream(chunk_stream);
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::TRANSFER_ENCODING, "chunked")
+        .body(body)
+        .expect("response builder never fails with these headers");
+
+    Ok(resp)
 }
 
 /// Parse a label selector string of the form `key=value,key2=value2` into key-value pairs.
@@ -197,11 +363,26 @@ pub async fn list_resource(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    check_watch(&query)?;
+) -> Result<Response, crate::status::StatusError> {
     let meta = lookup(&state, &group, &version, &plural)?.clone();
-
     let prefix = group_list_prefix(&group, &plural, None);
+
+    if query.watch == Some(true) {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{}/{}", group, version)
+        };
+        return watch_generic(
+            state,
+            prefix,
+            api_version,
+            meta.kind.clone(),
+            query.resource_version.unwrap_or(0),
+        )
+        .await;
+    }
+
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -223,7 +404,7 @@ pub async fn list_resource(
     };
 
     let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
-    Ok(Json(body))
+    Ok(Json(body).into_response())
 }
 
 pub async fn get_resource(
@@ -454,11 +635,26 @@ pub async fn list_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    check_watch(&query)?;
+) -> Result<Response, crate::status::StatusError> {
     let meta = lookup(&state, &group, &version, &plural)?.clone();
-
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
+
+    if query.watch == Some(true) {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{}/{}", group, version)
+        };
+        return watch_generic(
+            state,
+            prefix,
+            api_version,
+            meta.kind.clone(),
+            query.resource_version.unwrap_or(0),
+        )
+        .await;
+    }
+
     let resp = state
         .store
         .list(&prefix, ListOptions::default())
@@ -480,7 +676,7 @@ pub async fn list_namespaced_resource(
     };
 
     let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
-    Ok(Json(body))
+    Ok(Json(body).into_response())
 }
 
 pub async fn get_namespaced_resource(
@@ -916,8 +1112,18 @@ pub async fn core_list_resource(
     // Pods are namespaced; the registry has no cluster-scoped "pods" entry.
     // Handle GET /api/v1/pods by scanning across all namespaces.
     if plural == "pods" {
-        check_watch(&query)?;
         let prefix = crate::keys::cluster_list_prefix("pods");
+        if query.watch == Some(true) {
+            return watch_generic(
+                state,
+                prefix,
+                "v1".into(),
+                "Pod".into(),
+                query.resource_version.unwrap_or(0),
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
         let resp = state
             .store
             .list(&prefix, ListOptions::default())
