@@ -81,6 +81,66 @@ jobs:
           kubectl get namespace smoke-test
           kubectl get namespaces | grep smoke-test
 
+      - name: Watch stream
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          WATCH_OUT=$(mktemp)
+          # Use curl to hit the raw watch endpoint so the server's NDJSON envelope
+          # ({"type":"ADDED","object":{...}}) is preserved in the output.
+          # kubectl get --watch -o json strips the event type field, so ADDED/DELETED
+          # never appear in its output — the curl approach avoids that.
+          CA_CERT="$SMOKE_TMPDIR/ca.crt"
+          kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' \
+            | base64 -d > "$CA_CERT"
+          curl --silent --no-buffer \
+            --cacert "$CA_CERT" \
+            -H "Authorization: Bearer $SMOKE_TOKEN" \
+            "https://127.0.0.1:6443/api/v1/namespaces?watch=true" \
+            >"$WATCH_OUT" 2>&1 &
+          WATCH_PID=$!
+
+          # Create namespace — should trigger an ADDED event on the watch stream.
+          kubectl create namespace watch-test
+
+          # Wait up to 10s for the watch output to contain the namespace name and ADDED.
+          ADDED=0
+          for i in $(seq 1 10); do
+            if grep -q "watch-test" "$WATCH_OUT" && grep -q "ADDED" "$WATCH_OUT"; then
+              ADDED=1
+              break
+            fi
+            sleep 1
+          done
+
+          # Delete namespace — should trigger a DELETED event.
+          kubectl delete namespace watch-test
+
+          # Wait up to 10s for the DELETED event.
+          DELETED=0
+          for i in $(seq 1 10); do
+            if grep -q "DELETED" "$WATCH_OUT"; then
+              DELETED=1
+              break
+            fi
+            sleep 1
+          done
+
+          kill "$WATCH_PID" 2>/dev/null || true
+
+          if [ "$ADDED" -eq 0 ]; then
+            echo "ERROR: ADDED event for watch-test did not arrive within 10s"
+            echo "--- watch output ---"
+            cat "$WATCH_OUT"
+            exit 1
+          fi
+          if [ "$DELETED" -eq 0 ]; then
+            echo "ERROR: DELETED event for watch-test did not arrive within 10s"
+            echo "--- watch output ---"
+            cat "$WATCH_OUT"
+            exit 1
+          fi
+
       - name: ConfigMap CRUD
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
