@@ -128,4 +128,248 @@ mod tests {
         // Must be after 2024.
         assert!(now.as_str() >= "2024-01-01T00:00:00Z", "implausibly old: {now}");
     }
+
+    // ---------------------------------------------------------------------------
+    // Wire-level integration tests — extract_body against kubectl wire fixtures
+    //
+    // These tests replicate the exact byte layout kubectl sends over the wire so
+    // that the class of proto-decode bug that broke the smoke test (empty
+    // contentType field in the Unknown envelope, raw bytes being proto-encoded
+    // rather than JSON) cannot regress silently through unit tests.
+    //
+    // Fixture construction follows the documented wire format in proto.rs:
+    //   magic[4] | Unknown{ field1=TypeMeta, field2=raw, field4=contentType }
+    //
+    // The helpers below duplicate the varint/length-delimited encoder that lives
+    // in proto::tests so that these tests are self-contained with no non-test
+    // code changes.
+    // ---------------------------------------------------------------------------
+
+    fn encode_varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out
+    }
+
+    fn encode_ld(field_number: u64, payload: &[u8]) -> Vec<u8> {
+        let tag = (field_number << 3) | 2;
+        let mut out = encode_varint(tag);
+        out.extend_from_slice(&encode_varint(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Build a k8s Unknown envelope with TypeMeta (field 1), raw (field 2), and optional
+    /// contentType (field 4). Pass `content_type=None` to omit field 4, which is what kubectl
+    /// does for core types like Namespace and ConfigMap (the smoke-test bug scenario).
+    fn build_kubectl_proto_body(
+        api_version: &[u8],
+        kind: &[u8],
+        raw: &[u8],
+        content_type: Option<&[u8]>,
+    ) -> Vec<u8> {
+        const MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
+
+        let mut type_meta = encode_ld(1, api_version); // field 1 = apiVersion
+        type_meta.extend_from_slice(&encode_ld(2, kind)); // field 2 = kind
+
+        let mut unknown = encode_ld(1, &type_meta); // TypeMeta
+        unknown.extend_from_slice(&encode_ld(2, raw)); // raw
+        if let Some(ct) = content_type {
+            unknown.extend_from_slice(&encode_ld(4, ct)); // contentType
+        }
+
+        let mut body = MAGIC.to_vec();
+        body.extend_from_slice(&unknown);
+        body
+    }
+
+    /// Build a proto-encoded ObjectMeta with name and optional namespace.
+    fn build_object_meta(name: &[u8], namespace: Option<&[u8]>) -> Vec<u8> {
+        let mut meta = encode_ld(1, name); // field 1 = name
+        if let Some(ns) = namespace {
+            meta.extend_from_slice(&encode_ld(3, ns)); // field 3 = namespace
+        }
+        meta.extend_from_slice(&encode_ld(8, &[])); // field 8 = creationTimestamp (empty Time{})
+        meta
+    }
+
+    /// test_namespace_create_kubectl_wire_format
+    ///
+    /// kubectl create namespace test-ns sends:
+    ///   Content-Type: application/vnd.kubernetes.protobuf
+    ///   Body: magic + Unknown{ TypeMeta{v1/Namespace}, raw=proto(Namespace), contentType="" (absent) }
+    ///
+    /// extract_body must decode the nested proto-encoded Namespace and return JSON with the correct
+    /// name. This is the exact wire pattern that caused the smoke CI failure — the server previously
+    /// tried to JSON-parse the proto bytes (starting with 0x0a) and got "invalid JSON".
+    #[test]
+    fn test_namespace_create_kubectl_wire_format() {
+        let obj_meta = build_object_meta(b"test-ns", None);
+        let namespace_proto = encode_ld(1, &obj_meta); // Namespace.metadata = ObjectMeta
+
+        // kubectl omits field 4 (contentType) for core types
+        let body = build_kubectl_proto_body(b"v1", b"Namespace", &namespace_proto, None);
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let json: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("extract_body must produce valid JSON");
+
+        assert_eq!(json["kind"], "Namespace", "kind must be Namespace");
+        assert_eq!(json["apiVersion"], "v1", "apiVersion must be v1");
+        assert_eq!(
+            json["metadata"]["name"], "test-ns",
+            "name must survive proto decode — regression for smoke-test 'invalid JSON' failure"
+        );
+        assert!(
+            json["metadata"]["creationTimestamp"].is_null(),
+            "creationTimestamp must be null for kubectl compatibility"
+        );
+    }
+
+    /// test_configmap_create_kubectl_wire_format
+    ///
+    /// kubectl create configmap test-cm --from-literal=key=value --namespace=test-ns sends:
+    ///   Content-Type: application/vnd.kubernetes.protobuf
+    ///   Body: magic + Unknown{ TypeMeta{v1/ConfigMap}, raw=proto(ConfigMap), contentType="" (absent) }
+    ///
+    /// extract_body must decode the nested proto-encoded ConfigMap and return JSON with name,
+    /// namespace, and data intact. This exercises the same empty-contentType path as the Namespace
+    /// test — a regression guard for the smoke CI failure on configmap creation.
+    #[test]
+    fn test_configmap_create_kubectl_wire_format() {
+        let obj_meta = build_object_meta(b"test-cm", Some(b"test-ns"));
+
+        // ConfigMap.data map entry: { key="key", value="value" }
+        let mut data_entry = encode_ld(1, b"key");
+        data_entry.extend_from_slice(&encode_ld(2, b"value"));
+
+        let mut configmap_proto = encode_ld(1, &obj_meta); // field 1 = ObjectMeta
+        configmap_proto.extend_from_slice(&encode_ld(2, &data_entry)); // field 2 = data entry
+
+        // kubectl omits field 4 (contentType) for core types
+        let body = build_kubectl_proto_body(b"v1", b"ConfigMap", &configmap_proto, None);
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let json: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("extract_body must produce valid JSON");
+
+        assert_eq!(json["kind"], "ConfigMap", "kind must be ConfigMap");
+        assert_eq!(json["apiVersion"], "v1", "apiVersion must be v1");
+        assert_eq!(json["metadata"]["name"], "test-cm", "name must survive proto decode");
+        assert_eq!(
+            json["metadata"]["namespace"], "test-ns",
+            "namespace must survive proto decode"
+        );
+        assert_eq!(
+            json["data"]["key"], "value",
+            "configmap data must survive proto decode"
+        );
+    }
+
+    /// test_crd_apply_kubectl_wire_format
+    ///
+    /// kubectl apply --validate=false -f crd.yaml sends:
+    ///   Content-Type: application/json
+    ///   Body: plain JSON (kubectl uses JSON for apply, not proto)
+    ///
+    /// extract_body must pass the JSON body through unchanged when Content-Type is not protobuf.
+    /// This verifies the apply path does not accidentally strip or corrupt CRD JSON.
+    #[test]
+    fn test_crd_apply_kubectl_wire_format() {
+        let crd_json = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "widgets.example.com" },
+            "spec": {
+                "group": "example.com",
+                "names": { "kind": "Widget", "plural": "widgets" },
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        });
+        let body_bytes = serde_json::to_vec(&crd_json).unwrap();
+        let bytes = Bytes::from(body_bytes.clone());
+
+        let decoded = extract_body(&bytes, "application/json");
+        assert_eq!(
+            decoded.as_ref(),
+            body_bytes.as_slice(),
+            "CRD JSON body must pass through extract_body unchanged"
+        );
+
+        // Confirm the JSON is still parseable and correct
+        let parsed: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(parsed["kind"], "CustomResourceDefinition");
+        assert_eq!(parsed["metadata"]["name"], "widgets.example.com");
+    }
+
+    /// test_cr_apply_kubectl_wire_format
+    ///
+    /// kubectl apply --validate=false -f cr.yaml sends:
+    ///   Content-Type: application/json
+    ///   Body: plain JSON (kubectl uses JSON for apply of custom resources, not proto)
+    ///
+    /// extract_body must pass the CR JSON through unchanged. This verifies that custom resource
+    /// instances — which have no registered proto decoder — are handled correctly via the JSON
+    /// passthrough path, not corrupted by a proto decode attempt.
+    #[test]
+    fn test_cr_apply_kubectl_wire_format() {
+        let cr_json = serde_json::json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": { "name": "my-widget", "namespace": "default" },
+            "spec": { "color": "blue", "count": 3 }
+        });
+        let body_bytes = serde_json::to_vec(&cr_json).unwrap();
+        let bytes = Bytes::from(body_bytes.clone());
+
+        let decoded = extract_body(&bytes, "application/json");
+        assert_eq!(
+            decoded.as_ref(),
+            body_bytes.as_slice(),
+            "CR JSON body must pass through extract_body unchanged"
+        );
+
+        let parsed: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(parsed["kind"], "Widget");
+        assert_eq!(parsed["spec"]["color"], "blue");
+    }
+
+    /// test_extract_body_proto_with_explicit_json_content_type
+    ///
+    /// When kubectl sends a protobuf envelope but Unknown.contentType is "application/json",
+    /// extract_body must return the raw bytes directly (they are already JSON). This path is
+    /// taken for non-core types sent via protobuf where the inner encoding is JSON.
+    #[test]
+    fn test_extract_body_proto_with_explicit_json_content_type() {
+        let inner_json = br#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-via-json"}}"#;
+
+        // Build envelope with explicit contentType=application/json
+        let body = build_kubectl_proto_body(
+            b"v1",
+            b"Namespace",
+            inner_json,
+            Some(b"application/json"),
+        );
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let json: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("must be valid JSON");
+        assert_eq!(
+            json["metadata"]["name"], "ns-via-json",
+            "inner JSON must be returned as-is when contentType=application/json"
+        );
+    }
 }
