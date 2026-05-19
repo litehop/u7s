@@ -180,6 +180,13 @@ pub async fn create_crd(
         ));
     }
 
+    let expected_name = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
+    if name != expected_name {
+        return Err(Status::unprocessable_entity(format!(
+            "metadata.name must be {expected_name} (got {name})"
+        )));
+    }
+
     stamp_server_fields(&mut crd);
 
     let key = store_key(&name);
@@ -487,5 +494,63 @@ mod tests {
             Err(_) => panic!("list must succeed"),
         };
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Kubernetes requires metadata.name == "{plural}.{group}".
+    // A mismatched name must be rejected with 422 so kubectl and controllers
+    // can rely on the name encoding the resource identity.
+    #[tokio::test]
+    async fn create_crd_rejects_mismatched_name() {
+        let state = make_state();
+        // Correct would be "widgets.example.io" but we pass "wrong.example.io".
+        let body = Bytes::from(serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "wrong.example.io" },
+            "spec": {
+                "group": "example.io",
+                "names": {
+                    "plural": "widgets",
+                    "singular": "widget",
+                    "kind": "Widget"
+                },
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        }).to_string());
+
+        let err = err_status(create_crd(State(state), body).await);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 422, "mismatched name must return 422");
+        assert!(
+            json["message"].as_str().unwrap_or("").contains("widgets.example.io"),
+            "error must mention the expected name"
+        );
+    }
+
+    // A CRD whose metadata.name is exactly "{plural}.{group}" must be accepted.
+    #[tokio::test]
+    async fn create_crd_accepts_correct_name() {
+        let state = make_state();
+        let body = Bytes::from(serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "widgets.example.io" },
+            "spec": {
+                "group": "example.io",
+                "names": {
+                    "plural": "widgets",
+                    "singular": "widget",
+                    "kind": "Widget"
+                },
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        }).to_string());
+
+        assert!(
+            create_crd(State(state), body).await.is_ok(),
+            "correct name widgets.example.io must be accepted"
+        );
     }
 }
