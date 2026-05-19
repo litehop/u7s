@@ -43,6 +43,8 @@ jobs:
           chmod +x /usr/local/bin/kubectl
 
       - name: Start apiserver
+        env:
+          RUST_LOG: info
         run: |
           TMPDIR=$(mktemp -d)
           echo "SMOKE_TMPDIR=$TMPDIR" >> "$GITHUB_ENV"
@@ -54,12 +56,12 @@ jobs:
             --advertise-address https://127.0.0.1:6443 \
             >"$TMPDIR/server.log" 2>&1 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
-          # Wait until the server logs "listening on" (up to 30 s)
+          # Wait up to 30s for the server to accept TCP connections on 6443
           for i in $(seq 1 30); do
-            grep -q "listening on" "$TMPDIR/server.log" 2>/dev/null && break
+            nc -z 127.0.0.1 6443 2>/dev/null && break
             sleep 1
           done
-          grep -q "listening on" "$TMPDIR/server.log" || { echo "Server did not start"; cat "$TMPDIR/server.log"; exit 1; }
+          nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$TMPDIR/server.log"; exit 1; }
 
       - name: Smoke — namespace CRUD
         env:
