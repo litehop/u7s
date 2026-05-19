@@ -19,7 +19,11 @@
       "Bash(ls *)",
       "Bash(grep *)",
       "Bash(rustup *)",
-      "Bash(rustc *)"
+      "Bash(rustc *)",
+      "Bash(cd * && cargo *)",
+      "Bash(cd * && bd *)",
+      "Bash(cd * && git *)",
+      "Bash(cd * && gh *)"
     ]
   },
   "hooks": {
