@@ -1,36 +1,39 @@
 # Dashboard
 
-2026-05-20T08:00 UTC
+2026-05-20T08:15 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 3 (mayor-886 P2, mayor-a1a P2, mayor-xy2 P3 deferred)
+Open beads: 1 (mayor-xy2, P3, intentionally deferred)
 
 ## What needs the operator now
 
-Nothing blocking. Two PRs in CI (#54 Lease tests, #55 Node proto decoder) — will merge automatically when green.
+**Backlog is empty.** No decisions pending, no blockers.
 
-`mayor-xy2` (P3, CR schema validation) remains intentionally deferred.
+`mayor-xy2` (CR schema validation / openAPIV3Schema enforcement) is intentionally deferred for Phase 3 — permissive CR validation is safe for the Argo CD milestone.
+
+**Next direction needed from operator** — candidates:
+1. **Kubelet join attempt** — run a real kubelet against u7s to surface remaining gaps organically
+2. **Sonobuoy conformance** — enumerate API conformance gaps systematically
+3. **Code quality / perf audit** — dispatch a reviewer against recent commits (proto, handlers, inflight, watch)
 
 ## Forward-looking
 
-After #54 and #55 merge, all P1/P2 beads will be closed. Backlog near-zero.
+Mayor is idle pending operator direction. All loops are running (15m dispatch, 30m merge, 60m hygiene, 10m dashboard, 60m stance reminder). When operator names the next initiative, mayor will file beads and dispatch workers immediately.
 
-Next candidates (no beads filed yet — awaiting operator direction):
-- Attempt a real kubelet join against u7s (would surface remaining gaps organically)
-- Conformance testing via sonobuoy
-- Code quality / performance audit pass against recent commits
+## Recent progress
 
-## Recent progress (this session)
+This session closed 8 beads and merged 7 PRs:
 
-Major push on testing and kubelet surface:
-- **PR #49 merged** — smoke test proto decode fix (empty contentType bug)
-- **PR #50 merged** — 5 wire-level integration tests (exercise exact kubectl wire bytes)
-- **PR #51 merged** — watch stream smoke test (curl-based NDJSON; server was already correct)
-- **PR #52 merged** — inflight limiter (50/20 limits, 429 on exhaustion) + load RSS bench (3 MB delta)
-- **PR #53 merged** — fieldSelector=spec.nodeName for pod list/watch (P1 kubelet correctness)
-- **PR #54** (Lease integration tests) — in CI
-- **PR #55** (Node proto decoder) — in CI
-- Beads closed today: mayor-fp3, mayor-pjp, mayor-7ft, mayor-ajt, mayor-4m9, mayor-m7u (6 closed)
-- 92 total beads closed across project lifetime
+| PR | What | Beads |
+|----|------|-------|
+| #49 | Proto decode fix (empty contentType) | mayor-fp3 |
+| #50 | Wire-level kubectl integration tests (5 tests) | mayor-pjp |
+| #51 | Watch stream smoke test (curl-based NDJSON) | mayor-ajt |
+| #52 | Inflight limiter (50/20 limits) + load RSS bench | mayor-7ft |
+| #53 | fieldSelector=spec.nodeName for pod list/watch | mayor-4m9 |
+| #54 | Lease PUT OCC integration tests (3 tests) | mayor-886 |
+| #55 | Node proto decoder for kubelet PUT path | mayor-a1a |
+
+93 total beads closed across project lifetime. No open PRs. All worktrees cleaned.
 
 ## Stance
 
