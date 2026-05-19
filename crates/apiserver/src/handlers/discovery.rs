@@ -23,10 +23,14 @@ pub async fn api_v1_resources() -> Json<ApiResourceList> {
 // ---------------------------------------------------------------------------
 
 const STATIC_GROUPS: &[(&str, &str)] = &[
+    ("admissionregistration.k8s.io", "v1"),
     ("apiextensions.k8s.io", "v1"),
     ("apps", "v1"),
     ("authentication.k8s.io", "v1"),
     ("authorization.k8s.io", "v1"),
+    ("coordination.k8s.io", "v1"),
+    ("networking.k8s.io", "v1"),
+    ("policy", "v1"),
     ("rbac.authorization.k8s.io", "v1"),
 ];
 
@@ -119,10 +123,14 @@ pub async fn api_group_resources(
     Path((group, version)): Path<(String, String)>,
 ) -> Response {
     let static_list = match (group.as_str(), version.as_str()) {
+        ("admissionregistration.k8s.io", "v1") => Some(admissionregistration_v1_resources()),
         ("apiextensions.k8s.io", "v1") => Some(apiextensions_v1_resources()),
         ("apps", "v1") => Some(apps_v1_resources()),
         ("authentication.k8s.io", "v1") => Some(authn_v1_resources()),
         ("authorization.k8s.io", "v1") => Some(authz_v1_resources()),
+        ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
+        ("networking.k8s.io", "v1") => Some(networking_v1_resources()),
+        ("policy", "v1") => Some(policy_v1_resources()),
         ("rbac.authorization.k8s.io", "v1") => Some(rbac_v1_resources()),
         _ => None,
     };
@@ -329,6 +337,88 @@ fn rbac_v1_resources() -> serde_json::Value {
                 "singularName": "rolebinding",
                 "namespaced": true,
                 "kind": "RoleBinding",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn admissionregistration_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "admissionregistration.k8s.io/v1",
+        "resources": [
+            {
+                "name": "validatingwebhookconfigurations",
+                "singularName": "validatingwebhookconfiguration",
+                "namespaced": false,
+                "kind": "ValidatingWebhookConfiguration",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "mutatingwebhookconfigurations",
+                "singularName": "mutatingwebhookconfiguration",
+                "namespaced": false,
+                "kind": "MutatingWebhookConfiguration",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn coordination_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "coordination.k8s.io/v1",
+        "resources": [
+            {
+                "name": "leases",
+                "singularName": "lease",
+                "namespaced": true,
+                "kind": "Lease",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn networking_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "networking.k8s.io/v1",
+        "resources": [
+            {
+                "name": "networkpolicies",
+                "singularName": "networkpolicy",
+                "namespaced": true,
+                "kind": "NetworkPolicy",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "ingresses",
+                "singularName": "ingress",
+                "namespaced": true,
+                "kind": "Ingress",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn policy_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "policy/v1",
+        "resources": [
+            {
+                "name": "poddisruptionbudgets",
+                "singularName": "poddisruptionbudget",
+                "namespaced": true,
+                "kind": "PodDisruptionBudget",
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
