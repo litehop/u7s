@@ -2,6 +2,8 @@
   "permissions": {
     "defaultMode": "auto",
     "allow": [
+      "mcp__github__*",
+      "mcp__git__*",
       "Bash(cargo *)",
       "Bash(bd *)",
       "Bash(git *)",
@@ -22,8 +24,33 @@
       "Bash(mv *)"
     ]
   },
+  "worktree": {
+    "baseRef": "head"
+  },
   "hooks": {
+    "WorktreeCreate": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/create-worktree.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/assert-worktree-boundary.sh",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "matcher": "Bash",
         "hooks": [
