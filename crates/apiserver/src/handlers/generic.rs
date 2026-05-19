@@ -364,7 +364,16 @@ pub async fn list_resource(
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
 ) -> Result<Response, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::list_cr(
+                State(state),
+                Path((group, version, plural)),
+            )
+            .await;
+        }
+    };
     let prefix = group_list_prefix(&group, &plural, None);
 
     if query.watch == Some(true) {
@@ -411,7 +420,16 @@ pub async fn get_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::get_cr(
+                State(state),
+                Path((group, version, plural, name)),
+            )
+            .await;
+        }
+    };
 
     let key = group_object_key(&group, &plural, None, &name);
     let stored = state
@@ -434,7 +452,18 @@ pub async fn create_resource(
     Path((group, version, plural)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::create_cr(
+                State(state),
+                Path((group, version, plural)),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
 
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -465,7 +494,7 @@ pub async fn create_resource(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
-    Ok((StatusCode::CREATED, Json(obj.body)))
+    Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
 
 pub async fn replace_resource(
@@ -473,7 +502,18 @@ pub async fn replace_resource(
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::replace_cr(
+                State(state),
+                Path((group, version, plural, name)),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
 
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -507,14 +547,24 @@ pub async fn replace_resource(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
-    Ok(Json(obj.body))
+    Ok(Json(obj.body).into_response())
 }
 
 pub async fn delete_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::delete_cr(
+                State(state),
+                Path((group, version, plural, name)),
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
 
     let key = group_object_key(&group, &plural, None, &name);
 
@@ -539,7 +589,7 @@ pub async fn delete_resource(
             .map_err(|e| store_err(e, &name, &meta.kind))?;
         let mut body = soft;
         body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
-        return Ok(Json(body));
+        return Ok(Json(body).into_response());
     }
 
     state
@@ -557,7 +607,7 @@ pub async fn delete_resource(
         "apiVersion": "v1",
         "status": "Success",
         "code": 200
-    })))
+    })).into_response())
 }
 
 pub async fn patch_resource(
@@ -636,7 +686,16 @@ pub async fn list_namespaced_resource(
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
 ) -> Result<Response, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::list_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural)),
+            )
+            .await;
+        }
+    };
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
 
     if query.watch == Some(true) {
@@ -683,7 +742,16 @@ pub async fn get_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::get_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural, name)),
+            )
+            .await;
+        }
+    };
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let stored = state
@@ -706,7 +774,18 @@ pub async fn create_namespaced_resource(
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::create_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural)),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
 
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -739,7 +818,7 @@ pub async fn create_namespaced_resource(
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
-    Ok((StatusCode::CREATED, Json(obj.body)))
+    Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
 
 pub async fn replace_namespaced_resource(
@@ -747,7 +826,18 @@ pub async fn replace_namespaced_resource(
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::replace_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural, name)),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
 
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -781,14 +871,24 @@ pub async fn replace_namespaced_resource(
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
-    Ok(Json(obj.body))
+    Ok(Json(obj.body).into_response())
 }
 
 pub async fn delete_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::delete_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural, name)),
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
 
@@ -811,7 +911,7 @@ pub async fn delete_namespaced_resource(
             .map_err(|e| store_err(e, &name, &meta.kind))?;
         let mut body = soft;
         body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
-        return Ok(Json(body));
+        return Ok(Json(body).into_response());
     }
 
     state
@@ -829,7 +929,7 @@ pub async fn delete_namespaced_resource(
         "apiVersion": "v1",
         "status": "Success",
         "code": 200
-    })))
+    })).into_response())
 }
 
 pub async fn patch_namespaced_resource(

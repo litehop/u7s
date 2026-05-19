@@ -1,4 +1,5 @@
 pub mod authorization;
+pub mod cr;
 pub mod crd;
 pub mod discovery;
 pub mod generic;
