@@ -16,11 +16,13 @@ use crate::{
     types::{Object, ResourceKey},
 };
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct CollectionQuery {
     pub watch: Option<bool>,
     pub resource_version: Option<u64>,
     pub label_selector: Option<String>,
+    #[serde(rename = "fieldSelector")]
+    pub field_selector: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +275,55 @@ fn apply_label_selector(
         .collect()
 }
 
+/// Parse a `fieldSelector` string of the form `key=value,key2=value2` into pairs.
+/// Supported fields: `metadata.name`, `metadata.namespace`, `spec.nodeName`.
+/// Unknown fields are silently passed through (Kubernetes behaviour — callers must not error).
+fn parse_field_selector(selector: &str) -> Result<Vec<(String, String)>, crate::status::StatusError> {
+    let mut pairs = Vec::new();
+    for part in selector.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let mut it = part.splitn(2, '=');
+        let key = it.next().unwrap_or("").trim();
+        let val = it.next().ok_or_else(|| {
+            Status::bad_request(format!("invalid fieldSelector '{part}': expected key=value"))
+        })?.trim();
+        if key.is_empty() {
+            return Err(Status::bad_request(format!("invalid fieldSelector '{part}': empty key")));
+        }
+        pairs.push((key.to_string(), val.to_string()));
+    }
+    Ok(pairs)
+}
+
+/// Filter `items` by field selector pairs.
+/// Supported fields: `metadata.name`, `metadata.namespace`, `spec.nodeName`.
+/// Unknown fields: silently ignored (Kubernetes behaviour).
+fn apply_field_selector(
+    items: Vec<serde_json::Value>,
+    pairs: &[(String, String)],
+) -> Vec<serde_json::Value> {
+    if pairs.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter(|item| {
+            pairs.iter().all(|(field, expected)| {
+                let actual = match field.as_str() {
+                    "metadata.name" => item["metadata"]["name"].as_str(),
+                    "metadata.namespace" => item["metadata"]["namespace"].as_str(),
+                    "spec.nodeName" => item["spec"]["nodeName"].as_str(),
+                    _ => return true, // unknown field: pass through
+                };
+                actual == Some(expected.as_str())
+            })
+        })
+        .collect()
+}
+
 pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
     match rv {
         None | Some("") => Ok(None),
@@ -409,6 +460,13 @@ pub async fn list_resource(
     let items = if let Some(ref sel) = query.label_selector {
         let pairs = parse_label_selector(sel)?;
         apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
+
+    let items = if let Some(ref sel) = query.field_selector {
+        let pairs = parse_field_selector(sel)?;
+        apply_field_selector(items, &pairs)
     } else {
         items
     };
@@ -758,6 +816,13 @@ pub async fn list_namespaced_resource(
     let items = if let Some(ref sel) = query.label_selector {
         let pairs = parse_label_selector(sel)?;
         apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
+
+    let items = if let Some(ref sel) = query.field_selector {
+        let pairs = parse_field_selector(sel)?;
+        apply_field_selector(items, &pairs)
     } else {
         items
     };
@@ -1329,6 +1394,12 @@ pub async fn core_list_resource(
         } else {
             items
         };
+        let items = if let Some(ref sel) = query.field_selector {
+            let pairs = parse_field_selector(sel)?;
+            apply_field_selector(items, &pairs)
+        } else {
+            items
+        };
         let body = build_list_response("Pod", "", "v1", resp.revision, items);
         return Ok(Json(body).into_response());
     }
@@ -1734,6 +1805,106 @@ mod tests {
     fn non_core_group_api_version_includes_group() {
         let body = build_list_response("Deployment", "apps", "v1", 0, vec![]);
         assert_eq!(body["apiVersion"], "apps/v1");
+    }
+
+    // -- parse_field_selector --
+
+    #[test]
+    fn field_selector_single_pair() {
+        // metadata.name is the most common fieldSelector — must parse correctly
+        let pairs = ok(parse_field_selector("metadata.name=my-pod"));
+        assert_eq!(pairs, vec![("metadata.name".to_string(), "my-pod".to_string())]);
+    }
+
+    #[test]
+    fn field_selector_multiple_pairs_and_logic() {
+        // Multiple pairs must ALL be required (AND logic) — this is Kubernetes behaviour
+        let pairs = ok(parse_field_selector("metadata.name=foo,metadata.namespace=bar"));
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("metadata.name".to_string(), "foo".to_string()));
+        assert_eq!(pairs[1], ("metadata.namespace".to_string(), "bar".to_string()));
+    }
+
+    #[test]
+    fn field_selector_missing_equals_is_error() {
+        assert!(parse_field_selector("metadata.name").is_err());
+    }
+
+    #[test]
+    fn field_selector_empty_key_is_error() {
+        assert!(parse_field_selector("=value").is_err());
+    }
+
+    fn item_with_meta(name: &str, namespace: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": { "name": name, "namespace": namespace }
+        })
+    }
+
+    fn item_with_node(name: &str, namespace: &str, node: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": { "name": name, "namespace": namespace },
+            "spec": { "nodeName": node }
+        })
+    }
+
+    #[test]
+    fn field_selector_metadata_name_match() {
+        // fieldSelector=metadata.name=foo must keep only matching items — filtering by name
+        // is the primary use case (e.g. kubectl get pod foo)
+        let items = vec![item_with_meta("foo", "default"), item_with_meta("bar", "default")];
+        let pairs = vec![("metadata.name".to_string(), "foo".to_string())];
+        let result = apply_field_selector(items, &pairs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["metadata"]["name"], "foo");
+    }
+
+    #[test]
+    fn field_selector_metadata_name_excludes_non_matching() {
+        // Items that do not match the name filter must be excluded
+        let items = vec![item_with_meta("bar", "default"), item_with_meta("baz", "default")];
+        let pairs = vec![("metadata.name".to_string(), "foo".to_string())];
+        let result = apply_field_selector(items, &pairs);
+        assert!(result.is_empty(), "non-matching items must be excluded");
+    }
+
+    #[test]
+    fn field_selector_unknown_field_passes_through() {
+        // Unknown fields must not cause errors or exclude items — Kubernetes passes unknown
+        // field selectors through to the client without filtering (server-side ignore)
+        let items = vec![item_with_meta("x", "default")];
+        let pairs = vec![("some.unknown.field".to_string(), "val".to_string())];
+        let result = apply_field_selector(items, &pairs);
+        assert_eq!(result.len(), 1, "unknown field selector must not filter items");
+    }
+
+    #[test]
+    fn field_selector_spec_node_name() {
+        // spec.nodeName is used by kubelet to find pods assigned to a node
+        let items = vec![
+            item_with_node("pod-a", "default", "node-1"),
+            item_with_node("pod-b", "default", "node-2"),
+        ];
+        let pairs = vec![("spec.nodeName".to_string(), "node-1".to_string())];
+        let result = apply_field_selector(items, &pairs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["metadata"]["name"], "pod-a");
+    }
+
+    #[test]
+    fn field_selector_and_logic_both_must_match() {
+        // Multiple pairs: ALL must match (AND, not OR)
+        let items = vec![
+            item_with_node("pod-a", "default", "node-1"),
+            item_with_node("pod-b", "kube-system", "node-1"),
+        ];
+        let pairs = vec![
+            ("metadata.namespace".to_string(), "default".to_string()),
+            ("spec.nodeName".to_string(), "node-1".to_string()),
+        ];
+        let result = apply_field_selector(items, &pairs);
+        assert_eq!(result.len(), 1, "both conditions must match (AND)");
+        assert_eq!(result[0]["metadata"]["name"], "pod-a");
     }
 
     // -- CR status PUT fallback --

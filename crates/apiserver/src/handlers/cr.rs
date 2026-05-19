@@ -719,6 +719,7 @@ mod tests {
             watch: None,
             resource_version: None,
             label_selector: None,
+            field_selector: None,
         }
     }
 
@@ -1238,6 +1239,7 @@ mod tests {
             watch: Some(true),
             resource_version: Some(0),
             label_selector: None,
+            field_selector: None,
         }
     }
 
