@@ -9,6 +9,7 @@ use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
     keys::{cluster_list_prefix, cluster_object_key},
+    proto,
     state::AppState,
     status::Status,
     types::Object,
@@ -118,9 +119,39 @@ pub async fn create_namespace(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let body = extract_body(&body, ct);
-    let mut obj = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    // Decode the request body. When kubectl sends Content-Type:
+    // application/vnd.kubernetes.protobuf, the body is a k8s Unknown envelope. For core types
+    // like Namespace, Unknown.raw is proto-encoded (contentType = protobuf), not JSON. We decode
+    // the envelope to check the inner content-type and, if needed, decode the nested proto bytes
+    // using the Namespace-specific decoder.
+    let mut obj = if ct.starts_with("application/vnd.kubernetes.protobuf") {
+        match proto::decode_k8s_proto_envelope(&body) {
+            Some(env) if env.content_type == "application/json" || env.content_type.is_empty() => {
+                // Inner bytes are JSON — parse normally.
+                let b = bytes::Bytes::from(env.raw);
+                Object::from_bytes(&b)
+                    .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?
+            }
+            Some(env) => {
+                // Inner bytes are proto-encoded (e.g. contentType = protobuf). Decode using
+                // the Namespace-specific proto decoder.
+                let json_val = proto::decode_namespace_proto(&env.raw).ok_or_else(|| {
+                    Status::bad_request(
+                        "unsupported protobuf body: could not decode as Namespace".into(),
+                    )
+                })?;
+                Object { body: json_val }
+            }
+            None => {
+                // Not a valid k8s proto envelope — fall back to raw JSON parse.
+                Object::from_bytes(&body)
+                    .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?
+            }
+        }
+    } else {
+        Object::from_bytes(&body)
+            .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?
+    };
 
     let name = obj
         .name()
