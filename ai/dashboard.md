@@ -1,26 +1,21 @@
 # Dashboard
 
-2026-05-19T06:15 UTC
+2026-05-19T07:00 UTC
 Session: 96473ee9-26b3-4236-b9dc-1d311e5cee69
-Open beads: 13 (1 in flight, PR pending)
+Open beads: 9 (0 in flight)
 
 ## What needs the operator now
 
-Nothing urgent. One profiling worker running; PR #40 awaiting CI.
+Nothing urgent. Operator paused after profiling workflow merged. 9 P2/P3 beads ready for next session.
 
 ## In flight / pending
 
-| Item | Bead | Surface | Status |
-|------|------|---------|--------|
-| PR #40 | mayor-uca | CR status subresource fallback in generic.rs | CI running (rebased) |
-| Worker a3c495fbe98f583ec | mayor-pga | scripts/bench-rss.sh + perf CI job | Running |
+Nothing in flight.
 
 ## Open beads
 
 | Priority | Bead | Title | Notes |
 |----------|------|-------|-------|
-| P2 | mayor-uca | CR status subresource write path | PR #40 pending CI |
-| P2 | mayor-pga | Profiling workflow: RSS + latency bench | Worker in flight |
 | P2 | mayor-yx5 | fieldSelector support | Ready to dispatch |
 | P2 | mayor-l8f | generateName support | Ready to dispatch |
 | P2 | mayor-jf3 | JSON Patch RFC 6902 | Ready to dispatch |
@@ -36,15 +31,15 @@ Nothing urgent. One profiling worker running; PR #40 awaiting CI.
 Conformance analysis complete: ~40-50% of API-level tests passable now.
 Top blocker cluster for conformance: fieldSelector (mayor-yx5), generateName (mayor-l8f), JSON Patch (mayor-jf3), Pod status subresource (mayor-b4g). These 4 alone unlock another ~15-20% of conformance tests.
 
-Profiling workflow (mayor-pga) establishes the RSS gate: 64 MB threshold for apiserver, enforced in CI on main push.
+Profiling workflow (mayor-pga) merged (PR #41): bench-rss.sh asserts ≤64 MB idle RSS; perf CI job runs on every main push. RSS gate: 65536 kB threshold, sampled via `ps -o rss=`.
 
 Next dispatch round: cluster mayor-yx5 + mayor-l8f + mayor-b4g as they all touch query/handler plumbing; mayor-jf3 + mayor-c3v into patch.rs/namespaces.rs; mayor-qnc into delete handlers.
 
 ## Recent progress
 
-This session: PRs #36–40, ~20 beads closed. Conformance gap analysis: 8 beads filed. Profiling bead filed.
+This session: PRs #33–41, ~25 beads closed. Conformance gap analysis: 8 beads filed. Profiling workflow filed and merged. Argo CD gap analysis filed.
 
-Smoke CI green end-to-end with pure kubectl.
+Smoke CI green end-to-end with pure kubectl. perf CI job active on main push.
 
 ## Stance
 
