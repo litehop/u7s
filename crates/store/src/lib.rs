@@ -967,4 +967,72 @@ mod tests {
         assert!(keys.contains(&"/registry/pods/default/alpha"));
         assert!(keys.contains(&"/registry/pods/default/beta"));
     }
+
+    #[tokio::test]
+    async fn test_global_monotonic_resource_version() {
+        // Kubernetes conformance requires resourceVersion to be a strictly increasing
+        // integer across ALL resource types, not per-resource. A watch started at rv=N
+        // must receive only events with rv > N regardless of kind.
+        //
+        // This test writes 5 objects of 3 different resource kinds and verifies:
+        //   1. Each returned revision is strictly greater than the previous.
+        //   2. The revision stored in metadata.resourceVersion is an integer string
+        //      (no decimals, no non-numeric characters).
+        let store = make_store();
+
+        let pod_value = Bytes::from(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "p1", "namespace": "default" },
+            "spec": { "containers": [] }
+        }).to_string());
+
+        let ns_value = Bytes::from(serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": { "name": "staging" }
+        }).to_string());
+
+        let cm_value = Bytes::from(serde_json::json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": { "name": "cfg", "namespace": "default" },
+            "data": {}
+        }).to_string());
+
+        let rv1 = store.put("/registry/pods/default/p1",          pod_value.clone(), Some(0)).await.expect("create pod");
+        let rv2 = store.put("/registry/namespaces/staging",        ns_value.clone(),  Some(0)).await.expect("create namespace");
+        let rv3 = store.put("/registry/configmaps/default/cfg",    cm_value.clone(),  Some(0)).await.expect("create configmap");
+        let rv4 = store.put("/registry/pods/default/p2",          pod_value.clone(), Some(0)).await.expect("create pod 2");
+        let rv5 = store.put("/registry/namespaces/production",     ns_value.clone(),  Some(0)).await.expect("create namespace 2");
+
+        let revisions = [rv1, rv2, rv3, rv4, rv5];
+
+        // Strictly increasing: each write must advance the global counter by at least 1.
+        for window in revisions.windows(2) {
+            assert!(
+                window[1] > window[0],
+                "resourceVersion must be strictly increasing across resource kinds: {} → {}",
+                window[0], window[1]
+            );
+        }
+
+        // The revision stamped into metadata.resourceVersion must be an integer string.
+        // Kubernetes clients parse it with strconv.ParseInt — any decimal or non-numeric
+        // character would cause conformance failures.
+        for (key, expected_rv) in [
+            ("/registry/pods/default/p1",        rv1),
+            ("/registry/namespaces/staging",       rv2),
+            ("/registry/configmaps/default/cfg",   rv3),
+        ] {
+            let obj = store.get(key).await.expect("get").expect("should exist");
+            let parsed: serde_json::Value = serde_json::from_slice(&obj.value).unwrap();
+            let rv_str = parsed["metadata"]["resourceVersion"]
+                .as_str()
+                .unwrap_or_else(|| panic!("metadata.resourceVersion must be a string for key {key}"));
+
+            // Must parse as u64 (integer, no decimal point).
+            let rv_int: u64 = rv_str.parse().unwrap_or_else(|_| {
+                panic!("metadata.resourceVersion '{rv_str}' is not a valid integer string for key {key}")
+            });
+            assert_eq!(rv_int, expected_rv, "stamped resourceVersion must match returned revision for key {key}");
+        }
+    }
 }
