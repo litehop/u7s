@@ -12,7 +12,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::Object,
-    util::extract_body,
+    util::{extract_body, utc_now_rfc3339},
 };
 
 /// Validate a namespace name: lowercase alphanumeric + hyphens, 1–63 chars.
@@ -255,18 +255,45 @@ pub async fn delete_namespace(
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let key = cluster_object_key("namespaces", &name);
-    state
+
+    // Fetch current to get finalizers and to return the Terminating state.
+    let stored = state
         .store
-        .delete(&key, None)
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    // Stamp Terminating phase and deletionTimestamp (emits MODIFIED watch event on write-back).
+    obj.body["status"]["phase"] = serde_json::Value::String("Terminating".into());
+    obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+
+    let expected_rv = parse_resource_version(obj.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, obj.to_bytes(), expected_rv)
         .await
         .map_err(|e| store_err_to_status(e, &name))?;
+    obj.set_resource_version(new_rv);
 
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Success",
-        "code": 200
-    })))
+    // If no finalizers, hard-delete immediately (emits DELETED watch event).
+    let has_finalizers = obj.body["metadata"]["finalizers"]
+        .as_array()
+        .map(|arr| !arr.is_empty())
+        .unwrap_or(false);
+
+    if !has_finalizers {
+        state
+            .store
+            .delete(&key, None)
+            .await
+            .map_err(|e| store_err_to_status(e, &name))?;
+    }
+
+    Ok(Json(obj.body))
 }
 
 #[cfg(test)]
@@ -299,6 +326,87 @@ mod tests {
     fn invalid_returns_422() {
         let err = validate_namespace_name("Bad_Name").unwrap_err();
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // -- delete_namespace --
+
+    async fn make_state() -> (crate::state::AppState, std::sync::Arc<u7s_store::SqliteStore>) {
+        let store = std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(store.clone(), None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
+        (state, store)
+    }
+
+    /// delete_namespace on a non-existent namespace must return 404.
+    #[tokio::test]
+    async fn delete_namespace_not_found_returns_404() {
+        use axum::extract::{Path, State};
+        let (state, _store) = make_state().await;
+        let result = delete_namespace(State(state), Path("missing-ns".to_string())).await;
+        match result {
+            Err(e) => assert_eq!(e.0, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("expected 404"),
+        }
+    }
+
+    /// delete_namespace on an existing namespace (no finalizers) must:
+    /// - return 200 with the namespace body in Terminating phase,
+    /// - remove the namespace from the store (hard-delete after Terminating stamp).
+    #[tokio::test]
+    async fn delete_namespace_returns_terminating_body_and_removes_from_store() {
+        use axum::extract::{Path, State};
+        let (state, store) = make_state().await;
+
+        let key = "/registry/namespaces/my-ns";
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "my-ns" },
+            "status": { "phase": "Active" }
+        });
+        store.put(key, bytes::Bytes::from(serde_json::to_vec(&ns_obj).unwrap()), None).await.unwrap();
+
+        let result = delete_namespace(State(state), Path("my-ns".to_string())).await;
+        assert!(result.is_ok(), "delete_namespace must succeed for existing namespace");
+
+        // Namespace must be gone (no finalizers → hard-deleted after Terminating stamp)
+        let still_there = store.get(key).await.unwrap();
+        assert!(still_there.is_none(), "namespace with no finalizers must be removed after delete");
+    }
+
+    /// delete_namespace on a namespace with finalizers must soft-delete:
+    /// write Terminating state back but NOT remove from store.
+    #[tokio::test]
+    async fn delete_namespace_with_finalizers_stays_in_store_as_terminating() {
+        use axum::extract::{Path, State};
+        let (state, store) = make_state().await;
+
+        let key = "/registry/namespaces/finalized-ns";
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "finalized-ns",
+                "finalizers": ["kubernetes"]
+            },
+            "status": { "phase": "Active" }
+        });
+        store.put(key, bytes::Bytes::from(serde_json::to_vec(&ns_obj).unwrap()), None).await.unwrap();
+
+        let result = delete_namespace(State(state), Path("finalized-ns".to_string())).await;
+        assert!(result.is_ok(), "delete_namespace must succeed with finalizers present");
+
+        // Namespace must still be in the store
+        let stored = store.get(key).await.unwrap().expect("namespace must persist when finalizers present");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"],
+            "Terminating",
+            "status.phase must be Terminating after delete with finalizers"
+        );
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must be set"
+        );
     }
 
     // When ?watch=true, list_namespaces must route to the watch stream (chunked transfer)
