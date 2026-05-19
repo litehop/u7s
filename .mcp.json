@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "u7s": {
+      "type": "stdio",
+      "command": "cargo",
+      "args": ["run", "--quiet", "--manifest-path", "/Users/balint.erdos/u7s/Cargo.toml", "-p", "u7s-mcp-server"]
+    }
+  }
+}
