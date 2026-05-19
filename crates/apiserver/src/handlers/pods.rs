@@ -15,6 +15,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::{Namespace, Object},
+    util::extract_body,
 };
 
 #[derive(Deserialize)]
@@ -266,10 +267,12 @@ async fn watch_pods(
 pub async fn create_pod(
     State(state): State<AppState>,
     Path((raw_ns,)): Path<(String,)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
-
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -320,10 +323,12 @@ pub async fn get_pod(
 pub async fn replace_pod(
     State(state): State<AppState>,
     Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
-
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -627,10 +632,12 @@ mod watch_tests {
 pub async fn bind_pod(
     State(state): State<AppState>,
     Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
-
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let binding: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 

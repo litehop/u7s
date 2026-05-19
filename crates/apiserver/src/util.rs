@@ -1,3 +1,21 @@
+use bytes::Bytes;
+
+use crate::proto;
+
+/// If the request body uses the Kubernetes protobuf encoding, decode it and return the embedded
+/// raw payload (typically JSON). Otherwise return the bytes unchanged.
+///
+/// This allows all write handlers to support both `application/json` and
+/// `application/vnd.kubernetes.protobuf` without duplicating decode logic.
+pub fn extract_body(bytes: &Bytes, content_type: &str) -> Bytes {
+    if content_type.starts_with("application/vnd.kubernetes.protobuf") {
+        if let Some(raw) = proto::decode_k8s_proto(bytes) {
+            return Bytes::from(raw);
+        }
+    }
+    bytes.clone()
+}
+
 /// Returns the current UTC time formatted as RFC3339 (`YYYY-MM-DDThh:mm:ssZ`).
 /// Uses only `std::time` — no chrono dependency.
 pub fn utc_now_rfc3339() -> String {

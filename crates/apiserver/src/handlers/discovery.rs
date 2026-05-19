@@ -384,7 +384,7 @@ mod tests {
         let state = make_state();
 
         let body = crd_bytes("example.io", "widgets", "widget", "Widget", "Namespaced", "v1beta1");
-        assert!(create_crd(State(state.clone()), body).await.is_ok(), "create must succeed");
+        assert!(create_crd(State(state.clone()), axum::http::HeaderMap::new(), body).await.is_ok(), "create must succeed");
 
         let Json(list) = api_group_list(State(state)).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
@@ -416,7 +416,7 @@ mod tests {
 
         // Install a CRD whose group is already covered by static discovery.
         let body = crd_bytes("apps", "widgets", "widget", "Widget", "Namespaced", "v1");
-        assert!(create_crd(State(state.clone()), body).await.is_ok(), "create must succeed");
+        assert!(create_crd(State(state.clone()), axum::http::HeaderMap::new(), body).await.is_ok(), "create must succeed");
 
         let Json(list) = api_group_list(State(state)).await;
         let apps_count = list.groups.iter().filter(|g| g.name == "apps").count();
@@ -432,7 +432,7 @@ mod tests {
         let state = make_state();
 
         let body = crd_bytes("example.io", "gadgets", "gadget", "Gadget", "Cluster", "v1alpha1");
-        assert!(create_crd(State(state.clone()), body).await.is_ok(), "create must succeed");
+        assert!(create_crd(State(state.clone()), axum::http::HeaderMap::new(), body).await.is_ok(), "create must succeed");
 
         let resp = api_group_resources(
             State(state),
@@ -492,7 +492,7 @@ mod tests {
             })
             .to_string(),
         );
-        assert!(create_crd(State(state.clone()), body).await.is_ok(), "create must succeed");
+        assert!(create_crd(State(state.clone()), axum::http::HeaderMap::new(), body).await.is_ok(), "create must succeed");
 
         let Json(list) = api_group_list(State(state)).await;
         let group = list

@@ -2,6 +2,7 @@ mod auth;
 mod handlers;
 mod keys;
 mod patch;
+mod proto;
 mod rbac;
 mod state;
 mod status;

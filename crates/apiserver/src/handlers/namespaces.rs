@@ -12,6 +12,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::Object,
+    util::extract_body,
 };
 
 /// Validate a namespace name: lowercase alphanumeric + hyphens, 1–63 chars.
@@ -100,8 +101,11 @@ pub async fn list_namespaces(
 
 pub async fn create_namespace(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -159,8 +163,11 @@ pub async fn get_namespace(
 pub async fn replace_namespace(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let body = extract_body(&body, ct);
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
