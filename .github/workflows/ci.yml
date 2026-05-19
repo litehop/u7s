@@ -73,31 +73,42 @@ jobs:
           # yet verify. Use the static token instead; include the CA from the
           # generated kubeconfig so TLS server verification still works.
           CA_DATA=$(grep "certificate-authority-data" "$TMPDIR/kubeconfig" | awk '{print $2}')
+          # Decode CA cert to a PEM file for use with curl --cacert.
+          echo "$CA_DATA" | base64 -d > "$TMPDIR/ca.pem"
+          echo "SMOKE_CA_PEM=$TMPDIR/ca.pem" >> "$GITHUB_ENV"
+          echo "SMOKE_TOKEN=$SMOKE_TOKEN" >> "$GITHUB_ENV"
+          # Heredoc lines must start at column 0 to produce valid YAML.
           cat > "$TMPDIR/kubeconfig" <<KUBECFG
-          apiVersion: v1
-          kind: Config
-          clusters:
-          - cluster:
-              server: https://127.0.0.1:6443
-              certificate-authority-data: $CA_DATA
-            name: u7s
-          contexts:
-          - context:
-              cluster: u7s
-              user: smoke-admin
-            name: u7s
-          current-context: u7s
-          users:
-          - name: smoke-admin
-            user:
-              token: $SMOKE_TOKEN
-          KUBECFG
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://127.0.0.1:6443
+    certificate-authority-data: $CA_DATA
+  name: u7s
+contexts:
+- context:
+    cluster: u7s
+    user: smoke-admin
+  name: u7s
+current-context: u7s
+users:
+- name: smoke-admin
+  user:
+    token: $SMOKE_TOKEN
+KUBECFG
 
       - name: Smoke — namespace CRUD
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
-          kubectl create namespace smoke-test
+          # kubectl sends protobuf for write ops (mayor-837 tracks server-side fix).
+          # Use curl with JSON body for writes; kubectl get for reads (sends Accept: application/json).
+          curl -sf --cacert "$SMOKE_CA_PEM" \
+            -H "Authorization: Bearer $SMOKE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST https://127.0.0.1:6443/api/v1/namespaces \
+            -d '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"smoke-test"}}'
           kubectl get namespace smoke-test
           kubectl get namespaces | grep smoke-test
 
@@ -105,7 +116,11 @@ jobs:
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
-          kubectl create configmap smoke-cm --from-literal=key=value --namespace smoke-test
+          curl -sf --cacert "$SMOKE_CA_PEM" \
+            -H "Authorization: Bearer $SMOKE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST https://127.0.0.1:6443/api/v1/namespaces/smoke-test/configmaps \
+            -d '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"smoke-cm","namespace":"smoke-test"},"data":{"key":"value"}}'
           kubectl get configmap smoke-cm --namespace smoke-test
           kubectl get configmaps --namespace smoke-test | grep smoke-cm
 
@@ -113,42 +128,42 @@ jobs:
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
-          kubectl apply -f - <<'EOF'
-          apiVersion: apiextensions.k8s.io/v1
-          kind: CustomResourceDefinition
-          metadata:
-            name: foos.smoke.u7s.dev
-          spec:
-            group: smoke.u7s.dev
-            names:
-              kind: Foo
-              plural: foos
-              singular: foo
-            scope: Cluster
-            versions:
-              - name: v1alpha1
-                served: true
-                storage: true
-                schema:
-                  openAPIV3Schema:
-                    type: object
-                    properties:
-                      spec:
-                        type: object
-          EOF
+          curl -sf --cacert "$SMOKE_CA_PEM" \
+            -H "Authorization: Bearer $SMOKE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST https://127.0.0.1:6443/apis/apiextensions.k8s.io/v1/customresourcedefinitions \
+            -d '{
+              "apiVersion": "apiextensions.k8s.io/v1",
+              "kind": "CustomResourceDefinition",
+              "metadata": {"name": "foos.smoke.u7s.dev"},
+              "spec": {
+                "group": "smoke.u7s.dev",
+                "names": {"kind": "Foo", "plural": "foos", "singular": "foo"},
+                "scope": "Cluster",
+                "versions": [{
+                  "name": "v1alpha1",
+                  "served": true,
+                  "storage": true,
+                  "schema": {
+                    "openAPIV3Schema": {
+                      "type": "object",
+                      "properties": {"spec": {"type": "object"}}
+                    }
+                  }
+                }]
+              }
+            }'
           kubectl get crd foos.smoke.u7s.dev
 
       - name: Smoke — CR instance create and get
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
-          kubectl apply -f - <<'EOF'
-          apiVersion: smoke.u7s.dev/v1alpha1
-          kind: Foo
-          metadata:
-            name: smoke-foo
-          spec: {}
-          EOF
+          curl -sf --cacert "$SMOKE_CA_PEM" \
+            -H "Authorization: Bearer $SMOKE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST https://127.0.0.1:6443/apis/smoke.u7s.dev/v1alpha1/foos \
+            -d '{"apiVersion":"smoke.u7s.dev/v1alpha1","kind":"Foo","metadata":{"name":"smoke-foo"},"spec":{}}'
           kubectl get foo smoke-foo
 
       - name: Stop apiserver
