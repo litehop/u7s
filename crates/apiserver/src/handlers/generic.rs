@@ -177,6 +177,18 @@ fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
 
 use crate::util::utc_now_rfc3339;
 
+const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
+
+/// Build the RBAC index key for a cluster-scoped object.
+fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
+    format!("/apis/{group}/{version}/{plural}/{name}")
+}
+
+/// Build the RBAC index key for a namespaced object.
+fn rbac_namespaced_key(group: &str, version: &str, ns: &str, plural: &str, name: &str) -> String {
+    format!("/apis/{group}/{version}/namespaces/{ns}/{plural}/{name}")
+}
+
 // ---------------------------------------------------------------------------
 // Cluster-scoped handlers  (group/version/resource)
 // ---------------------------------------------------------------------------
@@ -268,6 +280,10 @@ pub async fn create_resource(
     };
 
     obj.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &obj.body);
+    }
     Ok((StatusCode::CREATED, Json(obj.body)))
 }
 
@@ -306,6 +322,10 @@ pub async fn replace_resource(
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
     obj.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &obj.body);
+    }
     Ok(Json(obj.body))
 }
 
@@ -347,6 +367,10 @@ pub async fn delete_resource(
         .await
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+        state.rbac_index.remove_object(&rbac_key);
+    }
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
@@ -400,6 +424,10 @@ pub async fn patch_resource(
             .delete(&key, None)
             .await
             .map_err(|e| store_err(e, &name, &meta.kind))?;
+        if group == RBAC_GROUP {
+            let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+            state.rbac_index.remove_object(&rbac_key);
+        }
         return Ok(Json(current.body));
     }
 
@@ -411,6 +439,10 @@ pub async fn patch_resource(
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
     current.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &current.body);
+    }
     Ok(Json(current.body))
 }
 
@@ -507,6 +539,10 @@ pub async fn create_namespaced_resource(
     };
 
     obj.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &obj.body);
+    }
     Ok((StatusCode::CREATED, Json(obj.body)))
 }
 
@@ -545,6 +581,10 @@ pub async fn replace_namespaced_resource(
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
     obj.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &obj.body);
+    }
     Ok(Json(obj.body))
 }
 
@@ -584,6 +624,10 @@ pub async fn delete_namespaced_resource(
         .await
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+        state.rbac_index.remove_object(&rbac_key);
+    }
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
@@ -637,6 +681,10 @@ pub async fn patch_namespaced_resource(
             .delete(&key, None)
             .await
             .map_err(|e| store_err(e, &name, &meta.kind))?;
+        if group == RBAC_GROUP {
+            let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+            state.rbac_index.remove_object(&rbac_key);
+        }
         return Ok(Json(current.body));
     }
 
@@ -648,6 +696,10 @@ pub async fn patch_namespaced_resource(
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
     current.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &current.body);
+    }
     Ok(Json(current.body))
 }
 
