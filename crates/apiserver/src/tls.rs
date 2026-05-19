@@ -128,6 +128,19 @@ pub fn generate_tls(_args: &Args) -> anyhow::Result<TlsMaterial> {
     })
 }
 
+fn pem_encode(label: &str, der: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let encoded = b64.encode(der);
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap());
+        out.push('\n');
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    out.into_bytes()
+}
+
 /// Typed builder for a minimal kubeconfig.
 /// Serialised to YAML manually — no serde_yaml dependency required.
 struct Kubeconfig {
@@ -141,10 +154,13 @@ impl Kubeconfig {
     fn new(server: &str, tls: &TlsMaterial) -> Self {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
+        // kubeconfig fields expect base64(PEM), not base64(DER).
+        let ca_pem = pem_encode("CERTIFICATE", &tls.ca_cert_der);
+        let cert_pem = pem_encode("CERTIFICATE", &tls.admin_cert_der);
         Kubeconfig {
             server: server.to_owned(),
-            ca_data: b64.encode(&tls.ca_cert_der),
-            cert_data: b64.encode(&tls.admin_cert_der),
+            ca_data: b64.encode(&ca_pem),
+            cert_data: b64.encode(&cert_pem),
             key_data: b64.encode(&tls.admin_key_pem),
         }
     }
