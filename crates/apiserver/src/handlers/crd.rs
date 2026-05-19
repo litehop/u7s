@@ -122,15 +122,10 @@ fn stamp_server_fields(crd: &mut CustomResourceDefinition) {
 
 fn new_uid() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
+    let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{secs:016x}-{nanos:08x}-crd0-0000-000000000000")
+        .unwrap_or_default();
+    format!("{:016x}-{:08x}-crd0-0000-000000000000", d.as_secs(), d.subsec_nanos())
 }
 
 fn to_bytes(crd: &CustomResourceDefinition) -> Bytes {
