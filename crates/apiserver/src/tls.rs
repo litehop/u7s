@@ -12,6 +12,8 @@ use crate::Args;
 pub struct SaKeys {
     /// PEM-encoded PKCS#8 private key — used to construct an EncodingKey.
     pub private_key_pem: Vec<u8>,
+    /// PEM-encoded RSA public key — used to construct a DecodingKey.
+    pub public_key_pem: Vec<u8>,
 }
 
 /// Load `sa.key` from disk, or generate a fresh RSA-2048 key and write it.
@@ -26,11 +28,23 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
     use rsa::RsaPrivateKey;
 
-    // If the private key already exists, load it.
+    // If the private key already exists, load it and re-derive the public key.
     if std::path::Path::new(sa_key_path).exists() {
+        use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
         let pem = std::fs::read(sa_key_path)?;
+        let pem_str = std::str::from_utf8(&pem)
+            .map_err(|e| anyhow::anyhow!("SA key file is not valid UTF-8: {e}"))?;
+        let private_key = RsaPrivateKey::from_pkcs8_pem(pem_str)
+            .map_err(|e| anyhow::anyhow!("failed to parse SA private key: {e}"))?;
+        let public_pem = private_key
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
         tracing::info!("loaded SA signing key from {sa_key_path}");
-        return Ok(SaKeys { private_key_pem: pem });
+        return Ok(SaKeys {
+            private_key_pem: pem,
+            public_key_pem: public_pem.into_bytes(),
+        });
     }
 
     // Generate a new 2048-bit RSA key.
@@ -51,7 +65,10 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
     std::fs::write(sa_pub_path, public_pem.as_bytes())?;
     tracing::info!("SA signing key written to {sa_key_path}");
 
-    Ok(SaKeys { private_key_pem: private_pem.as_bytes().to_vec() })
+    Ok(SaKeys {
+        private_key_pem: private_pem.as_bytes().to_vec(),
+        public_key_pem: public_pem.into_bytes(),
+    })
 }
 
 pub struct TlsMaterial {

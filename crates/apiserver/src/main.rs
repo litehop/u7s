@@ -85,19 +85,19 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 7. Load or generate the SA signing key.
-    let sa_encoding_key = match load_or_generate_sa_keys(&args.sa_key, &args.sa_pub) {
+    let (sa_encoding_key, sa_decoding_key) = match load_or_generate_sa_keys(&args.sa_key, &args.sa_pub) {
         Ok(sa_keys) => {
-            match jsonwebtoken::EncodingKey::from_rsa_pem(&sa_keys.private_key_pem) {
-                Ok(k) => Some(k),
-                Err(e) => {
-                    tracing::error!("failed to load SA signing key: {e}");
-                    None
-                }
-            }
+            let enc = jsonwebtoken::EncodingKey::from_rsa_pem(&sa_keys.private_key_pem)
+                .map_err(|e| { tracing::error!("failed to load SA signing key: {e}"); e })
+                .ok();
+            let dec = jsonwebtoken::DecodingKey::from_rsa_pem(&sa_keys.public_key_pem)
+                .map_err(|e| { tracing::error!("failed to load SA public key: {e}"); e })
+                .ok();
+            (enc, dec)
         }
         Err(e) => {
             tracing::error!("SA key gen/load failed: {e}");
-            None
+            (None, None)
         }
     };
 
@@ -117,14 +117,18 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("advertised server address: {server_address}");
 
     // 9. Build app state (shared with the auth layer).
-    let state = AppState::new(Arc::clone(&store), sa_encoding_key, server_address);
+    let state = AppState::new(Arc::clone(&store), sa_encoding_key, sa_decoding_key, server_address);
 
     // 9a. Populate RBAC index from persisted objects before serving.
     state.init().await;
 
     // 10. Build axum router and attach the auth tower layer.
     let app = build_router(state.clone())
-        .layer(AuthLayer::new(Arc::clone(&state.rbac_index), token_map));
+        .layer(AuthLayer::new(
+            Arc::clone(&state.rbac_index),
+            token_map,
+            state.sa_decoding_key.clone(),
+        ));
 
     // 11. Bind TLS listener and serve.
     let listener = TcpListener::bind(&args.listen).await?;

@@ -12,6 +12,8 @@ pub struct AppState {
     pub rbac_index: Arc<RbacIndex>,
     /// RSA signing key for service-account JWTs. None when SA key is unavailable.
     pub sa_key: Option<Arc<jsonwebtoken::EncodingKey>>,
+    /// RSA public key for verifying inbound SA JWTs. None when SA key is unavailable.
+    pub sa_decoding_key: Option<Arc<jsonwebtoken::DecodingKey>>,
     /// Advertised server address returned in /api discovery (e.g. "https://1.2.3.4:6443").
     pub server_address: String,
 }
@@ -20,6 +22,7 @@ impl AppState {
     pub fn new(
         store: Arc<SqliteStore>,
         sa_key: Option<jsonwebtoken::EncodingKey>,
+        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
         server_address: String,
     ) -> Self {
         let registry = build_registry();
@@ -28,6 +31,7 @@ impl AppState {
             resource_registry: Arc::new(registry),
             rbac_index: Arc::new(RbacIndex::new()),
             sa_key: sa_key.map(Arc::new),
+            sa_decoding_key: sa_decoding_key.map(Arc::new),
             server_address,
         }
     }

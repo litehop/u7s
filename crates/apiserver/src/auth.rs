@@ -1,7 +1,7 @@
 // Authentication + Authorization tower middleware layer.
 //
 // Implements static bearer-token authentication (--token-auth-file)
-// and RBAC authorization via RbacIndex.  JWT/SA validation is P2-07.
+// and RS256 JWT verification for service-account tokens.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -12,6 +12,8 @@ use std::task::{Context, Poll};
 
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
+use serde::Deserialize;
 use tower::Layer;
 use tower_service::Service;
 
@@ -28,6 +30,21 @@ pub struct UserInfo {
     #[allow(dead_code)]
     pub uid: String,
     pub groups: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// JWT Claims — used for decoding inbound SA tokens
+// ---------------------------------------------------------------------------
+
+/// Minimal claim set decoded from inbound SA JWTs.
+/// Must match the fields minted by `handlers::tokens::create_token`.
+#[derive(Debug, Deserialize)]
+struct SaClaims {
+    /// Subject — format: "system:serviceaccount:<namespace>:<name>"
+    sub: String,
+    /// Issuer — validated against expected value.
+    #[allow(dead_code)]
+    iss: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +100,7 @@ enum AuthnResult {
 fn authenticate(
     req: &Request<Body>,
     token_map: &HashMap<String, UserInfo>,
+    sa_decoding_key: Option<&DecodingKey>,
 ) -> AuthnResult {
     let auth_header = req.headers().get("authorization");
 
@@ -98,14 +116,48 @@ fn authenticate(
         Some(value) => {
             let value = value.to_str().unwrap_or("");
             if let Some(token) = value.strip_prefix("Bearer ") {
-                match token_map.get(token) {
-                    Some(info) => AuthnResult::Identified(info.clone()),
-                    None => AuthnResult::BadToken,
+                // 1. Check static token map first.
+                if let Some(info) = token_map.get(token) {
+                    return AuthnResult::Identified(info.clone());
                 }
+                // 2. If a SA decoding key is available, attempt JWT verification.
+                if let Some(key) = sa_decoding_key {
+                    if let Some(user) = try_verify_sa_jwt(token, key) {
+                        return AuthnResult::Identified(user);
+                    }
+                }
+                // 3. Token not recognized — reject.
+                AuthnResult::BadToken
             } else {
                 // Malformed Authorization header → treat as bad token.
                 AuthnResult::BadToken
             }
+        }
+    }
+}
+
+/// Attempt to decode and verify a bearer token as an RS256 SA JWT.
+/// Returns `Some(UserInfo)` on success, `None` if the token is invalid.
+fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&["https://kubernetes.default.svc"]);
+    validation.set_audience(&["https://kubernetes.default.svc"]);
+    // No leeway: reject tokens that are even 1 second past expiry.
+    validation.leeway = 0;
+
+    match jsonwebtoken::decode::<SaClaims>(token, key, &validation) {
+        Ok(data) => {
+            let sub = data.claims.sub;
+            tracing::debug!("SA JWT verified: sub={sub}");
+            Some(UserInfo {
+                username: sub,
+                uid: String::new(),
+                groups: vec!["system:serviceaccounts".to_owned()],
+            })
+        }
+        Err(e) => {
+            tracing::debug!("SA JWT verification failed: {e}");
+            None
         }
     }
 }
@@ -243,13 +295,19 @@ fn forbidden_response(user: &str, verb: &str, resource: &str) -> Response<Body> 
 pub struct AuthLayer {
     rbac_index: Arc<RbacIndex>,
     token_map: Arc<HashMap<String, UserInfo>>,
+    sa_decoding_key: Option<Arc<DecodingKey>>,
 }
 
 impl AuthLayer {
-    pub fn new(rbac_index: Arc<RbacIndex>, token_map: HashMap<String, UserInfo>) -> Self {
+    pub fn new(
+        rbac_index: Arc<RbacIndex>,
+        token_map: HashMap<String, UserInfo>,
+        sa_decoding_key: Option<Arc<DecodingKey>>,
+    ) -> Self {
         AuthLayer {
             rbac_index,
             token_map: Arc::new(token_map),
+            sa_decoding_key,
         }
     }
 }
@@ -262,6 +320,7 @@ impl<S> Layer<S> for AuthLayer {
             inner,
             rbac_index: Arc::clone(&self.rbac_index),
             token_map: Arc::clone(&self.token_map),
+            sa_decoding_key: self.sa_decoding_key.clone(),
         }
     }
 }
@@ -275,6 +334,7 @@ pub struct AuthService<S> {
     inner: S,
     rbac_index: Arc<RbacIndex>,
     token_map: Arc<HashMap<String, UserInfo>>,
+    sa_decoding_key: Option<Arc<DecodingKey>>,
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -302,7 +362,7 @@ where
         }
 
         // 1. Authenticate.
-        let user = match authenticate(&req, &self.token_map) {
+        let user = match authenticate(&req, &self.token_map, self.sa_decoding_key.as_deref()) {
             AuthnResult::Identified(u) => u,
             AuthnResult::BadToken => {
                 return Box::pin(async move { Ok(unauthorized_response()) });
@@ -363,7 +423,7 @@ mod tests {
         // Without an Authorization header, caller must be anonymous.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        let result = authenticate(&req, &map);
+        let result = authenticate(&req, &map, None);
         match result {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:anonymous");
@@ -386,7 +446,7 @@ mod tests {
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
-        match authenticate(&req, &map) {
+        match authenticate(&req, &map, None) {
             AuthnResult::Identified(u) => assert_eq!(u.username, "alice"),
             AuthnResult::BadToken => panic!("expected Identified"),
         }
@@ -399,7 +459,7 @@ mod tests {
         // silently downgraded to anonymous access.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer wrong-token"));
-        match authenticate(&req, &map) {
+        match authenticate(&req, &map, None) {
             AuthnResult::BadToken => {}
             AuthnResult::Identified(_) => panic!("unknown token must not succeed"),
         }
@@ -472,5 +532,122 @@ mod tests {
         let bob = map.get("tok2").expect("tok2 must be present");
         assert_eq!(bob.username, "bob");
         assert!(bob.groups.is_empty());
+    }
+
+    // --- SA JWT authentication ---
+
+    /// Generate a minimal in-memory RSA-2048 key pair for use in tests.
+    fn test_rsa_keypair() -> (jsonwebtoken::EncodingKey, jsonwebtoken::DecodingKey) {
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        let mut rng = rsa::rand_core::OsRng;
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
+        let priv_pem = private_key.to_pkcs8_pem(LineEnding::LF).expect("priv pem").as_bytes().to_vec();
+        let pub_pem = private_key.to_public_key().to_public_key_pem(LineEnding::LF).expect("pub pem").into_bytes();
+        let enc = jsonwebtoken::EncodingKey::from_rsa_pem(&priv_pem).expect("enc key");
+        let dec = jsonwebtoken::DecodingKey::from_rsa_pem(&pub_pem).expect("dec key");
+        (enc, dec)
+    }
+
+    /// Mint a minimal SA JWT using the provided encoding key.
+    fn mint_sa_jwt(
+        enc: &jsonwebtoken::EncodingKey,
+        sub: &str,
+        exp_offset_secs: i64,
+    ) -> String {
+        use serde_json::json;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = json!({
+            "iss": "https://kubernetes.default.svc",
+            "sub": sub,
+            "aud": ["https://kubernetes.default.svc"],
+            "iat": now,
+            "exp": now + exp_offset_secs,
+        });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        jsonwebtoken::encode(&header, &claims, enc).expect("mint JWT")
+    }
+
+    #[test]
+    fn test_authn_valid_sa_jwt_authenticates() {
+        // A valid SA JWT signed by the SA key must identify the subject.
+        // This is the primary fix: SA JWTs are now verified, not rejected.
+        let (enc, dec) = test_rsa_keypair();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
+        match authenticate(&req, &HashMap::new(), Some(&dec)) {
+            AuthnResult::Identified(u) => {
+                assert_eq!(u.username, "system:serviceaccount:default:my-sa");
+                assert!(
+                    u.groups.contains(&"system:serviceaccounts".to_owned()),
+                    "SA group must be present"
+                );
+            }
+            AuthnResult::BadToken => panic!("valid SA JWT must not be rejected"),
+        }
+    }
+
+    #[test]
+    fn test_authn_tampered_sa_jwt_rejected() {
+        // A JWT with a tampered signature must be rejected — not silently allowed.
+        // Tampering: replace last 8 chars of the token (signature portion).
+        let (enc, dec) = test_rsa_keypair();
+        let mut token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let len = token.len();
+        token.replace_range(len - 8.., "AAAAAAAA");
+        let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
+        match authenticate(&req, &HashMap::new(), Some(&dec)) {
+            AuthnResult::BadToken => {} // correct
+            AuthnResult::Identified(_) => panic!("tampered JWT must not succeed"),
+        }
+    }
+
+    #[test]
+    fn test_authn_expired_sa_jwt_rejected() {
+        // An expired JWT must be rejected — not silently allowed.
+        let (enc, dec) = test_rsa_keypair();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", -1);
+        let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
+        match authenticate(&req, &HashMap::new(), Some(&dec)) {
+            AuthnResult::BadToken => {} // correct
+            AuthnResult::Identified(_) => panic!("expired JWT must not succeed"),
+        }
+    }
+
+    #[test]
+    fn test_authn_sa_jwt_wrong_key_rejected() {
+        // A JWT signed by a different key must be rejected.
+        // This prevents accepting tokens from a different cluster.
+        let (enc, _dec) = test_rsa_keypair();
+        let (_enc2, dec2) = test_rsa_keypair();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
+        match authenticate(&req, &HashMap::new(), Some(&dec2)) {
+            AuthnResult::BadToken => {} // correct
+            AuthnResult::Identified(_) => panic!("JWT from wrong key must not succeed"),
+        }
+    }
+
+    #[test]
+    fn test_authn_static_token_takes_priority_over_jwt() {
+        // If a token happens to be in the static map, it must use static auth,
+        // not fall through to JWT parsing (which would fail on a non-JWT string).
+        let mut map = HashMap::new();
+        map.insert(
+            "static-tok".to_owned(),
+            UserInfo { username: "static-user".to_owned(), uid: "0".to_owned(), groups: vec![] },
+        );
+        let (enc, dec) = test_rsa_keypair();
+        // Use a static token string — not a JWT — to confirm static path fires.
+        let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer static-tok"));
+        match authenticate(&req, &map, Some(&dec)) {
+            AuthnResult::Identified(u) => assert_eq!(u.username, "static-user"),
+            AuthnResult::BadToken => panic!("static token must resolve"),
+        }
+        // Suppress unused warning in test context.
+        let _ = enc;
     }
 }
