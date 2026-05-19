@@ -269,6 +269,15 @@ fn build_router(state: AppState) -> Router {
                 .post(handlers::generic::create_namespaced_resource),
         )
 
+        // Scale subresource — apps/v1 workloads (deployments, replicasets, statefulsets)
+        // Must be registered before the generic namespaced named-resource catch-all.
+        .route(
+            "/apis/apps/v1/namespaces/:ns/:resource/:name/scale",
+            get(handlers::scale::get_scale)
+                .put(handlers::scale::put_scale)
+                .patch(handlers::scale::patch_scale),
+        )
+
         // Generic namespaced resources — named
         .route(
             "/apis/:group/:version/namespaces/:ns/:resource/:name",
