@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use u7s_store::{ListOptions, SqliteStore, Store as _};
 
+use crate::auth::UserInfo;
 use crate::rbac::RbacIndex;
 use crate::types::{ResourceKey, ResourceMeta};
 
@@ -14,6 +15,8 @@ pub struct AppState {
     pub sa_key: Option<Arc<jsonwebtoken::EncodingKey>>,
     /// RSA public key for verifying inbound SA JWTs. None when SA key is unavailable.
     pub sa_decoding_key: Option<Arc<jsonwebtoken::DecodingKey>>,
+    /// Static bearer-token map loaded from --token-auth-file. Empty when not configured.
+    pub token_map: Arc<HashMap<String, UserInfo>>,
     /// Advertised server address returned in /api discovery (e.g. "https://1.2.3.4:6443").
     pub server_address: String,
 }
@@ -23,6 +26,7 @@ impl AppState {
         store: Arc<SqliteStore>,
         sa_key: Option<jsonwebtoken::EncodingKey>,
         sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+        token_map: HashMap<String, UserInfo>,
         server_address: String,
     ) -> Self {
         let registry = build_registry();
@@ -32,6 +36,7 @@ impl AppState {
             rbac_index: Arc::new(RbacIndex::new()),
             sa_key: sa_key.map(Arc::new),
             sa_decoding_key: sa_decoding_key.map(Arc::new),
+            token_map: Arc::new(token_map),
             server_address,
         }
     }

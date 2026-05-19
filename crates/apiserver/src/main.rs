@@ -118,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("advertised server address: {server_address}");
 
     // 9. Build app state (shared with the auth layer).
-    let state = AppState::new(Arc::clone(&store), sa_encoding_key, sa_decoding_key, server_address);
+    let state = AppState::new(Arc::clone(&store), sa_encoding_key, sa_decoding_key, token_map, server_address);
 
     // 9a. Populate RBAC index from persisted objects before serving.
     state.init().await;
@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router(state.clone())
         .layer(AuthLayer::new(
             Arc::clone(&state.rbac_index),
-            token_map,
+            (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
         ));
 
@@ -251,6 +251,14 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
             post(handlers::authorization::self_subject_rules_review),
+        )
+        .route(
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            post(handlers::authorization::subject_access_review),
+        )
+        .route(
+            "/apis/authentication.k8s.io/v1/tokenreviews",
+            post(handlers::authorization::token_review),
         )
 
         // ServiceAccounts — token subresource (TokenRequest API)
