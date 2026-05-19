@@ -27,6 +27,36 @@ pub struct CollectionQuery {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+pub(crate) fn generate_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut n = t ^ c.wrapping_mul(0x9e3779b97f4a7c15);
+    const CHARS: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
+    let mut out = [0u8; 5];
+    for b in out.iter_mut() {
+        *b = CHARS[(n % CHARS.len() as u64) as usize];
+        n = n.wrapping_div(CHARS.len() as u64);
+    }
+    String::from_utf8(out.to_vec()).unwrap()
+}
+
+fn resolve_name(obj: &mut Object) -> Result<String, crate::status::StatusError> {
+    match obj.name().filter(|n| !n.is_empty()) {
+        Some(n) => Ok(n.to_string()),
+        None => {
+            let gen = obj.body["metadata"]["generateName"].as_str().unwrap_or("");
+            if gen.is_empty() {
+                return Err(Status::bad_request("metadata.name or metadata.generateName is required".into()));
+            }
+            let name = format!("{}{}", gen, generate_suffix());
+            obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+            Ok(name)
+        }
+    }
+}
+
 fn lookup<'a>(
     state: &'a AppState,
     group: &str,
@@ -473,11 +503,7 @@ pub async fn create_resource(
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let name = obj
-        .name()
-        .filter(|n| !n.is_empty())
-        .ok_or_else(|| Status::bad_request("metadata.name is required".into()))?
-        .to_string();
+    let name = resolve_name(&mut obj)?;
 
     let key = group_object_key(&group, &plural, None, &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
@@ -822,11 +848,7 @@ pub async fn create_namespaced_resource(
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let name = obj
-        .name()
-        .filter(|n| !n.is_empty())
-        .ok_or_else(|| Status::bad_request("metadata.name is required".into()))?
-        .to_string();
+    let name = resolve_name(&mut obj)?;
 
     obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
 
@@ -1849,6 +1871,65 @@ mod tests {
     fn non_core_group_api_version_includes_group() {
         let body = build_list_response("Deployment", "apps", "v1", 0, vec![]);
         assert_eq!(body["apiVersion"], "apps/v1");
+    }
+
+    // -- generate_suffix + resolve_name --
+
+    #[test]
+    fn generate_suffix_produces_5_chars_from_allowed_charset() {
+        // The suffix is used as a unique name component; must be 5 chars from the safe charset.
+        const ALLOWED: &str = "bcdfghjklmnpqrstvwxz2456789";
+        let suffix = generate_suffix();
+        assert_eq!(suffix.len(), 5, "suffix must be exactly 5 characters");
+        for c in suffix.chars() {
+            assert!(ALLOWED.contains(c), "suffix char '{c}' not in allowed set");
+        }
+    }
+
+    #[test]
+    fn generate_suffix_produces_different_values() {
+        // Two calls must produce different values (collision would cause a store conflict).
+        let a = generate_suffix();
+        let b = generate_suffix();
+        assert_ne!(a, b, "consecutive suffixes must differ");
+    }
+
+    #[test]
+    fn resolve_name_uses_existing_name() {
+        // When metadata.name is already set, generateName is ignored and the existing name wins.
+        let mut obj = Object::from_bytes(
+            &bytes::Bytes::from(serde_json::json!({
+                "metadata": { "name": "my-pod", "generateName": "ignored-" }
+            }).to_string())
+        ).unwrap();
+        let name = ok(resolve_name(&mut obj));
+        assert_eq!(name, "my-pod");
+        assert_eq!(obj.body["metadata"]["name"], "my-pod");
+    }
+
+    #[test]
+    fn resolve_name_generates_from_generate_name() {
+        // When metadata.name is absent but generateName is set, a name with the prefix is generated.
+        let mut obj = Object::from_bytes(
+            &bytes::Bytes::from(serde_json::json!({
+                "metadata": { "generateName": "test-" }
+            }).to_string())
+        ).unwrap();
+        let name = ok(resolve_name(&mut obj));
+        assert!(name.starts_with("test-"), "generated name must start with generateName prefix");
+        assert_eq!(name.len(), "test-".len() + 5, "generated name must be prefix + 5 char suffix");
+        // The name must be written back into the object body.
+        assert_eq!(obj.body["metadata"]["name"].as_str(), Some(name.as_str()));
+    }
+
+    #[test]
+    fn resolve_name_returns_400_when_neither_set() {
+        // Neither name nor generateName → must return 400 (not a panic, not 500).
+        let mut obj = Object::from_bytes(
+            &bytes::Bytes::from(serde_json::json!({ "metadata": {} }).to_string())
+        ).unwrap();
+        let err = resolve_name(&mut obj).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
     // -- CR status PUT fallback --

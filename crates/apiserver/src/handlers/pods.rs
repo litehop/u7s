@@ -276,11 +276,20 @@ pub async fn create_pod(
     let mut obj = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let name = obj
-        .name()
-        .filter(|n| !n.is_empty())
-        .ok_or_else(|| Status::bad_request("metadata.name is required".into()))?
-        .to_string();
+    let name = {
+        match obj.name().filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None => {
+                let gen = obj.body["metadata"]["generateName"].as_str().unwrap_or("");
+                if gen.is_empty() {
+                    return Err(Status::bad_request("metadata.name or metadata.generateName is required".into()));
+                }
+                let generated = format!("{}{}", gen, crate::handlers::generic::generate_suffix());
+                obj.body["metadata"]["name"] = serde_json::Value::String(generated.clone());
+                generated
+            }
+        }
+    };
 
     // Ensure namespace is set in the stored object
     obj.body["metadata"]["namespace"] =

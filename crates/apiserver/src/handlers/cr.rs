@@ -233,11 +233,20 @@ pub async fn create_cr(
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let name = obj["metadata"]["name"]
-        .as_str()
-        .filter(|n| !n.is_empty())
-        .ok_or_else(|| Status::bad_request("metadata.name is required".into()))?
-        .to_string();
+    let name = {
+        match obj["metadata"]["name"].as_str().filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None => {
+                let gen = obj["metadata"]["generateName"].as_str().unwrap_or("");
+                if gen.is_empty() {
+                    return Err(Status::bad_request("metadata.name or metadata.generateName is required".into()));
+                }
+                let generated = format!("{}{}", gen, crate::handlers::generic::generate_suffix());
+                obj["metadata"]["name"] = serde_json::Value::String(generated.clone());
+                generated
+            }
+        }
+    };
 
     stamp_cr(&mut obj, &group, &version, &ctx.kind);
 
@@ -449,11 +458,20 @@ pub async fn create_cr_namespaced(
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let name = obj["metadata"]["name"]
-        .as_str()
-        .filter(|n| !n.is_empty())
-        .ok_or_else(|| Status::bad_request("metadata.name is required".into()))?
-        .to_string();
+    let name = {
+        match obj["metadata"]["name"].as_str().filter(|n| !n.is_empty()) {
+            Some(n) => n.to_string(),
+            None => {
+                let gen = obj["metadata"]["generateName"].as_str().unwrap_or("");
+                if gen.is_empty() {
+                    return Err(Status::bad_request("metadata.name or metadata.generateName is required".into()));
+                }
+                let generated = format!("{}{}", gen, crate::handlers::generic::generate_suffix());
+                obj["metadata"]["name"] = serde_json::Value::String(generated.clone());
+                generated
+            }
+        }
+    };
 
     obj["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
     stamp_cr(&mut obj, &group, &version, &ctx.kind);
