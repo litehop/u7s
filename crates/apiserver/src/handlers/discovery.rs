@@ -4,7 +4,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use u7s_store::{ListOptions, Store as _};
 
+use crate::handlers::crd::CustomResourceDefinition;
 use crate::state::AppState;
 use crate::types::{APIGroup, APIGroupList, APIVersions, ApiResourceList, GroupVersionForDiscovery};
 
@@ -20,19 +22,65 @@ pub async fn api_v1_resources() -> Json<ApiResourceList> {
 // /apis — group list
 // ---------------------------------------------------------------------------
 
-pub async fn api_group_list() -> Json<APIGroupList> {
-    let groups = vec![
-        make_group("apiextensions.k8s.io", "v1"),
-        make_group("apps", "v1"),
-        make_group("authentication.k8s.io", "v1"),
-        make_group("authorization.k8s.io", "v1"),
-        make_group("rbac.authorization.k8s.io", "v1"),
-    ];
+const STATIC_GROUPS: &[(&str, &str)] = &[
+    ("apiextensions.k8s.io", "v1"),
+    ("apps", "v1"),
+    ("authentication.k8s.io", "v1"),
+    ("authorization.k8s.io", "v1"),
+    ("rbac.authorization.k8s.io", "v1"),
+];
+
+pub async fn api_group_list(State(state): State<AppState>) -> Json<APIGroupList> {
+    let mut groups: Vec<APIGroup> = STATIC_GROUPS
+        .iter()
+        .map(|(name, version)| make_group(name, version))
+        .collect();
+
+    if let Ok(resp) = state
+        .store
+        .list(
+            "/registry/apiextensions.k8s.io/customresourcedefinitions/",
+            ListOptions::default(),
+        )
+        .await
+    {
+        // Collect (group, preferred_version) pairs from CRDs, deduplicating by group name.
+        // A group already covered by STATIC_GROUPS is skipped.
+        let mut seen: std::collections::HashSet<String> = STATIC_GROUPS
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+
+        for obj in &resp.items {
+            let Ok(crd) = serde_json::from_slice::<CustomResourceDefinition>(&obj.value) else {
+                continue;
+            };
+            let group = &crd.spec.group;
+            if seen.contains(group.as_str()) {
+                continue;
+            }
+            seen.insert(group.clone());
+            let version = preferred_version(&crd);
+            groups.push(make_group(group, &version));
+        }
+    }
+
     Json(APIGroupList {
         kind: "APIGroupList",
         api_version: "v1",
         groups,
     })
+}
+
+/// Return the preferred (storage=true, else first) version name for a CRD.
+fn preferred_version(crd: &CustomResourceDefinition) -> String {
+    crd.spec
+        .versions
+        .iter()
+        .find(|v| v.storage)
+        .or_else(|| crd.spec.versions.first())
+        .map(|v| v.name.clone())
+        .unwrap_or_default()
 }
 
 fn make_group(name: &str, version: &str) -> APIGroup {
@@ -56,30 +104,73 @@ fn make_group(name: &str, version: &str) -> APIGroup {
 // ---------------------------------------------------------------------------
 
 pub async fn api_group_resources(
+    State(state): State<AppState>,
     Path((group, version)): Path<(String, String)>,
 ) -> Response {
-    let list = match (group.as_str(), version.as_str()) {
-        ("apiextensions.k8s.io", "v1") => apiextensions_v1_resources(),
-        ("apps", "v1") => apps_v1_resources(),
-        ("authentication.k8s.io", "v1") => authn_v1_resources(),
-        ("authorization.k8s.io", "v1") => authz_v1_resources(),
-        ("rbac.authorization.k8s.io", "v1") => rbac_v1_resources(),
-        _ => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "kind": "Status",
-                    "apiVersion": "v1",
-                    "status": "Failure",
-                    "message": format!("the server could not find the requested resource ({}/{})", group, version),
-                    "reason": "NotFound",
-                    "code": 404
-                })),
-            )
-                .into_response();
-        }
+    let static_list = match (group.as_str(), version.as_str()) {
+        ("apiextensions.k8s.io", "v1") => Some(apiextensions_v1_resources()),
+        ("apps", "v1") => Some(apps_v1_resources()),
+        ("authentication.k8s.io", "v1") => Some(authn_v1_resources()),
+        ("authorization.k8s.io", "v1") => Some(authz_v1_resources()),
+        ("rbac.authorization.k8s.io", "v1") => Some(rbac_v1_resources()),
+        _ => None,
     };
-    Json(list).into_response()
+
+    if let Some(list) = static_list {
+        return Json(list).into_response();
+    }
+
+    // Dynamic: query CRDs that belong to this group.
+    if let Ok(resp) = state
+        .store
+        .list(
+            "/registry/apiextensions.k8s.io/customresourcedefinitions/",
+            ListOptions::default(),
+        )
+        .await
+    {
+        let resources: Vec<serde_json::Value> = resp
+            .items
+            .iter()
+            .filter_map(|obj| serde_json::from_slice::<CustomResourceDefinition>(&obj.value).ok())
+            .filter(|crd| {
+                crd.spec.group == group
+                    && crd.spec.versions.iter().any(|v| v.name == version)
+            })
+            .map(|crd| {
+                serde_json::json!({
+                    "name": crd.spec.names.plural,
+                    "singularName": crd.spec.names.singular,
+                    "namespaced": crd.spec.scope == "Namespaced",
+                    "kind": crd.spec.names.kind,
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                })
+            })
+            .collect();
+
+        if !resources.is_empty() {
+            return Json(serde_json::json!({
+                "kind": "APIResourceList",
+                "apiVersion": "v1",
+                "groupVersion": format!("{group}/{version}"),
+                "resources": resources,
+            }))
+            .into_response();
+        }
+    }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "message": format!("the server could not find the requested resource ({}/{})", group, version),
+            "reason": "NotFound",
+            "code": 404
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -231,4 +322,133 @@ fn rbac_v1_resources() -> serde_json::Value {
             }
         ]
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use u7s_store::SqliteStore;
+
+    use crate::handlers::crd::create_crd;
+
+    fn make_state() -> AppState {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        AppState::new(store, None, None, "https://localhost:6443".into())
+    }
+
+    fn crd_bytes(group: &str, plural: &str, singular: &str, kind: &str, scope: &str, version: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": format!("{plural}.{group}") },
+                "spec": {
+                    "group": group,
+                    "names": {
+                        "plural": plural,
+                        "singular": singular,
+                        "kind": kind
+                    },
+                    "scope": scope,
+                    "versions": [
+                        { "name": version, "served": true, "storage": true }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    // After inserting a CRD, api_group_list must include its group.
+    // This verifies that discovery is live — not baked in at startup.
+    #[tokio::test]
+    async fn crd_group_appears_in_api_group_list() {
+        let state = make_state();
+
+        let body = crd_bytes("example.io", "widgets", "widget", "Widget", "Namespaced", "v1beta1");
+        assert!(create_crd(State(state.clone()), body).await.is_ok(), "create must succeed");
+
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"example.io"),
+            "example.io must appear in /apis after CRD install; got: {names:?}"
+        );
+    }
+
+    // Static groups must always be present regardless of stored CRDs.
+    #[tokio::test]
+    async fn static_groups_always_present() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        for (group, _) in STATIC_GROUPS {
+            assert!(
+                names.contains(group),
+                "static group {group} must always be in /apis; got: {names:?}"
+            );
+        }
+    }
+
+    // A group that matches a static group must not be duplicated when a CRD
+    // with that group name exists in the store.
+    #[tokio::test]
+    async fn crd_group_does_not_duplicate_static_groups() {
+        let state = make_state();
+
+        // Install a CRD whose group is already covered by static discovery.
+        let body = crd_bytes("apps", "widgets", "widget", "Widget", "Namespaced", "v1");
+        assert!(create_crd(State(state.clone()), body).await.is_ok(), "create must succeed");
+
+        let Json(list) = api_group_list(State(state)).await;
+        let apps_count = list.groups.iter().filter(|g| g.name == "apps").count();
+        assert_eq!(
+            apps_count, 1,
+            "apps group must appear exactly once even when a CRD declares group=apps"
+        );
+    }
+
+    // After inserting a CRD, api_group_resources for that group/version must return its resource.
+    #[tokio::test]
+    async fn crd_resource_appears_in_api_group_resources() {
+        let state = make_state();
+
+        let body = crd_bytes("example.io", "gadgets", "gadget", "Gadget", "Cluster", "v1alpha1");
+        assert!(create_crd(State(state.clone()), body).await.is_ok(), "create must succeed");
+
+        let resp = api_group_resources(
+            State(state),
+            Path(("example.io".to_string(), "v1alpha1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        assert_eq!(resources.len(), 1, "one resource entry expected");
+        assert_eq!(resources[0]["name"], "gadgets");
+        assert_eq!(resources[0]["kind"], "Gadget");
+        assert_eq!(resources[0]["namespaced"], false);
+    }
+
+    // api_group_resources for an unknown group/version must return 404.
+    #[tokio::test]
+    async fn unknown_group_returns_404() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("unknown.group.io".to_string(), "v1".to_string())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }
