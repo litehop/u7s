@@ -625,7 +625,7 @@ pub async fn patch_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_patch_content_type(&headers)?;
+    let patch_type = detect_patch_type(&headers)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -661,7 +661,13 @@ pub async fn patch_resource(
         }
     }
 
-    merge_patch(&mut current.body, &patch);
+    match patch_type {
+        PatchType::MergePatch => merge_patch(&mut current.body, &patch),
+        PatchType::StrategicMergePatch => {
+            crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                .map_err(|e| Status::bad_request(e.to_string()))?;
+        }
+    }
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
     let deletion_ts_set = current.body["metadata"]["deletionTimestamp"].is_string();
@@ -968,7 +974,7 @@ pub async fn patch_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_patch_content_type(&headers)?;
+    let patch_type = detect_patch_type(&headers)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1004,7 +1010,13 @@ pub async fn patch_namespaced_resource(
         }
     }
 
-    merge_patch(&mut current.body, &patch);
+    match patch_type {
+        PatchType::MergePatch => merge_patch(&mut current.body, &patch),
+        PatchType::StrategicMergePatch => {
+            crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                .map_err(|e| Status::bad_request(e.to_string()))?;
+        }
+    }
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
     let deletion_ts_set = current.body["metadata"]["deletionTimestamp"].is_string();
@@ -1112,7 +1124,7 @@ pub async fn patch_resource_status(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let meta = lookup(&state, &group, &version, &plural)?.clone();
-    validate_patch_content_type(&headers)?;
+    let patch_type = detect_patch_type(&headers)?;
 
     let key = group_object_key(&group, &plural, None, &name);
     let stored = state
@@ -1128,14 +1140,20 @@ pub async fn patch_resource_status(
     let patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    // Only merge the status portion of the patch.
+    // Only patch the status portion.
     if let Some(status_patch) = patch.get("status") {
         let entry = current
             .body
             .as_object_mut()
             .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
         if let Some(entry) = entry {
-            merge_patch(entry, status_patch);
+            match patch_type {
+                PatchType::MergePatch => merge_patch(entry, status_patch),
+                PatchType::StrategicMergePatch => {
+                    crate::patch::strategic_merge_patch(entry, status_patch)
+                        .map_err(|e| Status::bad_request(e.to_string()))?;
+                }
+            }
         }
     }
 
@@ -1206,7 +1224,7 @@ pub async fn patch_namespaced_resource_status(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let meta = lookup(&state, &group, &version, &plural)?.clone();
-    validate_patch_content_type(&headers)?;
+    let patch_type = detect_patch_type(&headers)?;
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let stored = state
@@ -1222,13 +1240,20 @@ pub async fn patch_namespaced_resource_status(
     let patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
+    // Only patch the status portion.
     if let Some(status_patch) = patch.get("status") {
         let entry = current
             .body
             .as_object_mut()
             .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
         if let Some(entry) = entry {
-            merge_patch(entry, status_patch);
+            match patch_type {
+                PatchType::MergePatch => merge_patch(entry, status_patch),
+                PatchType::StrategicMergePatch => {
+                    crate::patch::strategic_merge_patch(entry, status_patch)
+                        .map_err(|e| Status::bad_request(e.to_string()))?;
+                }
+            }
         }
     }
 
@@ -1483,30 +1508,103 @@ pub async fn core_patch_namespaced_resource_status(
 // Shared helper
 // ---------------------------------------------------------------------------
 
-fn validate_patch_content_type(headers: &HeaderMap) -> Result<(), crate::status::StatusError> {
+#[derive(Debug)]
+enum PatchType {
+    MergePatch,
+    StrategicMergePatch,
+}
+
+fn detect_patch_type(headers: &HeaderMap) -> Result<PatchType, crate::status::StatusError> {
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-
     if content_type.contains("application/strategic-merge-patch+json") {
-        return Err(Status::bad_request(
-            "strategic merge patch not supported in Phase 1; use application/merge-patch+json".into(),
-        ));
+        return Ok(PatchType::StrategicMergePatch);
     }
-
-    if !content_type.contains("application/merge-patch+json") {
-        return Err(Status::unsupported_media_type(format!(
-            "unsupported media type '{content_type}'; use application/merge-patch+json"
-        )));
+    if content_type.contains("application/merge-patch+json") {
+        return Ok(PatchType::MergePatch);
     }
-
-    Ok(())
+    Err(Status::unsupported_media_type(format!(
+        "unsupported media type '{content_type}'; use application/merge-patch+json or application/strategic-merge-patch+json"
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
+
+    // -- detect_patch_type --
+
+    fn headers_with_content_type(ct: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            ct.parse().unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn detect_patch_type_accepts_merge_patch() {
+        // kubectl uses application/merge-patch+json — must be accepted
+        let h = headers_with_content_type("application/merge-patch+json");
+        assert!(matches!(
+            detect_patch_type(&h),
+            Ok(PatchType::MergePatch)
+        ));
+    }
+
+    #[test]
+    fn detect_patch_type_accepts_strategic_merge_patch() {
+        // kubectl apply uses application/strategic-merge-patch+json — must be accepted
+        // (this was previously rejected with HTTP 400)
+        let h = headers_with_content_type("application/strategic-merge-patch+json");
+        assert!(matches!(
+            detect_patch_type(&h),
+            Ok(PatchType::StrategicMergePatch)
+        ));
+    }
+
+    #[test]
+    fn detect_patch_type_rejects_unknown_content_type() {
+        // An arbitrary content type must be rejected with 415
+        let h = headers_with_content_type("application/json");
+        let err = detect_patch_type(&h).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn detect_patch_type_rejects_missing_content_type() {
+        // No Content-Type header at all must also be rejected
+        let h = HeaderMap::new();
+        let err = detect_patch_type(&h).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn strategic_merge_patch_applied_correctly_via_handler_logic() {
+        // Verify that when SMP is dispatched, it merges arrays by name key (not replaces),
+        // which is the whole reason SMP exists — merge_patch would have replaced the array.
+        let mut body = serde_json::json!({
+            "spec": {
+                "containers": [
+                    {"name": "app", "image": "nginx:1.0"}
+                ]
+            }
+        });
+        let patch = serde_json::json!({
+            "spec": {
+                "containers": [
+                    {"name": "sidecar", "image": "sidecar:latest"}
+                ]
+            }
+        });
+        crate::patch::strategic_merge_patch(&mut body, &patch).unwrap();
+        let containers = body["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 2, "SMP must merge containers by name, not replace the array");
+    }
 
     fn item_with_labels(labels: &[(&str, &str)]) -> serde_json::Value {
         let mut map = serde_json::Map::new();
