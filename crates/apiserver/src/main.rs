@@ -144,7 +144,7 @@ fn build_router(state: AppState) -> Router {
 
         // Non-core group discovery
         .route("/apis",                    get(handlers::discovery::api_group_list))
-        .route("/apis/:group/:version",    get(handlers::discovery::api_group_resources))
+        .route("/apis/{group}/{version}",    get(handlers::discovery::api_group_resources))
 
         // Namespaces — collection
         .route(
@@ -154,7 +154,7 @@ fn build_router(state: AppState) -> Router {
 
         // Namespaces — named resource
         .route(
-            "/api/v1/namespaces/:name",
+            "/api/v1/namespaces/{name}",
             get(handlers::namespaces::get_namespace)
                 .put(handlers::namespaces::replace_namespace)
                 .patch(handlers::namespaces::patch_namespace)
@@ -163,13 +163,13 @@ fn build_router(state: AppState) -> Router {
 
         // Pods — collection
         .route(
-            "/api/v1/namespaces/:ns/pods",
+            "/api/v1/namespaces/{ns}/pods",
             get(handlers::pods::list_pods).post(handlers::pods::create_pod),
         )
 
         // Pods — named resource
         .route(
-            "/api/v1/namespaces/:ns/pods/:name",
+            "/api/v1/namespaces/{ns}/pods/{name}",
             get(handlers::pods::get_pod)
                 .put(handlers::pods::replace_pod)
                 .delete(handlers::pods::delete_pod)
@@ -178,20 +178,20 @@ fn build_router(state: AppState) -> Router {
 
         // Pods — binding subresource (scheduler write path)
         .route(
-            "/api/v1/namespaces/:ns/pods/:name/binding",
+            "/api/v1/namespaces/{ns}/pods/{name}/binding",
             axum::routing::post(handlers::pods::bind_pod),
         )
 
         // Core group (group="", apiVersion=v1) — cluster-scoped resources (e.g. nodes)
         .route(
-            "/api/v1/:resource",
+            "/api/v1/{resource}",
             get(handlers::generic::core_list_resource)
                 .post(handlers::generic::core_create_resource),
         )
 
         // Core group — cluster-scoped named resource
         .route(
-            "/api/v1/:resource/:name",
+            "/api/v1/{resource}/{name}",
             get(handlers::generic::core_get_resource)
                 .put(handlers::generic::core_replace_resource)
                 .delete(handlers::generic::core_delete_resource)
@@ -200,7 +200,7 @@ fn build_router(state: AppState) -> Router {
 
         // Core group — cluster-scoped status subresource
         .route(
-            "/api/v1/:resource/:name/status",
+            "/api/v1/{resource}/{name}/status",
             get(handlers::generic::core_get_resource_status)
                 .put(handlers::generic::core_put_resource_status)
                 .patch(handlers::generic::core_patch_resource_status),
@@ -208,14 +208,14 @@ fn build_router(state: AppState) -> Router {
 
         // Core group — namespaced resources collection (e.g. services, configmaps)
         .route(
-            "/api/v1/namespaces/:ns/:resource",
+            "/api/v1/namespaces/{ns}/{resource}",
             get(handlers::generic::core_list_namespaced_resource)
                 .post(handlers::generic::core_create_namespaced_resource),
         )
 
         // Core group — namespaced named resource
         .route(
-            "/api/v1/namespaces/:ns/:resource/:name",
+            "/api/v1/namespaces/{ns}/{resource}/{name}",
             get(handlers::generic::core_get_namespaced_resource)
                 .put(handlers::generic::core_replace_namespaced_resource)
                 .delete(handlers::generic::core_delete_namespaced_resource)
@@ -224,7 +224,7 @@ fn build_router(state: AppState) -> Router {
 
         // Core group — namespaced status subresource
         .route(
-            "/api/v1/namespaces/:ns/:resource/:name/status",
+            "/api/v1/namespaces/{ns}/{resource}/{name}/status",
             get(handlers::generic::core_get_namespaced_resource_status)
                 .put(handlers::generic::core_put_namespaced_resource_status)
                 .patch(handlers::generic::core_patch_namespaced_resource_status),
@@ -236,7 +236,7 @@ fn build_router(state: AppState) -> Router {
             get(handlers::crd::list_crds).post(handlers::crd::create_crd),
         )
         .route(
-            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/:name",
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}",
             get(handlers::crd::get_crd)
                 .put(handlers::crd::replace_crd)
                 .delete(handlers::crd::delete_crd),
@@ -254,20 +254,20 @@ fn build_router(state: AppState) -> Router {
 
         // ServiceAccounts — token subresource (TokenRequest API)
         .route(
-            "/api/v1/namespaces/:ns/serviceaccounts/:name/token",
+            "/api/v1/namespaces/{ns}/serviceaccounts/{name}/token",
             axum::routing::post(handlers::tokens::create_token),
         )
 
         // Generic cluster-scoped resources — collection
         .route(
-            "/apis/:group/:version/:resource",
+            "/apis/{group}/{version}/{resource}",
             get(handlers::generic::list_resource)
                 .post(handlers::generic::create_resource),
         )
 
         // Generic cluster-scoped resources — named
         .route(
-            "/apis/:group/:version/:resource/:name",
+            "/apis/{group}/{version}/{resource}/{name}",
             get(handlers::generic::get_resource)
                 .put(handlers::generic::replace_resource)
                 .delete(handlers::generic::delete_resource)
@@ -276,7 +276,7 @@ fn build_router(state: AppState) -> Router {
 
         // Generic namespaced resources — collection
         .route(
-            "/apis/:group/:version/namespaces/:ns/:resource",
+            "/apis/{group}/{version}/namespaces/{ns}/{resource}",
             get(handlers::generic::list_namespaced_resource)
                 .post(handlers::generic::create_namespaced_resource),
         )
@@ -284,7 +284,7 @@ fn build_router(state: AppState) -> Router {
         // Scale subresource — apps/v1 workloads (deployments, replicasets, statefulsets)
         // Must be registered before the generic namespaced named-resource catch-all.
         .route(
-            "/apis/apps/v1/namespaces/:ns/:resource/:name/scale",
+            "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
             get(handlers::scale::get_scale)
                 .put(handlers::scale::put_scale)
                 .patch(handlers::scale::patch_scale),
@@ -292,7 +292,7 @@ fn build_router(state: AppState) -> Router {
 
         // Generic namespaced resources — named
         .route(
-            "/apis/:group/:version/namespaces/:ns/:resource/:name",
+            "/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}",
             get(handlers::generic::get_namespaced_resource)
                 .put(handlers::generic::replace_namespaced_resource)
                 .delete(handlers::generic::delete_namespaced_resource)
@@ -301,7 +301,7 @@ fn build_router(state: AppState) -> Router {
 
         // Generic cluster-scoped — status subresource
         .route(
-            "/apis/:group/:version/:resource/:name/status",
+            "/apis/{group}/{version}/{resource}/{name}/status",
             get(handlers::generic::get_resource_status)
                 .put(handlers::generic::put_resource_status)
                 .patch(handlers::generic::patch_resource_status),
@@ -309,7 +309,7 @@ fn build_router(state: AppState) -> Router {
 
         // Generic namespaced — status subresource
         .route(
-            "/apis/:group/:version/namespaces/:ns/:resource/:name/status",
+            "/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}/status",
             get(handlers::generic::get_namespaced_resource_status)
                 .put(handlers::generic::put_namespaced_resource_status)
                 .patch(handlers::generic::patch_namespaced_resource_status),
