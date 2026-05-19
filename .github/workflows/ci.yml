@@ -48,11 +48,17 @@ jobs:
         run: |
           TMPDIR=$(mktemp -d)
           echo "SMOKE_TMPDIR=$TMPDIR" >> "$GITHUB_ENV"
+          # Static admin token — maps to system:masters group, bypasses RBAC.
+          # x509 client cert auth is not yet implemented (mayor-1qa); token auth
+          # is the supported path for smoke testing until then.
+          SMOKE_TOKEN="smoke-admin-token-$(date +%s)"
+          echo "$SMOKE_TOKEN,smoke-admin,uid0,system:masters" > "$TMPDIR/token-auth.csv"
           ./target/release/u7s-apiserver \
             --db "$TMPDIR/state.db" \
             --kubeconfig "$TMPDIR/kubeconfig" \
             --sa-key "$TMPDIR/sa.key" \
             --sa-pub "$TMPDIR/sa.pub" \
+            --token-auth-file "$TMPDIR/token-auth.csv" \
             --advertise-address https://127.0.0.1:6443 \
             >"$TMPDIR/server.log" 2>&1 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
@@ -62,6 +68,30 @@ jobs:
             sleep 1
           done
           nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$TMPDIR/server.log"; exit 1; }
+          # Overwrite the cert-based kubeconfig with a token-based one.
+          # The server-generated kubeconfig uses client certs which auth.rs doesn't
+          # yet verify. Use the static token instead; include the CA from the
+          # generated kubeconfig so TLS server verification still works.
+          CA_DATA=$(grep "certificate-authority-data" "$TMPDIR/kubeconfig" | awk '{print $2}')
+          cat > "$TMPDIR/kubeconfig" <<KUBECFG
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              server: https://127.0.0.1:6443
+              certificate-authority-data: $CA_DATA
+            name: u7s
+          contexts:
+          - context:
+              cluster: u7s
+              user: smoke-admin
+            name: u7s
+          current-context: u7s
+          users:
+          - name: smoke-admin
+            user:
+              token: $SMOKE_TOKEN
+          KUBECFG
 
       - name: Smoke — namespace CRUD
         env:
