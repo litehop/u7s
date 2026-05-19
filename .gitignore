@@ -10,3 +10,4 @@ ai/findings/
 target
 .claude/scheduled_tasks.lock
 ai/worktrees/
+.aqua/
