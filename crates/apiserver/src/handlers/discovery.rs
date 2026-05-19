@@ -33,7 +33,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
 pub async fn api_group_list(State(state): State<AppState>) -> Json<APIGroupList> {
     let mut groups: Vec<APIGroup> = STATIC_GROUPS
         .iter()
-        .map(|(name, version)| make_group(name, version))
+        .map(|(name, version)| make_group(name, version, &[version]))
         .collect();
 
     if let Ok(resp) = state
@@ -44,7 +44,7 @@ pub async fn api_group_list(State(state): State<AppState>) -> Json<APIGroupList>
         )
         .await
     {
-        // Collect (group, preferred_version) pairs from CRDs, deduplicating by group name.
+        // Collect (group, versions) pairs from CRDs, deduplicating by group name.
         // A group already covered by STATIC_GROUPS is skipped.
         let mut seen: std::collections::HashSet<String> = STATIC_GROUPS
             .iter()
@@ -60,8 +60,15 @@ pub async fn api_group_list(State(state): State<AppState>) -> Json<APIGroupList>
                 continue;
             }
             seen.insert(group.clone());
-            let version = preferred_version(&crd);
-            groups.push(make_group(group, &version));
+            let preferred = preferred_version(&crd);
+            let served: Vec<&str> = crd
+                .spec
+                .versions
+                .iter()
+                .filter(|v| v.served)
+                .map(|v| v.name.as_str())
+                .collect();
+            groups.push(make_group(group, &preferred, &served));
         }
     }
 
@@ -83,19 +90,23 @@ fn preferred_version(crd: &CustomResourceDefinition) -> String {
         .unwrap_or_default()
 }
 
-fn make_group(name: &str, version: &str) -> APIGroup {
-    let gv = GroupVersionForDiscovery {
-        group_version: format!("{}/{}", name, version),
-        version: version.to_string(),
-    };
-    let preferred = GroupVersionForDiscovery {
-        group_version: format!("{}/{}", name, version),
-        version: version.to_string(),
+/// Build an APIGroup with all served versions listed and the storage version as preferred.
+fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
+    let versions: Vec<GroupVersionForDiscovery> = served
+        .iter()
+        .map(|v| GroupVersionForDiscovery {
+            group_version: format!("{}/{}", name, v),
+            version: v.to_string(),
+        })
+        .collect();
+    let preferred_version = GroupVersionForDiscovery {
+        group_version: format!("{}/{}", name, preferred),
+        version: preferred.to_string(),
     };
     APIGroup {
         name: name.to_string(),
-        versions: vec![gv],
-        preferred_version: preferred,
+        versions,
+        preferred_version,
     }
 }
 
@@ -450,5 +461,59 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // A CRD with multiple served versions must expose ALL of them in the APIGroup.versions
+    // list, not just the storage version. This matters because kubectl discovery walks all
+    // listed versions to find available resources.
+    #[tokio::test]
+    async fn multi_version_crd_lists_all_served_versions_with_correct_preferred() {
+        let state = make_state();
+
+        // v1alpha1: served but not storage; v1: served and storage (preferred).
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        { "name": "v1alpha1", "served": true, "storage": false },
+                        { "name": "v1",       "served": true, "storage": true  }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        assert!(create_crd(State(state.clone()), body).await.is_ok(), "create must succeed");
+
+        let Json(list) = api_group_list(State(state)).await;
+        let group = list
+            .groups
+            .iter()
+            .find(|g| g.name == "example.io")
+            .expect("example.io must appear in /apis");
+
+        let version_names: Vec<&str> = group.versions.iter().map(|v| v.version.as_str()).collect();
+        assert!(
+            version_names.contains(&"v1alpha1"),
+            "v1alpha1 must be listed in versions; got: {version_names:?}"
+        );
+        assert!(
+            version_names.contains(&"v1"),
+            "v1 must be listed in versions; got: {version_names:?}"
+        );
+        assert_eq!(version_names.len(), 2, "exactly 2 served versions expected");
+        assert_eq!(
+            group.preferred_version.version, "v1",
+            "v1 (storage=true) must be the preferredVersion"
+        );
     }
 }
