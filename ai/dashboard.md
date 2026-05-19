@@ -1,43 +1,49 @@
 # Dashboard
 
-2026-05-19T13:15 UTC+9
-Session: mayor-phase3-dispatch — resume by opening Claude Code at /Users/balint.erdos/u7s
-Open beads: 3 (+ 1 in-progress: mayor-n9a)
+2026-05-19T06:30 UTC
+Session: 96473ee9-26b3-4236-b9dc-1d311e5cee69
+Open beads: 1
 
 ## What needs the operator now
 
-### 1. Security review — mayor-n9a (SA JWT validation)
-A PR will open shortly for SA JWT inbound verification. This touches the auth path — please review before merging. The PR description is flagged `⚠️ SECURITY REVIEW REQUESTED`.
+Nothing urgent. Board is cold — only one deferred P3 bead remains.
 
-### 2. Restart environment
-Operator requested restart to pick up config changes (settings.json allow-list, .mcp.json, worker.md tool restrictions).
+**Audit in flight:** Independent review of PRs #23–25 (CRD implementation) running now. Expect follow-on beads when it completes.
 
-## Remaining open beads
+## Open beads
 
 | Priority | Bead | Title | Notes |
 |----------|------|-------|-------|
-| P2 | mayor-d01 | Scale subresource (Deployments/ReplicaSets/StatefulSets) | Ready — dispatch next session |
-| P2 | mayor-u9f | CRD support | Large/architectural — third wave |
-| P3 | mayor-2hu | Controller manager SA token provisioning | Depends on mayor-n9a merge |
+| P3 | mayor-xy2 | CR instance schema validation (openAPIV3Schema enforcement) | Deferred intentionally — Argo CD does not require this in Phase 3 |
 
-## What changed this session
+## Forward-looking
 
-**Infra fixes:**
-- `.claude/settings.json`: Bash allow-list added (cargo/bd/git/gh + cd-prefixed variants) — workers no longer blocked on permissions
-- `.claude/agents/worker.md`: `permissionMode: auto`, explicit tool allowlist, `disallowedTools: WebSearch,WebFetch,Agent`, no-Python rule
-- `CLAUDE.md`: Rule 13 added — prefer Bash/Rust over Python
-- `crates/mcp-server/`: MCP server with `get_diagnostics`, `bd_ready`, `bd_show` tools
-- `.mcp.json`: wires MCP server into Claude Code for project scope
+**Next natural work:** Await audit results from the CRD review. If the audit surfaces correctness gaps or missing API surface, those become P1/P2 beads and the dispatch loop picks them up. If clean, the project is ready for Argo CD integration testing.
 
-**Phase 3 beads closed this session (12):**
-- mayor-srk (permissions fix), mayor-j55, mayor-weh, mayor-8sb, mayor-6wk (discovery surface)
-- mayor-0fb, mayor-bfu, mayor-aqv, mayor-2ae (cleanup)
-- mayor-vgr (RBAC startup scan), mayor-f28 (RBAC live updates)
-- mayor-5nv (cross-namespace pods), mayor-4z5 (generic watch), mayor-3w7 (scheduler scaffold)
-- mayor-35k (MCP server)
+**Argo CD milestone path:**
+1. CRD support ✓ (PRs #23–25)
+2. Argo CD install smoke test — not yet started; needs a running cluster
+3. Any gaps surfaced by Argo CD installation become new beads
 
-**PRs merged: #18, #19, #20, #21** (+ changes committed directly to main)
+**Standing deferred:** mayor-xy2 (CR schema validation) — implement when Argo CD integration reveals a concrete need, not speculatively.
+
+## Recent progress
+
+**This session (2026-05-19):**
+
+| PR | Title | Beads |
+|----|-------|-------|
+| #23 | feat(crd): CRD storage and CRUD handlers | mayor-6h1 |
+| #24 | feat(discovery): dynamic /apis — CRD groups appear without restart | mayor-f1h |
+| #25 | feat(cr): serve CR instance CRUD for installed CRDs | mayor-4fy |
+
+Also merged earlier:
+- PR #22 — scale subresource (mayor-d01)
+- Direct commit — controller-manager SA token provisioning (mayor-2hu)
+- Direct commit — SA JWT inbound verification (mayor-n9a)
+
+51 beads closed total. 52 filed this phase.
 
 ## Stance (reasserted each session)
 
-Pre-alpha/greenfield: break freely, no backward compat, delete dead code. Correctness first, then performance. kubectl-compatible API surface. Minimal dependencies. **Merge on green CI automatically**; flag security/API surface/architecture PRs for operator review first.
+Pre-alpha/greenfield: break freely, no backward compat, delete dead code. Correctness first. kubectl-compatible API surface. Minimal dependencies (resist adding crates). **Merge on green CI automatically**; flag security/API surface/architecture PRs for operator review first.
