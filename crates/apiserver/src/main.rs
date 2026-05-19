@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 8. Build app state (shared with the auth layer).
-    let state = AppState::new(Arc::clone(&store), sa_encoding_key);
+    let state = AppState::new(Arc::clone(&store), sa_encoding_key).await;
 
     // 9. Build axum router and attach the auth tower layer.
     let app = build_router(state.clone())
