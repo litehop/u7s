@@ -140,7 +140,7 @@ jobs:
 
       - name: Upload server log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: smoke-server-log
           path: ${{ env.SMOKE_TMPDIR }}/server.log
