@@ -7,6 +7,7 @@ mod state;
 mod status;
 mod tls;
 mod types;
+mod util;
 
 use std::sync::Arc;
 

@@ -107,7 +107,7 @@ fn apply_label_selector(
         .collect()
 }
 
-fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
+pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
     match rv {
         None | Some("") => Ok(None),
         Some("0") => Ok(Some(0)),
@@ -175,54 +175,7 @@ fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
     }
 }
 
-/// Returns the current UTC time formatted as RFC3339 (`YYYY-MM-DDThh:mm:ssZ`).
-/// Uses only `std::time` — no chrono dependency.
-fn utc_now_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400; // days since 1970-01-01
-
-    // Gregorian calendar computation — correct for dates within reasonable range.
-    let (year, month, day) = days_to_ymd(days);
-
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
-}
-
-fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
-    // 400-year cycle = 146097 days
-    let n400 = days / 146097;
-    days %= 146097;
-    let n100 = (days / 36524).min(3);
-    days -= n100 * 36524;
-    let n4 = days / 1461;
-    days %= 1461;
-    let n1 = (days / 365).min(3);
-    days -= n1 * 365;
-
-    let year = n400 * 400 + n100 * 100 + n4 * 4 + n1 + 1970;
-    let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-    let month_days: &[u64] = if leap {
-        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut month = 0u64;
-    for (i, &md) in month_days.iter().enumerate() {
-        if days < md {
-            month = i as u64 + 1;
-            break;
-        }
-        days -= md;
-    }
-    (year, month, days + 1)
-}
+use crate::util::utc_now_rfc3339;
 
 // ---------------------------------------------------------------------------
 // Cluster-scoped handlers  (group/version/resource)

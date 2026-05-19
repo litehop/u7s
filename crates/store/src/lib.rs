@@ -494,15 +494,6 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
     Ok(ListResponse { items, revision: snapshot_revision })
 }
 
-/// Derive the key prefix from a full key (e.g. "/registry/pods/default/nginx" → "/registry/pods/").
-/// For ring-buffer events we store the prefix directly on the event.
-fn key_prefix(key: &str) -> String {
-    // We store the full key on InternalEvent; the prefix field is the watch prefix.
-    // For broadcasting, we use the key itself and let watch() filter by starts_with.
-    // The prefix field on InternalEvent is populated by the caller.
-    key.to_string()
-}
-
 impl Store for SqliteStore {
     async fn get(&self, key: &str) -> Result<Option<StoreObject>> {
         let conn = self.read_conn.clone();
@@ -531,7 +522,7 @@ impl Store for SqliteStore {
         }).await??;
 
         self.push_event(Arc::new(InternalEvent {
-            prefix: key_prefix(key),
+            prefix: key.to_string(),
             key: key.to_string(),
             revision,
             value: Some(stamped_value),
@@ -550,7 +541,7 @@ impl Store for SqliteStore {
         }).await??;
 
         self.push_event(Arc::new(InternalEvent {
-            prefix: key_prefix(key),
+            prefix: key.to_string(),
             key: key.to_string(),
             revision,
             value: None,

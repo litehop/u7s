@@ -158,9 +158,7 @@ pub async fn create_token(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
-// ---------------------------------------------------------------------------
-// Time helpers (no chrono dep)
-// ---------------------------------------------------------------------------
+use crate::util::secs_to_rfc3339;
 
 fn unix_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -168,37 +166,6 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-/// Convert a Unix timestamp (seconds) to an RFC3339 string (`YYYY-MM-DDThh:mm:ssZ`).
-fn secs_to_rfc3339(secs: u64) -> String {
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-
-    let (year, month, day) = {
-        let mut d = days;
-        let n400 = d / 146097; d %= 146097;
-        let n100 = (d / 36524).min(3); d -= n100 * 36524;
-        let n4 = d / 1461; d %= 1461;
-        let n1 = (d / 365).min(3); d -= n1 * 365;
-        let year = n400 * 400 + n100 * 100 + n4 * 4 + n1 + 1970;
-        let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-        let month_days: &[u64] = if leap {
-            &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        } else {
-            &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-        };
-        let mut month = 0u64;
-        for (i, &md) in month_days.iter().enumerate() {
-            if d < md { month = i as u64 + 1; break; }
-            d -= md;
-        }
-        (year, month, d + 1)
-    };
-
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 // ---------------------------------------------------------------------------
