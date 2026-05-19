@@ -1,49 +1,46 @@
 # Dashboard
 
-2026-05-19T06:30 UTC
+2026-05-19T08:00 UTC
 Session: 96473ee9-26b3-4236-b9dc-1d311e5cee69
 Open beads: 1
 
 ## What needs the operator now
 
-Nothing urgent. Board is cold — only one deferred P3 bead remains.
+Nothing. The board is down to one deferred bead (mayor-xy2, CR schema validation) — intentionally held until Argo CD integration testing reveals a concrete need. Session can HOLD.
 
-**Audit in flight:** Independent review of PRs #23–25 (CRD implementation) running now. Expect follow-on beads when it completes.
+## In flight
+
+None.
 
 ## Open beads
 
 | Priority | Bead | Title | Notes |
 |----------|------|-------|-------|
-| P3 | mayor-xy2 | CR instance schema validation (openAPIV3Schema enforcement) | Deferred intentionally — Argo CD does not require this in Phase 3 |
+| P3 | mayor-xy2 | CR instance schema validation | Deferred — await Argo CD integration |
 
 ## Forward-looking
 
-**Next natural work:** Await audit results from the CRD review. If the audit surfaces correctness gaps or missing API surface, those become P1/P2 beads and the dispatch loop picks them up. If clean, the project is ready for Argo CD integration testing.
+The natural next step is **Argo CD integration testing** — install Argo CD against the running u7s API server and see what breaks. That will surface concrete gaps to file as beads.
 
-**Argo CD milestone path:**
-1. CRD support ✓ (PRs #23–25)
-2. Argo CD install smoke test — not yet started; needs a running cluster
-3. Any gaps surfaced by Argo CD installation become new beads
+No new beads expected until that integration test runs.
 
-**Standing deferred:** mayor-xy2 (CR schema validation) — implement when Argo CD integration reveals a concrete need, not speculatively.
+## Recent progress (this session)
 
-## Recent progress
-
-**This session (2026-05-19):**
+**Full CRD support shipped (PRs #23–28):**
 
 | PR | Title | Beads |
 |----|-------|-------|
-| #23 | feat(crd): CRD storage and CRUD handlers | mayor-6h1 |
-| #24 | feat(discovery): dynamic /apis — CRD groups appear without restart | mayor-f1h |
-| #25 | feat(cr): serve CR instance CRUD for installed CRDs | mayor-4fy |
+| #23 | feat(crd): CRD CRUD handlers | mayor-crd |
+| #24 | feat(discovery): dynamic discovery from CRDs | mayor-crd |
+| #25 | feat(cr): CR instance handlers + generic fallback | mayor-crd |
+| #26 | fix(crd+discovery): name validation + multi-version served versions | mayor-3jz, mayor-fp8 |
+| #27 | fix(cr): PATCH on CR instances — fallback was missing in patch handlers | mayor-d36 (P1) |
+| #28 | fix(crd+cr): UID generation calls SystemTime::now() once per call | mayor-c6u |
 
-Also merged earlier:
-- PR #22 — scale subresource (mayor-d01)
-- Direct commit — controller-manager SA token provisioning (mayor-2hu)
-- Direct commit — SA JWT inbound verification (mayor-n9a)
+**Loops registered:** 15m dispatch, 30m cluster, 60m hygiene, 30m PR merge, 10m dashboard (all session-only).
 
-51 beads closed total. 52 filed this phase.
+**Session totals:** 56 beads closed, PRs #22–28 merged.
 
-## Stance (reasserted each session)
+## Stance
 
-Pre-alpha/greenfield: break freely, no backward compat, delete dead code. Correctness first. kubectl-compatible API surface. Minimal dependencies (resist adding crates). **Merge on green CI automatically**; flag security/API surface/architecture PRs for operator review first.
+Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal deps. Merge on green CI automatically; flag security/API surface/architecture PRs for operator review first.
