@@ -15,9 +15,9 @@ metadata:
 - Performance-critical: workers flag allocations, O(n²) loops, and missed batching opportunities. Hot paths matter.
 - Simplicity first: readable > clever. A senior engineer must understand every line at a glance. No unnecessary abstractions.
 
-**Merge policy:** Operator approval required before any PR merge. Mayor stages PRs and notifies operator; operator gives the final OK. Mayor does not auto-merge.
+**Merge policy:** Merge on green CI automatically. Mayor does not wait for operator approval on each PR. Exception: PRs touching security, API surface, or architecture are flagged for operator review first.
 
-**Established:** 2026-05-18 by operator in inaugural mayor session.
+**Established:** 2026-05-18 by operator in inaugural mayor session. Merge policy updated 2026-05-19 at Phase 3 start.
 
 ## Worker preamble (inject verbatim)
 

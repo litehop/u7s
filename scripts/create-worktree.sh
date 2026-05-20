@@ -28,4 +28,8 @@ for f in .beads-credential-key; do
   fi
 done
 
+# Sync .claude/settings.json so workers inherit the project's permission allowlist
+mkdir -p "$WORKTREE_DIR/.claude"
+cp -f "$BASE_PATH/.claude/settings.json" "$WORKTREE_DIR/.claude/settings.json"
+
 printf '%s\n' "$WORKTREE_DIR"

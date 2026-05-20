@@ -1,37 +1,28 @@
 # Dashboard
 
-2026-05-20T06:45 UTC
+2026-05-20T07:15 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 1 (mayor-xy2 P3 deferred)
+Open beads: 1 (mayor-xy2 P3 deferred) + mayor-8ho in-flight
 
 ## What needs the operator now
 
-**Backlog cold. No decisions needed.**
+No blocking decisions.
 
-**Your next action:** Verify kubelet registers a node against the new build. Start u7s (`cargo run --bin u7s-apiserver`) and check kubelet logs in the lima VM. This is the acceptance gate for the 3 PRs merged this session.
+## In-flight
 
-If node registers → run sonobuoy → triage failures into new beads → mayor dispatches workers.
-If node still fails → investigate logs, file new beads with root cause.
+**mayor-8ho** — pod lifecycle smoke test (busybox hello-world via lima-node). Worker is iterating locally. First bug found: `patch_pod_status` was rejecting kubelet's `strategic-merge-patch` content type — fix staged, continuing iteration.
 
 ## Forward-looking
 
-1. **Kubelet node registration** — manual acceptance test (operator action)
-2. **Sonobuoy triage** — once node registers, restart sonobuoy; failures become new beads
-3. **mayor-xy2** (CR schema validation, P3) — only open bead, intentionally deferred; revisit at Argo CD milestone
+1. **Pod lifecycle test** — worker iterating; expect PR once pod completes locally + CI job added
+2. **Sonobuoy** — once pod lifecycle works, restart sonobuoy to generate conformance failure beads
+3. **mayor-xy2** (CR schema validation, P3) — deferred; revisit at Argo CD milestone
 
 ## Recent progress
 
-This session merged 5 PRs (all kubelet-registration blockers):
-
-| PR | What |
-|----|------|
-| #61 | seed kube-node-lease + kube-public namespaces |
-| #62 | storage.k8s.io/v1 resources in build_registry |
-| #63 | decode NodeSpec fields (podCIDR/providerID) from kubelet proto |
-| #64 | seed system:node ClusterRole+ClusterRoleBinding at startup |
-| #66 | persist CA key+cert across restarts (--ca-key/--ca-cert) |
-
-114 total beads closed. 0 open PRs. 0 worktrees. All kubelet smoke tests (1.34.8 / 1.35.5 / 1.36.1) green.
+- Branch hygiene: deleted 12 stale local branches, 12 stale remote branches; only `main` + `operator/*` + active worker remain
+- PRs #63/#64/#66 merged this session (node proto, RBAC seed, CA persist)
+- 114 total beads closed.
 
 ## Stance
 

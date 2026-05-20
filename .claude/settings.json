@@ -2,27 +2,51 @@
   "permissions": {
     "defaultMode": "auto",
     "allow": [
-      "mcp__github__*",
-      "mcp__git__*",
-      "mcp__rust__*",
-      "Bash(cargo *)",
       "Bash(bd *)",
-      "Bash(git *)",
-      "Bash(gh *)",
-      "Bash(find *)",
-      "Bash(ls)",
-      "Bash(ls *)",
-      "Bash(grep *)",
-      "Bash(rustup *)",
-      "Bash(rustc *)",
+      "Bash(cargo *)",
       "Bash(cat *)",
-      "Bash(mkdir *)",
-      "Bash(echo *)",
-      "Bash(jq *)",
-      "Bash(touch *)",
-      "Bash(rm *)",
       "Bash(cp *)",
-      "Bash(mv *)"
+      "Bash(curl -s *)",
+      "Bash(curl -sf *)",
+      "Bash(curl -sk *)",
+      "Bash(echo *)",
+      "Bash(find *)",
+      "Bash(gh *)",
+      "Bash(git *)",
+      "Bash(grep *)",
+      "Bash(jq *)",
+      "Bash(kill *)",
+      "Bash(kubectl apply *)",
+      "Bash(kubectl create *)",
+      "Bash(kubectl delete *)",
+      "Bash(kubectl describe *)",
+      "Bash(kubectl get *)",
+      "Bash(kubectl logs *)",
+      "Bash(kubectl wait *)",
+      "Bash(limactl copy *)",
+      "Bash(limactl list *)",
+      "Bash(limactl list)",
+      "Bash(limactl shell *)",
+      "Bash(mktemp *)",
+      "Bash(mktemp)",
+      "Bash(nc *)",
+      "Bash(pkill *)",
+      "Bash(printf *)",
+      "Bash(sleep *)",
+      "Bash(tee *)",
+      "Bash(wc *)",
+      "Bash(ls *)",
+      "Bash(ls)",
+      "Bash(mkdir *)",
+      "Bash(mv *)",
+      "Bash(rm *)",
+      "Bash(rustc *)",
+      "Bash(rustup *)",
+      "Bash(touch *)",
+      "mcp__git__*",
+      "mcp__github__*",
+      "mcp__lima_node__*",
+      "mcp__rust__*"
     ]
   },
   "worktree": {
@@ -94,5 +118,11 @@
         "lima-node"
       ]
     }
-  }
+  },
+  "enabledMcpjsonServers": [
+    "lima-node",
+    "git",
+    "github",
+    "rust"
+  ]
 }

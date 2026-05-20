@@ -34,7 +34,7 @@ export KUBECONFIG=/path/u7s/printed/kubeconfig
 scripts/lima-start.sh
 ```
 
-The script starts an Ubuntu 24.04 VM with containerd + kubelet 1.31, copies the kubeconfig into the VM (rewriting the address to `host.lima.internal`), starts kubelet, and polls until `lima-node` appears in `kubectl get nodes`.
+The script starts an Ubuntu 24.04 VM with cri-o + crun + kubelet, copies the kubeconfig into the VM (rewriting the address to `host.lima.internal`), starts kubelet, and polls until `lima-node` appears in `kubectl get nodes`.
 
 The VM definition is at [lima/kubelet.yaml](../lima/kubelet.yaml). The kubelet will show `NotReady` (no CNI) but it will register — that is the acceptance bar for this smoke test.
 
