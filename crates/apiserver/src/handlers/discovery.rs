@@ -30,8 +30,10 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("authorization.k8s.io", "v1"),
     ("coordination.k8s.io", "v1"),
     ("networking.k8s.io", "v1"),
+    ("node.k8s.io", "v1"),
     ("policy", "v1"),
     ("rbac.authorization.k8s.io", "v1"),
+    ("storage.k8s.io", "v1"),
 ];
 
 pub async fn api_group_list(State(state): State<AppState>) -> Json<APIGroupList> {
@@ -130,8 +132,10 @@ pub async fn api_group_resources(
         ("authorization.k8s.io", "v1") => Some(authz_v1_resources()),
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
         ("networking.k8s.io", "v1") => Some(networking_v1_resources()),
+        ("node.k8s.io", "v1") => Some(node_v1_resources()),
         ("policy", "v1") => Some(policy_v1_resources()),
         ("rbac.authorization.k8s.io", "v1") => Some(rbac_v1_resources()),
+        ("storage.k8s.io", "v1") => Some(storage_v1_resources()),
         _ => None,
     };
 
@@ -425,6 +429,61 @@ fn policy_v1_resources() -> serde_json::Value {
     })
 }
 
+fn node_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "node.k8s.io/v1",
+        "resources": [
+            {
+                "name": "runtimeclasses",
+                "singularName": "runtimeclass",
+                "namespaced": false,
+                "kind": "RuntimeClass",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn storage_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "storage.k8s.io/v1",
+        "resources": [
+            {
+                "name": "csidrivers",
+                "singularName": "csidriver",
+                "namespaced": false,
+                "kind": "CSIDriver",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "csinodes",
+                "singularName": "csinode",
+                "namespaced": false,
+                "kind": "CSINode",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "storageclasses",
+                "singularName": "storageclass",
+                "namespaced": false,
+                "kind": "StorageClass",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "volumeattachments",
+                "singularName": "volumeattachment",
+                "namespaced": false,
+                "kind": "VolumeAttachment",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -605,5 +664,76 @@ mod tests {
             group.preferred_version.version, "v1",
             "v1 (storage=true) must be the preferredVersion"
         );
+    }
+
+    // storage.k8s.io must appear unconditionally — kubelet probes it at startup.
+    #[tokio::test]
+    async fn storage_group_appears_in_api_group_list() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"storage.k8s.io"),
+            "storage.k8s.io must appear in /apis; got: {names:?}"
+        );
+    }
+
+    // node.k8s.io must appear unconditionally — kubelet probes it at startup.
+    #[tokio::test]
+    async fn node_group_appears_in_api_group_list() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"node.k8s.io"),
+            "node.k8s.io must appear in /apis; got: {names:?}"
+        );
+    }
+
+    // storage.k8s.io/v1 resource list must include csidrivers and csinodes so kubelet
+    // can register itself without errors.
+    #[tokio::test]
+    async fn storage_v1_resources_list() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("storage.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"csidrivers"), "csidrivers must be in storage.k8s.io/v1; got: {names:?}");
+        assert!(names.contains(&"csinodes"), "csinodes must be in storage.k8s.io/v1; got: {names:?}");
+    }
+
+    // node.k8s.io/v1 resource list must include runtimeclasses so kubelet can
+    // query the RuntimeClass API without errors.
+    #[tokio::test]
+    async fn node_v1_resources_list() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("node.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"runtimeclasses"), "runtimeclasses must be in node.k8s.io/v1; got: {names:?}");
     }
 }
