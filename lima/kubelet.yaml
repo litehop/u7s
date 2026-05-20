@@ -34,19 +34,22 @@ provision:
       #!/bin/bash
       set -euo pipefail
 
-      # Install containerd
       apt-get update -qq
-      apt-get install -y containerd
-      mkdir -p /etc/containerd
-      containerd config default > /etc/containerd/config.toml
-      sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-      systemctl enable --now containerd
-
-      # Install kubelet 1.31 from pkgs.k8s.io
       apt-get install -y apt-transport-https ca-certificates curl gpg
-      curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key \
-        | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-      echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' \
+
+      # Install cri-o 1.36 and crun
+      curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/Release.key \
+        | gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+      echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/ /' \
+        > /etc/apt/sources.list.d/cri-o.list
+      apt-get update -qq
+      apt-get install -y cri-o crun
+      systemctl enable --now crio
+
+      # Install kubelet 1.36 from pkgs.k8s.io
+      curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key \
+        | gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' \
         > /etc/apt/sources.list.d/kubernetes.list
       apt-get update -qq
       apt-get install -y kubelet
@@ -66,7 +69,7 @@ provision:
       ExecStart=/usr/bin/kubelet \
         --kubeconfig=/etc/kubelet-kubeconfig \
         --node-name=lima-node \
-        --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \
+        --container-runtime-endpoint=unix:///var/run/crio/crio.sock \
         --register-node=true \
         --fail-swap-on=false \
         --resolv-conf= \
@@ -76,8 +79,8 @@ provision:
       systemctl daemon-reload
 
 probes:
-  - description: containerd is running
+  - description: cri-o is running
     script: |
       #!/bin/bash
-      systemctl is-active --quiet containerd
-    hint: "containerd failed to start — check: limactl shell lima-node sudo journalctl -u containerd"
+      systemctl is-active --quiet crio
+    hint: "cri-o failed to start — check: limactl shell lima-node sudo journalctl -u crio"

@@ -5,4 +5,4 @@ registries:
   - type: standard
     ref: v4.513.1
 packages:
-  - name: kubernetes/kubernetes/kubectl@v1.31.14
+  - name: kubernetes/kubernetes/kubectl@v1.36.1
