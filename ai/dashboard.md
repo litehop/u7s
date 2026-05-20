@@ -1,36 +1,37 @@
 # Dashboard
 
-2026-05-20T06:35 UTC
+2026-05-20T06:45 UTC
 `bd prime` in a fresh Claude Code session
 Open beads: 1 (mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**Backlog is cold.** No blocking decisions.
+**Backlog cold. No decisions needed.**
 
-**Next step: test that kubelet registers a node.** Build u7s, start it, check kubelet logs. The three fixes landed this session should unblock node registration:
-- CA key persists across restarts → kubelet's trusted CA stays valid
-- system:node RBAC seeded at startup → kubelet credentials work without system:masters bypass
-- NodeSpec decoded from proto → stored nodes have valid podCIDR/providerID
+**Your next action:** Verify kubelet registers a node against the new build. Start u7s (`cargo run --bin u7s-apiserver`) and check kubelet logs in the lima VM. This is the acceptance gate for the 3 PRs merged this session.
 
-Once node registers: run sonobuoy, triage failures into new beads.
+If node registers → run sonobuoy → triage failures into new beads → mayor dispatches workers.
+If node still fails → investigate logs, file new beads with root cause.
 
 ## Forward-looking
 
-1. **Kubelet node registration smoke test** — `cargo build && ./u7s-apiserver`, check kubelet logs in lima
-2. **Sonobuoy** — once node registers, restart with `--mode=non-disruptive-conformance`
-3. **Triage sonobuoy failures** → new beads → worker dispatch
-4. **mayor-xy2** (CR schema validation, P3) — only open bead, low priority
+1. **Kubelet node registration** — manual acceptance test (operator action)
+2. **Sonobuoy triage** — once node registers, restart sonobuoy; failures become new beads
+3. **mayor-xy2** (CR schema validation, P3) — only open bead, intentionally deferred; revisit at Argo CD milestone
 
-## Recent progress — this session
+## Recent progress
 
-| PR | What | Status |
-|----|------|--------|
-| #63 | decode NodeSpec fields (podCIDR/providerID) from kubelet proto | merged |
-| #64 | seed system:node ClusterRole+ClusterRoleBinding at startup | merged |
-| #66 | persist CA key+cert across restarts (--ca-key/--ca-cert) | merged |
+This session merged 5 PRs (all kubelet-registration blockers):
 
-114 total beads closed. 0 open PRs. 0 worktrees. Kubelet smoke tests (1.34.8, 1.35.5, 1.36.1) passed CI for all PRs.
+| PR | What |
+|----|------|
+| #61 | seed kube-node-lease + kube-public namespaces |
+| #62 | storage.k8s.io/v1 resources in build_registry |
+| #63 | decode NodeSpec fields (podCIDR/providerID) from kubelet proto |
+| #64 | seed system:node ClusterRole+ClusterRoleBinding at startup |
+| #66 | persist CA key+cert across restarts (--ca-key/--ca-cert) |
+
+114 total beads closed. 0 open PRs. 0 worktrees. All kubelet smoke tests (1.34.8 / 1.35.5 / 1.36.1) green.
 
 ## Stance
 
