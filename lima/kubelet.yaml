@@ -64,6 +64,12 @@ provision:
       apt-get install -y kubelet
       apt-mark hold kubelet
 
+      # Install sonobuoy — static binary, used for local conformance runs against u7s on host
+      SONOBUOY_VERSION="0.57.3"
+      curl -fsSL "https://github.com/vmware-tanzu/sonobuoy/releases/download/v${SONOBUOY_VERSION}/sonobuoy_${SONOBUOY_VERSION}_linux_arm64.tar.gz" \
+        | tar -xz -C /usr/local/bin sonobuoy
+      chmod +x /usr/local/bin/sonobuoy
+
       # Disable kubelet until the kubeconfig is provisioned by scripts/lima-start.sh
       systemctl disable kubelet
 
@@ -98,3 +104,8 @@ probes:
       #!/bin/bash
       systemctl is-active --quiet crio
     hint: "cri-o failed to start — check: limactl shell lima-node sudo journalctl -u crio"
+  - description: sonobuoy is installed
+    script: |
+      #!/bin/bash
+      command -v sonobuoy >/dev/null
+    hint: "sonobuoy not found — re-provision: limactl delete lima-node && scripts/lima-start.sh"
