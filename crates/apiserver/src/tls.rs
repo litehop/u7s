@@ -235,9 +235,12 @@ impl Kubeconfig {
 /// The default path ("./kubeconfig") is write-only on first run — it is not
 /// a read fixture. The file is generated fresh from the in-memory TLS material
 /// each time the server starts.
-pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, args: &Args) -> anyhow::Result<()> {
-    let server = args.advertise_address.as_deref().unwrap_or("https://127.0.0.1:6443");
-    let kc = Kubeconfig::new(server, tls);
+pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, _args: &Args) -> anyhow::Result<()> {
+    // Always write 127.0.0.1 as the server URL — this kubeconfig is for local use on the host.
+    // lima-start.sh rewrites it to host.lima.internal when copying into the VM.
+    // The cert SANs already include the advertise-address host so connections from either
+    // address are valid.
+    let kc = Kubeconfig::new("https://127.0.0.1:6443", tls);
     std::fs::write(path, kc.to_yaml())?;
     tracing::info!("kubeconfig written to {path}");
     Ok(())
