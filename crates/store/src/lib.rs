@@ -46,6 +46,11 @@ pub struct FieldSelector {
 pub struct ListOptions {
     /// If set, filter results to objects where the named field equals the given value.
     pub field_selector: Option<FieldSelector>,
+    /// Maximum number of items to return. None means no limit.
+    pub limit: Option<u64>,
+    /// Opaque cursor: the store key to start from (exclusive lower bound).
+    /// Clients obtain this from `ListResponse::continue_key` (base64-encoded).
+    pub continue_key: Option<String>,
 }
 
 /// Result of a list operation.
@@ -54,6 +59,9 @@ pub struct ListResponse {
     pub items: Vec<StoreObject>,
     /// Global revision of the snapshot at which this list was consistent.
     pub revision: u64,
+    /// Set when more items remain after this page. Clients pass this back as `continue_key`
+    /// (after base64-encoding) to get the next page.
+    pub continue_key: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -382,62 +390,80 @@ fn prefix_upper_bound(prefix: &str) -> String {
     String::new() // no upper bound needed
 }
 
+fn query_all(conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Result<Vec<StoreObject>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(p, |r| {
+        Ok(StoreObject {
+            key:      r.get(0)?,
+            value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
+            revision: r.get(2)?,
+        })
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<ListResponse> {
     conn.execute_batch("BEGIN DEFERRED")?;
 
     let upper = prefix_upper_bound(prefix);
+    let ck = opts.continue_key.as_deref().unwrap_or("");
 
-    let items: Vec<StoreObject> = match &opts.field_selector {
+    // When limit is set with no field selector, use SQL-level pagination (fetch limit+1).
+    // When a field selector is present, collect all matching rows then paginate in memory,
+    // because in-memory filtering may discard rows between the cursor and the limit boundary.
+    let (items, continue_key) = match &opts.field_selector {
         // Indexed fast-path: spec.nodeName on pods — uses the partial index.
         Some(FieldSelector { field, value })
             if field == "spec.nodeName" && prefix.starts_with("/registry/pods/") =>
         {
             let like_prefix = format!("{}%", prefix);
-            let sql = "SELECT key, value, revision FROM objects \
-                       WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
-                       ORDER BY revision ASC";
-            let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map(params![like_prefix, value], |r| {
-                Ok(StoreObject {
-                    key:      r.get(0)?,
-                    value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                    revision: r.get(2)?,
-                })
-            })?.collect::<rusqlite::Result<_>>()?;
-            rows
+            let raw = if ck.is_empty() {
+                query_all(conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
+                     ORDER BY key ASC",
+                    &[&like_prefix, value as &dyn rusqlite::ToSql],
+                )?
+            } else {
+                query_all(conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
+                     AND key > ?3 ORDER BY key ASC",
+                    &[&like_prefix, value as &dyn rusqlite::ToSql, &ck],
+                )?
+            };
+            paginate_in_memory(raw, opts.limit)
         }
 
-        // Generic field selector: full scan + in-memory filter.
+        // Generic field selector: full scan + in-memory filter + in-memory pagination.
         Some(FieldSelector { field, value }) => {
-            let raw: Vec<StoreObject> = if upper.is_empty() {
-                let mut stmt = conn.prepare(
-                    "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
-                )?;
-                let rows = stmt.query_map(params![prefix], |r| {
-                    Ok(StoreObject {
-                        key:      r.get(0)?,
-                        value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                        revision: r.get(2)?,
-                    })
-                })?.collect::<rusqlite::Result<Vec<_>>>()?;
-                rows
-            } else {
-                let mut stmt = conn.prepare(
+            let raw = if upper.is_empty() {
+                if ck.is_empty() {
+                    query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
+                        &[&prefix],
+                    )?
+                } else {
+                    query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key > ?2 ORDER BY key ASC",
+                        &[&prefix, &ck],
+                    )?
+                }
+            } else if ck.is_empty() {
+                query_all(conn,
                     "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC",
-                )?;
-                let rows = stmt.query_map(params![prefix, upper], |r| {
-                    Ok(StoreObject {
-                        key:      r.get(0)?,
-                        value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                        revision: r.get(2)?,
-                    })
-                })?.collect::<rusqlite::Result<Vec<_>>>()?;
-                rows
+                    &[&prefix, &upper],
+                )?
+            } else {
+                query_all(conn,
+                    "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC",
+                    &[&prefix, &upper, &ck],
+                )?
             };
 
             // Walk the dot-separated path in the parsed JSON and compare to expected value.
             let path_parts: Vec<&str> = field.split('.').collect();
-            raw.into_iter().filter(|obj| {
+            let filtered: Vec<StoreObject> = raw.into_iter().filter(|obj| {
                 let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
                     return false;
                 };
@@ -449,35 +475,57 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
                     }
                 }
                 cur.as_str().is_some_and(|s| s == value)
-            }).collect()
+            }).collect();
+            paginate_in_memory(filtered, opts.limit)
         }
 
-        // No field selector: return all objects under prefix.
+        // No field selector: SQL-level pagination when limit is set (fetch limit+1 rows).
         None => {
-            if upper.is_empty() {
-                let mut stmt = conn.prepare(
-                    "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
-                )?;
-                let rows = stmt.query_map(params![prefix], |r| {
-                    Ok(StoreObject {
-                        key:      r.get(0)?,
-                        value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                        revision: r.get(2)?,
-                    })
-                })?.collect::<rusqlite::Result<_>>()?;
-                rows
+            let fetch_limit = opts.limit.map(|l| (l + 1) as i64);
+            let raw = if upper.is_empty() {
+                match (ck.is_empty(), fetch_limit) {
+                    (true, None)       => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
+                        &[&prefix])?,
+                    (true, Some(lim))  => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC LIMIT ?2",
+                        &[&prefix, &lim])?,
+                    (false, None)      => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key > ?2 ORDER BY key ASC",
+                        &[&prefix, &ck])?,
+                    (false, Some(lim)) => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key > ?2 ORDER BY key ASC LIMIT ?3",
+                        &[&prefix, &ck, &lim])?,
+                }
             } else {
-                let mut stmt = conn.prepare(
-                    "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC",
-                )?;
-                let rows = stmt.query_map(params![prefix, upper], |r| {
-                    Ok(StoreObject {
-                        key:      r.get(0)?,
-                        value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                        revision: r.get(2)?,
-                    })
-                })?.collect::<rusqlite::Result<_>>()?;
-                rows
+                match (ck.is_empty(), fetch_limit) {
+                    (true, None)       => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC",
+                        &[&prefix, &upper])?,
+                    (true, Some(lim))  => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC LIMIT ?3",
+                        &[&prefix, &upper, &lim])?,
+                    (false, None)      => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC",
+                        &[&prefix, &upper, &ck])?,
+                    (false, Some(lim)) => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC LIMIT ?4",
+                        &[&prefix, &upper, &ck, &lim])?,
+                }
+            };
+            // If we fetched limit+1 rows, there are more items. Discard the extra row
+            // and use the last returned item's key as the cursor for the next page.
+            if let Some(limit) = opts.limit.map(|l| l as usize) {
+                if raw.len() > limit {
+                    let mut items = raw;
+                    items.pop(); // discard the probe row; it belongs to the next page
+                    let ck = items.last().map(|o| o.key.clone());
+                    (items, ck)
+                } else {
+                    (raw, None)
+                }
+            } else {
+                (raw, None)
             }
         }
     };
@@ -490,7 +538,24 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
 
     conn.execute_batch("COMMIT")?;
 
-    Ok(ListResponse { items, revision: snapshot_revision })
+    Ok(ListResponse { items, revision: snapshot_revision, continue_key })
+}
+
+/// Apply in-memory pagination: if limit is set, return at most limit items and
+/// set continue_key to the last item's key if more remain.
+fn paginate_in_memory(mut items: Vec<StoreObject>, limit: Option<u64>) -> (Vec<StoreObject>, Option<String>) {
+    if let Some(limit) = limit {
+        let limit = limit as usize;
+        if items.len() > limit {
+            items.truncate(limit);
+            let ck = items.last().map(|o| o.key.clone());
+            (items, ck)
+        } else {
+            (items, None)
+        }
+    } else {
+        (items, None)
+    }
 }
 
 impl Store for SqliteStore {
@@ -915,6 +980,7 @@ mod tests {
                 field: "spec.nodeName".to_string(),
                 value: "node-1".to_string(),
             }),
+            ..Default::default()
         };
         let resp = store.list("/registry/pods/", opts).await.expect("list");
 
@@ -945,6 +1011,7 @@ mod tests {
                 field: "metadata.namespace".to_string(),
                 value: "default".to_string(),
             }),
+            ..Default::default()
         };
         let resp = store.list("/registry/pods/", opts).await.expect("list");
 
@@ -1034,5 +1101,69 @@ mod tests {
             });
             assert_eq!(rv_int, expected_rv, "stamped resourceVersion must match returned revision for key {key}");
         }
+    }
+
+    // --- Pagination tests ---
+
+    #[tokio::test]
+    async fn test_list_limit_returns_continue_key() {
+        // A page smaller than the total must return a continue_key so clients know more items remain.
+        // Without this, a client that gets fewer items than expected has no way to tell
+        // whether it's the last page or pagination is simply broken.
+        let store = make_store();
+
+        store.put("/registry/pods/default/aaa", pod_json("aaa"), Some(0)).await.expect("create aaa");
+        store.put("/registry/pods/default/bbb", pod_json("bbb"), Some(0)).await.expect("create bbb");
+        store.put("/registry/pods/default/ccc", pod_json("ccc"), Some(0)).await.expect("create ccc");
+
+        let resp = store.list("/registry/pods/default/", ListOptions { limit: Some(2), ..Default::default() })
+            .await.expect("list page 1");
+
+        assert_eq!(resp.items.len(), 2, "page 1 must return exactly limit items");
+        assert!(resp.continue_key.is_some(), "more items remain; continue_key must be set");
+    }
+
+    #[tokio::test]
+    async fn test_list_continue_returns_next_page() {
+        // Using the continue_key from page 1 must return the next page starting after
+        // the last item of page 1. If continue_key is ignored, the client gets duplicates.
+        let store = make_store();
+
+        store.put("/registry/pods/default/aaa", pod_json("aaa"), Some(0)).await.expect("create aaa");
+        store.put("/registry/pods/default/bbb", pod_json("bbb"), Some(0)).await.expect("create bbb");
+        store.put("/registry/pods/default/ccc", pod_json("ccc"), Some(0)).await.expect("create ccc");
+
+        let page1 = store.list("/registry/pods/default/", ListOptions { limit: Some(2), ..Default::default() })
+            .await.expect("page 1");
+        let ck = page1.continue_key.clone().expect("must have continue_key after page 1");
+
+        let page2 = store.list("/registry/pods/default/", ListOptions { limit: Some(2), continue_key: Some(ck), ..Default::default() })
+            .await.expect("page 2");
+
+        assert_eq!(page2.items.len(), 1, "page 2 must return the remaining 1 item");
+        assert!(page2.continue_key.is_none(), "no more items; last page must not have continue_key");
+
+        // Verify no overlap: page 2 must not contain any item from page 1.
+        let page1_keys: std::collections::HashSet<&str> = page1.items.iter().map(|o| o.key.as_str()).collect();
+        for item in &page2.items {
+            assert!(!page1_keys.contains(item.key.as_str()), "page 2 must not repeat items from page 1");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_last_page_no_continue_key() {
+        // When a single page covers all items exactly, continue_key must be absent.
+        // If it were set, the next request would return an empty page, which some clients
+        // treat as an error rather than end-of-list.
+        let store = make_store();
+
+        store.put("/registry/pods/default/aaa", pod_json("aaa"), Some(0)).await.expect("create aaa");
+        store.put("/registry/pods/default/bbb", pod_json("bbb"), Some(0)).await.expect("create bbb");
+
+        let resp = store.list("/registry/pods/default/", ListOptions { limit: Some(10), ..Default::default() })
+            .await.expect("list with limit > total");
+
+        assert_eq!(resp.items.len(), 2);
+        assert!(resp.continue_key.is_none(), "all items fit in one page; continue_key must be absent");
     }
 }

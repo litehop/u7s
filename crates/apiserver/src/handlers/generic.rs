@@ -23,6 +23,9 @@ pub struct CollectionQuery {
     pub label_selector: Option<String>,
     #[serde(rename = "fieldSelector")]
     pub field_selector: Option<String>,
+    pub limit: Option<u64>,
+    #[serde(rename = "continue")]
+    pub continue_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,22 +331,43 @@ pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::st
     }
 }
 
+/// Encode a store key as a URL-safe base64 continue token (no padding).
+fn encode_continue(key: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_bytes())
+}
+
+/// Decode a URL-safe base64 continue token back to a store key string.
+fn decode_continue(token: &str) -> Result<String, crate::status::StatusError> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| Status::bad_request(format!("invalid continue token '{token}': base64 decode failed")))?;
+    String::from_utf8(bytes)
+        .map_err(|_| Status::bad_request(format!("invalid continue token '{token}': not valid UTF-8")))
+}
+
 fn build_list_response(
     kind: &str,
     group: &str,
     version: &str,
     revision: u64,
     items: Vec<serde_json::Value>,
+    continue_key: Option<String>,
 ) -> serde_json::Value {
     let api_version = if group.is_empty() {
         version.to_string()
     } else {
         format!("{}/{}", group, version)
     };
+    let mut metadata = serde_json::json!({ "resourceVersion": revision.to_string() });
+    if let Some(key) = continue_key {
+        metadata["continue"] = serde_json::Value::String(encode_continue(&key));
+    }
     serde_json::json!({
         "kind": format!("{}List", kind),
         "apiVersion": api_version,
-        "metadata": { "resourceVersion": revision.to_string() },
+        "metadata": metadata,
         "items": items
     })
 }
@@ -438,9 +462,10 @@ pub async fn list_resource(
     }
 
     let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
+    let continue_key = query.continue_token.as_deref().map(decode_continue).transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions { field_selector, ..Default::default() })
+        .list(&prefix, ListOptions { field_selector, limit: query.limit, continue_key })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -458,7 +483,7 @@ pub async fn list_resource(
         items
     };
 
-    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
+    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items, resp.continue_key);
     Ok(Json(body).into_response())
 }
 
@@ -787,9 +812,10 @@ pub async fn list_namespaced_resource(
     }
 
     let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
+    let continue_key = query.continue_token.as_deref().map(decode_continue).transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions { field_selector, ..Default::default() })
+        .list(&prefix, ListOptions { field_selector, limit: query.limit, continue_key })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -807,7 +833,7 @@ pub async fn list_namespaced_resource(
         items
     };
 
-    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
+    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items, resp.continue_key);
     Ok(Json(body).into_response())
 }
 
@@ -1375,9 +1401,10 @@ pub async fn core_list_resource(
             .map(IntoResponse::into_response);
         }
         let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
+        let continue_key = query.continue_token.as_deref().map(decode_continue).transpose()?;
         let resp = state
             .store
-            .list(&prefix, ListOptions { field_selector, ..Default::default() })
+            .list(&prefix, ListOptions { field_selector, limit: query.limit, continue_key })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let mut items = Vec::with_capacity(resp.items.len());
@@ -1392,7 +1419,7 @@ pub async fn core_list_resource(
         } else {
             items
         };
-        let body = build_list_response("Pod", "", "v1", resp.revision, items);
+        let body = build_list_response("Pod", "", "v1", resp.revision, items, resp.continue_key);
         return Ok(Json(body).into_response());
     }
 
@@ -2073,14 +2100,14 @@ mod tests {
     #[test]
     fn core_group_api_version_is_version_only() {
         // For core group (group=""), apiVersion should be just "v1", not "/v1".
-        let body = build_list_response("Node", "", "v1", 0, vec![]);
+        let body = build_list_response("Node", "", "v1", 0, vec![], None);
         assert_eq!(body["apiVersion"], "v1");
         assert_eq!(body["kind"], "NodeList");
     }
 
     #[test]
     fn non_core_group_api_version_includes_group() {
-        let body = build_list_response("Deployment", "apps", "v1", 0, vec![]);
+        let body = build_list_response("Deployment", "apps", "v1", 0, vec![], None);
         assert_eq!(body["apiVersion"], "apps/v1");
     }
 
@@ -2584,5 +2611,46 @@ mod tests {
         assert_eq!(resp.items.len(), 1, "fieldSelector=metadata.name=foo must return exactly one item");
         let parsed: serde_json::Value = serde_json::from_slice(&resp.items[0].value).unwrap();
         assert_eq!(parsed["metadata"]["name"], "foo", "returned item must be the one named 'foo'");
+    }
+
+    // -- encode_continue / decode_continue --
+
+    #[test]
+    fn encode_decode_continue_roundtrips() {
+        // The continue token is opaque to clients; they must get back the original key after
+        // base64 round-trip. A broken encoding loses the cursor and re-scans from the start.
+        let key = "/registry/pods/default/my-pod";
+        let token = encode_continue(key);
+        let decoded = ok(decode_continue(&token));
+        assert_eq!(decoded, key, "decoded continue token must equal the original store key");
+    }
+
+    #[test]
+    fn decode_invalid_continue_token_is_400() {
+        // A malformed continue token from a client must return 400, not 500 or a panic.
+        let err = decode_continue("!!!not-valid-base64!!!").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn build_list_response_with_continue_key_sets_metadata_continue() {
+        // When there are more items, metadata.continue must be set to the base64-encoded cursor.
+        // Kubernetes clients use this field to request the next page; missing it means no pagination.
+        let body = build_list_response("Pod", "", "v1", 5, vec![], Some("/registry/pods/default/foo".to_string()));
+        let token = body["metadata"]["continue"].as_str().unwrap_or("");
+        assert!(!token.is_empty(), "metadata.continue must be set when continue_key is Some");
+        let decoded = ok(decode_continue(token));
+        assert_eq!(decoded, "/registry/pods/default/foo");
+    }
+
+    #[test]
+    fn build_list_response_without_continue_key_omits_metadata_continue() {
+        // When all items fit in one page, metadata.continue must be absent.
+        // An empty string would also confuse clients into requesting an unnecessary next page.
+        let body = build_list_response("Pod", "", "v1", 5, vec![], None);
+        assert!(
+            body["metadata"]["continue"].is_null(),
+            "metadata.continue must be absent when continue_key is None"
+        );
     }
 }
