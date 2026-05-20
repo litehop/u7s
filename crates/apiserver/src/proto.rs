@@ -235,25 +235,64 @@ pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
 ///
 /// Node proto layout (k8s.io/api/core/v1/generated.proto):
 ///   field 1 (ObjectMeta, wire 2): metadata
-///   field 2 (NodeSpec, wire 2): spec — treated as opaque, ignored
+///   field 2 (NodeSpec, wire 2): spec
 ///   field 3 (NodeStatus, wire 2): status — treated as opaque, ignored
 ///
-/// Only ObjectMeta fields are decoded (same layout as decode_namespace_proto). Spec and status
-/// are represented as empty objects `{}` — the server stores and returns whatever JSON it
-/// receives; the shape of Node spec/status is not validated here.
+/// NodeSpec proto layout (k8s.io/api/core/v1/generated.proto):
+///   field 1 (string): podCIDR
+///   field 2 (string): externalID (deprecated)
+///   field 3 (string): providerID
+///   field 4 (bool, wire 0): unschedulable — ignored
+///   field 5+ (complex messages): taints, configSource — ignored
+///   field 7 (string, repeated): podCIDRs
+///
+/// NodeStatus is not decoded — it contains complex repeated fields (conditions, addresses,
+/// capacity, etc.) that require a full proto schema. The status subresource PATCH path
+/// handles status separately.
 pub fn decode_node_proto(data: &[u8]) -> Option<serde_json::Value> {
     let mut meta = serde_json::json!({ "creationTimestamp": null });
     let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
     let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut spec = serde_json::Map::new();
+    let mut pod_cidrs: Vec<serde_json::Value> = Vec::new();
 
     scan_length_delimited_fields(data, |field_number, field_data| {
-        if field_number == 1 {
-            // field 1 = ObjectMeta — same layout as decode_namespace_proto
-            scan_mixed_fields(field_data, |fn2, wt, fd| {
-                decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
-            });
+        match field_number {
+            1 => {
+                // field 1 = ObjectMeta — same layout as decode_namespace_proto
+                scan_mixed_fields(field_data, |fn2, wt, fd| {
+                    decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
+                });
+            }
+            2 => {
+                // field 2 = NodeSpec — decode simple string fields
+                scan_length_delimited_fields(field_data, |fn2, fd| match fn2 {
+                    1 => {
+                        // podCIDR (string)
+                        let s = String::from_utf8_lossy(fd).into_owned();
+                        if !s.is_empty() {
+                            spec.insert("podCIDR".to_string(), serde_json::Value::String(s));
+                        }
+                    }
+                    3 => {
+                        // providerID (string)
+                        let s = String::from_utf8_lossy(fd).into_owned();
+                        if !s.is_empty() {
+                            spec.insert("providerID".to_string(), serde_json::Value::String(s));
+                        }
+                    }
+                    7 => {
+                        // podCIDRs (repeated string)
+                        let s = String::from_utf8_lossy(fd).into_owned();
+                        if !s.is_empty() {
+                            pod_cidrs.push(serde_json::Value::String(s));
+                        }
+                    }
+                    _ => {} // unschedulable (varint), taints, configSource: ignored
+                });
+            }
+            _ => {} // field 3 (NodeStatus) and others: ignored
         }
-        // field 2 (NodeSpec) and field 3 (NodeStatus) are ignored — treated as opaque.
     })?;
 
     if let Some(l) = labels {
@@ -262,12 +301,19 @@ pub fn decode_node_proto(data: &[u8]) -> Option<serde_json::Value> {
     if let Some(a) = annotations {
         meta["annotations"] = serde_json::Value::Object(a);
     }
+    if !pod_cidrs.is_empty() {
+        spec.insert("podCIDRs".to_string(), serde_json::Value::Array(pod_cidrs));
+    }
 
-    Some(serde_json::json!({
+    let mut obj = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Node",
         "metadata": meta
-    }))
+    });
+    if !spec.is_empty() {
+        obj["spec"] = serde_json::Value::Object(spec);
+    }
+    Some(obj)
 }
 
 /// Decode a proto-encoded core Kubernetes object by kind.
@@ -772,23 +818,55 @@ mod tests {
         assert!(result["metadata"]["creationTimestamp"].is_null());
     }
 
-    /// decode_node_proto must not panic when field 2 (NodeSpec) is present with content.
-    /// This guards against the common case where kubelet sends a full Node object including spec.
+    /// decode_node_proto must extract podCIDR and providerID from NodeSpec (field 2).
+    /// Kubelet sends a full Node proto on registration including spec fields — without this,
+    /// stored nodes have empty spec and controllers see a malformed node.
     #[test]
-    fn decode_node_proto_with_nonempty_spec_does_not_panic() {
-        // Build: Node { metadata: ObjectMeta { name: "node-2" }, spec: <opaque bytes> }
-        let obj_meta = encode_length_delimited(1, b"node-2"); // ObjectMeta.name
-        let mut node_proto = encode_length_delimited(1, &obj_meta); // Node.field 1 = ObjectMeta
-        // field 2 = NodeSpec — encode some opaque bytes that look like a nested proto message
-        let fake_spec = encode_length_delimited(1, b"some-provider-id"); // podCIDR or similar
-        node_proto.extend_from_slice(&encode_length_delimited(2, &fake_spec)); // Node.field 2 = NodeSpec
+    fn decode_node_proto_preserves_spec_fields() {
+        // Build: Node {
+        //   metadata: ObjectMeta { name: "node-1" },
+        //   spec: NodeSpec { podCIDR: "10.244.0.0/24", providerID: "aws://us-east-1a/i-1234" }
+        // }
+        let obj_meta = encode_length_delimited(1, b"node-1"); // ObjectMeta.name
+        let mut node_spec = Vec::new();
+        node_spec.extend_from_slice(&encode_length_delimited(1, b"10.244.0.0/24")); // NodeSpec.podCIDR
+        node_spec.extend_from_slice(&encode_length_delimited(3, b"aws://us-east-1a/i-1234")); // NodeSpec.providerID
+        node_spec.extend_from_slice(&encode_length_delimited(7, b"10.244.0.0/24")); // NodeSpec.podCIDRs[0]
 
-        let result = decode_node_proto(&node_proto).expect("must not panic on non-empty NodeSpec");
+        let mut node_proto = encode_length_delimited(1, &obj_meta); // Node.field 1 = ObjectMeta
+        node_proto.extend_from_slice(&encode_length_delimited(2, &node_spec)); // Node.field 2 = NodeSpec
+
+        let result = decode_node_proto(&node_proto).expect("must decode node with spec");
 
         assert_eq!(result["kind"], "Node");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "node-1");
+        assert_eq!(result["spec"]["podCIDR"], "10.244.0.0/24",
+            "podCIDR must be extracted from NodeSpec field 1");
+        assert_eq!(result["spec"]["providerID"], "aws://us-east-1a/i-1234",
+            "providerID must be extracted from NodeSpec field 3");
+        assert_eq!(result["spec"]["podCIDRs"][0], "10.244.0.0/24",
+            "podCIDRs must be extracted from NodeSpec field 7");
+    }
+
+    /// decode_node_proto must not panic when NodeSpec contains unrecognized fields (e.g. taints).
+    /// Guards against kubelet sending a full Node proto with complex nested spec fields.
+    #[test]
+    fn decode_node_proto_with_unknown_spec_fields_does_not_panic() {
+        // Build: Node { metadata: ObjectMeta { name: "node-2" }, spec: NodeSpec { podCIDR: "10.0.0.0/24", <unknown field> } }
+        let obj_meta = encode_length_delimited(1, b"node-2"); // ObjectMeta.name
+        let mut node_spec = Vec::new();
+        node_spec.extend_from_slice(&encode_length_delimited(1, b"10.0.0.0/24")); // NodeSpec.podCIDR
+        // field 5 = taints (repeated Taint message) — not decoded, must be silently skipped
+        node_spec.extend_from_slice(&encode_length_delimited(5, b"\x0a\x08NoSchedule")); // opaque Taint bytes
+
+        let mut node_proto = encode_length_delimited(1, &obj_meta);
+        node_proto.extend_from_slice(&encode_length_delimited(2, &node_spec));
+
+        let result = decode_node_proto(&node_proto).expect("must not panic on unknown NodeSpec fields");
+
         assert_eq!(result["metadata"]["name"], "node-2");
-        // spec is not decoded — the returned JSON only contains metadata
-        assert!(result.get("spec").is_none());
+        assert_eq!(result["spec"]["podCIDR"], "10.0.0.0/24");
     }
 
     /// decode_core_proto_by_kind must dispatch to decode_node_proto for kind="Node".
