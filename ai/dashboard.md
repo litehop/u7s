@@ -1,38 +1,36 @@
 # Dashboard
 
-2026-05-20T14:00 UTC
+2026-05-20T14:30 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 3 (mayor-w8x P2 in_progress, mayor-qah P2 blocked on w8x, mayor-xy2 P3 deferred)
+Open beads: 2 (mayor-qah P2 needs operator, mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**Worker running** — mayor-w8x (storage/node discovery stubs) dispatched to background worker. Will open a PR; review and merge when CI green.
+**HOLD — no dispatchable candidates.**
 
-`mayor-xy2` (CR schema validation / openAPIV3Schema enforcement) remains intentionally deferred — permissive validation is safe for the Argo CD milestone.
+`mayor-qah` (Sonobuoy conformance run) is unblocked but requires operator action: sonobuoy needs a live u7s + registered kubelet node to run against. Options:
+  1. Run locally: `cargo build --release`, start u7s, start kubelet via lima, then `sonobuoy run --mode=quick` against it
+  2. Or: say the word and mayor will build a CI workflow for it (adds a long-running CI job ~30–60 min)
 
-**Kubelet implementation** — operator raised; recommendation is to close API conformance gaps first. No bead filed, awaiting direction.
+`mayor-xy2` (CR schema validation) remains intentionally deferred.
 
 ## Forward-looking
 
-1. **mayor-w8x** — worker building storage.k8s.io/v1 + node.k8s.io/v1 discovery stubs; merge when green
-2. **mayor-qah (Sonobuoy conformance run)** — blocked on w8x landing; once merged, dispatch a worker to run sonobuoy against local u7s and triage failures into beads
-3. **mayor-xy2 (CR schema validation)** — deferred; re-evaluate at Argo CD milestone
-4. **Kubelet implementation** — longer-term; awaiting operator direction
+1. **mayor-qah (Sonobuoy)** — operator decides: run locally or build CI workflow; mayor will triage results into new beads
+2. **mayor-xy2 (CR schema validation)** — deferred; re-evaluate at Argo CD milestone
+3. **Kubelet implementation** — longer-term; awaiting operator direction
 
 ## Recent progress
 
-Operator activated two new initiatives (storage/node stubs + sonobuoy). Beads filed: mayor-w8x (P2), mayor-qah (P2, blocked on w8x). Worker dispatched for w8x.
-
-Prior session closed 11 beads and merged 2 PRs:
+PR #58 (d2a5b49) merged green — `storage.k8s.io/v1` and `node.k8s.io/v1` registered in discovery (csidrivers, csinodes, storageclasses, volumeattachments, runtimeclasses). Closes mayor-w8x.
 
 | PR | What | Beads |
 |----|------|-------|
-| #56 (e45a703) | fieldSelector wired to store + list pagination (+16 tests) | mayor-yx5, mayor-ynx |
+| #58 (d2a5b49) | storage.k8s.io/v1 + node.k8s.io/v1 discovery registration (+4 tests) | mayor-w8x |
+| #56 (e45a703) | fieldSelector wiring + list pagination (+16 tests) | mayor-yx5, mayor-ynx |
 | #57 (dd531fa) | merge_patch dedup, proto dedup, HEAD verb, rbac cleanup (−114 lines) | mayor-4r7, mayor-67m, mayor-abq, mayor-59u |
 
-Also fixed 5 kubelet-smoke CI regressions; 3-version matrix (1.34.8/1.35.5/1.36.1, cri-o+crun) green.
-
-105 total beads closed across project lifetime. 0 open PRs. Single worktree (main only). CI green.
+106 total beads closed across project lifetime. 0 open PRs. Single worktree (main only). All CI green.
 
 ## Stance
 
