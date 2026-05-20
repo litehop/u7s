@@ -200,6 +200,25 @@ fn advertise_host(advertise_address: Option<&str>) -> Option<String> {
     if host.is_empty() { None } else { Some(host.to_owned()) }
 }
 
+/// Build the full SAN list for the server certificate.
+/// Always includes localhost, 127.0.0.1, and host.lima.internal.
+/// If advertise_host is Some, appends it as an IP SAN or DNS SAN.
+fn build_server_sans(advertise_host_str: Option<&str>) -> anyhow::Result<Vec<SanType>> {
+    let mut sans: Vec<SanType> = vec![
+        SanType::DnsName("localhost".try_into()?),
+        SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        SanType::DnsName("host.lima.internal".try_into()?),
+    ];
+    if let Some(host) = advertise_host_str {
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            sans.push(SanType::IpAddress(ip));
+        } else {
+            sans.push(SanType::DnsName(host.try_into()?));
+        }
+    }
+    Ok(sans)
+}
+
 pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // --- CA: load-or-generate ---
     // If both ca.key (PEM) and ca.crt (DER) exist on disk, load them so the CA
@@ -211,20 +230,9 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // --- Server cert ---
     let server_key = KeyPair::generate()?;
     let mut server_params = CertificateParams::default();
-    // Always include localhost / 127.0.0.1 and the lima VM-to-host alias.
-    let mut sans: Vec<SanType> = vec![
-        SanType::DnsName("localhost".try_into()?),
-        SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-        SanType::DnsName("host.lima.internal".try_into()?),
-    ];
-    // Add the advertise-address host as a SAN (DNS name or IP).
-    if let Some(host) = advertise_host(args.advertise_address.as_deref()) {
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            sans.push(SanType::IpAddress(ip));
-        } else {
-            sans.push(SanType::DnsName(host.try_into()?));
-        }
-    }
+    // Always include localhost / 127.0.0.1 and the lima VM-to-host alias,
+    // plus the advertise-address host if provided.
+    let sans = build_server_sans(advertise_host(args.advertise_address.as_deref()).as_deref())?;
     server_params.subject_alt_names = sans;
     server_params.distinguished_name.push(
         rcgen::DnType::CommonName, "u7s-apiserver",
@@ -458,6 +466,34 @@ mod tests {
         // Also verify with no advertise address — defaults only.
         let args_none = args_with(None);
         generate_tls(&args_none).expect("generate_tls failed with no advertise address");
+    }
+
+    /// build_server_sans must always include host.lima.internal as a DNS SAN.
+    /// This is the lima VM-to-host alias required for kubelet-to-apiserver TLS.
+    /// If this entry is absent, kubelets running inside lima VMs cannot verify the
+    /// server certificate and will refuse to connect.
+    #[test]
+    fn build_server_sans_always_includes_lima_host() {
+        let sans = build_server_sans(None).expect("build_server_sans failed");
+        let has_lima = sans.iter().any(|s| {
+            matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal")
+        });
+        assert!(has_lima, "host.lima.internal must be in server SANs regardless of advertise_address");
+    }
+
+    /// build_server_sans with an IP advertise_host must include both host.lima.internal
+    /// (DNS) and the IP address SAN.
+    #[test]
+    fn build_server_sans_with_ip_includes_both() {
+        let sans = build_server_sans(Some("192.168.5.1")).expect("build_server_sans failed");
+        let has_lima = sans.iter().any(|s| {
+            matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal")
+        });
+        assert!(has_lima, "host.lima.internal must be present even when advertise_address is an IP");
+        let has_ip = sans.iter().any(|s| {
+            matches!(s, SanType::IpAddress(ip) if ip.to_string() == "192.168.5.1")
+        });
+        assert!(has_ip, "advertise IP 192.168.5.1 must be in SANs");
     }
 
     #[test]

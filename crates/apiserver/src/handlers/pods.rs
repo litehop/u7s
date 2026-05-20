@@ -921,6 +921,14 @@ pub async fn replace_pod_status(
     Ok(Json(current_obj.body))
 }
 
+/// Returns true if the content-type is acceptable for a pod status patch.
+/// Kubelet uses application/strategic-merge-patch+json; both strategic-merge-patch
+/// and merge-patch are accepted. JSON-patch (RFC 6902) is not supported for status.
+fn accepts_patch_content_type(ct: &str) -> bool {
+    ct.contains("application/strategic-merge-patch+json")
+        || ct.contains("application/merge-patch+json")
+}
+
 pub async fn patch_pod_status(
     State(state): State<AppState>,
     Path((raw_ns, name)): Path<(String, String)>,
@@ -933,9 +941,7 @@ pub async fn patch_pod_status(
         .unwrap_or("");
 
     // Kubelet uses strategic-merge-patch; both patch types update only the status field.
-    let is_merge = content_type.contains("application/merge-patch+json")
-        || content_type.contains("application/strategic-merge-patch+json");
-    if !is_merge {
+    if !accepts_patch_content_type(content_type) {
         return Err(Status::unsupported_media_type(format!(
             "unsupported media type '{content_type}'; use application/merge-patch+json or application/strategic-merge-patch+json"
         )));
@@ -1058,6 +1064,30 @@ mod status_tests {
         }
 
         assert_eq!(current["status"], original_status);
+    }
+
+    /// accepts_patch_content_type must accept strategic-merge-patch and merge-patch,
+    /// and must reject json-patch and empty strings.
+    /// Kubelet uses strategic-merge-patch+json; rejecting it would break node status
+    /// updates. Accepting json-patch would be incorrect (unsupported semantics for status).
+    #[test]
+    fn patch_content_type_acceptance() {
+        assert!(
+            accepts_patch_content_type("application/strategic-merge-patch+json"),
+            "strategic-merge-patch must be accepted — kubelet uses this type"
+        );
+        assert!(
+            accepts_patch_content_type("application/merge-patch+json"),
+            "merge-patch must be accepted"
+        );
+        assert!(
+            !accepts_patch_content_type("application/json-patch+json"),
+            "json-patch must be rejected — not supported for status subresource"
+        );
+        assert!(
+            !accepts_patch_content_type(""),
+            "empty content-type must be rejected"
+        );
     }
 }
 
