@@ -400,7 +400,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     let cr_body = serde_json::json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRole",
-        "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000010" },
+        "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000010", "creationTimestamp": "2024-01-01T00:00:00Z" },
         "rules": [
             { "apiGroups": [""], "resources": ["nodes"],      "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": [""], "resources": ["pods"],       "verbs": ["get","list","watch"] },
@@ -419,7 +419,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     let crb_body = serde_json::json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
-        "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000011" },
+        "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000011", "creationTimestamp": "2024-01-01T00:00:00Z" },
         "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:nodes" }],
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:node" }
     });
@@ -538,6 +538,11 @@ mod tests {
             serde_json::from_slice(&cr_obj.unwrap().value).expect("valid json");
         assert_eq!(cr["kind"].as_str(), Some("ClusterRole"));
         assert_eq!(cr["metadata"]["name"].as_str(), Some("system:node"));
+        // All Kubernetes objects must have a non-null creationTimestamp in metadata.
+        assert!(
+            !cr["metadata"]["creationTimestamp"].is_null(),
+            "ClusterRole metadata must contain a non-null creationTimestamp"
+        );
         // Must include rules for nodes, pods, events, configmaps, secrets.
         let rules = cr["rules"].as_array().expect("rules must be an array");
         assert!(!rules.is_empty(), "ClusterRole must have at least one rule");
@@ -563,6 +568,11 @@ mod tests {
             serde_json::from_slice(&crb_obj.unwrap().value).expect("valid json");
         assert_eq!(crb["kind"].as_str(), Some("ClusterRoleBinding"));
         assert_eq!(crb["metadata"]["name"].as_str(), Some("system:node"));
+        // All Kubernetes objects must have a non-null creationTimestamp in metadata.
+        assert!(
+            !crb["metadata"]["creationTimestamp"].is_null(),
+            "ClusterRoleBinding metadata must contain a non-null creationTimestamp"
+        );
         let subjects = crb["subjects"].as_array().expect("subjects must be an array");
         assert_eq!(subjects.len(), 1, "must have exactly one subject");
         assert_eq!(subjects[0]["kind"].as_str(), Some("Group"));
