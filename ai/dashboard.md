@@ -1,34 +1,33 @@
 # Dashboard
 
-2026-05-20T14:04 UTC
+2026-05-20T14:48 UTC
 `bd prime` in a fresh Claude Code session
 Open beads: 1 (mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**PR #79 CI pending** — IngressClass registration + Gateway API CR status test. Will auto-merge on green. No review needed (registry + test only).
+**PR #80 CI pending** — metadata.uid fix (kubelet pod lifecycle blocker). Will auto-merge on green.
 
-**Pod lifecycle e2e is now unblocked** — pods/status PATCH landed (PR #78). Ready to test a hello-world pod reaching Succeeded on lima-node. Want to do that run, or file it as a bead?
+**Stance check** — current stance: pre-alpha/greenfield, break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; security/API/arch PRs flagged for operator review. Confirm still correct or adjust.
 
-**Gateway API CRDs** — confirmed working today via CR handler fallback. You can install upstream Gateway API CRDs and controllers will be able to do CRUD + status writes without further apiserver changes.
+**Pod lifecycle retest** — after PR #80 merges, the e2e test should proceed past `ContainerCreating`. Two remaining unknowns until we rerun: (1) image pull succeeds inside lima VM, (2) no further apiserver gaps surface. Ready to retest on your signal.
 
 **Nothing else blocked on you.**
 
 ## Forward-looking
 
-1. Merge PR #79 (auto on CI green)
-2. Pod lifecycle e2e: manual test on lima-node → add CI smoke job
+1. PR #80 merges → rerun pod lifecycle test on lima-node
+2. If pod reaches Succeeded: add CI smoke job (create pod, assert Succeeded within 60s)
 3. mayor-xy2 (CR schema validation, P3) — deferred until Argo CD milestone
 
 ## Recent progress
 
-Big session. All landed today:
-- **PR #73** — RBAC soft-delete index fix (operator-reviewed)
-- **PR #74–77** — regression tests, CR panic fixes, patch edge cases, parse_resource_version dedup
-- **PR #78** — `PATCH pods/{name}/status` for kubelet pod phase reporting; 4 unit tests; 250 → 252 tests
-- **PR #79** — IngressClass registered; Gateway API CR status path verified with unit test
+Pod lifecycle e2e test run today — reached `ContainerCreating`, uncovered two bugs:
+- **mayor-xt2 (fixed, PR #80)**: `metadata.uid` was null; cri-o needs uid to name sandbox
+- **mayor-3ua (already done)**: system namespaces were already seeded in main.rs; bead closed as false alarm
+- **mayor-0hu (merged PR #78)**: pods/status PATCH — kubelet status writes working (conditions appeared correctly during test)
 
-Code quality audit → 6 beads filed → all closed in one sprint. Test count: ~170 → 252 this session.
+Session totals: PRs #73–80 merged or open; test count 219 → 255 this session.
 
 ## Stance
 
