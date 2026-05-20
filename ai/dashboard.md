@@ -1,42 +1,36 @@
 # Dashboard
 
-2026-05-20T05:35 UTC
+2026-05-20T06:35 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 1 (mayor-xy2 P3 blocked)
+Open beads: 1 (mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**WAITING — lima MCP wiring.** The previous session was blocked waiting for `.claude/settings.json` to be saved with the lima MCP config so Claude Code reloads it. Once that's done, mayor can drive sonobuoy autonomously.
+**Backlog is cold.** No blocking decisions.
 
-Key facts about current state:
-- The revert of the dns-preflight skip (1a5e527) means sonobuoy will fail on DNS check again — this was intentional if the fix was wrong, but needs follow-up
-- Kubelet/crio runtime regression still undiagnosed (sonobuoy aggregator pod not starting)
-- CA regenerates on every u7s restart, breaking kubelet trust — P2 bead candidate not yet filed
+**Next step: test that kubelet registers a node.** Build u7s, start it, check kubelet logs. The three fixes landed this session should unblock node registration:
+- CA key persists across restarts → kubelet's trusted CA stays valid
+- system:node RBAC seeded at startup → kubelet credentials work without system:masters bypass
+- NodeSpec decoded from proto → stored nodes have valid podCIDR/providerID
 
-**Operator decisions needed:**
-1. Is the dns-preflight revert intentional? If so, file a bead for an alternative approach.
-2. Ready to file CA-persistence bead (P2)?
+Once node registers: run sonobuoy, triage failures into new beads.
 
 ## Forward-looking
 
-1. **lima MCP** — once active, mayor runs sonobuoy autonomously and triages failures into beads
-2. **Sonobuoy aggregator pod** — kubelet/crio runtime regression to diagnose (needs lima MCP or manual triage)
-3. **CA persistence** — CA regenerates on every u7s restart, breaking kubelet trust; needs a bead
-4. **Sonobuoy triage** — failures → conformance-gap beads → worker dispatch
-5. **mayor-xy2** — CR schema validation, deferred; re-evaluate at Argo CD milestone
+1. **Kubelet node registration smoke test** — `cargo build && ./u7s-apiserver`, check kubelet logs in lima
+2. **Sonobuoy** — once node registers, restart with `--mode=non-disruptive-conformance`
+3. **Triage sonobuoy failures** → new beads → worker dispatch
+4. **mayor-xy2** (CR schema validation, P3) — only open bead, low priority
 
-With only 1 open bead (deferred/blocked), the backlog is cold. Mayor will HOLD on dispatch until operator resolves blockers above or files new beads.
+## Recent progress — this session
 
-## Recent progress
+| PR | What | Status |
+|----|------|--------|
+| #63 | decode NodeSpec fields (podCIDR/providerID) from kubelet proto | merged |
+| #64 | seed system:node ClusterRole+ClusterRoleBinding at startup | merged |
+| #66 | persist CA key+cert across restarts (--ca-key/--ca-cert) | merged |
 
-| Commit | What | Status |
-|--------|------|--------|
-| 1a5e527 | Revert sonobuoy dns-preflight skip | Just landed |
-| 257912f | Dashboard: waiting on lima MCP | Previous session |
-| 279ef31 | Add lima MCP server config | Previous session |
-| 553bb2b | fix(sonobuoy): skip dns preflight | Reverted |
-
-111 total beads closed. 0 open PRs. 202 tests passing.
+114 total beads closed. 0 open PRs. 0 worktrees. Kubelet smoke tests (1.34.8, 1.35.5, 1.36.1) passed CI for all PRs.
 
 ## Stance
 
