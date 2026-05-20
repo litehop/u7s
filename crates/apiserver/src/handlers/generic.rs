@@ -21,6 +21,8 @@ pub struct CollectionQuery {
     pub watch: Option<bool>,
     pub resource_version: Option<u64>,
     pub label_selector: Option<String>,
+    #[serde(rename = "fieldSelector")]
+    pub field_selector: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +305,18 @@ fn apply_label_selector(
         .collect()
 }
 
+/// Parse a `fieldSelector` query parameter of the form `key=value` into a `FieldSelector`.
+/// Only single equality selectors are supported. Returns 400 on malformed input.
+fn parse_field_selector(s: &str) -> Result<u7s_store::FieldSelector, crate::status::StatusError> {
+    let (field, value) = s.split_once('=').ok_or_else(|| {
+        Status::bad_request(format!("invalid fieldSelector '{s}': expected key=value"))
+    })?;
+    if field.is_empty() {
+        return Err(Status::bad_request(format!("invalid fieldSelector '{s}': empty key")));
+    }
+    Ok(u7s_store::FieldSelector { field: field.to_string(), value: value.to_string() })
+}
+
 pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
     match rv {
         None | Some("") => Ok(None),
@@ -423,9 +437,10 @@ pub async fn list_resource(
         .await;
     }
 
+    let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions::default())
+        .list(&prefix, ListOptions { field_selector, ..Default::default() })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -771,9 +786,10 @@ pub async fn list_namespaced_resource(
         .await;
     }
 
+    let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions::default())
+        .list(&prefix, ListOptions { field_selector, ..Default::default() })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -1358,9 +1374,10 @@ pub async fn core_list_resource(
             .await
             .map(IntoResponse::into_response);
         }
+        let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
         let resp = state
             .store
-            .list(&prefix, ListOptions::default())
+            .list(&prefix, ListOptions { field_selector, ..Default::default() })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let mut items = Vec::with_capacity(resp.items.len());
@@ -2502,5 +2519,70 @@ mod tests {
                 "stale Lease PUT must be rejected with 409 Conflict, not succeed"
             ),
         }
+    }
+
+    // -- parse_field_selector --
+
+    #[test]
+    fn parse_field_selector_valid() {
+        // fieldSelector=metadata.name=foo must parse into a FieldSelector with the right field and value.
+        // Handlers use this to push the filter down to the store; a wrong parse means no filtering.
+        let fs = ok(parse_field_selector("metadata.name=foo"));
+        assert_eq!(fs.field, "metadata.name");
+        assert_eq!(fs.value, "foo");
+    }
+
+    #[test]
+    fn parse_field_selector_empty_value_is_valid() {
+        // metadata.namespace= (empty value) must be accepted — it matches objects with empty namespace.
+        let fs = ok(parse_field_selector("metadata.namespace="));
+        assert_eq!(fs.field, "metadata.namespace");
+        assert_eq!(fs.value, "");
+    }
+
+    #[test]
+    fn parse_field_selector_missing_equals_is_400() {
+        // Missing '=' is malformed — must return 400, not 500 or a panic.
+        let err = parse_field_selector("metadata.name").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn parse_field_selector_empty_key_is_400() {
+        // '=foo' (empty key) is malformed — must return 400.
+        let err = parse_field_selector("=foo").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn field_selector_filters_list_to_matching_item() {
+        // Verifies the handler-layer plumbing: parse_field_selector → ListOptions →
+        // store returns only the item whose field matches. If the wiring is broken
+        // (e.g. ListOptions::default() is still used), all items are returned.
+        use std::sync::Arc;
+        use u7s_store::{ListOptions, SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let make_cm = |name: &str| {
+            bytes::Bytes::from(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": name, "namespace": "default" }
+            }).to_string())
+        };
+
+        store.put("/registry/configmaps/default/foo", make_cm("foo"), Some(0)).await.unwrap();
+        store.put("/registry/configmaps/default/bar", make_cm("bar"), Some(0)).await.unwrap();
+
+        let fs = ok(parse_field_selector("metadata.name=foo"));
+        let resp = store.list(
+            "/registry/configmaps/default/",
+            ListOptions { field_selector: Some(fs), ..Default::default() },
+        ).await.unwrap();
+
+        assert_eq!(resp.items.len(), 1, "fieldSelector=metadata.name=foo must return exactly one item");
+        let parsed: serde_json::Value = serde_json::from_slice(&resp.items[0].value).unwrap();
+        assert_eq!(parsed["metadata"]["name"], "foo", "returned item must be the one named 'foo'");
     }
 }

@@ -120,9 +120,22 @@ pub async fn list_pods(
         .await;
     }
 
+    let store_field_selector = query.field_selector.as_deref().and_then(|sel| {
+        sel.split(',').find_map(|term| {
+            let term = term.trim();
+            if !term.contains("!=") {
+                term.split_once('=').and_then(|(field, value)| {
+                    if field.is_empty() { return None; }
+                    Some(u7s_store::FieldSelector { field: field.to_string(), value: value.to_string() })
+                })
+            } else {
+                None
+            }
+        })
+    });
     let resp = state
         .store
-        .list(&prefix, ListOptions::default())
+        .list(&prefix, ListOptions { field_selector: store_field_selector, ..Default::default() })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
