@@ -1,31 +1,27 @@
 # Dashboard
 
-2026-05-20T13:42 UTC
+2026-05-20T13:56 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 1 (mayor-xy2 P3 deferred)
+Open beads: 3 (mayor-eet P2, mayor-br6 P2, mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**Decision: pods/status subresource** — kubelet cannot report pod phase without it. Fix is ~100-150 LoC in pods.rs (add PATCH route for status, merge only .status field, emit watch event). Ready to file bead and dispatch on your go-ahead.
+**Nothing blocked on you.**
 
-**Decision: stance check** — current stance: pre-alpha/greenfield, break freely, merge on green CI, security/API/arch PRs need operator review. Confirm still correct, or adjust milestone focus (pod lifecycle? Argo CD? sonobuoy conformance?).
+In-flight: worker/cluster-net dispatched for mayor-eet (IngressClass registration) + mayor-br6 (CR status subresource / Gateway API CRD path). CI pending on the PR when it lands.
 
 ## Forward-looking
 
-1. pods/status fix → enables hello-world pod reaching Succeeded on lima-node
-2. CI smoke job → create pod, assert Succeeded within 60s
-3. mayor-xy2 (CR schema validation, P3) — deferred until Argo CD milestone
+1. **cluster-net PR** — IngressClass one-liner + CR status subresource test (Gateway API sanity check)
+2. **Pod lifecycle e2e** — pods/status fix landed (PR #78, 250 tests). Next: manual test on lima-node, then add CI smoke job
+3. **mayor-xy2** (CR schema validation, P3) — deferred until Argo CD milestone
 
 ## Recent progress
 
-Quality sprint complete. 5 PRs merged today (#73–77):
-- RBAC soft-delete index fix, json-patch `add`, watch 410, field-selector dedup
-- Regression tests for strategic-merge-patch, SAN inclusion, RBAC edge cases
-- 7 `serde_json::to_vec().unwrap()` panics fixed in CR/CRD handlers
-- `parse_resource_version` deduplicated across 5 files
-- Test count: ~170 → 224+ this sprint
-
-Repo clean: 0 open PRs, 0 worktrees, 0 remote worker branches.
+- **PR #78 merged** — `PATCH /api/v1/namespaces/{ns}/pods/{name}/status` implemented; `apply_status_patch()` extracted with 4 unit tests; 250 tests total (up from 224)
+- Quality sprint complete: PRs #73-77 merged (RBAC fix, regression tests, CR panic fixes, patch edge cases, parse_resource_version dedup)
+- Networking audit: Ingress status already works; IngressClass missing (mayor-eet); Gateway API CRDs need status subresource test (mayor-br6)
+- Repo clean: 0 open PRs (cluster-net in flight), 1 active worktree
 
 ## Stance
 
