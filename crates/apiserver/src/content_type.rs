@@ -140,6 +140,10 @@ where
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static(PROTO_CONTENT_TYPE),
             );
+            // Remove Content-Length: the re-encoded protobuf body is a different size
+            // than the original JSON. Sending the old length causes clients to read a
+            // truncated or padded payload, which produces "illegal wireType" errors.
+            new_parts.headers.remove(header::CONTENT_LENGTH);
 
             Ok(Response::from_parts(new_parts, Body::from(proto_bytes)))
         })
@@ -316,6 +320,47 @@ mod tests {
         assert!(
             !body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
             "body must not start with k8s proto magic when client does not accept protobuf"
+        );
+    }
+
+    /// Content-Length must be removed when re-encoding as protobuf.
+    ///
+    /// If the original JSON response carried a Content-Length header (e.g. set by axum's
+    /// router), the re-encoded protobuf body will be a different size. Leaving the old
+    /// Content-Length causes clients to read a truncated or zero-padded payload, which the
+    /// protobuf decoder reports as "illegal wireType". This is the regression for
+    /// https://github.com/valerauko/u7s/pull/84 CI failure.
+    #[tokio::test]
+    async fn content_length_is_removed_on_re_encode() {
+        // FixedService does not set Content-Length by default, so use a custom builder.
+        #[derive(Clone)]
+        struct ServiceWithContentLength;
+        impl Service<Request<Body>> for ServiceWithContentLength {
+            type Response = Response<Body>;
+            type Error = std::convert::Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                let body = SAMPLE_JSON;
+                Box::pin(async move {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("content-length", body.len().to_string())
+                        .body(Body::from(body))
+                        .unwrap())
+                })
+            }
+        }
+
+        let mut layer_svc = ContentTypeLayer.layer(ServiceWithContentLength);
+        let resp = layer_svc.call(proto_accept_request()).await.unwrap();
+
+        assert!(
+            resp.headers().get(header::CONTENT_LENGTH).is_none(),
+            "Content-Length must be absent after proto re-encoding: old value causes truncated payload"
         );
     }
 
