@@ -36,7 +36,7 @@ trap 'rm -f "$REWRITTEN"' EXIT
 sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "$KUBECONFIG" > "$REWRITTEN"
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
 
-SONOBUOY_ARGS="run --mode=non-disruptive-conformance --wait --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
+SONOBUOY_ARGS="run --mode=non-disruptive-conformance --wait --kubeconfig /tmp/sonobuoy-kubeconfig"
 if [ -n "$FOCUS" ]; then
   SONOBUOY_ARGS="$SONOBUOY_ARGS --e2e-focus=$FOCUS"
 fi
