@@ -1,26 +1,37 @@
 # Dashboard
 
-2026-05-20T15:15 UTC
+2026-05-20T15:30 UTC
 `bd prime` in a fresh Claude Code session
 Open beads: 1 (mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**HOLD — backlog empty, CI green, no open PRs, no worktrees.**
+**ACTION REQUIRED — sonobuoy run.**
 
-Sonobuoy infrastructure is ready. Run it whenever you're ready to enumerate conformance gaps:
+To enumerate conformance gaps, start u7s and kick off sonobuoy:
+
 ```sh
-export KUBECONFIG=...
-scripts/lima-start.sh       # start lima VM + kubelet (if not running)
-scripts/sonobuoy-run.sh     # ~5–15 min; use --focus for targeted runs
+# Terminal 1 — start u7s apiserver
+cargo run -p u7s-apiserver -- \
+  --db /tmp/u7s-dev.db \
+  --kubeconfig /tmp/u7s-dev.kubeconfig \
+  --sa-key /tmp/u7s-sa.key \
+  --sa-pub /tmp/u7s-sa.pub \
+  --advertise-address https://host.lima.internal:6443
+
+# Terminal 2 — run sonobuoy (~5–15 min)
+export KUBECONFIG=/tmp/u7s-dev.kubeconfig
+scripts/lima-start.sh
+scripts/sonobuoy-run.sh
 ```
-Mayor will triage results into beads and dispatch workers.
+
+Paste the failure output to mayor. Mayor will triage into beads and dispatch workers immediately.
 
 `mayor-xy2` (CR schema validation) intentionally deferred.
 
 ## Forward-looking
 
-1. **Run sonobuoy** (operator-driven) → triage failures → new beads → dispatch workers
+1. **Sonobuoy triage** — operator runs sonobuoy → paste failures → mayor files conformance-gap beads → dispatch workers
 2. **mayor-xy2 (CR schema validation)** — deferred; re-evaluate at Argo CD milestone
 3. **Kubelet implementation** — longer-term; awaiting operator direction
 
