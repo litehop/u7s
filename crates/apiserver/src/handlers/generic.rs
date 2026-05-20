@@ -26,6 +26,10 @@ pub struct CollectionQuery {
     pub limit: Option<u64>,
     #[serde(rename = "continue")]
     pub continue_token: Option<String>,
+    /// When true, the server emits existing objects as ADDED events before streaming
+    /// live changes. Used by kubelet (Kubernetes 1.27+) for efficient informer startup.
+    #[serde(rename = "sendInitialEvents")]
+    pub send_initial_events: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,12 +169,17 @@ fn parse_key_name_ns(key: &str) -> (&str, &str) {
 
 /// Stream watch events for a given store prefix in NDJSON format.
 /// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
+///
+/// When `initial_items` is Some, those items are emitted as ADDED events first
+/// (implementing the Kubernetes 1.27+ sendInitialEvents protocol), followed by a
+/// BOOKMARK, before streaming live changes from `from_revision`.
 pub(crate) async fn watch_generic(
     state: AppState,
     prefix: String,
     api_version: String,
     kind: String,
     from_revision: u64,
+    initial_items: Option<(Vec<serde_json::Value>, u64)>,
 ) -> Result<Response, crate::status::StatusError> {
     let event_stream = state
         .store
@@ -189,6 +198,22 @@ pub(crate) async fn watch_generic(
 
         let mut max_duration = pin!(sleep(Duration::from_secs(5 * 60)));
         let mut last_rv: u64 = from_revision;
+
+        // sendInitialEvents: emit existing objects as ADDED, then BOOKMARK.
+        if let Some((items, list_rv)) = initial_items {
+            last_rv = last_rv.max(list_rv);
+            for item in items {
+                let line = format!(
+                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
+                    serde_json::to_string(&item).unwrap_or_default()
+                );
+                yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
+            }
+            let bookmark = format!(
+                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
+            );
+            yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+        }
 
         loop {
             tokio::select! {
@@ -432,12 +457,27 @@ pub async fn list_resource(
         } else {
             format!("{}/{}", group, version)
         };
+        let from_rv = query.resource_version.unwrap_or(0);
+        let initial = if query.send_initial_events == Some(true) {
+            let resp = state
+                .store
+                .list(&prefix, ListOptions::default())
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let items: Vec<serde_json::Value> = resp.items.iter()
+                .filter_map(|o| serde_json::from_slice(&o.value).ok())
+                .collect();
+            Some((items, resp.revision))
+        } else {
+            None
+        };
         return watch_generic(
             state,
             prefix,
             api_version,
             meta.kind.clone(),
-            query.resource_version.unwrap_or(0),
+            from_rv,
+            initial,
         )
         .await;
     }
@@ -782,12 +822,27 @@ pub async fn list_namespaced_resource(
         } else {
             format!("{}/{}", group, version)
         };
+        let from_rv = query.resource_version.unwrap_or(0);
+        let initial = if query.send_initial_events == Some(true) {
+            let resp = state
+                .store
+                .list(&prefix, ListOptions::default())
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let items: Vec<serde_json::Value> = resp.items.iter()
+                .filter_map(|o| serde_json::from_slice(&o.value).ok())
+                .collect();
+            Some((items, resp.revision))
+        } else {
+            None
+        };
         return watch_generic(
             state,
             prefix,
             api_version,
             meta.kind.clone(),
-            query.resource_version.unwrap_or(0),
+            from_rv,
+            initial,
         )
         .await;
     }
@@ -1371,12 +1426,27 @@ pub async fn core_list_resource(
     if plural == "pods" {
         let prefix = crate::keys::cluster_list_prefix("pods");
         if query.watch == Some(true) {
+            let from_rv = query.resource_version.unwrap_or(0);
+            let initial = if query.send_initial_events == Some(true) {
+                let resp = state
+                    .store
+                    .list(&prefix, ListOptions::default())
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let items: Vec<serde_json::Value> = resp.items.iter()
+                    .filter_map(|o| serde_json::from_slice(&o.value).ok())
+                    .collect();
+                Some((items, resp.revision))
+            } else {
+                None
+            };
             return watch_generic(
                 state,
                 prefix,
                 "v1".into(),
                 "Pod".into(),
-                query.resource_version.unwrap_or(0),
+                from_rv,
+                initial,
             )
             .await
             .map(IntoResponse::into_response);

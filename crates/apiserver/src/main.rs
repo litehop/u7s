@@ -402,11 +402,14 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "kind": "ClusterRole",
         "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000010" },
         "rules": [
-            { "apiGroups": [""], "resources": ["nodes"],      "verbs": ["get","list","watch","create","update","patch"] },
-            { "apiGroups": [""], "resources": ["pods"],       "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["events"],     "verbs": ["create","patch","update"] },
-            { "apiGroups": [""], "resources": ["configmaps"], "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["secrets"],    "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["nodes"],        "verbs": ["get","list","watch","create","update","patch"] },
+            { "apiGroups": [""], "resources": ["nodes/status"], "verbs": ["get","update","patch"] },
+            { "apiGroups": [""], "resources": ["pods"],         "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["pods/status"],  "verbs": ["get","update","patch"] },
+            { "apiGroups": [""], "resources": ["pods/log"],     "verbs": ["get"] },
+            { "apiGroups": [""], "resources": ["events"],       "verbs": ["create","patch","update"] },
+            { "apiGroups": [""], "resources": ["configmaps"],   "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["secrets"],      "verbs": ["get","list","watch"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] }
         ]
     });

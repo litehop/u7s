@@ -160,6 +160,7 @@ pub async fn list_cr(
             api_version,
             ctx.kind,
             query.resource_version.unwrap_or(0),
+            None,
         )
         .await;
     }
@@ -385,6 +386,7 @@ pub async fn list_cr_namespaced(
             api_version,
             ctx.kind,
             query.resource_version.unwrap_or(0),
+            None,
         )
         .await;
     }
@@ -721,6 +723,7 @@ mod tests {
             field_selector: None,
             limit: None,
             continue_token: None,
+            send_initial_events: None,
         }
     }
 
@@ -1243,6 +1246,7 @@ mod tests {
             field_selector: None,
             limit: None,
             continue_token: None,
+            send_initial_events: None,
         }
     }
 

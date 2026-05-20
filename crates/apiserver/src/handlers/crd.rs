@@ -149,6 +149,7 @@ pub async fn list_crds(
             API_VERSION.to_string(),
             KIND.to_string(),
             query.resource_version.unwrap_or(0),
+            None,
         )
         .await;
     }
@@ -503,7 +504,7 @@ mod tests {
     #[tokio::test]
     async fn list_empty() {
         let state = make_state();
-        let resp = match list_crds(State(state), Query(crate::handlers::generic::CollectionQuery { watch: None, resource_version: None, label_selector: None, field_selector: None, limit: None, continue_token: None })).await {
+        let resp = match list_crds(State(state), Query(crate::handlers::generic::CollectionQuery { watch: None, resource_version: None, label_selector: None, field_selector: None, limit: None, continue_token: None, send_initial_events: None })).await {
             Ok(r) => r,
             Err(_) => panic!("list must succeed"),
         };
@@ -582,6 +583,7 @@ mod tests {
             field_selector: None,
             limit: None,
             continue_token: None,
+            send_initial_events: None,
         });
 
         let resp = match list_crds(State(state), query).await {
