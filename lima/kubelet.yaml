@@ -1,0 +1,83 @@
+# Lima VM for local kubelet join testing against u7s running on the Mac host.
+#
+# Prerequisites:
+#   brew install lima
+#   u7s must be running on the host (scripts/lima-start.sh handles this check)
+#
+# Usage:
+#   scripts/lima-start.sh
+
+vmType: vz
+rosetta:
+  enabled: true
+  binfmt: true
+
+cpus: 2
+memory: 4GiB
+disk: 20GiB
+
+images:
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+    arch: x86_64
+  - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+
+mounts:
+  - location: "~"
+    writable: false
+  - location: "/tmp/lima"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euo pipefail
+
+      # Install containerd
+      apt-get update -qq
+      apt-get install -y containerd
+      mkdir -p /etc/containerd
+      containerd config default > /etc/containerd/config.toml
+      sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      systemctl enable --now containerd
+
+      # Install kubelet 1.31 from pkgs.k8s.io
+      apt-get install -y apt-transport-https ca-certificates curl gpg
+      curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key \
+        | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' \
+        > /etc/apt/sources.list.d/kubernetes.list
+      apt-get update -qq
+      apt-get install -y kubelet
+      apt-mark hold kubelet
+
+      # Disable kubelet until the kubeconfig is provisioned by scripts/lima-start.sh
+      systemctl disable kubelet
+
+      # Create static pod dir
+      mkdir -p /tmp/kubelet-pods
+
+      # Write kubelet args — kubeconfig placed at /etc/kubelet-kubeconfig by lima-start.sh
+      mkdir -p /etc/systemd/system/kubelet.service.d
+      cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<'UNIT'
+      [Service]
+      ExecStart=
+      ExecStart=/usr/bin/kubelet \
+        --kubeconfig=/etc/kubelet-kubeconfig \
+        --node-name=lima-node \
+        --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \
+        --register-node=true \
+        --fail-swap-on=false \
+        --resolv-conf= \
+        --pod-manifest-path=/tmp/kubelet-pods \
+        --v=2
+      UNIT
+      systemctl daemon-reload
+
+probes:
+  - description: containerd is running
+    script: |
+      #!/bin/bash
+      systemctl is-active --quiet containerd
+    hint: "containerd failed to start — check: limactl shell lima-node sudo journalctl -u containerd"

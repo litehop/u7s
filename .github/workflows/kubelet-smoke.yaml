@@ -1,0 +1,158 @@
+name: Kubelet smoke test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  kubelet-join:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install aqua
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/aquaproj/aqua-installer/v3.1.1/aqua-installer | bash
+          echo "$HOME/.local/share/aqua/bin" >> "$GITHUB_PATH"
+
+      - name: Install kubectl via aqua
+        run: aqua install
+
+      - name: Install containerd
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y containerd
+          sudo mkdir -p /etc/containerd
+          containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+          sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+          sudo systemctl enable --now containerd
+
+      - name: Install kubelet 1.31
+        run: |
+          sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+          curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' \
+            | sudo tee /etc/apt/sources.list.d/kubernetes.list
+          sudo apt-get update -qq
+          sudo apt-get install -y kubelet
+          sudo apt-mark hold kubelet
+          sudo systemctl disable --now kubelet
+
+      - name: Build release binary
+        run: cargo build --release -p u7s-apiserver
+
+      - name: Start apiserver
+        env:
+          RUST_LOG: info
+        run: |
+          TMPDIR=$(mktemp -d)
+          echo "SMOKE_TMPDIR=$TMPDIR" >> "$GITHUB_ENV"
+          SMOKE_TOKEN="kubelet-admin-token-$(date +%s)"
+          echo "$SMOKE_TOKEN,kubelet-admin,uid0,system:masters" > "$TMPDIR/token-auth.csv"
+          ./target/release/u7s-apiserver \
+            --db "$TMPDIR/state.db" \
+            --kubeconfig "$TMPDIR/kubeconfig" \
+            --sa-key "$TMPDIR/sa.key" \
+            --sa-pub "$TMPDIR/sa.pub" \
+            --token-auth-file "$TMPDIR/token-auth.csv" \
+            --advertise-address https://127.0.0.1:6443 \
+            >"$TMPDIR/server.log" 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            nc -z 127.0.0.1 6443 2>/dev/null && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$TMPDIR/server.log"; exit 1; }
+          CA_DATA=$(grep "certificate-authority-data" "$TMPDIR/kubeconfig" | awk '{print $2}')
+          echo "SMOKE_TOKEN=$SMOKE_TOKEN" >> "$GITHUB_ENV"
+          printf '%s\n' \
+            'apiVersion: v1' \
+            'kind: Config' \
+            'clusters:' \
+            '- cluster:' \
+            '    server: https://127.0.0.1:6443' \
+            "    certificate-authority-data: $CA_DATA" \
+            '  name: u7s' \
+            'contexts:' \
+            '- context:' \
+            '    cluster: u7s' \
+            '    user: kubelet-admin' \
+            '  name: u7s' \
+            'current-context: u7s' \
+            'users:' \
+            '- name: kubelet-admin' \
+            '  user:' \
+            "    token: $SMOKE_TOKEN" \
+            > "$TMPDIR/kubeconfig"
+
+      - name: Start kubelet
+        run: |
+          TMPDIR="${{ env.SMOKE_TMPDIR }}"
+          sudo mkdir -p /tmp/kubelet-pods
+          # Write a kubelet kubeconfig using the same CA and token as the smoke admin.
+          # Kubelet uses system:masters via token auth — simplest path for smoke testing.
+          sudo cp "$TMPDIR/kubeconfig" /etc/kubelet-kubeconfig
+          sudo chmod 644 /etc/kubelet-kubeconfig
+          sudo kubelet \
+            --kubeconfig=/etc/kubelet-kubeconfig \
+            --node-name=ci-node \
+            --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \
+            --register-node=true \
+            --fail-swap-on=false \
+            --resolv-conf= \
+            --pod-manifest-path=/tmp/kubelet-pods \
+            --v=2 \
+            >"$TMPDIR/kubelet.log" 2>&1 &
+          echo "KUBELET_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Assert node registers
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          FOUND=0
+          for i in $(seq 1 60); do
+            if kubectl get nodes 2>/dev/null | grep -q "ci-node"; then
+              FOUND=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "ERROR: ci-node did not appear in kubectl get nodes within 60s"
+            echo "--- server log ---"
+            cat "${{ env.SMOKE_TMPDIR }}/server.log"
+            echo "--- kubelet log ---"
+            cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+            exit 1
+          fi
+          echo "Node registered:"
+          kubectl get nodes
+
+      - name: Assert kubelet not crash-looping
+        run: |
+          sleep 5
+          if ! kill -0 "$KUBELET_PID" 2>/dev/null; then
+            echo "ERROR: kubelet exited within 60s"
+            cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+            exit 1
+          fi
+
+      - name: Stop server and kubelet
+        if: always()
+        run: |
+          [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+          [ -n "$KUBELET_PID" ] && sudo kill "$KUBELET_PID" 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: kubelet-smoke-logs
+          path: |
+            ${{ env.SMOKE_TMPDIR }}/server.log
+            ${{ env.SMOKE_TMPDIR }}/kubelet.log
