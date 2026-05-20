@@ -84,5 +84,15 @@
         "matcher": ""
       }
     ]
+  },
+  "mcpServers": {
+    "lima-node": {
+      "command": "limactl",
+      "args": [
+        "mcp",
+        "serve",
+        "lima-node"
+      ]
+    }
   }
 }
