@@ -72,17 +72,22 @@ provision:
 
       # Write kubelet args — kubeconfig placed at /etc/kubelet-kubeconfig by lima-start.sh
       mkdir -p /etc/systemd/system/kubelet.service.d
+      cat > /etc/kubelet-config.yaml <<'KUBECFG'
+      apiVersion: kubelet.config.k8s.io/v1beta1
+      kind: KubeletConfiguration
+      nodeName: lima-node
+      containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
+      registerNode: true
+      failSwapOn: false
+      resolvConf: ""
+      staticPodPath: /tmp/kubelet-pods
+      KUBECFG
       cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<'UNIT'
       [Service]
       ExecStart=
       ExecStart=/usr/bin/kubelet \
+        --config=/etc/kubelet-config.yaml \
         --kubeconfig=/etc/kubelet-kubeconfig \
-        --node-name=lima-node \
-        --container-runtime-endpoint=unix:///var/run/crio/crio.sock \
-        --register-node=true \
-        --fail-swap-on=false \
-        --resolv-conf= \
-        --pod-manifest-path=/tmp/kubelet-pods \
         --v=2
       UNIT
       systemctl daemon-reload

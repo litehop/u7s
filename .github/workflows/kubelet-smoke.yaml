@@ -43,7 +43,7 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/kubernetes.list
           sudo apt-get update -qq
-          sudo apt-get install -y "kubelet=${{ matrix.k8s }}-*" "kubectl=${{ matrix.k8s }}-*"
+          sudo apt-get install -y --allow-downgrades "kubelet=${{ matrix.k8s }}-*" "kubectl=${{ matrix.k8s }}-*"
           sudo apt-mark hold kubelet kubectl
           sudo systemctl disable --now kubelet
 
@@ -100,14 +100,19 @@ jobs:
           sudo mkdir -p /tmp/kubelet-pods
           sudo cp "$TMPDIR/kubeconfig" /etc/kubelet-kubeconfig
           sudo chmod 644 /etc/kubelet-kubeconfig
+          sudo tee /etc/kubelet-config.yaml <<'EOF'
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          nodeName: ci-node
+          containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
+          registerNode: true
+          failSwapOn: false
+          resolvConf: ""
+          staticPodPath: /tmp/kubelet-pods
+          EOF
           sudo kubelet \
+            --config=/etc/kubelet-config.yaml \
             --kubeconfig=/etc/kubelet-kubeconfig \
-            --node-name=ci-node \
-            --container-runtime-endpoint=unix:///var/run/crio/crio.sock \
-            --register-node=true \
-            --fail-swap-on=false \
-            --resolv-conf= \
-            --pod-manifest-path=/tmp/kubelet-pods \
             --v=2 \
             >"$TMPDIR/kubelet.log" 2>&1 &
           echo "KUBELET_PID=$!" >> "$GITHUB_ENV"
