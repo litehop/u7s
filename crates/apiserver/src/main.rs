@@ -143,6 +143,9 @@ async fn main() -> anyhow::Result<()> {
 
 fn build_router(state: AppState) -> Router {
     Router::new()
+        // Server version — no auth required (sonobuoy, kubectl version)
+        .route("/version", get(handlers::discovery::version))
+
         // Core discovery
         .route("/api",    get(handlers::discovery::api_versions))
         .route("/api/v1", get(handlers::discovery::api_v1_resources))

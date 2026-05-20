@@ -284,7 +284,7 @@ fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
 
 /// Paths that skip auth entirely.
 fn is_exempt(path: &str) -> bool {
-    matches!(path, "/healthz" | "/readyz" | "/livez" | "/api" | "/apis")
+    matches!(path, "/healthz" | "/readyz" | "/livez" | "/api" | "/apis" | "/version")
 }
 
 /// HTTP method → RBAC verb.
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn test_exempt_paths() {
         // Discovery and health paths must not require auth.
-        for path in &["/healthz", "/readyz", "/livez", "/api", "/apis"] {
+        for path in &["/healthz", "/readyz", "/livez", "/api", "/apis", "/version"] {
             assert!(is_exempt(path), "{path} must be exempt");
         }
         // Non-exempt paths must not be skipped.

@@ -10,6 +10,20 @@ use crate::handlers::crd::CustomResourceDefinition;
 use crate::state::AppState;
 use crate::types::{APIGroup, APIGroupList, APIVersions, ApiResourceList, GroupVersionForDiscovery};
 
+pub async fn version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "major": "1",
+        "minor": "36",
+        "gitVersion": "v1.36.0",
+        "gitCommit": "0000000000000000000000000000000000000000",
+        "gitTreeState": "clean",
+        "buildDate": "1970-01-01T00:00:00Z",
+        "goVersion": "go1.24.0",
+        "compiler": "gc",
+        "platform": "linux/amd64"
+    }))
+}
+
 pub async fn api_versions(State(state): State<AppState>) -> Json<APIVersions> {
     Json(APIVersions::v1(state.server_address.clone()))
 }
@@ -712,6 +726,20 @@ mod tests {
             .collect();
         assert!(names.contains(&"csidrivers"), "csidrivers must be in storage.k8s.io/v1; got: {names:?}");
         assert!(names.contains(&"csinodes"), "csinodes must be in storage.k8s.io/v1; got: {names:?}");
+    }
+
+    // GET /version must return a JSON object containing "gitVersion" and "major".
+    #[tokio::test]
+    async fn version_returns_server_version() {
+        let Json(val) = version().await;
+        assert!(
+            val.get("gitVersion").and_then(|v| v.as_str()).is_some(),
+            "gitVersion must be present in /version response"
+        );
+        assert!(
+            val.get("major").and_then(|v| v.as_str()).is_some(),
+            "major must be present in /version response"
+        );
     }
 
     // node.k8s.io/v1 resource list must include runtimeclasses so kubelet can
