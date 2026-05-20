@@ -23,6 +23,10 @@ pub struct CollectionQuery {
     pub watch: Option<bool>,
     pub resource_version: Option<u64>,
     pub field_selector: Option<String>,
+    /// When true, the server emits existing pods as ADDED events before streaming
+    /// live changes. Used by kubelet (Kubernetes 1.27+) for efficient informer startup.
+    #[serde(rename = "sendInitialEvents")]
+    pub send_initial_events: Option<bool>,
 }
 
 /// Parse a `fieldSelector` query string and test a pod JSON value against it.
@@ -110,12 +114,42 @@ pub async fn list_pods(
     let prefix = list_prefix("pods", ns.as_str());
 
     if query.watch == Some(true) {
+        let from_rv = query.resource_version.unwrap_or(0);
+        let initial_pods = if query.send_initial_events == Some(true) {
+            // Collect existing pods under this namespace prefix and filter by field selector.
+            let store_fs = query.field_selector.as_deref().and_then(|sel| {
+                sel.split(',').find_map(|term| {
+                    let term = term.trim();
+                    if !term.contains("!=") {
+                        term.split_once('=').and_then(|(field, value)| {
+                            if field.is_empty() { return None; }
+                            Some(u7s_store::FieldSelector { field: field.to_string(), value: value.to_string() })
+                        })
+                    } else { None }
+                })
+            });
+            let resp = state
+                .store
+                .list(&prefix, ListOptions { field_selector: store_fs, ..Default::default() })
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let mut pods: Vec<serde_json::Value> = resp.items.iter()
+                .filter_map(|o| serde_json::from_slice(&o.value).ok())
+                .collect();
+            if let Some(ref sel) = query.field_selector {
+                pods = filter_pods_by_field_selector(pods, sel);
+            }
+            Some((pods, resp.revision))
+        } else {
+            None
+        };
         return watch_pods(
             state,
             prefix,
             ns,
-            query.resource_version.unwrap_or(0),
+            from_rv,
             query.field_selector,
+            initial_pods,
         )
         .await;
     }
@@ -228,6 +262,7 @@ async fn watch_pods(
     _ns: Namespace,
     from_revision: u64,
     field_selector: Option<String>,
+    initial_pods: Option<(Vec<serde_json::Value>, u64)>,
 ) -> Result<Response, crate::status::StatusError> {
     let event_stream = state
         .store
@@ -254,6 +289,22 @@ async fn watch_pods(
 
         // Track the most recently seen revision for bookmark emission.
         let mut last_rv: u64 = from_revision;
+
+        // sendInitialEvents: emit existing pods as ADDED, then BOOKMARK.
+        if let Some((pods, list_rv)) = initial_pods {
+            last_rv = last_rv.max(list_rv);
+            for pod in pods {
+                let line = format!(
+                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
+                    serde_json::to_string(&pod).unwrap_or_default()
+                );
+                yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
+            }
+            let bookmark = format!(
+                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
+            );
+            yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+        }
 
         loop {
             tokio::select! {
@@ -688,6 +739,7 @@ mod watch_tests {
             watch: Some(true),
             resource_version: Some(42),
             field_selector: None,
+            send_initial_events: None,
         };
         assert!(q.watch == Some(true));
         assert_eq!(q.resource_version, Some(42));
@@ -700,6 +752,7 @@ mod watch_tests {
             watch: None,
             resource_version: None,
             field_selector: None,
+            send_initial_events: None,
         };
         assert_eq!(q.watch, None);
         assert_eq!(q.resource_version, None);
@@ -879,9 +932,12 @@ pub async fn patch_pod_status(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !content_type.contains("application/merge-patch+json") {
+    // Kubelet uses strategic-merge-patch; both patch types update only the status field.
+    let is_merge = content_type.contains("application/merge-patch+json")
+        || content_type.contains("application/strategic-merge-patch+json");
+    if !is_merge {
         return Err(Status::unsupported_media_type(format!(
-            "unsupported media type '{content_type}'; use application/merge-patch+json"
+            "unsupported media type '{content_type}'; use application/merge-patch+json or application/strategic-merge-patch+json"
         )));
     }
 

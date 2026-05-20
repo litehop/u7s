@@ -187,10 +187,11 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // --- Server cert ---
     let server_key = KeyPair::generate()?;
     let mut server_params = CertificateParams::default();
-    // Always include localhost / 127.0.0.1.
+    // Always include localhost / 127.0.0.1 and the lima VM-to-host alias.
     let mut sans: Vec<SanType> = vec![
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        SanType::DnsName("host.lima.internal".try_into()?),
     ];
     // Add the advertise-address host as a SAN (DNS name or IP).
     if let Some(host) = advertise_host(args.advertise_address.as_deref()) {

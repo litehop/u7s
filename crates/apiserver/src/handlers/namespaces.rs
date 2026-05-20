@@ -67,6 +67,7 @@ pub async fn list_namespaces(
             "v1".to_string(),
             "Namespace".to_string(),
             query.resource_version.unwrap_or(0),
+            None,
         )
         .await;
     }
@@ -341,6 +342,7 @@ mod tests {
             field_selector: None,
             limit: None,
             continue_token: None,
+            send_initial_events: None,
         };
 
         let resp = match list_namespaces(State(state), Query(query)).await {
