@@ -1,31 +1,33 @@
 # Dashboard
 
-2026-05-20T13:12 UTC
+2026-05-20T13:41 UTC
 `bd prime` in a fresh Claude Code session
 Open beads: 1 (mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**PR #73 — RBAC security surface, CI green, awaiting your review:**
-- Evicts RBAC index immediately on soft-delete; test proves alice loses access on DELETE before finalizers drain
-- Also: json-patch `add` on missing path, watch 410 uses compaction horizon, field-selector dedup
-- 226 tests. Do not merge without your review.
+**Stance check** — current stance is: pre-alpha/greenfield, break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI automatically; flag security/API/architecture PRs for operator review first. Confirm this is still correct or adjust.
 
-**PR #74 — regression tests only, CI green, safe to merge:**
-- Pure-function extractions (`accepts_patch_content_type`, `build_server_sans`) with unit tests
-- No logic changes. Optional review.
+**pods/status subresource** — kubelet cannot report pod phase (PATCHes `pods/{name}/status`) without this. Blocking pod lifecycle e2e. Ready to file a bead and dispatch if you want to move on it.
+
+**Nothing else blocked on you.**
 
 ## Forward-looking
 
-1. Merge PR #73 (after your review) + PR #74 (CI green)
-2. Post-merge: verify pod reaches Succeeded on lima-node; add CI smoke job
-3. mayor-xy2 (CR schema validation, P3) — deferred until Argo CD milestone
+1. **pods/status subresource fix** — file bead, dispatch worker; unblocks hello-world pod reaching Succeeded on lima-node
+2. **CI smoke job** — once pods/status works, add a job that creates a pod, waits for Succeeded, fails CI if not reached within 60s
+3. **mayor-xy2** (CR schema validation, P3) — deferred until Argo CD milestone
 
 ## Recent progress
 
-- Backlog cold: all P1/P2 beads closed this sprint (mayor-oyn, mayor-ofi, mayor-iek, mayor-lyc, mayor-adg)
-- 14 new regression tests added across PRs #73–74 (Rule 14 compliance)
-- Rule 14 codified in CLAUDE.md and worker preamble
+Major quality sprint closed. All merged today:
+- **PR #73** — RBAC soft-delete index fix + json-patch add + watch 410 + field-selector dedup (operator-reviewed)
+- **PR #74** — regression tests for strategic-merge-patch and host.lima.internal SAN
+- **PR #75** — RBAC edge-case tests: namespace mismatch, resourceNames, ClusterRoleBinding scope
+- **PR #76** — patch.rs strategic-merge edge-case tests + parse_resource_version deduplication
+- **PR #77** — CR/CRD panic fixes (7 `.unwrap()` → proper 500 returns) + pure-function extraction + discovery tests
+
+Test count grew from 219 → 224+ across this sprint. Worktrees and remote branches fully pruned; repo clean.
 
 ## Stance
 
