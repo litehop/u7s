@@ -1,6 +1,4 @@
 // This module provides the RBAC engine; callers (handlers) are added by other workers.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -20,11 +18,17 @@ pub struct PolicyRule {
 pub struct Subject {
     pub kind: String,
     pub name: String,
+    // Part of the RBAC Subject schema; used for ServiceAccount namespace scoping
+    // when RBAC evaluation is extended beyond name-only matching.
+    #[allow(dead_code)]
     pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RoleRef {
+    // Part of the RBAC RoleRef schema; used to validate that the referenced role
+    // belongs to the expected API group when cross-group binding is evaluated.
+    #[allow(dead_code)]
     #[serde(rename = "apiGroup")]
     pub api_group: String,
     pub kind: String,
