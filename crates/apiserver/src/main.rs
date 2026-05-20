@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
     // 3. Open store.
     let store = Arc::new(SqliteStore::new(&args.db)?);
     seed_namespaces(&store).await?;
+    seed_rbac(&store).await?;
 
     // 4. Generate TLS certs.
     let tls_material = generate_tls(&args)?;
@@ -378,6 +379,47 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    const GROUP: &str = "rbac.authorization.k8s.io";
+
+    // ClusterRole: system:node — permissions kubelet needs.
+    let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+    let cr_body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000010" },
+        "rules": [
+            { "apiGroups": [""], "resources": ["nodes"],      "verbs": ["get","list","watch","create","update","patch"] },
+            { "apiGroups": [""], "resources": ["pods"],       "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["events"],     "verbs": ["create","patch","update"] },
+            { "apiGroups": [""], "resources": ["configmaps"], "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["secrets"],    "verbs": ["get","list","watch"] },
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] }
+        ]
+    });
+    store.put(&cr_key, Bytes::from(cr_body.to_string()), None).await
+        .map_err(|e| anyhow::anyhow!("seed ClusterRole system:node: {e}"))?;
+    tracing::info!("seeded ClusterRole: system:node");
+
+    // ClusterRoleBinding: system:node — binds system:nodes group to the ClusterRole.
+    let crb_key = keys::group_object_key(GROUP, "clusterrolebindings", None, "system:node");
+    let crb_body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:node", "uid": "00000000-0000-0000-0000-000000000011" },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:nodes" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:node" }
+    });
+    store.put(&crb_key, Bytes::from(crb_body.to_string()), None).await
+        .map_err(|e| anyhow::anyhow!("seed ClusterRoleBinding system:node: {e}"))?;
+    tracing::info!("seeded ClusterRoleBinding: system:node");
+
+    Ok(())
+}
+
 async fn serve_tls(
     listener: TcpListener,
     app: Router,
@@ -465,5 +507,65 @@ mod tests {
         let store = make_store();
         seed_namespaces(&store).await.expect("first seed must not fail");
         seed_namespaces(&store).await.expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_creates_system_node_clusterrole() {
+        // Ensures kubelet nodes using real RBAC credentials (CN=system:node:<name>,
+        // O=system:nodes) get a non-empty RBAC policy on startup rather than 403.
+        // The ClusterRole and ClusterRoleBinding must be stored under the same key
+        // prefix that state::AppState::init() scans so the RBAC index is populated.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        // ClusterRole must exist and have the expected structure.
+        let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
+        let cr_obj = store.get(&cr_key).await.expect("get must not fail");
+        assert!(cr_obj.is_some(), "ClusterRole system:node must exist after seeding");
+        let cr: serde_json::Value =
+            serde_json::from_slice(&cr_obj.unwrap().value).expect("valid json");
+        assert_eq!(cr["kind"].as_str(), Some("ClusterRole"));
+        assert_eq!(cr["metadata"]["name"].as_str(), Some("system:node"));
+        // Must include rules for nodes, pods, events, configmaps, secrets.
+        let rules = cr["rules"].as_array().expect("rules must be an array");
+        assert!(!rules.is_empty(), "ClusterRole must have at least one rule");
+        let resources: Vec<String> = rules.iter()
+            .flat_map(|r| {
+                r["resources"].as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        for expected in ["nodes", "pods", "events", "configmaps", "secrets"] {
+            assert!(
+                resources.iter().any(|r| r == expected),
+                "ClusterRole rules must cover resource '{expected}'"
+            );
+        }
+
+        // ClusterRoleBinding must exist and bind system:nodes group.
+        let crb_key = keys::group_object_key(GROUP, "clusterrolebindings", None, "system:node");
+        let crb_obj = store.get(&crb_key).await.expect("get must not fail");
+        assert!(crb_obj.is_some(), "ClusterRoleBinding system:node must exist after seeding");
+        let crb: serde_json::Value =
+            serde_json::from_slice(&crb_obj.unwrap().value).expect("valid json");
+        assert_eq!(crb["kind"].as_str(), Some("ClusterRoleBinding"));
+        assert_eq!(crb["metadata"]["name"].as_str(), Some("system:node"));
+        let subjects = crb["subjects"].as_array().expect("subjects must be an array");
+        assert_eq!(subjects.len(), 1, "must have exactly one subject");
+        assert_eq!(subjects[0]["kind"].as_str(), Some("Group"));
+        assert_eq!(subjects[0]["name"].as_str(), Some("system:nodes"));
+        assert_eq!(crb["roleRef"]["name"].as_str(), Some("system:node"));
+        assert_eq!(crb["roleRef"]["kind"].as_str(), Some("ClusterRole"));
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_is_idempotent() {
+        // Unconditional puts must not fail on a second call — seed data can be overwritten.
+        let store = make_store();
+        seed_rbac(&store).await.expect("first seed must not fail");
+        seed_rbac(&store).await.expect("second seed must not fail");
     }
 }
