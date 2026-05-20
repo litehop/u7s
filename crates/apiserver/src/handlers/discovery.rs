@@ -134,11 +134,9 @@ fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
 // /apis/:group/:version — per-group resource list
 // ---------------------------------------------------------------------------
 
-pub async fn api_group_resources(
-    State(state): State<AppState>,
-    Path((group, version)): Path<(String, String)>,
-) -> Response {
-    let static_list = match (group.as_str(), version.as_str()) {
+/// Return the static APIResourceList for a well-known group/version, or None if unknown.
+fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Value> {
+    match (group, version) {
         ("admissionregistration.k8s.io", "v1") => Some(admissionregistration_v1_resources()),
         ("apiextensions.k8s.io", "v1") => Some(apiextensions_v1_resources()),
         ("apps", "v1") => Some(apps_v1_resources()),
@@ -151,7 +149,14 @@ pub async fn api_group_resources(
         ("rbac.authorization.k8s.io", "v1") => Some(rbac_v1_resources()),
         ("storage.k8s.io", "v1") => Some(storage_v1_resources()),
         _ => None,
-    };
+    }
+}
+
+pub async fn api_group_resources(
+    State(state): State<AppState>,
+    Path((group, version)): Path<(String, String)>,
+) -> Response {
+    let static_list = static_group_resources(group.as_str(), version.as_str());
 
     if let Some(list) = static_list {
         return Json(list).into_response();
@@ -726,6 +731,40 @@ mod tests {
             .collect();
         assert!(names.contains(&"csidrivers"), "csidrivers must be in storage.k8s.io/v1; got: {names:?}");
         assert!(names.contains(&"csinodes"), "csinodes must be in storage.k8s.io/v1; got: {names:?}");
+    }
+
+    // static_group_resources must return Some for apps/v1 — this is one of the most
+    // commonly probed groups and must always be present without a store lookup.
+    #[test]
+    fn static_group_resources_apps_v1_returns_some() {
+        let result = static_group_resources("apps", "v1");
+        assert!(result.is_some(), "apps/v1 must return Some");
+        let val = result.unwrap();
+        assert_eq!(val["groupVersion"], "apps/v1");
+    }
+
+    // static_group_resources must return Some for rbac.authorization.k8s.io/v1 —
+    // RBAC resources are critical for cluster bootstrap and must be statically served.
+    #[test]
+    fn static_group_resources_rbac_v1_returns_some() {
+        let result = static_group_resources("rbac.authorization.k8s.io", "v1");
+        assert!(result.is_some(), "rbac.authorization.k8s.io/v1 must return Some");
+        let val = result.unwrap();
+        assert_eq!(val["groupVersion"], "rbac.authorization.k8s.io/v1");
+    }
+
+    // static_group_resources must return None for unknown groups — callers fall through
+    // to dynamic CRD lookup only when the static match returns None.
+    #[test]
+    fn static_group_resources_unknown_returns_none() {
+        assert!(
+            static_group_resources("unknown.group.io", "v1").is_none(),
+            "unknown group must return None"
+        );
+        assert!(
+            static_group_resources("apps", "v2").is_none(),
+            "known group with unknown version must return None"
+        );
     }
 
     // GET /version must return a JSON object containing "gitVersion" and "major".

@@ -104,7 +104,7 @@ fn cr_list_prefix(group: &str, version: &str, plural: &str, namespace: Option<&s
 // Metadata stamping on create
 // ---------------------------------------------------------------------------
 
-fn stamp_cr(obj: &mut serde_json::Value, group: &str, version: &str, kind: &str) {
+fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind: &str) {
     let api_version = format!("{group}/{version}");
     obj["apiVersion"] = serde_json::Value::String(api_version);
     obj["kind"] = serde_json::Value::String(kind.to_string());
@@ -113,6 +113,32 @@ fn stamp_cr(obj: &mut serde_json::Value, group: &str, version: &str, kind: &str)
     }
     if obj["metadata"]["creationTimestamp"].as_str().map(|s| s.is_empty()).unwrap_or(true) {
         obj["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+    }
+}
+
+fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
+    if name.is_empty() {
+        return Err(Status::bad_request("metadata.name must not be empty".into()));
+    }
+    // DNS label: lowercase alphanumeric and hyphens, must start/end with alphanumeric.
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+        return Err(Status::bad_request(format!(
+            "metadata.name \"{name}\" contains invalid characters (must be a DNS label)"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_cr_metadata(stored: &serde_json::Value, incoming: &mut serde_json::Value) {
+    if incoming["metadata"]["uid"].as_str().map(|s| s.is_empty()).unwrap_or(true) {
+        if let Some(uid) = stored["metadata"]["uid"].as_str() {
+            incoming["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
+        }
+    }
+    if incoming["metadata"]["creationTimestamp"].as_str().map(|s| s.is_empty()).unwrap_or(true) {
+        if let Some(ts) = stored["metadata"]["creationTimestamp"].as_str() {
+            incoming["metadata"]["creationTimestamp"] = serde_json::Value::String(ts.to_string());
+        }
     }
 }
 
@@ -248,13 +274,15 @@ pub async fn create_cr(
             }
         }
     };
+    validate_cr_name(&name)?;
 
-    stamp_cr(&mut obj, &group, &version, &ctx.kind);
+    stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
     let key = cr_store_key(&group, &version, &plural, None, &name);
+    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
-        .put(&key, Bytes::from(serde_json::to_vec(&obj).unwrap()), Some(0))
+        .put(&key, Bytes::from(bytes), Some(0))
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
@@ -299,22 +327,14 @@ pub async fn replace_cr(
     // Preserve uid + creationTimestamp from stored.
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
-    if obj["metadata"]["uid"].as_str().map(|s| s.is_empty()).unwrap_or(true) {
-        if let Some(uid) = existing["metadata"]["uid"].as_str() {
-            obj["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
-        }
-    }
-    if obj["metadata"]["creationTimestamp"].as_str().map(|s| s.is_empty()).unwrap_or(true) {
-        if let Some(ts) = existing["metadata"]["creationTimestamp"].as_str() {
-            obj["metadata"]["creationTimestamp"] = serde_json::Value::String(ts.to_string());
-        }
-    }
+    resolve_cr_metadata(&existing, &mut obj);
 
     let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
 
+    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
-        .put(&key, Bytes::from(serde_json::to_vec(&obj).unwrap()), expected_rv)
+        .put(&key, Bytes::from(bytes), expected_rv)
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
@@ -471,14 +491,16 @@ pub async fn create_cr_namespaced(
             }
         }
     };
+    validate_cr_name(&name)?;
 
     obj["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
-    stamp_cr(&mut obj, &group, &version, &ctx.kind);
+    stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
     let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
+    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
-        .put(&key, Bytes::from(serde_json::to_vec(&obj).unwrap()), Some(0))
+        .put(&key, Bytes::from(bytes), Some(0))
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
@@ -521,22 +543,14 @@ pub async fn replace_cr_namespaced(
 
     let existing: serde_json::Value =
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
-    if obj["metadata"]["uid"].as_str().map(|s| s.is_empty()).unwrap_or(true) {
-        if let Some(uid) = existing["metadata"]["uid"].as_str() {
-            obj["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
-        }
-    }
-    if obj["metadata"]["creationTimestamp"].as_str().map(|s| s.is_empty()).unwrap_or(true) {
-        if let Some(ts) = existing["metadata"]["creationTimestamp"].as_str() {
-            obj["metadata"]["creationTimestamp"] = serde_json::Value::String(ts.to_string());
-        }
-    }
+    resolve_cr_metadata(&existing, &mut obj);
 
     let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
 
+    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
-        .put(&key, Bytes::from(serde_json::to_vec(&obj).unwrap()), expected_rv)
+        .put(&key, Bytes::from(bytes), expected_rv)
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
@@ -637,11 +651,12 @@ pub async fn patch_cr(
 
     crate::patch::merge_patch(&mut obj, &patch);
 
+    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(
             &key,
-            Bytes::from(serde_json::to_vec(&obj).unwrap()),
+            Bytes::from(bytes),
             Some(stored.revision),
         )
         .await
@@ -685,11 +700,12 @@ pub async fn patch_cr_namespaced(
 
     crate::patch::merge_patch(&mut obj, &patch);
 
+    let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
         .put(
             &key,
-            Bytes::from(serde_json::to_vec(&obj).unwrap()),
+            Bytes::from(bytes),
             Some(stored.revision),
         )
         .await
@@ -1230,6 +1246,70 @@ mod tests {
 
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 415, "wrong content type must return 415");
+    }
+
+    // stamp_cr_fields must assign uid and creationTimestamp when absent,
+    // and must set apiVersion and kind unconditionally.
+    #[test]
+    fn stamp_cr_sets_uid_and_timestamp_when_absent() {
+        let mut obj = serde_json::json!({ "metadata": {} });
+        stamp_cr_fields(&mut obj, "example.io", "v1", "Widget");
+        assert_eq!(obj["apiVersion"], "example.io/v1");
+        assert_eq!(obj["kind"], "Widget");
+        let uid = obj["metadata"]["uid"].as_str().unwrap_or("");
+        assert!(!uid.is_empty(), "uid must be assigned when absent");
+        let ts = obj["metadata"]["creationTimestamp"].as_str().unwrap_or("");
+        assert!(!ts.is_empty(), "creationTimestamp must be assigned when absent");
+    }
+
+    // stamp_cr_fields must preserve existing uid when already present,
+    // because a replace operation must not change the identity of the object.
+    #[test]
+    fn stamp_cr_preserves_existing_uid_on_replace() {
+        let mut obj = serde_json::json!({
+            "metadata": {
+                "uid": "existing-uid-abc",
+                "creationTimestamp": "2024-01-01T00:00:00Z"
+            }
+        });
+        stamp_cr_fields(&mut obj, "example.io", "v1", "Widget");
+        assert_eq!(obj["metadata"]["uid"], "existing-uid-abc",
+            "existing uid must be preserved");
+        assert_eq!(obj["metadata"]["creationTimestamp"], "2024-01-01T00:00:00Z",
+            "existing creationTimestamp must be preserved");
+    }
+
+    // validate_cr_name must reject empty names — empty string is not a valid
+    // Kubernetes resource name and must not be silently accepted.
+    #[test]
+    fn validate_cr_name_rejects_empty() {
+        let result = validate_cr_name("");
+        assert!(result.is_err(), "empty name must be rejected");
+    }
+
+    // validate_cr_name must accept a valid DNS label — the common case for CR names.
+    #[test]
+    fn validate_cr_name_accepts_valid_dns_label() {
+        assert!(validate_cr_name("my-resource").is_ok(), "valid DNS label must be accepted");
+        assert!(validate_cr_name("foo123").is_ok(), "alphanumeric name must be accepted");
+    }
+
+    // resolve_cr_metadata must copy uid from stored into incoming when incoming
+    // has no uid set — replace handlers must preserve object identity.
+    #[test]
+    fn resolve_cr_metadata_copies_uid() {
+        let stored = serde_json::json!({
+            "metadata": {
+                "uid": "stored-uid-xyz",
+                "creationTimestamp": "2024-06-01T00:00:00Z"
+            }
+        });
+        let mut incoming = serde_json::json!({ "metadata": {} });
+        resolve_cr_metadata(&stored, &mut incoming);
+        assert_eq!(incoming["metadata"]["uid"], "stored-uid-xyz",
+            "uid must be copied from stored into incoming");
+        assert_eq!(incoming["metadata"]["creationTimestamp"], "2024-06-01T00:00:00Z",
+            "creationTimestamp must be copied from stored into incoming");
     }
 
     fn watch_query() -> super::super::generic::CollectionQuery {
