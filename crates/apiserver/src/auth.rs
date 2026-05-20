@@ -295,6 +295,9 @@ fn method_to_verb(method: &axum::http::Method) -> &'static str {
         "PUT" => "update",
         "PATCH" => "patch",
         "DELETE" => "delete",
+        // HEAD is not a distinct RBAC verb in Kubernetes — it maps to "get".
+        "HEAD" => "get",
+        // Unknown/future methods: fall back to "get" (least-privilege intent).
         _ => "get",
     }
 }
