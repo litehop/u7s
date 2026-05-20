@@ -1,41 +1,38 @@
 # Dashboard
 
-2026-05-20T12:00 UTC
+2026-05-20T13:00 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 6 (mayor-xy2 P3 deferred; mayor-4r7, mayor-67m, mayor-abq, mayor-59u P3 code quality; mayor-p19/mayor-pua closed)
+Open beads: 1 (mayor-xy2, P3, intentionally deferred)
 
 ## What needs the operator now
 
-**kubelet-smoke CI in progress (run 26137189337)** — fixing two failures found in the matrix:
-1. `apt` rejects downgrade for 1.34/1.35 (runner has newer kubectl) — fixed with `--allow-downgrades`
-2. kubelet 1.36 removed `--node-name` CLI flag — migrated all flags to `KubeletConfiguration` file
+**Backlog is empty.** No decisions pending, no blockers.
 
-Watch for green. If another failure, mayor will triage.
+`mayor-xy2` (CR schema validation / openAPIV3Schema enforcement) intentionally deferred.
 
-**No operator decisions pending.** All 4 code quality beads (mayor-4r7, mayor-67m, mayor-abq, mayor-59u) are P3 backlog — no urgency.
-
-`mayor-xy2` (CR schema validation) intentionally deferred.
+**Roadmap question raised** — see Forward-looking.
 
 ## Forward-looking
 
-1. **Confirm kubelet-smoke matrix green** — run 26137189337 in progress
-2. **Code quality P3 backlog** — 4 beads ready: merge_patch dedup, proto ObjectMeta dedup, method_to_verb HEAD, rbac dead_code cleanup
-3. **Sonobuoy conformance** — enumerate API conformance gaps once kubelet CI is stable
+Backlog drained this session. Next initiative candidates (operator input welcome):
+
+1. **kubelet implementation** — operator raised this; see roadmap discussion below
+2. **Sonobuoy conformance** — enumerate remaining API gaps systematically; fieldSelector + pagination now landed which unblocks more conformance tests
+3. **More code quality passes** — reviewer identified patterns to continue (e.g. watch-path refactor, handler error type unification)
+4. **mayor-xy2 (CR schema validation)** — deferred; re-evaluate when Argo CD milestone closer
 
 ## Recent progress
 
-This session closed 6 beads:
+This session closed 11 beads and merged 2 PRs, all on green CI:
 
-| Commit | What | Beads |
-|--------|------|-------|
-| 5debd14 | aqua lockfile (kubectl v1.31.14), docs/dev-setup.md | mayor-7gz |
-| 01bbe5f | kubelet-smoke.yaml (Linux CI), lima/kubelet.yaml, scripts/lima-start.sh | mayor-hov, mayor-lf3 |
-| e4cc3fb+44897f5 | cri-o+crun, 3-version matrix, gpg --batch, crun drop-in | mayor-p19, mayor-pua |
-| mayor-cd2 | Code quality audit complete, 4 follow-up beads filed | mayor-cd2 |
+| PR | What | Beads |
+|----|------|-------|
+| #56 (e45a703) | fieldSelector wired to store + list pagination with limit/continue cursor tokens (+16 tests) | mayor-yx5, mayor-ynx |
+| #57 (dd531fa) | merge_patch dedup (4→1), proto ObjectMeta dedup (3→1), HEAD verb mapping, rbac dead_code cleanup (−114 lines net) | mayor-4r7, mayor-67m, mayor-abq, mayor-59u |
 
-Also fixed 4 CI regressions in sequence: aqua SLSA, gpg /dev/tty, apt downgrade, --node-name removal.
+Also: kubelet-smoke matrix finally green — all three legs (1.34.8, 1.35.5, 1.36.1) pass with cri-o+crun. Fixed 5 successive CI regressions to get there (aqua SLSA, gpg --batch, apt downgrade, --node-name removal, nodeName-in-KubeletConfiguration).
 
-99 total beads closed. No open PRs. Single worktree (main only).
+107 total beads closed across project lifetime. 0 open PRs. Single worktree (main only). CI fully green.
 
 ## Stance
 
