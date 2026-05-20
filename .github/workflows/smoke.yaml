@@ -204,3 +204,160 @@ jobs:
         with:
           name: smoke-server-log
           path: ${{ env.SMOKE_TMPDIR }}/server.log
+
+  kubelet:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        k8s: ["1.34.8", "1.35.5", "1.36.1"]
+    name: kubelet ${{ matrix.k8s }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.1
+
+      - name: Install cri-o and crun
+        run: |
+          MINOR=$(echo "${{ matrix.k8s }}" | cut -d. -f1-2)
+          sudo apt-get update -qq
+          sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+          curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
+            | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
+            | sudo tee /etc/apt/sources.list.d/cri-o.list
+          sudo apt-get update -qq
+          sudo apt-get install -y cri-o crun
+          sudo mkdir -p /etc/crio/crio.conf.d
+          printf '[crio.runtime]\ndefault_runtime = "crun"\n[crio.runtime.runtimes.crun]\nruntime_path = "/usr/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
+            | sudo tee /etc/crio/crio.conf.d/10-crun.conf
+          sudo systemctl enable --now crio
+
+      - name: Install kubelet and kubectl ${{ matrix.k8s }}
+        run: |
+          MINOR=$(echo "${{ matrix.k8s }}" | cut -d. -f1-2)
+          curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/Release.key" \
+            | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/ /" \
+            | sudo tee /etc/apt/sources.list.d/kubernetes.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --allow-downgrades "kubelet=${{ matrix.k8s }}-*" "kubectl=${{ matrix.k8s }}-*"
+          sudo apt-mark hold kubelet kubectl
+          sudo systemctl disable --now kubelet
+
+      - name: Build release binary
+        run: cargo build --release -p u7s-apiserver
+
+      - name: Start apiserver
+        env:
+          RUST_LOG: info
+        run: |
+          TMPDIR=$(mktemp -d)
+          echo "SMOKE_TMPDIR=$TMPDIR" >> "$GITHUB_ENV"
+          SMOKE_TOKEN="kubelet-admin-token-$(date +%s)"
+          echo "$SMOKE_TOKEN,kubelet-admin,uid0,system:masters" > "$TMPDIR/token-auth.csv"
+          ./target/release/u7s-apiserver \
+            --db "$TMPDIR/state.db" \
+            --kubeconfig "$TMPDIR/kubeconfig" \
+            --sa-key "$TMPDIR/sa.key" \
+            --sa-pub "$TMPDIR/sa.pub" \
+            --token-auth-file "$TMPDIR/token-auth.csv" \
+            --advertise-address https://127.0.0.1:6443 \
+            >"$TMPDIR/server.log" 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            nc -z 127.0.0.1 6443 2>/dev/null && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$TMPDIR/server.log"; exit 1; }
+          CA_DATA=$(grep "certificate-authority-data" "$TMPDIR/kubeconfig" | awk '{print $2}')
+          echo "SMOKE_TOKEN=$SMOKE_TOKEN" >> "$GITHUB_ENV"
+          printf '%s\n' \
+            'apiVersion: v1' \
+            'kind: Config' \
+            'clusters:' \
+            '- cluster:' \
+            '    server: https://127.0.0.1:6443' \
+            "    certificate-authority-data: $CA_DATA" \
+            '  name: u7s' \
+            'contexts:' \
+            '- context:' \
+            '    cluster: u7s' \
+            '    user: kubelet-admin' \
+            '  name: u7s' \
+            'current-context: u7s' \
+            'users:' \
+            '- name: kubelet-admin' \
+            '  user:' \
+            "    token: $SMOKE_TOKEN" \
+            > "$TMPDIR/kubeconfig"
+
+      - name: Start kubelet
+        run: |
+          TMPDIR="${{ env.SMOKE_TMPDIR }}"
+          sudo mkdir -p /tmp/kubelet-pods
+          sudo cp "$TMPDIR/kubeconfig" /etc/kubelet-kubeconfig
+          sudo chmod 644 /etc/kubelet-kubeconfig
+          sudo tee /etc/kubelet-config.yaml <<'EOF'
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
+          registerNode: true
+          failSwapOn: false
+          resolvConf: ""
+          staticPodPath: /tmp/kubelet-pods
+          EOF
+          sudo kubelet \
+            --config=/etc/kubelet-config.yaml \
+            --kubeconfig=/etc/kubelet-kubeconfig \
+            --hostname-override=ci-node \
+            --v=2 \
+            >"$TMPDIR/kubelet.log" 2>&1 &
+          echo "KUBELET_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Assert node registers
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          FOUND=0
+          for i in $(seq 1 90); do
+            if kubectl get nodes 2>/dev/null | grep -q "ci-node"; then
+              FOUND=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "ERROR: ci-node did not appear in kubectl get nodes within 60s"
+            echo "--- server log ---"
+            cat "${{ env.SMOKE_TMPDIR }}/server.log"
+            echo "--- kubelet log ---"
+            cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+            exit 1
+          fi
+          echo "Node registered:"
+          kubectl get nodes
+
+      - name: Assert kubelet not crash-looping
+        run: |
+          sleep 5
+          if ! kill -0 "$KUBELET_PID" 2>/dev/null; then
+            echo "ERROR: kubelet exited"
+            cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+            exit 1
+          fi
+
+      - name: Stop server and kubelet
+        if: always()
+        run: |
+          [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+          [ -n "$KUBELET_PID" ] && sudo kill "$KUBELET_PID" 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: kubelet-smoke-logs-${{ matrix.k8s }}
+          path: |
+            ${{ env.SMOKE_TMPDIR }}/server.log
+            ${{ env.SMOKE_TMPDIR }}/kubelet.log
