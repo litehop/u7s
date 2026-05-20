@@ -1,34 +1,33 @@
 # Dashboard
 
-2026-05-21T16:05 UTC
+2026-05-21T16:35 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 1 (mayor-xy2 P3 deferred)
+Open beads: 2 (mayor-1di P1, mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**e2e retest decision** — three apiserver bugs fixed (PRs #80–82). The pod lifecycle test is ready to rerun. The remaining unknown is cri-o: `container create failed: unknown version specified` (CNI config issue in the lima VM). Options:
-1. Rerun the test now to confirm apiserver fixes unblock kubelet initialization
-2. Investigate the lima VM CNI config first
-3. File a bead and move on to next milestone
+**Root cause identified for all kubelet "invalid JSON" failures** — mayor-1di P1. Kubelet 1.36 sends `Accept: application/vnd.kubernetes.protobuf` on every request (CSINode, Lease, Events, Node). Our server always returns `content-type: application/json`. The Go client-go library fails to decode the response and emits "invalid JSON: expected value at line 1 column 1". Fix: detect the `Accept` header and encode responses as protobuf using the existing `proto.rs` infrastructure when protobuf is preferred. This is the only remaining blocker to node Ready and pod scheduling.
 
-Recommendation: rerun first, confirm the node reaches Ready, then decide on cri-o.
+**CNI gap fixed** — bridge CNI config written to `/etc/cni/net.d/` in the lima VM during this session; NetworkReady is no longer in the error message.
 
-**Nothing else blocked on you.**
+**Next dispatch:** mayor-1di (protobuf response negotiation). Ready to dispatch on your signal.
+
+**CoreDNS / sonobuoy:** Agreed — seed a default DNS service (Deployment + ConfigMap + ClusterIP Service at `10.96.0.10`) in `kube-system` at startup. Operator can replace it with any DNS server; it doesn't have to be CoreDNS specifically. File as a separate bead once the kubelet e2e is unblocked.
 
 ## Forward-looking
 
-1. Pod lifecycle e2e retest → if node reaches Ready, cri-o CNI is the last gap → file bead
-2. If pod reaches Succeeded: add CI smoke job (create pod, assert Succeeded within 60s)
-3. mayor-xy2 (CR schema validation, P3) — deferred until Argo CD milestone
+1. **mayor-1di** — protobuf response negotiation → node reaches Ready → pod lifecycle test can proceed
+2. After node Ready: seed default DNS service (coredns or generic) for sonobuoy milestone
+3. CI smoke job: create pod, assert Succeeded within 60s
+4. mayor-xy2 (CR schema validation, P3) — deferred until Argo CD milestone
 
 ## Recent progress
 
-Session closed out cleanly:
-- **PRs #80–82 merged**: uid stamping, apply-patch+yaml acceptance, SSA upsert — kubelet CSINode + Lease init now unblocked
-- **Worktree hygiene**: 5 stale worktrees + 1 orphan remote branch removed
-- **Policy update**: Rule 15 added — prefer `--merge` for PRs, `--squash` only for noisy CI branches, never `--rebase`
-- Test count: 255 → 260
+- **PR #83 merged**: `storage.k8s.io/csinodes` and `csidrivers` added to seeded `system:node` ClusterRole — RBAC was correct but underlying issue is protobuf response negotiation
+- Live e2e test run: node registers, CNI gap fixed, two blockers remain (protobuf responses, CSINode init)
+- Root cause of all "invalid JSON" errors traced and filed as mayor-1di
+- Test count: 260 (unchanged this round)
 
 ## Stance
 
-Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI with `--merge` (regular merge commit); flag security/API/architecture PRs for operator review first. Every bug fix ships with a regression test (Rule 14).
+Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI with `--merge`; flag security/API/architecture PRs for operator review first. Every bug fix ships with a regression test (Rule 14).
