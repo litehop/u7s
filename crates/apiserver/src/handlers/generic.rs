@@ -726,6 +726,11 @@ pub async fn patch_resource(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -741,12 +746,51 @@ pub async fn patch_resource(
     };
 
     let key = group_object_key(&group, &plural, None, &name);
-    let stored = state
+    let stored_opt = state
         .store
         .get(&key)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // SSA upsert: apply-patch+yaml on a missing resource creates it.
+    if is_ssa && stored_opt.is_none() {
+        let mut obj = Object::from_bytes(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+        obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+        stamp_metadata(&mut obj);
+        let new_rv = match state.store.put(&key, obj.to_bytes(), Some(0)).await {
+            Ok(rv) => rv,
+            Err(StoreError::AlreadyExists { .. }) => {
+                // Race: another writer created it; fall through to normal merge below.
+                // Refetch and continue as if it existed.
+                let stored = state
+                    .store
+                    .get(&key)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+                let mut current = Object::from_bytes(&stored.value)
+                    .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+                let patch: serde_json::Value = serde_json::from_slice(&body)
+                    .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+                crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                    .map_err(|e| Status::bad_request(e.to_string()))?;
+                let expected_rv = parse_resource_version(current.resource_version())?;
+                let rv = state
+                    .store
+                    .put(&key, current.to_bytes(), expected_rv)
+                    .await
+                    .map_err(|e| store_err(e, &name, &meta.kind))?;
+                current.set_resource_version(rv);
+                return Ok(Json(current.body).into_response());
+            }
+            Err(e) => return Err(store_err(e, &name, &meta.kind)),
+        };
+        obj.set_resource_version(new_rv);
+        return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
+    }
+
+    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &meta.kind))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -1098,6 +1142,11 @@ pub async fn patch_namespaced_resource(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1113,12 +1162,51 @@ pub async fn patch_namespaced_resource(
     };
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
-    let stored = state
+    let stored_opt = state
         .store
         .get(&key)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // SSA upsert: apply-patch+yaml on a missing resource creates it.
+    if is_ssa && stored_opt.is_none() {
+        let mut obj = Object::from_bytes(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+        obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+        obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
+        stamp_metadata(&mut obj);
+        let new_rv = match state.store.put(&key, obj.to_bytes(), Some(0)).await {
+            Ok(rv) => rv,
+            Err(StoreError::AlreadyExists { .. }) => {
+                // Race: another writer created it; fall through to normal merge below.
+                let stored = state
+                    .store
+                    .get(&key)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+                let mut current = Object::from_bytes(&stored.value)
+                    .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+                let patch: serde_json::Value = serde_json::from_slice(&body)
+                    .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+                crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                    .map_err(|e| Status::bad_request(e.to_string()))?;
+                let expected_rv = parse_resource_version(current.resource_version())?;
+                let rv = state
+                    .store
+                    .put(&key, current.to_bytes(), expected_rv)
+                    .await
+                    .map_err(|e| store_err(e, &name, &meta.kind))?;
+                current.set_resource_version(rv);
+                return Ok(Json(current.body).into_response());
+            }
+            Err(e) => return Err(store_err(e, &name, &meta.kind)),
+        };
+        obj.set_resource_version(new_rv);
+        return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
+    }
+
+    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &meta.kind))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -3238,6 +3326,223 @@ mod tests {
         let ts = obj.body["metadata"]["creationTimestamp"].as_str().unwrap_or("");
         assert!(!ts.is_empty(), "creationTimestamp must be set");
         assert!(ts.contains('T'), "creationTimestamp must be RFC3339");
+    }
+
+    // -- mayor-t1e: apply-patch+yaml PATCH must upsert (create if not found) --
+
+    /// Kubelet PATCH CSINode with apply-patch+yaml on a non-existent cluster-scoped resource
+    /// must create it (HTTP 201) with uid assigned, not return 404.
+    ///
+    /// Without the fix, patch_resource returns 404 because strategic-merge-patch has no
+    /// creation semantics. Real Kubernetes SSA is an upsert — if the object doesn't exist,
+    /// the patch body is used as the initial object.
+    #[tokio::test]
+    async fn apply_patch_yaml_creates_cluster_scoped_resource_when_absent() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "lima-node" },
+            "spec": {
+                "drivers": [{"name": "driver.csi.k8s.io", "nodeID": "lima-node"}]
+            }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "csinodes".to_string(),
+                "lima-node".to_string(),
+            )),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("apply-patch+yaml on absent CSINode must not return 404"))
+        .into_response();
+
+        // Must return 201 Created, not 200 OK (upsert created a new object).
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "apply-patch+yaml on absent cluster-scoped resource must return 201 Created; \
+             without the fix kubelet gets 404 and CSINode is never registered"
+        );
+
+        // Response body must have a uid assigned (server stamped metadata).
+        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let uid = v["metadata"]["uid"].as_str().unwrap_or("");
+        assert!(
+            !uid.is_empty(),
+            "created object must have uid assigned by stamp_metadata"
+        );
+
+        // The object must be persisted in the store.
+        let key = "/registry/storage.k8s.io/csinodes/lima-node";
+        assert!(
+            store.get(key).await.unwrap().is_some(),
+            "CSINode must be persisted in the store after SSA upsert"
+        );
+    }
+
+    /// Kubelet PATCH Lease with apply-patch+yaml on a non-existent namespaced resource
+    /// must create it (HTTP 201) with uid assigned, not return 404.
+    ///
+    /// Without the fix, patch_namespaced_resource returns 404 because strategic-merge-patch
+    /// has no creation semantics. Real Kubernetes SSA is an upsert.
+    #[tokio::test]
+    async fn apply_patch_yaml_creates_namespaced_resource_when_absent() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "lima-node",
+                "namespace": "kube-node-lease"
+            },
+            "spec": {
+                "holderIdentity": "lima-node",
+                "leaseDurationSeconds": 40,
+                "renewTime": "2026-05-21T00:00:00Z"
+            }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "lima-node".to_string(),
+            )),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("apply-patch+yaml on absent Lease must not return 404"))
+        .into_response();
+
+        // Must return 201 Created, not 200 OK.
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "apply-patch+yaml on absent namespaced resource must return 201 Created; \
+             without the fix kubelet gets 404 and the node heartbeat lease is never created"
+        );
+
+        // Response body must have a uid assigned.
+        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let uid = v["metadata"]["uid"].as_str().unwrap_or("");
+        assert!(
+            !uid.is_empty(),
+            "created Lease must have uid assigned by stamp_metadata"
+        );
+
+        // The object must be persisted in the store.
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/lima-node";
+        assert!(
+            store.get(key).await.unwrap().is_some(),
+            "Lease must be persisted in the store after SSA upsert"
+        );
+    }
+
+    /// strategic-merge-patch+json PATCH on a non-existent resource must still return 404.
+    ///
+    /// The upsert behaviour must be exclusive to apply-patch+yaml (SSA). A regular
+    /// strategic-merge-patch that targets a missing object is a client error and must
+    /// not silently create the resource.
+    #[tokio::test]
+    async fn strategic_merge_patch_on_absent_resource_returns_404() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "spec": { "drivers": [] }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut smp_headers = axum::http::HeaderMap::new();
+        smp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+
+        let result = patch_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "csinodes".to_string(),
+                "nonexistent-node".to_string(),
+            )),
+            smp_headers,
+            patch_bytes,
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::NOT_FOUND,
+                "strategic-merge-patch+json on missing resource must return 404; \
+                 only apply-patch+yaml (SSA) has upsert semantics"
+            ),
+            Ok(_) => panic!(
+                "strategic-merge-patch on absent resource must return 404, not create it"
+            ),
+        }
     }
 
     // -- mayor-1fu: server-side apply (application/apply-patch+yaml) must not return 415 --
