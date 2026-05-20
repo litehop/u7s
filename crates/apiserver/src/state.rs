@@ -177,5 +177,28 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     // policy/v1
     m.insert(rk("policy", "v1", "poddisruptionbudgets"), rm("PodDisruptionBudget", true, false));
 
+    // storage.k8s.io/v1 — all cluster-scoped
+    // kubelet uses create-or-update (PUT) semantics for csinodes
+    m.insert(rk("storage.k8s.io", "v1", "csinodes"),          rm_cou("CSINode",          false));
+    m.insert(rk("storage.k8s.io", "v1", "csidrivers"),        rm("CSIDriver",        false, false));
+    m.insert(rk("storage.k8s.io", "v1", "storageclasses"),    rm("StorageClass",     false, false));
+    m.insert(rk("storage.k8s.io", "v1", "volumeattachments"), rm("VolumeAttachment", false, true));
+
     m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csinodes_registered_as_cluster_scoped_create_or_update() {
+        let registry = build_registry();
+        let key = rk("storage.k8s.io", "v1", "csinodes");
+        let meta = registry.get(&key).expect("csinodes must be in build_registry");
+        // kubelet PUTs CSINode on every boot; create_or_update must be true so the
+        // handler doesn't reject the request when the object already exists.
+        assert!(meta.create_or_update, "csinodes must have create_or_update=true");
+        assert!(!meta.namespaced, "csinodes is cluster-scoped");
+    }
 }
