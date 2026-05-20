@@ -43,7 +43,7 @@ provision:
       echo 'deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v1.36/deb/ /' \
         > /etc/apt/sources.list.d/cri-o.list
       apt-get update -qq
-      apt-get install -y cri-o crun
+      apt-get install -y cri-o crun conmon
       mkdir -p /etc/crio/crio.conf.d
       cat > /etc/crio/crio.conf.d/10-crun.conf <<'CRUN'
       [crio.runtime]
