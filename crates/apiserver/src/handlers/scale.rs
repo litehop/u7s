@@ -120,7 +120,7 @@ pub async fn put_scale(
 
     obj.body["spec"]["replicas"] = serde_json::Value::Number(new_replicas.into());
 
-    let expected_rv = crate::handlers::generic::parse_resource_version(obj.resource_version())?;
+    let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
     let new_rv = state
         .store
         .put(&key, obj.to_bytes(), expected_rv)
@@ -163,7 +163,7 @@ pub async fn patch_scale(
         extract_replicas(&obj.body)
     };
 
-    let expected_rv = crate::handlers::generic::parse_resource_version(obj.resource_version())?;
+    let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
     let new_rv = state
         .store
         .put(&key, obj.to_bytes(), expected_rv)

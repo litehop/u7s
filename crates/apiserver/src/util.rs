@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::proto;
+use crate::{proto, status::Status};
 
 /// If the request body uses the Kubernetes protobuf encoding, decode it and return the embedded
 /// raw payload as JSON bytes. Otherwise return the bytes unchanged.
@@ -40,6 +40,22 @@ pub fn extract_body(bytes: &Bytes, content_type: &str) -> Bytes {
     }
     // Cannot decode — return original bytes so the handler reports a meaningful error.
     bytes.clone()
+}
+
+/// Parse an optional `resourceVersion` string into an optional `u64`.
+///
+/// - `None` or `""` → `Ok(None)` (unconditional write)
+/// - `"0"`          → `Ok(Some(0))` (write only if key doesn't exist)
+/// - any other      → parse as `u64`, error on failure
+pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
+    match rv {
+        None | Some("") => Ok(None),
+        Some("0") => Ok(Some(0)),
+        Some(s) => s
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| Status::bad_request(format!("invalid resourceVersion: {s}"))),
+    }
 }
 
 /// Returns the current UTC time formatted as RFC3339 (`YYYY-MM-DDThh:mm:ssZ`).

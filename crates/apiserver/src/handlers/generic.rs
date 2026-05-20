@@ -14,6 +14,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::{Object, ResourceKey},
+    util::parse_resource_version,
 };
 
 #[derive(Deserialize)]
@@ -345,16 +346,6 @@ fn parse_field_selector(s: &str) -> Result<u7s_store::FieldSelector, crate::stat
     Ok(u7s_store::FieldSelector { field: field.to_string(), value: value.to_string() })
 }
 
-pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
-    match rv {
-        None | Some("") => Ok(None),
-        Some("0") => Ok(Some(0)),
-        Some(s) => s
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|_| Status::bad_request(format!("invalid resourceVersion: {s}"))),
-    }
-}
 
 /// Encode a store key as a URL-safe base64 continue token (no padding).
 fn encode_continue(key: &str) -> String {

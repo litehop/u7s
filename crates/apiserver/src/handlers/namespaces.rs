@@ -13,7 +13,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::Object,
-    util::extract_body,
+    util::{extract_body, parse_resource_version},
 };
 
 /// Validate a namespace name: lowercase alphanumeric + hyphens, 1–63 chars.
@@ -43,16 +43,6 @@ fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusErro
     }
 }
 
-fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
-    match rv {
-        None | Some("") => Ok(None),
-        Some("0") => Ok(Some(0)),
-        Some(s) => s
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|_| Status::bad_request(format!("invalid resourceVersion: {s}"))),
-    }
-}
 
 pub async fn list_namespaces(
     State(state): State<AppState>,

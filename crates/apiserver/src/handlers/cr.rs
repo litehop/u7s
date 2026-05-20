@@ -11,7 +11,7 @@ use crate::{
     handlers::crd::CustomResourceDefinition,
     state::AppState,
     status::Status,
-    util::{extract_body, utc_now_rfc3339},
+    util::{extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
 const CRD_LIST_PREFIX: &str = "/registry/apiextensions.k8s.io/customresourcedefinitions/";
@@ -310,10 +310,7 @@ pub async fn replace_cr(
         }
     }
 
-    let expected_rv: Option<u64> = obj["metadata"]["resourceVersion"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse().ok());
+    let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
 
     let rv = state
         .store
@@ -535,10 +532,7 @@ pub async fn replace_cr_namespaced(
         }
     }
 
-    let expected_rv: Option<u64> = obj["metadata"]["resourceVersion"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse().ok());
+    let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
 
     let rv = state
         .store
