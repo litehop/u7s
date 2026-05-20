@@ -372,25 +372,6 @@ fn build_list_response(
     })
 }
 
-fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
-    if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
-        for (k, v) in p {
-            if v.is_null() {
-                t.remove(k);
-            } else if v.is_object() {
-                let entry = t
-                    .entry(k)
-                    .or_insert(serde_json::Value::Object(Default::default()));
-                merge_patch(entry, v);
-            } else {
-                t.insert(k.clone(), v.clone());
-            }
-        }
-    } else {
-        *target = patch.clone();
-    }
-}
-
 /// Check finalizers for delete: if non-empty, set deletionTimestamp and return modified object.
 /// Returns `None` if hard-delete should proceed, `Some(obj)` if soft-delete was applied.
 fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
@@ -728,7 +709,7 @@ pub async fn patch_resource(
     }
 
     match patch_type {
-        PatchType::Merge => merge_patch(&mut current.body, &patch),
+        PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
         PatchType::StrategicMerge => {
             crate::patch::strategic_merge_patch(&mut current.body, &patch)
                 .map_err(|e| Status::bad_request(e.to_string()))?;
@@ -1078,7 +1059,7 @@ pub async fn patch_namespaced_resource(
     }
 
     match patch_type {
-        PatchType::Merge => merge_patch(&mut current.body, &patch),
+        PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
         PatchType::StrategicMerge => {
             crate::patch::strategic_merge_patch(&mut current.body, &patch)
                 .map_err(|e| Status::bad_request(e.to_string()))?;
@@ -1224,7 +1205,7 @@ pub async fn patch_resource_status(
                     .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
                 if let Some(entry) = entry {
                     match patch_type {
-                        PatchType::Merge => merge_patch(entry, status_patch),
+                        PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
                         PatchType::StrategicMerge => {
                             crate::patch::strategic_merge_patch(entry, status_patch)
                                 .map_err(|e| Status::bad_request(e.to_string()))?;
@@ -1350,7 +1331,7 @@ pub async fn patch_namespaced_resource_status(
                     .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
                 if let Some(entry) = entry {
                     match patch_type {
-                        PatchType::Merge => merge_patch(entry, status_patch),
+                        PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
                         PatchType::StrategicMerge => {
                             crate::patch::strategic_merge_patch(entry, status_patch)
                                 .map_err(|e| Status::bad_request(e.to_string()))?;

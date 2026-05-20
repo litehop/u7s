@@ -1,5 +1,31 @@
 use thiserror::Error;
 
+/// Apply a JSON Merge Patch (RFC 7396) to `target`.
+///
+/// Rules:
+/// - null value → remove key from object
+/// - object value → recurse
+/// - any other value → overwrite
+/// - if patch or target is not an object → replace target with patch clone
+pub fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
+        for (k, v) in p {
+            if v.is_null() {
+                t.remove(k);
+            } else if v.is_object() {
+                let entry = t
+                    .entry(k)
+                    .or_insert(serde_json::Value::Object(Default::default()));
+                merge_patch(entry, v);
+            } else {
+                t.insert(k.clone(), v.clone());
+            }
+        }
+    } else {
+        *target = patch.clone();
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PatchError {
     #[error("patch is not an object")]

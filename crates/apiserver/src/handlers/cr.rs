@@ -585,25 +585,6 @@ pub async fn delete_cr_namespaced(
 // Patch helpers
 // ---------------------------------------------------------------------------
 
-fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
-    if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
-        for (k, v) in p {
-            if v.is_null() {
-                t.remove(k);
-            } else if v.is_object() {
-                let entry = t
-                    .entry(k)
-                    .or_insert(serde_json::Value::Object(Default::default()));
-                merge_patch(entry, v);
-            } else {
-                t.insert(k.clone(), v.clone());
-            }
-        }
-    } else {
-        *target = patch.clone();
-    }
-}
-
 fn validate_patch_content_type(headers: &HeaderMap) -> Result<(), crate::status::StatusError> {
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -658,7 +639,7 @@ pub async fn patch_cr(
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    merge_patch(&mut obj, &patch);
+    crate::patch::merge_patch(&mut obj, &patch);
 
     let new_rv = state
         .store
@@ -706,7 +687,7 @@ pub async fn patch_cr_namespaced(
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    merge_patch(&mut obj, &patch);
+    crate::patch::merge_patch(&mut obj, &patch);
 
     let new_rv = state
         .store
