@@ -128,8 +128,10 @@ fn new_uid() -> String {
     format!("{:016x}-{:08x}-crd0-0000-000000000000", d.as_secs(), d.subsec_nanos())
 }
 
-fn to_bytes(crd: &CustomResourceDefinition) -> Bytes {
-    Bytes::from(serde_json::to_vec(crd).expect("CRD serialization never fails"))
+fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::StatusError> {
+    serde_json::to_vec(crd)
+        .map(Bytes::from)
+        .map_err(|e| Status::internal(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +206,7 @@ pub async fn create_crd(
     let key = store_key(&name);
     let rv = state
         .store
-        .put(&key, to_bytes(&crd), Some(0))
+        .put(&key, to_bytes(&crd)?, Some(0))
         .await
         .map_err(|e| store_err_crd(e, &name))?;
 
@@ -286,7 +288,7 @@ pub async fn replace_crd(
 
     let rv = state
         .store
-        .put(&key, to_bytes(&crd), expected_rv)
+        .put(&key, to_bytes(&crd)?, expected_rv)
         .await
         .map_err(|e| store_err_crd(e, &name))?;
 
