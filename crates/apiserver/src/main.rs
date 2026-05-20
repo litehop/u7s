@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     let tls_material = generate_tls(&args)?;
 
     // 5. Write kubeconfig.
-    write_kubeconfig(&args.kubeconfig, &tls_material)?;
+    write_kubeconfig(&args.kubeconfig, &tls_material, &args)?;
 
     // 6. Load optional static token map.
     let token_map = match &args.token_auth_file {
