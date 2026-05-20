@@ -1311,6 +1311,9 @@ pub async fn put_namespaced_resource_status(
     let incoming = Object::from_bytes(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
+    // CR fallback: if the resource is not in the registry (e.g. Gateway API CRDs), fall back
+    // to the CR storage key. This allows Gateway/GatewayClass controllers to PUT status on
+    // their custom resources using the same /status route as built-in types.
     let (key, kind_fallback) = match lookup(&state, &group, &version, &plural) {
         Ok(meta) => (group_object_key(&group, &plural, Some(&ns), &name), meta.kind.clone()),
         Err(_) => {
@@ -2956,6 +2959,107 @@ mod tests {
         assert_eq!(rv, "500",
             "410 ERROR must carry horizon as resourceVersion so clients relist from \
              a valid point, not from last_rv which may predate the compaction horizon");
+    }
+
+    // -- mayor-br6: Gateway API CR status patch via generic handler fallback --
+
+    /// Gateway API controllers PATCH status on namespaced Gateway CRs using the /status route.
+    /// The group (gateway.networking.k8s.io) is not in the static resource registry, so
+    /// patch_namespaced_resource_status must fall back to the CR store key.
+    ///
+    /// Invariants:
+    ///   - patching {"status": {"conditions": [...]}} updates only .status
+    ///   - .spec is untouched (merge-patch touches only declared keys)
+    #[tokio::test]
+    async fn gateway_cr_status_merge_patch_updates_status_only() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let group = "gateway.networking.k8s.io";
+        let version = "v1";
+        let plural = "gateways";
+        let ns = "default";
+        let name = "my-gateway";
+        let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
+
+        // Seed a Gateway CR with spec and empty status.
+        let initial = serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "Gateway",
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+                "resourceVersion": "1"
+            },
+            "spec": {
+                "gatewayClassName": "nginx",
+                "listeners": [{"name": "http", "port": 80, "protocol": "HTTP"}]
+            },
+            "status": {}
+        });
+        let initial_bytes = bytes::Bytes::from(serde_json::to_vec(&initial).unwrap());
+        store.put(&cr_key, initial_bytes, None).await.expect("seed Gateway CR");
+
+        // PATCH the status with a Ready condition — group not in registry → CR fallback fires.
+        let patch = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                name.to_string(),
+            )),
+            headers,
+            patch_bytes,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Gateway CR status PATCH must succeed via CR fallback");
+
+        let stored = store.get(&cr_key).await.expect("store get").expect("CR must exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        // Status must reflect the patched conditions.
+        let conds = v["status"]["conditions"].as_array()
+            .expect("status.conditions must be an array after PATCH");
+        assert_eq!(conds.len(), 1, "exactly one condition must be present after PATCH");
+        assert_eq!(conds[0]["type"], "Ready", "condition type must be Ready");
+        assert_eq!(conds[0]["status"], "True", "condition status must be True");
+
+        // Spec must be completely unchanged — merge-patch must not touch spec.
+        assert_eq!(
+            v["spec"]["gatewayClassName"],
+            "nginx",
+            "spec.gatewayClassName must be unchanged after status PATCH"
+        );
+        assert_eq!(
+            v["spec"]["listeners"][0]["port"],
+            80,
+            "spec.listeners must be unchanged after status PATCH"
+        );
     }
 
     // -- mayor-oyn: RBAC index must be evicted on soft-delete --

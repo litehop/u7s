@@ -170,6 +170,7 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     // networking.k8s.io/v1
     m.insert(rk("networking.k8s.io", "v1", "networkpolicies"), rm("NetworkPolicy", true,  false));
     m.insert(rk("networking.k8s.io", "v1", "ingresses"),       rm("Ingress",       true,  true));
+    m.insert(rk("networking.k8s.io", "v1", "ingressclasses"),  rm("IngressClass",  false, false));
 
     // admissionregistration.k8s.io/v1
     m.insert(rk("admissionregistration.k8s.io", "v1", "validatingwebhookconfigurations"), rm("ValidatingWebhookConfiguration", false, false));
@@ -276,6 +277,19 @@ mod tests {
             name, prefix.as_str(),
             "strip_prefix must strip exactly one prefix occurrence, not recursively"
         );
+    }
+
+    /// IngressClass is a cluster-scoped resource in networking.k8s.io/v1. Without this entry
+    /// GET/LIST/WATCH on /apis/networking.k8s.io/v1/ingressclasses falls through to the CR
+    /// handler which returns 404 (no CRD installed), breaking ingress controller discovery.
+    #[test]
+    fn ingressclass_registered_as_cluster_scoped() {
+        let registry = build_registry();
+        let key = rk("networking.k8s.io", "v1", "ingressclasses");
+        let meta = registry.get(&key).expect("ingressclasses must be in build_registry");
+        assert!(!meta.namespaced, "IngressClass is cluster-scoped");
+        assert!(!meta.has_status_subresource, "IngressClass has no status subresource");
+        assert_eq!(meta.kind, "IngressClass");
     }
 
     /// kubelet lists node.k8s.io/v1/runtimeclasses on startup. Without this entry the
