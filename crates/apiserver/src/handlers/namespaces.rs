@@ -357,6 +357,9 @@ mod tests {
             watch: Some(true),
             resource_version: Some(0),
             label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
         };
 
         let resp = match list_namespaces(State(state), Query(query)).await {

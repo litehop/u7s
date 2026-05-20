@@ -503,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn list_empty() {
         let state = make_state();
-        let resp = match list_crds(State(state), Query(crate::handlers::generic::CollectionQuery { watch: None, resource_version: None, label_selector: None })).await {
+        let resp = match list_crds(State(state), Query(crate::handlers::generic::CollectionQuery { watch: None, resource_version: None, label_selector: None, field_selector: None, limit: None, continue_token: None })).await {
             Ok(r) => r,
             Err(_) => panic!("list must succeed"),
         };
@@ -579,6 +579,9 @@ mod tests {
             watch: Some(true),
             resource_version: Some(0),
             label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
         });
 
         let resp = match list_crds(State(state), query).await {

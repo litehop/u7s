@@ -21,6 +21,11 @@ pub struct CollectionQuery {
     pub watch: Option<bool>,
     pub resource_version: Option<u64>,
     pub label_selector: Option<String>,
+    #[serde(rename = "fieldSelector")]
+    pub field_selector: Option<String>,
+    pub limit: Option<u64>,
+    #[serde(rename = "continue")]
+    pub continue_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +308,18 @@ fn apply_label_selector(
         .collect()
 }
 
+/// Parse a `fieldSelector` query parameter of the form `key=value` into a `FieldSelector`.
+/// Only single equality selectors are supported. Returns 400 on malformed input.
+fn parse_field_selector(s: &str) -> Result<u7s_store::FieldSelector, crate::status::StatusError> {
+    let (field, value) = s.split_once('=').ok_or_else(|| {
+        Status::bad_request(format!("invalid fieldSelector '{s}': expected key=value"))
+    })?;
+    if field.is_empty() {
+        return Err(Status::bad_request(format!("invalid fieldSelector '{s}': empty key")));
+    }
+    Ok(u7s_store::FieldSelector { field: field.to_string(), value: value.to_string() })
+}
+
 pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::status::StatusError> {
     match rv {
         None | Some("") => Ok(None),
@@ -314,22 +331,43 @@ pub fn parse_resource_version(rv: Option<&str>) -> Result<Option<u64>, crate::st
     }
 }
 
+/// Encode a store key as a URL-safe base64 continue token (no padding).
+fn encode_continue(key: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_bytes())
+}
+
+/// Decode a URL-safe base64 continue token back to a store key string.
+fn decode_continue(token: &str) -> Result<String, crate::status::StatusError> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| Status::bad_request(format!("invalid continue token '{token}': base64 decode failed")))?;
+    String::from_utf8(bytes)
+        .map_err(|_| Status::bad_request(format!("invalid continue token '{token}': not valid UTF-8")))
+}
+
 fn build_list_response(
     kind: &str,
     group: &str,
     version: &str,
     revision: u64,
     items: Vec<serde_json::Value>,
+    continue_key: Option<String>,
 ) -> serde_json::Value {
     let api_version = if group.is_empty() {
         version.to_string()
     } else {
         format!("{}/{}", group, version)
     };
+    let mut metadata = serde_json::json!({ "resourceVersion": revision.to_string() });
+    if let Some(key) = continue_key {
+        metadata["continue"] = serde_json::Value::String(encode_continue(&key));
+    }
     serde_json::json!({
         "kind": format!("{}List", kind),
         "apiVersion": api_version,
-        "metadata": { "resourceVersion": revision.to_string() },
+        "metadata": metadata,
         "items": items
     })
 }
@@ -423,9 +461,11 @@ pub async fn list_resource(
         .await;
     }
 
+    let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
+    let continue_key = query.continue_token.as_deref().map(decode_continue).transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions::default())
+        .list(&prefix, ListOptions { field_selector, limit: query.limit, continue_key })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -443,7 +483,7 @@ pub async fn list_resource(
         items
     };
 
-    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
+    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items, resp.continue_key);
     Ok(Json(body).into_response())
 }
 
@@ -771,9 +811,11 @@ pub async fn list_namespaced_resource(
         .await;
     }
 
+    let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
+    let continue_key = query.continue_token.as_deref().map(decode_continue).transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions::default())
+        .list(&prefix, ListOptions { field_selector, limit: query.limit, continue_key })
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -791,7 +833,7 @@ pub async fn list_namespaced_resource(
         items
     };
 
-    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items);
+    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items, resp.continue_key);
     Ok(Json(body).into_response())
 }
 
@@ -1358,9 +1400,11 @@ pub async fn core_list_resource(
             .await
             .map(IntoResponse::into_response);
         }
+        let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
+        let continue_key = query.continue_token.as_deref().map(decode_continue).transpose()?;
         let resp = state
             .store
-            .list(&prefix, ListOptions::default())
+            .list(&prefix, ListOptions { field_selector, limit: query.limit, continue_key })
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let mut items = Vec::with_capacity(resp.items.len());
@@ -1375,7 +1419,7 @@ pub async fn core_list_resource(
         } else {
             items
         };
-        let body = build_list_response("Pod", "", "v1", resp.revision, items);
+        let body = build_list_response("Pod", "", "v1", resp.revision, items, resp.continue_key);
         return Ok(Json(body).into_response());
     }
 
@@ -2056,14 +2100,14 @@ mod tests {
     #[test]
     fn core_group_api_version_is_version_only() {
         // For core group (group=""), apiVersion should be just "v1", not "/v1".
-        let body = build_list_response("Node", "", "v1", 0, vec![]);
+        let body = build_list_response("Node", "", "v1", 0, vec![], None);
         assert_eq!(body["apiVersion"], "v1");
         assert_eq!(body["kind"], "NodeList");
     }
 
     #[test]
     fn non_core_group_api_version_includes_group() {
-        let body = build_list_response("Deployment", "apps", "v1", 0, vec![]);
+        let body = build_list_response("Deployment", "apps", "v1", 0, vec![], None);
         assert_eq!(body["apiVersion"], "apps/v1");
     }
 
@@ -2502,5 +2546,111 @@ mod tests {
                 "stale Lease PUT must be rejected with 409 Conflict, not succeed"
             ),
         }
+    }
+
+    // -- parse_field_selector --
+
+    #[test]
+    fn parse_field_selector_valid() {
+        // fieldSelector=metadata.name=foo must parse into a FieldSelector with the right field and value.
+        // Handlers use this to push the filter down to the store; a wrong parse means no filtering.
+        let fs = ok(parse_field_selector("metadata.name=foo"));
+        assert_eq!(fs.field, "metadata.name");
+        assert_eq!(fs.value, "foo");
+    }
+
+    #[test]
+    fn parse_field_selector_empty_value_is_valid() {
+        // metadata.namespace= (empty value) must be accepted — it matches objects with empty namespace.
+        let fs = ok(parse_field_selector("metadata.namespace="));
+        assert_eq!(fs.field, "metadata.namespace");
+        assert_eq!(fs.value, "");
+    }
+
+    #[test]
+    fn parse_field_selector_missing_equals_is_400() {
+        // Missing '=' is malformed — must return 400, not 500 or a panic.
+        let err = parse_field_selector("metadata.name").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn parse_field_selector_empty_key_is_400() {
+        // '=foo' (empty key) is malformed — must return 400.
+        let err = parse_field_selector("=foo").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn field_selector_filters_list_to_matching_item() {
+        // Verifies the handler-layer plumbing: parse_field_selector → ListOptions →
+        // store returns only the item whose field matches. If the wiring is broken
+        // (e.g. ListOptions::default() is still used), all items are returned.
+        use std::sync::Arc;
+        use u7s_store::{ListOptions, SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let make_cm = |name: &str| {
+            bytes::Bytes::from(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": name, "namespace": "default" }
+            }).to_string())
+        };
+
+        store.put("/registry/configmaps/default/foo", make_cm("foo"), Some(0)).await.unwrap();
+        store.put("/registry/configmaps/default/bar", make_cm("bar"), Some(0)).await.unwrap();
+
+        let fs = ok(parse_field_selector("metadata.name=foo"));
+        let resp = store.list(
+            "/registry/configmaps/default/",
+            ListOptions { field_selector: Some(fs), ..Default::default() },
+        ).await.unwrap();
+
+        assert_eq!(resp.items.len(), 1, "fieldSelector=metadata.name=foo must return exactly one item");
+        let parsed: serde_json::Value = serde_json::from_slice(&resp.items[0].value).unwrap();
+        assert_eq!(parsed["metadata"]["name"], "foo", "returned item must be the one named 'foo'");
+    }
+
+    // -- encode_continue / decode_continue --
+
+    #[test]
+    fn encode_decode_continue_roundtrips() {
+        // The continue token is opaque to clients; they must get back the original key after
+        // base64 round-trip. A broken encoding loses the cursor and re-scans from the start.
+        let key = "/registry/pods/default/my-pod";
+        let token = encode_continue(key);
+        let decoded = ok(decode_continue(&token));
+        assert_eq!(decoded, key, "decoded continue token must equal the original store key");
+    }
+
+    #[test]
+    fn decode_invalid_continue_token_is_400() {
+        // A malformed continue token from a client must return 400, not 500 or a panic.
+        let err = decode_continue("!!!not-valid-base64!!!").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn build_list_response_with_continue_key_sets_metadata_continue() {
+        // When there are more items, metadata.continue must be set to the base64-encoded cursor.
+        // Kubernetes clients use this field to request the next page; missing it means no pagination.
+        let body = build_list_response("Pod", "", "v1", 5, vec![], Some("/registry/pods/default/foo".to_string()));
+        let token = body["metadata"]["continue"].as_str().unwrap_or("");
+        assert!(!token.is_empty(), "metadata.continue must be set when continue_key is Some");
+        let decoded = ok(decode_continue(token));
+        assert_eq!(decoded, "/registry/pods/default/foo");
+    }
+
+    #[test]
+    fn build_list_response_without_continue_key_omits_metadata_continue() {
+        // When all items fit in one page, metadata.continue must be absent.
+        // An empty string would also confuse clients into requesting an unnecessary next page.
+        let body = build_list_response("Pod", "", "v1", 5, vec![], None);
+        assert!(
+            body["metadata"]["continue"].is_null(),
+            "metadata.continue must be absent when continue_key is None"
+        );
     }
 }
