@@ -1,55 +1,43 @@
 # Dashboard
 
-2026-05-20T05:16 UTC
+2026-05-20T05:22 UTC
 `bd prime` in a fresh Claude Code session
 Open beads: 1 (mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**TWO ACTIONS — lima MCP config + kubelet runtime fix.**
+**WAITING — lima MCP wiring in progress.**
 
-### 1. Add lima MCP to Claude Code settings
+Once `.claude/settings.json` is saved with the lima MCP config and Claude Code reloads it, mayor can drive sonobuoy autonomously. Keep u7s running on the host — do not stop it.
 
-Add to `.claude/settings.json` (or `~/.claude.json` for global):
-
-```json
-{
-  "mcpServers": {
-    "lima-node": {
-      "command": "limactl",
-      "args": ["mcp", "serve", "lima-node"]
-    }
-  }
-}
-```
-
-This lets mayor/workers run commands inside the lima VM directly — no manual log relaying needed.
-
-### 2. Kubelet using containerd instead of crio after restart
-
-After a kubelet restart, `--container-runtime-endpoint` reverts to `containerd.sock` instead of `crio.sock`. The kubelet config override in `/etc/systemd/system/kubelet.service.d/u7s.conf` is not being applied. Re-run `scripts/lima-start.sh` to reprovision, then check:
+If restarting u7s to pick up latest commits (namespace seeding + /version), use:
 
 ```sh
-limactl shell lima-node sudo journalctl -u kubelet --no-pager -n 5
+cargo run -p u7s-apiserver -- \
+  --db /tmp/u7s-dev.db \
+  --kubeconfig /tmp/u7s-dev.kubeconfig \
+  --sa-key /tmp/u7s-sa.key \
+  --sa-pub /tmp/u7s-sa.pub \
+  --advertise-address https://host.lima.internal:6443
 ```
 
-Sonobuoy aggregator pod is stuck because the pod scheduling loop isn't completing (kubelet → cri-o → container running → status PATCH back to u7s).
+Then re-run `scripts/lima-start.sh` to push fresh CA into VM before sonobuoy.
 
 `mayor-xy2` (CR schema validation) intentionally deferred.
 
 ## Forward-looking
 
-1. **lima MCP setup** — once configured, mayor can iterate on sonobuoy failures autonomously
-2. **Sonobuoy aggregator pod stuck** — kubelet must pick up the sonobuoy pod and run it; likely needs crio fix + possibly pod scheduling gaps in u7s
-3. **CA persistence** — CA regenerates on every u7s restart, breaking kubelet trust; P2 candidate bead
-4. **Sonobuoy triage** — once aggregator runs, paste failures → mayor files conformance-gap beads
+1. **lima MCP** — once active, mayor runs sonobuoy autonomously and triages failures into beads
+2. **Sonobuoy aggregator pod** — needs kubelet picking up the pod via crio; kubelet/crio runtime regression to diagnose
+3. **CA persistence** — CA regenerates on every u7s restart, breaking kubelet trust; P2 bead candidate
+4. **Sonobuoy triage** — failures → conformance-gap beads → worker dispatch
 5. **mayor-xy2** — deferred; re-evaluate at Argo CD milestone
 
 ## Recent progress
 
 | Commit/PR | What | Bead |
 |-----------|------|------|
-| 553bb2b | fix(sonobuoy): skip dns preflight (--skip-preflight=dnscheck) | — |
+| 553bb2b | fix(sonobuoy): --skip-preflight=dnscheck | — |
 | #60 (075fa8f) | feat(bootstrap): seed default + kube-system namespaces on startup | mayor-0hc |
 | 26aae71 | feat(version): GET /version — fixes sonobuoy server version check | mayor-mr2 |
 | 2f339ed + 8c80901 | fix(tls): advertise-address SAN + kubeconfig server URL | mayor-iko |
