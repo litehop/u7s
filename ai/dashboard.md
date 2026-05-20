@@ -1,33 +1,32 @@
 # Dashboard
 
-2026-05-20T14:48 UTC
+2026-05-21T15:30 UTC
 `bd prime` in a fresh Claude Code session
 Open beads: 1 (mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**PR #80 CI pending** — metadata.uid fix (kubelet pod lifecycle blocker). Will auto-merge on green.
+**Pod lifecycle e2e still blocked** — Two bugs fixed and merged (PR #80: uid stamping, PR #81: accept apply-patch+yaml as strategic-merge-patch), but CSINode init still fails. Root cause identified: `PATCH /apis/storage.k8s.io/v1/csinodes/lima-node` with `apply-patch+yaml` returns 404 when the resource doesn't exist — SSA should upsert. This is the next fix needed before the pod can proceed past kubelet initialization. Ready to dispatch on your signal.
 
-**Stance check** — current stance: pre-alpha/greenfield, break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; security/API/arch PRs flagged for operator review. Confirm still correct or adjust.
-
-**Pod lifecycle retest** — after PR #80 merges, the e2e test should proceed past `ContainerCreating`. Two remaining unknowns until we rerun: (1) image pull succeeds inside lima VM, (2) no further apiserver gaps surface. Ready to retest on your signal.
+**Operator question:** Should I dispatch the SSA upsert fix (apply-patch+yaml creates if not found) as a P1 worker now? It's a targeted change in `patch_resource()` in generic.rs, ~20 LoC.
 
 **Nothing else blocked on you.**
 
 ## Forward-looking
 
-1. PR #80 merges → rerun pod lifecycle test on lima-node
-2. If pod reaches Succeeded: add CI smoke job (create pod, assert Succeeded within 60s)
-3. mayor-xy2 (CR schema validation, P3) — deferred until Argo CD milestone
+1. Fix SSA upsert (apply-patch+yaml PATCH creates resource if absent) → kubelet CSINode and Lease init unblocked
+2. Rerun pod lifecycle test once kubelet reaches Ready → pod should progress past ContainerCreating  
+3. The cri-o sandbox failure (`unknown version specified`) may be a separate CNI/cri-o config issue in the lima VM — unrelated to apiserver
+4. CI smoke job (create pod, assert Succeeded in 60s) — after manual e2e succeeds
+5. mayor-xy2 (CR schema validation, P3) — deferred until Argo CD milestone
 
 ## Recent progress
 
-Pod lifecycle e2e test run today — reached `ContainerCreating`, uncovered two bugs:
-- **mayor-xt2 (fixed, PR #80)**: `metadata.uid` was null; cri-o needs uid to name sandbox
-- **mayor-3ua (already done)**: system namespaces were already seeded in main.rs; bead closed as false alarm
-- **mayor-0hu (merged PR #78)**: pods/status PATCH — kubelet status writes working (conditions appeared correctly during test)
-
-Session totals: PRs #73–80 merged or open; test count 219 → 255 this session.
+Two bugs fixed this session from the pod lifecycle e2e test run:
+- **PR #80 merged**: `metadata.uid` now assigned at create time — kubelet can name cri-o sandbox
+- **PR #81 merged**: `application/apply-patch+yaml` accepted as strategic-merge-patch — kubelet can send SSA requests
+- **e2e test status**: node registers, pod gets uid, kubelet tries to initialize CSINode and Lease via SSA PATCH → hits upsert gap (404 on non-existent CSINode)
+- Test count: 255 → 257
 
 ## Stance
 
