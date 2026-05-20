@@ -981,6 +981,25 @@ fn accepts_patch_content_type(ct: &str) -> bool {
         || ct.contains("application/merge-patch+json")
 }
 
+/// Apply only the `.status` portion of `patch` to `stored`, returning the full updated pod.
+///
+/// Fields outside `.status` in the patch body (e.g. `.spec`) are ignored — the status
+/// subresource cannot modify spec. This is the Kubernetes API contract for status subresources.
+pub fn apply_status_patch(
+    stored: &serde_json::Value,
+    patch: &serde_json::Value,
+) -> serde_json::Value {
+    let mut result = stored.clone();
+    if let Some(patch_status) = patch.get("status") {
+        if result["status"].is_object() && patch_status.is_object() {
+            crate::patch::merge_patch(&mut result["status"], patch_status);
+        } else {
+            result["status"] = patch_status.clone();
+        }
+    }
+    result
+}
+
 pub async fn patch_pod_status(
     State(state): State<AppState>,
     Path((raw_ns, name)): Path<(String, String)>,
@@ -1015,13 +1034,7 @@ pub async fn patch_pod_status(
     let patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    if let Some(patch_status) = patch.get("status") {
-        if current_obj.body["status"].is_object() && patch_status.is_object() {
-            crate::patch::merge_patch(&mut current_obj.body["status"], patch_status);
-        } else {
-            current_obj.body["status"] = patch_status.clone();
-        }
-    }
+    current_obj.body = apply_status_patch(&current_obj.body, &patch);
 
     let expected_rv = parse_resource_version(current_obj.resource_version())?;
     let new_rv = state
@@ -1140,6 +1153,130 @@ mod status_tests {
             !accepts_patch_content_type(""),
             "empty content-type must be rejected"
         );
+    }
+
+    /// apply_status_patch with {"status":{"phase":"Running"}} on a Pending pod must
+    /// yield phase=Running. This is the primary kubelet use-case: reporting pod lifecycle
+    /// transitions. If the phase doesn't update, pod lifecycle e2e is impossible.
+    #[test]
+    fn patch_pod_status_updates_phase() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"phase": "Pending"}
+        });
+        let patch = serde_json::json!({"status": {"phase": "Running"}});
+
+        let result = apply_status_patch(&stored, &patch);
+
+        assert_eq!(result["status"]["phase"], "Running",
+            "phase must transition Pending -> Running after kubelet patch");
+    }
+
+    /// apply_status_patch must ignore spec fields in the patch body.
+    /// The status subresource cannot modify spec — Kubernetes API contract.
+    /// If spec can be changed via /status, an attacker could hijack pod scheduling.
+    #[test]
+    fn patch_pod_status_ignores_spec_fields() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "worker-1", "containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"phase": "Pending"}
+        });
+        let patch = serde_json::json!({
+            "status": {"phase": "Running"},
+            "spec": {"nodeName": "hacked"}
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+
+        assert_eq!(result["status"]["phase"], "Running",
+            "status phase must be updated");
+        assert_eq!(result["spec"]["nodeName"], "worker-1",
+            "spec.nodeName must not be changed — status subresource cannot modify spec");
+    }
+
+    /// apply_status_patch must preserve existing status fields not present in the patch.
+    /// Kubelet sends incremental updates; clobbering existing conditions would lose
+    /// previously reported state (e.g. Initialized, ContainersReady conditions).
+    #[test]
+    fn patch_pod_status_preserves_existing_status_fields() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {},
+            "status": {
+                "phase": "Pending",
+                "conditions": [{"type": "Initialized", "status": "True"}],
+                "hostIP": "10.0.0.1"
+            }
+        });
+        let patch = serde_json::json!({"status": {"phase": "Running"}});
+
+        let result = apply_status_patch(&stored, &patch);
+
+        assert_eq!(result["status"]["phase"], "Running",
+            "phase must be updated");
+        assert_eq!(result["status"]["hostIP"], "10.0.0.1",
+            "pre-existing hostIP must not be clobbered");
+        let conditions = result["status"]["conditions"].as_array()
+            .expect("conditions must still be an array");
+        assert_eq!(conditions.len(), 1,
+            "pre-existing conditions must be preserved");
+        assert_eq!(conditions[0]["type"], "Initialized",
+            "Initialized condition must survive the phase-only patch");
+    }
+
+    /// apply_status_patch that adds a new condition to status.conditions merges correctly.
+    /// For merge-patch semantics: arrays are replaced, so patching with a new conditions
+    /// array replaces the old one. This is the expected RFC 7396 behavior.
+    /// If this merges incorrectly, kubelet's reported conditions will be wrong.
+    #[test]
+    fn patch_pod_status_with_conditions_merge() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {},
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "Initialized", "status": "True"},
+                    {"type": "Ready", "status": "False"}
+                ]
+            }
+        });
+        // Kubelet sends the full updated conditions array (merge-patch replaces arrays).
+        let patch = serde_json::json!({
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "Initialized", "status": "True"},
+                    {"type": "Ready", "status": "True"},
+                    {"type": "ContainersReady", "status": "True"}
+                ]
+            }
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+
+        let conditions = result["status"]["conditions"].as_array()
+            .expect("conditions must be an array");
+        // Merge-patch replaces the array entirely with the patch value.
+        assert_eq!(conditions.len(), 3,
+            "conditions array must reflect the full patch (merge-patch replaces arrays)");
+        let ready = conditions.iter().find(|c| c["type"] == "Ready")
+            .expect("Ready condition must be present");
+        assert_eq!(ready["status"], "True",
+            "Ready condition status must be updated to True");
+        let containers_ready = conditions.iter().find(|c| c["type"] == "ContainersReady");
+        assert!(containers_ready.is_some(),
+            "ContainersReady condition must be added by the patch");
     }
 }
 
