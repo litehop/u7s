@@ -410,7 +410,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["events"],       "verbs": ["create","patch","update"] },
             { "apiGroups": [""], "resources": ["configmaps"],   "verbs": ["get","list","watch"] },
             { "apiGroups": [""], "resources": ["secrets"],      "verbs": ["get","list","watch"] },
-            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] }
+            { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] },
+            { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch"] },
+            { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] }
         ]
     });
     store.put(&cr_key, Bytes::from(cr_body.to_string()), None).await
@@ -546,7 +548,9 @@ mod tests {
             !cr["metadata"]["creationTimestamp"].is_null(),
             "ClusterRole metadata must contain a non-null creationTimestamp"
         );
-        // Must include rules for nodes, pods, events, configmaps, secrets.
+        // Must include rules for nodes, pods, events, configmaps, secrets, leases, and csinodes.
+        // Missing csinodes causes kubelet to get 403 for CSINode PATCH/WATCH, which client-go
+        // surfaces as "invalid JSON: expected value at line 1 column 1".
         let rules = cr["rules"].as_array().expect("rules must be an array");
         assert!(!rules.is_empty(), "ClusterRole must have at least one rule");
         let resources: Vec<String> = rules.iter()
@@ -556,7 +560,7 @@ mod tests {
                     .unwrap_or_default()
             })
             .collect();
-        for expected in ["nodes", "pods", "events", "configmaps", "secrets"] {
+        for expected in ["nodes", "pods", "events", "configmaps", "secrets", "leases", "csinodes"] {
             assert!(
                 resources.iter().any(|r| r == expected),
                 "ClusterRole rules must cover resource '{expected}'"
