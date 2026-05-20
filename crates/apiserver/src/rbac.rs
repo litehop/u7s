@@ -585,4 +585,227 @@ mod tests {
         let r_pods = req("carol", &groups, "get", "pods", "", Some("default"), None);
         assert!(!idx.is_allowed(&r_pods), "plain pods must be denied when rule only covers pods/log");
     }
+
+    #[test]
+    fn rolebinding_namespace_mismatch_denies() {
+        // A RoleBinding in namespace "foo" must NOT grant access to a request in
+        // namespace "bar". Failing this check would be a silent authz bypass:
+        // any user bound in one namespace could escalate to another.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_role(
+            "foo",
+            "secret-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["get"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_role_binding(
+            "foo",
+            "dave-secret-reader",
+            "secret-reader",
+            json!([{ "kind": "User", "name": "dave" }]),
+        );
+
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // Allowed in the bound namespace.
+        let r_foo = req("dave", &groups, "get", "secrets", "", Some("foo"), None);
+        assert!(idx.is_allowed(&r_foo), "must be allowed in bound namespace 'foo'");
+
+        // Must be denied in a different namespace — the binding does not cross ns boundaries.
+        let r_bar = req("dave", &groups, "get", "secrets", "", Some("bar"), None);
+        assert!(
+            !idx.is_allowed(&r_bar),
+            "RoleBinding in 'foo' must not grant access in 'bar' — namespace boundary violation"
+        );
+    }
+
+    #[test]
+    fn clusterrolebinding_grants_in_namespace_scope() {
+        // A ClusterRoleBinding must grant access even when the request specifies a
+        // namespace. ClusterRoleBindings are namespace-agnostic by design; failing to
+        // honor them for namespaced requests would silently deny legitimate cluster-wide
+        // admin access.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "configmap-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["configmaps"],
+                "verbs": ["get", "list"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "eve-configmap-reader",
+            "configmap-reader",
+            json!([{ "kind": "User", "name": "eve" }]),
+        );
+
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // Request is namespace-scoped but the ClusterRoleBinding must still allow it.
+        let r = req("eve", &groups, "get", "configmaps", "", Some("production"), None);
+        assert!(
+            idx.is_allowed(&r),
+            "ClusterRoleBinding must grant access for namespace-scoped requests"
+        );
+
+        // Also works in a different namespace — cluster-wide binding is not namespace-restricted.
+        let r2 = req("eve", &groups, "list", "configmaps", "", Some("kube-system"), None);
+        assert!(
+            idx.is_allowed(&r2),
+            "ClusterRoleBinding must grant access in any namespace"
+        );
+    }
+
+    #[test]
+    fn resource_names_empty_matches_all() {
+        // A rule with resourceNames: [] (empty) must match a request for any resource
+        // name. Empty resourceNames means "no restriction" in Kubernetes RBAC. If this
+        // were treated as "no names allowed" it would silently deny all named-resource
+        // requests, which would be a correctness bug.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-getter",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"],
+                "resourceNames": []
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "frank-pod-getter",
+            "pod-getter",
+            json!([{ "kind": "User", "name": "frank" }]),
+        );
+
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // Request for a specific named pod — must be allowed because resourceNames is empty.
+        let r = req("frank", &groups, "get", "pods", "", Some("default"), Some("my-pod"));
+        assert!(
+            idx.is_allowed(&r),
+            "empty resourceNames must match any name — treating it as a deny-all would be a bug"
+        );
+
+        // Request without a name — also must be allowed.
+        let r2 = req("frank", &groups, "get", "pods", "", Some("default"), None);
+        assert!(
+            idx.is_allowed(&r2),
+            "empty resourceNames must also match requests that supply no name"
+        );
+    }
+
+    #[test]
+    fn resource_names_non_empty_restricts() {
+        // A rule with resourceNames: ["allowed-pod"] must deny a request for a
+        // different name. Failing this check would be an escalation: a user granted
+        // access to one named resource could access any resource of that type.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "named-pod-getter",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"],
+                "resourceNames": ["allowed-pod"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "grace-named-pod",
+            "named-pod-getter",
+            json!([{ "kind": "User", "name": "grace" }]),
+        );
+
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // Allowed name — must be permitted.
+        let r_ok = req("grace", &groups, "get", "pods", "", Some("default"), Some("allowed-pod"));
+        assert!(
+            idx.is_allowed(&r_ok),
+            "request for the explicitly listed resourceName must be allowed"
+        );
+
+        // Different name — must be denied (not in the resourceNames list).
+        let r_deny = req("grace", &groups, "get", "pods", "", Some("default"), Some("other-pod"));
+        assert!(
+            !idx.is_allowed(&r_deny),
+            "request for a name not in resourceNames must be denied — would be an escalation"
+        );
+
+        // No name supplied — must be denied when resourceNames is non-empty.
+        let r_no_name = req("grace", &groups, "get", "pods", "", Some("default"), None);
+        assert!(
+            !idx.is_allowed(&r_no_name),
+            "request with no name must be denied when resourceNames is non-empty"
+        );
+    }
+
+    #[test]
+    fn subresource_rule_does_not_bleed_across_subresources() {
+        // A rule granting ["pods", "pods/log"] must allow pods and pods/log but must
+        // NOT allow pods/status. Subresource rules are explicit — bleeding across
+        // subresources would let a user escalate from log access to status/exec/etc.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-and-log",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods", "pods/log"],
+                "verbs": ["get"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "hank-pod-log",
+            "pod-and-log",
+            json!([{ "kind": "User", "name": "hank" }]),
+        );
+
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // Plain pods — must be allowed.
+        let r_pods = req("hank", &groups, "get", "pods", "", Some("default"), None);
+        assert!(idx.is_allowed(&r_pods), "plain pods must be allowed");
+
+        // pods/log — must be allowed.
+        let r_log = req("hank", &groups, "get", "pods", "log", Some("default"), None);
+        assert!(idx.is_allowed(&r_log), "pods/log must be allowed");
+
+        // pods/status — must be denied (not in the rule's resource list).
+        let r_status = req("hank", &groups, "get", "pods", "status", Some("default"), None);
+        assert!(
+            !idx.is_allowed(&r_status),
+            "pods/status must be denied — pods/log rule must not bleed to other subresources"
+        );
+
+        // pods/exec — must also be denied.
+        let r_exec = req("hank", &groups, "get", "pods", "exec", Some("default"), None);
+        assert!(
+            !idx.is_allowed(&r_exec),
+            "pods/exec must be denied — pods/log rule must not bleed to other subresources"
+        );
+    }
 }
