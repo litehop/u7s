@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 3. Open store.
     let store = Arc::new(SqliteStore::new(&args.db)?);
+    seed_namespaces(&store).await?;
 
     // 4. Generate TLS certs.
     let tls_material = generate_tls(&args)?;
@@ -342,6 +343,39 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+    // Static UIDs — no uuid crate needed.
+    const NS: &[(&str, &str)] = &[
+        ("default",     "00000000-0000-0000-0000-000000000001"),
+        ("kube-system", "00000000-0000-0000-0000-000000000002"),
+    ];
+    for (name, uid) in NS {
+        let key = keys::cluster_object_key("namespaces", name);
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": name,
+                "uid": uid,
+                "creationTimestamp": "2024-01-01T00:00:00Z",
+                "labels": { "kubernetes.io/metadata.name": name }
+            },
+            "status": { "phase": "Active" }
+        });
+        let bytes = Bytes::from(body.to_string());
+        match store.put(&key, bytes, Some(0)).await {
+            Ok(_) => tracing::info!("seeded namespace: {name}"),
+            Err(u7s_store::StoreError::AlreadyExists { .. }) => {
+                // Already exists — idempotent, ignore.
+            }
+            Err(e) => return Err(anyhow::anyhow!("seed namespace {name}: {e}")),
+        }
+    }
+    Ok(())
+}
+
 async fn serve_tls(
     listener: TcpListener,
     app: Router,
@@ -390,5 +424,44 @@ async fn serve_tls(
                 tracing::debug!("connection error: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use u7s_store::{Store, SqliteStore};
+
+    fn make_store() -> SqliteStore {
+        SqliteStore::new(":memory:").expect("open in-memory db")
+    }
+
+    #[tokio::test]
+    async fn seed_namespaces_creates_default_and_kube_system() {
+        // Both namespaces must exist after a single call — this is the sonobuoy preflight fix.
+        let store = make_store();
+        seed_namespaces(&store).await.expect("seed must not fail");
+
+        for name in ["default", "kube-system"] {
+            let key = keys::cluster_object_key("namespaces", name);
+            let obj = store.get(&key).await.expect("get must not fail");
+            assert!(
+                obj.is_some(),
+                "namespace '{name}' must exist after seeding"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&obj.unwrap().value).expect("valid json");
+            assert_eq!(parsed["kind"].as_str(), Some("Namespace"));
+            assert_eq!(parsed["metadata"]["name"].as_str(), Some(name));
+            assert_eq!(parsed["status"]["phase"].as_str(), Some("Active"));
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_namespaces_is_idempotent() {
+        // A second call must not error — CAS rv=0 returns AlreadyExists which is silently ignored.
+        let store = make_store();
+        seed_namespaces(&store).await.expect("first seed must not fail");
+        seed_namespaces(&store).await.expect("second seed must not fail");
     }
 }
