@@ -184,6 +184,10 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     m.insert(rk("storage.k8s.io", "v1", "storageclasses"),    rm("StorageClass",     false, false));
     m.insert(rk("storage.k8s.io", "v1", "volumeattachments"), rm("VolumeAttachment", false, true));
 
+    // node.k8s.io/v1 — cluster-scoped
+    // kubelet lists runtimeclasses on startup; serve as empty collection to stop the error loop.
+    m.insert(rk("node.k8s.io", "v1", "runtimeclasses"), rm("RuntimeClass", false, false));
+
     m
 }
 
@@ -200,5 +204,17 @@ mod tests {
         // handler doesn't reject the request when the object already exists.
         assert!(meta.create_or_update, "csinodes must have create_or_update=true");
         assert!(!meta.namespaced, "csinodes is cluster-scoped");
+    }
+
+    /// kubelet lists node.k8s.io/v1/runtimeclasses on startup. Without this entry the
+    /// generic handler falls through to the CR handler which returns 404 (no CRD installed),
+    /// causing a tight error loop and log spam every few seconds.
+    #[test]
+    fn runtimeclasses_registered_as_cluster_scoped() {
+        let registry = build_registry();
+        let key = rk("node.k8s.io", "v1", "runtimeclasses");
+        let meta = registry.get(&key).expect("runtimeclasses must be in build_registry");
+        assert!(!meta.namespaced, "runtimeclasses is cluster-scoped");
+        assert_eq!(meta.kind, "RuntimeClass");
     }
 }
