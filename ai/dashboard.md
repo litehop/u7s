@@ -1,36 +1,37 @@
 # Dashboard
 
-2026-05-20T09:15 UTC
+2026-05-20T10:45 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 5 (cluster-a worker in-flight)
+Open beads: 2 (mayor-adg P1, mayor-xy2 P3)
 
 ## What needs the operator now
 
-**Review before merge — PR #72 (cluster-a-generic, RBAC security surface):** When the cluster-a worker finishes, its PR touches the RBAC index (soft-delete security gap, mayor-oyn P1). Flag for your review before merging per merge policy.
+**Review PR #73 before merge — RBAC security surface:**
+- mayor-oyn: RBAC index now evicted on soft-delete (ClusterRoleBinding/RoleBinding)
+- Test `rbac_index_evicted_on_soft_delete_of_clusterrolebinding` verifies alice loses access immediately on DELETE, not after finalizers clear
+- CI pending; do not merge without your review
 
-**Nothing else blocked on you.** PRs #69–71 merge automatically on green CI.
+**Nothing else blocked on you.**
 
 ## In-flight
 
-- **worker/cluster-a-generic** — mayor-oyn (P1 RBAC soft-delete), mayor-ofi (json-patch add), mayor-iek (watch 410 rv), mayor-lyc (field-selector dedup). Still running, no PR yet.
-- **PR #69** — proto varint test (mayor-1cy). CI pending. Merges on green.
-- **PR #70** — TLS partial CA fix (mayor-cst). CI pending. Merges on green.
-- **PR #71** — RBAC seed metadata + key parsing (mayor-032/9zd). CI pending. Merges on green.
+- **PR #73** — 4-bead cluster (RBAC soft-delete, json-patch add, watch 410, field-selector dedup). CI pending. **Flagged for operator review.**
+- **mayor-adg (P1)** — retroactive regression tests for PRs #67-68 (sendInitialEvents annotation, strategic-merge-patch, SAN inclusion). Ready to dispatch.
 
-## Recent progress (this session)
+## Recent progress
 
-- Merged PR #67: kubelet compat — TLS SAN, sendInitialEvents BOOKMARK, strategic-merge-patch, RBAC subresources.
-- Merged PR #68: CSINode watch BOOKMARK test + RuntimeClass stub (runtimeclasses in registry → 200 instead of 404).
-- Filed 8 review beads (code quality audit), dispatched 4 workers to resolve them.
-- Closed: mayor-032, mayor-9zd, mayor-cst, mayor-1cy, mayor-c5i, mayor-9jc.
-- Worktree hygiene: agent-a7fad47c5a89d7887 removed, origin pruned.
+- Merged PRs #69 (proto varint test), #70 (TLS partial CA fix), #71 (RBAC seed metadata + key parsing).
+- Policy update committed: Rule 14 — every bug fix ships with a regression test; testing policy added to worker preamble.
+- Closed: mayor-oyn, mayor-ofi, mayor-iek, mayor-lyc, mayor-032, mayor-9zd, mayor-cst, mayor-1cy.
+- Caught and closed PR #72 (first cluster-a attempt): worker deleted sendInitialEvents implementation. Redone directly with all 3 strings verified present (20 hits in generic.rs, 5 in pods.rs).
+- 226 tests total, 10 new regression tests added in PR #73.
 
 ## Forward-looking
 
-1. **Pod lifecycle** — once cluster-a lands, no known remaining kubelet blockers. Next: verify pod reaches Succeeded on lima-node, then add CI smoke job to `.github/workflows/smoke.yaml`.
-2. **Sonobuoy** — after pod lifecycle end-to-end.
+1. **mayor-adg** — dispatch worker to add regression tests for PRs #67-68 (sendInitialEvents BOOKMARK annotation, strategic-merge-patch, SAN inclusion).
+2. **Pod lifecycle** — no remaining known kubelet blockers. Once PR #73 merged, verify pod reaches Succeeded on lima-node, then add CI smoke job.
 3. **mayor-xy2** (CR schema validation, P3) — deferred until Argo CD milestone.
 
 ## Stance
 
-Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; flag security/API/architecture PRs for operator review first.
+Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; flag security/API/architecture PRs for operator review first. Every bug fix ships with a regression test (Rule 14).
