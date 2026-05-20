@@ -543,7 +543,7 @@ pub async fn patch_pod(
         crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
             .map_err(|e| Status::bad_request(e.to_string()))?;
     } else {
-        json_merge_patch(&mut current_obj.body, &patch);
+        crate::patch::merge_patch(&mut current_obj.body, &patch);
     }
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
@@ -578,24 +578,6 @@ pub async fn patch_pod(
 
 use crate::util::utc_now_rfc3339;
 
-fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
-    if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
-        for (k, v) in p {
-            if v.is_null() {
-                t.remove(k);
-            } else if v.is_object() {
-                let entry = t
-                    .entry(k)
-                    .or_insert(serde_json::Value::Object(Default::default()));
-                json_merge_patch(entry, v);
-            } else {
-                t.insert(k.clone(), v.clone());
-            }
-        }
-    } else {
-        *target = patch.clone();
-    }
-}
 
 #[cfg(test)]
 mod watch_tests {
@@ -921,7 +903,7 @@ pub async fn patch_pod_status(
 
     if let Some(patch_status) = patch.get("status") {
         if current_obj.body["status"].is_object() && patch_status.is_object() {
-            json_merge_patch(&mut current_obj.body["status"], patch_status);
+            crate::patch::merge_patch(&mut current_obj.body["status"], patch_status);
         } else {
             current_obj.body["status"] = patch_status.clone();
         }
@@ -981,7 +963,7 @@ mod status_tests {
         let patch_status = serde_json::json!({"phase": "Running"});
 
         // json_merge_patch on the status object: merges in place.
-        json_merge_patch(&mut status, &patch_status);
+        crate::patch::merge_patch(&mut status, &patch_status);
 
         assert_eq!(status["phase"], "Running");
         // pre-existing fields not in the patch must survive
@@ -994,7 +976,7 @@ mod status_tests {
         let mut status = serde_json::json!({"phase": "Running", "hostIP": "1.2.3.4"});
         let patch_status = serde_json::json!({"hostIP": null});
 
-        json_merge_patch(&mut status, &patch_status);
+        crate::patch::merge_patch(&mut status, &patch_status);
 
         // null in merge patch means delete
         assert!(status.get("hostIP").map_or(true, |v| v.is_null() || !status.as_object().unwrap().contains_key("hostIP")));
@@ -1013,7 +995,7 @@ mod status_tests {
         // Simulate handler logic: only act if patch has "status" key
         if let Some(patch_status) = patch.get("status") {
             if current["status"].is_object() && patch_status.is_object() {
-                json_merge_patch(&mut current["status"], patch_status);
+                crate::patch::merge_patch(&mut current["status"], patch_status);
             } else {
                 current["status"] = patch_status.clone();
             }

@@ -62,6 +62,72 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
 }
 
 
+/// Decode one ObjectMeta proto field into `meta`, `labels`, and `annotations`.
+///
+/// Called from within a `scan_mixed_fields` closure for field 1 (ObjectMeta) of any top-level
+/// Kubernetes object.  All three decoders (Namespace, ConfigMap, Node) share the identical
+/// ObjectMeta wire layout — this function consolidates that logic.
+fn decode_object_meta_field(
+    fn2: u64,
+    wt: u64,
+    fd: &[u8],
+    meta: &mut serde_json::Value,
+    labels: &mut Option<serde_json::Map<String, serde_json::Value>>,
+    annotations: &mut Option<serde_json::Map<String, serde_json::Value>>,
+) {
+    match (fn2, wt) {
+        (1, 2) => {
+            // name (string)
+            meta["name"] = serde_json::Value::String(String::from_utf8_lossy(fd).into_owned());
+        }
+        (2, 2) => {
+            // generateName (string)
+            let s = String::from_utf8_lossy(fd).into_owned();
+            if !s.is_empty() {
+                meta["generateName"] = serde_json::Value::String(s);
+            }
+        }
+        (3, 2) => {
+            // namespace (string) — usually empty for cluster-scoped objects
+            let s = String::from_utf8_lossy(fd).into_owned();
+            if !s.is_empty() {
+                meta["namespace"] = serde_json::Value::String(s);
+            }
+        }
+        (5, 2) => {
+            // uid (string)
+            let s = String::from_utf8_lossy(fd).into_owned();
+            if !s.is_empty() {
+                meta["uid"] = serde_json::Value::String(s);
+            }
+        }
+        (6, 2) => {
+            // resourceVersion (string)
+            let s = String::from_utf8_lossy(fd).into_owned();
+            if !s.is_empty() {
+                meta["resourceVersion"] = serde_json::Value::String(s);
+            }
+        }
+        (11, 2) => {
+            // labels map entry
+            if let Some((k, v)) = decode_map_entry(fd) {
+                labels
+                    .get_or_insert_with(serde_json::Map::new)
+                    .insert(k, serde_json::Value::String(v));
+            }
+        }
+        (12, 2) => {
+            // annotations map entry
+            if let Some((k, v)) = decode_map_entry(fd) {
+                annotations
+                    .get_or_insert_with(serde_json::Map::new)
+                    .insert(k, serde_json::Value::String(v));
+            }
+        }
+        _ => {} // ignore other fields (creationTimestamp wire type 2, generation varint, etc.)
+    }
+}
+
 /// Decode a proto-encoded Namespace object into a `serde_json::Value`.
 ///
 /// Namespace proto layout (k8s.io/api/core/v1/generated.proto):
@@ -90,58 +156,7 @@ pub fn decode_namespace_proto(data: &[u8]) -> Option<serde_json::Value> {
         if field_number == 1 {
             // field 1 = ObjectMeta
             scan_mixed_fields(field_data, |fn2, wt, fd| {
-                match (fn2, wt) {
-                    (1, 2) => {
-                        // name (string)
-                        meta["name"] =
-                            serde_json::Value::String(String::from_utf8_lossy(fd).into_owned());
-                    }
-                    (2, 2) => {
-                        // generateName (string)
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            meta["generateName"] = serde_json::Value::String(s);
-                        }
-                    }
-                    (3, 2) => {
-                        // namespace (string) — usually empty for cluster-scoped objects
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            meta["namespace"] = serde_json::Value::String(s);
-                        }
-                    }
-                    (5, 2) => {
-                        // uid (string)
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            meta["uid"] = serde_json::Value::String(s);
-                        }
-                    }
-                    (6, 2) => {
-                        // resourceVersion (string)
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            meta["resourceVersion"] = serde_json::Value::String(s);
-                        }
-                    }
-                    (11, 2) => {
-                        // labels map entry
-                        if let Some((k, v)) = decode_map_entry(fd) {
-                            labels
-                                .get_or_insert_with(serde_json::Map::new)
-                                .insert(k, serde_json::Value::String(v));
-                        }
-                    }
-                    (12, 2) => {
-                        // annotations map entry
-                        if let Some((k, v)) = decode_map_entry(fd) {
-                            annotations
-                                .get_or_insert_with(serde_json::Map::new)
-                                .insert(k, serde_json::Value::String(v));
-                        }
-                    }
-                    _ => {} // ignore other fields (creationTimestamp wire type 2, generation varint, etc.)
-                }
+                decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
             });
         }
         // field 2 (NamespaceSpec) and field 3 (NamespaceStatus) are ignored —
@@ -181,52 +196,9 @@ pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
     scan_length_delimited_fields(data, |field_number, field_data| {
         match field_number {
             1 => {
-                // ObjectMeta — same layout as in decode_namespace_proto
+                // ObjectMeta — same layout as decode_namespace_proto
                 scan_mixed_fields(field_data, |fn2, wt, fd| {
-                    match (fn2, wt) {
-                        (1, 2) => {
-                            meta["name"] = serde_json::Value::String(String::from_utf8_lossy(fd).into_owned());
-                        }
-                        (2, 2) => {
-                            let s = String::from_utf8_lossy(fd).into_owned();
-                            if !s.is_empty() {
-                                meta["generateName"] = serde_json::Value::String(s);
-                            }
-                        }
-                        (3, 2) => {
-                            let s = String::from_utf8_lossy(fd).into_owned();
-                            if !s.is_empty() {
-                                meta["namespace"] = serde_json::Value::String(s);
-                            }
-                        }
-                        (5, 2) => {
-                            let s = String::from_utf8_lossy(fd).into_owned();
-                            if !s.is_empty() {
-                                meta["uid"] = serde_json::Value::String(s);
-                            }
-                        }
-                        (6, 2) => {
-                            let s = String::from_utf8_lossy(fd).into_owned();
-                            if !s.is_empty() {
-                                meta["resourceVersion"] = serde_json::Value::String(s);
-                            }
-                        }
-                        (11, 2) => {
-                            if let Some((k, v)) = decode_map_entry(fd) {
-                                labels
-                                    .get_or_insert_with(serde_json::Map::new)
-                                    .insert(k, serde_json::Value::String(v));
-                            }
-                        }
-                        (12, 2) => {
-                            if let Some((k, v)) = decode_map_entry(fd) {
-                                annotations
-                                    .get_or_insert_with(serde_json::Map::new)
-                                    .insert(k, serde_json::Value::String(v));
-                            }
-                        }
-                        _ => {}
-                    }
+                    decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
                 });
             }
             2 => {
@@ -278,51 +250,7 @@ pub fn decode_node_proto(data: &[u8]) -> Option<serde_json::Value> {
         if field_number == 1 {
             // field 1 = ObjectMeta — same layout as decode_namespace_proto
             scan_mixed_fields(field_data, |fn2, wt, fd| {
-                match (fn2, wt) {
-                    (1, 2) => {
-                        meta["name"] =
-                            serde_json::Value::String(String::from_utf8_lossy(fd).into_owned());
-                    }
-                    (2, 2) => {
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            meta["generateName"] = serde_json::Value::String(s);
-                        }
-                    }
-                    (3, 2) => {
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            meta["namespace"] = serde_json::Value::String(s);
-                        }
-                    }
-                    (5, 2) => {
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            meta["uid"] = serde_json::Value::String(s);
-                        }
-                    }
-                    (6, 2) => {
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            meta["resourceVersion"] = serde_json::Value::String(s);
-                        }
-                    }
-                    (11, 2) => {
-                        if let Some((k, v)) = decode_map_entry(fd) {
-                            labels
-                                .get_or_insert_with(serde_json::Map::new)
-                                .insert(k, serde_json::Value::String(v));
-                        }
-                    }
-                    (12, 2) => {
-                        if let Some((k, v)) = decode_map_entry(fd) {
-                            annotations
-                                .get_or_insert_with(serde_json::Map::new)
-                                .insert(k, serde_json::Value::String(v));
-                        }
-                    }
-                    _ => {}
-                }
+                decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
             });
         }
         // field 2 (NodeSpec) and field 3 (NodeStatus) are ignored — treated as opaque.
