@@ -1,8 +1,8 @@
 # Dashboard
 
-2026-05-20T10:45 UTC
+2026-05-20T13:03 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 2 (mayor-adg P1, mayor-xy2 P3)
+Open beads: 1 (mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
@@ -11,26 +11,31 @@ Open beads: 2 (mayor-adg P1, mayor-xy2 P3)
 - Test `rbac_index_evicted_on_soft_delete_of_clusterrolebinding` verifies alice loses access immediately on DELETE, not after finalizers clear
 - CI pending; do not merge without your review
 
+**Review PR #74 before merge — regression tests only (no logic changes):**
+- mayor-adg: adds `accepts_patch_content_type()` and `build_server_sans()` pure functions with unit tests
+- Tests fail if strategic-merge-patch fix or host.lima.internal SAN hardcoding is reverted
+- 219 tests passing, clippy clean — lower risk, but review if you wish before merge
+
 **Nothing else blocked on you.**
 
 ## In-flight
 
 - **PR #73** — 4-bead cluster (RBAC soft-delete, json-patch add, watch 410, field-selector dedup). CI pending. **Flagged for operator review.**
-- **mayor-adg (P1)** — retroactive regression tests for PRs #67-68 (sendInitialEvents annotation, strategic-merge-patch, SAN inclusion). Ready to dispatch.
+- **PR #74** — regression tests for PRs #67-68 fixes. 219 tests. CI pending. Operator review optional.
 
 ## Recent progress
 
+- Closed mayor-adg: PR #74 open with 4 new regression tests (accepts_patch_content_type, build_server_sans x2; sendInitialEvents already had test).
 - Merged PRs #69 (proto varint test), #70 (TLS partial CA fix), #71 (RBAC seed metadata + key parsing).
 - Policy update committed: Rule 14 — every bug fix ships with a regression test; testing policy added to worker preamble.
-- Closed: mayor-oyn, mayor-ofi, mayor-iek, mayor-lyc, mayor-032, mayor-9zd, mayor-cst, mayor-1cy.
-- Caught and closed PR #72 (first cluster-a attempt): worker deleted sendInitialEvents implementation. Redone directly with all 3 strings verified present (20 hits in generic.rs, 5 in pods.rs).
-- 226 tests total, 10 new regression tests added in PR #73.
+- 226 tests total in PR #73 branch, 219 in PR #74 branch (PR #74 is based on main at 472ade0).
 
 ## Forward-looking
 
-1. **mayor-adg** — dispatch worker to add regression tests for PRs #67-68 (sendInitialEvents BOOKMARK annotation, strategic-merge-patch, SAN inclusion).
-2. **Pod lifecycle** — no remaining known kubelet blockers. Once PR #73 merged, verify pod reaches Succeeded on lima-node, then add CI smoke job.
-3. **mayor-xy2** (CR schema validation, P3) — deferred until Argo CD milestone.
+1. **PR #73** — merge after operator review (RBAC security surface)
+2. **PR #74** — merge after CI green (or operator review if desired)
+3. **Pod lifecycle** — once both PRs merged, verify pod reaches Succeeded on lima-node, add CI smoke job
+4. **mayor-xy2** (CR schema validation, P3) — deferred until Argo CD milestone
 
 ## Stance
 
