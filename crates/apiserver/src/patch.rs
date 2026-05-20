@@ -364,4 +364,151 @@ mod tests {
             "replacement element must be the patch value"
         );
     }
+
+    #[test]
+    fn test_smp_multiple_patch_delete() {
+        // A patch with two $patch:delete elements must delete both matching elements.
+        // This matters because each delete is processed independently in a loop; if the
+        // loop short-circuits or skips after the first delete the second target survives.
+        let mut target = json!({
+            "spec": {
+                "containers": [
+                    {"name": "alpha", "image": "a:1"},
+                    {"name": "beta",  "image": "b:1"},
+                    {"name": "gamma", "image": "g:1"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "containers": [
+                    {"name": "alpha", "$patch": "delete"},
+                    {"name": "gamma", "$patch": "delete"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 1, "both deleted containers must be gone");
+        assert_eq!(
+            containers[0]["name"].as_str().unwrap(),
+            "beta",
+            "non-deleted container must survive"
+        );
+    }
+
+    #[test]
+    fn test_smp_patch_replace_directive() {
+        // A patch containing $patch:replace replaces the entire array with the remaining
+        // non-directive elements. Existing containers are discarded entirely; the directive
+        // element itself must not appear in the result.
+        let mut target = json!({
+            "spec": {
+                "containers": [
+                    {"name": "old-a", "image": "a:1"},
+                    {"name": "old-b", "image": "b:1"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "containers": [
+                    {"$patch": "replace"},
+                    {"name": "new-only", "image": "n:1"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["containers"].as_array().unwrap();
+        assert_eq!(
+            containers.len(),
+            1,
+            "$patch:replace must discard old containers and yield exactly the non-directive elements"
+        );
+        assert_eq!(
+            containers[0]["name"].as_str().unwrap(),
+            "new-only",
+            "only the non-directive patch element must remain"
+        );
+        assert!(
+            containers.iter().all(|c| c.get("$patch").is_none()),
+            "directive element must not appear in the result array"
+        );
+    }
+
+    #[test]
+    fn test_smp_element_without_merge_key_is_appended() {
+        // A normal patch element (no $patch directive) that lacks the merge key cannot
+        // match any existing element, so it must be appended.  If the code ever changes
+        // to error-out instead, this test will catch it.
+        let mut target = json!({
+            "spec": {
+                "containers": [
+                    {"name": "existing", "image": "e:1"}
+                ]
+            }
+        });
+        // Patch element has no "name" field — the merge key for spec.containers.
+        let patch = json!({
+            "spec": {
+                "containers": [
+                    {"image": "no-name:1"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["containers"].as_array().unwrap();
+        assert_eq!(
+            containers.len(),
+            2,
+            "element without a merge key must be appended, not dropped or merged"
+        );
+        assert_eq!(
+            containers[1]["image"].as_str().unwrap(),
+            "no-name:1",
+            "the appended element must be the patch element as-is"
+        );
+    }
+
+    #[test]
+    fn test_smp_patch_delete_with_empty_merge_key_value() {
+        // $patch:delete where the merge key is present but set to "" (empty string).
+        // The code matches by value equality, so it removes elements whose merge key
+        // is exactly "".  Elements with a non-empty merge key must be untouched.
+        let mut target = json!({
+            "spec": {
+                "containers": [
+                    {"name": "",      "image": "unnamed:1"},
+                    {"name": "real",  "image": "real:1"}
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "containers": [
+                    {"name": "", "$patch": "delete"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["containers"].as_array().unwrap();
+        assert_eq!(
+            containers.len(),
+            1,
+            "element with empty merge key value must be deleted"
+        );
+        assert_eq!(
+            containers[0]["name"].as_str().unwrap(),
+            "real",
+            "element with non-empty merge key must be untouched"
+        );
+    }
 }

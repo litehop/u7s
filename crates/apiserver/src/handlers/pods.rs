@@ -10,12 +10,11 @@ use serde::Deserialize;
 use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
 
 use crate::{
-    handlers::generic::parse_resource_version,
     keys::{cluster_object_key, list_prefix, object_key},
     state::AppState,
     status::Status,
     types::{Namespace, Object},
-    util::extract_body,
+    util::{extract_body, parse_resource_version},
 };
 
 #[derive(Deserialize)]
