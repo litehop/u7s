@@ -103,6 +103,30 @@ fn load_or_generate_ca(
     let key_exists = std::path::Path::new(ca_key_path).exists();
     let cert_exists = std::path::Path::new(ca_cert_path).exists();
 
+    // Detect partial state: exactly one of the two files exists (e.g. the server
+    // crashed between the two fs::write calls). Silently falling through to
+    // generate a fresh CA would rotate the CA and break kubelets that already
+    // trust the old cert. Instead: log an error, delete the stale file, and
+    // fall through to the normal "generate fresh CA" path so the state is clean.
+    if key_exists ^ cert_exists {
+        if key_exists {
+            tracing::error!(
+                "partial CA state: {ca_key_path} exists but {ca_cert_path} is missing; \
+                 deleting stale key and regenerating CA"
+            );
+            std::fs::remove_file(ca_key_path)
+                .map_err(|e| anyhow::anyhow!("remove stale CA key {ca_key_path}: {e}"))?;
+        } else {
+            tracing::error!(
+                "partial CA state: {ca_cert_path} exists but {ca_key_path} is missing; \
+                 deleting stale cert and regenerating CA"
+            );
+            std::fs::remove_file(ca_cert_path)
+                .map_err(|e| anyhow::anyhow!("remove stale CA cert {ca_cert_path}: {e}"))?;
+        }
+        // Fall through to generate a fresh CA below.
+    }
+
     if key_exists && cert_exists {
         // Load CA key from PEM.
         let key_pem = std::fs::read_to_string(ca_key_path)
@@ -476,6 +500,62 @@ mod tests {
         );
 
         // Clean up.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Helper: call load_or_generate_ca with paths inside `dir`.
+    fn run_load_or_generate_ca(dir: &std::path::Path) -> anyhow::Result<(KeyPair, rcgen::Certificate, Vec<u8>)> {
+        let ca_key_path = dir.join("ca.key").to_string_lossy().into_owned();
+        let ca_cert_path = dir.join("ca.crt").to_string_lossy().into_owned();
+        load_or_generate_ca(&ca_key_path, &ca_cert_path)
+    }
+
+    #[test]
+    fn partial_state_only_key_recovers() {
+        // Simulate a crash after ca.key was written but before ca.crt was written.
+        // load_or_generate_ca must: delete the stale key, generate a fresh CA,
+        // and return Ok with both files present. Without this fix the stale key
+        // would be silently overwritten and kubelets trusting the previous CA
+        // would break on server restart.
+        let dir = test_temp_dir("partial-key");
+        let ca_key_path = dir.join("ca.key");
+        let ca_cert_path = dir.join("ca.crt");
+
+        // Write only ca.key — no ca.crt.
+        std::fs::write(&ca_key_path, b"dummy-key-content").expect("write dummy ca.key");
+        assert!(ca_key_path.exists());
+        assert!(!ca_cert_path.exists());
+
+        let result = run_load_or_generate_ca(&dir);
+        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
+
+        assert!(ca_key_path.exists(), "ca.key must exist after recovery");
+        assert!(ca_cert_path.exists(), "ca.crt must exist after recovery");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_state_only_cert_recovers() {
+        // Simulate a crash after ca.crt was written but after ca.key was deleted
+        // (or ca.key was never written, e.g. manual operator error).
+        // load_or_generate_ca must: delete the stale cert, generate a fresh CA,
+        // and return Ok with both files present.
+        let dir = test_temp_dir("partial-cert");
+        let ca_key_path = dir.join("ca.key");
+        let ca_cert_path = dir.join("ca.crt");
+
+        // Write only ca.crt — no ca.key.
+        std::fs::write(&ca_cert_path, b"dummy-cert-content").expect("write dummy ca.crt");
+        assert!(!ca_key_path.exists());
+        assert!(ca_cert_path.exists());
+
+        let result = run_load_or_generate_ca(&dir);
+        assert!(result.is_ok(), "expected Ok but got: {:?}", result.err());
+
+        assert!(ca_key_path.exists(), "ca.key must exist after recovery");
+        assert!(ca_cert_path.exists(), "ca.crt must exist after recovery");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
