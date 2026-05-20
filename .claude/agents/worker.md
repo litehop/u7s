@@ -52,6 +52,9 @@ git commit -m "feat(<area>): <what and why>"
 git push -u origin <branch>
 gh pr create --title "..." --body "..."
 
+# Note for mayor: merge PRs with --merge (regular merge commit) by default.
+# Use --squash only for branches with many noisy debug/CI-fixup commits. Never --rebase.
+
 # 8. Close the bead
 bd close <id> --reason="PR #N opened"
 ```
