@@ -428,6 +428,7 @@ pub async fn create_pod(
     // Ensure namespace is set in the stored object
     obj.body["metadata"]["namespace"] =
         serde_json::Value::String(ns.as_str().to_owned());
+    crate::handlers::generic::stamp_metadata(&mut obj);
 
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state

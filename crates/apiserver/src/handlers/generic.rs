@@ -411,6 +411,17 @@ fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
 
 use crate::util::{extract_body, utc_now_rfc3339};
 
+pub(crate) fn stamp_metadata(obj: &mut Object) {
+    if obj.body["metadata"]["uid"].is_null() {
+        obj.body["metadata"]["uid"] =
+            serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+    }
+    if obj.body["metadata"]["creationTimestamp"].is_null() {
+        obj.body["metadata"]["creationTimestamp"] =
+            serde_json::Value::String(utc_now_rfc3339());
+    }
+}
+
 const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
 
 /// Build the RBAC index key for a cluster-scoped object.
@@ -559,6 +570,7 @@ pub async fn create_resource(
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let name = resolve_name(&mut obj)?;
+    stamp_metadata(&mut obj);
 
     let key = group_object_key(&group, &plural, None, &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
@@ -933,6 +945,7 @@ pub async fn create_namespaced_resource(
     let name = resolve_name(&mut obj)?;
 
     obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
+    stamp_metadata(&mut obj);
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
@@ -3150,5 +3163,58 @@ mod tests {
             "soft-deleted ClusterRoleBinding must be evicted from RBAC index immediately, \
              not wait for finalizers to clear"
         );
+    }
+
+    #[test]
+    fn stamp_metadata_sets_uid_when_absent() {
+        // Kubelet requires a non-empty pod UID to name the sandbox — the server must
+        // assign a UUID v4 if the client did not supply one. Without this fix, cri-o
+        // fails with "cannot generate pod name without uid in metadata".
+        let mut obj = Object::from_bytes(
+            &bytes::Bytes::from(serde_json::json!({
+                "metadata": { "name": "hello-world" }
+            }).to_string())
+        ).unwrap();
+        stamp_metadata(&mut obj);
+        let uid = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+        assert!(!uid.is_empty(), "uid must be assigned by server");
+        let parts: Vec<&str> = uid.split('-').collect();
+        assert_eq!(parts.len(), 5, "uid must be UUID with 5 hyphen-separated groups");
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 4);
+        assert_eq!(parts[2].len(), 4);
+        assert_eq!(parts[3].len(), 4);
+        assert_eq!(parts[4].len(), 12);
+    }
+
+    #[test]
+    fn stamp_metadata_preserves_client_supplied_uid() {
+        // If the client supplies a UID (e.g. during restore or testing), the server
+        // must not overwrite it.
+        let mut obj = Object::from_bytes(
+            &bytes::Bytes::from(serde_json::json!({
+                "metadata": { "name": "hello-world", "uid": "my-custom-uid" }
+            }).to_string())
+        ).unwrap();
+        stamp_metadata(&mut obj);
+        assert_eq!(
+            obj.body["metadata"]["uid"].as_str().unwrap(),
+            "my-custom-uid",
+            "server must not overwrite a client-supplied uid"
+        );
+    }
+
+    #[test]
+    fn stamp_metadata_sets_creation_timestamp_when_absent() {
+        // creationTimestamp must be a non-empty RFC3339 string after stamping.
+        let mut obj = Object::from_bytes(
+            &bytes::Bytes::from(serde_json::json!({
+                "metadata": { "name": "hello-world" }
+            }).to_string())
+        ).unwrap();
+        stamp_metadata(&mut obj);
+        let ts = obj.body["metadata"]["creationTimestamp"].as_str().unwrap_or("");
+        assert!(!ts.is_empty(), "creationTimestamp must be set");
+        assert!(ts.contains('T'), "creationTimestamp must be RFC3339");
     }
 }
