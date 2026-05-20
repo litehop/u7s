@@ -1710,6 +1710,14 @@ fn detect_patch_type(headers: &HeaderMap) -> Result<PatchType, crate::status::St
     if content_type.contains("application/json-patch+json") {
         return Ok(PatchType::Json);
     }
+    // Treat server-side apply as strategic-merge-patch: we don't implement full SSA
+    // semantics (field ownership, managed fields), but the apply body is structurally
+    // identical to a strategic-merge-patch body.  This is sufficient for kubelet's
+    // Lease and CSINode use cases; without this kubelet gets 415 and logs
+    // "invalid JSON: expected value at line 1 column 1".
+    if content_type.contains("application/apply-patch+yaml") {
+        return Ok(PatchType::StrategicMerge);
+    }
     Err(Status::unsupported_media_type(format!(
         "unsupported media type '{content_type}'; use application/merge-patch+json, application/strategic-merge-patch+json, or application/json-patch+json"
     )))
@@ -2324,6 +2332,20 @@ mod tests {
         // application/json-patch+json must now be accepted instead of 415
         let h = headers_with_content_type("application/json-patch+json");
         assert!(matches!(detect_patch_type(&h), Ok(PatchType::Json)));
+    }
+
+    #[test]
+    fn detect_patch_type_accepts_apply_patch_yaml_as_strategic_merge() {
+        // kubelet 1.36 sends application/apply-patch+yaml for Lease and CSINode SSA requests.
+        // Without this branch, detect_patch_type returns 415 and kubelet logs
+        // "invalid JSON: expected value at line 1 column 1", blocking node Ready.
+        // We treat SSA bodies as strategic-merge-patch: no field-ownership semantics,
+        // but structurally identical for kubelet's use cases.
+        let h = headers_with_content_type("application/apply-patch+yaml");
+        assert!(
+            matches!(detect_patch_type(&h), Ok(PatchType::StrategicMerge)),
+            "application/apply-patch+yaml must be accepted as StrategicMerge, not rejected with 415"
+        );
     }
 
     // -- generate_suffix + resolve_name --
@@ -3216,5 +3238,102 @@ mod tests {
         let ts = obj.body["metadata"]["creationTimestamp"].as_str().unwrap_or("");
         assert!(!ts.is_empty(), "creationTimestamp must be set");
         assert!(ts.contains('T'), "creationTimestamp must be RFC3339");
+    }
+
+    // -- mayor-1fu: server-side apply (application/apply-patch+yaml) must not return 415 --
+
+    /// kubelet 1.36 PATCHes Lease and CSINode objects using
+    /// Content-Type: application/apply-patch+yaml (server-side apply).
+    /// Before this fix, detect_patch_type returned 415 and kubelet logged
+    /// "invalid JSON: expected value at line 1 column 1", blocking node Ready.
+    ///
+    /// This test creates a Lease, then PATCHes it with application/apply-patch+yaml
+    /// and asserts the PATCH succeeds and the resource is updated.
+    /// If the fix is reverted, detect_patch_type returns 415 and the PATCH fails.
+    #[tokio::test]
+    async fn apply_patch_yaml_accepted_and_updates_resource() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Create the Lease via PUT (no resourceVersion → unconditional create).
+        replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(None),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Lease PUT must succeed"))
+        .into_response();
+
+        // PATCH the Lease using application/apply-patch+yaml (server-side apply).
+        // The body is a strategic-merge-patch-shaped document: only the fields we
+        // want to change.  Without the fix, detect_patch_type returns 415 here.
+        let patch = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "worker-node-1",
+                "namespace": "kube-node-lease"
+            },
+            "spec": {
+                "holderIdentity": "worker-node-1",
+                "leaseDurationSeconds": 40,
+                "renewTime": "2026-05-21T00:00:00Z"
+            }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let patch_result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await;
+
+        assert!(
+            patch_result.is_ok(),
+            "PATCH with application/apply-patch+yaml must return 200, not 415 — \
+             kubelet uses SSA for Lease/CSINode and interprets 415 as JSON decode failure"
+        );
+
+        // Verify that the patch was actually applied (renewTime updated).
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/worker-node-1";
+        let stored = store.get(key).await.expect("store get").expect("Lease must exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["renewTime"],
+            "2026-05-21T00:00:00Z",
+            "spec.renewTime must be updated by the SSA patch"
+        );
     }
 }
