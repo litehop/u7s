@@ -869,6 +869,41 @@ mod tests {
         assert_eq!(result["spec"]["podCIDR"], "10.0.0.0/24");
     }
 
+    /// decode_node_proto must not panic and must return Some when NodeSpec contains the
+    /// `unschedulable` field (field 4, wire type 0, varint=1).
+    ///
+    /// Real kubelets send `unschedulable=true` during maintenance (node cordoning). The NodeSpec
+    /// scanner uses scan_length_delimited_fields, which silently skips varint fields. This test
+    /// guards against a future change to the scanner accidentally turning the silent-skip into a
+    /// panic or a None return for nodes that are unschedulable.
+    ///
+    /// Protobuf encoding of `unschedulable=true` in NodeSpec:
+    ///   tag = (field 4 << 3) | wire_type 0 = 0x20
+    ///   value = varint 1 = 0x01
+    #[test]
+    fn decode_node_proto_unschedulable_node_does_not_panic() {
+        // Build: Node {
+        //   metadata: ObjectMeta { name: "maintenance-node" },
+        //   spec: NodeSpec { podCIDR: "10.0.1.0/24", unschedulable: true }
+        // }
+        let obj_meta = encode_length_delimited(1, b"maintenance-node");
+        let mut node_spec = Vec::new();
+        node_spec.extend_from_slice(&encode_length_delimited(1, b"10.0.1.0/24")); // NodeSpec.podCIDR
+        // NodeSpec.unschedulable = true: tag=0x20 (field 4, wire type 0), value=0x01
+        node_spec.push(0x20);
+        node_spec.push(0x01);
+
+        let mut node_proto = encode_length_delimited(1, &obj_meta);
+        node_proto.extend_from_slice(&encode_length_delimited(2, &node_spec));
+
+        // Must return Some — the varint field must be silently skipped, not cause a panic or None.
+        let result = decode_node_proto(&node_proto)
+            .expect("decode_node_proto must return Some even when unschedulable=true is present");
+
+        assert_eq!(result["metadata"]["name"], "maintenance-node");
+        assert_eq!(result["spec"]["podCIDR"], "10.0.1.0/24");
+    }
+
     /// decode_core_proto_by_kind must dispatch to decode_node_proto for kind="Node".
     /// This is the dispatch fix that ensures extract_body can handle kubelet Node proto bodies.
     #[test]
