@@ -60,7 +60,9 @@ impl AppState {
                     for obj in resp.items {
                         // Store key: /registry/<group>/<plural>/<name>
                         // apply_object expects: /apis/<group>/v1/<plural>/<name>
-                        let name = obj.key.trim_start_matches(&prefix);
+                        // Use strip_prefix (strips exactly once) instead of
+                        // trim_start_matches (strips all occurrences of the pattern).
+                        let name = obj.key.strip_prefix(prefix.as_str()).unwrap_or(&obj.key);
                         let api_key = format!("/apis/{GROUP}/v1/{plural}/{name}");
                         match serde_json::from_slice::<serde_json::Value>(&obj.value) {
                             Ok(val) => self.rbac_index.apply_object(&api_key, &val),
@@ -83,7 +85,9 @@ impl AppState {
                     for obj in resp.items {
                         // Store key: /registry/<group>/<plural>/<ns>/<name>
                         // apply_object expects: /apis/<group>/v1/namespaces/<ns>/<plural>/<name>
-                        let rest = obj.key.trim_start_matches(&prefix);
+                        // Use strip_prefix (strips exactly once) instead of
+                        // trim_start_matches (strips all occurrences of the pattern).
+                        let rest = obj.key.strip_prefix(prefix.as_str()).unwrap_or(&obj.key);
                         // rest = "<ns>/<name>"
                         let api_key = match rest.split_once('/') {
                             Some((ns, name)) => {
@@ -204,6 +208,74 @@ mod tests {
         // handler doesn't reject the request when the object already exists.
         assert!(meta.create_or_update, "csinodes must have create_or_update=true");
         assert!(!meta.namespaced, "csinodes is cluster-scoped");
+    }
+
+    // Helper: mirrors the cluster-scoped key-to-api-path transformation used in init().
+    fn cluster_key_to_api_path(group: &str, plural: &str, store_key: &str) -> String {
+        let prefix = format!("/registry/{group}/{plural}/");
+        let name = store_key.strip_prefix(prefix.as_str()).unwrap_or(store_key);
+        format!("/apis/{group}/v1/{plural}/{name}")
+    }
+
+    // Helper: mirrors the namespaced key-to-api-path transformation used in init().
+    fn namespaced_key_to_api_path(
+        group: &str,
+        plural: &str,
+        store_key: &str,
+    ) -> Option<String> {
+        let prefix = format!("/registry/{group}/{plural}/");
+        let rest = store_key.strip_prefix(prefix.as_str()).unwrap_or(store_key);
+        rest.split_once('/').map(|(ns, name)| {
+            format!("/apis/{group}/v1/namespaces/{ns}/{plural}/{name}")
+        })
+    }
+
+    const GROUP: &str = "rbac.authorization.k8s.io";
+
+    #[test]
+    fn clusterrolebinding_store_key_parses_to_correct_name() {
+        // A store key /registry/<group>/clusterrolebindings/system:node must produce
+        // an api path ending in /clusterrolebindings/system:node so the RBAC index
+        // receives the right key when AppState::init() populates it at startup.
+        let store_key = format!("/registry/{GROUP}/clusterrolebindings/system:node");
+        let api_path = cluster_key_to_api_path(GROUP, "clusterrolebindings", &store_key);
+        assert_eq!(
+            api_path,
+            format!("/apis/{GROUP}/v1/clusterrolebindings/system:node"),
+            "clusterrolebinding store key must map to correct api path"
+        );
+    }
+
+    #[test]
+    fn rolebinding_store_key_parses_to_correct_namespace_and_name() {
+        // A store key /registry/<group>/rolebindings/<ns>/<name> must produce an api
+        // path of /apis/<group>/v1/namespaces/<ns>/rolebindings/<name> so namespaced
+        // RBAC policies are indexed under the right key at startup.
+        let store_key = format!("/registry/{GROUP}/rolebindings/kube-system/my-binding");
+        let api_path =
+            namespaced_key_to_api_path(GROUP, "rolebindings", &store_key)
+                .expect("valid namespaced key must produce Some");
+        assert_eq!(
+            api_path,
+            format!("/apis/{GROUP}/v1/namespaces/kube-system/rolebindings/my-binding"),
+            "rolebinding store key must map to correct namespaced api path"
+        );
+    }
+
+    #[test]
+    fn strip_prefix_strips_exactly_once_not_repeatedly() {
+        // trim_start_matches would strip all leading occurrences of the pattern; strip_prefix
+        // strips exactly one. This test encodes why we use strip_prefix: a name that begins
+        // with the same characters as the suffix of the prefix must not be double-stripped.
+        let group = "rbac.authorization.k8s.io";
+        let plural = "clusterroles";
+        let prefix = format!("/registry/{group}/{plural}/");
+        let doubled = format!("{prefix}{prefix}");
+        let name = doubled.strip_prefix(prefix.as_str()).unwrap_or(&doubled);
+        assert_eq!(
+            name, prefix.as_str(),
+            "strip_prefix must strip exactly one prefix occurrence, not recursively"
+        );
     }
 
     /// kubelet lists node.k8s.io/v1/runtimeclasses on startup. Without this entry the
