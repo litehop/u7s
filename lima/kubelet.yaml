@@ -44,6 +44,15 @@ provision:
         > /etc/apt/sources.list.d/cri-o.list
       apt-get update -qq
       apt-get install -y cri-o crun
+      mkdir -p /etc/crio/crio.conf.d
+      cat > /etc/crio/crio.conf.d/10-crun.conf <<'CRUN'
+      [crio.runtime]
+      default_runtime = "crun"
+      [crio.runtime.runtimes.crun]
+      runtime_path = "/usr/bin/crun"
+      runtime_type = "oci"
+      runtime_root = "/run/crun"
+      CRUN
       systemctl enable --now crio
 
       # Install kubelet 1.36 from pkgs.k8s.io

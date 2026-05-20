@@ -30,6 +30,9 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/cri-o.list
           sudo apt-get update -qq
           sudo apt-get install -y cri-o crun
+          sudo mkdir -p /etc/crio/crio.conf.d
+          printf '[crio.runtime]\ndefault_runtime = "crun"\n[crio.runtime.runtimes.crun]\nruntime_path = "/usr/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
+            | sudo tee /etc/crio/crio.conf.d/10-crun.conf
           sudo systemctl enable --now crio
 
       - name: Install kubelet and kubectl ${{ matrix.k8s }}
