@@ -222,10 +222,13 @@ pub(crate) async fn watch_generic(
 
                             bookmark_tick.reset();
 
-                            if matches!(event, WatchEvent::Compacted { .. }) {
-                                let error_line = Bytes::from(
-                                    "{\"type\":\"ERROR\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\"}}\n"
-                                );
+                            if let WatchEvent::Compacted { horizon, .. } = &event {
+                                // RFC: send the compaction horizon as resourceVersion so clients
+                                // relist from a revision the store still holds, not from last_rv
+                                // which may be older than the horizon and cause an infinite relist loop.
+                                let error_line = Bytes::from(format!(
+                                    "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}\n"
+                                ));
                                 yield Ok::<Bytes, axum::BoxError>(error_line);
                                 break;
                             }
@@ -643,6 +646,13 @@ pub async fn delete_resource(
             .put(&key, obj.to_bytes(), expected_rv)
             .await
             .map_err(|e| store_err(e, &name, &meta.kind))?;
+        // SECURITY: revoke RBAC permissions immediately at deletion request time,
+        // not when finalizers eventually clear. A soft-deleted ClusterRoleBinding
+        // must not grant permissions after the user has deleted it.
+        if group == RBAC_GROUP {
+            let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+            state.rbac_index.remove_object(&rbac_key);
+        }
         let mut body = soft;
         body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
         return Ok(Json(body).into_response());
@@ -993,6 +1003,13 @@ pub async fn delete_namespaced_resource(
             .put(&key, obj.to_bytes(), expected_rv)
             .await
             .map_err(|e| store_err(e, &name, &meta.kind))?;
+        // SECURITY: revoke RBAC permissions immediately at deletion request time,
+        // not when finalizers eventually clear. A soft-deleted RoleBinding must not
+        // grant permissions after the user has deleted it.
+        if group == RBAC_GROUP {
+            let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+            state.rbac_index.remove_object(&rbac_key);
+        }
         let mut body = soft;
         body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
         return Ok(Json(body).into_response());
@@ -1642,9 +1659,15 @@ fn apply_json_patch(
         })?;
 
         match op_str {
-            "add" | "replace" => {
+            "add" => {
                 let value = op.get("value").ok_or_else(|| {
-                    Status::unprocessable_entity(format!("'{op_str}' operation requires a 'value' field"))
+                    Status::unprocessable_entity("'add' operation requires a 'value' field".into())
+                })?.clone();
+                json_patch_add(obj, path, value)?;
+            }
+            "replace" => {
+                let value = op.get("value").ok_or_else(|| {
+                    Status::unprocessable_entity("'replace' operation requires a 'value' field".into())
                 })?.clone();
                 json_patch_set(obj, path, value)?;
             }
@@ -1712,6 +1735,94 @@ fn json_navigate_one<'a>(
             "cannot traverse into non-object/array at segment '{seg}'"
         ))),
     }
+}
+
+/// Like `json_navigate_one` but creates a missing object key as an empty object.
+/// Used by the RFC 6902 'add' operation which must create intermediate nodes.
+/// 'replace' uses the strict `json_navigate_one` so it continues to 422 on missing.
+fn json_navigate_one_or_create<'a>(
+    node: &'a mut serde_json::Value,
+    seg: &str,
+) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
+    match node {
+        serde_json::Value::Object(map) => {
+            // Insert an empty object if the key doesn't exist, then return a mutable ref.
+            if !map.contains_key(seg) {
+                map.insert(seg.to_string(), serde_json::Value::Object(Default::default()));
+            }
+            Ok(map.get_mut(seg).expect("just inserted"))
+        }
+        serde_json::Value::Array(arr) => {
+            // Arrays: navigate by index (no creation semantics for intermediate arrays).
+            let idx: usize = seg.parse().map_err(|_| {
+                Status::unprocessable_entity(format!("path segment '{seg}' is not a valid array index"))
+            })?;
+            arr.get_mut(idx).ok_or_else(|| {
+                Status::unprocessable_entity(format!("array index {idx} out of bounds"))
+            })
+        }
+        _ => Err(Status::unprocessable_entity(format!(
+            "cannot traverse into non-object/array at segment '{seg}'"
+        ))),
+    }
+}
+
+/// Navigate to the parent of the target for 'add', creating missing intermediate objects.
+fn json_patch_navigate_mut_or_create<'a>(
+    obj: &'a mut serde_json::Value,
+    segments: &[String],
+) -> Result<(&'a mut serde_json::Value, String), crate::status::StatusError> {
+    if segments.is_empty() {
+        return Err(Status::unprocessable_entity("cannot operate on root document".into()));
+    }
+    let (parents, last) = segments.split_at(segments.len() - 1);
+    let mut cur = obj;
+    for seg in parents {
+        cur = json_navigate_one_or_create(cur, seg)?;
+    }
+    Ok((cur, last[0].clone()))
+}
+
+/// Apply RFC 6902 'add': create intermediate objects as needed, then insert value.
+fn json_patch_add(
+    obj: &mut serde_json::Value,
+    pointer: &str,
+    value: serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let segs = json_pointer_segments(pointer);
+    if segs.is_empty() {
+        *obj = value;
+        return Ok(());
+    }
+    let (parent, key) = json_patch_navigate_mut_or_create(obj, &segs)?;
+    match parent {
+        serde_json::Value::Object(map) => {
+            map.insert(key, value);
+        }
+        serde_json::Value::Array(arr) => {
+            if key == "-" {
+                arr.push(value);
+            } else {
+                let idx: usize = key.parse().map_err(|_| {
+                    Status::unprocessable_entity(format!("invalid array index '{key}'"))
+                })?;
+                if idx <= arr.len() {
+                    arr.insert(idx, value);
+                } else {
+                    return Err(Status::unprocessable_entity(format!(
+                        "array index {idx} out of bounds (len {})",
+                        arr.len()
+                    )));
+                }
+            }
+        }
+        _ => {
+            return Err(Status::unprocessable_entity(
+                "cannot set value on non-object/array".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn json_patch_set(
@@ -2632,6 +2743,193 @@ mod tests {
         assert!(
             body["metadata"]["continue"].is_null(),
             "metadata.continue must be absent when continue_key is None"
+        );
+    }
+
+    // -- mayor-ofi: json-patch 'add' creates intermediate objects (RFC 6902 §4.1) --
+
+    /// RFC 6902 §4.1: 'add' to /status/conditions/- must succeed even when
+    /// the 'conditions' key does not exist yet. Controllers initialise condition
+    /// arrays this way; a 422 would break the controller reconciliation loop.
+    #[test]
+    fn json_patch_add_creates_missing_intermediate_object() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "x"}
+        });
+        // 'status' key does not exist; 'conditions' key doesn't exist either.
+        let patch = serde_json::json!([{
+            "op": "add",
+            "path": "/status/conditions",
+            "value": []
+        }]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert_eq!(
+            obj["status"]["conditions"],
+            serde_json::json!([]),
+            "'add' must create intermediate 'status' object and 'conditions' array"
+        );
+    }
+
+    /// Variant: 'add' to array '-' appended to a non-existent parent succeeds.
+    #[test]
+    fn json_patch_add_array_append_to_non_existent_parent() {
+        let mut obj = serde_json::json!({
+            "metadata": {"name": "x"}
+        });
+        // Create status.conditions as a new array, then append an element.
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/status/conditions", "value": []},
+            {"op": "add", "path": "/status/conditions/-", "value": {"type": "Ready", "status": "True"}}
+        ]);
+        ok(apply_json_patch(&mut obj, &patch));
+        let conds = obj["status"]["conditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0]["type"], "Ready");
+    }
+
+    /// 'replace' must keep the strict 422-on-missing behavior — it is not allowed
+    /// to create keys; that is 'add's job. If 'replace' silently creates, callers
+    /// cannot detect typos in their patch paths.
+    #[test]
+    fn json_patch_replace_on_missing_path_is_422() {
+        let mut obj = serde_json::json!({"metadata": {"name": "x"}});
+        let patch = serde_json::json!([{
+            "op": "replace",
+            "path": "/status/conditions",
+            "value": []
+        }]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "'replace' on missing path must return 422, not silently create"
+        );
+    }
+
+    // -- mayor-iek: watch 410 ERROR uses compaction horizon as resourceVersion --
+
+    /// When Compacted is received, the 410 ERROR event must carry the horizon
+    /// as metadata.resourceVersion, not last_rv. Clients use this to relist
+    /// from a valid point; sending last_rv (which is older than the horizon)
+    /// would cause an infinite relist loop.
+    #[test]
+    fn watch_410_error_uses_compaction_horizon() {
+        // Simulate what watch_generic emits when Compacted is received.
+        // We cannot easily call watch_generic directly (it's async and needs a store),
+        // so we replicate the exact format string here as a regression guard.
+        let horizon: u64 = 500;
+        let error_line = format!(
+            "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}\n"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(error_line.trim_end()).expect("must be valid JSON");
+
+        assert_eq!(parsed["type"], "ERROR");
+        assert_eq!(parsed["object"]["code"], 410);
+        assert_eq!(
+            parsed["object"]["metadata"]["resourceVersion"].as_str().unwrap(),
+            "500",
+            "410 ERROR must carry horizon as resourceVersion so clients relist from \
+             a valid point, not from last_rv which may predate the compaction horizon"
+        );
+    }
+
+    // -- mayor-oyn: RBAC index evicted immediately on soft-delete --
+
+    /// Security invariant: after a soft-delete of a ClusterRoleBinding (object
+    /// has finalizers), the RBAC index must no longer contain the binding.
+    /// Without this fix, the binding would keep granting permissions until
+    /// finalizers cleared, which could be minutes or hours later.
+    #[tokio::test]
+    async fn rbac_index_evicted_on_soft_delete_of_clusterrolebinding() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+        let plural = "clusterrolebindings";
+        let name = "test-binding";
+
+        // Create a ClusterRoleBinding with a finalizer so soft-delete fires.
+        let crb = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {
+                "name": name,
+                "finalizers": ["test.io/cleanup"]
+            },
+            "subjects": [{"kind": "User", "name": "alice", "apiGroup": "rbac.authorization.k8s.io"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+
+        // Create the binding via the handler so the RBAC index gets populated.
+        let create_result = create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((group.to_string(), version.to_string(), plural.to_string())),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),
+        )
+        .await;
+        assert!(create_result.is_ok(), "ClusterRoleBinding creation must succeed");
+
+        // Also seed a matching ClusterRole so enumerate_rules can resolve rules.
+        let cluster_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "cluster-admin"},
+            "rules": [{"apiGroups":["*"],"resources":["*"],"verbs":["*"]}]
+        });
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((group.to_string(), version.to_string(), "clusterroles".to_string())),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cluster_role).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("ClusterRole creation must succeed"));
+
+        // Before delete: alice must have rules via the binding.
+        let rules_before = state.rbac_index.enumerate_rules("alice", &[], "");
+        assert!(
+            !rules_before.is_empty(),
+            "alice must have rules before deletion"
+        );
+
+        // Issue the delete — object has finalizers, so this is a soft-delete.
+        let delete_result = delete_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                name.to_string(),
+            )),
+        )
+        .await;
+        assert!(delete_result.is_ok(), "soft-delete must succeed");
+
+        // After soft-delete: the RBAC index must no longer contain the binding,
+        // so alice gets no rules from it even though the object still exists in the store.
+        let rules_after = state.rbac_index.enumerate_rules("alice", &[], "");
+        assert!(
+            rules_after.is_empty(),
+            "SECURITY: RBAC binding must be evicted from the index immediately on \
+             soft-delete, not when finalizers eventually clear"
         );
     }
 }

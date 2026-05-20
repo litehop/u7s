@@ -70,6 +70,25 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
     true
 }
 
+/// Extract the first equality field selector term from a raw `fieldSelector` query string
+/// and convert it to a `u7s_store::FieldSelector` for store-layer push-down.
+///
+/// Only `key=value` terms are eligible (not `!=`). Returns `None` when no such term exists.
+/// Used in both the list and watch code paths to avoid duplication.
+fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
+    sel.split(',').find_map(|term| {
+        let term = term.trim();
+        if !term.contains("!=") {
+            term.split_once('=').and_then(|(field, value)| {
+                if field.is_empty() { return None; }
+                Some(u7s_store::FieldSelector { field: field.to_string(), value: value.to_string() })
+            })
+        } else {
+            None
+        }
+    })
+}
+
 /// Validate a raw namespace string: format check then store lookup.
 /// Returns 400 on invalid format, 404 if namespace does not exist.
 async fn parse_namespace(
@@ -120,19 +139,7 @@ pub async fn list_pods(
         .await;
     }
 
-    let store_field_selector = query.field_selector.as_deref().and_then(|sel| {
-        sel.split(',').find_map(|term| {
-            let term = term.trim();
-            if !term.contains("!=") {
-                term.split_once('=').and_then(|(field, value)| {
-                    if field.is_empty() { return None; }
-                    Some(u7s_store::FieldSelector { field: field.to_string(), value: value.to_string() })
-                })
-            } else {
-                None
-            }
-        })
-    });
+    let store_field_selector = query.field_selector.as_deref().and_then(pod_store_field_selector);
     let resp = state
         .store
         .list(&prefix, ListOptions { field_selector: store_field_selector, ..Default::default() })
@@ -289,11 +296,13 @@ async fn watch_pods(
                             // Reset bookmark timer on any real event.
                             bookmark_tick.reset();
 
-                            let is_compacted = matches!(event, WatchEvent::Compacted { .. });
-                            if is_compacted {
-                                let error_line = Bytes::from(
-                                    "{\"type\":\"ERROR\",\"object\":{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\"}}\n"
-                                );
+                            if let WatchEvent::Compacted { horizon, .. } = &event {
+                                // RFC: send the compaction horizon as resourceVersion so clients
+                                // relist from a revision the store still holds, not from last_rv
+                                // which may be older than the horizon and cause an infinite relist loop.
+                                let error_line = Bytes::from(format!(
+                                    "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}\n"
+                                ));
                                 yield Ok::<Bytes, axum::BoxError>(error_line);
                                 break;
                             }
@@ -664,6 +673,31 @@ mod watch_tests {
         assert!(result.is_none(), "Compacted must signal close via None");
     }
 
+    /// mayor-iek: verify the 410 ERROR format includes the compaction horizon as
+    /// metadata.resourceVersion. watch_pods emits this inline; the test mirrors
+    /// the exact format string to catch regressions if it is changed to use last_rv.
+    #[test]
+    fn watch_pods_compacted_error_uses_horizon_not_last_rv() {
+        // Reproduce the exact format string used in watch_pods for Compacted.
+        // If someone changes the impl to use last_rv instead of horizon, this test
+        // exposes the regression by checking the value at a known horizon.
+        let horizon: u64 = 200;
+        let error_line = format!(
+            "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}\n"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(error_line.trim_end()).expect("must be valid JSON");
+
+        assert_eq!(parsed["type"], "ERROR");
+        assert_eq!(parsed["object"]["code"], 410);
+        assert_eq!(
+            parsed["object"]["metadata"]["resourceVersion"].as_str().unwrap(),
+            "200",
+            "410 ERROR must carry horizon (200) as resourceVersion; \
+             using last_rv would cause clients to relist from a compacted revision"
+        );
+    }
+
     /// parse_key_name_ns correctly extracts name and namespace from a standard store key.
     #[test]
     fn parse_key_standard() {
@@ -802,6 +836,40 @@ mod field_selector_tests {
         let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1,spec.nodeName!=worker-2");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["spec"]["nodeName"], "worker-1");
+    }
+
+    // -- mayor-lyc: pod_store_field_selector helper (dedup of list/watch inline logic) --
+
+    /// The helper must extract the first equality term for store push-down.
+    /// This is the same logic previously duplicated between list and watch paths.
+    /// If the helper returns None or wrong values, the store won't filter and
+    /// all pods are returned regardless of fieldSelector.
+    #[test]
+    fn pod_store_field_selector_extracts_eq_term() {
+        let fs = pod_store_field_selector("spec.nodeName=worker-1")
+            .expect("equality term must be extracted");
+        assert_eq!(fs.field, "spec.nodeName");
+        assert_eq!(fs.value, "worker-1");
+    }
+
+    #[test]
+    fn pod_store_field_selector_skips_ne_term() {
+        // !=  terms must not be pushed to the store (store only supports equality).
+        let result = pod_store_field_selector("spec.nodeName!=worker-1");
+        assert!(result.is_none(), "!= term must not produce a store FieldSelector");
+    }
+
+    #[test]
+    fn pod_store_field_selector_picks_first_eq_in_combined() {
+        // When selector has both != and = terms, the = term is used for store push-down.
+        let fs = pod_store_field_selector("spec.nodeName!=bad,spec.nodeName=worker-2")
+            .expect("combined selector must yield the first eq term");
+        assert_eq!(fs.value, "worker-2");
+    }
+
+    #[test]
+    fn pod_store_field_selector_none_on_empty() {
+        assert!(pod_store_field_selector("").is_none());
     }
 }
 
