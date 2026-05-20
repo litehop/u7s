@@ -72,6 +72,86 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
     })
 }
 
+// ---------------------------------------------------------------------------
+// CA key+cert — persisted across restarts
+// ---------------------------------------------------------------------------
+
+/// Load the CA keypair and certificate from disk, or generate and write them.
+///
+/// Returns `(ca_key, ca_cert)` where `ca_cert` is an rcgen `Certificate` that
+/// can be used for signing. The DER bytes of `ca_cert` are what we persist.
+///
+/// Design: keeping the CA stable means kubelets (and any other component that
+/// trusts our CA via kubeconfig) do not see a cert validation failure after a
+/// restart.
+/// Load-or-generate the CA keypair and cert for signing leaf certificates.
+///
+/// Returns `(ca_key, ca_cert, ca_cert_der)` where:
+/// - `ca_key` is the rcgen KeyPair (same on every restart when loaded from disk)
+/// - `ca_cert` is an rcgen Certificate for `signed_by` calls (re-issued but with the
+///   same key, so chain verification still works for leaf certs signed by it)
+/// - `ca_cert_der` is the *original* DER bytes written to disk — used in TlsMaterial
+///   for kubeconfig and rustls so that kubelets see a stable CA cert across restarts
+///
+/// Note: on the load path, `ca_cert.der()` will differ from `ca_cert_der` because
+/// rcgen re-issues the certificate with fresh timestamps. This is intentional — we
+/// always hand `ca_cert_der` (the stable original) to TlsMaterial, never `ca_cert.der()`.
+fn load_or_generate_ca(
+    ca_key_path: &str,
+    ca_cert_path: &str,
+) -> anyhow::Result<(KeyPair, rcgen::Certificate, Vec<u8>)> {
+    let key_exists = std::path::Path::new(ca_key_path).exists();
+    let cert_exists = std::path::Path::new(ca_cert_path).exists();
+
+    if key_exists && cert_exists {
+        // Load CA key from PEM.
+        let key_pem = std::fs::read_to_string(ca_key_path)
+            .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
+        let ca_key = KeyPair::from_pem(&key_pem)
+            .map_err(|e| anyhow::anyhow!("parse CA key: {e}"))?;
+
+        // Load the persisted CA cert DER (stable — handed to TlsMaterial as-is).
+        let ca_cert_der = std::fs::read(ca_cert_path)
+            .map_err(|e| anyhow::anyhow!("read CA cert {ca_cert_path}: {e}"))?;
+
+        // Reconstruct an rcgen Certificate using the loaded key and fixed params.
+        // We cannot round-trip rcgen 0.13 from DER/PEM back to CertificateParams,
+        // so we re-self-sign with the same key and standard CA params. The resulting
+        // cert is used only for signed_by() — its DER is discarded in favour of
+        // the stable ca_cert_der loaded above.
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "u7s-ca");
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .map_err(|e| anyhow::anyhow!("reconstruct CA cert: {e}"))?;
+
+        tracing::info!("loaded CA key from {ca_key_path}; cert DER from {ca_cert_path}");
+        return Ok((ca_key, ca_cert, ca_cert_der));
+    }
+
+    // Generate fresh CA.
+    tracing::info!("generating new CA key+cert → {ca_key_path} / {ca_cert_path}");
+    let ca_key = KeyPair::generate()
+        .map_err(|e| anyhow::anyhow!("generate CA key: {e}"))?;
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "u7s-ca");
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .map_err(|e| anyhow::anyhow!("self-sign CA: {e}"))?;
+
+    let ca_cert_der = ca_cert.der().to_vec();
+
+    // Persist: key as PEM, cert as DER.
+    std::fs::write(ca_key_path, ca_key.serialize_pem())
+        .map_err(|e| anyhow::anyhow!("write CA key {ca_key_path}: {e}"))?;
+    std::fs::write(ca_cert_path, &ca_cert_der)
+        .map_err(|e| anyhow::anyhow!("write CA cert {ca_cert_path}: {e}"))?;
+
+    Ok((ca_key, ca_cert, ca_cert_der))
+}
+
 pub struct TlsMaterial {
     /// DER-encoded CA certificate (written into kubeconfig).
     pub ca_cert_der: Vec<u8>,
@@ -97,14 +177,12 @@ fn advertise_host(advertise_address: Option<&str>) -> Option<String> {
 }
 
 pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
-    // --- CA ---
-    let ca_key = KeyPair::generate()?;
-    let mut ca_params = CertificateParams::default();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.distinguished_name.push(
-        rcgen::DnType::CommonName, "u7s-ca",
-    );
-    let ca_cert = ca_params.self_signed(&ca_key)?;
+    // --- CA: load-or-generate ---
+    // If both ca.key (PEM) and ca.crt (DER) exist on disk, load them so the CA
+    // stays stable across restarts. If either is missing, generate fresh and write.
+    // ca_cert_der is the original DER bytes — stable across restarts.
+    // ca_cert is an rcgen Certificate used only for signed_by calls.
+    let (ca_key, ca_cert, ca_cert_der) = load_or_generate_ca(&args.ca_key, &args.ca_cert)?;
 
     // --- Server cert ---
     let server_key = KeyPair::generate()?;
@@ -137,10 +215,11 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     let admin_cert = admin_params.signed_by(&admin_key, &ca_cert, &ca_key)?;
 
     // --- Build rustls ServerConfig ---
-    // Include the CA cert in the chain so clients can verify without a system CA store.
+    // Use ca_cert_der (the stable, original bytes) for the chain and trust store —
+    // not ca_cert.der(), which is re-issued on each load and would differ from disk.
     let server_cert_chain = vec![
         CertificateDer::from(server_cert.der().to_vec()),
-        CertificateDer::from(ca_cert.der().to_vec()),
+        CertificateDer::from(ca_cert_der.clone()),
     ];
     let server_key_der = PrivateKeyDer::try_from(server_key.serialize_der())
         .map_err(|e| anyhow::anyhow!("key error: {e}"))?;
@@ -149,7 +228,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // Clients that present a cert signed by our CA will be authenticated via x509.
     // Clients without a cert fall through to other auth mechanisms (tokens, anonymous).
     let mut root_store = RootCertStore::empty();
-    root_store.add(CertificateDer::from(ca_cert.der().to_vec()))?;
+    root_store.add(CertificateDer::from(ca_cert_der.clone()))?;
     let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
         .allow_unauthenticated()
         .build()
@@ -159,7 +238,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         .with_single_cert(server_cert_chain, server_key_der)?;
 
     Ok(TlsMaterial {
-        ca_cert_der:    ca_cert.der().to_vec(),
+        ca_cert_der,
         admin_cert_der: admin_cert.der().to_vec(),
         admin_key_pem:  admin_key.serialize_pem().into_bytes(),
         server_config:  Arc::new(server_config),
@@ -250,6 +329,21 @@ pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, _args: &Args) -> anyhow::
 mod tests {
     use super::*;
 
+    /// Return a unique temp directory for a test, creating it on disk.
+    /// Uses subsecond nanos + thread ID for uniqueness across parallel tests.
+    #[allow(dead_code)]
+    fn test_temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let tid = std::thread::current().id();
+        let dir = std::env::temp_dir().join(format!("u7s-tls-{tag}-{nanos}-{tid:?}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
     fn args_with(advertise_address: Option<&str>) -> Args {
         Args {
             db: "./state.db".into(),
@@ -258,6 +352,8 @@ mod tests {
             token_auth_file: None,
             sa_key: "./sa.key".into(),
             sa_pub: "./sa.pub".into(),
+            ca_key: "./ca.key".into(),
+            ca_cert: "./ca.crt".into(),
             advertise_address: advertise_address.map(str::to_owned),
         }
     }
@@ -337,5 +433,49 @@ mod tests {
         // Also verify with no advertise address — defaults only.
         let args_none = args_with(None);
         generate_tls(&args_none).expect("generate_tls failed with no advertise address");
+    }
+
+    #[test]
+    fn ca_key_is_loaded_not_regenerated() {
+        // Write a CA key+cert to a temp dir, call generate_tls twice with that dir,
+        // and verify the CA cert DER is identical — proving the CA was loaded rather
+        // than regenerated on the second call.
+        let dir = test_temp_dir("ca-persist");
+        let ca_key_path = dir.join("ca.key").to_string_lossy().into_owned();
+        let ca_cert_path = dir.join("ca.crt").to_string_lossy().into_owned();
+
+        let args = Args {
+            db: "./state.db".into(),
+            listen: "0.0.0.0:6443".into(),
+            kubeconfig: "./kubeconfig".into(),
+            token_auth_file: None,
+            sa_key: "./sa.key".into(),
+            sa_pub: "./sa.pub".into(),
+            ca_key: ca_key_path.clone(),
+            ca_cert: ca_cert_path.clone(),
+            advertise_address: None,
+        };
+
+        // First call: generates and writes CA files.
+        let tls1 = generate_tls(&args).expect("first generate_tls failed");
+        assert!(
+            std::path::Path::new(&ca_key_path).exists(),
+            "ca.key must be written on first call"
+        );
+        assert!(
+            std::path::Path::new(&ca_cert_path).exists(),
+            "ca.crt must be written on first call"
+        );
+
+        // Second call: must load the existing CA files, not regenerate.
+        let tls2 = generate_tls(&args).expect("second generate_tls failed");
+
+        assert_eq!(
+            tls1.ca_cert_der, tls2.ca_cert_der,
+            "CA cert DER must be identical on second call — CA must be loaded, not regenerated"
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

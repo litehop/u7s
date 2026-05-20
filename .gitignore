@@ -11,3 +11,12 @@ target
 .claude/scheduled_tasks.lock
 ai/worktrees/
 .aqua/
+
+# Generated TLS / signing-key files (written by u7s-apiserver on first start)
+ca.key
+ca.crt
+sa.key
+sa.pub
+kubeconfig
+
+.claude/scheduled_tasks.json

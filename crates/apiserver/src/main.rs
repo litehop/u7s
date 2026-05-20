@@ -53,6 +53,16 @@ struct Args {
     #[arg(long, default_value = "./sa.pub")]
     sa_pub: String,
 
+    /// Path to the CA private key (PEM). Generated on first run; loaded on
+    /// subsequent starts so the CA stays stable across restarts.
+    #[arg(long, default_value = "./ca.key")]
+    ca_key: String,
+
+    /// Path to the CA certificate (DER). Generated on first run; loaded on
+    /// subsequent starts so kubelets trust the same CA after a restart.
+    #[arg(long, default_value = "./ca.crt")]
+    ca_cert: String,
+
     /// Address advertised to clients in /api discovery (e.g. "https://1.2.3.4:6443").
     /// Defaults to the listen address, substituting 0.0.0.0 with 127.0.0.1.
     #[arg(long)]
