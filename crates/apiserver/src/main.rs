@@ -348,8 +348,10 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
     use u7s_store::Store;
     // Static UIDs — no uuid crate needed.
     const NS: &[(&str, &str)] = &[
-        ("default",     "00000000-0000-0000-0000-000000000001"),
-        ("kube-system", "00000000-0000-0000-0000-000000000002"),
+        ("default",          "00000000-0000-0000-0000-000000000001"),
+        ("kube-system",      "00000000-0000-0000-0000-000000000002"),
+        ("kube-node-lease",  "00000000-0000-0000-0000-000000000003"),
+        ("kube-public",      "00000000-0000-0000-0000-000000000004"),
     ];
     for (name, uid) in NS {
         let key = keys::cluster_object_key("namespaces", name);
@@ -438,11 +440,11 @@ mod tests {
 
     #[tokio::test]
     async fn seed_namespaces_creates_default_and_kube_system() {
-        // Both namespaces must exist after a single call — this is the sonobuoy preflight fix.
+        // All four namespaces must exist after a single call — required by Kubernetes API contract.
         let store = make_store();
         seed_namespaces(&store).await.expect("seed must not fail");
 
-        for name in ["default", "kube-system"] {
+        for name in ["default", "kube-system", "kube-node-lease", "kube-public"] {
             let key = keys::cluster_object_key("namespaces", name);
             let obj = store.get(&key).await.expect("get must not fail");
             assert!(
