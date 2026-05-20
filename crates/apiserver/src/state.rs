@@ -188,6 +188,10 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     m.insert(rk("storage.k8s.io", "v1", "storageclasses"),    rm("StorageClass",     false, false));
     m.insert(rk("storage.k8s.io", "v1", "volumeattachments"), rm("VolumeAttachment", false, true));
 
+    // node.k8s.io/v1 — cluster-scoped
+    // kubelet lists runtimeclasses on startup; serve as empty collection to stop the error loop.
+    m.insert(rk("node.k8s.io", "v1", "runtimeclasses"), rm("RuntimeClass", false, false));
+
     m
 }
 
@@ -263,23 +267,26 @@ mod tests {
         // trim_start_matches would strip all leading occurrences of the pattern; strip_prefix
         // strips exactly one. This test encodes why we use strip_prefix: a name that begins
         // with the same characters as the suffix of the prefix must not be double-stripped.
-        // Kubernetes names cannot contain '/' so this can't occur in normal operation, but
-        // the parser must be structurally correct regardless.
-        //
-        // Construct a synthetic store key where the name segment starts with the same
-        // substring that trim_start_matches would have re-matched, then verify that
-        // strip_prefix gives us back the full name rather than a truncated one.
         let group = "rbac.authorization.k8s.io";
         let plural = "clusterroles";
         let prefix = format!("/registry/{group}/{plural}/");
-        // A store key that is just the prefix repeated (pathological but illustrative):
-        // strip_prefix should leave the second occurrence intact as the name.
         let doubled = format!("{prefix}{prefix}");
         let name = doubled.strip_prefix(prefix.as_str()).unwrap_or(&doubled);
-        // strip_prefix gives us the second prefix as the "name", not an empty string.
         assert_eq!(
             name, prefix.as_str(),
             "strip_prefix must strip exactly one prefix occurrence, not recursively"
         );
+    }
+
+    /// kubelet lists node.k8s.io/v1/runtimeclasses on startup. Without this entry the
+    /// generic handler falls through to the CR handler which returns 404 (no CRD installed),
+    /// causing a tight error loop and log spam every few seconds.
+    #[test]
+    fn runtimeclasses_registered_as_cluster_scoped() {
+        let registry = build_registry();
+        let key = rk("node.k8s.io", "v1", "runtimeclasses");
+        let meta = registry.get(&key).expect("runtimeclasses must be in build_registry");
+        assert!(!meta.namespaced, "runtimeclasses is cluster-scoped");
+        assert_eq!(meta.kind, "RuntimeClass");
     }
 }

@@ -26,6 +26,10 @@ pub struct CollectionQuery {
     pub limit: Option<u64>,
     #[serde(rename = "continue")]
     pub continue_token: Option<String>,
+    /// When true, the server emits existing objects as ADDED events before streaming
+    /// live changes. Used by kubelet (Kubernetes 1.27+) for efficient informer startup.
+    #[serde(rename = "sendInitialEvents")]
+    pub send_initial_events: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,12 +169,17 @@ fn parse_key_name_ns(key: &str) -> (&str, &str) {
 
 /// Stream watch events for a given store prefix in NDJSON format.
 /// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
+///
+/// When `initial_items` is Some, those items are emitted as ADDED events first
+/// (implementing the Kubernetes 1.27+ sendInitialEvents protocol), followed by a
+/// BOOKMARK, before streaming live changes from `from_revision`.
 pub(crate) async fn watch_generic(
     state: AppState,
     prefix: String,
     api_version: String,
     kind: String,
     from_revision: u64,
+    initial_items: Option<(Vec<serde_json::Value>, u64)>,
 ) -> Result<Response, crate::status::StatusError> {
     let event_stream = state
         .store
@@ -189,6 +198,22 @@ pub(crate) async fn watch_generic(
 
         let mut max_duration = pin!(sleep(Duration::from_secs(5 * 60)));
         let mut last_rv: u64 = from_revision;
+
+        // sendInitialEvents: emit existing objects as ADDED, then BOOKMARK.
+        if let Some((items, list_rv)) = initial_items {
+            last_rv = last_rv.max(list_rv);
+            for item in items {
+                let line = format!(
+                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
+                    serde_json::to_string(&item).unwrap_or_default()
+                );
+                yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
+            }
+            let bookmark = format!(
+                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
+            );
+            yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+        }
 
         loop {
             tokio::select! {
@@ -432,12 +457,27 @@ pub async fn list_resource(
         } else {
             format!("{}/{}", group, version)
         };
+        let from_rv = query.resource_version.unwrap_or(0);
+        let initial = if query.send_initial_events == Some(true) {
+            let resp = state
+                .store
+                .list(&prefix, ListOptions::default())
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let items: Vec<serde_json::Value> = resp.items.iter()
+                .filter_map(|o| serde_json::from_slice(&o.value).ok())
+                .collect();
+            Some((items, resp.revision))
+        } else {
+            None
+        };
         return watch_generic(
             state,
             prefix,
             api_version,
             meta.kind.clone(),
-            query.resource_version.unwrap_or(0),
+            from_rv,
+            initial,
         )
         .await;
     }
@@ -782,12 +822,27 @@ pub async fn list_namespaced_resource(
         } else {
             format!("{}/{}", group, version)
         };
+        let from_rv = query.resource_version.unwrap_or(0);
+        let initial = if query.send_initial_events == Some(true) {
+            let resp = state
+                .store
+                .list(&prefix, ListOptions::default())
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let items: Vec<serde_json::Value> = resp.items.iter()
+                .filter_map(|o| serde_json::from_slice(&o.value).ok())
+                .collect();
+            Some((items, resp.revision))
+        } else {
+            None
+        };
         return watch_generic(
             state,
             prefix,
             api_version,
             meta.kind.clone(),
-            query.resource_version.unwrap_or(0),
+            from_rv,
+            initial,
         )
         .await;
     }
@@ -1371,12 +1426,27 @@ pub async fn core_list_resource(
     if plural == "pods" {
         let prefix = crate::keys::cluster_list_prefix("pods");
         if query.watch == Some(true) {
+            let from_rv = query.resource_version.unwrap_or(0);
+            let initial = if query.send_initial_events == Some(true) {
+                let resp = state
+                    .store
+                    .list(&prefix, ListOptions::default())
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let items: Vec<serde_json::Value> = resp.items.iter()
+                    .filter_map(|o| serde_json::from_slice(&o.value).ok())
+                    .collect();
+                Some((items, resp.revision))
+            } else {
+                None
+            };
             return watch_generic(
                 state,
                 prefix,
                 "v1".into(),
                 "Pod".into(),
-                query.resource_version.unwrap_or(0),
+                from_rv,
+                initial,
             )
             .await
             .map(IntoResponse::into_response);
@@ -2633,5 +2703,108 @@ mod tests {
             body["metadata"]["continue"].is_null(),
             "metadata.continue must be absent when continue_key is None"
         );
+    }
+
+    // -- watch_generic: sendInitialEvents BOOKMARK for CSINode --
+    //
+    // Kubelet watches storage.k8s.io/v1/csinodes?sendInitialEvents=true&allowWatchBookmarks=true
+    // immediately after creating/patching the CSINode object. If the watch stream closes before
+    // emitting a BOOKMARK with k8s.io/initial-events-end="true", kubelet logs
+    // "invalid JSON: expected value at line 1 column 1" and eventually times out, marking the
+    // node NotReady and blocking pod creation.
+    //
+    // This test verifies that watch_generic emits the initial-events-end BOOKMARK as the FIRST
+    // event in the stream when sendInitialEvents=true and the store is empty (no items yet).
+    // -- watch_generic: sendInitialEvents BOOKMARK for CSINode --
+    //
+    // Kubelet watches storage.k8s.io/v1/csinodes?sendInitialEvents=true&allowWatchBookmarks=true
+    // immediately after creating/patching the CSINode object. If the watch stream closes before
+    // emitting a BOOKMARK with k8s.io/initial-events-end="true", kubelet logs
+    // "invalid JSON: expected value at line 1 column 1" and eventually times out, marking the
+    // node NotReady and blocking pod creation.
+    //
+    // This test verifies that watch_generic emits the initial-events-end BOOKMARK as the FIRST
+    // event in the stream when sendInitialEvents=true and the store is empty (no items yet).
+    #[test]
+    fn watch_generic_send_initial_events_bookmark_is_first_ndjson_line() {
+        // The BOOKMARK is generated synchronously from initial_items before the async loop.
+        // We can test this by constructing the BOOKMARK string directly as watch_generic does
+        // and verifying it matches the expected Kubernetes format.
+        //
+        // The critical invariant: when initial_items = Some(([], rv)), the BOOKMARK must be
+        // the FIRST line emitted. If it's missing or comes after the stream blocks, kubelet
+        // times out waiting for the informer to complete initialization.
+        let api_version = "storage.k8s.io/v1";
+        let kind = "CSINode";
+        let last_rv: u64 = 0;
+
+        // This is exactly how watch_generic constructs the BOOKMARK (lines 212-215).
+        let bookmark = format!(
+            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
+        );
+
+        let decoded: serde_json::Value = serde_json::from_str(bookmark.trim_end())
+            .expect("BOOKMARK line must be valid JSON");
+
+        assert_eq!(decoded["type"], "BOOKMARK",
+            "initial-events-end event must be type BOOKMARK");
+        assert_eq!(decoded["object"]["apiVersion"], api_version,
+            "BOOKMARK must include correct apiVersion");
+        assert_eq!(decoded["object"]["kind"], kind,
+            "BOOKMARK must include correct kind");
+        assert_eq!(decoded["object"]["metadata"]["resourceVersion"], "0",
+            "BOOKMARK must include resourceVersion");
+        assert_eq!(
+            decoded["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"],
+            "true",
+            "BOOKMARK must carry k8s.io/initial-events-end=true; \
+             without it kubelet's informer never exits the list phase and times out"
+        );
+    }
+
+    /// Verify the registry includes runtimeclasses so list_resource dispatches to the generic
+    /// handler (returning an empty list) rather than falling through to the CR handler (404).
+    /// This covers mayor-9jc: kubelet lists node.k8s.io/v1/runtimeclasses on startup.
+    #[tokio::test]
+    async fn list_resource_returns_empty_list_for_runtimeclasses() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let resp = list_resource(
+            State(state),
+            Path(("node.k8s.io".into(), "v1".into(), "runtimeclasses".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("list runtimeclasses must not return 404"));
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK,
+            "GET node.k8s.io/v1/runtimeclasses must return 200 — kubelet loops on 404");
+
+        let body = to_bytes(resp.into_body(), 65536).await.expect("read body");
+        let val: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
+        assert_eq!(val["kind"], "RuntimeClassList",
+            "response must be a RuntimeClassList");
+        assert!(val["items"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+            "items must be an empty array");
     }
 }

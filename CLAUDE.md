@@ -31,6 +31,9 @@ Before adding code, read exports, immediate callers, and shared utilities. "Look
 ### Rule 9 — Tests Verify Intent, Not Just Behavior
 Tests must encode WHY behavior matters, not just WHAT it does. A test that can't fail when business logic changes is wrong.
 
+### Rule 14 — Every Bug Fix Ships with a Regression Test
+A bug fix without a test is incomplete. The test must fail if the fix is reverted. If the fix touches an async handler that can't be called in isolation, extract the decision logic into a pure function and test that. Decision trees buried in handlers are a code smell — unit-testable functions are the goal.
+
 ### Rule 10 — Checkpoint After Every Significant Step
 Summarize what was done, what's verified, what's left. If you lose track, stop and restate before continuing.
 
