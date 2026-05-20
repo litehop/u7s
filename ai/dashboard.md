@@ -1,33 +1,31 @@
 # Dashboard
 
-2026-05-20T13:41 UTC
+2026-05-20T13:42 UTC
 `bd prime` in a fresh Claude Code session
 Open beads: 1 (mayor-xy2 P3 deferred)
 
 ## What needs the operator now
 
-**Stance check** — current stance is: pre-alpha/greenfield, break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI automatically; flag security/API/architecture PRs for operator review first. Confirm this is still correct or adjust.
+**Decision: pods/status subresource** — kubelet cannot report pod phase without it. Fix is ~100-150 LoC in pods.rs (add PATCH route for status, merge only .status field, emit watch event). Ready to file bead and dispatch on your go-ahead.
 
-**pods/status subresource** — kubelet cannot report pod phase (PATCHes `pods/{name}/status`) without this. Blocking pod lifecycle e2e. Ready to file a bead and dispatch if you want to move on it.
-
-**Nothing else blocked on you.**
+**Decision: stance check** — current stance: pre-alpha/greenfield, break freely, merge on green CI, security/API/arch PRs need operator review. Confirm still correct, or adjust milestone focus (pod lifecycle? Argo CD? sonobuoy conformance?).
 
 ## Forward-looking
 
-1. **pods/status subresource fix** — file bead, dispatch worker; unblocks hello-world pod reaching Succeeded on lima-node
-2. **CI smoke job** — once pods/status works, add a job that creates a pod, waits for Succeeded, fails CI if not reached within 60s
-3. **mayor-xy2** (CR schema validation, P3) — deferred until Argo CD milestone
+1. pods/status fix → enables hello-world pod reaching Succeeded on lima-node
+2. CI smoke job → create pod, assert Succeeded within 60s
+3. mayor-xy2 (CR schema validation, P3) — deferred until Argo CD milestone
 
 ## Recent progress
 
-Major quality sprint closed. All merged today:
-- **PR #73** — RBAC soft-delete index fix + json-patch add + watch 410 + field-selector dedup (operator-reviewed)
-- **PR #74** — regression tests for strategic-merge-patch and host.lima.internal SAN
-- **PR #75** — RBAC edge-case tests: namespace mismatch, resourceNames, ClusterRoleBinding scope
-- **PR #76** — patch.rs strategic-merge edge-case tests + parse_resource_version deduplication
-- **PR #77** — CR/CRD panic fixes (7 `.unwrap()` → proper 500 returns) + pure-function extraction + discovery tests
+Quality sprint complete. 5 PRs merged today (#73–77):
+- RBAC soft-delete index fix, json-patch `add`, watch 410, field-selector dedup
+- Regression tests for strategic-merge-patch, SAN inclusion, RBAC edge cases
+- 7 `serde_json::to_vec().unwrap()` panics fixed in CR/CRD handlers
+- `parse_resource_version` deduplicated across 5 files
+- Test count: ~170 → 224+ this sprint
 
-Test count grew from 219 → 224+ across this sprint. Worktrees and remote branches fully pruned; repo clean.
+Repo clean: 0 open PRs, 0 worktrees, 0 remote worker branches.
 
 ## Stance
 
