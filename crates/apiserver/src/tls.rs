@@ -72,6 +72,66 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
     })
 }
 
+// ---------------------------------------------------------------------------
+// CA key+cert — persisted across restarts
+// ---------------------------------------------------------------------------
+
+/// Load the CA keypair and certificate from disk, or generate and write them.
+///
+/// Returns `(ca_key, ca_cert)` where `ca_cert` is an rcgen `Certificate` that
+/// can be used for signing. The DER bytes of `ca_cert` are what we persist.
+///
+/// Design: keeping the CA stable means kubelets (and any other component that
+/// trusts our CA via kubeconfig) do not see a cert validation failure after a
+/// restart.
+fn load_or_generate_ca(
+    ca_key_path: &str,
+    ca_cert_path: &str,
+) -> anyhow::Result<(KeyPair, rcgen::Certificate)> {
+    let key_exists = std::path::Path::new(ca_key_path).exists();
+    let cert_exists = std::path::Path::new(ca_cert_path).exists();
+
+    if key_exists && cert_exists {
+        // Load CA key from PEM.
+        let key_pem = std::fs::read_to_string(ca_key_path)
+            .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
+        let ca_key = KeyPair::from_pem(&key_pem)
+            .map_err(|e| anyhow::anyhow!("parse CA key: {e}"))?;
+
+        // Load CA cert DER and reconstruct an rcgen Certificate for signing.
+        let ca_der = std::fs::read(ca_cert_path)
+            .map_err(|e| anyhow::anyhow!("read CA cert {ca_cert_path}: {e}"))?;
+        let ca_der_ref = CertificateDer::from(ca_der);
+        let ca_params = CertificateParams::from_ca_cert_der(&ca_der_ref)
+            .map_err(|e| anyhow::anyhow!("parse CA cert params: {e}"))?;
+        let ca_cert = ca_params
+            .self_signed(&ca_key)
+            .map_err(|e| anyhow::anyhow!("reconstruct CA cert: {e}"))?;
+
+        tracing::info!("loaded CA key+cert from {ca_key_path} / {ca_cert_path}");
+        return Ok((ca_key, ca_cert));
+    }
+
+    // Generate fresh CA.
+    tracing::info!("generating new CA key+cert → {ca_key_path} / {ca_cert_path}");
+    let ca_key = KeyPair::generate()
+        .map_err(|e| anyhow::anyhow!("generate CA key: {e}"))?;
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "u7s-ca");
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .map_err(|e| anyhow::anyhow!("self-sign CA: {e}"))?;
+
+    // Persist: key as PEM, cert as DER.
+    std::fs::write(ca_key_path, ca_key.serialize_pem())
+        .map_err(|e| anyhow::anyhow!("write CA key {ca_key_path}: {e}"))?;
+    std::fs::write(ca_cert_path, ca_cert.der().as_ref())
+        .map_err(|e| anyhow::anyhow!("write CA cert {ca_cert_path}: {e}"))?;
+
+    Ok((ca_key, ca_cert))
+}
+
 pub struct TlsMaterial {
     /// DER-encoded CA certificate (written into kubeconfig).
     pub ca_cert_der: Vec<u8>,
@@ -97,14 +157,10 @@ fn advertise_host(advertise_address: Option<&str>) -> Option<String> {
 }
 
 pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
-    // --- CA ---
-    let ca_key = KeyPair::generate()?;
-    let mut ca_params = CertificateParams::default();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.distinguished_name.push(
-        rcgen::DnType::CommonName, "u7s-ca",
-    );
-    let ca_cert = ca_params.self_signed(&ca_key)?;
+    // --- CA: load-or-generate ---
+    // If both ca.key (PEM) and ca.crt (DER) exist on disk, load them so the CA
+    // stays stable across restarts. If either is missing, generate fresh and write.
+    let (ca_key, ca_cert) = load_or_generate_ca(&args.ca_key, &args.ca_cert)?;
 
     // --- Server cert ---
     let server_key = KeyPair::generate()?;
@@ -258,6 +314,8 @@ mod tests {
             token_auth_file: None,
             sa_key: "./sa.key".into(),
             sa_pub: "./sa.pub".into(),
+            ca_key: "./ca.key".into(),
+            ca_cert: "./ca.crt".into(),
             advertise_address: advertise_address.map(str::to_owned),
         }
     }
