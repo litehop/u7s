@@ -18,6 +18,73 @@
 
 const K8S_PROTO_MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
 
+// ---------------------------------------------------------------------------
+// Encoder — produces Kubernetes protobuf wire format from a JSON value.
+// ---------------------------------------------------------------------------
+
+/// Encode a varint into a byte vector.
+fn encode_varint(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+    out
+}
+
+/// Encode a length-delimited (wire type 2) field: tag + length varint + payload.
+fn encode_ld_field(field_number: u64, payload: &[u8]) -> Vec<u8> {
+    let tag = (field_number << 3) | 2;
+    let mut out = encode_varint(tag);
+    out.extend_from_slice(&encode_varint(payload.len() as u64));
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Encode a `serde_json::Value` as a Kubernetes protobuf response body.
+///
+/// Wire format:
+///   [4 bytes magic: 0x6b, 0x38, 0x73, 0x00]
+///   [protobuf-encoded Unknown message]
+///     field 1 (TypeMeta, LEN): apiVersion (field 1, string) + kind (field 2, string)
+///     field 2 (raw, LEN): the raw JSON bytes of the object
+///     field 4 (contentType, LEN): "application/json"
+///
+/// client-go reads the `contentType` field (field 4) to determine how to decode
+/// the `raw` field (field 2).  By setting contentType to "application/json" and
+/// placing the original JSON bytes in `raw`, the client decodes it with its JSON
+/// decoder regardless of the outer content-type header — this is why this scheme
+/// works for all object types without needing a per-type proto encoder.
+pub fn encode_proto_response(val: &serde_json::Value) -> bytes::Bytes {
+    let api_version = val["apiVersion"].as_str().unwrap_or("");
+    let kind = val["kind"].as_str().unwrap_or("");
+
+    // TypeMeta sub-message: field 1 = apiVersion, field 2 = kind.
+    let type_meta = {
+        let mut t = encode_ld_field(1, api_version.as_bytes());
+        t.extend_from_slice(&encode_ld_field(2, kind.as_bytes()));
+        t
+    };
+
+    let json_bytes = val.to_string();
+    let json_bytes = json_bytes.as_bytes();
+
+    // Unknown envelope: field 1 = TypeMeta, field 2 = raw JSON, field 4 = contentType.
+    let mut envelope = encode_ld_field(1, &type_meta);
+    envelope.extend_from_slice(&encode_ld_field(2, json_bytes));
+    envelope.extend_from_slice(&encode_ld_field(4, b"application/json"));
+
+    let mut out = Vec::with_capacity(4 + envelope.len());
+    out.extend_from_slice(K8S_PROTO_MAGIC);
+    out.extend_from_slice(&envelope);
+    bytes::Bytes::from(out)
+}
+
 /// The decoded `Unknown` envelope fields we care about.
 pub struct ProtoEnvelope {
     /// The raw bytes of `Unknown.raw` (field 2).
