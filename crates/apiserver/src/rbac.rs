@@ -26,9 +26,6 @@ pub struct Subject {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RoleRef {
-    // Part of the RBAC RoleRef schema; used to validate that the referenced role
-    // belongs to the expected API group when cross-group binding is evaluated.
-    #[allow(dead_code)]
     #[serde(rename = "apiGroup")]
     pub api_group: String,
     pub kind: String,
@@ -260,7 +257,7 @@ fn subject_matches(binding: &RbacBinding, username: &str, groups: &[String]) -> 
 }
 
 fn resolve_cluster_role_rules<'a>(inner: &'a RbacInner, role_ref: &RoleRef) -> &'a [PolicyRule] {
-    if role_ref.kind == "ClusterRole" {
+    if role_ref.kind == "ClusterRole" && role_ref.api_group == "rbac.authorization.k8s.io" {
         inner
             .cluster_roles
             .get(&role_ref.name)
@@ -276,6 +273,9 @@ fn resolve_role_rules<'a>(
     role_ref: &RoleRef,
     namespace: &str,
 ) -> &'a [PolicyRule] {
+    if role_ref.api_group != "rbac.authorization.k8s.io" {
+        return &[];
+    }
     match role_ref.kind.as_str() {
         "Role" => inner
             .roles
@@ -914,6 +914,45 @@ mod tests {
         assert!(
             !idx.is_allowed(&r_exec),
             "pods/exec must be denied — pods/log rule must not bleed to other subresources"
+        );
+    }
+
+    #[test]
+    fn clusterrolebinding_wrong_api_group_denies() {
+        // A ClusterRoleBinding whose roleRef.apiGroup is not "rbac.authorization.k8s.io"
+        // must NOT grant access even when the role name matches. Kubernetes only resolves
+        // roleRefs in the RBAC API group; accepting bindings from other groups would allow
+        // privilege escalation by crafting a binding with an arbitrary group name.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        // Binding with a wrong apiGroup — must be ignored even though role name matches.
+        let bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/wrong-group-binding".to_owned();
+        let bind_val = json!({
+            "subjects": [{ "kind": "User", "name": "mallory" }],
+            "roleRef": {
+                "apiGroup": "wrong.group",
+                "kind": "ClusterRole",
+                "name": "pod-reader"
+            }
+        });
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+        let r = req("mallory", &groups, "get", "pods", "", Some("default"), None);
+        assert!(
+            !idx.is_allowed(&r),
+            "roleRef with wrong apiGroup must not grant access — accepting any apiGroup would be a privilege escalation"
         );
     }
 }

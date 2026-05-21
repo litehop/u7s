@@ -641,7 +641,7 @@ fn validate_patch_content_type(headers: &HeaderMap) -> Result<(), crate::status:
         .unwrap_or("");
 
     if content_type.contains("application/strategic-merge-patch+json") {
-        return Err(Status::bad_request(
+        return Err(Status::unsupported_media_type(
             "strategic merge patch is not supported for custom resources; use application/merge-patch+json"
                 .into(),
         ));
@@ -1484,23 +1484,34 @@ mod tests {
         );
     }
 
-    // validate_patch_content_type must reject strategic-merge-patch+json with a user-friendly
-    // message that contains no dev-era notes like "Phase". kubectl users see this message
-    // directly, so it must be production-appropriate.
+    // validate_patch_content_type must reject strategic-merge-patch+json with 415 (not 400)
+    // and a user-friendly message that contains no dev-era notes like "Phase".
+    // 415 is the correct Kubernetes API convention for unsupported media types;
+    // returning 400 would mislead clients into thinking the request body was malformed.
     #[test]
-    fn strategic_merge_patch_error_has_no_phase_reference() {
+    fn strategic_merge_patch_rejected_with_415() {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::CONTENT_TYPE,
             "application/strategic-merge-patch+json".parse().unwrap(),
         );
         let err = validate_patch_content_type(&headers).unwrap_err();
+        // Must be 415, not 400 — wrong status code misleads clients about root cause.
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "strategic-merge-patch must be rejected with 415 Unsupported Media Type"
+        );
         let body = serde_json::to_string(&err.1).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["code"],
+            415,
+            "status body code field must be 415"
+        );
         assert!(
             body.to_lowercase().find("phase").is_none(),
             "error message must not contain 'phase' (got: {body})"
         );
-        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
     // new_cr_uid must produce valid RFC-4122 v4 UUIDs. Non-standard UIDs break
