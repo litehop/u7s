@@ -522,15 +522,26 @@ async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
 
-    const NAMESPACES: &[&str] = &["default", "kube-system", "kube-node-lease", "kube-public"];
-    for ns in NAMESPACES {
+    // Static UIDs — no uuid crate needed for seeded objects; deterministic values
+    // are required so token recipients can correlate a JWT's kubernetes.io.serviceaccount.uid
+    // claim back to the ServiceAccount object. Without a UID the claim is empty, which
+    // violates the Kubernetes token projection contract.
+    const NAMESPACES: &[(&str, &str)] = &[
+        ("default", "00000000-0000-0000-0001-000000000001"),
+        ("kube-system", "00000000-0000-0000-0001-000000000002"),
+        ("kube-node-lease", "00000000-0000-0000-0001-000000000003"),
+        ("kube-public", "00000000-0000-0000-0001-000000000004"),
+    ];
+    for (ns, uid) in NAMESPACES {
         let key = keys::object_key("serviceaccounts", ns, "default");
         let body = serde_json::json!({
             "apiVersion": "v1",
             "kind": "ServiceAccount",
             "metadata": {
                 "name": "default",
-                "namespace": ns
+                "namespace": ns,
+                "uid": uid,
+                "creationTimestamp": "2024-01-01T00:00:00Z"
             }
         });
         match store
@@ -1041,6 +1052,8 @@ mod tests {
         // The default ServiceAccount must exist in every seeded namespace so that
         // pods can obtain a projected SA token via TokenRequest. Without it,
         // the TokenRequest handler returns 404 and in-cluster authentication fails.
+        // The SA must also carry a non-empty UID so the kubernetes.io.serviceaccount.uid
+        // JWT claim is populated — an empty UID breaks the token projection contract.
         let store = make_store();
         seed_serviceaccounts(&store)
             .await
@@ -1058,6 +1071,15 @@ mod tests {
             assert_eq!(parsed["kind"].as_str(), Some("ServiceAccount"));
             assert_eq!(parsed["metadata"]["name"].as_str(), Some("default"));
             assert_eq!(parsed["metadata"]["namespace"].as_str(), Some(ns));
+            // UID must be non-empty so the JWT kubernetes.io.serviceaccount.uid claim
+            // is populated. An empty UID violates the Kubernetes token projection spec.
+            let uid = parsed["metadata"]["uid"].as_str().unwrap_or("");
+            assert!(
+                !uid.is_empty(),
+                "ServiceAccount {ns}/default must have a non-empty UID — \
+                 an empty UID causes the JWT kubernetes.io.serviceaccount.uid claim \
+                 to be empty, breaking in-cluster token correlation"
+            );
         }
     }
 
@@ -1182,5 +1204,128 @@ mod tests {
             serde_json::from_slice(&stored.unwrap().value).expect("valid json");
         assert_eq!(parsed["kind"].as_str(), Some("CSINode"));
         assert_eq!(parsed["metadata"]["name"].as_str(), Some("ci-node"));
+    }
+
+    /// Full SA token round-trip: mint via TokenRequest handler, authenticate via auth middleware.
+    ///
+    /// This is the end-to-end correctness test for projected SA token volumes:
+    ///   1. A ServiceAccount exists in the store (seeded by seed_serviceaccounts).
+    ///   2. kubelet POSTs to /api/v1/namespaces/{ns}/serviceaccounts/{name}/token
+    ///      and receives a JWT signed by the SA key.
+    ///   3. A pod uses that JWT as a Bearer token; the auth middleware verifies it
+    ///      using the SA decoding key and maps it to the correct service account identity.
+    ///
+    /// If either side is broken — the handler returns an invalid/empty token, the JWT
+    /// has wrong claims, or the auth middleware rejects a valid token — this test fails.
+    #[tokio::test]
+    async fn sa_token_request_to_auth_round_trip() {
+        use axum::response::IntoResponse as _;
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        use std::sync::Arc;
+
+        // 1. Generate a fresh RSA key pair for this test — the same key must be used
+        //    for minting (handler) and verification (auth middleware).
+        let mut rng = rsa::rand_core::OsRng;
+        let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
+        let priv_pem = rsa_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("priv pem")
+            .as_bytes()
+            .to_vec();
+        let pub_pem = rsa_key
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("pub pem")
+            .into_bytes();
+        let enc_key =
+            jsonwebtoken::EncodingKey::from_rsa_pem(&priv_pem).expect("encoding key from pem");
+        let dec_key =
+            jsonwebtoken::DecodingKey::from_rsa_pem(&pub_pem).expect("decoding key from pem");
+
+        // 2. Build AppState with the SA key pair and seed the store.
+        let store = Arc::new(make_store());
+        seed_namespaces(&store)
+            .await
+            .expect("seed namespaces must not fail");
+        seed_serviceaccounts(&store)
+            .await
+            .expect("seed serviceaccounts must not fail");
+
+        let state = state::AppState::new(
+            Arc::clone(&store),
+            Some(enc_key),
+            Some(dec_key.clone()),
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // 3. Call the TokenRequest handler directly — this is what kubelet does when it
+        //    projects an SA token into a pod volume.
+        let token_handler_result = handlers::tokens::create_token(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_owned(), "default".to_owned())),
+            bytes::Bytes::new(), // empty body → default audience + expiration
+        )
+        .await;
+        let token_resp = match token_handler_result {
+            Ok(r) => r.into_response(),
+            Err(e) => {
+                // StatusError doesn't implement Debug; produce a meaningful panic message.
+                panic!("create_token must succeed for a valid SA: status={}", e.0);
+            }
+        };
+
+        assert_eq!(
+            token_resp.status(),
+            axum::http::StatusCode::CREATED,
+            "TokenRequest must return 201 Created"
+        );
+
+        // 4. Extract the token from the response body.
+        let body_bytes = axum::body::to_bytes(token_resp.into_body(), usize::MAX)
+            .await
+            .expect("body collect must not fail");
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("response must be valid JSON");
+
+        let token = resp_json["status"]["token"]
+            .as_str()
+            .expect("response must contain status.token string");
+        assert!(
+            !token.is_empty(),
+            "minted token must not be empty — empty token cannot authenticate"
+        );
+
+        let exp_ts = resp_json["status"]["expirationTimestamp"]
+            .as_str()
+            .expect("response must contain status.expirationTimestamp");
+        assert!(
+            !exp_ts.is_empty(),
+            "expirationTimestamp must not be empty — kubelet needs it to know when to refresh"
+        );
+
+        // 5. Authenticate the minted token via the auth middleware path.
+        //    This verifies the full round-trip: the JWT the handler mints can be
+        //    verified by the same decoding key used in production.
+        let user = auth::authenticate_token(token, &std::collections::HashMap::new(), Some(&dec_key))
+            .expect("minted SA token must authenticate successfully — round-trip broken if None");
+
+        // Username must be the service account identity.
+        assert_eq!(
+            user.username,
+            "system:serviceaccount:default:default",
+            "authenticated username must be the service account subject"
+        );
+
+        // Both SA groups must be present — RBAC policies bind to these groups.
+        assert!(
+            user.groups.contains(&"system:serviceaccounts".to_owned()),
+            "broad SA group must be present for RBAC policies that apply to all service accounts"
+        );
+        assert!(
+            user.groups
+                .contains(&"system:serviceaccounts:default".to_owned()),
+            "namespace-scoped SA group must be present for namespace-scoped RBAC policies"
+        );
     }
 }
