@@ -1918,6 +1918,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
@@ -1928,6 +1929,17 @@ dependencies = [
  "u7s-store",
  "uuid",
  "x509-cert",
+]
+
+[[package]]
+name = "u7s-client-util"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "rustls",
+ "rustls-pemfile",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -1949,6 +1961,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "u7s-client-util",
 ]
 
 [[package]]
@@ -1984,6 +1997,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "u7s-client-util",
 ]
 
 [[package]]

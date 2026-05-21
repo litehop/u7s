@@ -6,20 +6,17 @@
 ///
 /// No leader election logic is implemented; the --leader-elect flag is
 /// accepted and silently ignored.
-use std::sync::Arc;
-
 use anyhow::{bail, Context};
-use base64::Engine;
 use clap::Parser;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
+use u7s_client_util::{build_tls_connector, parse_kubeconfig};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -43,89 +40,6 @@ struct Args {
     /// Accept leader-elect flag; silently ignored.
     #[arg(long)]
     leader_elect: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Kubeconfig parsing (minimal — only the fields we need)
-// ---------------------------------------------------------------------------
-
-/// Parsed credentials extracted from a kubeconfig file.
-struct ClientCreds {
-    /// Base URL of the API server, e.g. "https://127.0.0.1:6443"
-    server: String,
-    /// DER-encoded CA certificate used to verify the server.
-    ca_cert: CertificateDer<'static>,
-    /// DER-encoded client certificate.
-    client_cert: CertificateDer<'static>,
-    /// DER-encoded client private key.
-    client_key: PrivateKeyDer<'static>,
-}
-
-fn parse_kubeconfig(path: &str) -> anyhow::Result<ClientCreds> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("reading kubeconfig {path}"))?;
-
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    // Manual YAML extraction — no serde_yaml dependency.
-    // The format is the fixed structure written by u7s-apiserver's tls.rs.
-    let server = extract_yaml_value(&raw, "server:").context("kubeconfig: missing server")?;
-    let ca_data = extract_yaml_value(&raw, "certificate-authority-data:")
-        .context("kubeconfig: missing certificate-authority-data")?;
-    let cert_data = extract_yaml_value(&raw, "client-certificate-data:")
-        .context("kubeconfig: missing client-certificate-data")?;
-    let key_data = extract_yaml_value(&raw, "client-key-data:")
-        .context("kubeconfig: missing client-key-data")?;
-
-    let ca_der = b64.decode(ca_data.trim()).context("decode CA cert")?;
-    let cert_der = b64.decode(cert_data.trim()).context("decode client cert")?;
-    let key_pem = b64.decode(key_data.trim()).context("decode client key")?;
-
-    let client_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .context("parse client key PEM")?
-        .context("no private key in kubeconfig client-key-data")?;
-
-    Ok(ClientCreds {
-        server: server.trim().to_owned(),
-        ca_cert: CertificateDer::from(ca_der),
-        client_cert: CertificateDer::from(cert_der),
-        client_key,
-    })
-}
-
-/// Extract the first occurrence of a YAML scalar value for `key` in `text`.
-/// Handles both "  key: value" and "key: value" with arbitrary leading whitespace.
-fn extract_yaml_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(key) {
-            return Some(rest.trim());
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// TLS client setup
-// ---------------------------------------------------------------------------
-
-fn build_tls_connector(creds: &ClientCreds) -> anyhow::Result<TlsConnector> {
-    use rustls::ClientConfig;
-
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store
-        .add(creds.ca_cert.clone())
-        .context("add CA cert to root store")?;
-
-    let client_cert_chain = vec![creds.client_cert.clone()];
-    let client_key = creds.client_key.clone_key();
-
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(client_cert_chain, client_key)
-        .context("configure mTLS client cert")?;
-
-    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 // ---------------------------------------------------------------------------
