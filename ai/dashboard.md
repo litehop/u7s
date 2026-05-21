@@ -1,37 +1,36 @@
 # Dashboard
 
-2026-05-21 05:15 UTC
+2026-05-21 05:55 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 9 (was 20 at session start)
+Open beads: 2 (+ 2 in-flight with workers)
 
 ## What needs the operator now
 
-**Stance check:** Current stance is pre-alpha/greenfield — break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; security/API/architecture PRs flagged for review first. Does this still match your intent?
+**Renovate PRs #109 (rcgen 0.14) and #110 (rusqlite 0.39)** — both break the build. `rcgen 0.14` changed `signed_by()` API from 3-arg to 2-arg. Need your call: accept the upgrades (dispatch a worker to fix the call site in `tls.rs`)? Or close/ignore the Renovate PRs for now?
 
-**Renovate PRs #109, #110** (rcgen 0.14, rusqlite 0.39) are failing — both break the build because `rcgen 0.14` changed `signed_by()` from 3-arg to 2-arg API. These need code adaptation before they can merge. A worker can handle this if you want to accept the upgrades.
+**PRs #97 and #103** (node Ready, pod lifecycle) — you rebased these onto main; CI reruns in progress. Should go green with wireType 7 fix now merged.
 
-**`system:masters` hardcoded bypass** — flagged earlier as architecturally fishy. Noted in bd memory for revisit. No action needed now.
+**`system:masters` bypass** — flagged as architecturally fishy, tracked in bd memory. No action needed now.
 
-**PRs #97 and #103** (node Ready assertion, pod lifecycle) — kubelet CI reruns triggered after wireType 7 fix (#111) landed. Should go green shortly; merge loop will catch them.
+**`mayor-2ni`** (sonobuoy audit) and **`mayor-pgdr`** (typed proto bindings) — both held. 2ni needs Lima VM (can't run in CI worker). pgdr needs approach decision (Option A prost vs Option C Unknown-envelope — see bead description). No action needed unless you want to prioritise.
 
 ## Forward-looking
 
-4 workers in flight (dispatched this loop):
-- **cluster-5vyz-vm3l** — wire RBAC escalation check into CRB handler + remove dead_code suppressions
-- **solo-rph** — deduplicate watch_pods into thin wrapper
-- **solo-zcur** — CRD status subresource (Argo CD compatibility)
-- **solo-3lv** — extract shared HTTP client stack into client-util crate
+2 workers in flight:
+- **solo-vxo9** — GET collection → list verb fix (auth.rs), kubeconfig 0o600 perms (tls.rs), store error message sanitisation
+- **solo-xy2** — openAPIV3Schema validation for CR instances (422 on type/required violations)
 
-After those land, remaining open beads are all P3: sonobuoy audit, proto bindings, schema validation, security MED/LOW audit. Natural pause point to check in with you on priorities.
+After those land, the bead backlog will be cold (2ni and pgdr held). Natural pause — good time for the sonobuoy run locally, or to decide on the Renovate upgrades.
 
 ## Recent progress (this session)
 
-- **gpg smoke fix** — kubectl install step was failing with `cannot open /dev/tty`; added `--batch --yes` (direct mayor edit)
-- **Security sprint** — 12 beads closed: constant-time token compare, body size limit, CSPRNG UIDs, SA key 0o600 permissions, path traversal validation, CRD group shadowing, RBAC escalation prevention, SAR privilege gate, per-client watch limit
-- **CI hardening** — permissions blocks on all workflow jobs, all Actions pinned to commit SHAs
-- **Proto fix** — wireType 7 in Node watch stream; Node/NodeList excluded from proto re-encoding (returns JSON, which kubelet accepts)
-- **PRs merged this session:** #104, #106, #107, #108, #111 (+ #103/#97 reruns pending)
-- ~111+ PRs merged total since project start
+Security sprint (all P1s closed): constant-time token compare, CSPRNG UIDs, body size limit, SA key 0o600, path traversal, CRD group shadowing, RBAC escalation (logic + wiring), SAR privilege gate, per-client watch limit.
+
+CI hardening: gpg --batch fix, permissions blocks, SHA pinning, wireType 7 proto fix (Node/NodeList).
+
+Feature work: CRD status subresource (#114), watch_pods dedup (#113), client-util crate (#112), RBAC dead code cleanup (#115).
+
+**PRs merged this session: ~115 total since project start. Session merges: #103/#97 pending + #104, #106–#108, #111–#115.**
 
 ## Stance
 
