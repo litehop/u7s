@@ -781,6 +781,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_nodes_group_is_authorized_after_rbac_seed_and_init() {
+        // Verifies the full chain: seed_rbac writes ClusterRole+ClusterRoleBinding,
+        // AppState::init() loads them into the RBAC index, and is_allowed returns
+        // true for a kubelet in system:nodes.
+        //
+        // Without this test the seeded data could be structurally correct (stored under
+        // the right key) but still broken at the authorization layer — e.g. if init()
+        // builds the wrong api_key or if subject_matches ignores the Group kind.
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        // Populate RBAC index from persisted seed data — mirrors what main() does.
+        state.init().await;
+
+        let groups = vec!["system:nodes".to_owned()];
+
+        // A kubelet in system:nodes must be able to GET a pod assigned to it.
+        let pod_read = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "pods",
+            subresource: "",
+            namespace: Some("default"),
+            name: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&pod_read),
+            "system:nodes must be allowed to GET pods — kubelet needs this to reconcile its pod list"
+        );
+
+        // A kubelet in system:nodes must be able to create a lease (heartbeat).
+        let lease_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "coordination.k8s.io",
+            resource: "leases",
+            subresource: "",
+            namespace: Some("kube-node-lease"),
+            name: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&lease_create),
+            "system:nodes must be allowed to create leases — kubelet heartbeat depends on this"
+        );
+
+        // A user NOT in system:nodes must be denied — the binding is group-specific.
+        let other_groups = vec!["system:authenticated".to_owned()];
+        let pod_read_other = rbac::AuthzRequest {
+            username: "someone-else",
+            groups: &other_groups,
+            verb: "get",
+            api_group: "",
+            resource: "pods",
+            subresource: "",
+            namespace: Some("default"),
+            name: None,
+        };
+        assert!(
+            !state.rbac_index.is_allowed(&pod_read_other),
+            "users not in system:nodes must not inherit kubelet permissions"
+        );
+    }
+
+    #[tokio::test]
     async fn seed_services_creates_kubernetes_and_kube_dns() {
         // Both Services are required for in-cluster communication:
         //   - default/kubernetes: pods reach the API server via kubernetes.default.svc.cluster.local
