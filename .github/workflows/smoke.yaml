@@ -235,7 +235,7 @@ jobs:
         run: |
           MINOR=$(echo "${{ matrix.k8s }}" | cut -d. -f1-2)
           sudo apt-get update -qq
-          sudo apt-get install -y apt-transport-https ca-certificates curl gpg containernetworking-plugins
+          sudo apt-get install -y apt-transport-https ca-certificates curl gpg
           curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
           echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
@@ -285,6 +285,9 @@ jobs:
           sudo apt-get install -y --allow-downgrades "kubelet=${{ matrix.k8s }}-*" "kubectl=${{ matrix.k8s }}-*"
           sudo apt-mark hold kubelet kubectl
           sudo systemctl disable --now kubelet
+          # Install containernetworking-plugins after kubelet so it can overwrite
+          # the kubernetes-cni package files without a dpkg conflict.
+          sudo apt-get install -y --allow-overwrite containernetworking-plugins
 
       - name: Build release binary
         run: cargo build --release -p u7s-apiserver
