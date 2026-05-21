@@ -149,4 +149,18 @@ impl Status {
             },
         )
     }
+
+    pub fn forbidden(message: String) -> StatusError {
+        StatusError(
+            StatusCode::FORBIDDEN,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "Forbidden",
+                code: 403,
+            },
+        )
+    }
 }
