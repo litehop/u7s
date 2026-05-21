@@ -285,25 +285,12 @@ pub async fn create_cr(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let body = extract_body(&body, ct);
-    let mut obj: serde_json::Value = serde_json::from_slice(&body)
+    let obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let name = {
-        match obj["metadata"]["name"].as_str().filter(|n| !n.is_empty()) {
-            Some(n) => n.to_string(),
-            None => {
-                let gen = obj["metadata"]["generateName"].as_str().unwrap_or("");
-                if gen.is_empty() {
-                    return Err(Status::bad_request(
-                        "metadata.name or metadata.generateName is required".into(),
-                    ));
-                }
-                let generated = format!("{}{}", gen, crate::handlers::generic::generate_suffix());
-                obj["metadata"]["name"] = serde_json::Value::String(generated.clone());
-                generated
-            }
-        }
-    };
+    let mut wrapped = crate::types::Object { body: obj };
+    let name = crate::handlers::generic::resolve_name(&mut wrapped)?;
+    let mut obj = wrapped.body;
     validate_cr_name(&name)?;
 
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
@@ -512,25 +499,12 @@ pub async fn create_cr_namespaced(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let body = extract_body(&body, ct);
-    let mut obj: serde_json::Value = serde_json::from_slice(&body)
+    let obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let name = {
-        match obj["metadata"]["name"].as_str().filter(|n| !n.is_empty()) {
-            Some(n) => n.to_string(),
-            None => {
-                let gen = obj["metadata"]["generateName"].as_str().unwrap_or("");
-                if gen.is_empty() {
-                    return Err(Status::bad_request(
-                        "metadata.name or metadata.generateName is required".into(),
-                    ));
-                }
-                let generated = format!("{}{}", gen, crate::handlers::generic::generate_suffix());
-                obj["metadata"]["name"] = serde_json::Value::String(generated.clone());
-                generated
-            }
-        }
-    };
+    let mut wrapped = crate::types::Object { body: obj };
+    let name = crate::handlers::generic::resolve_name(&mut wrapped)?;
+    let mut obj = wrapped.body;
     validate_cr_name(&name)?;
 
     obj["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
