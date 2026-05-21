@@ -90,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
     seed_namespaces(&store).await?;
     seed_rbac(&store).await?;
     seed_services(&store).await?;
+    seed_coredns(&store).await?;
 
     // 4. Generate TLS certs.
     let tls_material = generate_tls(&args)?;
@@ -505,6 +506,54 @@ async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    // kube-system/coredns Deployment — provides in-cluster DNS resolution.
+    // kubelet injects 10.96.0.10 (kube-dns Service) into every pod's /etc/resolv.conf;
+    // without a running CoreDNS pod behind that Service, DNS lookups fail inside pods.
+    let key = keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
+    let body = serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system",
+            "uid": "00000000-0000-0000-0000-000000000030",
+            "creationTimestamp": "2024-01-01T00:00:00Z",
+            "labels": { "k8s-app": "kube-dns" }
+        },
+        "spec": {
+            "replicas": 1,
+            "selector": { "matchLabels": { "k8s-app": "kube-dns" } },
+            "template": {
+                "metadata": { "labels": { "k8s-app": "kube-dns" } },
+                "spec": {
+                    "containers": [{
+                        "name": "coredns",
+                        "image": "registry.k8s.io/coredns/coredns:v1.11.1",
+                        "ports": [
+                            { "containerPort": 53, "protocol": "UDP", "name": "dns" },
+                            { "containerPort": 53, "protocol": "TCP", "name": "dns-tcp" }
+                        ]
+                    }]
+                }
+            }
+        }
+    });
+    match store
+        .put(&key, Bytes::from(body.to_string()), Some(0))
+        .await
+    {
+        Ok(_) => tracing::info!("seeded Deployment: kube-system/coredns"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(anyhow::anyhow!("seed Deployment kube-system/coredns: {e}")),
+    }
+
+    Ok(())
+}
+
 async fn serve_tls(
     listener: TcpListener,
     app: Router,
@@ -792,6 +841,85 @@ mod tests {
         assert!(
             dns_obj.is_some(),
             "Service kube-system/kube-dns must still exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_coredns_creates_deployment_in_kube_system() {
+        // CoreDNS Deployment must exist after seeding so in-cluster DNS resolution works.
+        // Without this Deployment, pods get an empty DNS response for service names
+        // because no pod backs the kube-dns Service (10.96.0.10).
+        let store = make_store();
+        seed_coredns(&store).await.expect("seed must not fail");
+
+        let key = keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
+        let obj = store.get(&key).await.expect("get must not fail");
+        assert!(
+            obj.is_some(),
+            "Deployment kube-system/coredns must exist after seeding"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&obj.unwrap().value).expect("valid json");
+        assert_eq!(parsed["kind"].as_str(), Some("Deployment"));
+        assert_eq!(parsed["apiVersion"].as_str(), Some("apps/v1"));
+        assert_eq!(parsed["metadata"]["name"].as_str(), Some("coredns"));
+        assert_eq!(
+            parsed["metadata"]["namespace"].as_str(),
+            Some("kube-system")
+        );
+        // Selector must match kube-dns label so kubelet pod assignment reaches CoreDNS pods.
+        assert_eq!(
+            parsed["spec"]["selector"]["matchLabels"]["k8s-app"].as_str(),
+            Some("kube-dns"),
+            "selector must match k8s-app=kube-dns so the kube-dns Service selects CoreDNS pods"
+        );
+        // Container must use the expected image.
+        let containers = parsed["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .expect("containers must be an array");
+        assert_eq!(containers.len(), 1, "must have exactly one container");
+        assert_eq!(
+            containers[0]["image"].as_str(),
+            Some("registry.k8s.io/coredns/coredns:v1.11.1"),
+            "image must be pinned to a known CoreDNS version"
+        );
+        // DNS ports must be present.
+        let ports = containers[0]["ports"]
+            .as_array()
+            .expect("ports must be an array");
+        assert_eq!(ports.len(), 2, "must expose both UDP and TCP port 53");
+        let protocols: Vec<&str> = ports
+            .iter()
+            .filter_map(|p| p["protocol"].as_str())
+            .collect();
+        assert!(
+            protocols.contains(&"UDP"),
+            "CoreDNS must expose UDP port 53 for DNS queries"
+        );
+        assert!(
+            protocols.contains(&"TCP"),
+            "CoreDNS must expose TCP port 53 for large DNS responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_coredns_is_idempotent() {
+        // A second call must not error — startup can happen against an existing database.
+        // Without idempotency, every restart would fail after the first boot.
+        let store = make_store();
+        seed_coredns(&store)
+            .await
+            .expect("first seed must not fail");
+        seed_coredns(&store)
+            .await
+            .expect("second seed must not fail — seed must be idempotent");
+
+        // Data must still be correct after two calls.
+        let key = keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
+        let obj = store.get(&key).await.expect("get must not fail");
+        assert!(
+            obj.is_some(),
+            "Deployment kube-system/coredns must still exist after second seed call"
         );
     }
 }
