@@ -1180,4 +1180,281 @@ mod tests {
         assert_eq!(json["metadata"]["name"], "smoke-cm");
         assert_eq!(json["data"]["key"], "value");
     }
+
+    /// encode_proto_response must produce a valid proto envelope for APIVersions
+    /// (the /api discovery response). kubectl requests this with Accept: proto
+    /// before attempting any resource operations. A wireType 6 in this response
+    /// would cause "proto: illegal wireType 6" before kubectl even issues the
+    /// namespace create command.
+    #[test]
+    fn encode_proto_response_no_illegal_wire_types_api_versions() {
+        let val = serde_json::json!({
+            "kind": "APIVersions",
+            "apiVersion": "v1",
+            "versions": ["v1"],
+            "serverAddressByClientCIDRs": [{
+                "clientCIDR": "0.0.0.0/0",
+                "serverAddress": "https://127.0.0.1:6443"
+            }]
+        });
+
+        let encoded = encode_proto_response(&val);
+        assert_eq!(&encoded[..4], &[0x6b, 0x38, 0x73, 0x00]);
+
+        let fields = assert_valid_wire_types(&encoded[4..]);
+        let field_numbers: Vec<u64> = fields.iter().map(|(fn_, _, _)| *fn_).collect();
+        assert!(field_numbers.contains(&1), "TypeMeta field must be present");
+        assert!(field_numbers.contains(&2), "raw field must be present");
+        assert!(field_numbers.contains(&4), "contentType field must be present");
+
+        let env = decode_k8s_proto_envelope(&encoded).expect("must decode as k8s envelope");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&env.raw).expect("raw must be valid JSON");
+        assert_eq!(recovered["kind"], "APIVersions");
+    }
+
+    /// encode_proto_response must produce a valid proto envelope for APIResourceList
+    /// (the /api/v1 discovery response). kubectl fetches this to discover core resources.
+    #[test]
+    fn encode_proto_response_no_illegal_wire_types_api_resource_list() {
+        let val = serde_json::json!({
+            "kind": "APIResourceList",
+            "apiVersion": "v1",
+            "groupVersion": "v1",
+            "resources": [
+                {
+                    "name": "namespaces",
+                    "singularName": "namespace",
+                    "namespaced": false,
+                    "kind": "Namespace",
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                },
+                {
+                    "name": "pods",
+                    "singularName": "pod",
+                    "namespaced": true,
+                    "kind": "Pod",
+                    "shortNames": ["po"],
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                }
+            ]
+        });
+
+        let encoded = encode_proto_response(&val);
+        assert_eq!(&encoded[..4], &[0x6b, 0x38, 0x73, 0x00]);
+        assert_valid_wire_types(&encoded[4..]);
+
+        let env = decode_k8s_proto_envelope(&encoded).expect("must decode as k8s envelope");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&env.raw).expect("raw must be valid JSON");
+        assert_eq!(recovered["kind"], "APIResourceList");
+    }
+
+    /// encode_proto_response must produce a valid proto envelope for APIGroupList
+    /// (the /apis discovery response). kubectl fetches this to enumerate all API groups.
+    /// This response can be large (11+ groups) and contains slash-containing strings
+    /// like "rbac.authorization.k8s.io/v1" which must not produce illegal wire types.
+    #[test]
+    fn encode_proto_response_no_illegal_wire_types_api_group_list() {
+        let val = serde_json::json!({
+            "kind": "APIGroupList",
+            "apiVersion": "v1",
+            "groups": [
+                {
+                    "name": "admissionregistration.k8s.io",
+                    "versions": [{"groupVersion": "admissionregistration.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "admissionregistration.k8s.io/v1", "version": "v1"}
+                },
+                {
+                    "name": "apiextensions.k8s.io",
+                    "versions": [{"groupVersion": "apiextensions.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "apiextensions.k8s.io/v1", "version": "v1"}
+                },
+                {
+                    "name": "apps",
+                    "versions": [{"groupVersion": "apps/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "apps/v1", "version": "v1"}
+                },
+                {
+                    "name": "authentication.k8s.io",
+                    "versions": [{"groupVersion": "authentication.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "authentication.k8s.io/v1", "version": "v1"}
+                },
+                {
+                    "name": "authorization.k8s.io",
+                    "versions": [{"groupVersion": "authorization.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "authorization.k8s.io/v1", "version": "v1"}
+                },
+                {
+                    "name": "coordination.k8s.io",
+                    "versions": [{"groupVersion": "coordination.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "coordination.k8s.io/v1", "version": "v1"}
+                },
+                {
+                    "name": "networking.k8s.io",
+                    "versions": [{"groupVersion": "networking.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "networking.k8s.io/v1", "version": "v1"}
+                },
+                {
+                    "name": "node.k8s.io",
+                    "versions": [{"groupVersion": "node.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "node.k8s.io/v1", "version": "v1"}
+                },
+                {
+                    "name": "policy",
+                    "versions": [{"groupVersion": "policy/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "policy/v1", "version": "v1"}
+                },
+                {
+                    "name": "rbac.authorization.k8s.io",
+                    "versions": [{"groupVersion": "rbac.authorization.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "rbac.authorization.k8s.io/v1", "version": "v1"}
+                },
+                {
+                    "name": "storage.k8s.io",
+                    "versions": [{"groupVersion": "storage.k8s.io/v1", "version": "v1"}],
+                    "preferredVersion": {"groupVersion": "storage.k8s.io/v1", "version": "v1"}
+                }
+            ]
+        });
+
+        let encoded = encode_proto_response(&val);
+        assert_eq!(&encoded[..4], &[0x6b, 0x38, 0x73, 0x00]);
+        assert_valid_wire_types(&encoded[4..]);
+
+        let env = decode_k8s_proto_envelope(&encoded).expect("must decode as k8s envelope");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&env.raw).expect("raw must be valid JSON");
+        assert_eq!(recovered["kind"], "APIGroupList");
+        assert_eq!(
+            recovered["groups"].as_array().unwrap().len(),
+            11,
+            "all 11 groups must be present"
+        );
+    }
+
+    /// Regression test for mayor-cux: encode_proto_response must produce a valid Kubernetes
+    /// protobuf envelope for a realistic Namespace JSON with name, uid, resourceVersion,
+    /// creationTimestamp, and labels — the exact fields present in a real `kubectl create
+    /// namespace smoke-test` response.
+    ///
+    /// This test walks EVERY byte of the encoded output, checking that each proto tag has a
+    /// legal wire type. It must fail if encode_proto_response produces an illegal wire type,
+    /// and must pass after the fix is applied.
+    ///
+    /// The "proto: illegal wireType 6" CI failure is reproduced when the Go proto decoder
+    /// misaligns while reading the Unknown envelope — e.g., due to a wrong length varint that
+    /// causes it to stop reading the raw field too early, leaving JSON bytes to be mis-read
+    /// as proto tags. ('n' = 0x6E has wire type 6.)
+    #[test]
+    fn encode_proto_response_no_illegal_wire_types_realistic_namespace() {
+        // Build a realistic namespace JSON matching what the server returns after
+        // create_namespace: includes uid, resourceVersion, labels, and creationTimestamp.
+        let val = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "creationTimestamp": null,
+                "labels": {
+                    "kubernetes.io/metadata.name": "smoke-test"
+                },
+                "name": "smoke-test",
+                "resourceVersion": "5",
+                "uid": "12345678-1234-1234-1234-123456789012"
+            },
+            "status": {
+                "phase": "Active"
+            }
+        });
+
+        let encoded = encode_proto_response(&val);
+
+        // Must start with k8s proto magic.
+        assert_eq!(
+            &encoded[..4],
+            &[0x6b, 0x38, 0x73, 0x00],
+            "must start with k8s proto magic"
+        );
+
+        let envelope = &encoded[4..];
+
+        // Walk every tag in the Unknown envelope, asserting no illegal wire types.
+        // This is the core of the regression: if any tag byte has wire type 6 (or 3, 4, 7),
+        // the Go proto decoder would produce "proto: illegal wireType N".
+        let fields = assert_valid_wire_types(envelope);
+
+        // Verify the expected fields are present.
+        let field_numbers: Vec<u64> = fields.iter().map(|(fn_, _, _)| *fn_).collect();
+        assert!(
+            field_numbers.contains(&1),
+            "field 1 (TypeMeta) must be in Unknown envelope"
+        );
+        assert!(
+            field_numbers.contains(&2),
+            "field 2 (raw JSON) must be in Unknown envelope"
+        );
+        assert!(
+            field_numbers.contains(&4),
+            "field 4 (contentType) must be in Unknown envelope"
+        );
+
+        // Also walk the TypeMeta sub-message.
+        let type_meta_len = fields.iter().find(|(fn_, _, _)| *fn_ == 1).map(|(_, _, l)| *l).unwrap();
+        let type_meta_start = {
+            // field 1 tag byte (1 byte) + len varint (1 byte for len < 128)
+            let mut p = 0;
+            let (tag, rest) = decode_varint(envelope).unwrap();
+            p += envelope.len() - rest.len();
+            let (_len, rest2) = decode_varint(rest).unwrap();
+            p += rest.len() - rest2.len();
+            p
+        };
+        let type_meta_bytes = &envelope[type_meta_start..type_meta_start + type_meta_len];
+        assert_valid_wire_types(type_meta_bytes);
+
+        // Full round-trip: raw field must be valid JSON containing our namespace data.
+        let env = decode_k8s_proto_envelope(&encoded).expect("must decode as k8s envelope");
+        assert_eq!(env.content_type, "application/json");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&env.raw).expect("raw field must be valid JSON");
+        assert_eq!(recovered["kind"], "Namespace");
+        assert_eq!(recovered["metadata"]["name"], "smoke-test");
+        assert_eq!(
+            recovered["metadata"]["uid"],
+            "12345678-1234-1234-1234-123456789012"
+        );
+        assert_eq!(
+            recovered["metadata"]["labels"]["kubernetes.io/metadata.name"],
+            "smoke-test"
+        );
+        assert_eq!(recovered["metadata"]["resourceVersion"], "5");
+        assert!(recovered["metadata"]["creationTimestamp"].is_null());
+    }
+
+    /// encode_proto_response must produce a valid proto envelope for the /version response.
+    /// This JSON has no apiVersion or kind fields, resulting in empty TypeMeta strings.
+    /// Empty strings still produce valid LEN-encoded fields with zero-length payloads.
+    #[test]
+    fn encode_proto_response_no_illegal_wire_types_server_version() {
+        let val = serde_json::json!({
+            "major": "1",
+            "minor": "36",
+            "gitVersion": "v1.36.0",
+            "gitCommit": "0000000000000000000000000000000000000000",
+            "gitTreeState": "clean",
+            "buildDate": "1970-01-01T00:00:00Z",
+            "goVersion": "go1.24.0",
+            "compiler": "gc",
+            "platform": "linux/amd64"
+        });
+
+        let encoded = encode_proto_response(&val);
+        assert_eq!(&encoded[..4], &[0x6b, 0x38, 0x73, 0x00]);
+        assert_valid_wire_types(&encoded[4..]);
+
+        let env = decode_k8s_proto_envelope(&encoded).expect("must decode as k8s envelope");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&env.raw).expect("raw must be valid JSON");
+        assert_eq!(recovered["gitVersion"], "v1.36.0");
+    }
 }

@@ -80,6 +80,12 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let wants_proto = prefer_proto(req.headers());
         let uri = req.uri().to_string();
+        let accept = req
+            .headers()
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -87,8 +93,10 @@ where
 
             // Only re-encode when client asked for protobuf.
             if !wants_proto {
+                tracing::debug!(uri = %uri, accept = %accept, "skip: no proto accept");
                 return Ok(resp);
             }
+            tracing::info!(uri = %uri, accept = %accept, status = resp.status().as_u16(), "wants proto");
 
             // Only re-encode successful (2xx) responses.
             if !resp.status().is_success() {
@@ -133,15 +141,18 @@ where
             // Re-encode as protobuf.
             let proto_bytes = encode_proto_response(&json_val);
             let proto_len = proto_bytes.len();
+            let kind = json_val["kind"].as_str().unwrap_or("").to_string();
             tracing::info!(
                 uri = %uri,
+                accept = %accept,
+                kind = %kind,
                 proto_len = proto_len,
                 json_len = body_bytes.len(),
-                first_bytes = %proto_bytes[..proto_bytes.len().min(20)]
+                all_bytes = %proto_bytes
                     .iter()
                     .map(|b| format!("{b:02x}"))
                     .collect::<Vec<_>>()
-                    .join(" "),
+                    .join(""),
                 "proto re-encode"
             );
 
