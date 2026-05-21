@@ -14,7 +14,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::{Object, ResourceKey},
-    util::{content_type, parse_resource_version},
+    util::{content_type, parse_resource_version, store_err_to_status},
 };
 
 #[derive(Deserialize)]
@@ -96,7 +96,20 @@ fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusEr
         StoreError::RevisionMismatch { expected, current } => Status::conflict(format!(
             "{kind} \"{name}\" cannot be updated: resource version mismatch (expected {expected}, current {current})"
         )),
-        other => Status::internal(other.to_string()),
+        other => {
+            let status = store_err_to_status(&other);
+            crate::status::StatusError(
+                status,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: other.to_string(),
+                    reason: "InternalError",
+                    code: status.as_u16(),
+                },
+            )
+        }
     }
 }
 
