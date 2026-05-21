@@ -346,6 +346,10 @@ fn is_exempt(path: &str) -> bool {
 }
 
 /// HTTP method → RBAC verb.
+///
+/// For GET requests the caller must call `get_verb` instead, because Kubernetes
+/// distinguishes between "get" (named resource), "list" (collection), and
+/// "watch" (streaming watch).
 fn method_to_verb(method: &axum::http::Method) -> &'static str {
     match method.as_str() {
         "GET" => "get",
@@ -357,6 +361,32 @@ fn method_to_verb(method: &axum::http::Method) -> &'static str {
         "HEAD" => "get",
         // Unknown/future methods: fall back to "get" (least-privilege intent).
         _ => "get",
+    }
+}
+
+/// Resolve the RBAC verb for a GET request.
+///
+/// Kubernetes differentiates three GET-related verbs:
+///   "watch"  — query param `watch=true` or `watch=1` is present
+///   "list"   — collection endpoint (no resource name in path)
+///   "get"    — named resource endpoint
+///
+/// This prevents the authorization bypass where a user with only the `get`
+/// verb could enumerate all resources by hitting the collection endpoint.
+fn get_verb(name: Option<&str>, query: Option<&str>) -> &'static str {
+    // Watch takes priority: a client streaming watch events needs "watch", not "list".
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if let Some(val) = pair.strip_prefix("watch=") {
+                if val == "true" || val == "1" {
+                    return "watch";
+                }
+            }
+        }
+    }
+    match name {
+        Some(_) => "get",
+        None => "list",
     }
 }
 
@@ -560,7 +590,11 @@ where
 
         // 2. Authorize.
         let parsed = parse_path(&path);
-        let verb = method_to_verb(req.method());
+        let verb = if req.method() == axum::http::Method::GET {
+            get_verb(parsed.name.as_deref(), req.uri().query())
+        } else {
+            method_to_verb(req.method())
+        };
 
         let allowed = self.rbac_index.is_allowed(&AuthzRequest {
             username: &user.username,
@@ -751,6 +785,48 @@ mod tests {
         assert_eq!(p.resource, "pods");
         assert_eq!(p.subresource, "status");
         assert_eq!(p.name.as_deref(), Some("mypod"));
+    }
+
+    // --- get_verb() — collection vs named vs watch disambiguation ---
+
+    /// GET on a collection endpoint must map to "list".
+    /// A user with only "get" must NOT be allowed to enumerate all pods via
+    /// the collection endpoint — that would be an authorization bypass.
+    #[test]
+    fn test_get_verb_collection_is_list() {
+        assert_eq!(get_verb(None, None), "list");
+        assert_eq!(get_verb(None, Some("")), "list");
+        assert_eq!(get_verb(None, Some("limit=500")), "list");
+    }
+
+    /// GET on a named resource endpoint must map to "get".
+    #[test]
+    fn test_get_verb_named_is_get() {
+        assert_eq!(get_verb(Some("nginx"), None), "get");
+        assert_eq!(get_verb(Some("nginx"), Some("resourceVersion=42")), "get");
+    }
+
+    /// GET with watch=true must map to "watch", regardless of whether a name
+    /// is present. "watch" is a separate RBAC verb in Kubernetes.
+    #[test]
+    fn test_get_verb_watch_param_is_watch() {
+        assert_eq!(get_verb(None, Some("watch=true")), "watch");
+        assert_eq!(get_verb(Some("nginx"), Some("watch=true")), "watch");
+        // watch=1 is also accepted
+        assert_eq!(get_verb(None, Some("watch=1")), "watch");
+        // watch takes priority even with other params
+        assert_eq!(get_verb(None, Some("limit=100&watch=true")), "watch");
+        assert_eq!(
+            get_verb(None, Some("watch=true&resourceVersion=0")),
+            "watch"
+        );
+    }
+
+    /// "watch=false" must NOT map to "watch" — client explicitly opted out.
+    #[test]
+    fn test_get_verb_watch_false_is_list() {
+        assert_eq!(get_verb(None, Some("watch=false")), "list");
+        assert_eq!(get_verb(None, Some("watch=0")), "list");
     }
 
     // --- is_exempt() ---
