@@ -229,7 +229,10 @@ mod tests {
     fn validate_cli_path_accepts_absolute() {
         let p = std::path::Path::new("/var/lib/u7s/ca.key");
         let result = validate_cli_path(p);
-        assert!(result.is_ok(), "absolute path without '..' must be accepted");
+        assert!(
+            result.is_ok(),
+            "absolute path without '..' must be accepted"
+        );
         assert_eq!(result.unwrap(), p);
     }
 
@@ -239,7 +242,10 @@ mod tests {
     fn validate_cli_path_accepts_relative_without_dotdot() {
         let p = std::path::Path::new("./sa.key");
         let result = validate_cli_path(p);
-        assert!(result.is_ok(), "relative path without '..' must be accepted");
+        assert!(
+            result.is_ok(),
+            "relative path without '..' must be accepted"
+        );
         assert_eq!(result.unwrap(), p);
     }
 

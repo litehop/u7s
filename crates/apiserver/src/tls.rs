@@ -124,14 +124,14 @@ fn load_or_generate_ca(
                 "partial CA state: {ca_key_path} exists but {ca_cert_path} is missing; \
                  deleting stale key and regenerating CA"
             );
-            std::fs::remove_file(ca_key_path)
+            std::fs::remove_file(validate_cli_path(std::path::Path::new(ca_key_path))?)
                 .map_err(|e| anyhow::anyhow!("remove stale CA key {ca_key_path}: {e}"))?;
         } else {
             tracing::error!(
                 "partial CA state: {ca_cert_path} exists but {ca_key_path} is missing; \
                  deleting stale cert and regenerating CA"
             );
-            std::fs::remove_file(ca_cert_path)
+            std::fs::remove_file(validate_cli_path(std::path::Path::new(ca_cert_path))?)
                 .map_err(|e| anyhow::anyhow!("remove stale CA cert {ca_cert_path}: {e}"))?;
         }
         // Fall through to generate a fresh CA below.
@@ -139,10 +139,9 @@ fn load_or_generate_ca(
 
     if key_exists && cert_exists {
         // Load CA key from PEM.
-        let key_pem = std::fs::read_to_string(
-            validate_cli_path(std::path::Path::new(ca_key_path))?,
-        )
-        .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
+        let key_pem =
+            std::fs::read_to_string(validate_cli_path(std::path::Path::new(ca_key_path))?)
+                .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
         let ca_key =
             KeyPair::from_pem(&key_pem).map_err(|e| anyhow::anyhow!("parse CA key: {e}"))?;
 
