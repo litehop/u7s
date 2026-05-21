@@ -29,14 +29,19 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
 ## Workflow
 
 ```bash
-# 0. Verify you are on the correct branch — BEFORE touching any file
-current_branch=$(git branch --show-current)
-expected_branch="worker/<slug>-<bead-id>"
-if [ "$current_branch" != "$expected_branch" ]; then
-  git checkout -b "$expected_branch" || git checkout "$expected_branch"
-fi
-# Confirm the working tree is clean; if not, stash or abort
-git status --short
+# 0. Verify you are in your isolated worktree — BEFORE touching any file
+#
+# Your working directory must be ai/worktrees/<name>, NOT the repo root.
+# If you are in the repo root (/Users/balint.erdos/u7s or similar), STOP.
+# You are in the wrong place and will corrupt the mayor's main branch.
+#
+# Check:
+pwd                        # must end in ai/worktrees/<something>
+git branch --show-current  # must be worker/<slug>-<bead-id>
+git status --short         # must be clean
+
+# If you are NOT in a worktree, abort and report the issue to the mayor.
+# Do not attempt to create a branch or checkout in the repo root.
 
 # 1. Claim the bead
 bd update <id> --claim
