@@ -1662,6 +1662,20 @@ mod create_defaults_tests {
     }
 }
 
+/// Extract the target node name from a Binding object body.
+///
+/// Returns `Err` with a 400 if `target.name` is absent or empty.
+/// Extracted for testability — the full `bind_pod` handler is async and requires a live store.
+pub fn extract_binding_node_name(
+    binding: &serde_json::Value,
+) -> Result<String, crate::status::StatusError> {
+    binding["target"]["name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Status::bad_request("target.name is required".into()))
+        .map(str::to_string)
+}
+
 pub async fn bind_pod(
     State(state): State<AppState>,
     Path((raw_ns, name)): Path<(String, String)>,
@@ -1677,11 +1691,7 @@ pub async fn bind_pod(
     let binding: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let node_name = binding["target"]["name"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Status::bad_request("target.name is required".into()))?
-        .to_string();
+    let node_name = extract_binding_node_name(&binding)?;
 
     let key = object_key("pods", ns.as_str(), &name);
     let stored = state
@@ -1707,4 +1717,1393 @@ pub async fn bind_pod(
     obj.set_resource_version(new_rv);
 
     Ok((StatusCode::CREATED, Json(obj.body)))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for pure functions: store_err_to_status, JSON patch helpers,
+// binding extraction. These cover lines/branches not reachable via the
+// existing watch_tests / field_selector_tests / status_tests / patch_type_tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pure_logic_tests {
+    use super::*;
+    use u7s_store::StoreError;
+
+    // -----------------------------------------------------------------------
+    // store_err_to_status
+    // -----------------------------------------------------------------------
+
+    /// StoreError::NotFound must map to HTTP 404 and name the "Pod" kind.
+    /// Without this, callers (get_pod, delete_pod) would surface wrong status codes.
+    #[test]
+    fn store_err_not_found_becomes_404() {
+        let err = StoreError::NotFound {
+            key: "/registry/pods/default/my-pod".into(),
+        };
+        let status_err = store_err_to_status(err, "my-pod");
+        let resp: axum::response::Response = status_err.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// StoreError::AlreadyExists must map to HTTP 409.
+    /// create_pod must surface Conflict when the key already exists.
+    #[test]
+    fn store_err_already_exists_becomes_409() {
+        let err = StoreError::AlreadyExists {
+            key: "/registry/pods/default/my-pod".into(),
+        };
+        let status_err = store_err_to_status(err, "my-pod");
+        let resp: axum::response::Response = status_err.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    /// StoreError::RevisionMismatch must map to HTTP 409 Conflict.
+    /// replace_pod OCC relies on this: a stale resourceVersion must not silently
+    /// overwrite newer data.
+    #[test]
+    fn store_err_revision_mismatch_becomes_409() {
+        let err = StoreError::RevisionMismatch {
+            expected: 3,
+            current: 7,
+        };
+        let status_err = store_err_to_status(err, "my-pod");
+        let resp: axum::response::Response = status_err.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+    }
+
+    /// Other StoreErrors (e.g. Compacted) must map to HTTP 500 Internal Server Error.
+    /// This is the catch-all arm; any unrecognised store error must not leak as a 2xx.
+    #[test]
+    fn store_err_compacted_becomes_500() {
+        let err = StoreError::Compacted {
+            requested: 1,
+            horizon: 100,
+        };
+        let status_err = store_err_to_status(err, "my-pod");
+        let resp: axum::response::Response = status_err.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_json_pointer_segments
+    // -----------------------------------------------------------------------
+
+    /// Empty pointer yields empty segments — root document path.
+    #[test]
+    fn pointer_segments_empty_string() {
+        assert!(pod_json_pointer_segments("").is_empty());
+    }
+
+    /// "/a/b/c" splits into ["a", "b", "c"].
+    #[test]
+    fn pointer_segments_three_parts() {
+        assert_eq!(pod_json_pointer_segments("/a/b/c"), vec!["a", "b", "c"]);
+    }
+
+    /// RFC 6901 escape sequences: ~1 -> "/" and ~0 -> "~".
+    #[test]
+    fn pointer_segments_rfc6901_escapes() {
+        let segs = pod_json_pointer_segments("/a~1b/c~0d");
+        assert_eq!(segs, vec!["a/b", "c~d"]);
+    }
+
+    /// A pointer without a leading slash is used as-is (strip_prefix returns None).
+    #[test]
+    fn pointer_segments_no_leading_slash() {
+        let segs = pod_json_pointer_segments("foo/bar");
+        assert_eq!(segs, vec!["foo", "bar"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_json_navigate_mut
+    // -----------------------------------------------------------------------
+
+    /// Empty segments must return an error ("cannot operate on root document").
+    #[test]
+    fn navigate_mut_empty_segments_returns_err() {
+        let mut obj = serde_json::json!({"a": 1});
+        let result = pod_json_navigate_mut(&mut obj, &[]);
+        assert!(result.is_err(), "empty segments must error");
+        let resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Single segment returns (root_object, "key") — the last segment.
+    #[test]
+    fn navigate_mut_single_segment() {
+        let mut obj = serde_json::json!({"x": 99});
+        let segs = vec!["x".to_string()];
+        let (parent, key) =
+            pod_json_navigate_mut(&mut obj, &segs).unwrap_or_else(|_| panic!("must succeed"));
+        assert_eq!(key, "x");
+        assert!(parent.is_object());
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_json_navigate_one
+    // -----------------------------------------------------------------------
+
+    /// Traversing into an object with a known key succeeds.
+    #[test]
+    fn navigate_one_object_known_key() {
+        let mut obj = serde_json::json!({"spec": {"nodeName": "worker-1"}});
+        let result = pod_json_navigate_one(&mut obj, "spec");
+        assert!(result.is_ok());
+    }
+
+    /// Traversing into an object with an unknown key returns 422.
+    #[test]
+    fn navigate_one_object_missing_key_returns_422() {
+        let mut obj = serde_json::json!({"spec": {}});
+        let result = pod_json_navigate_one(&mut obj, "status");
+        assert!(result.is_err());
+        let resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Traversing into an array by numeric index succeeds.
+    #[test]
+    fn navigate_one_array_valid_index() {
+        let mut obj = serde_json::json!([10, 20, 30]);
+        let result = pod_json_navigate_one(&mut obj, "1");
+        assert!(result.is_ok());
+        let val = result.unwrap_or_else(|_| panic!("must succeed"));
+        assert_eq!(*val, serde_json::json!(20));
+    }
+
+    /// Traversing into an array with an out-of-bounds index returns 422.
+    #[test]
+    fn navigate_one_array_oob_returns_422() {
+        let mut obj = serde_json::json!([10]);
+        let result = pod_json_navigate_one(&mut obj, "5");
+        assert!(result.is_err());
+    }
+
+    /// Traversing into an array with a non-numeric index returns 422.
+    #[test]
+    fn navigate_one_array_non_numeric_index_returns_422() {
+        let mut obj = serde_json::json!([10]);
+        let result = pod_json_navigate_one(&mut obj, "not-a-number");
+        assert!(result.is_err());
+    }
+
+    /// Traversing into a scalar (non-object/array) returns 422.
+    #[test]
+    fn navigate_one_scalar_returns_422() {
+        let mut obj = serde_json::json!(42);
+        let result = pod_json_navigate_one(&mut obj, "foo");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_json_navigate_one_or_create
+    // -----------------------------------------------------------------------
+
+    /// Creating an intermediate key in an object succeeds.
+    #[test]
+    fn navigate_one_or_create_creates_missing_key() {
+        let mut obj = serde_json::json!({});
+        let result = pod_json_navigate_one_or_create(&mut obj, "spec");
+        assert!(result.is_ok());
+        let node = result.unwrap_or_else(|_| panic!("must succeed"));
+        assert!(node.is_object());
+    }
+
+    /// Creating into a non-object (e.g. array, scalar) returns 422.
+    #[test]
+    fn navigate_one_or_create_non_object_returns_422() {
+        let mut obj = serde_json::json!([1, 2, 3]);
+        let result = pod_json_navigate_one_or_create(&mut obj, "key");
+        assert!(result.is_err());
+        let resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_json_patch_add — branches not covered by patch_type_tests
+    // -----------------------------------------------------------------------
+
+    /// add to root (empty pointer) replaces the whole document.
+    #[test]
+    fn patch_add_root_replaces_document() {
+        let mut obj = serde_json::json!({"old": true});
+        pod_json_patch_add(&mut obj, "", serde_json::json!({"new": true}))
+            .unwrap_or_else(|_| panic!("add to root must succeed"));
+        assert_eq!(obj, serde_json::json!({"new": true}));
+    }
+
+    /// add with "-" as last segment appends to an array.
+    /// This is the RFC 6902 append convention; kubelet uses it for conditions.
+    #[test]
+    fn patch_add_dash_appends_to_array() {
+        let mut obj = serde_json::json!({"items": [1, 2]});
+        pod_json_patch_add(&mut obj, "/items/-", serde_json::json!(3))
+            .unwrap_or_else(|_| panic!("add '-' must succeed"));
+        assert_eq!(obj["items"], serde_json::json!([1, 2, 3]));
+    }
+
+    /// add with a numeric index inserts at that position.
+    #[test]
+    fn patch_add_numeric_index_inserts_at_position() {
+        let mut obj = serde_json::json!({"items": [1, 3]});
+        pod_json_patch_add(&mut obj, "/items/1", serde_json::json!(2))
+            .unwrap_or_else(|_| panic!("add at index must succeed"));
+        assert_eq!(obj["items"], serde_json::json!([1, 2, 3]));
+    }
+
+    /// add with an out-of-bounds index returns 422.
+    #[test]
+    fn patch_add_array_oob_returns_422() {
+        let mut obj = serde_json::json!({"items": [1]});
+        let result = pod_json_patch_add(&mut obj, "/items/5", serde_json::json!(99));
+        assert!(result.is_err());
+    }
+
+    /// add with an invalid (non-numeric) array index returns 422.
+    #[test]
+    fn patch_add_invalid_array_index_returns_422() {
+        let mut obj = serde_json::json!({"items": [1]});
+        let result = pod_json_patch_add(&mut obj, "/items/not-a-num", serde_json::json!(99));
+        assert!(result.is_err());
+    }
+
+    /// add to a scalar (non-object/array) returns 422.
+    #[test]
+    fn patch_add_to_scalar_returns_422() {
+        let mut obj = serde_json::json!(42);
+        let result = pod_json_patch_add(&mut obj, "/foo", serde_json::json!(1));
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_json_patch_set — branches not covered by patch_type_tests
+    // -----------------------------------------------------------------------
+
+    /// set (replace) on root (empty pointer) replaces the whole document.
+    #[test]
+    fn patch_set_root_replaces_document() {
+        let mut obj = serde_json::json!({"old": true});
+        pod_json_patch_set(&mut obj, "", serde_json::json!({"new": true}))
+            .unwrap_or_else(|_| panic!("set root must succeed"));
+        assert_eq!(obj, serde_json::json!({"new": true}));
+    }
+
+    /// set with "-" on an array appends (same as add "-").
+    #[test]
+    fn patch_set_dash_appends_to_array() {
+        let mut obj = serde_json::json!({"items": [1, 2]});
+        pod_json_patch_set(&mut obj, "/items/-", serde_json::json!(3))
+            .unwrap_or_else(|_| panic!("set '-' must succeed"));
+        assert_eq!(obj["items"], serde_json::json!([1, 2, 3]));
+    }
+
+    /// set with a numeric index beyond bounds returns 422.
+    #[test]
+    fn patch_set_array_oob_returns_422() {
+        let mut obj = serde_json::json!({"items": [1]});
+        let result = pod_json_patch_set(&mut obj, "/items/5", serde_json::json!(99));
+        assert!(result.is_err());
+    }
+
+    /// set with an invalid array index returns 422.
+    #[test]
+    fn patch_set_invalid_array_index_returns_422() {
+        let mut obj = serde_json::json!({"items": [1]});
+        let result = pod_json_patch_set(&mut obj, "/items/bad", serde_json::json!(2));
+        assert!(result.is_err());
+    }
+
+    /// set on a scalar parent (non-object/array) returns 422.
+    #[test]
+    fn patch_set_non_object_parent_returns_422() {
+        let mut obj = serde_json::json!({"leaf": 42});
+        // "leaf" is an integer; navigating into it then setting a sub-key must fail.
+        let result = pod_json_patch_set(&mut obj, "/leaf/sub", serde_json::json!(1));
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_json_patch_remove — branches not covered by patch_type_tests
+    // -----------------------------------------------------------------------
+
+    /// remove a key that does not exist returns 422.
+    #[test]
+    fn patch_remove_missing_key_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let result = pod_json_patch_remove(&mut obj, "/b");
+        assert!(result.is_err());
+    }
+
+    /// remove by valid array index succeeds and shortens the array.
+    #[test]
+    fn patch_remove_array_index_succeeds() {
+        let mut obj = serde_json::json!({"items": [10, 20, 30]});
+        pod_json_patch_remove(&mut obj, "/items/1")
+            .unwrap_or_else(|_| panic!("remove at valid index must succeed"));
+        assert_eq!(obj["items"], serde_json::json!([10, 30]));
+    }
+
+    /// remove with an out-of-bounds array index returns 422.
+    #[test]
+    fn patch_remove_array_oob_returns_422() {
+        let mut obj = serde_json::json!({"items": [10]});
+        let result = pod_json_patch_remove(&mut obj, "/items/5");
+        assert!(result.is_err());
+    }
+
+    /// remove with a non-numeric array index returns 422.
+    #[test]
+    fn patch_remove_invalid_array_index_returns_422() {
+        let mut obj = serde_json::json!({"items": [10]});
+        let result = pod_json_patch_remove(&mut obj, "/items/not-num");
+        assert!(result.is_err());
+    }
+
+    /// remove from a scalar (non-object/array) returns 422.
+    #[test]
+    fn patch_remove_scalar_parent_returns_422() {
+        let mut obj = serde_json::json!({"leaf": 42});
+        // Navigate into "leaf" (integer) then attempt remove of a sub-key.
+        let result = pod_json_patch_remove(&mut obj, "/leaf/sub");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_apply_json_patch — error paths not covered by patch_type_tests
+    // -----------------------------------------------------------------------
+
+    /// patch body must be a JSON array; a non-array returns 422.
+    #[test]
+    fn apply_json_patch_non_array_body_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!({"op": "replace", "path": "/a", "value": 2});
+        let result = pod_apply_json_patch(&mut obj, &patch);
+        assert!(result.is_err());
+        let resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// An operation missing the "op" field returns 422.
+    #[test]
+    fn apply_json_patch_missing_op_field_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"path": "/a", "value": 2}]);
+        let result = pod_apply_json_patch(&mut obj, &patch);
+        assert!(result.is_err());
+    }
+
+    /// An operation missing the "path" field returns 422.
+    #[test]
+    fn apply_json_patch_missing_path_field_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "replace", "value": 2}]);
+        let result = pod_apply_json_patch(&mut obj, &patch);
+        assert!(result.is_err());
+    }
+
+    /// An "add" operation missing "value" returns 422.
+    #[test]
+    fn apply_json_patch_add_missing_value_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "add", "path": "/b"}]);
+        let result = pod_apply_json_patch(&mut obj, &patch);
+        assert!(result.is_err());
+    }
+
+    /// A "replace" operation missing "value" returns 422.
+    #[test]
+    fn apply_json_patch_replace_missing_value_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "replace", "path": "/a"}]);
+        let result = pod_apply_json_patch(&mut obj, &patch);
+        assert!(result.is_err());
+    }
+
+    /// An unsupported op (e.g. "copy") returns 422.
+    /// Only add, remove, replace are supported.
+    #[test]
+    fn apply_json_patch_unsupported_op_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "copy", "from": "/a", "path": "/b"}]);
+        let result = pod_apply_json_patch(&mut obj, &patch);
+        assert!(result.is_err());
+    }
+
+    /// An empty array patch is a no-op and must succeed.
+    #[test]
+    fn apply_json_patch_empty_array_is_noop() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([]);
+        assert!(pod_apply_json_patch(&mut obj, &patch).is_ok());
+        assert_eq!(obj["a"], 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_binding_node_name
+    // -----------------------------------------------------------------------
+
+    /// A valid binding with target.name returns the node name.
+    /// This is the primary scheduler use-case: bind pod to node.
+    #[test]
+    fn extract_binding_node_name_valid() {
+        let binding = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Binding",
+            "target": {"kind": "Node", "name": "worker-1"}
+        });
+        let result = extract_binding_node_name(&binding);
+        let name = result.unwrap_or_else(|_| panic!("valid binding must yield node name"));
+        assert_eq!(name, "worker-1");
+    }
+
+    /// A binding with an empty target.name must be rejected with 400.
+    /// An empty nodeName would silently leave the pod unscheduled.
+    #[test]
+    fn extract_binding_node_name_empty_returns_400() {
+        let binding = serde_json::json!({"target": {"name": ""}});
+        let result = extract_binding_node_name(&binding);
+        assert!(result.is_err());
+        let resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// A binding missing target.name must be rejected with 400.
+    #[test]
+    fn extract_binding_node_name_missing_returns_400() {
+        let binding = serde_json::json!({"target": {}});
+        let result = extract_binding_node_name(&binding);
+        assert!(result.is_err());
+        let resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// A binding missing target entirely must be rejected with 400.
+    #[test]
+    fn extract_binding_node_name_no_target_returns_400() {
+        let binding = serde_json::json!({"kind": "Binding"});
+        let result = extract_binding_node_name(&binding);
+        assert!(result.is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Integration-style tests for async handlers (tower::ServiceExt::oneshot)
+// These use an in-memory store so no real server is needed.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod handler_tests {
+    use std::sync::Arc;
+
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::{delete, get, patch, post, put},
+        Router,
+    };
+    use bytes::Bytes;
+    use tower::ServiceExt;
+    use u7s_store::{SqliteStore, Store};
+
+    use super::*;
+    use crate::state::AppState;
+
+    /// Build a minimal AppState backed by an in-memory SQLite store.
+    fn make_state() -> (AppState, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        (state, store)
+    }
+
+    /// Seed the store with a namespace so parse_namespace succeeds.
+    async fn seed_namespace(store: &Arc<SqliteStore>, ns: &str) {
+        let key = format!("/registry/namespaces/{ns}");
+        let val = serde_json::json!({"kind": "Namespace", "metadata": {"name": ns}});
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .expect("seed namespace");
+    }
+
+    /// Seed the store with a pod, merging `extra` into the default pod JSON.
+    async fn seed_pod(store: &Arc<SqliteStore>, ns: &str, name: &str, extra: serde_json::Value) {
+        let key = format!("/registry/pods/{ns}/{name}");
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+                "resourceVersion": "1"
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"phase": "Pending"}
+        });
+        if let Some(map) = extra.as_object() {
+            for (k, v) in map {
+                pod[k] = v.clone();
+            }
+        }
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .expect("seed pod");
+    }
+
+    fn json_body(v: &serde_json::Value) -> Body {
+        Body::from(Bytes::from(serde_json::to_vec(v).unwrap()))
+    }
+
+    // -----------------------------------------------------------------------
+    // get_pod
+    // -----------------------------------------------------------------------
+
+    /// GET a pod that exists must return 200 with the pod JSON.
+    #[tokio::test]
+    async fn get_pod_returns_200_for_existing_pod() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "nginx", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/nginx")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// GET a pod that does not exist must return 404.
+    #[tokio::test]
+    async fn get_pod_returns_404_for_missing_pod() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/ghost")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// GET a pod in a namespace that does not exist must return 404.
+    #[tokio::test]
+    async fn get_pod_returns_404_for_missing_namespace() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/nonexistent/pods/nginx")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // create_pod
+    // -----------------------------------------------------------------------
+
+    /// POST a valid pod must return 201 with the created pod.
+    #[tokio::test]
+    async fn create_pod_returns_201() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// POST a pod with invalid JSON must return 400.
+    #[tokio::test]
+    async fn create_pod_returns_400_for_invalid_json() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_pod (PUT)
+    // -----------------------------------------------------------------------
+
+    /// PUT with mismatched name in URL vs body must return 400.
+    /// This guards against accidental or malicious object renaming via PUT.
+    #[tokio::test]
+    async fn replace_pod_name_mismatch_returns_400() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "nginx", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .with_state(state);
+
+        // URL says "nginx" but body says "other-pod".
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "other-pod",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": {}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/nginx")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_pod
+    // -----------------------------------------------------------------------
+
+    /// DELETE a pod without finalizers must return 200 with a Status object.
+    #[tokio::test]
+    async fn delete_pod_without_finalizers_returns_200() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "to-delete", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/to-delete")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// DELETE a pod with finalizers must soft-delete: stamp deletionTimestamp, keep object.
+    #[tokio::test]
+    async fn delete_pod_with_finalizers_stamps_deletion_timestamp() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        // Seed with finalizers directly (don't rely on seed_pod merge for nested metadata).
+        let key = "/registry/pods/default/finalized-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "finalized-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "finalizers": ["my.io/cleanup"]
+            },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .with_state(state.clone());
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/finalized-pod")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "soft-delete must return 200");
+
+        // The pod must still exist with deletionTimestamp set.
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must be stamped on soft-delete"
+        );
+    }
+
+    /// DELETE a pod that does not exist must return 404.
+    #[tokio::test]
+    async fn delete_pod_missing_returns_404() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/ghost")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_pod
+    // -----------------------------------------------------------------------
+
+    /// PATCH with merge-patch+json must update the specified field.
+    #[tokio::test]
+    async fn patch_pod_merge_patch_updates_field() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"metadata": {"labels": {"app": "test"}}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// PATCH with an unsupported content-type must return 415.
+    #[tokio::test]
+    async fn patch_pod_unsupported_content_type_returns_415() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_pod_status
+    // -----------------------------------------------------------------------
+
+    /// GET /status on an existing pod returns 200.
+    #[tokio::test]
+    async fn get_pod_status_returns_200() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                get(get_pod_status),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// GET /status on a missing pod returns 404.
+    #[tokio::test]
+    async fn get_pod_status_returns_404_for_missing() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                get(get_pod_status),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/ghost/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_pod_status (PUT /status)
+    // -----------------------------------------------------------------------
+
+    /// PUT /status must update the status field and preserve spec.
+    #[tokio::test]
+    async fn replace_pod_status_updates_status_only() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "status": {"phase": "Running"},
+            "spec": {"containers": [{"name": "hacker"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify store: status updated, spec preserved.
+        let key = "/registry/pods/default/my-pod";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["status"]["phase"], "Running");
+        // spec was seeded with one container named "app"; the handler must not overwrite it.
+        assert_eq!(v["spec"]["containers"][0]["name"], "app");
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_pod_status (PATCH /status)
+    // -----------------------------------------------------------------------
+
+    /// PATCH /status with strategic-merge-patch must update the phase.
+    #[tokio::test]
+    async fn patch_pod_status_updates_phase() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"status": {"phase": "Running"}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status")
+            .header(
+                header::CONTENT_TYPE,
+                "application/strategic-merge-patch+json",
+            )
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// PATCH /status with an unsupported content-type must return 415.
+    #[tokio::test]
+    async fn patch_pod_status_unsupported_content_type_returns_415() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod/status")
+            .header(header::CONTENT_TYPE, "application/json-patch+json")
+            .body(Body::from("[]"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // -----------------------------------------------------------------------
+    // bind_pod (POST /binding)
+    // -----------------------------------------------------------------------
+
+    /// POST /binding with a valid target.name must set spec.nodeName on the pod.
+    #[tokio::test]
+    async fn bind_pod_sets_node_name() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "unscheduled-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .with_state(state);
+
+        let binding = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Binding",
+            "metadata": {"name": "unscheduled-pod", "namespace": "default"},
+            "target": {"kind": "Node", "name": "worker-1"}
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/unscheduled-pod/binding")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&binding))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Verify spec.nodeName was set.
+        let key = "/registry/pods/default/unscheduled-pod";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["nodeName"], "worker-1",
+            "bind_pod must set spec.nodeName to the target node"
+        );
+    }
+
+    /// POST /binding with missing target.name must return 400.
+    #[tokio::test]
+    async fn bind_pod_missing_target_name_returns_400() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/binding",
+                post(bind_pod),
+            )
+            .with_state(state);
+
+        let binding = serde_json::json!({"apiVersion": "v1", "kind": "Binding", "target": {}});
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/my-pod/binding")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&binding))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_pod — JSON patch through handler
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // list_pods (GET /namespaces/:ns/pods)
+    // -----------------------------------------------------------------------
+
+    /// GET /pods on an existing namespace returns 200 with a PodList.
+    /// This covers the non-watch list_pods path and its inline lambdas.
+    #[tokio::test]
+    async fn list_pods_returns_200_with_pod_list() {
+        use axum::http::method::Method;
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "pod-a", serde_json::json!({})).await;
+        seed_pod(&store, "default", "pod-b", serde_json::json!({})).await;
+
+        let user = crate::auth::UserInfo {
+            username: "test-user".into(),
+            uid: String::new(),
+            groups: vec![],
+        };
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", get(list_pods))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces/default/pods")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["kind"], "PodList");
+        assert_eq!(
+            v["items"].as_array().unwrap().len(),
+            2,
+            "must return both seeded pods"
+        );
+    }
+
+    /// GET /pods with a field selector must filter pods by nodeName.
+    #[tokio::test]
+    async fn list_pods_with_field_selector_filters_pods() {
+        use axum::http::method::Method;
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        // Seed one pod on worker-1 and one on worker-2.
+        let key_a = "/registry/pods/default/pod-a";
+        let pod_a = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pod-a", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "worker-1", "containers": []}
+        });
+        store
+            .put(
+                key_a,
+                Bytes::from(serde_json::to_vec(&pod_a).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let key_b = "/registry/pods/default/pod-b";
+        let pod_b = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "pod-b", "namespace": "default", "resourceVersion": "2"},
+            "spec": {"nodeName": "worker-2", "containers": []}
+        });
+        store
+            .put(
+                key_b,
+                Bytes::from(serde_json::to_vec(&pod_b).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let user = crate::auth::UserInfo {
+            username: "test-user".into(),
+            uid: String::new(),
+            groups: vec![],
+        };
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", get(list_pods))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces/default/pods?field_selector=spec.nodeName%3Dworker-1")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "only worker-1 pods should be returned");
+        assert_eq!(items[0]["spec"]["nodeName"], "worker-1");
+    }
+
+    /// GET /pods on a nonexistent namespace must return 404.
+    #[tokio::test]
+    async fn list_pods_missing_namespace_returns_404() {
+        use axum::http::method::Method;
+
+        let (state, _store) = make_state();
+
+        let user = crate::auth::UserInfo {
+            username: "test-user".into(),
+            uid: String::new(),
+            groups: vec![],
+        };
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", get(list_pods))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces/nonexistent/pods")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_pod (PUT) — success path
+    // -----------------------------------------------------------------------
+
+    /// PUT with matching name and valid resourceVersion must return 200.
+    #[tokio::test]
+    async fn replace_pod_valid_update_returns_200() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        // seed_pod seeds with resourceVersion "1" in the body; the actual store revision is 1.
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        // Read back the actual stored revision so we can construct the PUT correctly.
+        let stored_rv = {
+            let obj = store
+                .get("/registry/pods/default/my-pod")
+                .await
+                .unwrap()
+                .unwrap();
+            obj.revision
+        };
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-pod",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx:latest"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_pod — strategic-merge-patch (delete-then-recreate finalizer path)
+    // -----------------------------------------------------------------------
+
+    /// PATCH with strategic-merge-patch+json must succeed.
+    #[tokio::test]
+    async fn patch_pod_strategic_merge_patch_succeeds() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "my-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!({"metadata": {"annotations": {"k": "v"}}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/my-pod")
+            .header(
+                header::CONTENT_TYPE,
+                "application/strategic-merge-patch+json",
+            )
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_pod — deletionTimestamp+empty-finalizers path
+    // -----------------------------------------------------------------------
+
+    /// PATCH that clears finalizers on a pod with deletionTimestamp set must hard-delete.
+    #[tokio::test]
+    async fn patch_pod_clears_finalizers_triggers_hard_delete() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        // Seed pod with deletionTimestamp and a finalizer.
+        let key = "/registry/pods/default/finalized-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "finalized-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2025-01-01T00:00:00Z",
+                "finalizers": ["my.io/cleanup"]
+            },
+            "spec": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state.clone());
+
+        // Patch to remove the finalizer.
+        let patch_body = serde_json::json!({"metadata": {"finalizers": []}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/finalized-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Pod should now be deleted from the store.
+        let stored = store.get(key).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "pod must be hard-deleted when deletionTimestamp is set and finalizers are empty"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PATCH with json-patch+json and a valid remove op must succeed.
+    // -----------------------------------------------------------------------
+
+    /// PATCH with json-patch+json and a valid remove op must succeed.
+    #[tokio::test]
+    async fn patch_pod_json_patch_remove_label() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        // Seed pod with a label directly so we control the exact JSON.
+        let key = "/registry/pods/default/labeled-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "labeled-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"env": "test"}
+            },
+            "spec": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let patch_body = serde_json::json!([{"op": "remove", "path": "/metadata/labels/env"}]);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/labeled-pod")
+            .header(header::CONTENT_TYPE, "application/json-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
