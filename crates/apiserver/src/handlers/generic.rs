@@ -40,6 +40,45 @@ pub struct CollectionQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Path parameter validation
+// ---------------------------------------------------------------------------
+
+/// Validate a Kubernetes resource name or namespace against DNS label rules.
+///
+/// Rules: 1–253 lowercase alphanumeric chars or hyphens. No `/`, no `..`,
+/// no uppercase. This prevents path-traversal attacks where a crafted `ns` or
+/// `name` value (e.g. `../../secrets`) could escape the expected key prefix in
+/// the store and read or overwrite unintended objects.
+///
+/// Returns `Err` with a 400 Bad Request StatusError if invalid.
+pub(crate) fn validate_name(label: &str, value: &str) -> Result<(), crate::status::StatusError> {
+    if value.is_empty() || value.len() > 253 {
+        return Err(Status::bad_request(format!(
+            "invalid {label} '{}': must be 1–253 characters",
+            value
+        )));
+    }
+    // Fast-path rejection: any slash or dot-dot is an immediate traversal indicator.
+    if value.contains('/') || value.contains("..") {
+        return Err(Status::bad_request(format!(
+            "invalid {label} '{}': must not contain '/' or '..'",
+            value
+        )));
+    }
+    // Full DNS-label charset check: lowercase alpha, digits, hyphens only.
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
+        return Err(Status::bad_request(format!(
+            "invalid {label} '{}': must match [a-z0-9.-]+",
+            value
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -717,6 +756,7 @@ pub async fn get_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -796,6 +836,7 @@ pub async fn replace_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -850,6 +891,7 @@ pub async fn delete_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1048,6 +1090,7 @@ pub async fn patch_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -1081,6 +1124,7 @@ pub async fn list_namespaced_resource(
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1171,6 +1215,8 @@ pub async fn get_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1204,6 +1250,7 @@ pub async fn create_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -1256,6 +1303,8 @@ pub async fn replace_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -1310,6 +1359,8 @@ pub async fn delete_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1377,6 +1428,8 @@ pub async fn patch_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -1440,6 +1493,7 @@ pub async fn put_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let meta = lookup(&state, &group, &version, &plural)?.clone();
     let body = extract_body(&body, content_type(&headers));
     let incoming =
@@ -1483,6 +1537,7 @@ pub async fn patch_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let meta = lookup(&state, &group, &version, &plural)?.clone();
     let patch_type = detect_patch_type(&headers)?;
 
@@ -1553,6 +1608,8 @@ pub async fn put_namespaced_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let body = extract_body(&body, content_type(&headers));
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -1613,6 +1670,8 @@ pub async fn patch_namespaced_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
 
     let key = match lookup(&state, &group, &version, &plural) {
@@ -4457,5 +4516,45 @@ mod resolve_name_tests {
             result.is_ok(),
             "bob's watch must succeed even when alice has exhausted her per-client limit"
         );
+    }
+
+    // -- validate_name (path traversal regression) --
+
+    /// A namespace value of "../../secrets" must return 400.
+    /// Without this check, a crafted request could escape the expected key prefix
+    /// in the SQLite store and read or overwrite arbitrary objects.
+    #[test]
+    fn validate_name_rejects_dotdot_traversal() {
+        let err = validate_name("namespace", "../../secrets")
+            .expect_err("path traversal must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 400,
+            "path traversal must return 400 Bad Request, not 200"
+        );
+    }
+
+    #[test]
+    fn validate_name_rejects_slash() {
+        let err = validate_name("name", "a/b").expect_err("slash in name must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400);
+    }
+
+    #[test]
+    fn validate_name_rejects_empty() {
+        let err = validate_name("name", "").expect_err("empty name must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400);
+    }
+
+    #[test]
+    fn validate_name_accepts_valid_dns_label() {
+        // Kubernetes names are DNS labels: lowercase alpha, digits, hyphens.
+        // Dots are also permitted (used in CRD names like "foo.example.com").
+        assert!(validate_name("name", "my-pod").is_ok());
+        assert!(validate_name("namespace", "kube-system").is_ok());
+        assert!(validate_name("name", "foo.example.com").is_ok());
+        assert!(validate_name("name", "a123").is_ok());
     }
 }
