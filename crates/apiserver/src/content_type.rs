@@ -134,6 +134,22 @@ where
                 return Ok(resp);
             }
 
+            // Watch streams use chunked transfer encoding (streaming NDJSON).
+            // Buffering a watch stream would deadlock the response — the stream
+            // never ends while the connection is open.  Pass watch responses
+            // through unchanged; the client's Accept includes "application/json"
+            // as a fallback so returning JSON is always legal.
+            let is_chunked = resp
+                .headers()
+                .get(header::TRANSFER_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .map(|te| te.eq_ignore_ascii_case("chunked"))
+                .unwrap_or(false);
+            if is_chunked {
+                tracing::debug!(uri = %uri, "skip proto re-encode: chunked watch stream");
+                return Ok(resp);
+            }
+
             // Collect the body bytes. Limit to 32 MiB — any larger response is
             // pathological for our API surface.
             let (parts, body) = resp.into_parts();
@@ -844,5 +860,83 @@ mod tests {
                 "discovery kind '{kind}' body must be the original JSON unchanged"
             );
         }
+    }
+
+    /// Watch streams (Transfer-Encoding: chunked) must NOT be buffered or re-encoded as proto.
+    ///
+    /// The content_type layer must detect chunked responses and pass them through.
+    /// Buffering a watch stream deadlocks the response — the stream never ends while
+    /// the connection is open, so `to_bytes` would block forever.
+    ///
+    /// This is the regression for the pod lifecycle smoke test failure: the kubelet's
+    /// node watch (`GET /api/v1/nodes?fieldSelector=metadata.name=ci-node&watch=true`)
+    /// was being intercepted and buffered, so the kubelet never received any watch events,
+    /// its local node cache remained empty, and it never ran any pods.
+    #[tokio::test]
+    async fn watch_stream_not_buffered_or_re_encoded() {
+        // Simulate the watch handler: chunked transfer encoding, application/json.
+        #[derive(Clone)]
+        struct ChunkedService;
+        impl Service<Request<Body>> for ChunkedService {
+            type Response = Response<Body>;
+            type Error = std::convert::Infallible;
+            type Future =
+                Pin<Box<dyn Future<Output = Result<Response<Body>, Self::Error>> + Send>>;
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                Box::pin(async move {
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header("transfer-encoding", "chunked")
+                        .body(Body::from(
+                            r#"{"type":"ADDED","object":{"kind":"Node","apiVersion":"v1","metadata":{"name":"ci-node"}}}"#,
+                        ))
+                        .unwrap())
+                })
+            }
+        }
+        let mut layer_svc = ContentTypeLayer.layer(ChunkedService);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/nodes?fieldSelector=metadata.name%3Dci-node&watch=true")
+            .header("accept", "application/vnd.kubernetes.protobuf, application/json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = layer_svc.call(req).await.unwrap();
+
+        // Must remain application/json — not converted to proto.
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            ct, "application/json",
+            "chunked watch stream must not be re-encoded as proto: buffering an \
+             infinite stream deadlocks the response"
+        );
+
+        // Transfer-Encoding header must be preserved.
+        let te = resp
+            .headers()
+            .get("transfer-encoding")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(te, "chunked", "watch stream transfer-encoding must be preserved");
+
+        // Body must be the original NDJSON, not a proto envelope.
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body_bytes.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "watch stream body must not start with k8s proto magic"
+        );
     }
 }
