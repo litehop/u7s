@@ -29,6 +29,15 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
 ## Workflow
 
 ```bash
+# 0. Verify you are on the correct branch — BEFORE touching any file
+current_branch=$(git branch --show-current)
+expected_branch="worker/<slug>-<bead-id>"
+if [ "$current_branch" != "$expected_branch" ]; then
+  git checkout -b "$expected_branch" || git checkout "$expected_branch"
+fi
+# Confirm the working tree is clean; if not, stash or abort
+git status --short
+
 # 1. Claim the bead
 bd update <id> --claim
 

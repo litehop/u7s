@@ -20,3 +20,4 @@ sa.pub
 kubeconfig
 
 .claude/scheduled_tasks.json
+.claude/plans/
