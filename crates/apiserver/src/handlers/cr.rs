@@ -210,6 +210,8 @@ pub async fn list_cr(
             ctx.kind,
             query.resource_version.unwrap_or(0),
             None,
+            query.label_selector,
+            query.field_selector,
         )
         .await;
     }
@@ -435,6 +437,8 @@ pub async fn list_cr_namespaced(
             ctx.kind,
             query.resource_version.unwrap_or(0),
             None,
+            query.label_selector,
+            query.field_selector,
         )
         .await;
     }
