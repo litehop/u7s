@@ -43,11 +43,11 @@ Conformance > taste. If you genuinely think a convention is harmful, surface it.
 ### Rule 12 — Fail Loud
 "Completed" is wrong if anything was skipped silently. "Tests pass" is wrong if any were skipped. Default to surfacing uncertainty.
 
+### Rule 13 — Prefer Native Tooling
+Use Bash and Rust over Python. Do not introduce Python scripts or Python dependencies. Prefer the agent's native tools for file operations. Read over cat/head/tail. Edit over sed/awk. Write over echo>/heredoc. Grep over shell grep/find. Bash is for runtime commands: git, test runners, builds, installs — not file I/O.
+
 ### Rule 15 — Prefer Merge Commits for PRs
 Use `gh pr merge --merge` (a regular merge commit) by default. This preserves the full branch history and keeps individual commits readable in `git log`. Use `--squash` only when a branch has many noisy debug or fixup commits (e.g. repeated CI tweaks) that would clutter the log. Never use `--rebase` — it rewrites commit SHAs and makes history chaotic. When squashing, say why in the merge message.
-
-### Rule 13 — Prefer Native Tooling
-Use Bash and Rust over Python. Do not introduce Python scripts or Python dependencies. For shell tasks (JSON extraction, text processing), use `jq`, `grep`, `sed`, `awk`. For anything more complex, write a Rust binary or use an existing Rust CLI tool.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
