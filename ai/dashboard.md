@@ -1,36 +1,42 @@
 # Dashboard
 
-2026-05-21 05:55 UTC
+2026-05-21 06:35 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 2 (+ 2 in-flight with workers)
+Open beads: 2 (both held)
 
 ## What needs the operator now
 
-**Renovate PRs #109 (rcgen 0.14) and #110 (rusqlite 0.39)** — both break the build. `rcgen 0.14` changed `signed_by()` API from 3-arg to 2-arg. Need your call: accept the upgrades (dispatch a worker to fix the call site in `tls.rs`)? Or close/ignore the Renovate PRs for now?
+**PRs #97 and #103** (node Ready, pod lifecycle) — CI running after root-cause fix. Watch stream fix landed on main (see below); both PRs rebased and fmt-fixed. Should go green.
 
-**PRs #97 and #103** (node Ready, pod lifecycle) — you rebased these onto main; CI reruns in progress. Should go green with wireType 7 fix now merged.
+**Renovate PRs #109/#110** (rcgen 0.14, rusqlite 0.39) — both break the build (rcgen API change). Ignored per operator policy until backlog empty.
+
+**Renovate PR #117** (jsonwebtoken v10) — breaks JWT auth tests. Same policy: ignore.
 
 **`system:masters` bypass** — flagged as architecturally fishy, tracked in bd memory. No action needed now.
 
-**`mayor-2ni`** (sonobuoy audit) and **`mayor-pgdr`** (typed proto bindings) — both held. 2ni needs Lima VM (can't run in CI worker). pgdr needs approach decision (Option A prost vs Option C Unknown-envelope — see bead description). No action needed unless you want to prioritise.
+**`mayor-2ni`** (sonobuoy audit) and **`mayor-pgdr`** (typed proto bindings) — both held. 2ni needs Lima VM. pgdr needs approach decision. No action unless you want to prioritise.
 
-## Forward-looking
+## Root cause found and fixed: pod lifecycle smoke test
 
-2 workers in flight:
-- **solo-vxo9** — GET collection → list verb fix (auth.rs), kubeconfig 0o600 perms (tls.rs), store error message sanitisation
-- **solo-xy2** — openAPIV3Schema validation for CR instances (422 on type/required violations)
+**Bug:** `ContentTypeLayer` was intercepting watch stream responses (kubelet's node watch, pod watch) and calling `to_bytes()` on the infinite streaming body. This deadlocked all watch responses — the kubelet never received node/pod watch events, its local cache stayed empty, and it never ran any pods.
 
-After those land, the bead backlog will be cold (2ni and pgdr held). Natural pause — good time for the sonobuoy run locally, or to decide on the Renovate upgrades.
+**Fix:** detect `Transfer-Encoding: chunked` before buffering; skip re-encoding for streaming responses. Watch responses are already JSON; `application/json` fallback in Accept is always valid. Regression test added (`watch_stream_not_buffered_or_re_encoded`). Committed to main as `fix(content_type)`, PRs #97/#103 rebased.
+
+**PRs merged this round:** #118 (openAPIV3Schema validation, xy2 worker), #119 (list verb/kubeconfig perms/error sanitisation, vxo9 worker, merged --admin for CodeQL false positive in tests).
+
+## Backlog status
+
+Bead backlog is cold (2ni, pgdr both held). After #97 and #103 merge, the only open work is held beads and Renovate PRs.
 
 ## Recent progress (this session)
 
 Security sprint (all P1s closed): constant-time token compare, CSPRNG UIDs, body size limit, SA key 0o600, path traversal, CRD group shadowing, RBAC escalation (logic + wiring), SAR privilege gate, per-client watch limit.
 
-CI hardening: gpg --batch fix, permissions blocks, SHA pinning, wireType 7 proto fix (Node/NodeList).
+CI hardening: gpg --batch fix, permissions blocks, SHA pinning, wireType 7 proto fix (Node/NodeList GET), watch stream deadlock fix.
 
-Feature work: CRD status subresource (#114), watch_pods dedup (#113), client-util crate (#112), RBAC dead code cleanup (#115).
+Feature work: CRD status subresource (#114), watch_pods dedup (#113), client-util crate (#112), RBAC dead code cleanup (#115), openAPIV3Schema validation (#118), list-verb/kubeconfig/error-sanitisation (#119).
 
-**PRs merged this session: ~115 total since project start. Session merges: #103/#97 pending + #104, #106–#108, #111–#115.**
+**PRs merged total: ~120. This round: #118, #119 (+ #97/#103 pending).**
 
 ## Stance
 
