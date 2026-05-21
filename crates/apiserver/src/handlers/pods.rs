@@ -1,15 +1,15 @@
 use axum::{
-    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use serde::Deserialize;
-use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
+use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
+    auth::UserInfo,
     keys::{cluster_object_key, list_prefix, object_key},
     state::AppState,
     status::Status,
@@ -137,6 +137,7 @@ pub async fn list_pods(
     State(state): State<AppState>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
     let prefix = list_prefix("pods", ns.as_str());
@@ -180,6 +181,7 @@ pub async fn list_pods(
             query.field_selector,
             initial_pods,
             query.allow_watch_bookmarks == Some(true),
+            user.username,
         )
         .await;
     }
@@ -223,6 +225,14 @@ pub async fn list_pods(
     Ok(Json(body).into_response())
 }
 
+/// Thin wrapper: delegate pod watch to `watch_generic`.
+///
+/// Pod-specific field selectors (spec.nodeName =, !=) are handled by
+/// `generic::object_matches_field_selector`, which was extended to support
+/// `spec.nodeName` alongside `metadata.name` / `metadata.namespace`.
+/// The `initial_pods` list is already filtered by the caller (list_pods)
+/// before being passed here, so `watch_generic` emits them as-is.
+#[allow(clippy::too_many_arguments)]
 async fn watch_pods(
     state: AppState,
     prefix: String,
@@ -231,146 +241,21 @@ async fn watch_pods(
     field_selector: Option<String>,
     initial_pods: Option<(Vec<serde_json::Value>, u64)>,
     allow_watch_bookmarks: bool,
+    username: String,
 ) -> Result<Response, crate::status::StatusError> {
-    let event_stream = state
-        .store
-        .watch(&prefix, from_revision)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    // The body stream yields Result<Bytes, BoxError> items.
-    // We transform WatchEvent items into NDJSON chunks.
-    // A periodic bookmark is sent every 60 s if no other events fire.
-    // Max watch duration: 5 minutes per the Kubernetes spec default.
-    let field_selector = field_selector.unwrap_or_default();
-    let chunk_stream = async_stream::stream! {
-        use futures_core::Stream;
-        use std::pin::pin;
-        use tokio::time::{Duration, interval, sleep};
-
-        let mut event_stream = pin!(event_stream);
-        let mut bookmark_tick = interval(Duration::from_secs(60));
-        // Skip the first immediate tick so we don't send a bookmark before any events.
-        bookmark_tick.tick().await;
-
-        let mut max_duration = pin!(sleep(Duration::from_secs(5 * 60)));
-
-        // Track the most recently seen revision for bookmark emission.
-        let mut last_rv: u64 = from_revision;
-
-        // sendInitialEvents: emit existing pods as ADDED, then BOOKMARK.
-        if let Some((pods, list_rv)) = initial_pods {
-            last_rv = last_rv.max(list_rv);
-            for pod in pods {
-                let line = format!(
-                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
-                    serde_json::to_string(&pod).unwrap_or_default()
-                );
-                yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
-            }
-            let bookmark = format!(
-                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
-            );
-            yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
-        }
-
-        loop {
-            tokio::select! {
-                biased;
-
-                maybe_event = {
-                    use std::future::poll_fn;
-                    poll_fn(|cx| {
-                        use std::task::Poll;
-                        match event_stream.as_mut().poll_next(cx) {
-                            Poll::Ready(v) => Poll::Ready(v),
-                            Poll::Pending => Poll::Pending,
-                        }
-                    })
-                } => {
-                    match maybe_event {
-                        None => break, // store closed the stream
-                        Some(event) => {
-                            // Update last_rv from the event before encoding.
-                            match &event {
-                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
-                                    last_rv = last_rv.max(obj.revision);
-                                }
-                                WatchEvent::Deleted { revision, .. } => {
-                                    last_rv = last_rv.max(*revision);
-                                }
-                                WatchEvent::Bookmark { revision } => {
-                                    last_rv = last_rv.max(*revision);
-                                }
-                                WatchEvent::Compacted { .. } => {}
-                            }
-
-                            // Reset bookmark timer on any real event.
-                            bookmark_tick.reset();
-
-                            if let WatchEvent::Compacted { horizon, .. } = &event {
-                                // Use horizon (not last_rv) — clients use this rv to relist;
-                                // last_rv may predate the horizon causing an infinite relist loop.
-                                let error_line = Bytes::from(format!(
-                                    "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}}}\n"
-                                ));
-                                yield Ok::<Bytes, axum::BoxError>(error_line);
-                                break;
-                            }
-
-                            // Apply fieldSelector: for Added/Modified, check spec.nodeName.
-                            // Deleted events lack full pod data; pass them through so the
-                            // kubelet can clean up resources it was already tracking.
-                            let skip = !field_selector.is_empty() && match &event {
-                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
-                                    let pod: serde_json::Value =
-                                        serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
-                                    !pod_matches_field_selector(&pod, &field_selector)
-                                }
-                                _ => false,
-                            };
-
-                            if !skip {
-                                if let Some(chunk) = super::generic::encode_watch_event(&event, "v1", "Pod") {
-                                    yield Ok::<Bytes, axum::BoxError>(chunk);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                _ = bookmark_tick.tick() => {
-                    if allow_watch_bookmarks {
-                        let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                        );
-                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
-                    }
-                }
-
-                _ = &mut max_duration => {
-                    // Max watch duration reached — send a final BOOKMARK and close gracefully.
-                    if allow_watch_bookmarks {
-                        let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                        );
-                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
-                    }
-                    break;
-                }
-            }
-        }
-    };
-
-    let body = Body::from_stream(chunk_stream);
-    let resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .header(axum::http::header::TRANSFER_ENCODING, "chunked")
-        .body(body)
-        .expect("response builder never fails with these headers");
-
-    Ok(resp)
+    super::generic::watch_generic(
+        state,
+        prefix,
+        "v1".into(),
+        "Pod".into(),
+        from_revision,
+        initial_pods,
+        None, // label_selector: pods watch does not filter by label
+        field_selector,
+        allow_watch_bookmarks,
+        username,
+    )
+    .await
 }
 
 pub async fn create_pod(
@@ -393,6 +278,8 @@ pub async fn create_pod(
     // Ensure namespace is set in the stored object
     obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.as_str().to_owned());
     crate::handlers::generic::stamp_metadata(&mut obj);
+
+    apply_pod_create_defaults(&mut obj.body);
 
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state
@@ -1707,6 +1594,70 @@ mod patch_type_tests {
         assert!(
             pod["metadata"]["labels"].get("app").is_none(),
             "remove op must delete the key"
+        );
+    }
+}
+
+/// Apply pod creation defaults: set spec.enableServiceLinks=true if absent.
+///
+/// Extracted for testability — the full create_pod handler is async and needs
+/// a live store, so the defaulting logic lives here as a pure function.
+pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
+    if pod["spec"]["enableServiceLinks"].is_null() {
+        pod["spec"]["enableServiceLinks"] = serde_json::Value::Bool(true);
+    }
+}
+
+#[cfg(test)]
+mod create_defaults_tests {
+    use super::*;
+
+    /// create_pod must default spec.enableServiceLinks to true when absent.
+    ///
+    /// The kubelet's kuberuntime_manager requires this field to construct service
+    /// env vars for each container.  Without it the container fails with
+    /// CreateContainerConfigError: "nil pod.spec.enableServiceLinks encountered".
+    /// Real kube-apiserver always sets this field on create.
+    #[test]
+    fn enable_service_links_defaults_to_true_when_absent() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "smoke-pod", "namespace": "default"},
+            "spec": {
+                "nodeName": "ci-node",
+                "containers": [{"name": "hello", "image": "busybox:1.36"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["enableServiceLinks"],
+            serde_json::Value::Bool(true),
+            "enableServiceLinks must be defaulted to true so the kubelet can construct \
+             service env vars; a nil value causes CreateContainerConfigError"
+        );
+    }
+
+    /// create_pod must NOT override an explicit false value for enableServiceLinks.
+    ///
+    /// If the user explicitly disables service link injection, that preference
+    /// must be preserved.
+    #[test]
+    fn enable_service_links_false_is_preserved() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "enableServiceLinks": false,
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["enableServiceLinks"],
+            serde_json::Value::Bool(false),
+            "an explicit enableServiceLinks=false must not be overridden by the default"
         );
     }
 }

@@ -23,6 +23,7 @@ const K8S_PROTO_MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
 // ---------------------------------------------------------------------------
 
 /// Encode a varint into a byte vector.
+#[cfg(test)]
 fn encode_varint(mut v: u64) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
@@ -38,6 +39,7 @@ fn encode_varint(mut v: u64) -> Vec<u8> {
 }
 
 /// Encode a length-delimited (wire type 2) field: tag + length varint + payload.
+#[cfg(test)]
 fn encode_ld_field(field_number: u64, payload: &[u8]) -> Vec<u8> {
     let tag = (field_number << 3) | 2;
     let mut out = encode_varint(tag);
@@ -60,6 +62,7 @@ fn encode_ld_field(field_number: u64, payload: &[u8]) -> Vec<u8> {
 /// placing the original JSON bytes in `raw`, the client decodes it with its JSON
 /// decoder regardless of the outer content-type header — this is why this scheme
 /// works for all object types without needing a per-type proto encoder.
+#[cfg(test)]
 pub fn encode_proto_response(val: &serde_json::Value) -> bytes::Bytes {
     let api_version = val["apiVersion"].as_str().unwrap_or("");
     let kind = val["kind"].as_str().unwrap_or("");
@@ -386,6 +389,256 @@ pub fn decode_node_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
+/// Decode a proto-encoded Lease object into a `serde_json::Value`.
+///
+/// Lease proto layout (k8s.io/api/coordination/v1/generated.proto):
+///   field 1 (ObjectMeta, wire 2): metadata
+///   field 2 (LeaseSpec, wire 2): spec
+///
+/// LeaseSpec proto layout:
+///   field 1 (string): holderIdentity
+///   field 2 (int32, wire 0): leaseDurationSeconds
+///   field 3 (MicroTime, wire 2): acquireTime — skipped
+///   field 4 (MicroTime, wire 2): renewTime — skipped
+///   field 5 (int32, wire 0): leaseTransitions — skipped
+///   field 6 (string): strategy — skipped
+pub fn decode_lease_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let mut meta = serde_json::json!({ "creationTimestamp": null });
+    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut spec = serde_json::Map::new();
+
+    scan_length_delimited_fields(data, |field_number, field_data| match field_number {
+        1 => {
+            scan_mixed_fields(field_data, |fn2, wt, fd| {
+                decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
+            });
+        }
+        2 => {
+            scan_mixed_fields(field_data, |fn2, wt, fd| match (fn2, wt) {
+                (1, 2) => {
+                    let s = String::from_utf8_lossy(fd).into_owned();
+                    if !s.is_empty() {
+                        spec.insert("holderIdentity".to_string(), serde_json::Value::String(s));
+                    }
+                }
+                (2, 0) => {
+                    if let Some((v, _)) = decode_varint(fd) {
+                        spec.insert(
+                            "leaseDurationSeconds".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(v as i64)),
+                        );
+                    }
+                }
+                _ => {}
+            });
+        }
+        _ => {}
+    })?;
+
+    if let Some(l) = labels {
+        meta["labels"] = serde_json::Value::Object(l);
+    }
+    if let Some(a) = annotations {
+        meta["annotations"] = serde_json::Value::Object(a);
+    }
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
+        "metadata": meta
+    });
+    if !spec.is_empty() {
+        obj["spec"] = serde_json::Value::Object(spec);
+    }
+    Some(obj)
+}
+
+/// Decode a proto-encoded CSINode object into a `serde_json::Value`.
+///
+/// CSINode proto layout (k8s.io/api/storage/v1/generated.proto):
+///   field 1 (ObjectMeta, wire 2): metadata
+///   field 2 (CSINodeSpec, wire 2): spec
+///
+/// CSINodeSpec proto layout:
+///   field 1 (repeated CSINodeDriver, wire 2): drivers
+///
+/// CSINodeDriver proto layout:
+///   field 1 (string): name
+///   field 2 (string): nodeID
+///   field 3 (repeated string): topologyKeys — skipped
+///   field 4 (CSINodeAllocatedCapacity, wire 2): allocatable — skipped
+pub fn decode_csinode_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let mut meta = serde_json::json!({ "creationTimestamp": null });
+    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut drivers: Vec<serde_json::Value> = Vec::new();
+
+    scan_length_delimited_fields(data, |field_number, field_data| match field_number {
+        1 => {
+            scan_mixed_fields(field_data, |fn2, wt, fd| {
+                decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
+            });
+        }
+        2 => {
+            scan_length_delimited_fields(field_data, |fn2, fd| {
+                if fn2 == 1 {
+                    let mut name = String::new();
+                    let mut node_id = String::new();
+                    scan_length_delimited_fields(fd, |fn3, fd3| match fn3 {
+                        1 => name = String::from_utf8_lossy(fd3).into_owned(),
+                        2 => node_id = String::from_utf8_lossy(fd3).into_owned(),
+                        _ => {}
+                    });
+                    drivers.push(serde_json::json!({
+                        "name": name,
+                        "nodeID": node_id
+                    }));
+                }
+            });
+        }
+        _ => {}
+    })?;
+
+    if let Some(l) = labels {
+        meta["labels"] = serde_json::Value::Object(l);
+    }
+    if let Some(a) = annotations {
+        meta["annotations"] = serde_json::Value::Object(a);
+    }
+
+    Some(serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "CSINode",
+        "metadata": meta,
+        "spec": {
+            "drivers": drivers
+        }
+    }))
+}
+
+/// Decode a proto-encoded Event object into a `serde_json::Value`.
+///
+/// Event proto layout (k8s.io/api/core/v1/generated.proto):
+///   field 1 (ObjectMeta, wire 2): metadata
+///   field 2 (ObjectReference, wire 2): involvedObject
+///   field 3 (string): reason
+///   field 4 (string): message
+///   field 5 (ObjectReference, wire 2): source — skipped
+///   field 6 (Time, wire 2): firstTimestamp — skipped
+///   field 7 (Time, wire 2): lastTimestamp — skipped
+///   field 8 (int32, wire 0): count
+///   field 9 (string): type
+///
+/// ObjectReference proto layout:
+///   field 1 (string): kind
+///   field 2 (string): namespace
+///   field 3 (string): name
+///   field 4 (string): uid
+///   field 5 (string): apiVersion
+///   field 6 (string): resourceVersion
+///   field 7 (string): fieldPath
+pub fn decode_event_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let mut meta = serde_json::json!({ "creationTimestamp": null });
+    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut involved_object = serde_json::Map::new();
+    let mut reason = String::new();
+    let mut message = String::new();
+    let mut count: Option<i64> = None;
+    let mut event_type = String::new();
+
+    scan_mixed_fields(data, |field_number, wt, field_data| {
+        match (field_number, wt) {
+            (1, 2) => {
+                scan_mixed_fields(field_data, |fn2, wt2, fd| {
+                    decode_object_meta_field(
+                        fn2,
+                        wt2,
+                        fd,
+                        &mut meta,
+                        &mut labels,
+                        &mut annotations,
+                    );
+                });
+            }
+            (2, 2) => {
+                scan_length_delimited_fields(field_data, |fn2, fd| {
+                    let s = String::from_utf8_lossy(fd).into_owned();
+                    match fn2 {
+                        1 => {
+                            involved_object
+                                .insert("kind".to_string(), serde_json::Value::String(s));
+                        }
+                        2 => {
+                            involved_object
+                                .insert("namespace".to_string(), serde_json::Value::String(s));
+                        }
+                        3 => {
+                            involved_object
+                                .insert("name".to_string(), serde_json::Value::String(s));
+                        }
+                        4 => {
+                            involved_object.insert("uid".to_string(), serde_json::Value::String(s));
+                        }
+                        5 => {
+                            involved_object
+                                .insert("apiVersion".to_string(), serde_json::Value::String(s));
+                        }
+                        6 => {
+                            involved_object.insert(
+                                "resourceVersion".to_string(),
+                                serde_json::Value::String(s),
+                            );
+                        }
+                        7 => {
+                            involved_object
+                                .insert("fieldPath".to_string(), serde_json::Value::String(s));
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            (3, 2) => reason = String::from_utf8_lossy(field_data).into_owned(),
+            (4, 2) => message = String::from_utf8_lossy(field_data).into_owned(),
+            (8, 0) => {
+                if let Some((v, _)) = decode_varint(field_data) {
+                    count = Some(v as i64);
+                }
+            }
+            (9, 2) => event_type = String::from_utf8_lossy(field_data).into_owned(),
+            _ => {}
+        }
+    })?;
+
+    if let Some(l) = labels {
+        meta["labels"] = serde_json::Value::Object(l);
+    }
+    if let Some(a) = annotations {
+        meta["annotations"] = serde_json::Value::Object(a);
+    }
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Event",
+        "metadata": meta,
+        "involvedObject": serde_json::Value::Object(involved_object)
+    });
+    if !reason.is_empty() {
+        obj["reason"] = serde_json::Value::String(reason);
+    }
+    if !message.is_empty() {
+        obj["message"] = serde_json::Value::String(message);
+    }
+    if let Some(c) = count {
+        obj["count"] = serde_json::Value::Number(serde_json::Number::from(c));
+    }
+    if !event_type.is_empty() {
+        obj["type"] = serde_json::Value::String(event_type);
+    }
+    Some(obj)
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -395,6 +648,9 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "Namespace" => decode_namespace_proto(raw),
         "ConfigMap" => decode_configmap_proto(raw),
         "Node" => decode_node_proto(raw),
+        "Lease" => decode_lease_proto(raw),
+        "CSINode" => decode_csinode_proto(raw),
+        "Event" => decode_event_proto(raw),
         _ => None,
     }
 }
@@ -1438,6 +1694,108 @@ mod tests {
         assert!(recovered["metadata"]["creationTimestamp"].is_null());
     }
 
+    /// Regression test for mayor-ajtd: encode_proto_response must produce a valid Kubernetes
+    /// protobuf envelope for a realistic Node JSON with status conditions and addresses —
+    /// the exact response shape the kubelet receives when reading its own node status.
+    ///
+    /// This test verifies that encode_proto_response itself does NOT produce wireType 7.
+    /// The actual kubelet failure ("proto: illegal wireType 7") arises because client-go's
+    /// typed Node proto decoder ignores the contentType=application/json field inside the
+    /// Unknown envelope and tries to decode Unknown.raw as a typed proto Node. The JSON bytes
+    /// (e.g. '/' in CIDRs, 'o' in "conditions") happen to have low 3 bits = 0b111 at the
+    /// position the decoder is reading, producing wireType 7. The fix is to not re-encode
+    /// Node responses at all (see content_type.rs). This test guards the encoder itself:
+    /// the proto envelope we produce is structurally correct even if client-go won't use
+    /// the contentType field.
+    #[test]
+    fn encode_proto_response_no_illegal_wire_types_node_with_status() {
+        let val = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "ci-node",
+                "uid": "abc-def-123",
+                "resourceVersion": "7",
+                "creationTimestamp": "2026-05-21T00:00:00Z"
+            },
+            "spec": {
+                "podCIDR": "10.244.0.0/24",
+                "podCIDRs": ["10.244.0.0/24"],
+                "providerID": "kind://docker/local/local-worker"
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "lastHeartbeatTime": "2026-05-21T00:01:00Z",
+                        "lastTransitionTime": "2026-05-21T00:00:30Z",
+                        "reason": "KubeletReady",
+                        "message": "kubelet is posting ready status"
+                    },
+                    {
+                        "type": "MemoryPressure",
+                        "status": "False",
+                        "reason": "KubeletHasSufficientMemory"
+                    }
+                ],
+                "addresses": [
+                    {"type": "InternalIP", "address": "192.168.1.10"},
+                    {"type": "Hostname", "address": "ci-node"}
+                ],
+                "nodeInfo": {
+                    "machineID": "abc123",
+                    "systemUUID": "abc123",
+                    "bootID": "xyz",
+                    "kernelVersion": "6.1.0",
+                    "osImage": "Ubuntu 22.04",
+                    "containerRuntimeVersion": "containerd://1.7.0",
+                    "kubeletVersion": "v1.36.0",
+                    "kubeProxyVersion": "v1.36.0",
+                    "operatingSystem": "linux",
+                    "architecture": "amd64"
+                }
+            }
+        });
+
+        let encoded = encode_proto_response(&val);
+        assert_eq!(
+            &encoded[..4],
+            &[0x6b, 0x38, 0x73, 0x00],
+            "must start with k8s proto magic"
+        );
+
+        // Walk every tag in the Unknown envelope: no wireType 7 (or 3, 4, 6) allowed.
+        // wireType 7 = 0b111 in low 3 bits; any such byte as a proto tag is illegal.
+        let fields = assert_valid_wire_types(&encoded[4..]);
+
+        let field_numbers: Vec<u64> = fields.iter().map(|(fn_, _, _)| *fn_).collect();
+        assert!(field_numbers.contains(&1), "TypeMeta field must be present");
+        assert!(
+            field_numbers.contains(&2),
+            "raw Node JSON field must be present"
+        );
+        assert!(
+            field_numbers.contains(&4),
+            "contentType field must be present"
+        );
+
+        // The envelope must be decodable and the raw field must be valid JSON.
+        let env = decode_k8s_proto_envelope(&encoded).expect("must decode as k8s envelope");
+        assert_eq!(env.content_type, "application/json");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&env.raw).expect("raw field must be valid JSON");
+        assert_eq!(recovered["kind"], "Node");
+        assert_eq!(recovered["metadata"]["name"], "ci-node");
+        assert_eq!(recovered["spec"]["podCIDR"], "10.244.0.0/24");
+        assert_eq!(recovered["status"]["conditions"][0]["type"], "Ready");
+        assert_eq!(recovered["status"]["conditions"][0]["status"], "True");
+        assert_eq!(
+            recovered["status"]["addresses"][0]["address"],
+            "192.168.1.10"
+        );
+    }
+
     /// encode_proto_response must produce a valid proto envelope for the /version response.
     /// This JSON has no apiVersion or kind fields, resulting in empty TypeMeta strings.
     /// Empty strings still produce valid LEN-encoded fields with zero-length payloads.
@@ -1463,5 +1821,176 @@ mod tests {
         let recovered: serde_json::Value =
             serde_json::from_slice(&env.raw).expect("raw must be valid JSON");
         assert_eq!(recovered["gitVersion"], "v1.36.0");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_lease_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_lease_proto must extract metadata, holderIdentity, and leaseDurationSeconds.
+    /// The kubelet sends Lease proto on PUT /apis/coordination.k8s.io/v1/namespaces/{ns}/leases/{name}
+    /// to renew its node lease. Without this decoder, extract_body returns None and the handler
+    /// cannot decode the proto request body.
+    #[test]
+    fn decode_lease_proto_extracts_holder_and_duration() {
+        // Build: Lease {
+        //   metadata: ObjectMeta { name: "lima-node", namespace: "kube-node-lease" },
+        //   spec: LeaseSpec { holderIdentity: "lima-node", leaseDurationSeconds: 40 }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"lima-node");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"kube-node-lease"));
+
+        // LeaseSpec field 1 = holderIdentity (string, wire 2)
+        let mut lease_spec = encode_length_delimited(1, b"lima-node");
+        // LeaseSpec field 2 = leaseDurationSeconds (int32, wire 0): tag=0x10, value=40 varint=0x28
+        lease_spec.push(0x10); // (2 << 3) | 0 = field 2, wire type 0
+        lease_spec.push(0x28); // varint 40
+
+        let mut lease_proto = encode_length_delimited(1, &obj_meta);
+        lease_proto.extend_from_slice(&encode_length_delimited(2, &lease_spec));
+
+        let result = decode_lease_proto(&lease_proto).expect("must decode Lease proto");
+
+        assert_eq!(result["kind"], "Lease");
+        assert_eq!(result["apiVersion"], "coordination.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "lima-node");
+        assert_eq!(result["metadata"]["namespace"], "kube-node-lease");
+        assert_eq!(result["spec"]["holderIdentity"], "lima-node");
+        assert_eq!(result["spec"]["leaseDurationSeconds"], 40);
+    }
+
+    /// decode_core_proto_by_kind must dispatch to decode_lease_proto for kind="Lease".
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_lease() {
+        let obj_meta = encode_length_delimited(1, b"test-node");
+        let lease_proto = encode_length_delimited(1, &obj_meta);
+
+        let result = decode_core_proto_by_kind("Lease", &lease_proto)
+            .expect("Lease must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "Lease");
+        assert_eq!(result["metadata"]["name"], "test-node");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_csinode_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_csinode_proto must extract metadata and the drivers array.
+    /// The kubelet registers its CSI drivers via PUT /apis/storage.k8s.io/v1/csinodes/{name}.
+    /// Without this decoder the proto body cannot be decoded and the request fails.
+    #[test]
+    fn decode_csinode_proto_extracts_drivers() {
+        // Build: CSINode {
+        //   metadata: ObjectMeta { name: "ci-node" },
+        //   spec: CSINodeSpec {
+        //     drivers: [CSINodeDriver { name: "csi.example.com", nodeID: "node-abc" }]
+        //   }
+        // }
+        let obj_meta = encode_length_delimited(1, b"ci-node");
+
+        // CSINodeDriver: field 1=name, field 2=nodeID
+        let mut driver = encode_length_delimited(1, b"csi.example.com");
+        driver.extend_from_slice(&encode_length_delimited(2, b"node-abc"));
+
+        // CSINodeSpec: field 1 = repeated CSINodeDriver
+        let csinode_spec = encode_length_delimited(1, &driver);
+
+        let mut csinode_proto = encode_length_delimited(1, &obj_meta);
+        csinode_proto.extend_from_slice(&encode_length_delimited(2, &csinode_spec));
+
+        let result = decode_csinode_proto(&csinode_proto).expect("must decode CSINode proto");
+
+        assert_eq!(result["kind"], "CSINode");
+        assert_eq!(result["apiVersion"], "storage.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "ci-node");
+        assert_eq!(result["spec"]["drivers"][0]["name"], "csi.example.com");
+        assert_eq!(result["spec"]["drivers"][0]["nodeID"], "node-abc");
+    }
+
+    /// decode_core_proto_by_kind must dispatch to decode_csinode_proto for kind="CSINode".
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_csinode() {
+        let obj_meta = encode_length_delimited(1, b"test-node");
+        let csinode_proto = encode_length_delimited(1, &obj_meta);
+
+        let result = decode_core_proto_by_kind("CSINode", &csinode_proto)
+            .expect("CSINode must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "CSINode");
+        assert_eq!(result["metadata"]["name"], "test-node");
+        assert!(result["spec"]["drivers"].is_array());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_event_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_event_proto must extract metadata, involvedObject, reason, message, count, and type.
+    /// The kubelet posts Events to /api/v1/namespaces/{ns}/events on significant node/pod events.
+    /// Without this decoder the proto body cannot be decoded and events are lost.
+    #[test]
+    fn decode_event_proto_extracts_all_fields() {
+        // Build: Event {
+        //   metadata: ObjectMeta { name: "pod.abc123", namespace: "default" },
+        //   involvedObject: ObjectReference { kind: "Pod", namespace: "default", name: "mypod",
+        //                                    uid: "uid-1", apiVersion: "v1" },
+        //   reason: "Started",
+        //   message: "Started container myapp",
+        //   count: 1,
+        //   type: "Normal"
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"pod.abc123");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        // ObjectReference (field 2 of Event)
+        let mut obj_ref = encode_length_delimited(1, b"Pod"); // kind
+        obj_ref.extend_from_slice(&encode_length_delimited(2, b"default")); // namespace
+        obj_ref.extend_from_slice(&encode_length_delimited(3, b"mypod")); // name
+        obj_ref.extend_from_slice(&encode_length_delimited(4, b"uid-1")); // uid
+        obj_ref.extend_from_slice(&encode_length_delimited(5, b"v1")); // apiVersion
+
+        // Encode count=1 as varint field 8, wire type 0: tag = (8 << 3) | 0 = 0x40, value = 0x01
+        let count_bytes: Vec<u8> = vec![0x40, 0x01];
+
+        // Build the full Event message using scan_mixed_fields-compatible encoding:
+        // field 1 (ObjectMeta, wire 2), field 2 (involvedObject, wire 2),
+        // field 3 (reason, wire 2), field 4 (message, wire 2),
+        // field 8 (count, wire 0), field 9 (type, wire 2)
+        let mut event_proto = encode_length_delimited(1, &obj_meta);
+        event_proto.extend_from_slice(&encode_length_delimited(2, &obj_ref));
+        event_proto.extend_from_slice(&encode_length_delimited(3, b"Started"));
+        event_proto.extend_from_slice(&encode_length_delimited(4, b"Started container myapp"));
+        event_proto.extend_from_slice(&count_bytes);
+        event_proto.extend_from_slice(&encode_length_delimited(9, b"Normal"));
+
+        let result = decode_event_proto(&event_proto).expect("must decode Event proto");
+
+        assert_eq!(result["kind"], "Event");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "pod.abc123");
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert_eq!(result["involvedObject"]["kind"], "Pod");
+        assert_eq!(result["involvedObject"]["namespace"], "default");
+        assert_eq!(result["involvedObject"]["name"], "mypod");
+        assert_eq!(result["involvedObject"]["uid"], "uid-1");
+        assert_eq!(result["involvedObject"]["apiVersion"], "v1");
+        assert_eq!(result["reason"], "Started");
+        assert_eq!(result["message"], "Started container myapp");
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["type"], "Normal");
+    }
+
+    /// decode_core_proto_by_kind must dispatch to decode_event_proto for kind="Event".
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_event() {
+        let obj_meta = encode_length_delimited(1, b"myevent");
+        let event_proto = encode_length_delimited(1, &obj_meta);
+
+        let result = decode_core_proto_by_kind("Event", &event_proto)
+            .expect("Event must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "Event");
+        assert_eq!(result["metadata"]["name"], "myevent");
     }
 }

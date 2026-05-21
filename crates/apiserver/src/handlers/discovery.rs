@@ -602,20 +602,62 @@ mod tests {
         }
     }
 
-    // A group that matches a static group must not be duplicated when a CRD
-    // with that group name exists in the store.
+    // A group that matches a static group must not be duplicated even if a CRD
+    // with that group name somehow exists in the store (e.g. inserted before
+    // the create-time validation was added). This tests the discovery layer's
+    // own deduplication logic, independent of API validation.
     #[tokio::test]
     async fn crd_group_does_not_duplicate_static_groups() {
+        use crate::handlers::crd::{
+            CrdMetadata, CustomResourceDefinitionNames, CustomResourceDefinitionSpec,
+            CustomResourceDefinitionVersion,
+        };
         let state = make_state();
 
-        // Install a CRD whose group is already covered by static discovery.
-        let body = crd_bytes("apps", "widgets", "widget", "Widget", "Namespaced", "v1");
-        assert!(
-            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
-                .await
-                .is_ok(),
-            "create must succeed"
-        );
+        // Insert a CRD directly into the store, bypassing create_crd() validation,
+        // to simulate a store that has a CRD with a built-in group (e.g. after a
+        // schema migration or manual edit). The discovery layer must still deduplicate.
+        let crd = CustomResourceDefinition {
+            api_version: "apiextensions.k8s.io/v1".to_string(),
+            kind: "CustomResourceDefinition".to_string(),
+            metadata: CrdMetadata {
+                name: "widgets.apps".to_string(),
+                namespace: String::new(),
+                labels: None,
+                annotations: None,
+                resource_version: String::new(),
+                uid: "test-uid".to_string(),
+                creation_timestamp: "2024-01-01T00:00:00Z".to_string(),
+            },
+            spec: CustomResourceDefinitionSpec {
+                group: "apps".to_string(),
+                names: CustomResourceDefinitionNames {
+                    plural: "widgets".to_string(),
+                    singular: "widget".to_string(),
+                    kind: "Widget".to_string(),
+                    short_names: vec![],
+                    list_kind: String::new(),
+                },
+                scope: "Namespaced".to_string(),
+                versions: vec![CustomResourceDefinitionVersion {
+                    name: "v1".to_string(),
+                    served: true,
+                    storage: true,
+                    schema: None,
+                    subresources: None,
+                }],
+                conversion: None,
+                preserve_unknown_fields: false,
+            },
+            status: None,
+        };
+        let key = format!("/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.apps");
+        let bytes = bytes::Bytes::from(serde_json::to_vec(&crd).unwrap());
+        state
+            .store
+            .put(&key, bytes, Some(0))
+            .await
+            .expect("direct store insert must succeed");
 
         let Json(list) = api_group_list(State(state)).await;
         let apps_count = list.groups.iter().filter(|g| g.name == "apps").count();

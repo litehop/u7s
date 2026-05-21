@@ -2,13 +2,14 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
+    auth::UserInfo,
     state::AppState,
     status::Status,
     util::{extract_body, utc_now_rfc3339},
@@ -51,6 +52,10 @@ pub struct CustomResourceDefinitionVersion {
     pub storage: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
+    /// Subresources declared for this version. The `status` key, if present
+    /// and non-null, indicates that this version has a status subresource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subresources: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +101,57 @@ pub struct CustomResourceDefinition {
 }
 
 // ---------------------------------------------------------------------------
+// Built-in API group protection
+// ---------------------------------------------------------------------------
+
+/// API groups that CRDs must never shadow. Allowing a CRD to claim one of
+/// these groups would let an unprivileged actor intercept or replace built-in
+/// Kubernetes API objects (e.g. create a "pods" CRD in group "apps" and have
+/// it served instead of the real apps/v1 Deployments).
+const BUILTIN_GROUPS: &[&str] = &[
+    "",
+    "apps",
+    "batch",
+    "autoscaling",
+    "rbac.authorization.k8s.io",
+    "authorization.k8s.io",
+    "authentication.k8s.io",
+    "apiextensions.k8s.io",
+    "admissionregistration.k8s.io",
+    "networking.k8s.io",
+    "policy",
+    "storage.k8s.io",
+    "scheduling.k8s.io",
+    "coordination.k8s.io",
+    "node.k8s.io",
+    "discovery.k8s.io",
+    "events.k8s.io",
+    "flowcontrol.apiserver.k8s.io",
+    "internal.apiserver.k8s.io",
+];
+
+/// Validate that a CRD spec.group does not shadow a built-in API group and
+/// contains no path traversal characters.
+fn validate_crd_group(group: &str) -> Result<(), crate::status::StatusError> {
+    // Block path traversal in group name.
+    if group.contains('/') || group.contains("..") {
+        return Err(Status::unprocessable_entity(format!(
+            "spec.group '{}' must not contain '/' or '..'",
+            group
+        )));
+    }
+    // Block built-in groups.
+    if BUILTIN_GROUPS.contains(&group) {
+        return Err(Status::unprocessable_entity(format!(
+            "spec.group '{}' shadows a built-in Kubernetes API group and is not allowed; \
+             choose a group name you control (e.g. 'myapp.example.com')",
+            group
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -124,15 +180,11 @@ fn stamp_server_fields(crd: &mut CustomResourceDefinition) {
 }
 
 fn new_uid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!(
-        "{:016x}-{:08x}-crd0-0000-000000000000",
-        d.as_secs(),
-        d.subsec_nanos()
-    )
+    // Use UUIDv4 (CSPRNG) for uid generation. The previous implementation
+    // formatted system time as hex — two CRDs created in the same nanosecond
+    // would collide, and the value was predictable (no entropy). Kubernetes
+    // expects UIDs in UUID string format (RFC 4122).
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::StatusError> {
@@ -148,6 +200,7 @@ fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::Stat
 pub async fn list_crds(
     State(state): State<AppState>,
     Query(query): Query<super::generic::CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let prefix = list_prefix();
 
@@ -162,6 +215,7 @@ pub async fn list_crds(
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
+            user.username,
         )
         .await;
     }
@@ -206,6 +260,8 @@ pub async fn create_crd(
             "metadata.name is required".into(),
         ));
     }
+
+    validate_crd_group(&crd.spec.group)?;
 
     let expected_name = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
     if name != expected_name {
@@ -448,6 +504,22 @@ mod tests {
         assert_eq!(crd.kind, "CustomResourceDefinition");
     }
 
+    /// new_uid() must return a valid UUIDv4 string. Two calls must produce
+    /// different values — a time-based uid (the previous impl) would collide
+    /// for CRDs created in the same nanosecond and is also predictable.
+    #[test]
+    fn new_uid_returns_uuid_format() {
+        let uid1 = new_uid();
+        let uid2 = new_uid();
+        // UUID format: 8-4-4-4-12 hex chars separated by dashes, 36 total chars.
+        assert_eq!(uid1.len(), 36, "uid must be a 36-char UUID string");
+        assert!(
+            uid1.parse::<uuid::Uuid>().is_ok(),
+            "uid must parse as a valid UUID (got '{uid1}')"
+        );
+        assert_ne!(uid1, uid2, "consecutive UIDs must differ (CSPRNG source)");
+    }
+
     // stamp_server_fields must not overwrite existing uid/timestamp.
     #[test]
     fn stamp_server_fields_preserves_existing() {
@@ -561,6 +633,11 @@ mod tests {
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
             }),
+            Extension(UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
         )
         .await
         {
@@ -657,7 +734,17 @@ mod tests {
             allow_watch_bookmarks: None,
         });
 
-        let resp = match list_crds(State(state), query).await {
+        let resp = match list_crds(
+            State(state),
+            query,
+            Extension(UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("watch must not error"),
         };
@@ -671,5 +758,100 @@ mod tests {
             Some("chunked"),
             "watch response must use chunked transfer encoding"
         );
+    }
+
+    // -- validate_crd_group: built-in group shadowing protection --
+
+    /// A CRD with spec.group="apps" must be rejected with 422.
+    /// Allowing it would let unprivileged users shadow the real apps/v1 API group
+    /// and intercept Deployment, ReplicaSet, etc. traffic.
+    #[tokio::test]
+    async fn create_crd_rejects_builtin_group_apps() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "foos.apps" },
+                "spec": {
+                    "group": "apps",
+                    "names": {
+                        "plural": "foos",
+                        "singular": "foo",
+                        "kind": "Foo"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+
+        let err = err_status(create_crd(State(state), HeaderMap::new(), body).await);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "built-in group 'apps' must return 422 Unprocessable Entity"
+        );
+        assert!(
+            json["message"].as_str().unwrap_or("").contains("built-in"),
+            "error must mention built-in group restriction"
+        );
+    }
+
+    /// A CRD with a valid user-controlled group must be accepted.
+    #[tokio::test]
+    async fn create_crd_accepts_user_controlled_group() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.myapp.example.com" },
+                "spec": {
+                    "group": "myapp.example.com",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            create_crd(State(state), HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "user-controlled group must be accepted"
+        );
+    }
+
+    /// validate_crd_group unit tests for all built-in groups and edge cases.
+    #[test]
+    fn validate_crd_group_blocks_all_builtin_groups() {
+        for group in BUILTIN_GROUPS {
+            let result = validate_crd_group(group);
+            assert!(
+                result.is_err(),
+                "built-in group '{group}' must be rejected by validate_crd_group"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_crd_group_rejects_path_traversal() {
+        assert!(validate_crd_group("../../etc").is_err());
+        assert!(validate_crd_group("foo/bar").is_err());
+    }
+
+    #[test]
+    fn validate_crd_group_accepts_valid_user_groups() {
+        assert!(validate_crd_group("example.com").is_ok());
+        assert!(validate_crd_group("argoproj.io").is_ok());
+        assert!(validate_crd_group("gateway.networking.x-k8s.io").is_ok());
     }
 }

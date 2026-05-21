@@ -297,6 +297,7 @@ fn put_sync(
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
     // 2. Read current stored revision for optimistic concurrency check.
+    // SQLite stores integers as i64; cast to u64 (revisions fit in i63 range).
     let stored: Option<u64> = conn
         .query_row(
             "SELECT revision FROM objects WHERE key = ?1",

@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/store", "crates/apiserver", "crates/scheduler", "crates/mcp-server", "crates/controller-manager"]
+members = ["crates/store", "crates/apiserver", "crates/scheduler", "crates/mcp-server", "crates/controller-manager", "crates/client-util"]
 resolver = "2"
