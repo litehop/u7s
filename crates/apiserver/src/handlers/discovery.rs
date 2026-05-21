@@ -8,7 +8,9 @@ use u7s_store::{ListOptions, Store as _};
 
 use crate::handlers::crd::CustomResourceDefinition;
 use crate::state::AppState;
-use crate::types::{APIGroup, APIGroupList, APIVersions, ApiResourceList, GroupVersionForDiscovery};
+use crate::types::{
+    APIGroup, APIGroupList, APIVersions, ApiResourceList, GroupVersionForDiscovery,
+};
 
 pub async fn version() -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -176,8 +178,7 @@ pub async fn api_group_resources(
             .iter()
             .filter_map(|obj| serde_json::from_slice::<CustomResourceDefinition>(&obj.value).ok())
             .filter(|crd| {
-                crd.spec.group == group
-                    && crd.spec.versions.iter().any(|v| v.name == version)
+                crd.spec.group == group && crd.spec.versions.iter().any(|v| v.name == version)
             })
             .map(|crd| {
                 serde_json::json!({
@@ -519,10 +520,23 @@ mod tests {
 
     fn make_state() -> AppState {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        AppState::new(store, None, None, std::collections::HashMap::new(), "https://localhost:6443".into())
+        AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
     }
 
-    fn crd_bytes(group: &str, plural: &str, singular: &str, kind: &str, scope: &str, version: &str) -> Bytes {
+    fn crd_bytes(
+        group: &str,
+        plural: &str,
+        singular: &str,
+        kind: &str,
+        scope: &str,
+        version: &str,
+    ) -> Bytes {
         Bytes::from(
             serde_json::json!({
                 "apiVersion": "apiextensions.k8s.io/v1",
@@ -551,8 +565,20 @@ mod tests {
     async fn crd_group_appears_in_api_group_list() {
         let state = make_state();
 
-        let body = crd_bytes("example.io", "widgets", "widget", "Widget", "Namespaced", "v1beta1");
-        assert!(create_crd(State(state.clone()), axum::http::HeaderMap::new(), body).await.is_ok(), "create must succeed");
+        let body = crd_bytes(
+            "example.io",
+            "widgets",
+            "widget",
+            "Widget",
+            "Namespaced",
+            "v1beta1",
+        );
+        assert!(
+            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create must succeed"
+        );
 
         let Json(list) = api_group_list(State(state)).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
@@ -584,7 +610,12 @@ mod tests {
 
         // Install a CRD whose group is already covered by static discovery.
         let body = crd_bytes("apps", "widgets", "widget", "Widget", "Namespaced", "v1");
-        assert!(create_crd(State(state.clone()), axum::http::HeaderMap::new(), body).await.is_ok(), "create must succeed");
+        assert!(
+            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create must succeed"
+        );
 
         let Json(list) = api_group_list(State(state)).await;
         let apps_count = list.groups.iter().filter(|g| g.name == "apps").count();
@@ -599,8 +630,20 @@ mod tests {
     async fn crd_resource_appears_in_api_group_resources() {
         let state = make_state();
 
-        let body = crd_bytes("example.io", "gadgets", "gadget", "Gadget", "Cluster", "v1alpha1");
-        assert!(create_crd(State(state.clone()), axum::http::HeaderMap::new(), body).await.is_ok(), "create must succeed");
+        let body = crd_bytes(
+            "example.io",
+            "gadgets",
+            "gadget",
+            "Gadget",
+            "Cluster",
+            "v1alpha1",
+        );
+        assert!(
+            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create must succeed"
+        );
 
         let resp = api_group_resources(
             State(state),
@@ -610,7 +653,9 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let resources = val["resources"].as_array().unwrap();
         assert_eq!(resources.len(), 1, "one resource entry expected");
@@ -660,7 +705,12 @@ mod tests {
             })
             .to_string(),
         );
-        assert!(create_crd(State(state.clone()), axum::http::HeaderMap::new(), body).await.is_ok(), "create must succeed");
+        assert!(
+            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create must succeed"
+        );
 
         let Json(list) = api_group_list(State(state)).await;
         let group = list
@@ -722,15 +772,23 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let resources = val["resources"].as_array().unwrap();
         let names: Vec<&str> = resources
             .iter()
             .map(|r| r["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"csidrivers"), "csidrivers must be in storage.k8s.io/v1; got: {names:?}");
-        assert!(names.contains(&"csinodes"), "csinodes must be in storage.k8s.io/v1; got: {names:?}");
+        assert!(
+            names.contains(&"csidrivers"),
+            "csidrivers must be in storage.k8s.io/v1; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"csinodes"),
+            "csinodes must be in storage.k8s.io/v1; got: {names:?}"
+        );
     }
 
     // static_group_resources must return Some for apps/v1 — this is one of the most
@@ -748,7 +806,10 @@ mod tests {
     #[test]
     fn static_group_resources_rbac_v1_returns_some() {
         let result = static_group_resources("rbac.authorization.k8s.io", "v1");
-        assert!(result.is_some(), "rbac.authorization.k8s.io/v1 must return Some");
+        assert!(
+            result.is_some(),
+            "rbac.authorization.k8s.io/v1 must return Some"
+        );
         let val = result.unwrap();
         assert_eq!(val["groupVersion"], "rbac.authorization.k8s.io/v1");
     }
@@ -794,13 +855,18 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let resources = val["resources"].as_array().unwrap();
         let names: Vec<&str> = resources
             .iter()
             .map(|r| r["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"runtimeclasses"), "runtimeclasses must be in node.k8s.io/v1; got: {names:?}");
+        assert!(
+            names.contains(&"runtimeclasses"),
+            "runtimeclasses must be in node.k8s.io/v1; got: {names:?}"
+        );
     }
 }

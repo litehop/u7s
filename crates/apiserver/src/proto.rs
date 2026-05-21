@@ -58,9 +58,12 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
             _ => {}
         }
     })?;
-    Some(ProtoEnvelope { raw: raw?, content_type, kind })
+    Some(ProtoEnvelope {
+        raw: raw?,
+        content_type,
+        kind,
+    })
 }
-
 
 /// Decode one ObjectMeta proto field into `meta`, `labels`, and `annotations`.
 ///
@@ -443,7 +446,6 @@ fn decode_map_entry(data: &[u8]) -> Option<(String, String)> {
     Some((key, value))
 }
 
-
 /// Decode a protobuf varint from the front of `data`.
 /// Returns `Some((value, remaining))` or `None` if the data is too short or the varint
 /// exceeds 10 bytes (which would overflow a u64).
@@ -522,7 +524,10 @@ mod tests {
         let proto_body = build_k8s_proto(json);
 
         let result = decode_k8s_proto_envelope(&proto_body).expect("must decode successfully");
-        assert_eq!(result.raw, json, "extracted raw must equal the original JSON payload");
+        assert_eq!(
+            result.raw, json,
+            "extracted raw must equal the original JSON payload"
+        );
     }
 
     /// The envelope decoder must return None for a body without the magic prefix.
@@ -579,7 +584,8 @@ mod tests {
         let mut body = K8S_PROTO_MAGIC.to_vec();
         body.extend_from_slice(&proto);
 
-        let result = decode_k8s_proto_envelope(&body).expect("must decode field 2 even when other fields are present");
+        let result = decode_k8s_proto_envelope(&body)
+            .expect("must decode field 2 even when other fields are present");
         assert_eq!(result.raw, json);
         assert_eq!(result.content_type, "application/json");
         assert_eq!(result.kind, "Pod");
@@ -635,7 +641,10 @@ mod tests {
 
         let env = decode_k8s_proto_envelope(&body).expect("must decode envelope");
         assert_eq!(env.raw, raw);
-        assert_eq!(env.content_type, "", "contentType must be empty when field 4 is absent");
+        assert_eq!(
+            env.content_type, "",
+            "contentType must be empty when field 4 is absent"
+        );
     }
 
     /// decode_k8s_proto_envelope must return None when the magic prefix is absent.
@@ -681,7 +690,7 @@ mod tests {
     fn decode_namespace_proto_extracts_labels_and_annotations() {
         // Build: ObjectMeta { name: "ns", labels: {"env": "test"}, annotations: {"note": "hi"} }
         let mut obj_meta = encode_length_delimited(1, b"ns"); // field 1 = name
-        // Labels map entry (field 11): {field 1="env", field 2="test"}
+                                                              // Labels map entry (field 11): {field 1="env", field 2="test"}
         let mut label_entry = encode_length_delimited(1, b"env");
         label_entry.extend_from_slice(&encode_length_delimited(2, b"test"));
         obj_meta.extend_from_slice(&encode_length_delimited(11, &label_entry));
@@ -711,7 +720,7 @@ mod tests {
     fn full_kubectl_create_namespace_smoke_regression() {
         // Build proto-encoded Namespace{metadata:{name:"smoke-test", creationTimestamp:{}}}
         let mut obj_meta = encode_length_delimited(1, b"smoke-test"); // name
-        // creationTimestamp (field 8, wire 2) — empty Time{} message (len=0)
+                                                                      // creationTimestamp (field 8, wire 2) — empty Time{} message (len=0)
         obj_meta.extend_from_slice(&encode_length_delimited(8, &[])); // empty Time
         let namespace_proto = encode_length_delimited(1, &obj_meta);
 
@@ -737,7 +746,10 @@ mod tests {
 
         // Decode the inner proto-encoded Namespace
         let json = decode_namespace_proto(&env.raw).expect("namespace proto decode must succeed");
-        assert_eq!(json["metadata"]["name"], "smoke-test", "name must be extracted from proto");
+        assert_eq!(
+            json["metadata"]["name"], "smoke-test",
+            "name must be extracted from proto"
+        );
         assert_eq!(json["kind"], "Namespace");
         assert_eq!(json["apiVersion"], "v1");
     }
@@ -757,7 +769,7 @@ mod tests {
         // Build: ObjectMeta { name: "smoke-cm", namespace: "smoke-test" }
         let mut obj_meta = encode_length_delimited(1, b"smoke-cm"); // field 1 = name
         obj_meta.extend_from_slice(&encode_length_delimited(3, b"smoke-test")); // field 3 = namespace
-        // data map entry (field 2 of ConfigMap): { key="key", value="value" }
+                                                                                // data map entry (field 2 of ConfigMap): { key="key", value="value" }
         let mut data_entry = encode_length_delimited(1, b"key");
         data_entry.extend_from_slice(&encode_length_delimited(2, b"value"));
 
@@ -841,12 +853,18 @@ mod tests {
         assert_eq!(result["kind"], "Node");
         assert_eq!(result["apiVersion"], "v1");
         assert_eq!(result["metadata"]["name"], "node-1");
-        assert_eq!(result["spec"]["podCIDR"], "10.244.0.0/24",
-            "podCIDR must be extracted from NodeSpec field 1");
-        assert_eq!(result["spec"]["providerID"], "aws://us-east-1a/i-1234",
-            "providerID must be extracted from NodeSpec field 3");
-        assert_eq!(result["spec"]["podCIDRs"][0], "10.244.0.0/24",
-            "podCIDRs must be extracted from NodeSpec field 7");
+        assert_eq!(
+            result["spec"]["podCIDR"], "10.244.0.0/24",
+            "podCIDR must be extracted from NodeSpec field 1"
+        );
+        assert_eq!(
+            result["spec"]["providerID"], "aws://us-east-1a/i-1234",
+            "providerID must be extracted from NodeSpec field 3"
+        );
+        assert_eq!(
+            result["spec"]["podCIDRs"][0], "10.244.0.0/24",
+            "podCIDRs must be extracted from NodeSpec field 7"
+        );
     }
 
     /// decode_node_proto must not panic when NodeSpec contains unrecognized fields (e.g. taints).
@@ -857,13 +875,14 @@ mod tests {
         let obj_meta = encode_length_delimited(1, b"node-2"); // ObjectMeta.name
         let mut node_spec = Vec::new();
         node_spec.extend_from_slice(&encode_length_delimited(1, b"10.0.0.0/24")); // NodeSpec.podCIDR
-        // field 5 = taints (repeated Taint message) — not decoded, must be silently skipped
+                                                                                  // field 5 = taints (repeated Taint message) — not decoded, must be silently skipped
         node_spec.extend_from_slice(&encode_length_delimited(5, b"\x0a\x08NoSchedule")); // opaque Taint bytes
 
         let mut node_proto = encode_length_delimited(1, &obj_meta);
         node_proto.extend_from_slice(&encode_length_delimited(2, &node_spec));
 
-        let result = decode_node_proto(&node_proto).expect("must not panic on unknown NodeSpec fields");
+        let result =
+            decode_node_proto(&node_proto).expect("must not panic on unknown NodeSpec fields");
 
         assert_eq!(result["metadata"]["name"], "node-2");
         assert_eq!(result["spec"]["podCIDR"], "10.0.0.0/24");
@@ -889,7 +908,7 @@ mod tests {
         let obj_meta = encode_length_delimited(1, b"maintenance-node");
         let mut node_spec = Vec::new();
         node_spec.extend_from_slice(&encode_length_delimited(1, b"10.0.1.0/24")); // NodeSpec.podCIDR
-        // NodeSpec.unschedulable = true: tag=0x20 (field 4, wire type 0), value=0x01
+                                                                                  // NodeSpec.unschedulable = true: tag=0x20 (field 4, wire type 0), value=0x01
         node_spec.push(0x20);
         node_spec.push(0x01);
 
@@ -942,14 +961,17 @@ mod tests {
         };
         let mut unknown = encode_length_delimited(1, &type_meta); // TypeMeta
         unknown.extend_from_slice(&encode_length_delimited(2, &configmap_proto)); // raw
-        // contentType field 4 is absent (empty = kubectl behavior)
+                                                                                  // contentType field 4 is absent (empty = kubectl behavior)
 
         let mut body = K8S_PROTO_MAGIC.to_vec();
         body.extend_from_slice(&unknown);
 
         let env = decode_k8s_proto_envelope(&body).expect("envelope decode must succeed");
         assert_eq!(env.kind, "ConfigMap");
-        assert_eq!(env.content_type, "", "kubectl sends empty contentType for core types");
+        assert_eq!(
+            env.content_type, "",
+            "kubectl sends empty contentType for core types"
+        );
 
         let json = decode_core_proto_by_kind(&env.kind, &env.raw)
             .expect("ConfigMap proto decode must succeed");

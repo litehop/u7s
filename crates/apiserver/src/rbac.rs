@@ -233,7 +233,10 @@ impl Default for RbacIndex {
 // --- helpers ---
 
 fn extract_last_segment(key: &str) -> String {
-    key.split('/').rfind(|s| !s.is_empty()).unwrap_or("").to_owned()
+    key.split('/')
+        .rfind(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_owned()
 }
 
 /// Extract namespace from key segments like .../namespaces/<ns>/roles/<name>
@@ -256,12 +259,13 @@ fn subject_matches(binding: &RbacBinding, username: &str, groups: &[String]) -> 
     })
 }
 
-fn resolve_cluster_role_rules<'a>(
-    inner: &'a RbacInner,
-    role_ref: &RoleRef,
-) -> &'a [PolicyRule] {
+fn resolve_cluster_role_rules<'a>(inner: &'a RbacInner, role_ref: &RoleRef) -> &'a [PolicyRule] {
     if role_ref.kind == "ClusterRole" {
-        inner.cluster_roles.get(&role_ref.name).map(Vec::as_slice).unwrap_or(&[])
+        inner
+            .cluster_roles
+            .get(&role_ref.name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     } else {
         &[]
     }
@@ -293,7 +297,11 @@ fn rules_allow(rules: &[PolicyRule], req: &AuthzRequest<'_>) -> bool {
 
 fn rule_covers(rule: &PolicyRule, req: &AuthzRequest<'_>) -> bool {
     // 1. api_groups
-    if !rule.api_groups.iter().any(|g| g == "*" || g == req.api_group) {
+    if !rule
+        .api_groups
+        .iter()
+        .any(|g| g == "*" || g == req.api_group)
+    {
         return false;
     }
 
@@ -362,8 +370,7 @@ mod tests {
         role_name: &str,
         subjects: serde_json::Value,
     ) -> (String, serde_json::Value) {
-        let key =
-            format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}");
+        let key = format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}");
         let val = json!({
             "subjects": subjects,
             "roleRef": {
@@ -375,14 +382,8 @@ mod tests {
         (key, val)
     }
 
-    fn make_role(
-        ns: &str,
-        name: &str,
-        rules: serde_json::Value,
-    ) -> (String, serde_json::Value) {
-        let key = format!(
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/roles/{name}"
-        );
+    fn make_role(ns: &str, name: &str, rules: serde_json::Value) -> (String, serde_json::Value) {
+        let key = format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/roles/{name}");
         let val = json!({ "rules": rules });
         (key, val)
     }
@@ -393,9 +394,7 @@ mod tests {
         role_name: &str,
         subjects: serde_json::Value,
     ) -> (String, serde_json::Value) {
-        let key = format!(
-            "/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/{name}"
-        );
+        let key = format!("/apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings/{name}");
         let val = json!({
             "subjects": subjects,
             "roleRef": {
@@ -434,7 +433,15 @@ mod tests {
         // system:masters group must bypass ALL policy checks — even with no bindings.
         let idx = RbacIndex::new();
         let groups = vec!["system:masters".to_owned()];
-        let r = req("alice", &groups, "delete", "secrets", "", Some("kube-system"), None);
+        let r = req(
+            "alice",
+            &groups,
+            "delete",
+            "secrets",
+            "",
+            Some("kube-system"),
+            None,
+        );
         assert!(
             idx.is_allowed(&r),
             "system:masters must always be allowed regardless of policy"
@@ -447,10 +454,7 @@ mod tests {
         let idx = RbacIndex::new();
         let groups: Vec<String> = vec![];
         let r = req("bob", &groups, "get", "pods", "", Some("default"), None);
-        assert!(
-            !idx.is_allowed(&r),
-            "no bindings must result in deny"
-        );
+        assert!(!idx.is_allowed(&r), "no bindings must result in deny");
     }
 
     #[test]
@@ -478,16 +482,41 @@ mod tests {
         let groups: Vec<String> = vec![];
 
         // get pods in namespace "production" — must be allowed
-        let r = req("alice", &groups, "get", "pods", "", Some("production"), None);
-        assert!(idx.is_allowed(&r), "cluster binding must grant access in any namespace");
+        let r = req(
+            "alice",
+            &groups,
+            "get",
+            "pods",
+            "",
+            Some("production"),
+            None,
+        );
+        assert!(
+            idx.is_allowed(&r),
+            "cluster binding must grant access in any namespace"
+        );
 
         // list pods in namespace "staging" — must be allowed
         let r2 = req("alice", &groups, "list", "pods", "", Some("staging"), None);
-        assert!(idx.is_allowed(&r2), "list must also be allowed via cluster binding");
+        assert!(
+            idx.is_allowed(&r2),
+            "list must also be allowed via cluster binding"
+        );
 
         // delete pods — must be denied (not in verbs)
-        let r3 = req("alice", &groups, "delete", "pods", "", Some("default"), None);
-        assert!(!idx.is_allowed(&r3), "delete must be denied — not in rule verbs");
+        let r3 = req(
+            "alice",
+            &groups,
+            "delete",
+            "pods",
+            "",
+            Some("default"),
+            None,
+        );
+        assert!(
+            !idx.is_allowed(&r3),
+            "delete must be denied — not in rule verbs"
+        );
     }
 
     #[test]
@@ -504,8 +533,12 @@ mod tests {
                 "verbs": ["get"]
             }]),
         );
-        let (bind_key, bind_val) =
-            make_role_binding("foo", "alice-binding", "pod-reader", json!([{ "kind": "User", "name": "alice" }]));
+        let (bind_key, bind_val) = make_role_binding(
+            "foo",
+            "alice-binding",
+            "pod-reader",
+            json!([{ "kind": "User", "name": "alice" }]),
+        );
 
         idx.apply_object(&role_key, &role_val);
         idx.apply_object(&bind_key, &bind_val);
@@ -514,11 +547,17 @@ mod tests {
 
         // allowed in "foo"
         let r_foo = req("alice", &groups, "get", "pods", "", Some("foo"), None);
-        assert!(idx.is_allowed(&r_foo), "must be allowed in bound namespace 'foo'");
+        assert!(
+            idx.is_allowed(&r_foo),
+            "must be allowed in bound namespace 'foo'"
+        );
 
         // denied in "bar" — binding is namespace-scoped
         let r_bar = req("alice", &groups, "get", "pods", "", Some("bar"), None);
-        assert!(!idx.is_allowed(&r_bar), "must be denied in different namespace 'bar'");
+        assert!(
+            !idx.is_allowed(&r_bar),
+            "must be denied in different namespace 'bar'"
+        );
     }
 
     #[test]
@@ -544,12 +583,11 @@ mod tests {
         idx.apply_object(&bind_key, &bind_val);
 
         let groups: Vec<String> = vec![];
-        for verb in &["get", "list", "create", "update", "patch", "delete", "watch"] {
+        for verb in &[
+            "get", "list", "create", "update", "patch", "delete", "watch",
+        ] {
             let r = req("bob", &groups, verb, "pods", "", Some("default"), None);
-            assert!(
-                idx.is_allowed(&r),
-                "wildcard verb must allow '{verb}'"
-            );
+            assert!(idx.is_allowed(&r), "wildcard verb must allow '{verb}'");
         }
     }
 
@@ -578,12 +616,23 @@ mod tests {
         let groups: Vec<String> = vec![];
 
         // pods/log — must be allowed
-        let r_log = req("carol", &groups, "get", "pods", "log", Some("default"), None);
+        let r_log = req(
+            "carol",
+            &groups,
+            "get",
+            "pods",
+            "log",
+            Some("default"),
+            None,
+        );
         assert!(idx.is_allowed(&r_log), "pods/log must be allowed");
 
         // plain pods — must be denied (rule only covers pods/log)
         let r_pods = req("carol", &groups, "get", "pods", "", Some("default"), None);
-        assert!(!idx.is_allowed(&r_pods), "plain pods must be denied when rule only covers pods/log");
+        assert!(
+            !idx.is_allowed(&r_pods),
+            "plain pods must be denied when rule only covers pods/log"
+        );
     }
 
     #[test]
@@ -616,7 +665,10 @@ mod tests {
 
         // Allowed in the bound namespace.
         let r_foo = req("dave", &groups, "get", "secrets", "", Some("foo"), None);
-        assert!(idx.is_allowed(&r_foo), "must be allowed in bound namespace 'foo'");
+        assert!(
+            idx.is_allowed(&r_foo),
+            "must be allowed in bound namespace 'foo'"
+        );
 
         // Must be denied in a different namespace — the binding does not cross ns boundaries.
         let r_bar = req("dave", &groups, "get", "secrets", "", Some("bar"), None);
@@ -654,14 +706,30 @@ mod tests {
         let groups: Vec<String> = vec![];
 
         // Request is namespace-scoped but the ClusterRoleBinding must still allow it.
-        let r = req("eve", &groups, "get", "configmaps", "", Some("production"), None);
+        let r = req(
+            "eve",
+            &groups,
+            "get",
+            "configmaps",
+            "",
+            Some("production"),
+            None,
+        );
         assert!(
             idx.is_allowed(&r),
             "ClusterRoleBinding must grant access for namespace-scoped requests"
         );
 
         // Also works in a different namespace — cluster-wide binding is not namespace-restricted.
-        let r2 = req("eve", &groups, "list", "configmaps", "", Some("kube-system"), None);
+        let r2 = req(
+            "eve",
+            &groups,
+            "list",
+            "configmaps",
+            "",
+            Some("kube-system"),
+            None,
+        );
         assert!(
             idx.is_allowed(&r2),
             "ClusterRoleBinding must grant access in any namespace"
@@ -697,7 +765,15 @@ mod tests {
         let groups: Vec<String> = vec![];
 
         // Request for a specific named pod — must be allowed because resourceNames is empty.
-        let r = req("frank", &groups, "get", "pods", "", Some("default"), Some("my-pod"));
+        let r = req(
+            "frank",
+            &groups,
+            "get",
+            "pods",
+            "",
+            Some("default"),
+            Some("my-pod"),
+        );
         assert!(
             idx.is_allowed(&r),
             "empty resourceNames must match any name — treating it as a deny-all would be a bug"
@@ -739,14 +815,30 @@ mod tests {
         let groups: Vec<String> = vec![];
 
         // Allowed name — must be permitted.
-        let r_ok = req("grace", &groups, "get", "pods", "", Some("default"), Some("allowed-pod"));
+        let r_ok = req(
+            "grace",
+            &groups,
+            "get",
+            "pods",
+            "",
+            Some("default"),
+            Some("allowed-pod"),
+        );
         assert!(
             idx.is_allowed(&r_ok),
             "request for the explicitly listed resourceName must be allowed"
         );
 
         // Different name — must be denied (not in the resourceNames list).
-        let r_deny = req("grace", &groups, "get", "pods", "", Some("default"), Some("other-pod"));
+        let r_deny = req(
+            "grace",
+            &groups,
+            "get",
+            "pods",
+            "",
+            Some("default"),
+            Some("other-pod"),
+        );
         assert!(
             !idx.is_allowed(&r_deny),
             "request for a name not in resourceNames must be denied — would be an escalation"
@@ -795,14 +887,30 @@ mod tests {
         assert!(idx.is_allowed(&r_log), "pods/log must be allowed");
 
         // pods/status — must be denied (not in the rule's resource list).
-        let r_status = req("hank", &groups, "get", "pods", "status", Some("default"), None);
+        let r_status = req(
+            "hank",
+            &groups,
+            "get",
+            "pods",
+            "status",
+            Some("default"),
+            None,
+        );
         assert!(
             !idx.is_allowed(&r_status),
             "pods/status must be denied — pods/log rule must not bleed to other subresources"
         );
 
         // pods/exec — must also be denied.
-        let r_exec = req("hank", &groups, "get", "pods", "exec", Some("default"), None);
+        let r_exec = req(
+            "hank",
+            &groups,
+            "get",
+            "pods",
+            "exec",
+            Some("default"),
+            None,
+        );
         assert!(
             !idx.is_allowed(&r_exec),
             "pods/exec must be denied — pods/log rule must not bleed to other subresources"

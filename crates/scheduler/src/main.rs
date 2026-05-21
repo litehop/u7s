@@ -62,15 +62,14 @@ struct ClientCreds {
 }
 
 fn parse_kubeconfig(path: &str) -> anyhow::Result<ClientCreds> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading kubeconfig {path}"))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading kubeconfig {path}"))?;
 
     let b64 = base64::engine::general_purpose::STANDARD;
 
     // Manual YAML extraction — no serde_yaml dependency.
     // The format is the fixed structure written by u7s-apiserver's tls.rs.
-    let server = extract_yaml_value(&raw, "server:")
-        .context("kubeconfig: missing server")?;
+    let server = extract_yaml_value(&raw, "server:").context("kubeconfig: missing server")?;
     let ca_data = extract_yaml_value(&raw, "certificate-authority-data:")
         .context("kubeconfig: missing certificate-authority-data")?;
     let cert_data = extract_yaml_value(&raw, "client-certificate-data:")
@@ -210,7 +209,12 @@ async fn send_request(
     let status = resp.status();
 
     use http_body_util::BodyExt;
-    let bytes = resp.into_body().collect().await.context("read body")?.to_bytes();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .context("read body")?
+        .to_bytes();
     let text = String::from_utf8_lossy(&bytes).into_owned();
 
     Ok((status, text))
@@ -259,7 +263,10 @@ async fn stream_watch_events(
         .body(http_body_util::Empty::<bytes::Bytes>::new())
         .context("build watch request")?;
 
-    let resp: Response<Incoming> = sender.send_request(req).await.context("send watch request")?;
+    let resp: Response<Incoming> = sender
+        .send_request(req)
+        .await
+        .context("send watch request")?;
     if !resp.status().is_success() {
         bail!("watch returned HTTP {}", resp.status());
     }
@@ -323,8 +330,7 @@ fn needs_scheduling(event: &Value) -> Option<(String, String)> {
         return None;
     }
     let node_name = &event["object"]["spec"]["nodeName"];
-    let already_scheduled =
-        node_name.is_string() && !node_name.as_str().unwrap_or("").is_empty();
+    let already_scheduled = node_name.is_string() && !node_name.as_str().unwrap_or("").is_empty();
     if already_scheduled {
         return None;
     }
@@ -372,9 +378,7 @@ async fn bind_pod(
     pod_name: &str,
     node_name: &str,
 ) -> anyhow::Result<()> {
-    let path = format!(
-        "/api/v1/namespaces/{namespace}/pods/{pod_name}/binding"
-    );
+    let path = format!("/api/v1/namespaces/{namespace}/pods/{pod_name}/binding");
     let payload = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Binding",
@@ -399,8 +403,7 @@ async fn bind_pod(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -445,9 +448,14 @@ async fn main() -> anyhow::Result<()> {
                 match pick_node(&connector_clone, &server_clone).await {
                     Err(e) => error!("failed to list nodes: {e}"),
                     Ok(node) => {
-                        if let Err(e) =
-                            bind_pod(&connector_clone, &server_clone, &namespace, &pod_name, &node)
-                                .await
+                        if let Err(e) = bind_pod(
+                            &connector_clone,
+                            &server_clone,
+                            &namespace,
+                            &pod_name,
+                            &node,
+                        )
+                        .await
                         {
                             error!("bind error: {e}");
                         }

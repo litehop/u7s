@@ -62,7 +62,9 @@ pub struct ApiResourceList {
     pub resources: &'static [ApiResource],
 }
 
-static CORE_VERBS: &[&str] = &["create", "delete", "get", "list", "patch", "update", "watch"];
+static CORE_VERBS: &[&str] = &[
+    "create", "delete", "get", "list", "patch", "update", "watch",
+];
 static PODS_SHORT_NAMES: &[&str] = &["po"];
 static NODES_SHORT_NAMES: &[&str] = &["no"];
 static SERVICES_SHORT_NAMES: &[&str] = &["svc"];
@@ -153,7 +155,7 @@ impl ApiResourceList {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceKey {
-    pub group: String,   // "" for core group
+    pub group: String, // "" for core group
     pub version: String,
     pub plural: String,
 }
@@ -208,8 +210,14 @@ impl Namespace {
     /// Parse and validate a raw namespace string.
     /// Returns `Err` with a human-readable message on failure.
     pub fn parse(raw: &str) -> Result<Self, String> {
-        if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-            return Err(format!("invalid namespace name '{raw}': must match [a-z0-9-]+"));
+        if raw.is_empty()
+            || !raw
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return Err(format!(
+                "invalid namespace name '{raw}': must match [a-z0-9-]+"
+            ));
         }
         Ok(Namespace(raw.to_owned()))
     }

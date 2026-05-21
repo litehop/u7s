@@ -8,7 +8,11 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store, StoreError};
 
-use crate::{state::AppState, status::Status, util::{extract_body, utc_now_rfc3339}};
+use crate::{
+    state::AppState,
+    status::Status,
+    util::{extract_body, utc_now_rfc3339},
+};
 
 const GROUP: &str = "apiextensions.k8s.io";
 const PLURAL: &str = "customresourcedefinitions";
@@ -96,9 +100,8 @@ pub struct CustomResourceDefinition {
 // ---------------------------------------------------------------------------
 
 fn parse_crd(body: &Bytes) -> Result<CustomResourceDefinition, crate::status::StatusError> {
-    serde_json::from_slice(body).map_err(|e| {
-        Status::unprocessable_entity(format!("invalid CustomResourceDefinition: {e}"))
-    })
+    serde_json::from_slice(body)
+        .map_err(|e| Status::unprocessable_entity(format!("invalid CustomResourceDefinition: {e}")))
 }
 
 fn store_err_crd(err: StoreError, name: &str) -> crate::status::StatusError {
@@ -125,7 +128,11 @@ fn new_uid() -> String {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{:016x}-{:08x}-crd0-0000-000000000000", d.as_secs(), d.subsec_nanos())
+    format!(
+        "{:016x}-{:08x}-crd0-0000-000000000000",
+        d.as_secs(),
+        d.subsec_nanos()
+    )
 }
 
 fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::StatusError> {
@@ -183,7 +190,10 @@ pub async fn create_crd(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
     let mut crd = parse_crd(&body)?;
 
@@ -240,7 +250,10 @@ pub async fn replace_crd(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
     let mut crd = parse_crd(&body)?;
 
@@ -336,38 +349,51 @@ mod tests {
 
     fn make_state() -> AppState {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        AppState::new(store, None, None, std::collections::HashMap::new(), "https://localhost:6443".into())
+        AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
     }
 
     fn minimal_crd_bytes(name: &str) -> Bytes {
-        Bytes::from(serde_json::json!({
-            "apiVersion": "apiextensions.k8s.io/v1",
-            "kind": "CustomResourceDefinition",
-            "metadata": { "name": name },
-            "spec": {
-                "group": "argoproj.io",
-                "names": {
-                    "plural": "applications",
-                    "singular": "application",
-                    "kind": "Application",
-                    "listKind": "ApplicationList"
-                },
-                "scope": "Namespaced",
-                "versions": [
-                    { "name": "v1alpha1", "served": true, "storage": true }
-                ]
-            }
-        }).to_string())
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": name },
+                "spec": {
+                    "group": "argoproj.io",
+                    "names": {
+                        "plural": "applications",
+                        "singular": "application",
+                        "kind": "Application",
+                        "listKind": "ApplicationList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        { "name": "v1alpha1", "served": true, "storage": true }
+                    ]
+                }
+            })
+            .to_string(),
+        )
     }
 
-    fn ok_crd(r: Result<CustomResourceDefinition, crate::status::StatusError>) -> CustomResourceDefinition {
+    fn ok_crd(
+        r: Result<CustomResourceDefinition, crate::status::StatusError>,
+    ) -> CustomResourceDefinition {
         match r {
             Ok(v) => v,
             Err(_) => panic!("expected Ok but got StatusError"),
         }
     }
 
-    fn err_status(r: Result<impl IntoResponse, crate::status::StatusError>) -> crate::status::StatusError {
+    fn err_status(
+        r: Result<impl IntoResponse, crate::status::StatusError>,
+    ) -> crate::status::StatusError {
         match r {
             Ok(_) => panic!("expected Err but got Ok"),
             Err(e) => e,
@@ -440,7 +466,12 @@ mod tests {
         let name = "applications.argoproj.io";
         let body = minimal_crd_bytes(name);
 
-        assert!(create_crd(State(state.clone()), HeaderMap::new(), body).await.is_ok(), "create must succeed");
+        assert!(
+            create_crd(State(state.clone()), HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create must succeed"
+        );
 
         let resp = match get_crd(State(state), Path(name.to_string())).await {
             Ok(r) => r,
@@ -457,7 +488,9 @@ mod tests {
         let body = minimal_crd_bytes(name);
 
         assert!(
-            create_crd(State(state.clone()), HeaderMap::new(), body.clone()).await.is_ok(),
+            create_crd(State(state.clone()), HeaderMap::new(), body.clone())
+                .await
+                .is_ok(),
             "first create must succeed"
         );
 
@@ -484,7 +517,8 @@ mod tests {
     #[tokio::test]
     async fn delete_missing_returns_404() {
         let state = make_state();
-        let err = err_status(delete_crd(State(state), Path("missing.example.com".to_string())).await);
+        let err =
+            err_status(delete_crd(State(state), Path("missing.example.com".to_string())).await);
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 404);
         assert_eq!(json["reason"], "NotFound");
@@ -496,7 +530,13 @@ mod tests {
         let state = make_state();
         let body = minimal_crd_bytes("missing.example.com");
         let err = err_status(
-            replace_crd(State(state), Path("missing.example.com".to_string()), HeaderMap::new(), body).await,
+            replace_crd(
+                State(state),
+                Path("missing.example.com".to_string()),
+                HeaderMap::new(),
+                body,
+            )
+            .await,
         );
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 404);
@@ -506,7 +546,20 @@ mod tests {
     #[tokio::test]
     async fn list_empty() {
         let state = make_state();
-        let resp = match list_crds(State(state), Query(crate::handlers::generic::CollectionQuery { watch: None, resource_version: None, label_selector: None, field_selector: None, limit: None, continue_token: None, send_initial_events: None })).await {
+        let resp = match list_crds(
+            State(state),
+            Query(crate::handlers::generic::CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+            }),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("list must succeed"),
         };
@@ -520,27 +573,33 @@ mod tests {
     async fn create_crd_rejects_mismatched_name() {
         let state = make_state();
         // Correct would be "widgets.example.io" but we pass "wrong.example.io".
-        let body = Bytes::from(serde_json::json!({
-            "apiVersion": "apiextensions.k8s.io/v1",
-            "kind": "CustomResourceDefinition",
-            "metadata": { "name": "wrong.example.io" },
-            "spec": {
-                "group": "example.io",
-                "names": {
-                    "plural": "widgets",
-                    "singular": "widget",
-                    "kind": "Widget"
-                },
-                "scope": "Namespaced",
-                "versions": [{ "name": "v1", "served": true, "storage": true }]
-            }
-        }).to_string());
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "wrong.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
 
         let err = err_status(create_crd(State(state), HeaderMap::new(), body).await);
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 422, "mismatched name must return 422");
         assert!(
-            json["message"].as_str().unwrap_or("").contains("widgets.example.io"),
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("widgets.example.io"),
             "error must mention the expected name"
         );
     }
@@ -549,24 +608,29 @@ mod tests {
     #[tokio::test]
     async fn create_crd_accepts_correct_name() {
         let state = make_state();
-        let body = Bytes::from(serde_json::json!({
-            "apiVersion": "apiextensions.k8s.io/v1",
-            "kind": "CustomResourceDefinition",
-            "metadata": { "name": "widgets.example.io" },
-            "spec": {
-                "group": "example.io",
-                "names": {
-                    "plural": "widgets",
-                    "singular": "widget",
-                    "kind": "Widget"
-                },
-                "scope": "Namespaced",
-                "versions": [{ "name": "v1", "served": true, "storage": true }]
-            }
-        }).to_string());
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
 
         assert!(
-            create_crd(State(state), HeaderMap::new(), body).await.is_ok(),
+            create_crd(State(state), HeaderMap::new(), body)
+                .await
+                .is_ok(),
             "correct name widgets.example.io must be accepted"
         );
     }
@@ -596,7 +660,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // watch_generic always sets transfer-encoding: chunked
         assert_eq!(
-            resp.headers().get("transfer-encoding").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("transfer-encoding")
+                .and_then(|v| v.to_str().ok()),
             Some("chunked"),
             "watch response must use chunked transfer encoding"
         );

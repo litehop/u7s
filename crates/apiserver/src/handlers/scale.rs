@@ -6,12 +6,7 @@ use axum::{
 use bytes::Bytes;
 use u7s_store::Store as _;
 
-use crate::{
-    keys::group_object_key,
-    state::AppState,
-    status::Status,
-    types::Object,
-};
+use crate::{keys::group_object_key, state::AppState, status::Status, types::Object};
 
 // ---------------------------------------------------------------------------
 // Scale subresource — GET/PUT/PATCH
@@ -43,7 +38,12 @@ fn require_scale_resource(resource: &str) -> Result<(), crate::status::StatusErr
 
 /// Build a Scale (autoscaling/v1) object from the given name, namespace, and
 /// replica count.  `resource_version` is taken from the stored workload.
-pub fn build_scale(name: &str, ns: &str, replicas: i64, resource_version: &str) -> serde_json::Value {
+pub fn build_scale(
+    name: &str,
+    ns: &str,
+    replicas: i64,
+    resource_version: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "autoscaling/v1",
         "kind": "Scale",
@@ -127,7 +127,12 @@ pub async fn put_scale(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    Ok(Json(build_scale(&name, &ns, new_replicas, &new_rv.to_string())))
+    Ok(Json(build_scale(
+        &name,
+        &ns,
+        new_replicas,
+        &new_rv.to_string(),
+    )))
 }
 
 /// PATCH /apis/apps/v1/namespaces/:ns/:resource/:name/scale
@@ -170,7 +175,12 @@ pub async fn patch_scale(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    Ok(Json(build_scale(&name, &ns, new_replicas, &new_rv.to_string())))
+    Ok(Json(build_scale(
+        &name,
+        &ns,
+        new_replicas,
+        &new_rv.to_string(),
+    )))
 }
 
 // ---------------------------------------------------------------------------

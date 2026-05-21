@@ -1,15 +1,18 @@
-use axum::{http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::Serialize;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
-    pub kind:        &'static str,
+    pub kind: &'static str,
     pub api_version: &'static str,
-    pub status:      &'static str,
-    pub message:     String,
-    pub reason:      &'static str,
-    pub code:        u16,
+    pub status: &'static str,
+    pub message: String,
+    pub reason: &'static str,
+    pub code: u16,
 }
 
 pub struct StatusError(pub StatusCode, pub Status);
@@ -25,9 +28,12 @@ impl Status {
         StatusError(
             StatusCode::NOT_FOUND,
             Status {
-                kind: "Status", api_version: "v1", status: "Failure",
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
                 message: format!("{kind} \"{name}\" not found"),
-                reason: "NotFound", code: 404,
+                reason: "NotFound",
+                code: 404,
             },
         )
     }
@@ -36,9 +42,12 @@ impl Status {
         StatusError(
             StatusCode::CONFLICT,
             Status {
-                kind: "Status", api_version: "v1", status: "Failure",
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
                 message: format!("{kind} \"{name}\" already exists"),
-                reason: "AlreadyExists", code: 409,
+                reason: "AlreadyExists",
+                code: 409,
             },
         )
     }
@@ -47,9 +56,12 @@ impl Status {
         StatusError(
             StatusCode::CONFLICT,
             Status {
-                kind: "Status", api_version: "v1", status: "Failure",
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
                 message,
-                reason: "Conflict", code: 409,
+                reason: "Conflict",
+                code: 409,
             },
         )
     }
@@ -58,9 +70,12 @@ impl Status {
         StatusError(
             StatusCode::BAD_REQUEST,
             Status {
-                kind: "Status", api_version: "v1", status: "Failure",
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
                 message,
-                reason: "BadRequest", code: 400,
+                reason: "BadRequest",
+                code: 400,
             },
         )
     }
@@ -69,9 +84,12 @@ impl Status {
         StatusError(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Status {
-                kind: "Status", api_version: "v1", status: "Failure",
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
                 message,
-                reason: "UnsupportedMediaType", code: 415,
+                reason: "UnsupportedMediaType",
+                code: 415,
             },
         )
     }
@@ -80,9 +98,12 @@ impl Status {
         StatusError(
             StatusCode::UNPROCESSABLE_ENTITY,
             Status {
-                kind: "Status", api_version: "v1", status: "Failure",
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
                 message,
-                reason: "Invalid", code: 422,
+                reason: "Invalid",
+                code: 422,
             },
         )
     }
@@ -91,9 +112,12 @@ impl Status {
         StatusError(
             StatusCode::INTERNAL_SERVER_ERROR,
             Status {
-                kind: "Status", api_version: "v1", status: "Failure",
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
                 message,
-                reason: "InternalError", code: 500,
+                reason: "InternalError",
+                code: 500,
             },
         )
     }

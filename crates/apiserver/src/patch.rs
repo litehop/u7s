@@ -169,11 +169,8 @@ fn strategic_merge_array(
             None => {
                 // Normal merge: find by merge key and deep-merge, or append.
                 let key_val = patch_elem.get(merge_key);
-                let found = key_val.and_then(|kv| {
-                    target_arr
-                        .iter_mut()
-                        .find(|t| t.get(merge_key) == Some(kv))
-                });
+                let found = key_val
+                    .and_then(|kv| target_arr.iter_mut().find(|t| t.get(merge_key) == Some(kv)));
 
                 match found {
                     Some(target_elem) => {
@@ -270,7 +267,10 @@ mod tests {
             .iter()
             .map(|c| c["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"existing"), "original container must survive");
+        assert!(
+            names.contains(&"existing"),
+            "original container must survive"
+        );
         assert!(names.contains(&"sidecar"), "new container must be added");
     }
 
