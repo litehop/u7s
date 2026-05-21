@@ -83,6 +83,9 @@ pub enum StoreError {
 
     #[error("compacted: requested revision {requested} is below compaction horizon {horizon}")]
     Compacted { requested: u64, horizon: u64 },
+
+    #[error("json serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -245,10 +248,9 @@ fn open_conn(path: &str) -> Result<Connection> {
 /// Stamps metadata.resourceVersion into the stored JSON.
 /// Parses the JSON, sets the field, re-serializes.
 fn stamp_resource_version(value: &Bytes, revision: u64) -> Result<Bytes> {
-    let mut obj: serde_json::Value = serde_json::from_slice(value)
-        .map_err(|e| StoreError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+    let mut obj: serde_json::Value = serde_json::from_slice(value)?;
     obj["metadata"]["resourceVersion"] = serde_json::Value::String(revision.to_string());
-    Ok(Bytes::from(serde_json::to_vec(&obj).unwrap()))
+    Ok(Bytes::from(serde_json::to_vec(&obj)?))
 }
 
 // Full write procedure — runs inside spawn_blocking.
@@ -1165,5 +1167,25 @@ mod tests {
 
         assert_eq!(resp.items.len(), 2);
         assert!(resp.continue_key.is_none(), "all items fit in one page; continue_key must be absent");
+    }
+
+    #[test]
+    fn stamp_resource_version_returns_err_on_invalid_json() {
+        // Regression test for mayor-n37: stamp_resource_version must return Err rather than
+        // panicking when the stored value is not valid JSON. Before the fix this called
+        // `.unwrap()` on serde_json::to_vec, but the real risk was the from_slice unwrap path
+        // (the to_vec call on a serde_json::Value is infallible in practice). The test
+        // covers the from_slice error path — if the fix is reverted, the function returns
+        // an unwrap panic on a Result::Err rather than propagating StoreError::Serialization.
+        let bad_bytes = Bytes::from_static(b"not valid json {{{");
+        let result = stamp_resource_version(&bad_bytes, 42);
+        assert!(
+            result.is_err(),
+            "stamp_resource_version must return Err on invalid JSON, not panic"
+        );
+        assert!(
+            matches!(result.unwrap_err(), StoreError::Serialization(_)),
+            "error variant must be StoreError::Serialization"
+        );
     }
 }
