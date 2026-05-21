@@ -12,6 +12,7 @@ use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
 use crate::{
     auth::UserInfo,
     keys::{group_list_prefix, group_object_key},
+    rbac::user_holds_all_rules,
     state::AppState,
     status::Status,
     types::{Object, ResourceKey},
@@ -662,6 +663,48 @@ pub(crate) fn stamp_metadata(obj: &mut Object) {
 }
 
 const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
+const CLUSTER_ROLE_BINDINGS: &str = "clusterrolebindings";
+
+/// Escalation prevention for ClusterRoleBinding writes.
+///
+/// A user may only create or update a ClusterRoleBinding if they already hold
+/// every permission enumerated in the referenced ClusterRole. If they don't,
+/// they could use the binding to grant themselves privileges they don't have.
+///
+/// Returns `Ok(())` if the check passes (or is not applicable), or
+/// `Err(StatusError)` with 403 Forbidden if the check fails.
+pub(crate) fn check_crb_escalation(
+    plural: &str,
+    group: &str,
+    user: &UserInfo,
+    body: &serde_json::Value,
+    state: &AppState,
+) -> Result<(), crate::status::StatusError> {
+    if group != RBAC_GROUP || plural != CLUSTER_ROLE_BINDINGS {
+        return Ok(());
+    }
+    // system:masters unconditionally bypasses the escalation check.
+    if user.groups.iter().any(|g| g == "system:masters") {
+        return Ok(());
+    }
+    let role_ref_name = body["roleRef"]["name"].as_str().unwrap_or("");
+    let role_rules = state.rbac_index.cluster_role_rules(role_ref_name);
+    // An empty rule set (role not found) means the user cannot hold all rules
+    // of a non-existent role — deny unless role_rules is truly empty from an
+    // existing role. We check: if role_ref_name is non-empty and rules are
+    // empty, the role does not exist → deny.
+    if !role_ref_name.is_empty() && role_rules.is_empty() {
+        return Err(Status::forbidden(format!(
+            "cannot escalate privileges: ClusterRole \"{role_ref_name}\" not found or has no rules"
+        )));
+    }
+    if !user_holds_all_rules(&user.username, &user.groups, &role_rules, &state.rbac_index) {
+        return Err(Status::forbidden(
+            "cannot escalate privileges: user does not hold all rules of the referenced ClusterRole".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Build the RBAC index key for a cluster-scoped object.
 fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
@@ -800,6 +843,7 @@ pub async fn get_resource(
 pub async fn create_resource(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -820,6 +864,11 @@ pub async fn create_resource(
 
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // Escalation prevention: before persisting a ClusterRoleBinding, verify the
+    // caller already holds all rules of the referenced ClusterRole. This prevents
+    // users from granting themselves permissions they don't currently have.
+    check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
 
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
@@ -850,6 +899,7 @@ pub async fn create_resource(
 pub async fn replace_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -871,6 +921,10 @@ pub async fn replace_resource(
 
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // Escalation prevention: before updating a ClusterRoleBinding, verify the
+    // caller already holds all rules of the referenced ClusterRole.
+    check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
 
     let obj_name = obj.name().unwrap_or("").to_string();
     if obj_name != name {
@@ -1849,12 +1903,14 @@ pub async fn core_get_resource(
 pub async fn core_create_resource(
     State(state): State<AppState>,
     Path(plural): Path<String>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     create_resource(
         State(state),
         Path(("".into(), "v1".into(), plural)),
+        Extension(user),
         headers,
         body,
     )
@@ -1864,12 +1920,14 @@ pub async fn core_create_resource(
 pub async fn core_replace_resource(
     State(state): State<AppState>,
     Path((plural, name)): Path<(String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     replace_resource(
         State(state),
         Path(("".into(), "v1".into(), plural, name)),
+        Extension(user),
         headers,
         body,
     )
@@ -3644,6 +3702,12 @@ mod tests {
             "metadata": {"name": "cluster-admin"},
             "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
         });
+        // Use system:masters to bypass the escalation check in test setup.
+        let admin_user = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
         create_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((
@@ -3651,6 +3715,7 @@ mod tests {
                 version.to_string(),
                 "clusterroles".to_string(),
             )),
+            admin_user.clone(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&cr).unwrap()),
         )
@@ -3660,6 +3725,7 @@ mod tests {
         create_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((group.to_string(), version.to_string(), plural.to_string())),
+            admin_user,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),
         )
@@ -4604,5 +4670,239 @@ mod resolve_name_tests {
         assert!(validate_name("namespace", "kube-system").is_ok());
         assert!(validate_name("name", "foo.example.com").is_ok());
         assert!(validate_name("name", "a123").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod escalation_tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+    use u7s_store::SqliteStore;
+
+    fn json_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        h
+    }
+
+    fn make_state() -> crate::state::AppState {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    /// A user who can create ClusterRoleBindings but does NOT hold cluster-admin
+    /// rules must receive 403 Forbidden when creating a CRB that references
+    /// cluster-admin. This is Kubernetes RBAC escalation prevention (v1.17+):
+    /// you cannot grant permissions you don't already have.
+    #[tokio::test]
+    async fn create_clusterrolebinding_denied_for_unprivileged_user() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+
+        // Seed cluster-admin ClusterRole into the RBAC index.
+        let admin_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "cluster-admin"},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        // Use a privileged user to create the ClusterRole setup.
+        let admin_user = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterroles".to_string(),
+            )),
+            admin_user,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&admin_role).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seeding cluster-admin ClusterRole must succeed"));
+
+        // Give "carol" only create on clusterrolebindings — NOT cluster-admin rules.
+        let carol_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "crb-creator"},
+            "rules": [{
+                "apiGroups": ["rbac.authorization.k8s.io"],
+                "resources": ["clusterrolebindings"],
+                "verbs": ["create"]
+            }]
+        });
+        let carol_binding = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "carol-crb-creator"},
+            "subjects": [{"kind": "User", "name": "carol"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "crb-creator"
+            }
+        });
+        let admin_user2 = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterroles".to_string(),
+            )),
+            admin_user2.clone(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&carol_role).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seeding crb-creator ClusterRole must succeed"));
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterrolebindings".to_string(),
+            )),
+            admin_user2,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&carol_binding).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seeding carol's ClusterRoleBinding must succeed"));
+
+        // Now carol tries to create a CRB binding someone to cluster-admin.
+        // She has create on clusterrolebindings but NOT the cluster-admin rules.
+        // The escalation check must deny this with 403.
+        let escalating_crb = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "evil-binding"},
+            "subjects": [{"kind": "User", "name": "carol"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        let carol_user = Extension(crate::auth::UserInfo {
+            username: "carol".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
+        let result = create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterrolebindings".to_string(),
+            )),
+            carol_user,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&escalating_crb).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "carol must be denied: she cannot grant cluster-admin rules she doesn't hold"
+        );
+        // Verify the error is a 403 Forbidden, not a different status code.
+        // A wrong code (e.g. 500) would indicate an implementation bug.
+        if let Err(err) = result {
+            assert_eq!(
+                err.0,
+                StatusCode::FORBIDDEN,
+                "escalation attempt must return 403 Forbidden, not {}",
+                err.0
+            );
+        }
+    }
+
+    /// A system:masters user must be exempt from the escalation check and allowed
+    /// to create any ClusterRoleBinding regardless of the referenced role's rules.
+    /// system:masters is the cluster bootstrapper identity — blocking it would
+    /// make initial cluster setup impossible.
+    #[tokio::test]
+    async fn create_clusterrolebinding_allowed_for_system_masters() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+
+        // Seed cluster-admin ClusterRole.
+        let admin_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "cluster-admin"},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        let admin_user = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterroles".to_string(),
+            )),
+            admin_user.clone(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&admin_role).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seeding cluster-admin ClusterRole must succeed"));
+
+        // system:masters user creates a CRB binding to cluster-admin — must succeed.
+        let crb = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "admin-binding"},
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        let result = create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterrolebindings".to_string(),
+            )),
+            admin_user,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "system:masters must always pass the escalation check and be allowed to create any CRB"
+        );
     }
 }
