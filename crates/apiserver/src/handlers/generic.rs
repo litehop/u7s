@@ -115,7 +115,11 @@ fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusEr
 
 /// Serialise a single watch event to NDJSON bytes (including trailing newline).
 /// Returns None on Compacted — the caller should close the stream.
-fn encode_watch_event(event: &WatchEvent, api_version: &str, kind: &str) -> Option<Bytes> {
+pub(crate) fn encode_watch_event(
+    event: &WatchEvent,
+    api_version: &str,
+    kind: &str,
+) -> Option<Bytes> {
     let line = match event {
         WatchEvent::Added(obj) => {
             let object: serde_json::Value =
