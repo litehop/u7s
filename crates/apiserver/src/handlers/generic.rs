@@ -284,10 +284,10 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
     true
 }
 
-/// Test whether a JSON object matches a field selector string (`key=value,...`).
-/// Supports `metadata.name` and `metadata.namespace` equality checks.
-/// Returns true if the selector is empty (pass-through) or all pairs match.
-/// Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
+/// Test whether a JSON object matches a field selector string (`key=value,...` or `key!=value,...`).
+/// Supports `metadata.name`, `metadata.namespace` (equality only), and `spec.nodeName`
+/// (equality and inequality). Returns true if the selector is empty (pass-through) or all
+/// terms match. Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
 pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &str) -> bool {
     if selector.is_empty() {
         return true;
@@ -297,9 +297,20 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
         if part.is_empty() {
             continue;
         }
-        if let Some(eq_pos) = part.find('=') {
-            let field = part[..eq_pos].trim();
-            let value = part[eq_pos + 1..].trim();
+        // Check for inequality (`!=`) before equality (`=`) to avoid misparse.
+        if let Some((field, value)) = part.split_once("!=") {
+            let field = field.trim();
+            let value = value.trim();
+            if field == "spec.nodeName" {
+                let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
+                if node_name == value {
+                    return false;
+                }
+            }
+            // Unknown fields: ignore (conservative).
+        } else if let Some((field, value)) = part.split_once('=') {
+            let field = field.trim();
+            let value = value.trim();
             match field {
                 "metadata.name" => {
                     let name = obj["metadata"]["name"].as_str().unwrap_or("");
@@ -310,6 +321,12 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
                 "metadata.namespace" => {
                     let ns = obj["metadata"]["namespace"].as_str().unwrap_or("");
                     if ns != value {
+                        return false;
+                    }
+                }
+                "spec.nodeName" => {
+                    let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
+                    if node_name != value {
                         return false;
                     }
                 }
@@ -4194,10 +4211,41 @@ mod tests {
     #[test]
     fn field_selector_unknown_field_is_ignored() {
         let obj = serde_json::json!({ "metadata": { "name": "x" }, "spec": { "nodeName": "n1" } });
-        // spec.nodeName is not supported in object_matches_field_selector; must pass through.
+        // A truly unknown field must pass through — don't drop events we can't evaluate.
+        assert!(
+            object_matches_field_selector(&obj, "status.phase=Running"),
+            "unknown field selectors must be ignored (pass-through), not drop events"
+        );
+    }
+
+    /// spec.nodeName equality must filter to only pods on the matching node.
+    /// This is used by kubelet watches; without it, every kubelet receives every pod.
+    #[test]
+    fn field_selector_spec_node_name_eq_matches_correct_node() {
+        let obj =
+            serde_json::json!({ "metadata": { "name": "p" }, "spec": { "nodeName": "worker-1" } });
         assert!(
             object_matches_field_selector(&obj, "spec.nodeName=worker-1"),
-            "unknown field selectors must be ignored (pass-through), not drop events"
+            "spec.nodeName=worker-1 must match a pod on worker-1"
+        );
+        assert!(
+            !object_matches_field_selector(&obj, "spec.nodeName=worker-2"),
+            "spec.nodeName=worker-2 must NOT match a pod on worker-1"
+        );
+    }
+
+    /// spec.nodeName inequality must exclude pods on the specified node.
+    #[test]
+    fn field_selector_spec_node_name_ne_excludes_matching_node() {
+        let obj =
+            serde_json::json!({ "metadata": { "name": "p" }, "spec": { "nodeName": "worker-1" } });
+        assert!(
+            !object_matches_field_selector(&obj, "spec.nodeName!=worker-1"),
+            "spec.nodeName!=worker-1 must exclude a pod on worker-1"
+        );
+        assert!(
+            object_matches_field_selector(&obj, "spec.nodeName!=worker-2"),
+            "spec.nodeName!=worker-2 must pass through a pod on worker-1"
         );
     }
 
