@@ -17,9 +17,14 @@ use crate::Args;
 ///
 /// Using std::fs::write() leaves the file world-readable by default (0o644
 /// or whatever the process umask allows). Private keys must be owner-only.
-fn write_private_key(path: std::path::PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// The path is validated against traversal (`..'` components) before opening,
+/// even when the caller has already validated it at the CLI boundary.
+fn write_private_key(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
+    let path = validate_cli_path(path.as_ref())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -87,7 +92,7 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
         .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
 
     write_private_key(
-        validate_cli_path(std::path::Path::new(sa_key_path))?.to_path_buf(),
+        validate_cli_path(std::path::Path::new(sa_key_path))?,
         private_pem.as_bytes(),
     )?;
     std::fs::write(
@@ -203,7 +208,7 @@ fn load_or_generate_ca(
 
     // Persist: key as PEM with 0o600 (owner-only), cert as DER with default perms.
     write_private_key(
-        validate_cli_path(std::path::Path::new(ca_key_path))?.to_path_buf(),
+        validate_cli_path(std::path::Path::new(ca_key_path))?,
         ca_key.serialize_pem().as_bytes(),
     )
     .map_err(|e| anyhow::anyhow!("write CA key {ca_key_path}: {e}"))?;
