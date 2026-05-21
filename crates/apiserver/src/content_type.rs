@@ -79,6 +79,7 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let wants_proto = prefer_proto(req.headers());
+        let method = req.method().clone();
         let uri = req.uri().to_string();
         let accept = req
             .headers()
@@ -96,6 +97,24 @@ where
                 tracing::debug!(uri = %uri, accept = %accept, "skip: no proto accept");
                 return Ok(resp);
             }
+
+            // Only re-encode GET responses.
+            //
+            // For write operations (POST/PUT/PATCH), client-go's protobuf decoder
+            // does not reliably honour the contentType=application/json field inside
+            // the Unknown envelope: it may attempt to decode the raw JSON bytes as a
+            // typed proto message, producing "proto: illegal wireType 6" (ASCII 'n'
+            // from "name" field is interpreted as a proto tag with wire type 6).
+            //
+            // The Accept header includes "application/json" as a fallback, so the
+            // server is permitted to respond with JSON for these methods. Kubelet
+            // smoke tests pass with this change because they use GET for status
+            // reads and kubelet's PUT path also handles JSON responses correctly.
+            if method != axum::http::Method::GET {
+                tracing::debug!(uri = %uri, method = %method, "skip proto re-encode: non-GET method");
+                return Ok(resp);
+            }
+
             tracing::info!(uri = %uri, accept = %accept, status = resp.status().as_u16(), "wants proto");
 
             // Only re-encode successful (2xx) responses.
@@ -545,6 +564,107 @@ mod tests {
         assert_eq!(
             envelope.content_type, "application/json",
             "contentType field must be 'application/json'"
+        );
+    }
+
+    /// POST/PUT/PATCH responses must NOT be re-encoded as proto even when the client sends
+    /// Accept: application/vnd.kubernetes.protobuf.
+    ///
+    /// This is the primary regression fix for `kubectl create namespace smoke-test` failing with
+    /// "proto: illegal wireType 6" in CI. When kubectl sends POST /api/v1/namespaces with
+    /// Accept: protobuf and gets back a proto Unknown envelope with contentType=application/json,
+    /// client-go's protobuf decoder does not reliably honour the contentType field: it may try to
+    /// decode the raw JSON bytes as a typed proto message. The byte 'n' (0x6E) from "name" in
+    /// the JSON is read as a proto tag with wire type 6, producing the illegal wireType error.
+    ///
+    /// Since the Accept header includes "application/json" as a fallback, the server is allowed
+    /// to respond with JSON for write operations. kubectl will use its JSON decoder, which succeeds.
+    #[tokio::test]
+    async fn post_response_not_re_encoded_as_proto() {
+        let namespace_json =
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"smoke-test"}}"#;
+        let svc = FixedService {
+            status: StatusCode::CREATED,
+            content_type: "application/json",
+            body: namespace_json,
+        };
+        let mut layer_svc = ContentTypeLayer.layer(svc);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/namespaces")
+            .header(
+                "accept",
+                "application/vnd.kubernetes.protobuf, application/json",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = layer_svc.call(req).await.unwrap();
+
+        // Content-Type must remain application/json — POST must NOT be re-encoded as proto.
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            ct, "application/json",
+            "POST response must not be re-encoded as proto even with proto Accept header; \
+             client-go ignores contentType=application/json inside Unknown envelope for write ops"
+        );
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !resp_body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "POST response body must not start with k8s proto magic"
+        );
+        assert_eq!(
+            resp_body.as_ref(),
+            namespace_json.as_bytes(),
+            "POST response body must be the original JSON unchanged"
+        );
+    }
+
+    /// PUT responses must NOT be re-encoded as proto (same reason as POST).
+    #[tokio::test]
+    async fn put_response_not_re_encoded_as_proto() {
+        let svc = FixedService {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: SAMPLE_JSON,
+        };
+        let mut layer_svc = ContentTypeLayer.layer(svc);
+
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/nodes/my-node")
+            .header(
+                "accept",
+                "application/vnd.kubernetes.protobuf, application/json",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = layer_svc.call(req).await.unwrap();
+
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "application/json", "PUT response must remain JSON");
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !resp_body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "PUT response body must not start with k8s proto magic"
         );
     }
 
