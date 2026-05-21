@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(SqliteStore::new(&args.db)?);
     seed_namespaces(&store).await?;
     seed_rbac(&store).await?;
+    seed_services(&store).await?;
 
     // 4. Generate TLS certs.
     let tls_material = generate_tls(&args)?;
@@ -435,6 +436,68 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    // default/kubernetes — reaches the API server from inside pods via
+    // in-cluster DNS (kubernetes.default.svc.cluster.local:443 → 10.96.0.1).
+    let k8s_key = keys::object_key("services", "default", "kubernetes");
+    let k8s_body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "kubernetes",
+            "namespace": "default",
+            "uid": "00000000-0000-0000-0000-000000000020",
+            "creationTimestamp": "2024-01-01T00:00:00Z",
+            "labels": { "component": "apiserver", "provider": "kubernetes" }
+        },
+        "spec": {
+            "clusterIP": "10.96.0.1",
+            "ports": [{ "name": "https", "port": 443, "targetPort": 6443, "protocol": "TCP" }],
+            "sessionAffinity": "None",
+            "type": "ClusterIP"
+        }
+    });
+    match store.put(&k8s_key, Bytes::from(k8s_body.to_string()), Some(0)).await {
+        Ok(_) => tracing::info!("seeded Service: default/kubernetes"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(anyhow::anyhow!("seed Service default/kubernetes: {e}")),
+    }
+
+    // kube-system/kube-dns — DNS resolver; kubelet advertises 10.96.0.10 as
+    // the nameserver in /etc/resolv.conf inside every pod.
+    let dns_key = keys::object_key("services", "kube-system", "kube-dns");
+    let dns_body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "kube-dns",
+            "namespace": "kube-system",
+            "uid": "00000000-0000-0000-0000-000000000021",
+            "creationTimestamp": "2024-01-01T00:00:00Z",
+            "labels": { "k8s-app": "kube-dns", "kubernetes.io/cluster-service": "true", "kubernetes.io/name": "CoreDNS" }
+        },
+        "spec": {
+            "clusterIP": "10.96.0.10",
+            "ports": [
+                { "name": "dns", "port": 53, "targetPort": 53, "protocol": "UDP" },
+                { "name": "dns-tcp", "port": 53, "targetPort": 53, "protocol": "TCP" }
+            ],
+            "sessionAffinity": "None",
+            "type": "ClusterIP"
+        }
+    });
+    match store.put(&dns_key, Bytes::from(dns_body.to_string()), Some(0)).await {
+        Ok(_) => tracing::info!("seeded Service: kube-system/kube-dns"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(anyhow::anyhow!("seed Service kube-system/kube-dns: {e}")),
+    }
+
+    Ok(())
+}
+
 async fn serve_tls(
     listener: TcpListener,
     app: Router,
@@ -594,5 +657,71 @@ mod tests {
         let store = make_store();
         seed_rbac(&store).await.expect("first seed must not fail");
         seed_rbac(&store).await.expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn seed_services_creates_kubernetes_and_kube_dns() {
+        // Both Services are required for in-cluster communication:
+        //   - default/kubernetes: pods reach the API server via kubernetes.default.svc.cluster.local
+        //   - kube-system/kube-dns: kubelet advertises 10.96.0.10 as the nameserver in /etc/resolv.conf
+        // Without them, any in-pod API call or DNS lookup fails.
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces must be seeded first");
+        seed_services(&store).await.expect("seed must not fail");
+
+        // Verify default/kubernetes Service.
+        let k8s_key = keys::object_key("services", "default", "kubernetes");
+        let k8s_obj = store.get(&k8s_key).await.expect("get must not fail");
+        assert!(k8s_obj.is_some(), "Service default/kubernetes must exist after seeding");
+        let k8s: serde_json::Value =
+            serde_json::from_slice(&k8s_obj.unwrap().value).expect("valid json");
+        assert_eq!(k8s["kind"].as_str(), Some("Service"));
+        assert_eq!(k8s["metadata"]["name"].as_str(), Some("kubernetes"));
+        assert_eq!(k8s["metadata"]["namespace"].as_str(), Some("default"));
+        assert_eq!(k8s["spec"]["clusterIP"].as_str(), Some("10.96.0.1"));
+        let k8s_ports = k8s["spec"]["ports"].as_array().expect("ports must be an array");
+        assert_eq!(k8s_ports.len(), 1, "kubernetes Service must have exactly one port");
+        assert_eq!(k8s_ports[0]["port"].as_u64(), Some(443));
+        assert_eq!(k8s_ports[0]["targetPort"].as_u64(), Some(6443));
+        assert_eq!(k8s_ports[0]["protocol"].as_str(), Some("TCP"));
+
+        // Verify kube-system/kube-dns Service.
+        let dns_key = keys::object_key("services", "kube-system", "kube-dns");
+        let dns_obj = store.get(&dns_key).await.expect("get must not fail");
+        assert!(dns_obj.is_some(), "Service kube-system/kube-dns must exist after seeding");
+        let dns: serde_json::Value =
+            serde_json::from_slice(&dns_obj.unwrap().value).expect("valid json");
+        assert_eq!(dns["kind"].as_str(), Some("Service"));
+        assert_eq!(dns["metadata"]["name"].as_str(), Some("kube-dns"));
+        assert_eq!(dns["metadata"]["namespace"].as_str(), Some("kube-system"));
+        assert_eq!(dns["spec"]["clusterIP"].as_str(), Some("10.96.0.10"));
+        let dns_ports = dns["spec"]["ports"].as_array().expect("ports must be an array");
+        assert_eq!(dns_ports.len(), 2, "kube-dns Service must have two ports (UDP and TCP)");
+        let protocols: Vec<&str> = dns_ports.iter()
+            .filter_map(|p| p["protocol"].as_str())
+            .collect();
+        assert!(protocols.contains(&"UDP"), "kube-dns must have a UDP port");
+        assert!(protocols.contains(&"TCP"), "kube-dns must have a TCP port");
+        for port in dns_ports {
+            assert_eq!(port["port"].as_u64(), Some(53), "kube-dns port number must be 53");
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_services_is_idempotent() {
+        // A second call must not error — CAS rv=0 returns AlreadyExists which is silently ignored.
+        // This matches the startup guarantee: u7s may restart against an existing database.
+        let store = make_store();
+        seed_namespaces(&store).await.expect("namespaces must be seeded first");
+        seed_services(&store).await.expect("first seed must not fail");
+        seed_services(&store).await.expect("second seed must not fail");
+
+        // Data must still be correct after two calls.
+        let k8s_key = keys::object_key("services", "default", "kubernetes");
+        let k8s_obj = store.get(&k8s_key).await.expect("get must not fail");
+        assert!(k8s_obj.is_some(), "Service default/kubernetes must still exist");
+        let dns_key = keys::object_key("services", "kube-system", "kube-dns");
+        let dns_obj = store.get(&dns_key).await.expect("get must not fail");
+        assert!(dns_obj.is_some(), "Service kube-system/kube-dns must still exist");
     }
 }
