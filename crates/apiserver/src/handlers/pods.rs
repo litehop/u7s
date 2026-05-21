@@ -696,19 +696,31 @@ fn pod_apply_json_patch(
             Status::unprocessable_entity("each JSON patch operation must have an 'op' field".into())
         })?;
         let path = op["path"].as_str().ok_or_else(|| {
-            Status::unprocessable_entity("each JSON patch operation must have a 'path' field".into())
+            Status::unprocessable_entity(
+                "each JSON patch operation must have a 'path' field".into(),
+            )
         })?;
         match op_str {
             "add" => {
-                let value = op.get("value").ok_or_else(|| {
-                    Status::unprocessable_entity("'add' operation requires a 'value' field".into())
-                })?.clone();
+                let value = op
+                    .get("value")
+                    .ok_or_else(|| {
+                        Status::unprocessable_entity(
+                            "'add' operation requires a 'value' field".into(),
+                        )
+                    })?
+                    .clone();
                 pod_json_patch_add(obj, path, value)?;
             }
             "replace" => {
-                let value = op.get("value").ok_or_else(|| {
-                    Status::unprocessable_entity("'replace' operation requires a 'value' field".into())
-                })?.clone();
+                let value = op
+                    .get("value")
+                    .ok_or_else(|| {
+                        Status::unprocessable_entity(
+                            "'replace' operation requires a 'value' field".into(),
+                        )
+                    })?
+                    .clone();
                 pod_json_patch_set(obj, path, value)?;
             }
             "remove" => {
@@ -740,7 +752,9 @@ fn pod_json_navigate_mut<'a>(
     segments: &[String],
 ) -> Result<(&'a mut serde_json::Value, String), crate::status::StatusError> {
     if segments.is_empty() {
-        return Err(Status::unprocessable_entity("cannot operate on root document".into()));
+        return Err(Status::unprocessable_entity(
+            "cannot operate on root document".into(),
+        ));
     }
     let (parents, last) = segments.split_at(segments.len() - 1);
     let mut cur = obj;
@@ -755,14 +769,14 @@ fn pod_json_navigate_one<'a>(
     seg: &str,
 ) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
     match node {
-        serde_json::Value::Object(map) => {
-            map.get_mut(seg).ok_or_else(|| {
-                Status::unprocessable_entity(format!("path segment '{seg}' not found"))
-            })
-        }
+        serde_json::Value::Object(map) => map
+            .get_mut(seg)
+            .ok_or_else(|| Status::unprocessable_entity(format!("path segment '{seg}' not found"))),
         serde_json::Value::Array(arr) => {
             let idx: usize = seg.parse().map_err(|_| {
-                Status::unprocessable_entity(format!("path segment '{seg}' is not a valid array index"))
+                Status::unprocessable_entity(format!(
+                    "path segment '{seg}' is not a valid array index"
+                ))
             })?;
             arr.get_mut(idx).ok_or_else(|| {
                 Status::unprocessable_entity(format!("array index {idx} out of bounds"))
@@ -780,7 +794,8 @@ fn pod_json_navigate_one_or_create<'a>(
 ) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
     match node {
         serde_json::Value::Object(map) => {
-            map.entry(seg).or_insert_with(|| serde_json::Value::Object(Default::default()));
+            map.entry(seg)
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
             Ok(map.get_mut(seg).unwrap())
         }
         _ => Err(Status::unprocessable_entity(format!(
@@ -806,7 +821,9 @@ fn pod_json_patch_add(
     }
     let key = &last[0];
     match cur {
-        serde_json::Value::Object(map) => { map.insert(key.clone(), value); }
+        serde_json::Value::Object(map) => {
+            map.insert(key.clone(), value);
+        }
         serde_json::Value::Array(arr) => {
             if key == "-" {
                 arr.push(value);
@@ -818,12 +835,17 @@ fn pod_json_patch_add(
                     arr.insert(idx, value);
                 } else {
                     return Err(Status::unprocessable_entity(format!(
-                        "array index {idx} out of bounds (len {})", arr.len()
+                        "array index {idx} out of bounds (len {})",
+                        arr.len()
                     )));
                 }
             }
         }
-        _ => return Err(Status::unprocessable_entity("cannot add value to non-object/array".into())),
+        _ => {
+            return Err(Status::unprocessable_entity(
+                "cannot add value to non-object/array".into(),
+            ))
+        }
     }
     Ok(())
 }
@@ -840,7 +862,9 @@ fn pod_json_patch_set(
     }
     let (parent, key) = pod_json_navigate_mut(obj, &segs)?;
     match parent {
-        serde_json::Value::Object(map) => { map.insert(key, value); }
+        serde_json::Value::Object(map) => {
+            map.insert(key, value);
+        }
         serde_json::Value::Array(arr) => {
             if key == "-" {
                 arr.push(value);
@@ -852,12 +876,17 @@ fn pod_json_patch_set(
                     arr.insert(idx, value);
                 } else {
                     return Err(Status::unprocessable_entity(format!(
-                        "array index {idx} out of bounds (len {})", arr.len()
+                        "array index {idx} out of bounds (len {})",
+                        arr.len()
                     )));
                 }
             }
         }
-        _ => return Err(Status::unprocessable_entity("cannot set value on non-object/array".into())),
+        _ => {
+            return Err(Status::unprocessable_entity(
+                "cannot set value on non-object/array".into(),
+            ))
+        }
     }
     Ok(())
 }
@@ -886,7 +915,11 @@ fn pod_json_patch_remove(
                 )));
             }
         }
-        _ => return Err(Status::unprocessable_entity("cannot remove from non-object/array".into())),
+        _ => {
+            return Err(Status::unprocessable_entity(
+                "cannot remove from non-object/array".into(),
+            ))
+        }
     }
     Ok(())
 }
@@ -1597,7 +1630,7 @@ mod status_tests {
 #[cfg(test)]
 mod patch_type_tests {
     use super::*;
-    use axum::http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
+    use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
 
     fn headers_with_ct(ct: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1659,7 +1692,10 @@ mod patch_type_tests {
         assert!(result.is_err(), "unknown content-type must be rejected");
         // Verify it produces a 415 response.
         let resp: axum::response::Response = result.unwrap_err().into_response();
-        assert_eq!(resp.status(), axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
     }
 
     /// pod_apply_json_patch: replace operation updates a field in the pod object.
@@ -1678,8 +1714,7 @@ mod patch_type_tests {
             "replace op must succeed"
         );
         assert_eq!(
-            pod["spec"]["nodeName"],
-            "worker-2",
+            pod["spec"]["nodeName"], "worker-2",
             "replace op must update spec.nodeName"
         );
     }

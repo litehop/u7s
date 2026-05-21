@@ -1,6 +1,31 @@
+use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
+use u7s_store::StoreError;
 
 use crate::{proto, status::Status};
+
+/// Map a `StoreError` to the corresponding HTTP `StatusCode`.
+///
+/// Handlers that need a richer error message (including resource name/kind) call
+/// the local `store_err(err, name, kind)` wrapper in their own module.  This
+/// function covers the status-code portion and is shared via `util`.
+pub(crate) fn store_err_to_status(e: &StoreError) -> StatusCode {
+    match e {
+        StoreError::NotFound { .. } => StatusCode::NOT_FOUND,
+        StoreError::AlreadyExists { .. } => StatusCode::CONFLICT,
+        StoreError::RevisionMismatch { .. } => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Extract the `Content-Type` header value as a `&str`.
+/// Returns `""` when the header is absent or not valid UTF-8.
+pub(crate) fn content_type(headers: &HeaderMap) -> &str {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
 
 /// If the request body uses the Kubernetes protobuf encoding, decode it and return the embedded
 /// raw payload as JSON bytes. Otherwise return the bytes unchanged.
@@ -114,6 +139,52 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- store_err_to_status --
+
+    /// NotFound → 404. Any handler mapping StoreError to an HTTP status must use this
+    /// so the code is in one place and cannot drift between handlers.
+    #[test]
+    fn store_err_to_status_not_found_is_404() {
+        let e = StoreError::NotFound { key: "k".into() };
+        assert_eq!(store_err_to_status(&e), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn store_err_to_status_already_exists_is_409() {
+        let e = StoreError::AlreadyExists { key: "k".into() };
+        assert_eq!(store_err_to_status(&e), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn store_err_to_status_revision_mismatch_is_409() {
+        let e = StoreError::RevisionMismatch {
+            expected: 1,
+            current: 2,
+        };
+        assert_eq!(store_err_to_status(&e), StatusCode::CONFLICT);
+    }
+
+    // -- content_type --
+
+    /// content_type returns the header value as a &str when present.
+    /// All write handlers call this; if the header is missing an empty str must be returned
+    /// (not a panic) so extract_body and detect_patch_type get a safe default.
+    #[test]
+    fn content_type_present() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        assert_eq!(content_type(&h), "application/json");
+    }
+
+    #[test]
+    fn content_type_absent_returns_empty() {
+        let h = HeaderMap::new();
+        assert_eq!(content_type(&h), "");
+    }
 
     /// secs_to_rfc3339 must produce correct date for a known epoch offset.
     /// 2024-01-01T00:00:00Z = 1704067200 seconds since epoch.
