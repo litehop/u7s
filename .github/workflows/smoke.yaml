@@ -241,10 +241,37 @@ jobs:
           echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/cri-o.list
           sudo apt-get update -qq
-          sudo apt-get install -y cri-o crun
-          sudo mkdir -p /etc/crio/crio.conf.d
-          printf '[crio.runtime]\ndefault_runtime = "crun"\n[crio.runtime.runtimes.crun]\nruntime_path = "/usr/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
-            | sudo tee /etc/crio/crio.conf.d/10-crun.conf
+          sudo apt-get install -y cri-o
+          # CRI-O ships its own crun binary that is ABI-compatible with the OCI spec
+          # version it generates (1.2.x for CRI-O 1.34+). The Ubuntu system crun
+          # (1.4.5 on 22.04) only accepts OCI spec 1.0/1.1 and returns
+          # "unknown version specified" when CRI-O passes a 1.2 spec — do NOT
+          # install system crun or override CRI-O's bundled runtime path.
+          # Install a minimal bridge CNI config so CRI-O can find at least one
+          # conflist at startup (required even for hostNetwork pods).
+          # Use cniVersion 0.4.0 and only bridge+host-local to avoid depending on
+          # portmap/firewall/tuning which are not always in /opt/cni/bin.
+          sudo mkdir -p /etc/cni/net.d
+          sudo tee /etc/cni/net.d/10-bridge.conflist <<'CNIEOF'
+          {
+            "cniVersion": "0.4.0",
+            "name": "bridge",
+            "plugins": [
+              {
+                "type": "bridge",
+                "bridge": "cni0",
+                "isGateway": true,
+                "ipMasq": true,
+                "hairpinMode": true,
+                "ipam": {
+                  "type": "host-local",
+                  "ranges": [[{"subnet": "10.88.0.0/16"}]],
+                  "routes": [{"dst": "0.0.0.0/0"}]
+                }
+              }
+            ]
+          }
+          CNIEOF
           sudo systemctl enable --now crio
 
       - name: Install kubelet and kubectl ${{ matrix.k8s }}
@@ -258,6 +285,9 @@ jobs:
           sudo apt-get install -y --allow-downgrades "kubelet=${{ matrix.k8s }}-*" "kubectl=${{ matrix.k8s }}-*"
           sudo apt-mark hold kubelet kubectl
           sudo systemctl disable --now kubelet
+          # Install containernetworking-plugins after kubelet; use dpkg force-overwrite
+          # to handle file conflicts with the kubernetes-cni package.
+          sudo apt-get install -y -o Dpkg::Options::="--force-overwrite" containernetworking-plugins
 
       - name: Build release binary
         run: cargo build --release -p u7s-apiserver
@@ -325,6 +355,7 @@ jobs:
             --config=/etc/kubelet-config.yaml \
             --kubeconfig=/etc/kubelet-kubeconfig \
             --hostname-override=ci-node \
+            --logging-format=text \
             --v=2 \
             >"$TMPDIR/kubelet.log" 2>&1 &
           echo "KUBELET_PID=$!" >> "$GITHUB_ENV"
@@ -360,6 +391,65 @@ jobs:
             cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
             exit 1
           fi
+
+      - name: Pod lifecycle (schedule → Succeeded)
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          # Create a one-shot pod bound to ci-node via nodeName.
+          # hostNetwork+dnsPolicy:None avoids ClusterDNS errors (kubelet warns when
+          # no DNS is configured; dnsPolicy:None suppresses that path entirely).
+          # restartPolicy:Never + busybox exit 0 means the pod reaches Succeeded
+          # without a scheduler or any other infrastructure.
+          kubectl apply --validate=false -f - <<'EOF'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: smoke-pod
+            namespace: default
+          spec:
+            nodeName: ci-node
+            hostNetwork: true
+            dnsPolicy: None
+            dnsConfig: {}
+            restartPolicy: Never
+            containers:
+              - name: hello
+                image: busybox:1.36
+                command: ["sh", "-c", "echo hello"]
+          EOF
+
+          # Wait up to 120s for the pod to reach Succeeded.
+          # ContainerCreating → Running → Succeeded is the expected path.
+          SUCCEEDED=0
+          for i in $(seq 1 120); do
+            PHASE=$(kubectl get pod smoke-pod -n default -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Succeeded" ]; then
+              SUCCEEDED=1
+              break
+            fi
+            if [ "$PHASE" = "Failed" ]; then
+              echo "ERROR: pod entered Failed phase"
+              kubectl describe pod smoke-pod -n default
+              echo "--- kubelet log ---"
+              cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "$SUCCEEDED" -eq 0 ]; then
+            PHASE=$(kubectl get pod smoke-pod -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "unknown")
+            echo "ERROR: pod did not reach Succeeded within 120s (current phase: $PHASE)"
+            kubectl describe pod smoke-pod -n default
+            echo "--- kubelet log (last 100 lines) ---"
+            tail -100 "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+            echo "--- server log (last 50 lines) ---"
+            tail -50 "${{ env.SMOKE_TMPDIR }}/server.log"
+            exit 1
+          fi
+          echo "Pod reached Succeeded:"
+          kubectl get pod smoke-pod -n default
 
       - name: Stop server and kubelet
         if: always()

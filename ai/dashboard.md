@@ -1,26 +1,32 @@
 # Dashboard
-2026-05-21 06:58 UTC
-Resume: open Claude Code in /Users/balint.erdos/u7s, say "I am the Mayor now"
-Open beads: 5 (3 in_progress, 2 open)
+2026-05-21 11:15 UTC
+`bd prime` in a fresh Claude Code session (or say "I am the Mayor now")
+Open beads: 5
 
 ## What needs the operator now
-- **PRs #97 and #103** both still failing kubelet smoke (pod stuck ContainerCreating, Events: <none>). Worker dispatched to investigate root cause — may surface a decision if the fix is architectural.
-- **Renovate PRs #109 (rcgen) and #110 (rusqlite)** are failing — not yet dispatched. Will handle after current batch.
+
+- **CSR bootstrap decision (mayor-z1bu, P3):** Option B (k3s-style direct signing, ~5–10 MB, simple) vs Option C (upstream CSR API compatible, ~10–20 MB). Worker cannot be dispatched until you decide.
+- **Remote orphan branches** — 4 worker branches on origin cannot be deleted due to branch protection rules: `worker/agent-a527be169434048f8`, `worker/agent-a9860d883980034a1`, `worker/agent-a30178a0715196ad9`, `worker/ci-node-ready-mayor-2dc`. All are from merged/closed PRs. Operator needs to delete these manually or relax the protection rule for `worker/*`.
+- **Renovate PRs #109 (rcgen) and #110 (rusqlite)** — still failing CI, need a rebase onto main to pick up smoke test fixes.
 
 ## Forward-looking
-3 workers running in parallel:
-1. **CodeQL fix** (mayor-47hf) — `auth.rs:66` split inline to locals; `tls.rs` test suppressions. Pure cleanup.
-2. **Kubelet smoke fix** (mayor-l90x) — pod stuck ContainerCreating. Investigating missing PATCH /pods/{name}/status endpoint or strategic-merge-patch gap. Will use CI artifact logs + lima-node locally.
-3. **jsonwebtoken v10 compat** (mayor-zxu4) — 5 test panics in auth.rs from missing CryptoProvider init. Enables Renovate PR #117 to merge.
 
-After these land: revisit Renovate PRs #109 and #110 (rcgen and rusqlite). Then sonobuoy gap audit (mayor-2ni) and protobuf bindings (mayor-pgdr).
+All P2 beads are dispatchable now. Next dispatch round:
+- **mayor-22n6** — replace system:masters hardcoded bypass with seeded ClusterRoleBinding
+- **mayor-8c89** — enforce coverage threshold as hard CI gate
+- **mayor-pudl** — verify SA token projection end-to-end
+- **mayor-2ni** (P3) — sonobuoy conformance audit (smoke test now green, this is unblocked)
+- Renovate PRs #109/#110 rebase workers
 
 ## Recent progress
-- PR #121 (schemars v1) merged ✓
-- PR #122 (thiserror v2) merged ✓
-- PR #120 (CSINode round-trip test) merged ✓
-- PRs #97 and #103 open — kubelet smoke failing on new pod lifecycle assertion step
-- Previous session: ~120 PRs total merged; security sprint, CI hardening, feature work complete
+
+Smoke test is now fully green across all 3 kubelet matrix versions (1.34.8, 1.35.5, 1.36.1). Two root causes fixed:
+1. CRI-O runtime: forced `crun` v1.4.5 rejected OCI spec 1.2.x from CRI-O 1.34+ — removed the pin, simplified CNI to cniVersion 0.4.0 bridge-only.
+2. `spec.enableServiceLinks` defaulting — kubelet raised `CreateContainerConfigError` when field absent — fixed with `apply_pod_create_defaults()` in `pods.rs`.
+
+PRs merged this session: **#125** (CNI + pod lifecycle test), **#127** (proto decoders + smoke fixes), **#126** (system:nodes RBAC), **#124** (jsonwebtoken), **#123** (CodeQL). ~10 PRs total today, ~12 beads closed.
+
+Hygiene: 3 idle local worktrees removed, stale tracking refs pruned.
 
 ## Stance
-Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Mayor merges on green CI; flags security/API/architecture PRs for operator review first.
+Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; flag security/API/architecture PRs for operator review first.

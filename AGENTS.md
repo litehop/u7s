@@ -47,6 +47,9 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+**Prefer native file tools over shell equivalents:**
+Use your agent's built-in file read/write/edit operations instead of `cat`, `sed`, `awk`, `echo >`, or `find` for file I/O. Reserve shell commands for git, test runners, builds, and installs.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker
 
