@@ -52,3 +52,107 @@ pub fn group_list_prefix(group: &str, plural: &str, namespace: Option<&str>) -> 
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // object_key must produce the canonical namespace-scoped etcd path
+    #[test]
+    fn object_key_format() {
+        assert_eq!(
+            object_key("pods", "default", "my-pod"),
+            "/registry/pods/default/my-pod"
+        );
+    }
+
+    // list_prefix must end with a slash so etcd prefix scans don't bleed into sibling namespaces
+    #[test]
+    fn list_prefix_ends_with_slash() {
+        assert_eq!(list_prefix("pods", "default"), "/registry/pods/default/");
+    }
+
+    // cluster_object_key must omit the namespace segment
+    #[test]
+    fn cluster_object_key_format() {
+        assert_eq!(
+            cluster_object_key("nodes", "my-node"),
+            "/registry/nodes/my-node"
+        );
+    }
+
+    // cluster_list_prefix must end with a slash for prefix scans
+    #[test]
+    fn cluster_list_prefix_ends_with_slash() {
+        assert_eq!(cluster_list_prefix("nodes"), "/registry/nodes/");
+    }
+
+    // group_object_key with empty group + namespace must fall back to the core object_key layout
+    #[test]
+    fn group_object_key_core_namespaced() {
+        assert_eq!(
+            group_object_key("", "pods", Some("default"), "my-pod"),
+            "/registry/pods/default/my-pod"
+        );
+    }
+
+    // group_object_key with empty group + no namespace must fall back to cluster_object_key layout
+    #[test]
+    fn group_object_key_core_cluster() {
+        assert_eq!(
+            group_object_key("", "nodes", None, "my-node"),
+            "/registry/nodes/my-node"
+        );
+    }
+
+    // group_object_key with non-core group + namespace must insert the group prefix
+    #[test]
+    fn group_object_key_noncore_namespaced() {
+        assert_eq!(
+            group_object_key("apps", "deployments", Some("default"), "my-deploy"),
+            "/registry/apps/deployments/default/my-deploy"
+        );
+    }
+
+    // group_object_key with non-core group + no namespace must produce a cluster-scoped path
+    #[test]
+    fn group_object_key_noncore_cluster() {
+        assert_eq!(
+            group_object_key("rbac.authorization.k8s.io", "clusterroles", None, "my-role"),
+            "/registry/rbac.authorization.k8s.io/clusterroles/my-role"
+        );
+    }
+
+    // group_list_prefix with empty group + namespace must fall back to core list_prefix layout
+    #[test]
+    fn group_list_prefix_core_namespaced() {
+        assert_eq!(
+            group_list_prefix("", "pods", Some("default")),
+            "/registry/pods/default/"
+        );
+    }
+
+    // group_list_prefix with empty group + no namespace must fall back to cluster_list_prefix layout
+    #[test]
+    fn group_list_prefix_core_cluster() {
+        assert_eq!(group_list_prefix("", "nodes", None), "/registry/nodes/");
+    }
+
+    // group_list_prefix with non-core group + namespace must insert group prefix and end with slash
+    #[test]
+    fn group_list_prefix_noncore_namespaced() {
+        assert_eq!(
+            group_list_prefix("apps", "deployments", Some("default")),
+            "/registry/apps/deployments/default/"
+        );
+    }
+
+    // group_list_prefix with non-core group + no namespace must produce cluster-scoped prefix
+    #[test]
+    fn group_list_prefix_noncore_cluster() {
+        assert_eq!(
+            group_list_prefix("rbac.authorization.k8s.io", "clusterroles", None),
+            "/registry/rbac.authorization.k8s.io/clusterroles/"
+        );
+    }
+}
