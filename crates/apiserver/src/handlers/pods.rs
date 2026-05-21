@@ -1,5 +1,4 @@
 use axum::{
-    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -7,7 +6,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde::Deserialize;
-use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
+use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
     auth::UserInfo,
@@ -226,6 +225,13 @@ pub async fn list_pods(
     Ok(Json(body).into_response())
 }
 
+/// Thin wrapper: delegate pod watch to `watch_generic`.
+///
+/// Pod-specific field selectors (spec.nodeName =, !=) are handled by
+/// `generic::object_matches_field_selector`, which was extended to support
+/// `spec.nodeName` alongside `metadata.name` / `metadata.namespace`.
+/// The `initial_pods` list is already filtered by the caller (list_pods)
+/// before being passed here, so `watch_generic` emits them as-is.
 #[allow(clippy::too_many_arguments)]
 async fn watch_pods(
     state: AppState,
@@ -237,158 +243,19 @@ async fn watch_pods(
     allow_watch_bookmarks: bool,
     username: String,
 ) -> Result<Response, crate::status::StatusError> {
-    // Enforce per-client watch concurrency limit. Try to acquire a permit from
-    // this user's semaphore. If the semaphore is exhausted (client already has
-    // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
-    let sem = state.watch_limit.semaphore_for(&username);
-    let _watch_permit = sem.try_acquire_owned().map_err(|_| {
-        crate::status::Status::too_many_requests(format!(
-            "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
-            crate::state::MAX_WATCHES_PER_CLIENT
-        ))
-    })?;
-    // _watch_permit is held for the duration of the watch stream and released when
-    // this function returns (RAII drop).
-
-    let event_stream = state
-        .store
-        .watch(&prefix, from_revision)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    // The body stream yields Result<Bytes, BoxError> items.
-    // We transform WatchEvent items into NDJSON chunks.
-    // A periodic bookmark is sent every 60 s if no other events fire.
-    // Max watch duration: 5 minutes per the Kubernetes spec default.
-    let field_selector = field_selector.unwrap_or_default();
-    let chunk_stream = async_stream::stream! {
-        use futures_core::Stream;
-        use std::pin::pin;
-        use tokio::time::{Duration, interval, sleep};
-
-        let mut event_stream = pin!(event_stream);
-        let mut bookmark_tick = interval(Duration::from_secs(60));
-        // Skip the first immediate tick so we don't send a bookmark before any events.
-        bookmark_tick.tick().await;
-
-        let mut max_duration = pin!(sleep(Duration::from_secs(5 * 60)));
-
-        // Track the most recently seen revision for bookmark emission.
-        let mut last_rv: u64 = from_revision;
-
-        // sendInitialEvents: emit existing pods as ADDED, then BOOKMARK.
-        if let Some((pods, list_rv)) = initial_pods {
-            last_rv = last_rv.max(list_rv);
-            for pod in pods {
-                let line = format!(
-                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
-                    serde_json::to_string(&pod).unwrap_or_default()
-                );
-                yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
-            }
-            let bookmark = format!(
-                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
-            );
-            yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
-        }
-
-        loop {
-            tokio::select! {
-                biased;
-
-                maybe_event = {
-                    use std::future::poll_fn;
-                    poll_fn(|cx| {
-                        use std::task::Poll;
-                        match event_stream.as_mut().poll_next(cx) {
-                            Poll::Ready(v) => Poll::Ready(v),
-                            Poll::Pending => Poll::Pending,
-                        }
-                    })
-                } => {
-                    match maybe_event {
-                        None => break, // store closed the stream
-                        Some(event) => {
-                            // Update last_rv from the event before encoding.
-                            match &event {
-                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
-                                    last_rv = last_rv.max(obj.revision);
-                                }
-                                WatchEvent::Deleted { revision, .. } => {
-                                    last_rv = last_rv.max(*revision);
-                                }
-                                WatchEvent::Bookmark { revision } => {
-                                    last_rv = last_rv.max(*revision);
-                                }
-                                WatchEvent::Compacted { .. } => {}
-                            }
-
-                            // Reset bookmark timer on any real event.
-                            bookmark_tick.reset();
-
-                            if let WatchEvent::Compacted { horizon, .. } = &event {
-                                // Use horizon (not last_rv) — clients use this rv to relist;
-                                // last_rv may predate the horizon causing an infinite relist loop.
-                                let error_line = Bytes::from(format!(
-                                    "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}}}\n"
-                                ));
-                                yield Ok::<Bytes, axum::BoxError>(error_line);
-                                break;
-                            }
-
-                            // Apply fieldSelector: for Added/Modified, check spec.nodeName.
-                            // Deleted events lack full pod data; pass them through so the
-                            // kubelet can clean up resources it was already tracking.
-                            let skip = !field_selector.is_empty() && match &event {
-                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
-                                    let pod: serde_json::Value =
-                                        serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
-                                    !pod_matches_field_selector(&pod, &field_selector)
-                                }
-                                _ => false,
-                            };
-
-                            if !skip {
-                                if let Some(chunk) = super::generic::encode_watch_event(&event, "v1", "Pod") {
-                                    yield Ok::<Bytes, axum::BoxError>(chunk);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                _ = bookmark_tick.tick() => {
-                    if allow_watch_bookmarks {
-                        let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                        );
-                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
-                    }
-                }
-
-                _ = &mut max_duration => {
-                    // Max watch duration reached — send a final BOOKMARK and close gracefully.
-                    if allow_watch_bookmarks {
-                        let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                        );
-                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
-                    }
-                    break;
-                }
-            }
-        }
-    };
-
-    let body = Body::from_stream(chunk_stream);
-    let resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .header(axum::http::header::TRANSFER_ENCODING, "chunked")
-        .body(body)
-        .expect("response builder never fails with these headers");
-
-    Ok(resp)
+    super::generic::watch_generic(
+        state,
+        prefix,
+        "v1".into(),
+        "Pod".into(),
+        from_revision,
+        initial_pods,
+        None, // label_selector: pods watch does not filter by label
+        field_selector,
+        allow_watch_bookmarks,
+        username,
+    )
+    .await
 }
 
 pub async fn create_pod(
