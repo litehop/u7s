@@ -279,6 +279,8 @@ pub async fn create_pod(
     obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.as_str().to_owned());
     crate::handlers::generic::stamp_metadata(&mut obj);
 
+    apply_pod_create_defaults(&mut obj.body);
+
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state
         .store
@@ -1592,6 +1594,70 @@ mod patch_type_tests {
         assert!(
             pod["metadata"]["labels"].get("app").is_none(),
             "remove op must delete the key"
+        );
+    }
+}
+
+/// Apply pod creation defaults: set spec.enableServiceLinks=true if absent.
+///
+/// Extracted for testability — the full create_pod handler is async and needs
+/// a live store, so the defaulting logic lives here as a pure function.
+pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
+    if pod["spec"]["enableServiceLinks"].is_null() {
+        pod["spec"]["enableServiceLinks"] = serde_json::Value::Bool(true);
+    }
+}
+
+#[cfg(test)]
+mod create_defaults_tests {
+    use super::*;
+
+    /// create_pod must default spec.enableServiceLinks to true when absent.
+    ///
+    /// The kubelet's kuberuntime_manager requires this field to construct service
+    /// env vars for each container.  Without it the container fails with
+    /// CreateContainerConfigError: "nil pod.spec.enableServiceLinks encountered".
+    /// Real kube-apiserver always sets this field on create.
+    #[test]
+    fn enable_service_links_defaults_to_true_when_absent() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "smoke-pod", "namespace": "default"},
+            "spec": {
+                "nodeName": "ci-node",
+                "containers": [{"name": "hello", "image": "busybox:1.36"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["enableServiceLinks"],
+            serde_json::Value::Bool(true),
+            "enableServiceLinks must be defaulted to true so the kubelet can construct \
+             service env vars; a nil value causes CreateContainerConfigError"
+        );
+    }
+
+    /// create_pod must NOT override an explicit false value for enableServiceLinks.
+    ///
+    /// If the user explicitly disables service link injection, that preference
+    /// must be preserved.
+    #[test]
+    fn enable_service_links_false_is_preserved() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "enableServiceLinks": false,
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["enableServiceLinks"],
+            serde_json::Value::Bool(false),
+            "an explicit enableServiceLinks=false must not be overridden by the default"
         );
     }
 }
