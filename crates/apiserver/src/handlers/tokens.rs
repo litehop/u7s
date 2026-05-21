@@ -281,8 +281,7 @@ mod tests {
 
         let v: serde_json::Value = serde_json::to_value(&claims).unwrap();
         assert_eq!(
-            v["kubernetes.io"]["serviceaccount"]["uid"],
-            "abc-123",
+            v["kubernetes.io"]["serviceaccount"]["uid"], "abc-123",
             "SA UID must be propagated into JWT claims"
         );
     }
