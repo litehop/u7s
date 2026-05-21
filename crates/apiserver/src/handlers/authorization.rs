@@ -371,10 +371,12 @@ mod tests {
 
         // Seed cluster-admin ClusterRole and the system:masters binding (as seed_rbac() does).
         let admin_role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin";
-        let admin_role_val = json!({ "rules": [{ "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }] });
+        let admin_role_val =
+            json!({ "rules": [{ "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }] });
         idx.apply_object(admin_role_key, &admin_role_val);
 
-        let admin_bind_key = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system:masters";
+        let admin_bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system:masters";
         let admin_bind_val = json!({
             "subjects": [{ "kind": "Group", "name": "system:masters" }],
             "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "cluster-admin" }
@@ -523,10 +525,12 @@ mod tests {
 
         // Seed cluster-admin ClusterRole and the system:masters binding.
         let admin_role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin";
-        let admin_role_val = json!({ "rules": [{ "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }] });
+        let admin_role_val =
+            json!({ "rules": [{ "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }] });
         idx.apply_object(admin_role_key, &admin_role_val);
 
-        let admin_bind_key = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system:masters";
+        let admin_bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system:masters";
         let admin_bind_val = json!({
             "subjects": [{ "kind": "Group", "name": "system:masters" }],
             "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "cluster-admin" }

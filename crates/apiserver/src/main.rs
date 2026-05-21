@@ -454,8 +454,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
 
     // ClusterRoleBinding: system:masters — grants cluster-admin to the system:masters group.
     // This replaces the former hardcoded bypass in is_allowed() / user_holds_all_rules().
-    let ca_bind_key =
-        keys::group_object_key(GROUP, "clusterrolebindings", None, "system:masters");
+    let ca_bind_key = keys::group_object_key(GROUP, "clusterrolebindings", None, "system:masters");
     let ca_bind_body = serde_json::json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
@@ -816,7 +815,10 @@ mod tests {
         assert_eq!(ca_role["kind"].as_str(), Some("ClusterRole"));
         assert_eq!(ca_role["metadata"]["name"].as_str(), Some("cluster-admin"));
         let rules = ca_role["rules"].as_array().expect("rules must be an array");
-        assert!(!rules.is_empty(), "cluster-admin must have at least one rule");
+        assert!(
+            !rules.is_empty(),
+            "cluster-admin must have at least one rule"
+        );
         // Verify wildcard access: all rules must grant ["*"] on verbs.
         for rule in rules {
             let verbs = rule["verbs"].as_array().expect("verbs must be an array");
@@ -837,10 +839,7 @@ mod tests {
         let ca_bind: serde_json::Value =
             serde_json::from_slice(&ca_bind_obj.unwrap().value).expect("valid json");
         assert_eq!(ca_bind["kind"].as_str(), Some("ClusterRoleBinding"));
-        assert_eq!(
-            ca_bind["metadata"]["name"].as_str(),
-            Some("system:masters")
-        );
+        assert_eq!(ca_bind["metadata"]["name"].as_str(), Some("system:masters"));
         let subjects = ca_bind["subjects"]
             .as_array()
             .expect("subjects must be an array");
