@@ -378,7 +378,6 @@ mod tests {
 
     /// Return a unique temp directory for a test, creating it on disk.
     /// Uses subsecond nanos + thread ID for uniqueness across parallel tests.
-    #[allow(dead_code)]
     fn test_temp_dir(tag: &str) -> std::path::PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
         let nanos = SystemTime::now()
