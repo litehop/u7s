@@ -1,6 +1,6 @@
 /// u7s-scheduler — minimal scheduler scaffold.
 ///
-/// Watches unscheduled pods (spec.nodeName absent) in the default namespace
+/// Watches unscheduled pods (spec.nodeName absent) cluster-wide
 /// via a long-poll watch on the API server, picks the first available node,
 /// and binds via POST /api/v1/namespaces/:ns/pods/:name/binding.
 ///
@@ -306,6 +306,35 @@ async fn stream_watch_events(
 // Scheduling logic
 // ---------------------------------------------------------------------------
 
+/// Determine whether a watch event represents a pod that needs scheduling.
+///
+/// Returns `Some((namespace, pod_name))` when the event is an ADDED or
+/// MODIFIED pod with an empty `spec.nodeName`; `None` otherwise.
+///
+/// Extracted as a pure function so the decision can be unit-tested without
+/// standing up an API server.
+fn needs_scheduling(event: &Value) -> Option<(String, String)> {
+    let event_type = event["type"].as_str().unwrap_or("");
+    if event_type != "ADDED" && event_type != "MODIFIED" {
+        return None;
+    }
+    let pod_name = event["object"]["metadata"]["name"].as_str().unwrap_or("");
+    if pod_name.is_empty() {
+        return None;
+    }
+    let node_name = &event["object"]["spec"]["nodeName"];
+    let already_scheduled =
+        node_name.is_string() && !node_name.as_str().unwrap_or("").is_empty();
+    if already_scheduled {
+        return None;
+    }
+    let namespace = event["object"]["metadata"]["namespace"]
+        .as_str()
+        .unwrap_or("default")
+        .to_owned();
+    Some((namespace, pod_name.to_owned()))
+}
+
 #[derive(Deserialize)]
 struct NodeList {
     items: Vec<NodeItem>,
@@ -394,8 +423,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Watch loop — reconnect on error with a short backoff.
     loop {
-        info!("starting pod watch on /api/v1/namespaces/default/pods?watch=true&fieldSelector=spec.nodeName%3D");
-        let path = "/api/v1/namespaces/default/pods?watch=true&fieldSelector=spec.nodeName%3D";
+        info!("starting pod watch on /api/v1/pods?watch=true&fieldSelector=spec.nodeName%3D");
+        let path = "/api/v1/pods?watch=true&fieldSelector=spec.nodeName%3D";
 
         // Collect events; for each ADDED/MODIFIED pod with empty nodeName, schedule it.
         // We clone connector per loop iteration (cheap Arc clone inside).
@@ -403,25 +432,9 @@ async fn main() -> anyhow::Result<()> {
         let server_ref = &server;
 
         let result = stream_watch_events(connector_ref, server_ref, path, |event| {
-            let event_type = event["type"].as_str().unwrap_or("").to_owned();
-            if event_type != "ADDED" && event_type != "MODIFIED" {
+            let Some((namespace, pod_name)) = needs_scheduling(&event) else {
                 return;
-            }
-            let pod_name = event["object"]["metadata"]["name"]
-                .as_str()
-                .unwrap_or("")
-                .to_owned();
-            let namespace = event["object"]["metadata"]["namespace"]
-                .as_str()
-                .unwrap_or("default")
-                .to_owned();
-            let node_name_val = &event["object"]["spec"]["nodeName"];
-            let already_scheduled = node_name_val.is_string()
-                && !node_name_val.as_str().unwrap_or("").is_empty();
-
-            if already_scheduled || pod_name.is_empty() {
-                return;
-            }
+            };
 
             info!("unscheduled pod detected: {namespace}/{pod_name}");
 
@@ -448,5 +461,84 @@ async fn main() -> anyhow::Result<()> {
             error!("watch error: {e} — reconnecting in 5s");
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Regression test: the cluster-wide watch path must NOT be scoped to a
+    // specific namespace.  If this constant ever reverts to the old
+    // "namespaces/default/pods" path, cross-namespace pods (e.g. CoreDNS in
+    // kube-system) will never be scheduled.
+    #[test]
+    fn watch_path_is_cluster_wide() {
+        let path = "/api/v1/pods?watch=true&fieldSelector=spec.nodeName%3D";
+        assert!(
+            !path.contains("namespaces/"),
+            "watch path must be cluster-wide, not namespace-scoped: {path}"
+        );
+        assert!(
+            path.starts_with("/api/v1/pods"),
+            "watch path must use /api/v1/pods, got: {path}"
+        );
+    }
+
+    #[test]
+    fn needs_scheduling_returns_none_for_non_pod_events() {
+        let event = json!({ "type": "DELETED", "object": { "metadata": { "name": "foo", "namespace": "default" }, "spec": {} } });
+        assert!(needs_scheduling(&event).is_none());
+    }
+
+    #[test]
+    fn needs_scheduling_returns_none_when_already_scheduled() {
+        let event = json!({
+            "type": "MODIFIED",
+            "object": {
+                "metadata": { "name": "foo", "namespace": "kube-system" },
+                "spec": { "nodeName": "node-1" }
+            }
+        });
+        assert!(needs_scheduling(&event).is_none());
+    }
+
+    #[test]
+    fn needs_scheduling_returns_namespace_from_event() {
+        // Pods outside `default` (e.g. CoreDNS in kube-system) must be
+        // scheduled using the namespace from the event, not a hard-coded value.
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "coredns-abc", "namespace": "kube-system" },
+                "spec": { "nodeName": "" }
+            }
+        });
+        let result = needs_scheduling(&event);
+        assert!(result.is_some(), "expected Some for unscheduled pod");
+        let (ns, name) = result.unwrap();
+        assert_eq!(ns, "kube-system", "namespace must come from event metadata");
+        assert_eq!(name, "coredns-abc");
+    }
+
+    #[test]
+    fn needs_scheduling_returns_some_for_unscheduled_pod_in_default() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "my-pod", "namespace": "default" },
+                "spec": {}
+            }
+        });
+        let result = needs_scheduling(&event);
+        assert!(result.is_some());
+        let (ns, name) = result.unwrap();
+        assert_eq!(ns, "default");
+        assert_eq!(name, "my-pod");
     }
 }
