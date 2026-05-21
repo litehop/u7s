@@ -251,18 +251,8 @@ impl Object {
         self.body["metadata"]["name"].as_str()
     }
 
-    #[allow(dead_code)]
-    pub fn namespace(&self) -> Option<&str> {
-        self.body["metadata"]["namespace"].as_str()
-    }
-
     pub fn resource_version(&self) -> Option<&str> {
         self.body["metadata"]["resourceVersion"].as_str()
-    }
-
-    #[allow(dead_code)]
-    pub fn resource_version_u64(&self) -> Option<u64> {
-        self.resource_version()?.parse().ok()
     }
 
     pub fn set_resource_version(&mut self, rv: u64) {

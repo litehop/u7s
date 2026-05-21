@@ -37,7 +37,6 @@ pub struct PeerCertificate(pub Vec<u8>);
 #[derive(Debug, Clone)]
 pub struct UserInfo {
     pub username: String,
-    #[allow(dead_code)]
     pub uid: String,
     pub groups: Vec<String>,
 }
