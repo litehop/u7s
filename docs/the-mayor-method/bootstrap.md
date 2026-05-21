@@ -35,6 +35,7 @@ Maintain `/ai/dashboard.md` for the operator, not yourself:
 - Then in-flight work, open PRs, recent merges, cleanup, interesting context.
 - Short enough that a returning operator re-orients in 30 seconds.
 - Update on every significant signal.
+- No need to push dashboard update commits (waste of CI time)
 
 Use `/ai/prompts/`, `/ai/findings/`, and `/ai/extended-context/`:
 - Prompts are durable AI instructions taken seriously.
