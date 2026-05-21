@@ -549,26 +549,44 @@ pub async fn delete_pod(
     })))
 }
 
+/// Classify the patch Content-Type for pod PATCH requests.
+/// Mirrors detect_patch_type in generic.rs; consolidated once generic exports it.
+#[derive(Debug)]
+enum PodPatchType {
+    Merge,
+    StrategicMerge,
+    Json,
+}
+
+fn detect_pod_patch_type(headers: &HeaderMap) -> Result<PodPatchType, crate::status::StatusError> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if content_type.contains("application/strategic-merge-patch+json") {
+        return Ok(PodPatchType::StrategicMerge);
+    }
+    if content_type.contains("application/merge-patch+json") {
+        return Ok(PodPatchType::Merge);
+    }
+    if content_type.contains("application/json-patch+json") {
+        return Ok(PodPatchType::Json);
+    }
+    if content_type.contains("application/apply-patch+yaml") {
+        return Ok(PodPatchType::StrategicMerge);
+    }
+    Err(Status::unsupported_media_type(format!(
+        "unsupported media type '{content_type}'; use application/merge-patch+json, application/strategic-merge-patch+json, or application/json-patch+json"
+    )))
+}
+
 pub async fn patch_pod(
     State(state): State<AppState>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    // Check Content-Type
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let is_smp = content_type.contains("application/strategic-merge-patch+json");
-    let is_jmp = content_type.contains("application/merge-patch+json");
-
-    if !is_smp && !is_jmp {
-        return Err(Status::unsupported_media_type(format!(
-            "unsupported media type '{content_type}'; use application/merge-patch+json or application/strategic-merge-patch+json"
-        )));
-    }
+    let patch_type = detect_pod_patch_type(&headers)?;
 
     let ns = parse_namespace(&raw_ns, &state).await?;
 
@@ -586,11 +604,17 @@ pub async fn patch_pod(
     let patch: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    if is_smp {
-        crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
-            .map_err(|e| Status::bad_request(e.to_string()))?;
-    } else {
-        crate::patch::merge_patch(&mut current_obj.body, &patch);
+    match patch_type {
+        PodPatchType::StrategicMerge => {
+            crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
+                .map_err(|e| Status::bad_request(e.to_string()))?;
+        }
+        PodPatchType::Merge => {
+            crate::patch::merge_patch(&mut current_obj.body, &patch);
+        }
+        PodPatchType::Json => {
+            pod_apply_json_patch(&mut current_obj.body, &patch)?;
+        }
     }
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
@@ -621,6 +645,219 @@ pub async fn patch_pod(
     current_obj.set_resource_version(new_rv);
 
     Ok(Json(current_obj.body))
+}
+
+// ---------------------------------------------------------------------------
+// JSON Patch (RFC 6902) helpers for pod PATCH.
+// Duplicated from generic.rs until that module exports them as pub(crate).
+// TODO(mayor-1hc follow-up): remove once generic::apply_json_patch is pub(crate).
+// ---------------------------------------------------------------------------
+
+fn pod_apply_json_patch(
+    obj: &mut serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let ops = patch.as_array().ok_or_else(|| {
+        Status::unprocessable_entity("JSON patch must be an array of operations".into())
+    })?;
+    for op in ops {
+        let op_str = op["op"].as_str().ok_or_else(|| {
+            Status::unprocessable_entity("each JSON patch operation must have an 'op' field".into())
+        })?;
+        let path = op["path"].as_str().ok_or_else(|| {
+            Status::unprocessable_entity("each JSON patch operation must have a 'path' field".into())
+        })?;
+        match op_str {
+            "add" => {
+                let value = op.get("value").ok_or_else(|| {
+                    Status::unprocessable_entity("'add' operation requires a 'value' field".into())
+                })?.clone();
+                pod_json_patch_add(obj, path, value)?;
+            }
+            "replace" => {
+                let value = op.get("value").ok_or_else(|| {
+                    Status::unprocessable_entity("'replace' operation requires a 'value' field".into())
+                })?.clone();
+                pod_json_patch_set(obj, path, value)?;
+            }
+            "remove" => {
+                pod_json_patch_remove(obj, path)?;
+            }
+            other => {
+                return Err(Status::unprocessable_entity(format!(
+                    "unsupported JSON patch operation '{other}'; supported: add, remove, replace"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pod_json_pointer_segments(pointer: &str) -> Vec<String> {
+    if pointer.is_empty() {
+        return vec![];
+    }
+    let stripped = pointer.strip_prefix('/').unwrap_or(pointer);
+    stripped
+        .split('/')
+        .map(|seg| seg.replace("~1", "/").replace("~0", "~"))
+        .collect()
+}
+
+fn pod_json_navigate_mut<'a>(
+    obj: &'a mut serde_json::Value,
+    segments: &[String],
+) -> Result<(&'a mut serde_json::Value, String), crate::status::StatusError> {
+    if segments.is_empty() {
+        return Err(Status::unprocessable_entity("cannot operate on root document".into()));
+    }
+    let (parents, last) = segments.split_at(segments.len() - 1);
+    let mut cur = obj;
+    for seg in parents {
+        cur = pod_json_navigate_one(cur, seg)?;
+    }
+    Ok((cur, last[0].clone()))
+}
+
+fn pod_json_navigate_one<'a>(
+    node: &'a mut serde_json::Value,
+    seg: &str,
+) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
+    match node {
+        serde_json::Value::Object(map) => {
+            map.get_mut(seg).ok_or_else(|| {
+                Status::unprocessable_entity(format!("path segment '{seg}' not found"))
+            })
+        }
+        serde_json::Value::Array(arr) => {
+            let idx: usize = seg.parse().map_err(|_| {
+                Status::unprocessable_entity(format!("path segment '{seg}' is not a valid array index"))
+            })?;
+            arr.get_mut(idx).ok_or_else(|| {
+                Status::unprocessable_entity(format!("array index {idx} out of bounds"))
+            })
+        }
+        _ => Err(Status::unprocessable_entity(format!(
+            "cannot traverse into non-object/array at segment '{seg}'"
+        ))),
+    }
+}
+
+fn pod_json_navigate_one_or_create<'a>(
+    node: &'a mut serde_json::Value,
+    seg: &str,
+) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
+    match node {
+        serde_json::Value::Object(map) => {
+            map.entry(seg).or_insert_with(|| serde_json::Value::Object(Default::default()));
+            Ok(map.get_mut(seg).unwrap())
+        }
+        _ => Err(Status::unprocessable_entity(format!(
+            "cannot create intermediate key '{seg}' in non-object"
+        ))),
+    }
+}
+
+fn pod_json_patch_add(
+    obj: &mut serde_json::Value,
+    pointer: &str,
+    value: serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let segs = pod_json_pointer_segments(pointer);
+    if segs.is_empty() {
+        *obj = value;
+        return Ok(());
+    }
+    let (parents, last) = segs.split_at(segs.len() - 1);
+    let mut cur = obj;
+    for seg in parents {
+        cur = pod_json_navigate_one_or_create(cur, seg)?;
+    }
+    let key = &last[0];
+    match cur {
+        serde_json::Value::Object(map) => { map.insert(key.clone(), value); }
+        serde_json::Value::Array(arr) => {
+            if key == "-" {
+                arr.push(value);
+            } else {
+                let idx: usize = key.parse().map_err(|_| {
+                    Status::unprocessable_entity(format!("invalid array index '{key}'"))
+                })?;
+                if idx <= arr.len() {
+                    arr.insert(idx, value);
+                } else {
+                    return Err(Status::unprocessable_entity(format!(
+                        "array index {idx} out of bounds (len {})", arr.len()
+                    )));
+                }
+            }
+        }
+        _ => return Err(Status::unprocessable_entity("cannot add value to non-object/array".into())),
+    }
+    Ok(())
+}
+
+fn pod_json_patch_set(
+    obj: &mut serde_json::Value,
+    pointer: &str,
+    value: serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let segs = pod_json_pointer_segments(pointer);
+    if segs.is_empty() {
+        *obj = value;
+        return Ok(());
+    }
+    let (parent, key) = pod_json_navigate_mut(obj, &segs)?;
+    match parent {
+        serde_json::Value::Object(map) => { map.insert(key, value); }
+        serde_json::Value::Array(arr) => {
+            if key == "-" {
+                arr.push(value);
+            } else {
+                let idx: usize = key.parse().map_err(|_| {
+                    Status::unprocessable_entity(format!("invalid array index '{key}'"))
+                })?;
+                if idx <= arr.len() {
+                    arr.insert(idx, value);
+                } else {
+                    return Err(Status::unprocessable_entity(format!(
+                        "array index {idx} out of bounds (len {})", arr.len()
+                    )));
+                }
+            }
+        }
+        _ => return Err(Status::unprocessable_entity("cannot set value on non-object/array".into())),
+    }
+    Ok(())
+}
+
+fn pod_json_patch_remove(
+    obj: &mut serde_json::Value,
+    pointer: &str,
+) -> Result<(), crate::status::StatusError> {
+    let segs = pod_json_pointer_segments(pointer);
+    let (parent, key) = pod_json_navigate_mut(obj, &segs)?;
+    match parent {
+        serde_json::Value::Object(map) => {
+            map.remove(&key).ok_or_else(|| {
+                Status::unprocessable_entity(format!("path '{pointer}' not found"))
+            })?;
+        }
+        serde_json::Value::Array(arr) => {
+            let idx: usize = key.parse().map_err(|_| {
+                Status::unprocessable_entity(format!("invalid array index '{key}'"))
+            })?;
+            if idx < arr.len() {
+                arr.remove(idx);
+            } else {
+                return Err(Status::unprocessable_entity(format!(
+                    "array index {idx} out of bounds"
+                )));
+            }
+        }
+        _ => return Err(Status::unprocessable_entity("cannot remove from non-object/array".into())),
+    }
+    Ok(())
 }
 
 use crate::util::utc_now_rfc3339;
@@ -1278,6 +1515,137 @@ mod status_tests {
         let containers_ready = conditions.iter().find(|c| c["type"] == "ContainersReady");
         assert!(containers_ready.is_some(),
             "ContainersReady condition must be added by the patch");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Patch type detection tests — regression for mayor-erz
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod patch_type_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
+
+    fn headers_with_ct(ct: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
+        h
+    }
+
+    /// json-patch+json must be accepted — not return 415.
+    /// This is the regression test for mayor-erz: before the fix, patch_pod
+    /// rejected application/json-patch+json with HTTP 415 Unsupported Media Type.
+    #[test]
+    fn json_patch_content_type_is_accepted() {
+        let h = headers_with_ct("application/json-patch+json");
+        let result = detect_pod_patch_type(&h);
+        assert!(
+            result.is_ok(),
+            "application/json-patch+json must be accepted by patch_pod; \
+             before mayor-erz fix it returned 415 Unsupported Media Type"
+        );
+        assert!(matches!(result.ok(), Some(PodPatchType::Json)));
+    }
+
+    /// strategic-merge-patch+json must be accepted.
+    #[test]
+    fn strategic_merge_patch_content_type_is_accepted() {
+        let h = headers_with_ct("application/strategic-merge-patch+json");
+        assert!(matches!(
+            detect_pod_patch_type(&h).ok(),
+            Some(PodPatchType::StrategicMerge)
+        ));
+    }
+
+    /// merge-patch+json must be accepted.
+    #[test]
+    fn merge_patch_content_type_is_accepted() {
+        let h = headers_with_ct("application/merge-patch+json");
+        assert!(matches!(
+            detect_pod_patch_type(&h).ok(),
+            Some(PodPatchType::Merge)
+        ));
+    }
+
+    /// apply-patch+yaml is treated as strategic-merge-patch (SSA approximation).
+    #[test]
+    fn apply_patch_yaml_is_accepted_as_strategic_merge() {
+        let h = headers_with_ct("application/apply-patch+yaml");
+        assert!(matches!(
+            detect_pod_patch_type(&h).ok(),
+            Some(PodPatchType::StrategicMerge)
+        ));
+    }
+
+    /// Unknown content-type must return 415 error.
+    #[test]
+    fn unknown_content_type_returns_415() {
+        let h = headers_with_ct("application/octet-stream");
+        // Must error, not succeed.
+        let result = detect_pod_patch_type(&h);
+        assert!(result.is_err(), "unknown content-type must be rejected");
+        // Verify it produces a 415 response.
+        let resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// pod_apply_json_patch: replace operation updates a field in the pod object.
+    /// This verifies the json-patch apply path end-to-end at the logic level.
+    #[test]
+    fn pod_apply_json_patch_replace_updates_field() {
+        let mut pod = serde_json::json!({
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {"nodeName": "worker-1"}
+        });
+        let patch = serde_json::json!([
+            {"op": "replace", "path": "/spec/nodeName", "value": "worker-2"}
+        ]);
+        assert!(
+            pod_apply_json_patch(&mut pod, &patch).is_ok(),
+            "replace op must succeed"
+        );
+        assert_eq!(
+            pod["spec"]["nodeName"],
+            "worker-2",
+            "replace op must update spec.nodeName"
+        );
+    }
+
+    /// pod_apply_json_patch: add operation inserts a new field.
+    #[test]
+    fn pod_apply_json_patch_add_inserts_field() {
+        let mut pod = serde_json::json!({
+            "metadata": {"name": "my-pod"},
+            "spec": {}
+        });
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/spec/nodeName", "value": "worker-3"}
+        ]);
+        assert!(
+            pod_apply_json_patch(&mut pod, &patch).is_ok(),
+            "add op must succeed"
+        );
+        assert_eq!(pod["spec"]["nodeName"], "worker-3");
+    }
+
+    /// pod_apply_json_patch: remove operation deletes a field.
+    #[test]
+    fn pod_apply_json_patch_remove_deletes_field() {
+        let mut pod = serde_json::json!({
+            "metadata": {"name": "my-pod", "labels": {"app": "test"}}
+        });
+        let patch = serde_json::json!([
+            {"op": "remove", "path": "/metadata/labels/app"}
+        ]);
+        assert!(
+            pod_apply_json_patch(&mut pod, &patch).is_ok(),
+            "remove op must succeed"
+        );
+        assert!(
+            pod["metadata"]["labels"].get("app").is_none(),
+            "remove op must delete the key"
+        );
     }
 }
 
