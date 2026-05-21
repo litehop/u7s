@@ -63,7 +63,9 @@ struct SaClaims {
 /// File format (one line per entry, comments and empty lines skipped):
 ///   <token>,<username>,<uid>,<group1>[,<group2>...]
 pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> {
-    let file = std::fs::File::open(validate_cli_path(std::path::Path::new(path))?)?;
+    let raw_path = std::path::Path::new(path);
+    let safe_path = validate_cli_path(raw_path)?;
+    let file = std::fs::File::open(safe_path)?;
     let mut map = HashMap::new();
 
     for (lineno, line) in BufReader::new(file).lines().enumerate() {
@@ -849,7 +851,7 @@ mod tests {
         // Write a temp file and verify parsing produces the right UserInfo.
         let dir = std::env::temp_dir();
         let path = dir.join("u7s_test_tokens.csv");
-        std::fs::write(
+        std::fs::write( // lgtm[rust/path-injection]
             &path,
             "tok1,alice,uid1,group-a,group-b\n# comment\n\ntok2,bob,uid2\n",
         )
