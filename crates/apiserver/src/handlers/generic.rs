@@ -3,13 +3,14 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use serde::Deserialize;
 use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
 
 use crate::{
+    auth::UserInfo,
     keys::{group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
@@ -291,6 +292,10 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
 /// When `initial_items` is Some, those items are emitted as ADDED events first
 /// (implementing the Kubernetes 1.27+ sendInitialEvents protocol), followed by a
 /// BOOKMARK, before streaming live changes from `from_revision`.
+///
+/// `username` is the authenticated client identity used to enforce the per-client
+/// watch stream concurrency limit (MAX_WATCHES_PER_CLIENT). Exceeding the limit
+/// returns HTTP 429 immediately without opening a watch stream.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn watch_generic(
     state: AppState,
@@ -302,7 +307,21 @@ pub(crate) async fn watch_generic(
     label_selector: Option<String>,
     field_selector: Option<String>,
     allow_watch_bookmarks: bool,
+    username: String,
 ) -> Result<Response, crate::status::StatusError> {
+    // Enforce per-client watch concurrency limit. Try to acquire a permit from
+    // this user's semaphore. If the semaphore is exhausted (client already has
+    // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
+    let sem = state.watch_limit.semaphore_for(&username);
+    let _watch_permit = sem.try_acquire_owned().map_err(|_| {
+        crate::status::Status::too_many_requests(format!(
+            "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
+            crate::state::MAX_WATCHES_PER_CLIENT
+        ))
+    })?;
+    // _watch_permit is held for the duration of the watch stream and released when
+    // this function returns (RAII drop).
+
     // Check compaction horizon BEFORE committing headers so clients get a synchronous HTTP 410.
     // If from_rv > 0 and below the horizon, the revision is expired — return 410 immediately.
     if from_revision > 0 {
@@ -610,11 +629,18 @@ pub async fn list_resource(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
-            return super::cr::list_cr(State(state), Path((group, version, plural)), query).await;
+            return super::cr::list_cr(
+                State(state),
+                Path((group, version, plural)),
+                query,
+                user.username,
+            )
+            .await;
         }
     };
     let prefix = group_list_prefix(&group, &plural, None);
@@ -638,6 +664,7 @@ pub async fn list_resource(
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
+            user.username,
         )
         .await;
     }
@@ -1056,6 +1083,7 @@ pub async fn list_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -1064,6 +1092,7 @@ pub async fn list_namespaced_resource(
                 State(state),
                 Path((group, version, ns, plural)),
                 query,
+                user.username,
             )
             .await;
         }
@@ -1089,6 +1118,7 @@ pub async fn list_namespaced_resource(
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
+            user.username,
         )
         .await;
     }
@@ -1663,6 +1693,7 @@ pub async fn core_list_resource(
     State(state): State<AppState>,
     Path(plural): Path<String>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Pods are namespaced; the registry has no cluster-scoped "pods" entry.
     // Handle GET /api/v1/pods by scanning across all namespaces.
@@ -1683,6 +1714,7 @@ pub async fn core_list_resource(
                 query.label_selector,
                 query.field_selector,
                 query.allow_watch_bookmarks == Some(true),
+                user.username,
             )
             .await
             .map(IntoResponse::into_response);
@@ -1729,6 +1761,7 @@ pub async fn core_list_resource(
         State(state),
         Path(("".into(), "v1".into(), plural)),
         Query(query),
+        Extension(user),
     )
     .await
     .map(IntoResponse::into_response)
@@ -1834,11 +1867,13 @@ pub async fn core_list_namespaced_resource(
     State(state): State<AppState>,
     Path((ns, plural)): Path<(String, String)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     list_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural)),
         Query(query),
+        Extension(user),
     )
     .await
 }
@@ -3260,6 +3295,11 @@ mod tests {
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
             }),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
         )
         .await
         .unwrap_or_else(|_| panic!("list runtimeclasses must not return 404"));
@@ -4137,6 +4177,7 @@ mod tests {
             None,
             None,
             false,
+            "test-user".into(),
         )
         .await;
 
@@ -4184,6 +4225,7 @@ mod tests {
             None,
             None,
             false,
+            "test-user".into(),
         )
         .await;
 
@@ -4302,5 +4344,119 @@ mod resolve_name_tests {
         let err = resolve_name(&mut obj).expect_err("must fail when no name and no generateName");
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 400, "must return 400 Bad Request");
+    }
+
+    // -- Per-client watch concurrency limit --
+    //
+    // A single client must not be able to exhaust global watch capacity by opening
+    // more than MAX_WATCHES_PER_CLIENT concurrent streams. The (MAX+1)th attempt from
+    // the same user identity must receive HTTP 429 immediately, while a different
+    // user's watch must still succeed.
+
+    /// The (MAX_WATCHES_PER_CLIENT + 1)th watch from the same user returns 429.
+    /// Without this limit a single client could hold all 50 InflightLayer slots
+    /// indefinitely and deny service to every other user.
+    #[tokio::test]
+    async fn watch_limit_per_client_returns_429_on_overflow() {
+        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Exhaust this user's permit budget by acquiring permits directly.
+        // watch_generic acquires one permit per call; we simulate MAX open streams
+        // by holding permits from the semaphore.
+        let sem = state.watch_limit.semaphore_for("alice");
+        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
+            .map(|_| {
+                sem.clone()
+                    .try_acquire_owned()
+                    .expect("permit must be available")
+            })
+            .collect();
+
+        // The (MAX+1)th watch from "alice" must be rejected with 429.
+        let result = watch_generic(
+            state.clone(),
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0,
+            None,
+            None,
+            None,
+            false,
+            "alice".into(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "watch_generic must return Err(429) when the per-client limit is exhausted"
+        );
+        let err_resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(
+            err_resp.status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "must return HTTP 429 when per-client watch limit is exhausted, not silently queue"
+        );
+    }
+
+    /// A different user's watch succeeds even when another user has exhausted their quota.
+    /// The per-client semaphore is independent per username — one user's cap must not
+    /// affect another user's ability to watch.
+    #[tokio::test]
+    async fn watch_limit_does_not_affect_other_users() {
+        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Exhaust alice's permits.
+        let sem_alice = state.watch_limit.semaphore_for("alice");
+        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
+            .map(|_| {
+                sem_alice
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("permit must be available")
+            })
+            .collect();
+
+        // bob's watch must succeed because bob has a separate semaphore.
+        let result = watch_generic(
+            state.clone(),
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0,
+            None,
+            None,
+            None,
+            false,
+            "bob".into(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "bob's watch must succeed even when alice has exhausted her per-client limit"
+        );
     }
 }

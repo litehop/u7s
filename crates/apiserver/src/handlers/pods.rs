@@ -3,13 +3,14 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use serde::Deserialize;
 use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
 
 use crate::{
+    auth::UserInfo,
     keys::{cluster_object_key, list_prefix, object_key},
     state::AppState,
     status::Status,
@@ -137,6 +138,7 @@ pub async fn list_pods(
     State(state): State<AppState>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
     let prefix = list_prefix("pods", ns.as_str());
@@ -180,6 +182,7 @@ pub async fn list_pods(
             query.field_selector,
             initial_pods,
             query.allow_watch_bookmarks == Some(true),
+            user.username,
         )
         .await;
     }
@@ -223,6 +226,7 @@ pub async fn list_pods(
     Ok(Json(body).into_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn watch_pods(
     state: AppState,
     prefix: String,
@@ -231,7 +235,21 @@ async fn watch_pods(
     field_selector: Option<String>,
     initial_pods: Option<(Vec<serde_json::Value>, u64)>,
     allow_watch_bookmarks: bool,
+    username: String,
 ) -> Result<Response, crate::status::StatusError> {
+    // Enforce per-client watch concurrency limit. Try to acquire a permit from
+    // this user's semaphore. If the semaphore is exhausted (client already has
+    // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
+    let sem = state.watch_limit.semaphore_for(&username);
+    let _watch_permit = sem.try_acquire_owned().map_err(|_| {
+        crate::status::Status::too_many_requests(format!(
+            "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
+            crate::state::MAX_WATCHES_PER_CLIENT
+        ))
+    })?;
+    // _watch_permit is held for the duration of the watch stream and released when
+    // this function returns (RAII drop).
+
     let event_stream = state
         .store
         .watch(&prefix, from_revision)

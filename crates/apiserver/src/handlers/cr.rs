@@ -189,6 +189,7 @@ pub async fn list_cr(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
     query: super::generic::CollectionQuery,
+    username: String,
 ) -> Result<Response, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -213,6 +214,7 @@ pub async fn list_cr(
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
+            username,
         )
         .await;
     }
@@ -404,6 +406,7 @@ pub async fn list_cr_namespaced(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     query: super::generic::CollectionQuery,
+    username: String,
 ) -> Result<Response, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -428,6 +431,7 @@ pub async fn list_cr_namespaced(
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
+            username,
         )
         .await;
     }
@@ -921,6 +925,7 @@ mod tests {
                     "things".to_string(),
                 )),
                 no_watch_query(),
+                "test-user".to_string(),
             )
             .await,
             "expected 404 for unknown group",
@@ -948,6 +953,7 @@ mod tests {
                     "widgets".to_string(),
                 )),
                 no_watch_query(),
+                "test-user".to_string(),
             )
             .await,
             "cluster-scoped CRD must reject namespaced path",
@@ -972,6 +978,7 @@ mod tests {
                     "applications".to_string(),
                 )),
                 no_watch_query(),
+                "test-user".to_string(),
             )
             .await,
             "namespaced CRD must reject cluster-scoped path",
@@ -1113,6 +1120,7 @@ mod tests {
             State(state.clone()),
             Path((group, version, ns, plural)),
             no_watch_query(),
+            "test-user".to_string(),
         )
         .await
         {
@@ -1414,6 +1422,7 @@ mod tests {
                 "widgets".to_string(),
             )),
             watch_query(),
+            "test-user".to_string(),
         )
         .await
         {
@@ -1449,6 +1458,7 @@ mod tests {
                 "applications".to_string(),
             )),
             watch_query(),
+            "test-user".to_string(),
         )
         .await
         {
