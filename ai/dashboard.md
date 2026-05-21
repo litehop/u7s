@@ -28,9 +28,11 @@ Heavy session. All previously failing CI is now green:
 - **mayor-8c89** (coverage gate) closed as verified — `--fail-under-lines` already enforced
 - **mayor-22n6** (system:masters bypass) — PR #128 open, CI pending
 - **mayor-pudl** (SA token projection) — found and fixed empty UID in seeded SAs; PR #129 open
-- **mayor-z1bu** closed — superseded: full upstream CSR API + kube-controller-manager chosen
+- **mayor-z1bu** closed — superseded by architectural decision: full upstream CSR API + kube-controller-manager
 - Orphan branches: all 4 deleted after operator relaxed branch protection rules
-- ~16 PRs merged total today, ~8 beads closed this session
+- Workers now required to run `cargo fmt --all` before pushing (memory saved)
+
+~6 beads closed, ~6 PRs merged this half-session. ~16 PRs merged total today.
 
 ## Stance
 Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; flag security/API/architecture PRs for operator review first.
