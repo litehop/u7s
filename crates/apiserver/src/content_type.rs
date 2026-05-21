@@ -79,6 +79,7 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let wants_proto = prefer_proto(req.headers());
+        let uri = req.uri().to_string();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -132,6 +133,17 @@ where
             // Re-encode as protobuf.
             let proto_bytes = encode_proto_response(&json_val);
             let proto_len = proto_bytes.len();
+            tracing::info!(
+                uri = %uri,
+                proto_len = proto_len,
+                json_len = body_bytes.len(),
+                first_bytes = %proto_bytes[..proto_bytes.len().min(20)]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "proto re-encode"
+            );
 
             let mut new_parts = parts;
             new_parts.headers.insert(
