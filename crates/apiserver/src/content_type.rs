@@ -364,6 +364,61 @@ mod tests {
         );
     }
 
+    /// Regression test for "illegal wireType 6": when Content-Length is the JSON byte length but
+    /// the proto body is larger, truncating to json_len bytes produces a malformed protobuf stream.
+    ///
+    /// This test proves three things:
+    ///   1. encode_proto_response always produces MORE bytes than the source JSON (so the old
+    ///      Content-Length was always wrong).
+    ///   2. A read truncated to the original json_len bytes fails to decode as a k8s proto
+    ///      envelope — this is the wireType 6 scenario the kubectl CI gate hit.
+    ///   3. The full (untruncated) bytes decode correctly — the fix (removing Content-Length) lets
+    ///      the client read all bytes and succeed.
+    ///
+    /// If the Content-Length removal is reverted, content_length_is_removed_on_re_encode catches
+    /// it at the header level; this test catches it at the byte level.
+    #[test]
+    fn truncated_proto_body_is_invalid_proving_content_length_must_be_removed() {
+        // Use a realistic Namespace response similar to what kubectl create namespace returns.
+        let json_str = r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"smoke-test","resourceVersion":"1","creationTimestamp":null},"spec":{"finalizers":["kubernetes"]},"status":{"phase":"Active"}}"#;
+        let json_bytes = json_str.as_bytes();
+        let json_len = json_bytes.len();
+
+        let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        let proto_bytes = encode_proto_response(&val);
+
+        // 1. Proto body must be larger than JSON (magic prefix + envelope overhead).
+        assert!(
+            proto_bytes.len() > json_len,
+            "proto body ({} bytes) must be larger than JSON ({} bytes); \
+             if equal, Content-Length mismatch cannot occur",
+            proto_bytes.len(),
+            json_len
+        );
+
+        // 2. Truncating to JSON size produces a body that fails to decode as a k8s proto envelope.
+        //    This is exactly what kubectl sees when Content-Length = json_len is honoured: it reads
+        //    json_len bytes of the proto stream, landing in the middle of an encoded field, and the
+        //    Go proto decoder reports "illegal wireType" when the next byte's low 3 bits are 6.
+        let truncated = &proto_bytes[..json_len];
+        assert!(
+            crate::proto::decode_k8s_proto_envelope(truncated).is_none(),
+            "truncated proto body (first json_len bytes) must not decode as a valid k8s envelope; \
+             this proves the Content-Length mismatch corrupts the response"
+        );
+
+        // 3. The full proto body must decode correctly — removing Content-Length lets the client
+        //    read all bytes and succeed.
+        let envelope = crate::proto::decode_k8s_proto_envelope(&proto_bytes)
+            .expect("full proto body must decode as a valid k8s envelope");
+        let recovered: serde_json::Value = serde_json::from_slice(&envelope.raw)
+            .expect("envelope raw field must be valid JSON");
+        assert_eq!(
+            recovered["metadata"]["name"], "smoke-test",
+            "name must survive the proto round-trip"
+        );
+    }
+
     /// The encoder function directly: encode_proto_response must produce a valid k8s
     /// protobuf envelope whose raw field (field 2) contains the original JSON bytes.
     ///
