@@ -361,6 +361,45 @@ jobs:
             exit 1
           fi
 
+      - name: Schedule pod to ci-node
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          kubectl apply --validate=false -f - <<'EOF'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: smoke-pod
+            namespace: default
+          spec:
+            nodeName: ci-node
+            restartPolicy: Never
+            containers:
+              - name: smoke
+                image: busybox:1.36
+                command: ["sh", "-c", "exit 0"]
+          EOF
+
+      - name: Assert pod reaches Succeeded
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          PHASE=""
+          for i in $(seq 1 120); do
+            PHASE=$(kubectl get pod smoke-pod -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+            if [ "$PHASE" = "Succeeded" ]; then
+              echo "Pod reached Succeeded after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          if [ "$PHASE" != "Succeeded" ]; then
+            echo "ERROR: pod did not reach Succeeded within 120s (phase=$PHASE)"
+            kubectl describe pod smoke-pod -n default 2>/dev/null || true
+            kubectl get pod smoke-pod -n default -o yaml 2>/dev/null || true
+            exit 1
+          fi
+
       - name: Stop server and kubelet
         if: always()
         run: |
