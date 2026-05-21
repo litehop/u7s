@@ -851,7 +851,8 @@ mod tests {
         // Write a temp file and verify parsing produces the right UserInfo.
         let dir = std::env::temp_dir();
         let path = dir.join("u7s_test_tokens.csv");
-        std::fs::write( // lgtm[rust/path-injection]
+        std::fs::write(
+            // lgtm[rust/path-injection]
             &path,
             "tok1,alice,uid1,group-a,group-b\n# comment\n\ntok2,bob,uid2\n",
         )
