@@ -26,6 +26,10 @@ pub struct CollectionQuery {
     /// live changes. Used by kubelet (Kubernetes 1.27+) for efficient informer startup.
     #[serde(rename = "sendInitialEvents")]
     pub send_initial_events: Option<bool>,
+    /// When true, the server sends periodic BOOKMARK events. When false or absent,
+    /// bookmarks are suppressed (except the sendInitialEvents end-of-list BOOKMARK).
+    #[serde(rename = "allowWatchBookmarks")]
+    pub allow_watch_bookmarks: Option<bool>,
 }
 
 /// Extract a store-level FieldSelector from a raw field selector string.
@@ -175,6 +179,7 @@ pub async fn list_pods(
             from_rv,
             query.field_selector,
             initial_pods,
+            query.allow_watch_bookmarks == Some(true),
         )
         .await;
     }
@@ -218,66 +223,6 @@ pub async fn list_pods(
     Ok(Json(body).into_response())
 }
 
-/// Serialise a single watch event to NDJSON bytes (including trailing newline).
-/// Returns None on Compacted — the caller should close the stream.
-fn encode_watch_event(event: &WatchEvent) -> Option<Bytes> {
-    let line = match event {
-        WatchEvent::Added(obj) => {
-            let object: serde_json::Value =
-                serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
-            format!(
-                "{{\"type\":\"ADDED\",\"object\":{}}}\n",
-                serde_json::to_string(&object).unwrap_or_default()
-            )
-        }
-        WatchEvent::Modified(obj) => {
-            let object: serde_json::Value =
-                serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
-            format!(
-                "{{\"type\":\"MODIFIED\",\"object\":{}}}\n",
-                serde_json::to_string(&object).unwrap_or_default()
-            )
-        }
-        WatchEvent::Deleted { key, revision } => {
-            // The store deleted event carries no bytes; reconstruct a minimal object.
-            // Key format: /registry/pods/<namespace>/<name>
-            let (name, namespace) = parse_key_name_ns(key);
-            let object = serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": name,
-                    "namespace": namespace,
-                    "resourceVersion": revision.to_string()
-                }
-            });
-            format!(
-                "{{\"type\":\"DELETED\",\"object\":{}}}\n",
-                serde_json::to_string(&object).unwrap_or_default()
-            )
-        }
-        WatchEvent::Bookmark { revision } => {
-            format!(
-                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{revision}\"}}}}}}\n"
-            )
-        }
-        WatchEvent::Compacted { .. } => return None,
-    };
-    Some(Bytes::from(line))
-}
-
-/// Parse the last two path segments of a store key as (name, namespace).
-/// Key format: /registry/<resource>/<namespace>/<name>
-fn parse_key_name_ns(key: &str) -> (&str, &str) {
-    let parts: Vec<&str> = key.rsplitn(3, '/').collect();
-    // rsplitn(3) gives [name, namespace, rest] for a well-formed key
-    match parts.as_slice() {
-        [name, namespace, ..] => (name, namespace),
-        [name] => (name, ""),
-        _ => ("", ""),
-    }
-}
-
 async fn watch_pods(
     state: AppState,
     prefix: String,
@@ -285,6 +230,7 @@ async fn watch_pods(
     from_revision: u64,
     field_selector: Option<String>,
     initial_pods: Option<(Vec<serde_json::Value>, u64)>,
+    allow_watch_bookmarks: bool,
 ) -> Result<Response, crate::status::StatusError> {
     let event_stream = state
         .store
@@ -385,7 +331,7 @@ async fn watch_pods(
                             };
 
                             if !skip {
-                                if let Some(chunk) = encode_watch_event(&event) {
+                                if let Some(chunk) = super::generic::encode_watch_event(&event, "v1", "Pod") {
                                     yield Ok::<Bytes, axum::BoxError>(chunk);
                                 }
                             }
@@ -394,18 +340,22 @@ async fn watch_pods(
                 }
 
                 _ = bookmark_tick.tick() => {
-                    let bookmark = format!(
-                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                    );
-                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
                 }
 
                 _ = &mut max_duration => {
                     // Max watch duration reached — send a final BOOKMARK and close gracefully.
-                    let bookmark = format!(
-                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                    );
-                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
                     break;
                 }
             }
@@ -925,7 +875,7 @@ mod watch_tests {
         }
     }
 
-    /// encode_watch_event for Added emits {"type":"ADDED","object":...}\n
+    /// encode_watch_event (shared via generic) for Added emits {"type":"ADDED","object":...}\n
     /// and the object bytes are valid JSON from the stored value.
     #[test]
     fn encode_added_roundtrip() {
@@ -934,7 +884,9 @@ mod watch_tests {
             5,
             serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx","resourceVersion":"5"}}),
         );
-        let bytes = encode_watch_event(&WatchEvent::Added(obj)).expect("should encode");
+        let bytes =
+            crate::handlers::generic::encode_watch_event(&WatchEvent::Added(obj), "v1", "Pod")
+                .expect("should encode");
         let line = std::str::from_utf8(&bytes).unwrap();
         assert!(line.ends_with('\n'), "NDJSON must end with newline");
 
@@ -951,7 +903,9 @@ mod watch_tests {
             7,
             serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx","resourceVersion":"7"}}),
         );
-        let bytes = encode_watch_event(&WatchEvent::Modified(obj)).expect("should encode");
+        let bytes =
+            crate::handlers::generic::encode_watch_event(&WatchEvent::Modified(obj), "v1", "Pod")
+                .expect("should encode");
         let parsed: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
         assert_eq!(parsed["type"], "MODIFIED");
@@ -961,10 +915,14 @@ mod watch_tests {
     /// The emitted object must contain name and namespace derived from the key.
     #[test]
     fn encode_deleted_reconstructs_metadata() {
-        let bytes = encode_watch_event(&WatchEvent::Deleted {
-            key: "/registry/pods/default/nginx".to_string(),
-            revision: 9,
-        })
+        let bytes = crate::handlers::generic::encode_watch_event(
+            &WatchEvent::Deleted {
+                key: "/registry/pods/default/nginx".to_string(),
+                revision: 9,
+            },
+            "v1",
+            "Pod",
+        )
         .expect("should encode");
         let parsed: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
@@ -977,8 +935,12 @@ mod watch_tests {
     /// encode_watch_event for Bookmark emits the correct structure.
     #[test]
     fn encode_bookmark() {
-        let bytes =
-            encode_watch_event(&WatchEvent::Bookmark { revision: 42 }).expect("should encode");
+        let bytes = crate::handlers::generic::encode_watch_event(
+            &WatchEvent::Bookmark { revision: 42 },
+            "v1",
+            "Pod",
+        )
+        .expect("should encode");
         let parsed: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
         assert_eq!(parsed["type"], "BOOKMARK");
@@ -989,10 +951,14 @@ mod watch_tests {
     /// encode_watch_event for Compacted returns None — the caller must close the stream.
     #[test]
     fn encode_compacted_returns_none() {
-        let result = encode_watch_event(&WatchEvent::Compacted {
-            requested: 5,
-            horizon: 50,
-        });
+        let result = crate::handlers::generic::encode_watch_event(
+            &WatchEvent::Compacted {
+                requested: 5,
+                horizon: 50,
+            },
+            "v1",
+            "Pod",
+        );
         assert!(result.is_none(), "Compacted must signal close via None");
     }
 
@@ -1023,10 +989,11 @@ mod watch_tests {
         );
     }
 
-    /// parse_key_name_ns correctly extracts name and namespace from a standard store key.
+    /// parse_key_name_ns (shared via generic) correctly extracts name and namespace.
     #[test]
     fn parse_key_standard() {
-        let (name, ns) = parse_key_name_ns("/registry/pods/default/nginx");
+        let (name, ns) =
+            crate::handlers::generic::parse_key_name_ns("/registry/pods/default/nginx");
         assert_eq!(name, "nginx");
         assert_eq!(ns, "default");
     }
@@ -1034,7 +1001,8 @@ mod watch_tests {
     /// parse_key_name_ns handles a custom namespace correctly.
     #[test]
     fn parse_key_custom_namespace() {
-        let (name, ns) = parse_key_name_ns("/registry/pods/kube-system/coredns");
+        let (name, ns) =
+            crate::handlers::generic::parse_key_name_ns("/registry/pods/kube-system/coredns");
         assert_eq!(name, "coredns");
         assert_eq!(ns, "kube-system");
     }
@@ -1048,6 +1016,7 @@ mod watch_tests {
             resource_version: Some(42),
             field_selector: None,
             send_initial_events: None,
+            allow_watch_bookmarks: None,
         };
         assert!(q.watch == Some(true));
         assert_eq!(q.resource_version, Some(42));
@@ -1061,6 +1030,7 @@ mod watch_tests {
             resource_version: None,
             field_selector: None,
             send_initial_events: None,
+            allow_watch_bookmarks: None,
         };
         assert_eq!(q.watch, None);
         assert_eq!(q.resource_version, None);

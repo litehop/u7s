@@ -31,6 +31,11 @@ pub struct CollectionQuery {
     /// live changes. Used by kubelet (Kubernetes 1.27+) for efficient informer startup.
     #[serde(rename = "sendInitialEvents")]
     pub send_initial_events: Option<bool>,
+    /// When true, the server sends periodic BOOKMARK events to keep the connection alive
+    /// and advance the client's resourceVersion. When false or absent, bookmarks are suppressed
+    /// (except the end-of-list BOOKMARK from sendInitialEvents, which is always sent).
+    #[serde(rename = "allowWatchBookmarks")]
+    pub allow_watch_bookmarks: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +120,11 @@ fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusEr
 
 /// Serialise a single watch event to NDJSON bytes (including trailing newline).
 /// Returns None on Compacted — the caller should close the stream.
-fn encode_watch_event(event: &WatchEvent, api_version: &str, kind: &str) -> Option<Bytes> {
+pub(crate) fn encode_watch_event(
+    event: &WatchEvent,
+    api_version: &str,
+    kind: &str,
+) -> Option<Bytes> {
     let line = match event {
         WatchEvent::Added(obj) => {
             let object: serde_json::Value =
@@ -292,7 +301,19 @@ pub(crate) async fn watch_generic(
     initial_items: Option<(Vec<serde_json::Value>, u64)>,
     label_selector: Option<String>,
     field_selector: Option<String>,
+    allow_watch_bookmarks: bool,
 ) -> Result<Response, crate::status::StatusError> {
+    // Check compaction horizon BEFORE committing headers so clients get a synchronous HTTP 410.
+    // If from_rv > 0 and below the horizon, the revision is expired — return 410 immediately.
+    if from_revision > 0 {
+        let horizon = state.store.compaction_horizon();
+        if from_revision < horizon {
+            return Err(Status::expired(format!(
+                "too old resource version: {from_revision} (current compaction horizon: {horizon})"
+            )));
+        }
+    }
+
     let event_stream = state
         .store
         .watch(&prefix, from_revision)
@@ -396,17 +417,21 @@ pub(crate) async fn watch_generic(
                 }
 
                 _ = bookmark_tick.tick() => {
-                    let bookmark = format!(
-                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                    );
-                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
                 }
 
                 _ = &mut max_duration => {
-                    let bookmark = format!(
-                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                    );
-                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
                     break;
                 }
             }
@@ -612,6 +637,7 @@ pub async fn list_resource(
             initial,
             query.label_selector,
             query.field_selector,
+            query.allow_watch_bookmarks == Some(true),
         )
         .await;
     }
@@ -1062,6 +1088,7 @@ pub async fn list_namespaced_resource(
             initial,
             query.label_selector,
             query.field_selector,
+            query.allow_watch_bookmarks == Some(true),
         )
         .await;
     }
@@ -1655,6 +1682,7 @@ pub async fn core_list_resource(
                 initial,
                 query.label_selector,
                 query.field_selector,
+                query.allow_watch_bookmarks == Some(true),
             )
             .await
             .map(IntoResponse::into_response);
@@ -3230,6 +3258,7 @@ mod tests {
                 limit: None,
                 continue_token: None,
                 send_initial_events: None,
+                allow_watch_bookmarks: None,
             }),
         )
         .await
@@ -4071,6 +4100,156 @@ mod tests {
         assert!(
             object_matches_field_selector(&obj, "spec.nodeName=worker-1"),
             "unknown field selectors must be ignored (pass-through), not drop events"
+        );
+    }
+
+    // -- watch_generic: HTTP 410 before streaming for expired resourceVersion --
+
+    /// Regression test for mayor-e8fx: when a client opens a watch with a resourceVersion
+    /// below the compaction horizon, watch_generic must return HTTP 410 BEFORE committing
+    /// headers. Previously it emitted HTTP 200 then a JSON ERROR body, which clients cannot
+    /// detect synchronously (they see 200 and start parsing the stream).
+    #[tokio::test]
+    async fn watch_generic_returns_410_before_streaming_for_expired_rv() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        // Simulate compaction: horizon is 50, so any from_revision in 1..50 is expired.
+        store.set_compaction_horizon_for_test(50);
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // from_revision=10 is below horizon=50 — must get HTTP 410, not a streaming response.
+        let result = watch_generic(
+            state,
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            10, // expired
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "watch_generic must return Err(410) for expired resourceVersion, \
+             not Ok(streaming 200) — clients cannot detect failure from a stream header"
+        );
+        let err_resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(
+            err_resp.status(),
+            axum::http::StatusCode::GONE,
+            "HTTP 410 Gone must be returned synchronously so clients can retry without \
+             waiting for the stream body"
+        );
+    }
+
+    /// watch_generic with from_revision=0 (full watch) must NOT trigger the 410 check,
+    /// even when a compaction horizon exists. rv=0 means "watch from now", not from a
+    /// specific point, and cannot be expired.
+    #[tokio::test]
+    async fn watch_generic_rv_zero_does_not_trigger_410() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        store.set_compaction_horizon_for_test(50);
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // rv=0 is never expired — it means "watch all future events".
+        let result = watch_generic(
+            state,
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0, // not expired
+            None,
+            None,
+            None,
+            false,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "rv=0 (full watch) must not trigger the 410 expiry check, \
+             even when a compaction horizon exists"
+        );
+    }
+
+    // -- allowWatchBookmarks: CollectionQuery field and bookmark suppression --
+
+    /// allowWatchBookmarks=Some(true) enables periodic bookmarks.
+    /// allowWatchBookmarks absent or Some(false) suppresses them.
+    /// This is the Kubernetes watch protocol: clients must opt-in to bookmark traffic.
+    #[test]
+    fn allow_watch_bookmarks_controls_bookmark_emission() {
+        // When Some(true): bookmarks are allowed.
+        let q_true = CollectionQuery {
+            watch: Some(true),
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: Some(true),
+        };
+        assert_eq!(
+            q_true.allow_watch_bookmarks == Some(true),
+            true,
+            "allowWatchBookmarks=true must enable periodic bookmarks"
+        );
+
+        // When None (absent): bookmarks are suppressed.
+        let q_none = CollectionQuery {
+            watch: Some(true),
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+        };
+        assert_ne!(
+            q_none.allow_watch_bookmarks,
+            Some(true),
+            "absent allowWatchBookmarks must suppress periodic bookmarks"
+        );
+
+        // When Some(false): bookmarks are suppressed.
+        let q_false = CollectionQuery {
+            watch: Some(true),
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: Some(false),
+        };
+        assert_ne!(
+            q_false.allow_watch_bookmarks,
+            Some(true),
+            "allowWatchBookmarks=false must suppress periodic bookmarks"
         );
     }
 }

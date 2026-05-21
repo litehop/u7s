@@ -249,6 +249,18 @@ impl SqliteStore {
         // Best-effort broadcast; lagging receivers are dropped automatically.
         let _ = self.tx.send(event);
     }
+
+    /// Return the current compaction horizon: the lowest revision no longer in the ring.
+    /// If `from_revision > 0 && from_revision < compaction_horizon()`, the revision is expired.
+    pub fn compaction_horizon(&self) -> u64 {
+        self.compaction_horizon.load(Ordering::Relaxed)
+    }
+
+    /// Directly set the compaction horizon. Intended for tests that simulate compaction
+    /// without needing to overflow the ring buffer (which requires 1000+ writes).
+    pub fn set_compaction_horizon_for_test(&self, horizon: u64) {
+        self.compaction_horizon.store(horizon, Ordering::Relaxed);
+    }
 }
 
 fn open_conn(path: &str) -> Result<Connection> {

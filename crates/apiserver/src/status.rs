@@ -108,6 +108,20 @@ impl Status {
         )
     }
 
+    pub fn expired(message: String) -> StatusError {
+        StatusError(
+            StatusCode::GONE,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "Expired",
+                code: 410,
+            },
+        )
+    }
+
     pub fn internal(message: String) -> StatusError {
         StatusError(
             StatusCode::INTERNAL_SERVER_ERROR,
