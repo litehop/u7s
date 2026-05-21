@@ -210,12 +210,79 @@ async fn fetch_initial_events(
     Ok(Some((items, resp.revision)))
 }
 
+/// Test whether a JSON object matches a label selector string (`key=value,...`).
+/// Returns true if the selector is empty (pass-through) or all pairs match
+/// `metadata.labels` in the object. Used to filter live watch events.
+pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &str) -> bool {
+    if selector.is_empty() {
+        return true;
+    }
+    let labels = &obj["metadata"]["labels"];
+    for part in selector.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Only equality selectors are supported; skip malformed terms (conservative: pass through).
+        if let Some(eq_pos) = part.find('=') {
+            let key = part[..eq_pos].trim();
+            let val = part[eq_pos + 1..].trim();
+            if key.is_empty() {
+                continue;
+            }
+            if labels.get(key).and_then(|v| v.as_str()) != Some(val) {
+                return false;
+            }
+        }
+        // Unknown/malformed term: ignore (conservative, don't drop events).
+    }
+    true
+}
+
+/// Test whether a JSON object matches a field selector string (`key=value,...`).
+/// Supports `metadata.name` and `metadata.namespace` equality checks.
+/// Returns true if the selector is empty (pass-through) or all pairs match.
+/// Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
+pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &str) -> bool {
+    if selector.is_empty() {
+        return true;
+    }
+    for part in selector.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(eq_pos) = part.find('=') {
+            let field = part[..eq_pos].trim();
+            let value = part[eq_pos + 1..].trim();
+            match field {
+                "metadata.name" => {
+                    let name = obj["metadata"]["name"].as_str().unwrap_or("");
+                    if name != value {
+                        return false;
+                    }
+                }
+                "metadata.namespace" => {
+                    let ns = obj["metadata"]["namespace"].as_str().unwrap_or("");
+                    if ns != value {
+                        return false;
+                    }
+                }
+                // Unknown fields: ignore (conservative).
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
 /// Stream watch events for a given store prefix in NDJSON format.
 /// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
 ///
 /// When `initial_items` is Some, those items are emitted as ADDED events first
 /// (implementing the Kubernetes 1.27+ sendInitialEvents protocol), followed by a
 /// BOOKMARK, before streaming live changes from `from_revision`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn watch_generic(
     state: AppState,
     prefix: String,
@@ -223,6 +290,8 @@ pub(crate) async fn watch_generic(
     kind: String,
     from_revision: u64,
     initial_items: Option<(Vec<serde_json::Value>, u64)>,
+    label_selector: Option<String>,
+    field_selector: Option<String>,
 ) -> Result<Response, crate::status::StatusError> {
     let event_stream = state
         .store
@@ -230,6 +299,8 @@ pub(crate) async fn watch_generic(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
+    let label_selector = label_selector.unwrap_or_default();
+    let field_selector = field_selector.unwrap_or_default();
     let chunk_stream = async_stream::stream! {
         use futures_core::Stream;
         use std::pin::pin;
@@ -301,8 +372,24 @@ pub(crate) async fn watch_generic(
                                 break;
                             }
 
-                            if let Some(chunk) = encode_watch_event(&event, &api_version, &kind) {
-                                yield Ok::<Bytes, axum::BoxError>(chunk);
+                            // Apply labelSelector and fieldSelector: filter Added/Modified events.
+                            // Deleted events always pass through so clients can clean up.
+                            // Bookmark and Compacted are handled above.
+                            let skip = match &event {
+                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_slice(&obj.value)
+                                            .unwrap_or(serde_json::Value::Null);
+                                    !object_matches_label_selector(&parsed, &label_selector)
+                                        || !object_matches_field_selector(&parsed, &field_selector)
+                                }
+                                _ => false,
+                            };
+
+                            if !skip {
+                                if let Some(chunk) = encode_watch_event(&event, &api_version, &kind) {
+                                    yield Ok::<Bytes, axum::BoxError>(chunk);
+                                }
                             }
                         }
                     }
@@ -523,6 +610,8 @@ pub async fn list_resource(
             meta.kind.clone(),
             from_rv,
             initial,
+            query.label_selector,
+            query.field_selector,
         )
         .await;
     }
@@ -971,6 +1060,8 @@ pub async fn list_namespaced_resource(
             meta.kind.clone(),
             from_rv,
             initial,
+            query.label_selector,
+            query.field_selector,
         )
         .await;
     }
@@ -1555,9 +1646,18 @@ pub async fn core_list_resource(
             let initial =
                 fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true))
                     .await?;
-            return watch_generic(state, prefix, "v1".into(), "Pod".into(), from_rv, initial)
-                .await
-                .map(IntoResponse::into_response);
+            return watch_generic(
+                state,
+                prefix,
+                "v1".into(),
+                "Pod".into(),
+                from_rv,
+                initial,
+                query.label_selector,
+                query.field_selector,
+            )
+            .await
+            .map(IntoResponse::into_response);
         }
         let field_selector = query
             .field_selector
@@ -3835,6 +3935,142 @@ mod tests {
         assert_eq!(
             v["spec"]["renewTime"], "2026-05-21T00:00:00Z",
             "spec.renewTime must be updated by the SSA patch"
+        );
+    }
+
+    // -- mayor-6zbc: labelSelector and fieldSelector must filter live watch events --
+    //
+    // Before this fix, watch_generic ignored label_selector and field_selector entirely:
+    // all events were delivered to the client regardless of any selector in the request.
+    // This caused clients watching with labelSelector=app=foo to receive events for
+    // objects labelled app=bar, which is a correctness violation.
+
+    fn obj_with_label(name: &str, label_key: &str, label_val: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": name,
+                "namespace": "default",
+                "labels": { label_key: label_val }
+            }
+        })
+    }
+
+    /// Empty label selector is a pass-through: all objects must match.
+    /// Clients that don't specify a labelSelector must receive all events.
+    #[test]
+    fn label_selector_empty_matches_all() {
+        let obj = obj_with_label("foo-deploy", "app", "foo");
+        assert!(
+            object_matches_label_selector(&obj, ""),
+            "empty label selector must match all objects"
+        );
+    }
+
+    /// A label selector matching the object must return true.
+    /// This is the core invariant: app=foo must include the foo object.
+    #[test]
+    fn label_selector_matching_label_returns_true() {
+        let obj = obj_with_label("foo-deploy", "app", "foo");
+        assert!(
+            object_matches_label_selector(&obj, "app=foo"),
+            "app=foo must match an object labelled app=foo"
+        );
+    }
+
+    /// A label selector NOT matching the object must return false.
+    /// This verifies the fix: before mayor-6zbc, this would return true (no filtering).
+    #[test]
+    fn label_selector_non_matching_label_returns_false() {
+        let obj = obj_with_label("bar-deploy", "app", "bar");
+        assert!(
+            !object_matches_label_selector(&obj, "app=foo"),
+            "app=foo must NOT match an object labelled app=bar — \
+             before mayor-6zbc fix this was silently true (no filtering in watch)"
+        );
+    }
+
+    /// Multiple comma-separated label selectors are ANDed: all must match.
+    #[test]
+    fn label_selector_multiple_pairs_are_anded() {
+        let obj = serde_json::json!({
+            "metadata": { "labels": { "app": "foo", "env": "prod" } }
+        });
+        assert!(
+            object_matches_label_selector(&obj, "app=foo,env=prod"),
+            "all label pairs must match"
+        );
+        assert!(
+            !object_matches_label_selector(&obj, "app=foo,env=staging"),
+            "a non-matching pair must cause the whole selector to fail"
+        );
+    }
+
+    /// Object with no labels at all must not match a non-empty selector.
+    #[test]
+    fn label_selector_no_labels_does_not_match() {
+        let obj = serde_json::json!({ "metadata": {} });
+        assert!(
+            !object_matches_label_selector(&obj, "app=foo"),
+            "an object with no labels must not match a label selector"
+        );
+    }
+
+    /// Empty field selector is a pass-through.
+    #[test]
+    fn field_selector_empty_matches_all() {
+        let obj = serde_json::json!({ "metadata": { "name": "x", "namespace": "default" } });
+        assert!(
+            object_matches_field_selector(&obj, ""),
+            "empty field selector must match all objects"
+        );
+    }
+
+    /// metadata.name equality must match the correct name.
+    #[test]
+    fn field_selector_metadata_name_eq_matches() {
+        let obj = serde_json::json!({ "metadata": { "name": "my-cm" } });
+        assert!(
+            object_matches_field_selector(&obj, "metadata.name=my-cm"),
+            "metadata.name=my-cm must match an object named my-cm"
+        );
+    }
+
+    /// metadata.name equality must NOT match a different name.
+    /// Without the mayor-6zbc fix, watches with metadata.name= would deliver all events.
+    #[test]
+    fn field_selector_metadata_name_eq_excludes_wrong_name() {
+        let obj = serde_json::json!({ "metadata": { "name": "other-cm" } });
+        assert!(
+            !object_matches_field_selector(&obj, "metadata.name=my-cm"),
+            "metadata.name=my-cm must NOT match an object named other-cm — \
+             before mayor-6zbc fix this was silently true (no field filtering in watch)"
+        );
+    }
+
+    /// metadata.namespace equality must filter by namespace.
+    #[test]
+    fn field_selector_metadata_namespace_eq_matches() {
+        let obj = serde_json::json!({ "metadata": { "name": "x", "namespace": "kube-system" } });
+        assert!(object_matches_field_selector(
+            &obj,
+            "metadata.namespace=kube-system"
+        ));
+        assert!(!object_matches_field_selector(
+            &obj,
+            "metadata.namespace=default"
+        ));
+    }
+
+    /// Unknown field selectors are ignored (conservative: don't drop events).
+    #[test]
+    fn field_selector_unknown_field_is_ignored() {
+        let obj = serde_json::json!({ "metadata": { "name": "x" }, "spec": { "nodeName": "n1" } });
+        // spec.nodeName is not supported in object_matches_field_selector; must pass through.
+        assert!(
+            object_matches_field_selector(&obj, "spec.nodeName=worker-1"),
+            "unknown field selectors must be ignored (pass-through), not drop events"
         );
     }
 }

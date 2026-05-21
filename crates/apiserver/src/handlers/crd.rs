@@ -159,6 +159,8 @@ pub async fn list_crds(
             KIND.to_string(),
             query.resource_version.unwrap_or(0),
             None,
+            query.label_selector,
+            query.field_selector,
         )
         .await;
     }
