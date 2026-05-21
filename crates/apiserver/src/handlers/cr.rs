@@ -25,6 +25,10 @@ pub struct CrContext {
     pub kind: String,
     pub list_kind: String,
     pub namespaced: bool,
+    /// True when at least one served version declares `subresources: {status: {}}`.
+    /// Controls whether the main PUT/PATCH endpoint strips `.status` and whether
+    /// the `/status` subresource endpoint is active.
+    pub has_status_subresource: bool,
 }
 
 /// Find the CRD whose spec.group == group and spec.names.plural == plural.
@@ -69,10 +73,21 @@ pub async fn find_crd(
         } else {
             crd.spec.names.list_kind.clone()
         };
+        // A version has a status subresource when `subresources.status` is present
+        // and non-null in the CRD spec. Check all versions; if any declares it, the
+        // resource has a status subresource (all served versions must agree in practice).
+        let has_status_subresource = crd.spec.versions.iter().any(|v| {
+            v.subresources
+                .as_ref()
+                .and_then(|s| s.get("status"))
+                .map(|st| !st.is_null())
+                .unwrap_or(false)
+        });
         return Ok(CrContext {
             kind: crd.spec.names.kind.clone(),
             list_kind,
             namespaced,
+            has_status_subresource,
         });
     }
 
@@ -352,6 +367,14 @@ pub async fn replace_cr(
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
     resolve_cr_metadata(&existing, &mut obj);
 
+    // When the CRD declares a status subresource, the main PUT endpoint must not
+    // update .status — clients must use PUT /status for that.
+    if ctx.has_status_subresource {
+        if let Some(map) = obj.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
     let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
@@ -568,6 +591,14 @@ pub async fn replace_cr_namespaced(
         serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
     resolve_cr_metadata(&existing, &mut obj);
 
+    // When the CRD declares a status subresource, the main PUT endpoint must not
+    // update .status — clients must use PUT /status for that.
+    if ctx.has_status_subresource {
+        if let Some(map) = obj.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
     let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
@@ -669,8 +700,16 @@ pub async fn patch_cr(
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
+    let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    // When the CRD declares a status subresource, the main PATCH endpoint must not
+    // update .status — clients must use PATCH /status for that.
+    if ctx.has_status_subresource {
+        if let Some(map) = patch.as_object_mut() {
+            map.remove("status");
+        }
+    }
 
     crate::patch::merge_patch(&mut obj, &patch);
 
@@ -714,8 +753,16 @@ pub async fn patch_cr_namespaced(
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    let patch: serde_json::Value = serde_json::from_slice(&body)
+    let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    // When the CRD declares a status subresource, the main PATCH endpoint must not
+    // update .status — clients must use PATCH /status for that.
+    if ctx.has_status_subresource {
+        if let Some(map) = patch.as_object_mut() {
+            map.remove("status");
+        }
+    }
 
     crate::patch::merge_patch(&mut obj, &patch);
 
@@ -728,6 +775,134 @@ pub async fn patch_cr_namespaced(
 
     obj["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
     Ok(Json(obj))
+}
+
+// ---------------------------------------------------------------------------
+// Status subresource handlers for cluster-scoped CRs
+// ---------------------------------------------------------------------------
+
+/// PUT /apis/{group}/{version}/{plural}/{name}/status
+///
+/// Handles both registry-backed resources (falls through to the same logic as
+/// `generic::put_resource_status`) and custom resources (stored under
+/// `/registry/cr/...`). Only updates the `.status` field; all other fields
+/// including `.spec` are left unchanged.
+pub async fn put_cr_status(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    use crate::{keys::group_object_key, types::ResourceKey, util::parse_resource_version};
+    use u7s_store::Store;
+
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let body = extract_body(&body, ct);
+    let incoming: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // Determine the store key: registry resources use the group-object key;
+    // CRs use the /registry/cr/... key.
+    let registry_key = ResourceKey {
+        group: group.clone(),
+        version: version.clone(),
+        plural: plural.clone(),
+    };
+    let (key, kind) = if let Some(meta) = state.resource_registry.get(&registry_key) {
+        (
+            group_object_key(&group, &plural, None, &name),
+            meta.kind.clone(),
+        )
+    } else {
+        // CR fallback: find the CRD to get the kind name, use CR storage key.
+        let ctx = find_crd(&state, &group, &version, &plural).await?;
+        if ctx.namespaced {
+            return Err(Status::not_found(&name, &ctx.kind));
+        }
+        (
+            cr_store_key(&group, &version, &plural, None, &name),
+            ctx.kind,
+        )
+    };
+
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &kind))?;
+
+    let mut current: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+
+    // Replace only the .status field; leave .spec and .metadata unchanged.
+    match &incoming["status"] {
+        serde_json::Value::Null => {
+            if let Some(map) = current.as_object_mut() {
+                map.remove("status");
+            }
+        }
+        v => {
+            current["status"] = v.clone();
+        }
+    }
+
+    let rv_str = current["metadata"]["resourceVersion"].as_str();
+    let expected_rv = parse_resource_version(rv_str)?;
+    let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
+    let new_rv = state
+        .store
+        .put(&key, Bytes::from(bytes), expected_rv)
+        .await
+        .map_err(|e| store_err_cr(e, &name, &kind))?;
+
+    current["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+    Ok(Json(current))
+}
+
+/// GET /apis/{group}/{version}/{plural}/{name}/status
+///
+/// Returns the full object (status is embedded). For CRs this is identical to
+/// the main GET endpoint. For registry resources it delegates to get_resource.
+pub async fn get_cr_status(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    use crate::types::ResourceKey;
+
+    let registry_key = ResourceKey {
+        group: group.clone(),
+        version: version.clone(),
+        plural: plural.clone(),
+    };
+    if state.resource_registry.contains_key(&registry_key) {
+        // Delegate to the generic get handler for registry resources.
+        return super::generic::get_resource(State(state), Path((group, version, plural, name)))
+            .await;
+    }
+
+    // CR path.
+    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    if ctx.namespaced {
+        return Err(Status::not_found(&name, &ctx.kind));
+    }
+    let key = cr_store_key(&group, &version, &plural, None, &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        stored.value,
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1520,5 +1695,587 @@ mod tests {
                 "UID must be UUID v4 (Random), got: {uid}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Status subresource tests
+    // ---------------------------------------------------------------------------
+
+    /// Builds a namespaced CRD body with `subresources: {status: {}}` on the version.
+    fn namespaced_crd_with_status_subresource_bytes() -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "applications.argoproj.io" },
+                "spec": {
+                    "group": "argoproj.io",
+                    "names": {
+                        "plural": "applications",
+                        "singular": "application",
+                        "kind": "Application",
+                        "listKind": "ApplicationList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        {
+                            "name": "v1alpha1",
+                            "served": true,
+                            "storage": true,
+                            "subresources": { "status": {} }
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    /// Builds a cluster-scoped CRD body with `subresources: {status: {}}`.
+    fn cluster_crd_with_status_subresource_bytes() -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Cluster",
+                    "versions": [
+                        {
+                            "name": "v1",
+                            "served": true,
+                            "storage": true,
+                            "subresources": { "status": {} }
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    async fn install_crd_with_status_subresource(state: &AppState) {
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespaced_crd_with_status_subresource_bytes(),
+            )
+            .await
+            .is_ok(),
+            "install namespaced CRD with status subresource"
+        );
+    }
+
+    async fn install_cluster_crd_with_status_subresource(state: &AppState) {
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                cluster_crd_with_status_subresource_bytes(),
+            )
+            .await
+            .is_ok(),
+            "install cluster CRD with status subresource"
+        );
+    }
+
+    fn app_body_with_spec_and_status(name: &str, ns: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": name, "namespace": ns },
+                "spec": { "destination": { "namespace": "default" } },
+                "status": { "phase": "Running", "health": "Healthy" }
+            })
+            .to_string(),
+        )
+    }
+
+    // PUT to the main endpoint for a CR whose CRD declares a status subresource must
+    // NOT update .status. Only .spec changes must be persisted.
+    // This is the Kubernetes contract: controllers write spec via the main endpoint
+    // and status via the /status subresource endpoint — mixing the two causes races.
+    #[tokio::test]
+    async fn namespaced_main_put_strips_status_when_has_status_subresource() {
+        let state = make_state();
+        install_crd_with_status_subresource(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "my-app".to_string();
+
+        // Create without status so the stored object has no .status.
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // PUT to the main endpoint with both spec and status changes.
+        // The CRD has a status subresource, so only spec must be persisted.
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "destination": { "namespace": "production" } },
+                "status": { "phase": "Injected" }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            replace_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    group.clone(),
+                    version.clone(),
+                    ns.clone(),
+                    plural.clone(),
+                    name.clone(),
+                )),
+                axum::http::HeaderMap::new(),
+                update_body,
+            )
+            .await
+            .is_ok(),
+            "replace must succeed"
+        );
+
+        // Get the stored object and verify .status was NOT updated.
+        let resp = match get_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            obj["spec"]["destination"]["namespace"], "production",
+            "spec must be updated by main PUT"
+        );
+        assert!(
+            obj["status"].is_null() || obj.get("status").is_none(),
+            "status must NOT be persisted by main PUT when status subresource is declared"
+        );
+    }
+
+    // Regression: A CRD WITHOUT a status subresource must persist .status normally
+    // on the main PUT endpoint. This verifies the guard fires only when declared.
+    #[tokio::test]
+    async fn namespaced_main_put_persists_status_without_subresource() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "my-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "destination": { "namespace": "default" } },
+                "status": { "phase": "Running" }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            replace_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    group.clone(),
+                    version.clone(),
+                    ns.clone(),
+                    plural.clone(),
+                    name.clone(),
+                )),
+                axum::http::HeaderMap::new(),
+                update_body,
+            )
+            .await
+            .is_ok(),
+            "replace must succeed"
+        );
+
+        let resp = match get_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            obj["status"]["phase"], "Running",
+            "status must be persisted when no status subresource is declared"
+        );
+    }
+
+    // PUT to the /status endpoint for a namespaced CR must update ONLY .status;
+    // the .spec must remain unchanged. This is tested via put_namespaced_resource_status
+    // (the generic handler with CR fallback).
+    //
+    // The generic handler is tested here using its CR fallback path, which stores to
+    // /registry/cr/... This verifies the Argo CD use-case: Application controller writes
+    // Application.status via the status subresource.
+    #[tokio::test]
+    async fn namespaced_status_put_updates_only_status() {
+        let state = make_state();
+        install_crd_with_status_subresource(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "my-app".to_string();
+
+        // Create with a spec field so we can verify it's unchanged after status PUT.
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "destination": { "namespace": "default" } }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                create_body,
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // PUT to /status: only .status should change.
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns },
+                "spec": { "destination": { "namespace": "SHOULD_NOT_CHANGE" } },
+                "status": { "phase": "Healthy", "ready": true }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            super::super::generic::put_namespaced_resource_status(
+                State(state.clone()),
+                Path((
+                    group.clone(),
+                    version.clone(),
+                    ns.clone(),
+                    plural.clone(),
+                    name.clone(),
+                )),
+                axum::http::HeaderMap::new(),
+                status_body,
+            )
+            .await
+            .is_ok(),
+            "status PUT must succeed"
+        );
+
+        let resp = match get_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            obj["status"]["phase"], "Healthy",
+            "status.phase must be updated by status PUT"
+        );
+        assert_eq!(
+            obj["status"]["ready"], true,
+            "status.ready must be updated by status PUT"
+        );
+        assert_eq!(
+            obj["spec"]["destination"]["namespace"], "default",
+            "spec must NOT be changed by status PUT"
+        );
+    }
+
+    // PUT to /status for a cluster-scoped CR must update ONLY .status.
+    // This tests put_cr_status which adds the CR fallback missing from put_resource_status.
+    #[tokio::test]
+    async fn cluster_scoped_status_put_updates_only_status() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "my-widget".to_string();
+
+        // Create with a spec field.
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name },
+                "spec": { "color": "blue" }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                create_body,
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // PUT to /status: only .status should change.
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name },
+                "spec": { "color": "SHOULD_NOT_CHANGE" },
+                "status": { "ready": true, "replicas": 3 }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            put_cr_status(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone(),)),
+                axum::http::HeaderMap::new(),
+                status_body,
+            )
+            .await
+            .is_ok(),
+            "cluster-scoped status PUT must succeed"
+        );
+
+        let resp = match get_cr(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            obj["status"]["ready"], true,
+            "status.ready must be updated by status PUT"
+        );
+        assert_eq!(
+            obj["status"]["replicas"], 3,
+            "status.replicas must be updated by status PUT"
+        );
+        assert_eq!(
+            obj["spec"]["color"], "blue",
+            "spec must NOT be changed by status PUT"
+        );
+    }
+
+    // find_crd must detect has_status_subresource=true when the CRD spec declares
+    // subresources.status on any version.
+    #[tokio::test]
+    async fn find_crd_detects_status_subresource() {
+        let state = make_state();
+        install_crd_with_status_subresource(&state).await;
+
+        let ctx = match find_crd(&state, "argoproj.io", "v1alpha1", "applications").await {
+            Ok(c) => c,
+            Err(_) => panic!("find_crd must succeed"),
+        };
+
+        assert!(
+            ctx.has_status_subresource,
+            "has_status_subresource must be true when subresources.status is declared"
+        );
+    }
+
+    // find_crd must return has_status_subresource=false when the CRD does not declare
+    // the status subresource.
+    #[tokio::test]
+    async fn find_crd_no_status_subresource_when_not_declared() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let ctx = match find_crd(&state, "argoproj.io", "v1alpha1", "applications").await {
+            Ok(c) => c,
+            Err(_) => panic!("find_crd must succeed"),
+        };
+
+        assert!(
+            !ctx.has_status_subresource,
+            "has_status_subresource must be false when subresources.status is absent"
+        );
+    }
+
+    // Main PUT for a namespaced CR with status subresource must strip .status
+    // even when patched via merge-patch (PATCH /apis/...).
+    #[tokio::test]
+    async fn namespaced_main_patch_strips_status_when_has_status_subresource() {
+        let state = make_state();
+        install_crd_with_status_subresource(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "patch-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "spec": { "color": "green" },
+                "status": { "phase": "MUST_NOT_BE_STORED" }
+            })
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    group.clone(),
+                    version.clone(),
+                    ns.clone(),
+                    plural.clone(),
+                    name.clone(),
+                )),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "patch must succeed"
+        );
+
+        let resp = match get_cr_namespaced(
+            State(state.clone()),
+            Path((group, version, ns, plural, name)),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            obj["status"].is_null() || obj.get("status").is_none(),
+            "status must NOT be stored by main PATCH when status subresource declared"
+        );
     }
 }

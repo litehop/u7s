@@ -52,6 +52,10 @@ pub struct CustomResourceDefinitionVersion {
     pub storage: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
+    /// Subresources declared for this version. The `status` key, if present
+    /// and non-null, indicates that this version has a status subresource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subresources: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
