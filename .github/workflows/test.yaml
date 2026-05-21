@@ -51,4 +51,4 @@ jobs:
         run: cargo install cargo-llvm-cov --locked
 
       - name: Coverage
-        run: cargo llvm-cov --workspace --summary-only
+        run: cargo llvm-cov --workspace --summary-only --fail-under-lines 61
