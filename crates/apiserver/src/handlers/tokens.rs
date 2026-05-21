@@ -93,7 +93,7 @@ pub async fn create_token(
 
     // 2. Validate ServiceAccount exists.
     let sa_key = object_key("serviceaccounts", ns.as_str(), &sa_name);
-    let _sa = state
+    let sa = state
         .store
         .get(&sa_key)
         .await
@@ -107,7 +107,7 @@ pub async fn create_token(
         .ok_or_else(|| Status::internal("SA signing key not available".into()))?;
 
     // 4. Parse request body — accept empty body (kubectl omits it in some versions).
-    let spec = if body.is_empty() {
+    let mut spec = if body.is_empty() {
         TokenRequestSpec {
             expiration_seconds: default_expiration(),
             audiences: vec!["https://kubernetes.default.svc".to_owned()],
@@ -122,7 +122,16 @@ pub async fn create_token(
         spec
     };
 
-    // 5. Mint JWT.
+    // Clamp expiration to Kubernetes-specified range: [600, 172800] (10 min to 48 h).
+    spec.expiration_seconds = spec.expiration_seconds.clamp(600, 172_800);
+
+    // 5. Extract UID from the stored ServiceAccount object.
+    let uid = serde_json::from_slice::<serde_json::Value>(&sa.value)
+        .ok()
+        .and_then(|v| v["metadata"]["uid"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+
+    // 6. Mint JWT.
     let now = unix_now();
     let exp = now + spec.expiration_seconds;
     let claims = KubernetesClaims {
@@ -135,7 +144,7 @@ pub async fn create_token(
             namespace: ns.as_str().to_owned(),
             serviceaccount: SaRef {
                 name: sa_name.clone(),
-                uid: String::new(),
+                uid,
             },
         },
     };
@@ -144,7 +153,7 @@ pub async fn create_token(
     let token = jsonwebtoken::encode(&header, &claims, encoding_key)
         .map_err(|e| Status::internal(format!("JWT encode error: {e}")))?;
 
-    // 6. Build response.
+    // 7. Build response.
     let expiration_timestamp = secs_to_rfc3339(exp);
     let resp = serde_json::json!({
         "apiVersion": "authentication.k8s.io/v1",
@@ -248,5 +257,51 @@ mod tests {
         );
         assert_eq!(v["kubernetes.io"]["namespace"], "default");
         assert_eq!(v["kubernetes.io"]["serviceaccount"]["name"], "my-sa");
+    }
+
+    /// SA UID must appear in the kubernetes.io.serviceaccount.uid claim so that
+    /// token recipients can correlate the token to a specific SA object. An empty
+    /// UID breaks the Kubernetes token projection contract.
+    #[test]
+    fn claims_serialize_sa_uid() {
+        let claims = KubernetesClaims {
+            iss: "https://kubernetes.default.svc".to_owned(),
+            sub: "system:serviceaccount:kube-system:coredns".to_owned(),
+            aud: vec!["https://kubernetes.default.svc".to_owned()],
+            exp: 1_704_070_800,
+            iat: 1_704_067_200,
+            kubernetes_io: KubernetesClaimsExt {
+                namespace: "kube-system".to_owned(),
+                serviceaccount: SaRef {
+                    name: "coredns".to_owned(),
+                    uid: "abc-123".to_owned(),
+                },
+            },
+        };
+
+        let v: serde_json::Value = serde_json::to_value(&claims).unwrap();
+        assert_eq!(
+            v["kubernetes.io"]["serviceaccount"]["uid"],
+            "abc-123",
+            "SA UID must be propagated into JWT claims"
+        );
+    }
+
+    /// expiration_seconds must be clamped to [600, 172800] (Kubernetes spec).
+    /// A value below 600 must become 600; a value above 172800 must become 172800.
+    /// Without clamping, tokens could be minted with arbitrarily long or zero TTLs.
+    #[test]
+    fn expiration_seconds_clamped() {
+        assert_eq!(
+            u64::MAX.clamp(600, 172_800),
+            172_800,
+            "overflow must clamp to max"
+        );
+        assert_eq!(1u64.clamp(600, 172_800), 600, "underflow must clamp to min");
+        assert_eq!(
+            3600u64.clamp(600, 172_800),
+            3600,
+            "in-range value must be unchanged"
+        );
     }
 }
