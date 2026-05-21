@@ -880,8 +880,7 @@ mod tests {
         impl Service<Request<Body>> for ChunkedService {
             type Response = Response<Body>;
             type Error = std::convert::Infallible;
-            type Future =
-                Pin<Box<dyn Future<Output = Result<Response<Body>, Self::Error>> + Send>>;
+            type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, Self::Error>> + Send>>;
             fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
                 Poll::Ready(Ok(()))
             }
@@ -902,7 +901,10 @@ mod tests {
         let req = Request::builder()
             .method(Method::GET)
             .uri("/api/v1/nodes?fieldSelector=metadata.name%3Dci-node&watch=true")
-            .header("accept", "application/vnd.kubernetes.protobuf, application/json")
+            .header(
+                "accept",
+                "application/vnd.kubernetes.protobuf, application/json",
+            )
             .body(Body::empty())
             .unwrap();
 
@@ -928,7 +930,10 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert_eq!(te, "chunked", "watch stream transfer-encoding must be preserved");
+        assert_eq!(
+            te, "chunked",
+            "watch stream transfer-encoding must be preserved"
+        );
 
         // Body must be the original NDJSON, not a proto envelope.
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
