@@ -168,6 +168,35 @@ pub(crate) fn parse_key_name_ns(key: &str) -> (&str, &str) {
     }
 }
 
+/// Fetch the initial items for sendInitialEvents watch protocol.
+///
+/// When `send_initial_events` is true, lists all objects under `prefix` and returns
+/// them as ADDED events before the live watch stream, followed by a BOOKMARK with
+/// `k8s.io/initial-events-end=true`. This implements the Kubernetes 1.27+ informer
+/// startup protocol used by kubelet and controller-manager.
+///
+/// Returns `None` when `send_initial_events` is false (caller uses normal watch).
+async fn fetch_initial_events(
+    state: &AppState,
+    prefix: &str,
+    send_initial_events: bool,
+) -> Result<Option<(Vec<serde_json::Value>, u64)>, crate::status::StatusError> {
+    if !send_initial_events {
+        return Ok(None);
+    }
+    let resp = state
+        .store
+        .list(prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let items: Vec<serde_json::Value> = resp
+        .items
+        .iter()
+        .filter_map(|o| serde_json::from_slice(&o.value).ok())
+        .collect();
+    Ok(Some((items, resp.revision)))
+}
+
 /// Stream watch events for a given store prefix in NDJSON format.
 /// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
 ///
@@ -472,21 +501,8 @@ pub async fn list_resource(
             format!("{}/{}", group, version)
         };
         let from_rv = query.resource_version.unwrap_or(0);
-        let initial = if query.send_initial_events == Some(true) {
-            let resp = state
-                .store
-                .list(&prefix, ListOptions::default())
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let items: Vec<serde_json::Value> = resp
-                .items
-                .iter()
-                .filter_map(|o| serde_json::from_slice(&o.value).ok())
-                .collect();
-            Some((items, resp.revision))
-        } else {
-            None
-        };
+        let initial =
+            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
         return watch_generic(
             state,
             prefix,
@@ -929,21 +945,8 @@ pub async fn list_namespaced_resource(
             format!("{}/{}", group, version)
         };
         let from_rv = query.resource_version.unwrap_or(0);
-        let initial = if query.send_initial_events == Some(true) {
-            let resp = state
-                .store
-                .list(&prefix, ListOptions::default())
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            let items: Vec<serde_json::Value> = resp
-                .items
-                .iter()
-                .filter_map(|o| serde_json::from_slice(&o.value).ok())
-                .collect();
-            Some((items, resp.revision))
-        } else {
-            None
-        };
+        let initial =
+            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
         return watch_generic(
             state,
             prefix,
@@ -1519,21 +1522,9 @@ pub async fn core_list_resource(
         let prefix = crate::keys::cluster_list_prefix("pods");
         if query.watch == Some(true) {
             let from_rv = query.resource_version.unwrap_or(0);
-            let initial = if query.send_initial_events == Some(true) {
-                let resp = state
-                    .store
-                    .list(&prefix, ListOptions::default())
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                let items: Vec<serde_json::Value> = resp
-                    .items
-                    .iter()
-                    .filter_map(|o| serde_json::from_slice(&o.value).ok())
-                    .collect();
-                Some((items, resp.revision))
-            } else {
-                None
-            };
+            let initial =
+                fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true))
+                    .await?;
             return watch_generic(state, prefix, "v1".into(), "Pod".into(), from_rv, initial)
                 .await
                 .map(IntoResponse::into_response);
