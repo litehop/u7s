@@ -134,24 +134,13 @@ impl RbacIndex {
     /// Return all PolicyRules that apply to the caller in the given namespace.
     ///
     /// Includes rules from cluster bindings (always) and namespace bindings
-    /// whose namespace matches `namespace`.  If the caller is in system:masters,
-    /// returns a single wildcard rule instead of enumerating.
+    /// whose namespace matches `namespace`.
     pub fn enumerate_rules(
         &self,
         username: &str,
         groups: &[String],
         namespace: &str,
     ) -> Vec<PolicyRule> {
-        // system:masters fast path.
-        if groups.iter().any(|g| g == "system:masters") {
-            return vec![PolicyRule {
-                api_groups: vec!["*".to_owned()],
-                resources: vec!["*".to_owned()],
-                verbs: vec!["*".to_owned()],
-                resource_names: vec![],
-            }];
-        }
-
         let inner = self.inner.read().unwrap();
         let mut rules: Vec<PolicyRule> = Vec::new();
 
@@ -190,11 +179,6 @@ impl RbacIndex {
     }
 
     pub fn is_allowed(&self, req: &AuthzRequest<'_>) -> bool {
-        // system:masters unconditional bypass
-        if req.groups.iter().any(|g| g == "system:masters") {
-            return true;
-        }
-
         let inner = self.inner.read().unwrap();
 
         // Check cluster bindings first (namespace-agnostic).
@@ -251,11 +235,6 @@ pub fn user_holds_all_rules(
     role_rules: &[PolicyRule],
     rbac: &RbacIndex,
 ) -> bool {
-    // system:masters unconditionally holds all permissions.
-    if groups.iter().any(|g| g == "system:masters") {
-        return true;
-    }
-
     for rule in role_rules {
         // For each (api_group, resource, verb) combination in the rule, verify
         // the caller already has that permission.
@@ -487,9 +466,13 @@ mod tests {
     }
 
     #[test]
-    fn test_system_masters_bypass() {
-        // system:masters group must bypass ALL policy checks — even with no bindings.
+    fn test_system_masters_via_rbac() {
+        // system:masters access must be granted via a cluster-admin ClusterRoleBinding,
+        // NOT via a hardcoded bypass.  Removing the binding must cause denial — this test
+        // will fail if the bypass is re-introduced in code rather than through RBAC data.
         let idx = RbacIndex::new();
+
+        // Without any bindings, system:masters must be denied.
         let groups = vec!["system:masters".to_owned()];
         let r = req(
             "alice",
@@ -501,8 +484,40 @@ mod tests {
             None,
         );
         assert!(
+            !idx.is_allowed(&r),
+            "system:masters must be DENIED when no ClusterRoleBinding exists — \
+             the bypass must come from RBAC data, not from hardcoded logic"
+        );
+
+        // Seed cluster-admin ClusterRole and the system:masters binding.
+        let (admin_role_key, admin_role_val) = make_cluster_role(
+            "cluster-admin",
+            json!([{
+                "apiGroups": ["*"],
+                "resources": ["*"],
+                "verbs": ["*"]
+            }]),
+        );
+        let (admin_bind_key, admin_bind_val) = make_cluster_binding(
+            "system:masters",
+            "cluster-admin",
+            json!([{ "kind": "Group", "name": "system:masters" }]),
+        );
+        idx.apply_object(&admin_role_key, &admin_role_val);
+        idx.apply_object(&admin_bind_key, &admin_bind_val);
+
+        // Now system:masters must be allowed — via RBAC, not a bypass.
+        assert!(
             idx.is_allowed(&r),
-            "system:masters must always be allowed regardless of policy"
+            "system:masters must be allowed after the cluster-admin ClusterRoleBinding is loaded"
+        );
+
+        // Remove the binding — must go back to denied.
+        idx.remove_object(&admin_bind_key);
+        assert!(
+            !idx.is_allowed(&r),
+            "system:masters must be denied again after the ClusterRoleBinding is removed — \
+             proves access comes from RBAC state, not hardcoded logic"
         );
     }
 
@@ -1071,8 +1086,8 @@ mod tests {
 
     #[test]
     fn escalation_check_system_masters_always_passes() {
-        // Members of system:masters are exempt from escalation checks because
-        // they are unconditionally granted all permissions by the RBAC engine.
+        // Members of system:masters pass escalation checks because they hold all
+        // permissions via the cluster-admin ClusterRoleBinding — not via a hardcoded bypass.
         let idx = RbacIndex::new();
 
         let (admin_role_key, admin_role_val) = make_cluster_role(
@@ -1085,13 +1100,21 @@ mod tests {
         );
         idx.apply_object(&admin_role_key, &admin_role_val);
 
+        // Bind system:masters to cluster-admin (as seed_rbac() does at startup).
+        let (admin_bind_key, admin_bind_val) = make_cluster_binding(
+            "system:masters",
+            "cluster-admin",
+            json!([{ "kind": "Group", "name": "system:masters" }]),
+        );
+        idx.apply_object(&admin_bind_key, &admin_bind_val);
+
         let admin_rules = idx.cluster_role_rules("cluster-admin");
         let groups = vec!["system:masters".to_owned()];
 
-        // system:masters bypasses the escalation check entirely.
+        // system:masters holds all rules via RBAC — escalation check passes.
         assert!(
             user_holds_all_rules("admin-user", &groups, &admin_rules, &idx),
-            "system:masters members must always pass the escalation check"
+            "system:masters members must pass the escalation check via their cluster-admin binding"
         );
     }
 

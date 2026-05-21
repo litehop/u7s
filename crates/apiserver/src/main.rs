@@ -436,6 +436,39 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("seed ClusterRoleBinding system:node: {e}"))?;
     tracing::info!("seeded ClusterRoleBinding: system:node");
 
+    // ClusterRole: cluster-admin — wildcard access to all resources in all API groups.
+    let ca_role_key = keys::group_object_key(GROUP, "clusterroles", None, "cluster-admin");
+    let ca_role_body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": "cluster-admin", "uid": "00000000-0000-0000-0000-000000000012", "creationTimestamp": "2024-01-01T00:00:00Z" },
+        "rules": [
+            { "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }
+        ]
+    });
+    store
+        .put(&ca_role_key, Bytes::from(ca_role_body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed ClusterRole cluster-admin: {e}"))?;
+    tracing::info!("seeded ClusterRole: cluster-admin");
+
+    // ClusterRoleBinding: system:masters — grants cluster-admin to the system:masters group.
+    // This replaces the former hardcoded bypass in is_allowed() / user_holds_all_rules().
+    let ca_bind_key =
+        keys::group_object_key(GROUP, "clusterrolebindings", None, "system:masters");
+    let ca_bind_body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:masters", "uid": "00000000-0000-0000-0000-000000000013", "creationTimestamp": "2024-01-01T00:00:00Z" },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:masters" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "cluster-admin" }
+    });
+    store
+        .put(&ca_bind_key, Bytes::from(ca_bind_body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed ClusterRoleBinding system:masters: {e}"))?;
+    tracing::info!("seeded ClusterRoleBinding: system:masters");
+
     Ok(())
 }
 
@@ -759,6 +792,67 @@ mod tests {
         assert_eq!(subjects[0]["name"].as_str(), Some("system:nodes"));
         assert_eq!(crb["roleRef"]["name"].as_str(), Some("system:node"));
         assert_eq!(crb["roleRef"]["kind"].as_str(), Some("ClusterRole"));
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_creates_cluster_admin_and_system_masters_binding() {
+        // The cluster-admin ClusterRole and system:masters ClusterRoleBinding must exist after
+        // seeding.  This replaces the former hardcoded bypass in is_allowed(); if these objects
+        // are missing on startup, system:masters users will be denied all requests.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        // cluster-admin ClusterRole must exist with wildcard rules.
+        let ca_role_key = keys::group_object_key(GROUP, "clusterroles", None, "cluster-admin");
+        let ca_role_obj = store.get(&ca_role_key).await.expect("get must not fail");
+        assert!(
+            ca_role_obj.is_some(),
+            "ClusterRole cluster-admin must exist after seeding"
+        );
+        let ca_role: serde_json::Value =
+            serde_json::from_slice(&ca_role_obj.unwrap().value).expect("valid json");
+        assert_eq!(ca_role["kind"].as_str(), Some("ClusterRole"));
+        assert_eq!(ca_role["metadata"]["name"].as_str(), Some("cluster-admin"));
+        let rules = ca_role["rules"].as_array().expect("rules must be an array");
+        assert!(!rules.is_empty(), "cluster-admin must have at least one rule");
+        // Verify wildcard access: all rules must grant ["*"] on verbs.
+        for rule in rules {
+            let verbs = rule["verbs"].as_array().expect("verbs must be an array");
+            assert!(
+                verbs.iter().any(|v| v.as_str() == Some("*")),
+                "cluster-admin rules must grant wildcard verbs"
+            );
+        }
+
+        // system:masters ClusterRoleBinding must exist and bind to cluster-admin.
+        let ca_bind_key =
+            keys::group_object_key(GROUP, "clusterrolebindings", None, "system:masters");
+        let ca_bind_obj = store.get(&ca_bind_key).await.expect("get must not fail");
+        assert!(
+            ca_bind_obj.is_some(),
+            "ClusterRoleBinding system:masters must exist after seeding"
+        );
+        let ca_bind: serde_json::Value =
+            serde_json::from_slice(&ca_bind_obj.unwrap().value).expect("valid json");
+        assert_eq!(ca_bind["kind"].as_str(), Some("ClusterRoleBinding"));
+        assert_eq!(
+            ca_bind["metadata"]["name"].as_str(),
+            Some("system:masters")
+        );
+        let subjects = ca_bind["subjects"]
+            .as_array()
+            .expect("subjects must be an array");
+        assert_eq!(subjects.len(), 1, "must have exactly one subject");
+        assert_eq!(subjects[0]["kind"].as_str(), Some("Group"));
+        assert_eq!(subjects[0]["name"].as_str(), Some("system:masters"));
+        assert_eq!(
+            ca_bind["roleRef"]["name"].as_str(),
+            Some("cluster-admin"),
+            "ClusterRoleBinding must reference cluster-admin role"
+        );
+        assert_eq!(ca_bind["roleRef"]["kind"].as_str(), Some("ClusterRole"));
     }
 
     #[tokio::test]

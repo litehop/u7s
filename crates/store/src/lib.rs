@@ -301,7 +301,7 @@ fn put_sync(
         .query_row(
             "SELECT revision FROM objects WHERE key = ?1",
             params![key],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
         )
         .optional()?;
 
@@ -344,7 +344,7 @@ fn put_sync(
     let new_revision: u64 = conn.query_row(
         "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
         [],
-        |r| r.get(0),
+        |r| r.get::<_, i64>(0).map(|v| v as u64),
     )?;
 
     // 6. Stamp metadata.resourceVersion in the JSON value.
@@ -354,7 +354,7 @@ fn put_sync(
     conn.execute(
         "INSERT INTO objects (key, value, revision) VALUES (?1, ?2, ?3)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, revision = excluded.revision",
-        params![key, stamped_value.as_ref(), new_revision],
+        params![key, stamped_value.as_ref(), new_revision as i64],
     )?;
 
     conn.execute_batch("COMMIT")?;
@@ -368,7 +368,7 @@ fn delete_sync(conn: &Connection, key: &str, expected_revision: Option<u64>) -> 
         .query_row(
             "SELECT revision FROM objects WHERE key = ?1",
             params![key],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
         )
         .optional()?;
 
@@ -399,7 +399,7 @@ fn delete_sync(conn: &Connection, key: &str, expected_revision: Option<u64>) -> 
     let new_revision: u64 = conn.query_row(
         "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
         [],
-        |r| r.get(0),
+        |r| r.get::<_, i64>(0).map(|v| v as u64),
     )?;
 
     conn.execute("DELETE FROM objects WHERE key = ?1", params![key])?;
@@ -416,7 +416,7 @@ fn get_sync(conn: &Connection, key: &str) -> Result<Option<StoreObject>> {
                 Ok(StoreObject {
                     key: r.get::<_, String>(0)?,
                     value: Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                    revision: r.get::<_, u64>(2)?,
+                    revision: r.get::<_, i64>(2).map(|v| v as u64)?,
                 })
             },
         )
@@ -446,7 +446,7 @@ fn query_all(conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Result
             Ok(StoreObject {
                 key: r.get(0)?,
                 value: Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                revision: r.get(2)?,
+                revision: r.get::<_, i64>(2).map(|v| v as u64)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -590,7 +590,7 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
     let snapshot_revision: u64 = conn.query_row(
         "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
         [],
-        |r| r.get(0),
+        |r| r.get::<_, i64>(0).map(|v| v as u64),
     )?;
 
     conn.execute_batch("COMMIT")?;
