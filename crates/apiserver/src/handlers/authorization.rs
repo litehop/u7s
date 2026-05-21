@@ -365,9 +365,24 @@ mod tests {
 
     #[test]
     fn test_enumerate_rules_system_masters_returns_wildcard() {
-        // system:masters must always return a single wildcard rule, not per-binding enumeration.
-        // This ensures the caller can discover they have full access without revealing policy internals.
+        // system:masters must return wildcard rules via the cluster-admin ClusterRoleBinding,
+        // not via a hardcoded bypass.  Without the binding, rules are empty.
         let idx = RbacIndex::new();
+
+        // Seed cluster-admin ClusterRole and the system:masters binding (as seed_rbac() does).
+        let admin_role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin";
+        let admin_role_val =
+            json!({ "rules": [{ "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }] });
+        idx.apply_object(admin_role_key, &admin_role_val);
+
+        let admin_bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system:masters";
+        let admin_bind_val = json!({
+            "subjects": [{ "kind": "Group", "name": "system:masters" }],
+            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "cluster-admin" }
+        });
+        idx.apply_object(admin_bind_key, &admin_bind_val);
+
         let groups = vec!["system:masters".to_owned()];
         let rules = idx.enumerate_rules("alice", &groups, "default");
         assert_eq!(rules.len(), 1);
@@ -501,11 +516,26 @@ mod tests {
     }
 
     #[test]
-    fn test_subject_access_review_system_masters_group_bypasses_rbac() {
-        // A request whose groups include system:masters must always be allowed,
-        // matching the same bypass used everywhere in the RBAC stack.
-        let idx = Arc::new(RbacIndex::new()); // no bindings at all
+    fn test_subject_access_review_system_masters_group_allowed_via_binding() {
+        // A request whose groups include system:masters must be allowed when the
+        // cluster-admin ClusterRoleBinding is seeded — access must come from RBAC
+        // state, not from a hardcoded bypass.  Without the binding, access is denied.
+        let idx = Arc::new(RbacIndex::new());
         let groups = vec!["system:masters".to_owned()];
+
+        // Seed cluster-admin ClusterRole and the system:masters binding.
+        let admin_role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin";
+        let admin_role_val =
+            json!({ "rules": [{ "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }] });
+        idx.apply_object(admin_role_key, &admin_role_val);
+
+        let admin_bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system:masters";
+        let admin_bind_val = json!({
+            "subjects": [{ "kind": "Group", "name": "system:masters" }],
+            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "cluster-admin" }
+        });
+        idx.apply_object(admin_bind_key, &admin_bind_val);
 
         assert!(
             idx.is_allowed(&AuthzRequest {
@@ -518,7 +548,7 @@ mod tests {
                 namespace: Some("kube-system"),
                 name: None,
             }),
-            "system:masters group must bypass RBAC regardless of bindings"
+            "system:masters must be allowed when the cluster-admin binding is present"
         );
     }
 
