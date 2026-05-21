@@ -138,21 +138,42 @@ where
                 }
             };
 
+            // Discovery meta-types are NOT re-encoded as proto.
+            //
+            // client-go 1.36+ sends Accept: application/vnd.kubernetes.protobuf for
+            // discovery requests (GET /api, /api/v1, /apis, /apis/{group}/{version})
+            // but its discovery decoder path decodes these types from JSON, not from
+            // our Unknown-envelope-with-JSON-inside proto format. Re-encoding them as
+            // proto causes "proto: illegal wireType 6" in kubectl because the Go proto
+            // decoder encounters unexpected bytes when trying to decode the discovery
+            // response as a typed proto message.
+            let kind = json_val["kind"].as_str().unwrap_or("");
+            if matches!(
+                kind,
+                "APIVersions"
+                    | "APIGroupList"
+                    | "APIResourceList"
+                    | "APIGroupDiscoveryList"
+                    | "APIGroup"
+            ) {
+                tracing::debug!(
+                    uri = %uri,
+                    kind = %kind,
+                    "skip proto re-encode: discovery response"
+                );
+                let resp = Response::from_parts(parts, Body::from(body_bytes));
+                return Ok(resp);
+            }
+
             // Re-encode as protobuf.
             let proto_bytes = encode_proto_response(&json_val);
             let proto_len = proto_bytes.len();
-            let kind = json_val["kind"].as_str().unwrap_or("").to_string();
             tracing::info!(
                 uri = %uri,
                 accept = %accept,
                 kind = %kind,
                 proto_len = proto_len,
                 json_len = body_bytes.len(),
-                all_bytes = %proto_bytes
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<Vec<_>>()
-                    .join(""),
                 "proto re-encode"
             );
 
@@ -525,5 +546,67 @@ mod tests {
             envelope.content_type, "application/json",
             "contentType field must be 'application/json'"
         );
+    }
+
+    /// Discovery responses (APIVersions, APIGroupList, APIResourceList) must NOT be re-encoded
+    /// as proto even when the client sends Accept: protobuf.
+    ///
+    /// client-go 1.36+ sends Accept: application/vnd.kubernetes.protobuf for discovery
+    /// requests but its discovery decoder path expects JSON, not the Unknown-envelope-with-JSON
+    /// proto format. Re-encoding discovery responses as proto causes "proto: illegal wireType 6"
+    /// in kubectl because the Go proto decoder encounters unexpected bytes when trying to decode
+    /// the discovery response.
+    #[tokio::test]
+    async fn discovery_responses_not_re_encoded_as_proto() {
+        for (kind, body) in [
+            (
+                "APIVersions",
+                r#"{"kind":"APIVersions","apiVersion":"v1","versions":["v1"]}"#,
+            ),
+            (
+                "APIGroupList",
+                r#"{"kind":"APIGroupList","apiVersion":"v1","groups":[]}"#,
+            ),
+            (
+                "APIResourceList",
+                r#"{"kind":"APIResourceList","apiVersion":"v1","groupVersion":"v1","resources":[]}"#,
+            ),
+        ] {
+            let svc = FixedService {
+                status: StatusCode::OK,
+                content_type: "application/json",
+                body,
+            };
+            let mut layer_svc = ContentTypeLayer.layer(svc);
+
+            let resp = layer_svc.call(proto_accept_request()).await.unwrap();
+
+            // Content-Type must remain application/json — not converted to proto.
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(
+                ct, "application/json",
+                "discovery kind '{kind}' must not be re-encoded as proto even with proto Accept"
+            );
+
+            // Body must NOT start with the k8s proto magic.
+            let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                !resp_body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+                "discovery kind '{kind}' body must not start with k8s proto magic"
+            );
+            // Body must be the original JSON.
+            assert_eq!(
+                resp_body.as_ref(),
+                body.as_bytes(),
+                "discovery kind '{kind}' body must be the original JSON unchanged"
+            );
+        }
     }
 }
