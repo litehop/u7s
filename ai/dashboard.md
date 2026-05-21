@@ -1,38 +1,43 @@
 # Dashboard
 
-2026-05-21 — session active
+2026-05-21 04:02 UTC
 `bd prime` in a fresh Claude Code session
-Open beads: 6 (2 workers in flight)
+Open beads: 20
 
 ## What needs the operator now
 
-Nothing blocking — no decisions queued.
+Nothing blocking — no decisions queued, no PRs pending review.
 
-**Workers in flight:**
-- **proto encoder fix** (`mayor-cux`, worker `a5ae2b40566e07637`) — diagnosing wireType 6 in `proto.rs`; will push fix to PR #84 branch to re-trigger CI
-- **scheduler namespace-aware** (`mayor-chl`, worker `a8d6e55c0c72edca9`) — changing watch URL to cluster-wide `/api/v1/pods`
-
-**PRs pending CI:**
-- **PR #84** (`worker/agent-a5fbeadb79a66a443`) — protobuf response negotiation. Still failing `kubectl` with wireType 6. Fix in-flight above.
-- **PR #86** (`worker/seed-services-mayor-lmz`) — seeds `default/kubernetes` + `kube-system/kube-dns` Services. Lint ✓, rest pending.
+All open beads are unassigned and ready to dispatch:
+- **4 P1 security** (`mayor-5vlg`, `mayor-dx5m`, `mayor-huwm`, `mayor-woob`) — weak RNG for UIDs, unbounded watch DoS, request body OOM, timing oracle on token compare
+- **1 P1 feat** (`mayor-v43`) — pod lifecycle smoke test (create pod → assert Succeeded)
 
 ## Forward-looking
 
-1. **mayor-cux** (in-flight) → PR #84 goes green → merge → kubelet smoke unblocked
-2. **mayor-chl** (in-flight) → new PR → scheduler watches all namespaces
-3. **mayor-2dc** (P1) — CI: assert node reaches Ready. Dispatch after PR #84 merges.
-4. **mayor-v43** (P1) — CI: pod lifecycle smoke. Blocked on mayor-2dc.
-5. **mayor-6m3** (P2) — seed CoreDNS deployment. Blocked on PR #86 merge (mayor-lmz).
-6. **mayor-2ni** (P3) — sonobuoy audit. Blocked on pod lifecycle.
-7. **mayor-xy2** (P3) — CR schema validation. Deferred.
+**Security sprint is the natural next focus** — 4 P1 security beads are cold and ready:
+1. `mayor-woob` — fix non-constant-time static token comparison (easy, 1-liner)
+2. `mayor-huwm` — add request body size limit (axum layer, ~20 LoC)
+3. `mayor-5vlg` — replace weak UID RNG with CSPRNG (`uuid::v4` already used for CRs — apply to all paths)
+4. `mayor-dx5m` — per-client watch stream concurrency cap
+
+Then:
+5. `mayor-v43` (P1) — pod lifecycle CI smoke test
+6. `mayor-2ni` (P3) — sonobuoy non-disruptive conformance gap audit
+7. `mayor-zcur` (P2) — CRD status subresource for custom resources
 
 ## Recent progress
 
-- **PR #86 opened**: seeds `kubernetes` + `kube-dns` Services at startup (mayor-lmz). +2 tests, 262 total.
-- **6 roadmap beads filed** this session: mayor-2dc, mayor-v43, mayor-lmz, mayor-chl, mayor-6m3, mayor-2ni.
-- Full prior backlog drained: 50+ beads closed before this session.
-- Mayor switched to `main` branch (was on `fix/proto-content-length`).
+**This session (2026-05-21):**
+- **SA token projection** (`mayor-vacv`) — tokens now correctly projected into pods; default ServiceAccounts seeded in all four namespaces. Correctness fixes over two rounds of commits.
+- **kubectl version matrix** (`mayor-jyt3`) — CI now smoke-tests against kubectl 1.34, 1.35, and 1.36 in parallel.
+- **watch quality** (`mayor-1hc`, `mayor-e8fx`, `mayor-5kzn`) — 410 Gone on expired resourceVersion, bookmark suppression, watch event dedup.
+- **CoreDNS seeding** (`mayor-6m3`) — minimal CoreDNS Deployment seeded in `kube-system` at startup.
+- **Path traversal fix** — `validate_cli_path` added to block path injection from CLI-supplied paths.
+- **ApiSerializer trait** (`mayor-oayj`) — JSON/proto wire format abstraction.
+- **labelSelector/fieldSelector** propagated into live watch streams (`mayor-6zbc`).
+- **Coverage CI** auto-updates baseline daily; fails if coverage drops >5% below baseline.
+- ~96+ PRs merged total since project start.
 
 ## Stance
 
-Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI with `--merge`; flag security/API/architecture PRs for operator review first. Every bug fix ships with a regression test (Rule 14).
+Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; flag security/API/architecture PRs for operator review first.
