@@ -14,7 +14,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::{Object, ResourceKey},
-    util::parse_resource_version,
+    util::{content_type, parse_resource_version},
 };
 
 #[derive(Deserialize)]
@@ -579,11 +579,7 @@ pub async fn create_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -633,11 +629,7 @@ pub async fn replace_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -752,36 +744,26 @@ pub async fn delete_resource(
     .into_response())
 }
 
-pub async fn patch_resource(
-    State(state): State<AppState>,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
+/// Shared patch logic for cluster-scoped and namespaced resources.
+///
+/// `ns` is `None` for cluster-scoped resources and `Some(namespace)` for namespaced ones.
+/// The caller supplies the pre-computed `key` and resolved `meta`.
+async fn do_patch(
+    state: &AppState,
+    key: &str,
+    meta: &crate::types::ResourceMeta,
+    group: &str,
+    version: &str,
+    plural: &str,
+    ns: Option<&str>,
+    name: &str,
+    is_ssa: bool,
+    patch_type: PatchType,
     body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let patch_type = detect_patch_type(&headers)?;
-    let is_ssa = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .contains("apply-patch+yaml");
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::patch_cr(
-                State(state),
-                Path((group, version, plural, name)),
-                headers,
-                body,
-            )
-            .await
-            .map(IntoResponse::into_response);
-        }
-    };
-
-    let key = group_object_key(&group, &plural, None, &name);
+) -> Result<Response, crate::status::StatusError> {
     let stored_opt = state
         .store
-        .get(&key)
+        .get(key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -789,19 +771,21 @@ pub async fn patch_resource(
     if is_ssa && stored_opt.is_none() {
         let mut obj = Object::from_bytes(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-        obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
+        obj.body["metadata"]["name"] = serde_json::Value::String(name.to_string());
+        if let Some(namespace) = ns {
+            obj.body["metadata"]["namespace"] = serde_json::Value::String(namespace.to_string());
+        }
         stamp_metadata(&mut obj);
-        let new_rv = match state.store.put(&key, obj.to_bytes(), Some(0)).await {
+        let new_rv = match state.store.put(key, obj.to_bytes(), Some(0)).await {
             Ok(rv) => rv,
             Err(StoreError::AlreadyExists { .. }) => {
                 // Race: another writer created it; fall through to normal merge below.
-                // Refetch and continue as if it existed.
                 let stored = state
                     .store
-                    .get(&key)
+                    .get(key)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+                    .ok_or_else(|| Status::not_found(name, &meta.kind))?;
                 let mut current = Object::from_bytes(&stored.value)
                     .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
                 let patch: serde_json::Value = serde_json::from_slice(&body)
@@ -811,25 +795,25 @@ pub async fn patch_resource(
                 let expected_rv = parse_resource_version(current.resource_version())?;
                 let rv = state
                     .store
-                    .put(&key, current.to_bytes(), expected_rv)
+                    .put(key, current.to_bytes(), expected_rv)
                     .await
-                    .map_err(|e| store_err(e, &name, &meta.kind))?;
+                    .map_err(|e| store_err(e, name, &meta.kind))?;
                 current.set_resource_version(rv);
                 return Ok(Json(current.body).into_response());
             }
-            Err(e) => return Err(store_err(e, &name, &meta.kind)),
+            Err(e) => return Err(store_err(e, name, &meta.kind)),
         };
         obj.set_resource_version(new_rv);
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
-    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+    let stored = stored_opt.ok_or_else(|| Status::not_found(name, &meta.kind))?;
 
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let mut patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let mut patch: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     // Strip status from the patch on the main endpoint for resources with a status subresource.
     if meta.has_status_subresource {
@@ -859,11 +843,14 @@ pub async fn patch_resource(
     if deletion_ts_set && finalizers_empty {
         state
             .store
-            .delete(&key, None)
+            .delete(key, None)
             .await
-            .map_err(|e| store_err(e, &name, &meta.kind))?;
+            .map_err(|e| store_err(e, name, &meta.kind))?;
         if group == RBAC_GROUP {
-            let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+            let rbac_key = match ns {
+                None => rbac_cluster_key(group, version, plural, name),
+                Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
+            };
             state.rbac_index.remove_object(&rbac_key);
         }
         return Ok(Json(current.body).into_response());
@@ -872,16 +859,45 @@ pub async fn patch_resource(
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
         .store
-        .put(&key, current.to_bytes(), expected_rv)
+        .put(key, current.to_bytes(), expected_rv)
         .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
+        .map_err(|e| store_err(e, name, &meta.kind))?;
 
     current.set_resource_version(new_rv);
     if group == RBAC_GROUP {
-        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+        let rbac_key = match ns {
+            None => rbac_cluster_key(group, version, plural, name),
+            Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
+        };
         state.rbac_index.apply_object(&rbac_key, &current.body);
     }
     Ok(Json(current.body).into_response())
+}
+
+pub async fn patch_resource(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::patch_cr(
+                State(state),
+                Path((group, version, plural, name)),
+                headers,
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
+
+    let key = group_object_key(&group, &plural, None, &name);
+    do_patch(&state, &key, &meta, &group, &version, &plural, None, &name, is_ssa, patch_type, body).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,11 +1040,7 @@ pub async fn create_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1080,11 +1092,7 @@ pub async fn replace_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1206,11 +1214,7 @@ pub async fn patch_namespaced_resource(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = detect_patch_type(&headers)?;
-    let is_ssa = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .contains("apply-patch+yaml");
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1226,109 +1230,7 @@ pub async fn patch_namespaced_resource(
     };
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
-    let stored_opt = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    // SSA upsert: apply-patch+yaml on a missing resource creates it.
-    if is_ssa && stored_opt.is_none() {
-        let mut obj = Object::from_bytes(&body)
-            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-        obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
-        obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
-        stamp_metadata(&mut obj);
-        let new_rv = match state.store.put(&key, obj.to_bytes(), Some(0)).await {
-            Ok(rv) => rv,
-            Err(StoreError::AlreadyExists { .. }) => {
-                // Race: another writer created it; fall through to normal merge below.
-                let stored = state
-                    .store
-                    .get(&key)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-                let mut current = Object::from_bytes(&stored.value)
-                    .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-                let patch: serde_json::Value = serde_json::from_slice(&body)
-                    .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-                crate::patch::strategic_merge_patch(&mut current.body, &patch)
-                    .map_err(|e| Status::bad_request(e.to_string()))?;
-                let expected_rv = parse_resource_version(current.resource_version())?;
-                let rv = state
-                    .store
-                    .put(&key, current.to_bytes(), expected_rv)
-                    .await
-                    .map_err(|e| store_err(e, &name, &meta.kind))?;
-                current.set_resource_version(rv);
-                return Ok(Json(current.body).into_response());
-            }
-            Err(e) => return Err(store_err(e, &name, &meta.kind)),
-        };
-        obj.set_resource_version(new_rv);
-        return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
-    }
-
-    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let mut patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-
-    // Strip status from the patch on the main endpoint for resources with a status subresource.
-    if meta.has_status_subresource {
-        if let Some(map) = patch.as_object_mut() {
-            map.remove("status");
-        }
-    }
-
-    match patch_type {
-        PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
-        PatchType::StrategicMerge => {
-            crate::patch::strategic_merge_patch(&mut current.body, &patch)
-                .map_err(|e| Status::bad_request(e.to_string()))?;
-        }
-        PatchType::Json => {
-            apply_json_patch(&mut current.body, &patch)?;
-        }
-    }
-
-    // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
-    let deletion_ts_set = current.body["metadata"]["deletionTimestamp"].is_string();
-    let finalizers_empty = current.body["metadata"]["finalizers"]
-        .as_array()
-        .map(|arr| arr.is_empty())
-        .unwrap_or(true);
-
-    if deletion_ts_set && finalizers_empty {
-        state
-            .store
-            .delete(&key, None)
-            .await
-            .map_err(|e| store_err(e, &name, &meta.kind))?;
-        if group == RBAC_GROUP {
-            let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
-            state.rbac_index.remove_object(&rbac_key);
-        }
-        return Ok(Json(current.body).into_response());
-    }
-
-    let expected_rv = parse_resource_version(current.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
-
-    current.set_resource_version(new_rv);
-    if group == RBAC_GROUP {
-        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
-        state.rbac_index.apply_object(&rbac_key, &current.body);
-    }
-    Ok(Json(current.body).into_response())
+    do_patch(&state, &key, &meta, &group, &version, &plural, Some(&ns), &name, is_ssa, patch_type, body).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,11 +1264,7 @@ pub async fn put_resource_status(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let meta = lookup(&state, &group, &version, &plural)?.clone();
-    let ct = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, content_type(&headers));
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -1478,11 +1376,7 @@ pub async fn put_namespaced_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let body = extract_body(&body, ct);
+    let body = extract_body(&body, content_type(&headers));
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
@@ -1920,17 +1814,14 @@ enum PatchType {
 }
 
 fn detect_patch_type(headers: &HeaderMap) -> Result<PatchType, crate::status::StatusError> {
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if content_type.contains("application/strategic-merge-patch+json") {
+    let ct = content_type(headers);
+    if ct.contains("application/strategic-merge-patch+json") {
         return Ok(PatchType::StrategicMerge);
     }
-    if content_type.contains("application/merge-patch+json") {
+    if ct.contains("application/merge-patch+json") {
         return Ok(PatchType::Merge);
     }
-    if content_type.contains("application/json-patch+json") {
+    if ct.contains("application/json-patch+json") {
         return Ok(PatchType::Json);
     }
     // Treat server-side apply as strategic-merge-patch: we don't implement full SSA
@@ -1938,11 +1829,11 @@ fn detect_patch_type(headers: &HeaderMap) -> Result<PatchType, crate::status::St
     // identical to a strategic-merge-patch body.  This is sufficient for kubelet's
     // Lease and CSINode use cases; without this kubelet gets 415 and logs
     // "invalid JSON: expected value at line 1 column 1".
-    if content_type.contains("application/apply-patch+yaml") {
+    if ct.contains("application/apply-patch+yaml") {
         return Ok(PatchType::StrategicMerge);
     }
     Err(Status::unsupported_media_type(format!(
-        "unsupported media type '{content_type}'; use application/merge-patch+json, application/strategic-merge-patch+json, or application/json-patch+json"
+        "unsupported media type '{ct}'; use application/merge-patch+json, application/strategic-merge-patch+json, or application/json-patch+json"
     )))
 }
 
