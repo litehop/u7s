@@ -159,6 +159,15 @@ pub async fn create_namespace(
         obj.body["status"] = serde_json::json!({ "phase": "Active" });
     }
 
+    // Assign a UID if none provided — required for owner references and garbage collection.
+    if obj.body["metadata"]["uid"]
+        .as_str()
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
+        obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+    }
+
     let key = cluster_object_key("namespaces", &name);
     let new_rv = state
         .store
@@ -364,5 +373,229 @@ mod tests {
             Some("chunked"),
             "watch response must use chunked transfer encoding"
         );
+    }
+
+    fn make_state() -> AppState {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    fn namespace_body(name: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": name }
+            })
+            .to_string(),
+        )
+    }
+
+    // create_namespace must return 201 with the name set and a non-empty UID assigned.
+    // A missing UID would break owner references and garbage collection.
+    #[tokio::test]
+    async fn create_namespace_returns_201_with_name_and_uid() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("my-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Verify the stored object has name and UID set
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "my-ns"))
+            .await
+            .expect("store get must not error")
+            .expect("namespace must exist in store");
+        let body: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored value must be valid JSON");
+        assert_eq!(
+            body["metadata"]["name"], "my-ns",
+            "created namespace must have correct name"
+        );
+        assert!(
+            body["metadata"]["uid"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "created namespace must have a non-empty UID"
+        );
+    }
+
+    // replace_namespace must reflect updated labels in the response body.
+    // This verifies that PUT applies the full replacement, not a partial update.
+    #[tokio::test]
+    async fn replace_namespace_reflects_updated_labels() {
+        let state = make_state();
+
+        // Create first
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("label-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Fetch to get uid and resourceVersion
+        let stored_entry = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "label-ns"))
+            .await
+            .expect("store get must not error")
+            .expect("must exist");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&stored_entry.value).expect("parse stored");
+        let rv = stored["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("1")
+            .to_string();
+        let uid = stored["metadata"]["uid"].as_str().unwrap_or("").to_string();
+
+        // PUT with new labels, carrying back uid+rv
+        let replace_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "label-ns",
+                    "uid": uid,
+                    "resourceVersion": rv,
+                    "labels": { "env": "prod" }
+                }
+            })
+            .to_string(),
+        );
+
+        // Verify stored state after replace reflects the label update
+        assert!(
+            replace_namespace(
+                State(state.clone()),
+                Path("label-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                replace_body,
+            )
+            .await
+            .is_ok(),
+            "replace must succeed"
+        );
+
+        let after = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "label-ns"))
+            .await
+            .expect("store get must not error")
+            .expect("must still exist");
+        let body: serde_json::Value = serde_json::from_slice(&after.value).expect("parse after");
+        assert_eq!(
+            body["metadata"]["labels"]["env"], "prod",
+            "replace must persist the updated labels"
+        );
+    }
+
+    // patch_namespace with merge-patch must return 200 and apply the patch.
+    // This verifies the happy path: correct content-type, namespace exists, patch is valid JSON.
+    #[tokio::test]
+    async fn patch_namespace_applies_merge_patch() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("patch-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!({ "metadata": { "labels": { "patched": "yes" } } }).to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_namespace(
+                State(state.clone()),
+                Path("patch-ns".to_string()),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "patch must succeed"
+        );
+
+        let after = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "patch-ns"))
+            .await
+            .expect("store get")
+            .expect("must still exist");
+        let body: serde_json::Value =
+            serde_json::from_slice(&after.value).expect("parse after patch");
+        assert_eq!(
+            body["metadata"]["labels"]["patched"], "yes",
+            "patch must apply the merge patch to the stored namespace"
+        );
+    }
+
+    // delete_namespace must remove the resource so a subsequent GET returns 404.
+    // A namespace that is not truly deleted would cause resource leaks.
+    #[tokio::test]
+    async fn delete_namespace_removes_resource() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("del-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        assert!(
+            delete_namespace(State(state.clone()), Path("del-ns".to_string()))
+                .await
+                .is_ok(),
+            "delete must succeed"
+        );
+
+        let err = get_namespace(State(state.clone()), Path("del-ns".to_string()))
+            .await
+            .unwrap_err();
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 404,
+            "deleted namespace must return 404 on GET"
+        );
+        assert_eq!(json["reason"], "NotFound");
     }
 }

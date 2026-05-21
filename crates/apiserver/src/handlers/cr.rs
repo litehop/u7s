@@ -170,15 +170,7 @@ fn resolve_cr_metadata(stored: &serde_json::Value, incoming: &mut serde_json::Va
 }
 
 fn new_cr_uid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!(
-        "{:016x}-{:08x}-cr00-0000-000000000000",
-        d.as_secs(),
-        d.subsec_nanos()
-    )
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn store_err_cr(err: u7s_store::StoreError, name: &str, kind: &str) -> crate::status::StatusError {
@@ -650,7 +642,7 @@ fn validate_patch_content_type(headers: &HeaderMap) -> Result<(), crate::status:
 
     if content_type.contains("application/strategic-merge-patch+json") {
         return Err(Status::bad_request(
-            "strategic merge patch not supported in Phase 1; use application/merge-patch+json"
+            "strategic merge patch is not supported for custom resources; use application/merge-patch+json"
                 .into(),
         ));
     }
@@ -1490,5 +1482,40 @@ mod tests {
             Some("chunked"),
             "namespaced CR watch must use chunked transfer encoding"
         );
+    }
+
+    // validate_patch_content_type must reject strategic-merge-patch+json with a user-friendly
+    // message that contains no dev-era notes like "Phase". kubectl users see this message
+    // directly, so it must be production-appropriate.
+    #[test]
+    fn strategic_merge_patch_error_has_no_phase_reference() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/strategic-merge-patch+json".parse().unwrap(),
+        );
+        let err = validate_patch_content_type(&headers).unwrap_err();
+        let body = serde_json::to_string(&err.1).unwrap();
+        assert!(
+            body.to_lowercase().find("phase").is_none(),
+            "error message must not contain 'phase' (got: {body})"
+        );
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    // new_cr_uid must produce valid RFC-4122 v4 UUIDs. Non-standard UIDs break
+    // kubectl tools that parse UIDs (e.g. owner references, garbage collection).
+    #[test]
+    fn new_cr_uid_produces_valid_uuids() {
+        for _ in 0..100 {
+            let uid = new_cr_uid();
+            let parsed = uuid::Uuid::parse_str(&uid)
+                .unwrap_or_else(|_| panic!("new_cr_uid returned non-UUID: {uid}"));
+            assert_eq!(
+                parsed.get_version(),
+                Some(uuid::Version::Random),
+                "UID must be UUID v4 (Random), got: {uid}"
+            );
+        }
     }
 }
