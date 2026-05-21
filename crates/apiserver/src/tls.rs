@@ -139,10 +139,9 @@ fn load_or_generate_ca(
 
     if key_exists && cert_exists {
         // Load CA key from PEM.
-        let key_pem = std::fs::read_to_string(
-            validate_cli_path(std::path::Path::new(ca_key_path))?,
-        )
-        .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
+        let key_pem =
+            std::fs::read_to_string(validate_cli_path(std::path::Path::new(ca_key_path))?)
+                .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
         let ca_key =
             KeyPair::from_pem(&key_pem).map_err(|e| anyhow::anyhow!("parse CA key: {e}"))?;
 
