@@ -1438,6 +1438,108 @@ mod tests {
         assert!(recovered["metadata"]["creationTimestamp"].is_null());
     }
 
+    /// Regression test for mayor-ajtd: encode_proto_response must produce a valid Kubernetes
+    /// protobuf envelope for a realistic Node JSON with status conditions and addresses —
+    /// the exact response shape the kubelet receives when reading its own node status.
+    ///
+    /// This test verifies that encode_proto_response itself does NOT produce wireType 7.
+    /// The actual kubelet failure ("proto: illegal wireType 7") arises because client-go's
+    /// typed Node proto decoder ignores the contentType=application/json field inside the
+    /// Unknown envelope and tries to decode Unknown.raw as a typed proto Node. The JSON bytes
+    /// (e.g. '/' in CIDRs, 'o' in "conditions") happen to have low 3 bits = 0b111 at the
+    /// position the decoder is reading, producing wireType 7. The fix is to not re-encode
+    /// Node responses at all (see content_type.rs). This test guards the encoder itself:
+    /// the proto envelope we produce is structurally correct even if client-go won't use
+    /// the contentType field.
+    #[test]
+    fn encode_proto_response_no_illegal_wire_types_node_with_status() {
+        let val = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "ci-node",
+                "uid": "abc-def-123",
+                "resourceVersion": "7",
+                "creationTimestamp": "2026-05-21T00:00:00Z"
+            },
+            "spec": {
+                "podCIDR": "10.244.0.0/24",
+                "podCIDRs": ["10.244.0.0/24"],
+                "providerID": "kind://docker/local/local-worker"
+            },
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "lastHeartbeatTime": "2026-05-21T00:01:00Z",
+                        "lastTransitionTime": "2026-05-21T00:00:30Z",
+                        "reason": "KubeletReady",
+                        "message": "kubelet is posting ready status"
+                    },
+                    {
+                        "type": "MemoryPressure",
+                        "status": "False",
+                        "reason": "KubeletHasSufficientMemory"
+                    }
+                ],
+                "addresses": [
+                    {"type": "InternalIP", "address": "192.168.1.10"},
+                    {"type": "Hostname", "address": "ci-node"}
+                ],
+                "nodeInfo": {
+                    "machineID": "abc123",
+                    "systemUUID": "abc123",
+                    "bootID": "xyz",
+                    "kernelVersion": "6.1.0",
+                    "osImage": "Ubuntu 22.04",
+                    "containerRuntimeVersion": "containerd://1.7.0",
+                    "kubeletVersion": "v1.36.0",
+                    "kubeProxyVersion": "v1.36.0",
+                    "operatingSystem": "linux",
+                    "architecture": "amd64"
+                }
+            }
+        });
+
+        let encoded = encode_proto_response(&val);
+        assert_eq!(
+            &encoded[..4],
+            &[0x6b, 0x38, 0x73, 0x00],
+            "must start with k8s proto magic"
+        );
+
+        // Walk every tag in the Unknown envelope: no wireType 7 (or 3, 4, 6) allowed.
+        // wireType 7 = 0b111 in low 3 bits; any such byte as a proto tag is illegal.
+        let fields = assert_valid_wire_types(&encoded[4..]);
+
+        let field_numbers: Vec<u64> = fields.iter().map(|(fn_, _, _)| *fn_).collect();
+        assert!(field_numbers.contains(&1), "TypeMeta field must be present");
+        assert!(
+            field_numbers.contains(&2),
+            "raw Node JSON field must be present"
+        );
+        assert!(
+            field_numbers.contains(&4),
+            "contentType field must be present"
+        );
+
+        // The envelope must be decodable and the raw field must be valid JSON.
+        let env = decode_k8s_proto_envelope(&encoded).expect("must decode as k8s envelope");
+        assert_eq!(env.content_type, "application/json");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&env.raw).expect("raw field must be valid JSON");
+        assert_eq!(recovered["kind"], "Node");
+        assert_eq!(recovered["metadata"]["name"], "ci-node");
+        assert_eq!(recovered["spec"]["podCIDR"], "10.244.0.0/24");
+        assert_eq!(recovered["status"]["conditions"][0]["type"], "Ready");
+        assert_eq!(recovered["status"]["conditions"][0]["status"], "True");
+        assert_eq!(
+            recovered["status"]["addresses"][0]["address"],
+            "192.168.1.10"
+        );
+    }
+
     /// encode_proto_response must produce a valid proto envelope for the /version response.
     /// This JSON has no apiVersion or kind fields, resulting in empty TypeMeta strings.
     /// Empty strings still produce valid LEN-encoded fields with zero-length payloads.
