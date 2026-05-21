@@ -20,6 +20,7 @@ use tower_service::Service;
 
 use crate::rbac::{AuthzRequest, RbacIndex};
 use crate::status::Status;
+use crate::util::validate_cli_path;
 
 // ---------------------------------------------------------------------------
 // PeerCertificate — DER bytes of the TLS client certificate leaf cert
@@ -65,7 +66,7 @@ struct SaClaims {
 /// File format (one line per entry, comments and empty lines skipped):
 ///   <token>,<username>,<uid>,<group1>[,<group2>...]
 pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> {
-    let file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(validate_cli_path(std::path::Path::new(path))?)?;
     let mut map = HashMap::new();
 
     for (lineno, line) in BufReader::new(file).lines().enumerate() {
@@ -271,10 +272,19 @@ fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
         Ok(data) => {
             let sub = data.claims.sub;
             tracing::debug!("SA JWT verified: sub={sub}");
+            // sub format: system:serviceaccount:{ns}:{name}
+            let groups = {
+                let mut g = vec!["system:serviceaccounts".to_owned()];
+                let parts: Vec<&str> = sub.splitn(4, ':').collect();
+                if parts.len() == 4 {
+                    g.push(format!("system:serviceaccounts:{}", parts[2]));
+                }
+                g
+            };
             Some(UserInfo {
                 username: sub,
                 uid: String::new(),
-                groups: vec!["system:serviceaccounts".to_owned()],
+                groups,
             })
         }
         Err(e) => {
@@ -753,6 +763,34 @@ mod tests {
                 assert!(
                     u.groups.contains(&"system:serviceaccounts".to_owned()),
                     "SA group must be present"
+                );
+            }
+            AuthnResult::BadToken => panic!("valid SA JWT must not be rejected"),
+        }
+    }
+
+    /// SA JWT authentication must produce both the broad group (system:serviceaccounts)
+    /// and the namespace-scoped group (system:serviceaccounts:{ns}). The namespace-scoped
+    /// group is required for RBAC policies that grant access to SAs in a specific namespace.
+    #[test]
+    fn test_sa_jwt_namespace_scoped_group() {
+        let (enc, dec) = test_rsa_keypair();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:kube-system:coredns", 3600);
+        let req = make_req(
+            Method::GET,
+            "/api/v1/pods",
+            Some(&format!("Bearer {token}")),
+        );
+        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
+            AuthnResult::Identified(u) => {
+                assert!(
+                    u.groups.contains(&"system:serviceaccounts".to_owned()),
+                    "broad SA group must be present"
+                );
+                assert!(
+                    u.groups
+                        .contains(&"system:serviceaccounts:kube-system".to_owned()),
+                    "namespace-scoped SA group must be present"
                 );
             }
             AuthnResult::BadToken => panic!("valid SA JWT must not be rejected"),

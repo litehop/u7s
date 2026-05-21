@@ -6,6 +6,7 @@ use rustls::{
 };
 use std::sync::Arc;
 
+use crate::util::validate_cli_path;
 use crate::Args;
 
 // ---------------------------------------------------------------------------
@@ -35,7 +36,7 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
     // If the private key already exists, load it and re-derive the public key.
     if std::path::Path::new(sa_key_path).exists() {
         use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
-        let pem = std::fs::read(sa_key_path)?;
+        let pem = std::fs::read(validate_cli_path(std::path::Path::new(sa_key_path))?)?;
         let pem_str = std::str::from_utf8(&pem)
             .map_err(|e| anyhow::anyhow!("SA key file is not valid UTF-8: {e}"))?;
         let private_key = RsaPrivateKey::from_pkcs8_pem(pem_str)
@@ -65,8 +66,14 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
         .to_public_key_pem(LineEnding::LF)
         .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
 
-    std::fs::write(sa_key_path, private_pem.as_bytes())?;
-    std::fs::write(sa_pub_path, public_pem.as_bytes())?;
+    std::fs::write(
+        validate_cli_path(std::path::Path::new(sa_key_path))?,
+        private_pem.as_bytes(),
+    )?;
+    std::fs::write(
+        validate_cli_path(std::path::Path::new(sa_pub_path))?,
+        public_pem.as_bytes(),
+    )?;
     tracing::info!("SA signing key written to {sa_key_path}");
 
     Ok(SaKeys {
@@ -132,13 +139,15 @@ fn load_or_generate_ca(
 
     if key_exists && cert_exists {
         // Load CA key from PEM.
-        let key_pem = std::fs::read_to_string(ca_key_path)
-            .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
+        let key_pem = std::fs::read_to_string(
+            validate_cli_path(std::path::Path::new(ca_key_path))?,
+        )
+        .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
         let ca_key =
             KeyPair::from_pem(&key_pem).map_err(|e| anyhow::anyhow!("parse CA key: {e}"))?;
 
         // Load the persisted CA cert DER (stable — handed to TlsMaterial as-is).
-        let ca_cert_der = std::fs::read(ca_cert_path)
+        let ca_cert_der = std::fs::read(validate_cli_path(std::path::Path::new(ca_cert_path))?)
             .map_err(|e| anyhow::anyhow!("read CA cert {ca_cert_path}: {e}"))?;
 
         // Reconstruct an rcgen Certificate using the loaded key and fixed params.
@@ -174,10 +183,16 @@ fn load_or_generate_ca(
     let ca_cert_der = ca_cert.der().to_vec();
 
     // Persist: key as PEM, cert as DER.
-    std::fs::write(ca_key_path, ca_key.serialize_pem())
-        .map_err(|e| anyhow::anyhow!("write CA key {ca_key_path}: {e}"))?;
-    std::fs::write(ca_cert_path, &ca_cert_der)
-        .map_err(|e| anyhow::anyhow!("write CA cert {ca_cert_path}: {e}"))?;
+    std::fs::write(
+        validate_cli_path(std::path::Path::new(ca_key_path))?,
+        ca_key.serialize_pem(),
+    )
+    .map_err(|e| anyhow::anyhow!("write CA key {ca_key_path}: {e}"))?;
+    std::fs::write(
+        validate_cli_path(std::path::Path::new(ca_cert_path))?,
+        &ca_cert_der,
+    )
+    .map_err(|e| anyhow::anyhow!("write CA cert {ca_cert_path}: {e}"))?;
 
     Ok((ca_key, ca_cert, ca_cert_der))
 }
@@ -367,7 +382,7 @@ pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, _args: &Args) -> anyhow::
     // The cert SANs already include the advertise-address host so connections from either
     // address are valid.
     let kc = Kubeconfig::new("https://127.0.0.1:6443", tls);
-    std::fs::write(path, kc.to_yaml())?;
+    std::fs::write(validate_cli_path(std::path::Path::new(path))?, kc.to_yaml())?;
     tracing::info!("kubeconfig written to {path}");
     Ok(())
 }

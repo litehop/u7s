@@ -4,6 +4,21 @@ use u7s_store::StoreError;
 
 use crate::{proto, status::Status};
 
+/// Validates a filesystem path supplied at the CLI boundary.
+/// Rejects paths containing `..` components to prevent traversal.
+/// Returns the path unchanged if valid.
+pub fn validate_cli_path(path: &std::path::Path) -> anyhow::Result<&std::path::Path> {
+    for component in path.components() {
+        if component == std::path::Component::ParentDir {
+            return Err(anyhow::anyhow!(
+                "path '{}' contains '..' which is not allowed",
+                path.display()
+            ));
+        }
+    }
+    Ok(path)
+}
+
 /// Map a `StoreError` to the corresponding HTTP `StatusCode`.
 ///
 /// Handlers that need a richer error message (including resource name/kind) call
@@ -204,6 +219,47 @@ mod tests {
     #[test]
     fn rfc3339_leap_year_feb29() {
         assert_eq!(secs_to_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    // -- validate_cli_path --
+
+    /// A normal absolute path without any `..` must be accepted unchanged.
+    /// This is the common case: operator supplies a concrete path at startup.
+    #[test]
+    fn validate_cli_path_accepts_absolute() {
+        let p = std::path::Path::new("/var/lib/u7s/ca.key");
+        let result = validate_cli_path(p);
+        assert!(result.is_ok(), "absolute path without '..' must be accepted");
+        assert_eq!(result.unwrap(), p);
+    }
+
+    /// A relative path without `..` must be accepted unchanged.
+    /// Operators commonly supply relative paths like `./sa.key`.
+    #[test]
+    fn validate_cli_path_accepts_relative_without_dotdot() {
+        let p = std::path::Path::new("./sa.key");
+        let result = validate_cli_path(p);
+        assert!(result.is_ok(), "relative path without '..' must be accepted");
+        assert_eq!(result.unwrap(), p);
+    }
+
+    /// A path with a `..` component must be rejected.
+    /// This is the path-traversal attack vector CodeQL flagged: an operator (or
+    /// attacker who controls CLI args) could supply `../../etc/passwd` to read
+    /// outside the intended directory.
+    #[test]
+    fn validate_cli_path_rejects_dotdot() {
+        let p = std::path::Path::new("/var/lib/u7s/../../etc/passwd");
+        let result = validate_cli_path(p);
+        assert!(
+            result.is_err(),
+            "path with '..' component must be rejected to prevent traversal"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains(".."),
+            "error message must mention the traversal component, got: {msg}"
+        );
     }
 
     /// utc_now_rfc3339 must return a plausible timestamp (after 2024-01-01).
