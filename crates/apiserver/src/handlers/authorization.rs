@@ -188,8 +188,43 @@ struct SubjectAccessReviewResponse {
 
 pub async fn subject_access_review(
     State(state): State<AppState>,
+    Extension(caller): Extension<UserInfo>,
     Json(body): Json<SubjectAccessReviewRequest>,
 ) -> impl IntoResponse {
+    // Defense-in-depth privilege check: only callers who have `create` on
+    // `subjectaccessreviews` in the authorization.k8s.io group (or are in
+    // system:masters) may use SAR to probe arbitrary subjects.
+    //
+    // The auth middleware already enforces this at the HTTP layer, but we also
+    // check here so that the restriction is visible in the handler, and so it
+    // remains in effect even if route ordering or middleware ever changes.
+    let caller_allowed = caller.groups.iter().any(|g| g == "system:masters")
+        || state.rbac_index.is_allowed(&crate::rbac::AuthzRequest {
+            username: &caller.username,
+            groups: &caller.groups,
+            verb: "create",
+            api_group: "authorization.k8s.io",
+            resource: "subjectaccessreviews",
+            subresource: "",
+            namespace: None,
+            name: None,
+        });
+
+    if !caller_allowed {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": "subjectaccessreviews.authorization.k8s.io is forbidden: User does not have create permission",
+                "reason": "Forbidden",
+                "code": 403
+            })),
+        )
+            .into_response();
+    }
+
     let spec = body.spec;
     let allowed = if let Some(attrs) = spec.resource_attributes {
         let ns = if attrs.namespace.is_empty() {
@@ -223,7 +258,7 @@ pub async fn subject_access_review(
         status: AccessReviewStatus { allowed },
     };
 
-    (StatusCode::CREATED, Json(resp))
+    (StatusCode::CREATED, Json(resp)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -524,5 +559,112 @@ mod tests {
         let map = HashMap::new();
         let result = authenticate_token("unknown-token", &map, None);
         assert!(result.is_none(), "unrecognized token must not authenticate");
+    }
+
+    // ---------------------------------------------------------------------------
+    // SubjectAccessReview privilege gate tests (mayor-mzcw)
+    // ---------------------------------------------------------------------------
+
+    /// Extract the privilege-check logic from subject_access_review into a
+    /// pure function so it can be unit-tested without spinning up a real handler.
+    ///
+    /// Returns `true` if the caller is permitted to use SAR (create on
+    /// subjectaccessreviews in authorization.k8s.io, or system:masters).
+    fn caller_may_use_sar(username: &str, groups: &[String], idx: &RbacIndex) -> bool {
+        groups.iter().any(|g| g == "system:masters")
+            || idx.is_allowed(&AuthzRequest {
+                username,
+                groups,
+                verb: "create",
+                api_group: "authorization.k8s.io",
+                resource: "subjectaccessreviews",
+                subresource: "",
+                namespace: None,
+                name: None,
+            })
+    }
+
+    #[test]
+    fn sar_privilege_gate_denies_unprivileged_user() {
+        // An authenticated user with no bindings must not be permitted to use SAR
+        // to probe other users' permissions.  Allowing any authenticated user to
+        // call SAR would leak authorization policy (can Alice delete secrets?  can
+        // Bob create deployments?) to adversaries who have obtained any valid token.
+        let idx = RbacIndex::new(); // no bindings — nobody is privileged
+        let groups: Vec<String> = vec![];
+
+        assert!(
+            !caller_may_use_sar("unprivileged-user", &groups, &idx),
+            "unprivileged user must not be allowed to use SAR — no binding grants create on subjectaccessreviews"
+        );
+    }
+
+    #[test]
+    fn sar_privilege_gate_denies_user_with_unrelated_binding() {
+        // A user who has a legitimate binding (e.g. pod-reader) but no
+        // `create subjectaccessreviews` permission must still be denied.
+        // This ensures a narrow binding cannot be used to escalate to SAR probing.
+        let idx = make_index_with_cluster_role_binding(
+            serde_json::json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get", "list"]
+            }]),
+            "pod-reader-user",
+        );
+        let groups: Vec<String> = vec![];
+
+        assert!(
+            !caller_may_use_sar("pod-reader-user", &groups, &idx),
+            "pod-reader binding must not grant SAR access — create on subjectaccessreviews is distinct"
+        );
+    }
+
+    #[test]
+    fn sar_privilege_gate_permits_system_masters() {
+        // system:masters bypasses all RBAC checks and must be allowed to use SAR
+        // even with no bindings in the index.
+        let idx = RbacIndex::new();
+        let groups = vec!["system:masters".to_owned()];
+
+        assert!(
+            caller_may_use_sar("admin", &groups, &idx),
+            "system:masters must always be permitted to use SAR"
+        );
+    }
+
+    #[test]
+    fn sar_privilege_gate_permits_user_with_explicit_sar_binding() {
+        // A user explicitly granted `create subjectaccessreviews` in
+        // authorization.k8s.io must be permitted to call SAR.
+        let idx = RbacIndex::new();
+
+        // Seed a ClusterRole + binding that grants SAR.
+        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/sar-user";
+        let role_val = serde_json::json!({
+            "rules": [{
+                "apiGroups": ["authorization.k8s.io"],
+                "resources": ["subjectaccessreviews"],
+                "verbs": ["create"]
+            }]
+        });
+        idx.apply_object(role_key, &role_val);
+
+        let bind_key = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/sar-user-binding";
+        let bind_val = serde_json::json!({
+            "subjects": [{ "kind": "User", "name": "sar-delegator" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "sar-user"
+            }
+        });
+        idx.apply_object(bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+        assert!(
+            caller_may_use_sar("sar-delegator", &groups, &idx),
+            "user with explicit create subjectaccessreviews binding must be permitted"
+        );
     }
 }
