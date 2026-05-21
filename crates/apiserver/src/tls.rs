@@ -10,6 +10,26 @@ use crate::util::validate_cli_path;
 use crate::Args;
 
 // ---------------------------------------------------------------------------
+// Private key write helper — always 0o600
+// ---------------------------------------------------------------------------
+
+/// Write `bytes` to `path` with mode 0o600 (owner read+write only).
+///
+/// Using std::fs::write() leaves the file world-readable by default (0o644
+/// or whatever the process umask allows). Private keys must be owner-only.
+fn write_private_key(path: std::path::PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+// ---------------------------------------------------------------------------
 // SA signing key — RSA 2048, persisted across restarts
 // ---------------------------------------------------------------------------
 
@@ -66,8 +86,8 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
         .to_public_key_pem(LineEnding::LF)
         .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
 
-    std::fs::write(
-        validate_cli_path(std::path::Path::new(sa_key_path))?,
+    write_private_key(
+        validate_cli_path(std::path::Path::new(sa_key_path))?.to_path_buf(),
         private_pem.as_bytes(),
     )?;
     std::fs::write(
@@ -181,10 +201,10 @@ fn load_or_generate_ca(
 
     let ca_cert_der = ca_cert.der().to_vec();
 
-    // Persist: key as PEM, cert as DER.
-    std::fs::write(
-        validate_cli_path(std::path::Path::new(ca_key_path))?,
-        ca_key.serialize_pem(),
+    // Persist: key as PEM with 0o600 (owner-only), cert as DER with default perms.
+    write_private_key(
+        validate_cli_path(std::path::Path::new(ca_key_path))?.to_path_buf(),
+        ca_key.serialize_pem().as_bytes(),
     )
     .map_err(|e| anyhow::anyhow!("write CA key {ca_key_path}: {e}"))?;
     std::fs::write(
@@ -634,6 +654,48 @@ mod tests {
         assert!(ca_key_path.exists(), "ca.key must exist after recovery");
         assert!(ca_cert_path.exists(), "ca.crt must exist after recovery");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SA private key must be written with mode 0o600 (owner-only) so it is
+    /// not world-readable. A world-readable key file allows any local user to
+    /// forge service-account tokens.
+    #[test]
+    fn sa_private_key_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_temp_dir("sa-key-perms");
+        let key_path = dir.join("sa.key");
+
+        let bytes = b"fake-key-content";
+        write_private_key(key_path.clone(), bytes).expect("write_private_key must succeed");
+
+        let meta = std::fs::metadata(&key_path).expect("file must exist");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "SA private key must be mode 0o600 (got {:#o}); \
+             world-readable keys allow local users to forge SA tokens",
+            mode
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CA private key must also be written with mode 0o600.
+    #[test]
+    fn ca_private_key_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_temp_dir("ca-key-perms");
+        let (_, _, _) = run_load_or_generate_ca(&dir).expect("generate CA");
+
+        let ca_key_path = dir.join("ca.key");
+        let meta = std::fs::metadata(&ca_key_path).expect("ca.key must exist");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "CA private key must be mode 0o600 (got {:#o}); \
+             world-readable CA keys allow anyone to sign rogue certs",
+            mode
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
