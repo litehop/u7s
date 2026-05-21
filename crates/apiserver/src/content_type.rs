@@ -166,6 +166,16 @@ where
             // proto causes "proto: illegal wireType 6" in kubectl because the Go proto
             // decoder encounters unexpected bytes when trying to decode the discovery
             // response as a typed proto message.
+            //
+            // Node/NodeList responses are also NOT re-encoded as proto.
+            //
+            // When the kubelet reads its own node (GET /api/v1/nodes/{name}?timeout=10s),
+            // client-go's typed proto decoder does not reliably honour the
+            // contentType=application/json field inside the Unknown envelope. It tries to
+            // decode Unknown.raw as a typed proto Node message, encounters JSON bytes that
+            // produce "proto: illegal wireType 7" (e.g. the `/` in a CIDR or `o` in
+            // "conditions" aligns to a varint byte whose low 3 bits are 0b111). Returning
+            // JSON is legal because Accept includes "application/json" as a fallback.
             let kind = json_val["kind"].as_str().unwrap_or("");
             if matches!(
                 kind,
@@ -174,11 +184,13 @@ where
                     | "APIResourceList"
                     | "APIGroupDiscoveryList"
                     | "APIGroup"
+                    | "Node"
+                    | "NodeList"
             ) {
                 tracing::debug!(
                     uri = %uri,
                     kind = %kind,
-                    "skip proto re-encode: discovery response"
+                    "skip proto re-encode: discovery or node response"
                 );
                 let resp = Response::from_parts(parts, Body::from(body_bytes));
                 return Ok(resp);
@@ -281,7 +293,11 @@ mod tests {
             .unwrap()
     }
 
-    const SAMPLE_JSON: &str = r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"my-node"}}"#;
+    // Use Namespace (not Node) so these tests remain valid after the Node proto-exclusion fix
+    // (mayor-ajtd). Node responses are intentionally not re-encoded as proto because client-go's
+    // typed Node decoder ignores contentType=application/json and produces wireType 7 errors.
+    const SAMPLE_JSON: &str =
+        r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"my-namespace"}}"#;
 
     /// A 2xx JSON response with Accept: protobuf must be re-encoded as protobuf.
     ///
@@ -332,7 +348,7 @@ mod tests {
         let recovered: serde_json::Value =
             serde_json::from_slice(&envelope.raw).expect("raw field must contain valid JSON");
         assert_eq!(
-            recovered["metadata"]["name"], "my-node",
+            recovered["metadata"]["name"], "my-namespace",
             "original object data must survive the proto round-trip"
         );
     }
@@ -665,6 +681,106 @@ mod tests {
         assert!(
             !resp_body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
             "PUT response body must not start with k8s proto magic"
+        );
+    }
+
+    /// Node GET responses must NOT be re-encoded as proto even when the client sends
+    /// Accept: application/vnd.kubernetes.protobuf.
+    ///
+    /// This is the regression test for the kubelet CI failure: "ci-node did not reach
+    /// Ready=True within 120s / proto: illegal wireType 7". When the kubelet reads its own
+    /// node status (GET /api/v1/nodes/ci-node?timeout=10s), client-go's typed proto decoder
+    /// does not reliably honour the contentType=application/json field inside the Unknown
+    /// envelope. It tries to decode Unknown.raw as a typed proto Node message, encounters JSON
+    /// bytes (e.g. '/' in a CIDR or 'o' in "conditions") whose low 3 bits are 0b111 = wireType
+    /// 7, and rejects the response with "proto: illegal wireType 7".
+    ///
+    /// Since Accept includes "application/json" as a fallback, returning JSON is legal per HTTP
+    /// content negotiation and the kubelet's JSON decoder handles it correctly.
+    #[tokio::test]
+    async fn node_response_not_re_encoded_as_proto() {
+        let node_json = r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"ci-node","uid":"abc-123","resourceVersion":"5"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2026-05-21T00:00:00Z","lastTransitionTime":"2026-05-21T00:00:00Z","reason":"KubeletReady","message":"kubelet is posting ready status"}],"addresses":[{"type":"InternalIP","address":"192.168.1.1"}]}}"#;
+        let svc = FixedService {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: node_json,
+        };
+        let mut layer_svc = ContentTypeLayer.layer(svc);
+
+        // Simulate kubelet: GET /api/v1/nodes/ci-node?timeout=10s with proto Accept.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/nodes/ci-node?timeout=10s")
+            .header(
+                "accept",
+                "application/vnd.kubernetes.protobuf, application/json",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = layer_svc.call(req).await.unwrap();
+
+        // Content-Type must remain application/json — Node must NOT be re-encoded as proto.
+        // Re-encoding would cause "proto: illegal wireType 7" in the kubelet's Go proto decoder,
+        // preventing the node from reaching Ready=True.
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            ct, "application/json",
+            "Node response must not be re-encoded as proto: client-go ignores \
+             contentType=application/json inside Unknown envelope for typed Node messages, \
+             causing wireType 7 errors when JSON bytes are mis-read as proto field tags"
+        );
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !resp_body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "Node response body must not start with k8s proto magic"
+        );
+        assert_eq!(
+            resp_body.as_ref(),
+            node_json.as_bytes(),
+            "Node response body must be the original JSON unchanged"
+        );
+    }
+
+    /// NodeList responses must also NOT be re-encoded as proto.
+    /// Same root cause as Node: client-go's typed proto decoder mis-reads JSON bytes.
+    #[tokio::test]
+    async fn node_list_response_not_re_encoded_as_proto() {
+        let node_list_json = r#"{"apiVersion":"v1","kind":"NodeList","metadata":{"resourceVersion":"10"},"items":[{"apiVersion":"v1","kind":"Node","metadata":{"name":"ci-node"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}"#;
+        let svc = FixedService {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            body: node_list_json,
+        };
+        let mut layer_svc = ContentTypeLayer.layer(svc);
+
+        let resp = layer_svc.call(proto_accept_request()).await.unwrap();
+
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            ct, "application/json",
+            "NodeList must not be re-encoded as proto"
+        );
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !resp_body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "NodeList body must not start with k8s proto magic"
         );
     }
 
