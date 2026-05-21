@@ -52,9 +52,6 @@ pub struct UserInfo {
 struct SaClaims {
     /// Subject — format: "system:serviceaccount:<namespace>:<name>"
     sub: String,
-    /// Issuer — validated against expected value.
-    #[allow(dead_code)]
-    iss: String,
 }
 
 // ---------------------------------------------------------------------------

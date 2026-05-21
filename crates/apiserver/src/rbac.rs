@@ -18,10 +18,6 @@ pub struct PolicyRule {
 pub struct Subject {
     pub kind: String,
     pub name: String,
-    // Part of the RBAC Subject schema; used for ServiceAccount namespace scoping
-    // when RBAC evaluation is extended beyond name-only matching.
-    #[allow(dead_code)]
-    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -181,9 +177,6 @@ impl RbacIndex {
     }
 
     /// Return a copy of the rules for the named ClusterRole, or empty if unknown.
-    // Used by escalation-prevention callers and tests; wiring into generic.rs
-    // handler is tracked separately (out of scope for this bead).
-    #[allow(dead_code)]
     pub fn cluster_role_rules(&self, name: &str) -> Vec<PolicyRule> {
         let inner = self.inner.read().unwrap();
         inner.cluster_roles.get(name).cloned().unwrap_or_default()
@@ -239,9 +232,6 @@ impl Default for RbacIndex {
 /// Check whether `username`/`groups` already hold every permission enumerated
 /// in `role_rules`.  Used by escalation prevention: a caller may only bind
 /// themselves to a ClusterRole if they already have all of its rules.
-// Wiring this into the HTTP create/update handler for ClusterRoleBindings is
-// tracked separately — that handler (generic.rs) is out of scope for this bead.
-#[allow(dead_code)]
 ///
 /// Returns `true` if every rule in `role_rules` is already allowed for the
 /// caller.  An empty rule set is trivially held (returns `true`).
