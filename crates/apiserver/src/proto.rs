@@ -23,6 +23,7 @@ const K8S_PROTO_MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
 // ---------------------------------------------------------------------------
 
 /// Encode a varint into a byte vector.
+#[cfg(test)]
 fn encode_varint(mut v: u64) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
@@ -38,6 +39,7 @@ fn encode_varint(mut v: u64) -> Vec<u8> {
 }
 
 /// Encode a length-delimited (wire type 2) field: tag + length varint + payload.
+#[cfg(test)]
 fn encode_ld_field(field_number: u64, payload: &[u8]) -> Vec<u8> {
     let tag = (field_number << 3) | 2;
     let mut out = encode_varint(tag);
@@ -60,6 +62,7 @@ fn encode_ld_field(field_number: u64, payload: &[u8]) -> Vec<u8> {
 /// placing the original JSON bytes in `raw`, the client decodes it with its JSON
 /// decoder regardless of the outer content-type header — this is why this scheme
 /// works for all object types without needing a per-type proto encoder.
+#[cfg(test)]
 pub fn encode_proto_response(val: &serde_json::Value) -> bytes::Bytes {
     let api_version = val["apiVersion"].as_str().unwrap_or("");
     let kind = val["kind"].as_str().unwrap_or("");

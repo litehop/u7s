@@ -1,19 +1,18 @@
 // content_type.rs — Tower middleware for Kubernetes protobuf content negotiation.
 //
 // Kubelet 1.36+ sends `Accept: application/vnd.kubernetes.protobuf, application/json`
-// on every request. The Go client-go library expects the server to honour the Accept
-// header: if it sent protobuf in Accept and the server returns JSON, client-go's
-// content-negotiation layer fails to route the response to the right decoder and emits
-// "invalid JSON: expected value at line 1 column 1".
+// on every request.  This middleware validates incoming requests and passes responses
+// through unchanged.
 //
-// This middleware intercepts responses: when the original request accepted protobuf
-// AND the response is a 2xx JSON body, it re-encodes the body as a Kubernetes protobuf
-// envelope and updates the Content-Type header accordingly.
+// We do NOT re-encode JSON responses as protobuf Unknown envelopes, even when the
+// client sends Accept: protobuf.  Reason: client-go's typed proto decoders ignore the
+// contentType=application/json field inside the Unknown envelope and attempt to decode
+// Unknown.raw as a native typed proto message.  When JSON bytes happen to align to
+// invalid proto wire types ("proto: illegal wireType N"), the kubelet crashes or hangs.
 //
-// Edge cases that are NOT re-encoded:
-//   - 4xx/5xx responses — client-go always expects errors as JSON.
-//   - Watch responses (streaming NDJSON) — never re-encoded.
-//   - Bodies that are not valid JSON — passed through unchanged.
+// Returning JSON is always valid because the client's Accept header includes
+// "application/json" as a fallback.  client-go falls back to its JSON decoder
+// transparently.  The proto.rs module is kept for reference and tests.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -23,8 +22,6 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 use tower::Layer;
 use tower_service::Service;
-
-use crate::proto::encode_proto_response;
 
 const PROTO_CONTENT_TYPE: &str = "application/vnd.kubernetes.protobuf";
 
@@ -193,53 +190,25 @@ where
             // "conditions" aligns to a varint byte whose low 3 bits are 0b111). Returning
             // JSON is legal because Accept includes "application/json" as a fallback.
             let kind = json_val["kind"].as_str().unwrap_or("");
-            if matches!(
-                kind,
-                "APIVersions"
-                    | "APIGroupList"
-                    | "APIResourceList"
-                    | "APIGroupDiscoveryList"
-                    | "APIGroup"
-                    | "Node"
-                    | "NodeList"
-            ) {
-                tracing::debug!(
-                    uri = %uri,
-                    kind = %kind,
-                    "skip proto re-encode: discovery or node response"
-                );
-                let resp = Response::from_parts(parts, Body::from(body_bytes));
-                return Ok(resp);
-            }
 
-            // Re-encode as protobuf.
-            let proto_bytes = encode_proto_response(&json_val);
-            let proto_len = proto_bytes.len();
-            tracing::info!(
+            // client-go's typed proto decoders do not reliably honour the
+            // contentType=application/json field inside the Unknown envelope — they
+            // attempt to decode Unknown.raw as a native typed proto message and
+            // produce "proto: illegal wireType N" when JSON bytes happen to align
+            // to invalid wire types.  Returning JSON is always valid: Accept
+            // includes "application/json" as a fallback, and client-go falls back
+            // to JSON decoding transparently.
+            //
+            // We previously re-encoded only non-discovery types as proto (to avoid
+            // a different wireType 6 error in kubectl for discovery responses), but
+            // that created a growing exclusion list (Node, NodeList, Pod, PodList,
+            // …).  The correct fix is to skip re-encoding for all types.
+            tracing::debug!(
                 uri = %uri,
-                accept = %accept,
                 kind = %kind,
-                proto_len = proto_len,
-                json_len = body_bytes.len(),
-                "proto re-encode"
+                "skip proto re-encode: returning JSON (always valid per Accept header)"
             );
-
-            let mut new_parts = parts;
-            new_parts.headers.insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static(PROTO_CONTENT_TYPE),
-            );
-            // Replace Content-Length with the proto body length.
-            // The original JSON Content-Length is wrong for the re-encoded body.
-            // We set it explicitly so hyper does not use chunked transfer encoding,
-            // which can trigger "illegal wireType" errors in the Go proto decoder.
-            new_parts.headers.insert(
-                header::CONTENT_LENGTH,
-                header::HeaderValue::from_str(&proto_len.to_string())
-                    .expect("proto body length is a valid header value"),
-            );
-
-            Ok(Response::from_parts(new_parts, Body::from(proto_bytes)))
+            Ok(Response::from_parts(parts, Body::from(body_bytes)))
         })
     }
 }
@@ -251,6 +220,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::encode_proto_response;
     use axum::body::Body;
     use axum::http::{Method, Request, Response, StatusCode};
     use std::task::{Context, Poll};
@@ -309,19 +279,19 @@ mod tests {
             .unwrap()
     }
 
-    // Use Namespace (not Node) so these tests remain valid after the Node proto-exclusion fix
-    // (mayor-ajtd). Node responses are intentionally not re-encoded as proto because client-go's
-    // typed Node decoder ignores contentType=application/json and produces wireType 7 errors.
     const SAMPLE_JSON: &str =
         r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"my-namespace"}}"#;
 
-    /// A 2xx JSON response with Accept: protobuf must be re-encoded as protobuf.
+    /// A 2xx JSON response with Accept: protobuf must be passed through as JSON unchanged.
     ///
-    /// This is the primary regression for the kubelet startup failure: client-go sends
-    /// Accept: protobuf on every request; if the server returns JSON, client-go's
-    /// content-negotiation emits "invalid JSON: expected value at line 1 column 1".
+    /// client-go's typed proto decoders do not reliably honour the contentType=application/json
+    /// field inside a proto Unknown envelope — they attempt to decode Unknown.raw as a native
+    /// typed proto message and produce "proto: illegal wireType N" when JSON bytes happen to
+    /// align to invalid wire types.  Returning JSON is always valid: the client's Accept header
+    /// includes "application/json" as a fallback, and client-go falls back to its JSON decoder
+    /// transparently.
     #[tokio::test]
-    async fn proto_accept_2xx_json_is_re_encoded_as_protobuf() {
+    async fn proto_accept_2xx_json_is_passed_through_as_json() {
         let svc = FixedService {
             status: StatusCode::OK,
             content_type: "application/json",
@@ -331,7 +301,7 @@ mod tests {
 
         let resp = layer_svc.call(proto_accept_request()).await.unwrap();
 
-        // Content-Type must be protobuf.
+        // Content-Type must remain application/json — not converted to proto.
         let ct = resp
             .headers()
             .get("content-type")
@@ -339,33 +309,23 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(
-            ct, "application/vnd.kubernetes.protobuf",
-            "content-type must be updated to protobuf"
+            ct, "application/json",
+            "content-type must remain application/json — typed proto decoders produce \
+             wireType errors when JSON bytes are mis-read as proto field tags"
         );
 
-        // Body must start with the k8s magic prefix.
+        // Body must be the original JSON unchanged.
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(
-            &body[..4],
-            &[0x6b, 0x38, 0x73, 0x00],
-            "response body must start with k8s proto magic"
+        assert!(
+            !body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "response body must not start with k8s proto magic"
         );
-
-        // The original JSON must be recoverable from the raw field (field 2) of the envelope.
-        // Decode the Unknown envelope and verify the raw field contains our JSON.
-        let envelope = crate::proto::decode_k8s_proto_envelope(&body)
-            .expect("re-encoded body must be a valid k8s protobuf envelope");
         assert_eq!(
-            envelope.content_type, "application/json",
-            "envelope contentType must be application/json so client-go uses JSON decoder"
-        );
-        let recovered: serde_json::Value =
-            serde_json::from_slice(&envelope.raw).expect("raw field must contain valid JSON");
-        assert_eq!(
-            recovered["metadata"]["name"], "my-namespace",
-            "original object data must survive the proto round-trip"
+            body.as_ref(),
+            SAMPLE_JSON.as_bytes(),
+            "response body must be the original JSON unchanged"
         );
     }
 
@@ -441,17 +401,14 @@ mod tests {
         );
     }
 
-    /// Content-Length must be updated to the proto body length when re-encoding as protobuf.
+    /// When the inner response carries a Content-Length header and the middleware passes it
+    /// through as JSON, the Content-Length must be preserved unchanged.
     ///
-    /// If the original JSON response carried a Content-Length header (e.g. set by axum's
-    /// router), the re-encoded protobuf body will be a different size. Leaving the old
-    /// Content-Length causes clients to read a truncated or zero-padded payload, which the
-    /// protobuf decoder reports as "illegal wireType". We must set Content-Length to the proto
-    /// body length so hyper uses Content-Length framing (not chunked transfer encoding).
-    /// This is the regression for https://github.com/valerauko/u7s/pull/84 CI failure.
+    /// Previously, the middleware would re-encode the body as proto (larger) and update
+    /// Content-Length to the proto length.  Since we now pass JSON through unchanged,
+    /// Content-Length should equal the original JSON byte count.
     #[tokio::test]
-    async fn content_length_is_updated_to_proto_length_on_re_encode() {
-        // FixedService does not set Content-Length by default, so use a custom builder.
+    async fn content_length_is_preserved_on_json_pass_through() {
         #[derive(Clone)]
         struct ServiceWithContentLength;
         impl Service<Request<Body>> for ServiceWithContentLength {
@@ -477,32 +434,26 @@ mod tests {
         let mut layer_svc = ContentTypeLayer.layer(ServiceWithContentLength);
         let resp = layer_svc.call(proto_accept_request()).await.unwrap();
 
-        // Content-Length must be the proto body length (not the original JSON length).
+        // Content-Length must equal the original JSON length (body is unchanged).
         let cl_header = resp
             .headers()
             .get(header::CONTENT_LENGTH)
-            .expect("Content-Length must be present after proto re-encoding")
+            .expect("Content-Length must be preserved")
             .to_str()
             .expect("Content-Length must be a valid string")
             .parse::<usize>()
             .expect("Content-Length must be a valid integer");
 
-        // The proto body is the re-encoded body from the response.
+        assert_eq!(
+            cl_header,
+            SAMPLE_JSON.len(),
+            "Content-Length must equal the original JSON byte count since body is unchanged"
+        );
+
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-
-        assert_eq!(
-            cl_header,
-            body.len(),
-            "Content-Length must equal the proto body length; JSON length ({}) would cause truncation",
-            SAMPLE_JSON.len()
-        );
-        assert_ne!(
-            cl_header,
-            SAMPLE_JSON.len(),
-            "Content-Length must not be the old JSON length — that causes wireType 6 truncation"
-        );
+        assert_eq!(body.as_ref(), SAMPLE_JSON.as_bytes());
     }
 
     /// Regression test for "illegal wireType 6": when Content-Length is the JSON byte length but
