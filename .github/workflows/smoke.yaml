@@ -235,7 +235,7 @@ jobs:
         run: |
           MINOR=$(echo "${{ matrix.k8s }}" | cut -d. -f1-2)
           sudo apt-get update -qq
-          sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+          sudo apt-get install -y apt-transport-https ca-certificates curl gpg containernetworking-plugins
           curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
           echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/ /" \
@@ -245,6 +245,33 @@ jobs:
           sudo mkdir -p /etc/crio/crio.conf.d
           printf '[crio.runtime]\ndefault_runtime = "crun"\n[crio.runtime.runtimes.crun]\nruntime_path = "/usr/bin/crun"\nruntime_type = "oci"\nruntime_root = "/run/crun"\n' \
             | sudo tee /etc/crio/crio.conf.d/10-crun.conf
+          # Install a minimal bridge CNI config so CRI-O can create pod network namespaces.
+          # Without this, RunPodSandbox fails with "unknown version specified" because
+          # CRI-O cannot find any CNI configuration and fails to set up the network namespace.
+          sudo mkdir -p /etc/cni/net.d
+          sudo tee /etc/cni/net.d/10-bridge.conflist <<'CNIEOF'
+          {
+            "cniVersion": "1.0.0",
+            "name": "bridge",
+            "plugins": [
+              {
+                "type": "bridge",
+                "bridge": "cni0",
+                "isGateway": true,
+                "ipMasq": true,
+                "hairpinMode": true,
+                "ipam": {
+                  "type": "host-local",
+                  "ranges": [[{"subnet": "10.88.0.0/16"}]],
+                  "routes": [{"dst": "0.0.0.0/0"}]
+                }
+              },
+              {"type": "portmap", "capabilities": {"portMappings": true}},
+              {"type": "firewall"},
+              {"type": "tuning"}
+            ]
+          }
+          CNIEOF
           sudo systemctl enable --now crio
 
       - name: Install kubelet and kubectl ${{ matrix.k8s }}
@@ -360,6 +387,65 @@ jobs:
             cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
             exit 1
           fi
+
+      - name: Pod lifecycle (schedule → Succeeded)
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          # Create a one-shot pod bound to ci-node via nodeName.
+          # hostNetwork+dnsPolicy:None avoids ClusterDNS errors (kubelet warns when
+          # no DNS is configured; dnsPolicy:None suppresses that path entirely).
+          # restartPolicy:Never + busybox exit 0 means the pod reaches Succeeded
+          # without a scheduler or any other infrastructure.
+          kubectl apply --validate=false -f - <<'EOF'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: smoke-pod
+            namespace: default
+          spec:
+            nodeName: ci-node
+            hostNetwork: true
+            dnsPolicy: None
+            dnsConfig: {}
+            restartPolicy: Never
+            containers:
+              - name: hello
+                image: busybox:1.36
+                command: ["sh", "-c", "echo hello"]
+          EOF
+
+          # Wait up to 120s for the pod to reach Succeeded.
+          # ContainerCreating → Running → Succeeded is the expected path.
+          SUCCEEDED=0
+          for i in $(seq 1 120); do
+            PHASE=$(kubectl get pod smoke-pod -n default -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Succeeded" ]; then
+              SUCCEEDED=1
+              break
+            fi
+            if [ "$PHASE" = "Failed" ]; then
+              echo "ERROR: pod entered Failed phase"
+              kubectl describe pod smoke-pod -n default
+              echo "--- kubelet log ---"
+              cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "$SUCCEEDED" -eq 0 ]; then
+            PHASE=$(kubectl get pod smoke-pod -n default -o jsonpath='{.status.phase}' 2>/dev/null || echo "unknown")
+            echo "ERROR: pod did not reach Succeeded within 120s (current phase: $PHASE)"
+            kubectl describe pod smoke-pod -n default
+            echo "--- kubelet log (last 100 lines) ---"
+            tail -100 "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+            echo "--- server log (last 50 lines) ---"
+            tail -50 "${{ env.SMOKE_TMPDIR }}/server.log"
+            exit 1
+          fi
+          echo "Pod reached Succeeded:"
+          kubectl get pod smoke-pod -n default
 
       - name: Stop server and kubelet
         if: always()
