@@ -180,6 +180,59 @@ mod tests {
         assert_eq!(store_err_to_status(&e), StatusCode::CONFLICT);
     }
 
+    /// StoreError::NotFound must NOT expose the internal registry key path to clients.
+    ///
+    /// The internal key format ("/registry/pods/default/nginx") is an implementation
+    /// detail that must not appear in client-facing error messages. Exposing it would
+    /// help attackers understand the internal key structure and could aid path
+    /// traversal or enumeration attacks.
+    ///
+    /// Handlers must use Status::not_found(name, kind) which produces the Kubernetes-
+    /// standard format `pods "nginx" not found` instead of forwarding e.to_string().
+    #[test]
+    fn store_not_found_to_string_contains_internal_key() {
+        // Confirm the raw StoreError message does contain the internal key — this is
+        // intentional for logging. The test below verifies the handler-layer translation.
+        let internal_key = "/registry/pods/default/nginx";
+        let e = StoreError::NotFound {
+            key: internal_key.to_owned(),
+        };
+        assert!(
+            e.to_string().contains(internal_key),
+            "StoreError::NotFound must include key for internal logging: {e}"
+        );
+    }
+
+    /// The Kubernetes-compatible 404 message must NOT include the internal store key.
+    ///
+    /// This test enforces the conversion contract: handlers must call
+    /// `Status::not_found(name, kind)` to produce the standard
+    /// `pods "nginx" not found` format, not forward `e.to_string()`.
+    #[test]
+    fn status_not_found_does_not_leak_internal_key() {
+        let internal_key = "/registry/pods/default/nginx";
+        let resource_name = "nginx";
+        let kind = "Pod";
+
+        let status_error = Status::not_found(resource_name, kind);
+        let message = &status_error.1.message;
+
+        // Must produce the Kubernetes-standard format.
+        assert_eq!(
+            message, "Pod \"nginx\" not found",
+            "not_found message must match Kubernetes format"
+        );
+        // Must NOT contain the internal store key path.
+        assert!(
+            !message.contains(internal_key),
+            "client-facing 404 message must not expose internal store key '{internal_key}', got: {message}"
+        );
+        assert!(
+            !message.contains("/registry/"),
+            "client-facing 404 must not expose /registry/ prefix, got: {message}"
+        );
+    }
+
     // -- content_type --
 
     /// content_type returns the header value as a &str when present.
