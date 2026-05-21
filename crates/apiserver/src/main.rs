@@ -6,6 +6,7 @@ mod keys;
 mod patch;
 mod proto;
 mod rbac;
+mod serializer;
 mod state;
 mod status;
 mod tls;
