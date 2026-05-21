@@ -50,7 +50,7 @@
     ]
   },
   "worktree": {
-    "baseRef": "head"
+    "baseRef": "fresh"
   },
   "hooks": {
     "WorktreeCreate": [
