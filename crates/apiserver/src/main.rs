@@ -1,4 +1,5 @@
 mod auth;
+mod content_type;
 mod handlers;
 mod inflight;
 mod keys;
@@ -24,6 +25,7 @@ use tower_service::Service;
 use u7s_store::SqliteStore;
 
 use auth::{AuthLayer, PeerCertificate};
+use content_type::ContentTypeLayer;
 use inflight::InflightLayer;
 use state::AppState;
 use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
@@ -155,8 +157,9 @@ async fn main() -> anyhow::Result<()> {
     state.init().await;
 
     // 10. Build axum router and attach tower layers.
-    //     Order (outermost first): inflight → auth → handler.
+    //     Order (outermost first): inflight → auth → content_type → handler.
     let app = build_router(state.clone())
+        .layer(ContentTypeLayer)
         .layer(AuthLayer::new(
             Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
