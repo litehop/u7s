@@ -55,7 +55,7 @@ pub(crate) fn generate_suffix() -> String {
     String::from_utf8(out.to_vec()).unwrap()
 }
 
-fn resolve_name(obj: &mut Object) -> Result<String, crate::status::StatusError> {
+pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::StatusError> {
     match obj.name().filter(|n| !n.is_empty()) {
         Some(n) => Ok(n.to_string()),
         None => {
@@ -4072,5 +4072,56 @@ mod tests {
             object_matches_field_selector(&obj, "spec.nodeName=worker-1"),
             "unknown field selectors must be ignored (pass-through), not drop events"
         );
+    }
+}
+
+#[cfg(test)]
+mod resolve_name_tests {
+    use super::*;
+
+    fn make_obj(body: serde_json::Value) -> crate::types::Object {
+        crate::types::Object { body }
+    }
+
+    /// resolve_name returns the explicit name when metadata.name is set.
+    /// The name field on the URL must match the body; without this, create handlers
+    /// would silently use a different key than the caller intended.
+    #[test]
+    fn resolve_name_returns_explicit_name() {
+        let mut obj = make_obj(serde_json::json!({ "metadata": { "name": "my-pod" } }));
+        let name =
+            resolve_name(&mut obj).unwrap_or_else(|_| panic!("must succeed with explicit name"));
+        assert_eq!(name, "my-pod");
+        assert_eq!(obj.body["metadata"]["name"], "my-pod");
+    }
+
+    /// resolve_name generates a name when only generateName is set.
+    /// Without generateName support, `kubectl run` and controller-created pods would fail
+    /// with "metadata.name or metadata.generateName is required".
+    #[test]
+    fn resolve_name_generates_when_generate_name_set() {
+        let mut obj =
+            make_obj(serde_json::json!({ "metadata": { "generateName": "job-worker-" } }));
+        let name =
+            resolve_name(&mut obj).unwrap_or_else(|_| panic!("must succeed with generateName"));
+        assert!(
+            name.starts_with("job-worker-"),
+            "generated name must carry the generateName prefix; got: {name}"
+        );
+        assert_eq!(
+            obj.body["metadata"]["name"].as_str(),
+            Some(name.as_str()),
+            "body must be updated with the generated name so the stored object is consistent"
+        );
+    }
+
+    /// resolve_name fails with 400 when both name and generateName are absent.
+    /// Kubernetes API contract: every create request must identify the object.
+    #[test]
+    fn resolve_name_errors_when_both_name_and_generate_name_absent() {
+        let mut obj = make_obj(serde_json::json!({ "metadata": {} }));
+        let err = resolve_name(&mut obj).expect_err("must fail when no name and no generateName");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400, "must return 400 Bad Request");
     }
 }
