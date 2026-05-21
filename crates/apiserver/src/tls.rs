@@ -1,4 +1,4 @@
-use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -111,30 +111,21 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
 // CA key+cert — persisted across restarts
 // ---------------------------------------------------------------------------
 
-/// Load the CA keypair and certificate from disk, or generate and write them.
-///
-/// Returns `(ca_key, ca_cert)` where `ca_cert` is an rcgen `Certificate` that
-/// can be used for signing. The DER bytes of `ca_cert` are what we persist.
-///
-/// Design: keeping the CA stable means kubelets (and any other component that
-/// trusts our CA via kubeconfig) do not see a cert validation failure after a
-/// restart.
 /// Load-or-generate the CA keypair and cert for signing leaf certificates.
 ///
-/// Returns `(ca_key, ca_cert, ca_cert_der)` where:
+/// Returns `(ca_key, ca_params, ca_cert_der)` where:
 /// - `ca_key` is the rcgen KeyPair (same on every restart when loaded from disk)
-/// - `ca_cert` is an rcgen Certificate for `signed_by` calls (re-issued but with the
-///   same key, so chain verification still works for leaf certs signed by it)
+/// - `ca_params` is the CertificateParams used for the CA cert, used to build an
+///   `Issuer` for signing leaf certificates with the rcgen 0.14 API
 /// - `ca_cert_der` is the *original* DER bytes written to disk — used in TlsMaterial
 ///   for kubeconfig and rustls so that kubelets see a stable CA cert across restarts
 ///
-/// Note: on the load path, `ca_cert.der()` will differ from `ca_cert_der` because
-/// rcgen re-issues the certificate with fresh timestamps. This is intentional — we
-/// always hand `ca_cert_der` (the stable original) to TlsMaterial, never `ca_cert.der()`.
+/// Design: keeping the CA stable means kubelets (and any other component that
+/// trusts our CA via kubeconfig) do not see a cert validation failure after a restart.
 fn load_or_generate_ca(
     ca_key_path: &str,
     ca_cert_path: &str,
-) -> anyhow::Result<(KeyPair, rcgen::Certificate, Vec<u8>)> {
+) -> anyhow::Result<(KeyPair, CertificateParams, Vec<u8>)> {
     let key_exists = std::path::Path::new(ca_key_path).exists();
     let cert_exists = std::path::Path::new(ca_cert_path).exists();
 
@@ -174,22 +165,19 @@ fn load_or_generate_ca(
         let ca_cert_der = std::fs::read(validate_cli_path(std::path::Path::new(ca_cert_path))?)
             .map_err(|e| anyhow::anyhow!("read CA cert {ca_cert_path}: {e}"))?;
 
-        // Reconstruct an rcgen Certificate using the loaded key and fixed params.
-        // We cannot round-trip rcgen 0.13 from DER/PEM back to CertificateParams,
-        // so we re-self-sign with the same key and standard CA params. The resulting
-        // cert is used only for signed_by() — its DER is discarded in favour of
-        // the stable ca_cert_der loaded above.
+        // Reconstruct CertificateParams matching the CA cert so callers can
+        // build an Issuer for signing leaf certs with the rcgen 0.14 API.
+        // We cannot round-trip from DER/PEM back to CertificateParams, so we
+        // reconstruct minimal CA params with the same key. The Issuer is used
+        // only for signed_by(); no DER is produced here.
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "u7s-ca");
-        let ca_cert = ca_params
-            .self_signed(&ca_key)
-            .map_err(|e| anyhow::anyhow!("reconstruct CA cert: {e}"))?;
 
         tracing::info!("loaded CA key from {ca_key_path}; cert DER from {ca_cert_path}");
-        return Ok((ca_key, ca_cert, ca_cert_der));
+        return Ok((ca_key, ca_params, ca_cert_der));
     }
 
     // Generate fresh CA.
@@ -200,11 +188,11 @@ fn load_or_generate_ca(
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "u7s-ca");
-    let ca_cert = ca_params
+    let ca_cert_der = ca_params
         .self_signed(&ca_key)
-        .map_err(|e| anyhow::anyhow!("self-sign CA: {e}"))?;
-
-    let ca_cert_der = ca_cert.der().to_vec();
+        .map_err(|e| anyhow::anyhow!("self-sign CA: {e}"))?
+        .der()
+        .to_vec();
 
     // Persist: key as PEM with 0o600 (owner-only), cert as DER with default perms.
     write_private_key(
@@ -218,7 +206,7 @@ fn load_or_generate_ca(
     )
     .map_err(|e| anyhow::anyhow!("write CA cert {ca_cert_path}: {e}"))?;
 
-    Ok((ca_key, ca_cert, ca_cert_der))
+    Ok((ca_key, ca_params, ca_cert_der))
 }
 
 pub struct TlsMaterial {
@@ -273,8 +261,10 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // If both ca.key (PEM) and ca.crt (DER) exist on disk, load them so the CA
     // stays stable across restarts. If either is missing, generate fresh and write.
     // ca_cert_der is the original DER bytes — stable across restarts.
-    // ca_cert is an rcgen Certificate used only for signed_by calls.
-    let (ca_key, ca_cert, ca_cert_der) = load_or_generate_ca(&args.ca_key, &args.ca_cert)?;
+    // ca_params is used to construct an Issuer for signing leaf certs (rcgen 0.14 API).
+    let (ca_key, ca_params, ca_cert_der) = load_or_generate_ca(&args.ca_key, &args.ca_cert)?;
+    // Build an Issuer from the CA params and key for signing leaf certificates.
+    let ca_issuer = Issuer::new(ca_params, ca_key);
 
     // --- Server cert ---
     let server_key = KeyPair::generate()?;
@@ -286,7 +276,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     server_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "u7s-apiserver");
-    let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key)?;
+    let server_cert = server_params.signed_by(&server_key, &ca_issuer)?;
 
     // --- Admin client cert ---
     let admin_key = KeyPair::generate()?;
@@ -298,7 +288,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     admin_params
         .distinguished_name
         .push(rcgen::DnType::OrganizationName, "system:masters");
-    let admin_cert = admin_params.signed_by(&admin_key, &ca_cert, &ca_key)?;
+    let admin_cert = admin_params.signed_by(&admin_key, &ca_issuer)?;
 
     // --- Build rustls ServerConfig ---
     // Use ca_cert_der (the stable, original bytes) for the chain and trust store —
@@ -614,7 +604,7 @@ mod tests {
     /// Helper: call load_or_generate_ca with paths inside `dir`.
     fn run_load_or_generate_ca(
         dir: &std::path::Path,
-    ) -> anyhow::Result<(KeyPair, rcgen::Certificate, Vec<u8>)> {
+    ) -> anyhow::Result<(KeyPair, CertificateParams, Vec<u8>)> {
         let ca_key_path = dir.join("ca.key").to_string_lossy().into_owned();
         let ca_cert_path = dir.join("ca.crt").to_string_lossy().into_owned();
         load_or_generate_ca(&ca_key_path, &ca_cert_path)

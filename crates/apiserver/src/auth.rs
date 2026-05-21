@@ -641,12 +641,11 @@ mod tests {
 
     /// Generate a DER cert with given CN and org using rcgen.
     fn make_cert_der(cn: &str, orgs: &[&str]) -> Vec<u8> {
-        use rcgen::{CertificateParams, KeyPair};
+        use rcgen::{CertificateParams, Issuer, KeyPair};
 
         let ca_key = KeyPair::generate().unwrap();
-        let mut ca_params = rcgen::CertificateParams::default();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_params = rcgen::CertificateParams::default();
+        let ca_issuer = Issuer::new(ca_params, ca_key);
 
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::default();
@@ -658,7 +657,7 @@ mod tests {
                 .distinguished_name
                 .push(rcgen::DnType::OrganizationName, *org);
         }
-        let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
+        let cert = params.signed_by(&key, &ca_issuer).unwrap();
         cert.der().to_vec()
     }
 
