@@ -90,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
     seed_namespaces(&store).await?;
     seed_rbac(&store).await?;
     seed_services(&store).await?;
+    seed_serviceaccounts(&store).await?;
     seed_coredns(&store).await?;
 
     // 4. Generate TLS certs.
@@ -503,6 +504,33 @@ async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
         Err(e) => return Err(anyhow::anyhow!("seed Service kube-system/kube-dns: {e}")),
     }
 
+    Ok(())
+}
+
+async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    const NAMESPACES: &[&str] = &["default", "kube-system", "kube-node-lease", "kube-public"];
+    for ns in NAMESPACES {
+        let key = keys::object_key("serviceaccounts", ns, "default");
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {
+                "name": "default",
+                "namespace": ns
+            }
+        });
+        match store
+            .put(&key, Bytes::from(body.to_string()), Some(0))
+            .await
+        {
+            Ok(_) => tracing::info!("seeded ServiceAccount: {ns}/default"),
+            Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(anyhow::anyhow!("seed ServiceAccount {ns}/default: {e}")),
+        }
+    }
     Ok(())
 }
 
@@ -921,5 +949,42 @@ mod tests {
             obj.is_some(),
             "Deployment kube-system/coredns must still exist after second seed call"
         );
+    }
+
+    #[tokio::test]
+    async fn seed_serviceaccounts_creates_default_sa_in_each_namespace() {
+        // The default ServiceAccount must exist in every seeded namespace so that
+        // pods can obtain a projected SA token via TokenRequest. Without it,
+        // the TokenRequest handler returns 404 and in-cluster authentication fails.
+        let store = make_store();
+        seed_serviceaccounts(&store)
+            .await
+            .expect("seed must not fail");
+
+        for ns in ["default", "kube-system", "kube-node-lease", "kube-public"] {
+            let key = keys::object_key("serviceaccounts", ns, "default");
+            let obj = store.get(&key).await.expect("get must not fail");
+            assert!(
+                obj.is_some(),
+                "ServiceAccount {ns}/default must exist after seeding"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&obj.unwrap().value).expect("valid json");
+            assert_eq!(parsed["kind"].as_str(), Some("ServiceAccount"));
+            assert_eq!(parsed["metadata"]["name"].as_str(), Some("default"));
+            assert_eq!(parsed["metadata"]["namespace"].as_str(), Some(ns));
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_serviceaccounts_is_idempotent() {
+        // A second call must not error — CAS rv=0 returns AlreadyExists which is silently ignored.
+        let store = make_store();
+        seed_serviceaccounts(&store)
+            .await
+            .expect("first seed must not fail");
+        seed_serviceaccounts(&store)
+            .await
+            .expect("second seed must not fail");
     }
 }
