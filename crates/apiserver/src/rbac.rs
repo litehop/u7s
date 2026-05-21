@@ -180,6 +180,15 @@ impl RbacIndex {
         rules
     }
 
+    /// Return a copy of the rules for the named ClusterRole, or empty if unknown.
+    // Used by escalation-prevention callers and tests; wiring into generic.rs
+    // handler is tracked separately (out of scope for this bead).
+    #[allow(dead_code)]
+    pub fn cluster_role_rules(&self, name: &str) -> Vec<PolicyRule> {
+        let inner = self.inner.read().unwrap();
+        inner.cluster_roles.get(name).cloned().unwrap_or_default()
+    }
+
     pub fn is_allowed(&self, req: &AuthzRequest<'_>) -> bool {
         // system:masters unconditional bypass
         if req.groups.iter().any(|g| g == "system:masters") {
@@ -225,6 +234,55 @@ impl Default for RbacIndex {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Check whether `username`/`groups` already hold every permission enumerated
+/// in `role_rules`.  Used by escalation prevention: a caller may only bind
+/// themselves to a ClusterRole if they already have all of its rules.
+// Wiring this into the HTTP create/update handler for ClusterRoleBindings is
+// tracked separately — that handler (generic.rs) is out of scope for this bead.
+#[allow(dead_code)]
+///
+/// Returns `true` if every rule in `role_rules` is already allowed for the
+/// caller.  An empty rule set is trivially held (returns `true`).
+pub fn user_holds_all_rules(
+    username: &str,
+    groups: &[String],
+    role_rules: &[PolicyRule],
+    rbac: &RbacIndex,
+) -> bool {
+    // system:masters unconditionally holds all permissions.
+    if groups.iter().any(|g| g == "system:masters") {
+        return true;
+    }
+
+    for rule in role_rules {
+        // For each (api_group, resource, verb) combination in the rule, verify
+        // the caller already has that permission.
+        for api_group in &rule.api_groups {
+            for resource in &rule.resources {
+                for verb in &rule.verbs {
+                    // Wildcard entries in the rule mean "all": we check a
+                    // concrete representative.  If the caller has the wildcard
+                    // grant themselves, is_allowed will cover it.
+                    let req = AuthzRequest {
+                        username,
+                        groups,
+                        verb,
+                        api_group,
+                        resource,
+                        subresource: "",
+                        namespace: None,
+                        name: None,
+                    };
+                    if !rbac.is_allowed(&req) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
 }
 
 // --- helpers ---
@@ -914,6 +972,126 @@ mod tests {
         assert!(
             !idx.is_allowed(&r_exec),
             "pods/exec must be denied — pods/log rule must not bleed to other subresources"
+        );
+    }
+
+    #[test]
+    fn escalation_check_denies_unprivileged_user_binding_to_cluster_admin() {
+        // A user who can create ClusterRoleBindings but does NOT already hold
+        // cluster-admin permissions must NOT pass the escalation check when
+        // binding to cluster-admin.  This is Kubernetes RBAC escalation
+        // prevention (v1.17+): you cannot grant permissions you don't already
+        // have.
+        let idx = RbacIndex::new();
+
+        // Seed cluster-admin ClusterRole with wildcard rules.
+        let (admin_role_key, admin_role_val) = make_cluster_role(
+            "cluster-admin",
+            json!([{
+                "apiGroups": ["*"],
+                "resources": ["*"],
+                "verbs": ["*"]
+            }]),
+        );
+        idx.apply_object(&admin_role_key, &admin_role_val);
+
+        // Give "carol" only create on clusterrolebindings — NOT cluster-admin.
+        let (carol_role_key, carol_role_val) = make_cluster_role(
+            "crb-creator",
+            json!([{
+                "apiGroups": ["rbac.authorization.k8s.io"],
+                "resources": ["clusterrolebindings"],
+                "verbs": ["create"]
+            }]),
+        );
+        let (carol_bind_key, carol_bind_val) = make_cluster_binding(
+            "carol-crb-creator",
+            "crb-creator",
+            json!([{ "kind": "User", "name": "carol" }]),
+        );
+        idx.apply_object(&carol_role_key, &carol_role_val);
+        idx.apply_object(&carol_bind_key, &carol_bind_val);
+
+        // The rules in cluster-admin that carol would be granting.
+        let admin_rules = idx.cluster_role_rules("cluster-admin");
+        let groups: Vec<String> = vec![];
+
+        // Escalation check: carol cannot grant permissions she doesn't hold.
+        assert!(
+            !user_holds_all_rules("carol", &groups, &admin_rules, &idx),
+            "carol must fail the escalation check: she does not hold cluster-admin rules"
+        );
+    }
+
+    #[test]
+    fn escalation_check_permits_user_who_already_holds_all_rules() {
+        // A user who already has all permissions in a ClusterRole must pass
+        // the escalation check and be allowed to create a binding to it.
+        // This is required so that admins can manage bindings for roles they
+        // already hold.
+        let idx = RbacIndex::new();
+
+        // A limited role: get/list pods.
+        let (pod_role_key, pod_role_val) = make_cluster_role(
+            "pod-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get", "list"]
+            }]),
+        );
+        idx.apply_object(&pod_role_key, &pod_role_val);
+
+        // "dave" already holds get/list pods via his own binding.
+        let (dave_role_key, dave_role_val) = make_cluster_role(
+            "dave-role",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get", "list"]
+            }]),
+        );
+        let (dave_bind_key, dave_bind_val) = make_cluster_binding(
+            "dave-binding",
+            "dave-role",
+            json!([{ "kind": "User", "name": "dave" }]),
+        );
+        idx.apply_object(&dave_role_key, &dave_role_val);
+        idx.apply_object(&dave_bind_key, &dave_bind_val);
+
+        let pod_reader_rules = idx.cluster_role_rules("pod-reader");
+        let groups: Vec<String> = vec![];
+
+        // Dave already has all of pod-reader's rules — escalation check passes.
+        assert!(
+            user_holds_all_rules("dave", &groups, &pod_reader_rules, &idx),
+            "dave must pass the escalation check: he already holds all pod-reader rules"
+        );
+    }
+
+    #[test]
+    fn escalation_check_system_masters_always_passes() {
+        // Members of system:masters are exempt from escalation checks because
+        // they are unconditionally granted all permissions by the RBAC engine.
+        let idx = RbacIndex::new();
+
+        let (admin_role_key, admin_role_val) = make_cluster_role(
+            "cluster-admin",
+            json!([{
+                "apiGroups": ["*"],
+                "resources": ["*"],
+                "verbs": ["*"]
+            }]),
+        );
+        idx.apply_object(&admin_role_key, &admin_role_val);
+
+        let admin_rules = idx.cluster_role_rules("cluster-admin");
+        let groups = vec!["system:masters".to_owned()];
+
+        // system:masters bypasses the escalation check entirely.
+        assert!(
+            user_holds_all_rules("admin-user", &groups, &admin_rules, &idx),
+            "system:masters members must always pass the escalation check"
         );
     }
 
