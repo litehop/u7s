@@ -106,6 +106,45 @@ pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> 
 }
 
 // ---------------------------------------------------------------------------
+// Constant-time token lookup
+// ---------------------------------------------------------------------------
+
+/// Look up a bearer token in the static token map using constant-time byte
+/// comparison. This prevents timing side-channels: a naive HashMap::get()
+/// uses SipHash which can reveal information about how many characters of
+/// the candidate token match a stored token's hash. By comparing all bytes
+/// of each stored token against the candidate in constant time (no early
+/// exit), an attacker learns nothing about valid token prefixes.
+///
+/// Performance: the static token map is small (typically <100 entries loaded
+/// at startup), so the O(n) scan is negligible compared to network latency.
+fn ct_token_lookup<'a>(
+    map: &'a HashMap<String, UserInfo>,
+    candidate: &str,
+) -> Option<&'a UserInfo> {
+    use subtle::ConstantTimeEq;
+    let candidate_bytes = candidate.as_bytes();
+    let mut found: Option<&'a UserInfo> = None;
+    for (stored_token, info) in map.iter() {
+        let stored_bytes = stored_token.as_bytes();
+        // ConstantTimeEq returns Choice (1u8 for equal, 0u8 for not equal).
+        // Length mismatch: pad both sides to the same length conceptually —
+        // subtle::ConstantTimeEq on slices of different lengths always returns
+        // 0 (not equal) without short-circuiting, so we can call it directly.
+        // We use a manual length check first (which leaks whether lengths match,
+        // but not token content) then the constant-time byte compare.
+        if stored_bytes.len() == candidate_bytes.len()
+            && stored_bytes.ct_eq(candidate_bytes).into()
+        {
+            found = Some(info);
+            // Do NOT break: continue iterating so the loop takes the same time
+            // regardless of which token matched or whether any matched.
+        }
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
 // Authentication
 // ---------------------------------------------------------------------------
 
@@ -143,8 +182,12 @@ fn authenticate(
         Some(value) => {
             let value = value.to_str().unwrap_or("");
             if let Some(token) = value.strip_prefix("Bearer ") {
-                // 1. Check static token map first.
-                if let Some(info) = token_map.get(token) {
+                // 1. Check static token map first using constant-time comparison.
+                // HashMap.get() can leak timing information about token prefixes
+                // (SipHash is non-cryptographic). Instead, compare all tokens in
+                // constant time so an attacker cannot distinguish valid prefixes
+                // from invalid ones.
+                if let Some(info) = ct_token_lookup(token_map, token) {
                     return AuthnResult::Identified(info.clone());
                 }
                 // 2. If a SA decoding key is available, attempt JWT verification.
@@ -248,7 +291,7 @@ pub fn authenticate_token(
     token_map: &HashMap<String, UserInfo>,
     sa_decoding_key: Option<&DecodingKey>,
 ) -> Option<UserInfo> {
-    if let Some(info) = token_map.get(token) {
+    if let Some(info) = ct_token_lookup(token_map, token) {
         return Some(info.clone());
     }
     if let Some(key) = sa_decoding_key {
@@ -634,6 +677,55 @@ mod tests {
             AuthnResult::BadToken => {}
             AuthnResult::Identified(_) => panic!("unknown token must not succeed"),
         }
+    }
+
+    // --- ct_token_lookup ---
+
+    #[test]
+    fn ct_token_lookup_finds_exact_match() {
+        // A valid token must be found — correctness of the constant-time path.
+        let mut map = HashMap::new();
+        map.insert(
+            "exact-token-abc".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+            },
+        );
+        let result = ct_token_lookup(&map, "exact-token-abc");
+        assert!(result.is_some(), "exact match must be found");
+        assert_eq!(result.unwrap().username, "alice");
+    }
+
+    #[test]
+    fn ct_token_lookup_rejects_prefix_of_valid_token() {
+        // A prefix of a valid token must NOT match — timing oracle would allow
+        // an attacker to discover valid tokens one character at a time.
+        let mut map = HashMap::new();
+        map.insert(
+            "secret-abc".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+            },
+        );
+        assert!(
+            ct_token_lookup(&map, "secret").is_none(),
+            "a prefix of a valid token must not match (timing oracle would otherwise apply)"
+        );
+        assert!(
+            ct_token_lookup(&map, "secret-abcX").is_none(),
+            "a token with extra chars must not match"
+        );
+    }
+
+    #[test]
+    fn ct_token_lookup_empty_map_returns_none() {
+        // Empty map must not panic or return a result.
+        let map = HashMap::new();
+        assert!(ct_token_lookup(&map, "any-token").is_none());
     }
 
     // --- parse_path() ---
