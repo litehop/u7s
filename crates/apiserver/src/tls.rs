@@ -400,13 +400,20 @@ impl Kubeconfig {
 /// The default path ("./kubeconfig") is write-only on first run — it is not
 /// a read fixture. The file is generated fresh from the in-memory TLS material
 /// each time the server starts.
+///
+/// The kubeconfig contains embedded client certificate and private key material,
+/// so it is written with mode 0o600 (owner read+write only), matching the same
+/// permission applied to the SA and CA key files by `write_private_key`.
 pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, _args: &Args) -> anyhow::Result<()> {
     // Always write 127.0.0.1 as the server URL — this kubeconfig is for local use on the host.
     // lima-start.sh rewrites it to host.lima.internal when copying into the VM.
     // The cert SANs already include the advertise-address host so connections from either
     // address are valid.
     let kc = Kubeconfig::new("https://127.0.0.1:6443", tls);
-    std::fs::write(validate_cli_path(std::path::Path::new(path))?, kc.to_yaml())?;
+    write_private_key(
+        validate_cli_path(std::path::Path::new(path))?,
+        kc.to_yaml().as_bytes(),
+    )?;
     tracing::info!("kubeconfig written to {path}");
     Ok(())
 }
@@ -680,6 +687,44 @@ mod tests {
             mode, 0o600,
             "SA private key must be mode 0o600 (got {:#o}); \
              world-readable keys allow local users to forge SA tokens",
+            mode
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Kubeconfig must be written with mode 0o600 (owner-only).
+    ///
+    /// The kubeconfig contains the admin client certificate and private key in
+    /// base64 form. A world-readable kubeconfig allows any local user to impersonate
+    /// the cluster admin — same severity as a world-readable CA private key.
+    #[test]
+    fn kubeconfig_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_temp_dir("kubeconfig-perms");
+        let kubeconfig_path = dir.join("kubeconfig");
+
+        let args = Args {
+            db: "./state.db".into(),
+            listen: "0.0.0.0:6443".into(),
+            kubeconfig: kubeconfig_path.to_string_lossy().into_owned(),
+            token_auth_file: None,
+            sa_key: "./sa.key".into(),
+            sa_pub: "./sa.pub".into(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            advertise_address: None,
+        };
+
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        write_kubeconfig(&kubeconfig_path.to_string_lossy(), &tls, &args)
+            .expect("write_kubeconfig must succeed");
+
+        let meta = std::fs::metadata(&kubeconfig_path).expect("kubeconfig file must exist");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "kubeconfig must be mode 0o600 (got {:#o}); \
+             world-readable kubeconfig allows any local user to impersonate cluster admin",
             mode
         );
         let _ = std::fs::remove_dir_all(&dir);
