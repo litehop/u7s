@@ -29,6 +29,9 @@ pub struct CrContext {
     /// Controls whether the main PUT/PATCH endpoint strips `.status` and whether
     /// the `/status` subresource endpoint is active.
     pub has_status_subresource: bool,
+    /// The `openAPIV3Schema` from the matched version's schema field, if present.
+    /// Used for server-side CR body validation on CREATE and UPDATE.
+    pub schema: Option<serde_json::Value>,
 }
 
 /// Find the CRD whose spec.group == group and spec.names.plural == plural.
@@ -56,17 +59,24 @@ pub async fn find_crd(
             continue;
         }
         // Matching group + plural. Now check version is served.
-        let version_served = crd
+        let matched_version = crd
             .spec
             .versions
             .iter()
-            .any(|v| v.name == version && v.served);
-        if !version_served {
+            .find(|v| v.name == version && v.served);
+        if matched_version.is_none() {
             return Err(Status::not_found(
                 &format!("{group}/{version}/{plural}"),
                 "Resource",
             ));
         }
+        let matched_version = matched_version.unwrap();
+        // Extract openAPIV3Schema from the matched version's schema field.
+        let schema = matched_version
+            .schema
+            .as_ref()
+            .and_then(|s| s.get("openAPIV3Schema"))
+            .cloned();
         let namespaced = crd.spec.scope == "Namespaced";
         let list_kind = if crd.spec.names.list_kind.is_empty() {
             format!("{}List", crd.spec.names.kind)
@@ -88,6 +98,7 @@ pub async fn find_crd(
             list_kind,
             namespaced,
             has_status_subresource,
+            schema,
         });
     }
 
@@ -194,6 +205,134 @@ fn store_err_cr(err: u7s_store::StoreError, name: &str, kind: &str) -> crate::st
         u7s_store::StoreError::AlreadyExists { .. } => Status::already_exists(name, kind),
         other => Status::internal(other.to_string()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// openAPIV3Schema validation
+// ---------------------------------------------------------------------------
+
+/// Validate `value` against a minimal subset of openAPIV3Schema.
+///
+/// Supported keywords:
+/// - `type`: "object", "string", "integer", "boolean", "number", "array"
+/// - `properties`: recursive sub-schema per key (only when type is "object")
+/// - `required`: list of required property names
+/// - `additionalProperties: false`: reject keys not listed in `properties`
+///
+/// Unknown keywords are silently ignored (permissive on unsupported features).
+/// Returns `Ok(())` when valid, `Err(message)` describing the first violation.
+pub fn validate_against_schema(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    // Validate `type` constraint.
+    if let Some(expected_type) = schema.get("type").and_then(|t| t.as_str()) {
+        let actual_ok = match expected_type {
+            "object" => value.is_object(),
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            // Unknown type keywords → permissive
+            _ => true,
+        };
+        if !actual_ok {
+            let actual_type = json_type_name(value);
+            return Err(format!(
+                "{path}: expected type {expected_type}, got {actual_type}"
+            ));
+        }
+    }
+
+    // Only validate properties/required/additionalProperties for objects.
+    if let Some(obj) = value.as_object() {
+        let properties = schema.get("properties").and_then(|p| p.as_object());
+
+        // Validate `required` constraint.
+        if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+            for req in required {
+                if let Some(key) = req.as_str() {
+                    if !obj.contains_key(key) {
+                        let field_path = if path.is_empty() {
+                            key.to_string()
+                        } else {
+                            format!("{path}.{key}")
+                        };
+                        return Err(format!("{field_path}: required field missing"));
+                    }
+                }
+            }
+        }
+
+        // Validate `additionalProperties: false`.
+        let additional_props = schema.get("additionalProperties");
+        let rejects_additional = matches!(additional_props, Some(serde_json::Value::Bool(false)));
+        if rejects_additional {
+            if let Some(props) = &properties {
+                for key in obj.keys() {
+                    if !props.contains_key(key.as_str()) {
+                        let field_path = if path.is_empty() {
+                            key.to_string()
+                        } else {
+                            format!("{path}.{key}")
+                        };
+                        return Err(format!(
+                            "{field_path}: unknown field (additionalProperties is false)"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Recursively validate each declared property that is present in the object.
+        if let Some(props) = &properties {
+            for (key, sub_schema) in props.iter() {
+                if let Some(val) = obj.get(key.as_str()) {
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    validate_against_schema(val, sub_schema, &child_path)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(n) => {
+            if n.is_f64() {
+                "number"
+            } else {
+                "integer"
+            }
+        }
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Validate `obj` against the CRD schema in `ctx`, if a schema is present.
+/// Returns `Err(StatusError)` with HTTP 422 if validation fails.
+fn validate_cr_schema(
+    obj: &serde_json::Value,
+    ctx: &CrContext,
+) -> Result<(), crate::status::StatusError> {
+    if let Some(schema) = &ctx.schema {
+        validate_against_schema(obj, schema, "").map_err(|msg| {
+            Status::unprocessable_entity(format!("CR instance schema validation failed: {msg}"))
+        })?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +450,8 @@ pub async fn create_cr(
     let mut obj = wrapped.body;
     validate_cr_name(&name)?;
 
+    validate_cr_schema(&obj, &ctx)?;
+
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
     let key = cr_store_key(&group, &version, &plural, None, &name);
@@ -374,6 +515,8 @@ pub async fn replace_cr(
             map.remove("status");
         }
     }
+
+    validate_cr_schema(&obj, &ctx)?;
 
     let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
 
@@ -536,6 +679,8 @@ pub async fn create_cr_namespaced(
     let mut obj = wrapped.body;
     validate_cr_name(&name)?;
 
+    validate_cr_schema(&obj, &ctx)?;
+
     obj["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
@@ -598,6 +743,8 @@ pub async fn replace_cr_namespaced(
             map.remove("status");
         }
     }
+
+    validate_cr_schema(&obj, &ctx)?;
 
     let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
 
@@ -713,6 +860,8 @@ pub async fn patch_cr(
 
     crate::patch::merge_patch(&mut obj, &patch);
 
+    validate_cr_schema(&obj, &ctx)?;
+
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
@@ -765,6 +914,8 @@ pub async fn patch_cr_namespaced(
     }
 
     crate::patch::merge_patch(&mut obj, &patch);
+
+    validate_cr_schema(&obj, &ctx)?;
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
@@ -2276,6 +2427,416 @@ mod tests {
         assert!(
             obj["status"].is_null() || obj.get("status").is_none(),
             "status must NOT be stored by main PATCH when status subresource declared"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // openAPIV3Schema validation tests
+    // ---------------------------------------------------------------------------
+
+    // validate_against_schema: type:object with valid object passes.
+    // This is the happy path — a properly typed CR body must not be rejected.
+    #[test]
+    fn schema_valid_object_passes() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": { "type": "object" }
+            }
+        });
+        let value = serde_json::json!({ "spec": {} });
+        assert!(
+            validate_against_schema(&value, &schema, "").is_ok(),
+            "valid object must pass schema validation"
+        );
+    }
+
+    // validate_against_schema: type:object with spec as string fails.
+    // Ensures the type constraint is actually enforced — wrong types must be caught.
+    #[test]
+    fn schema_wrong_type_for_property_fails() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": { "type": "object" }
+            }
+        });
+        let value = serde_json::json!({ "spec": "not-an-object" });
+        let err = validate_against_schema(&value, &schema, "").unwrap_err();
+        assert!(
+            err.contains("spec"),
+            "error must name the offending field (got: {err})"
+        );
+        assert!(
+            err.contains("object"),
+            "error must mention expected type (got: {err})"
+        );
+    }
+
+    // validate_against_schema: required field missing causes an error.
+    // Controllers rely on required fields being present — silent acceptance would
+    // allow incomplete CRs that break the controller's assumptions.
+    #[test]
+    fn schema_required_field_missing_fails() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["spec"],
+            "properties": {
+                "spec": { "type": "object" }
+            }
+        });
+        let value = serde_json::json!({ "metadata": { "name": "foo" } });
+        let err = validate_against_schema(&value, &schema, "").unwrap_err();
+        assert!(
+            err.contains("spec"),
+            "error must mention the missing required field (got: {err})"
+        );
+        assert!(
+            err.contains("required"),
+            "error must say the field is required (got: {err})"
+        );
+    }
+
+    // validate_against_schema: additionalProperties:false rejects unknown keys.
+    // Strict schemas should prevent typos in field names from being silently stored.
+    #[test]
+    fn schema_additional_properties_false_rejects_unknown_key() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "spec": { "type": "object" }
+            },
+            "additionalProperties": false
+        });
+        let value = serde_json::json!({ "spec": {}, "unknownField": "oops" });
+        let err = validate_against_schema(&value, &schema, "").unwrap_err();
+        assert!(
+            err.contains("unknownField"),
+            "error must name the unexpected field (got: {err})"
+        );
+    }
+
+    // validate_against_schema: unknown keywords are ignored (permissive).
+    // openAPIV3Schema has many optional keywords; we must not reject schemas
+    // that use keywords we haven't implemented.
+    #[test]
+    fn schema_unknown_keywords_are_ignored() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "x-kubernetes-preserve-unknown-fields": true,
+            "description": "some doc",
+            "default": {}
+        });
+        let value = serde_json::json!({ "anything": "here" });
+        assert!(
+            validate_against_schema(&value, &schema, "").is_ok(),
+            "unknown keywords must not cause validation failure"
+        );
+    }
+
+    // validate_against_schema: scalar types are correctly checked.
+    // These are the leaf types that CRD schemas declare for individual fields.
+    #[test]
+    fn schema_scalar_type_checks() {
+        let string_schema = serde_json::json!({ "type": "string" });
+        assert!(validate_against_schema(&serde_json::json!("hello"), &string_schema, "f").is_ok());
+        assert!(validate_against_schema(&serde_json::json!(42), &string_schema, "f").is_err());
+
+        let int_schema = serde_json::json!({ "type": "integer" });
+        assert!(validate_against_schema(&serde_json::json!(7), &int_schema, "f").is_ok());
+        assert!(validate_against_schema(&serde_json::json!("7"), &int_schema, "f").is_err());
+
+        let bool_schema = serde_json::json!({ "type": "boolean" });
+        assert!(validate_against_schema(&serde_json::json!(true), &bool_schema, "f").is_ok());
+        assert!(validate_against_schema(&serde_json::json!(1), &bool_schema, "f").is_err());
+    }
+
+    // CRD with schema: valid CR body accepted by create_cr_namespaced.
+    // This is the integration path: schema extracted from CRD, CR body validated.
+    #[tokio::test]
+    async fn create_cr_namespaced_with_schema_accepts_valid_body() {
+        let state = make_state();
+
+        // Install CRD with openAPIV3Schema requiring spec to be an object.
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "spec": { "type": "object" }
+                                }
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                crd_bytes
+            )
+            .await
+            .is_ok(),
+            "install CRD with schema"
+        );
+
+        // CR with spec as object — must pass validation.
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "good-widget", "namespace": "default" },
+                "spec": { "color": "blue" }
+            })
+            .to_string(),
+        );
+
+        let result = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "widgets".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            cr_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "CR with valid spec object must be accepted by schema validation"
+        );
+    }
+
+    // CRD with schema: CR body with wrong spec type rejected with 422.
+    // Server-side validation must fire when the CRD has a schema — wrong types
+    // must not be silently stored (the whole point of this feature).
+    #[tokio::test]
+    async fn create_cr_namespaced_with_schema_rejects_wrong_spec_type() {
+        let state = make_state();
+
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "spec": { "type": "object" }
+                                }
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                crd_bytes
+            )
+            .await
+            .is_ok(),
+            "install CRD with schema"
+        );
+
+        // CR with spec as a string — must fail schema validation.
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "bad-widget", "namespace": "default" },
+                "spec": "not-an-object"
+            })
+            .to_string(),
+        );
+
+        let err = expect_err_status(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "default".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                cr_body,
+            )
+            .await,
+            "CR with spec as string must be rejected",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 422, "schema violation must return 422");
+        assert_eq!(
+            json["reason"], "Invalid",
+            "schema violation must return reason=Invalid"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("schema validation failed"),
+            "message must mention schema validation (got: {})",
+            json["message"]
+        );
+    }
+
+    // CRD with required field: CR missing that field is rejected with 422.
+    // Required constraints protect controllers that always expect certain fields.
+    #[tokio::test]
+    async fn create_cr_namespaced_with_required_schema_rejects_missing_field() {
+        let state = make_state();
+
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "listKind": "WidgetList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "required": ["spec"],
+                                "properties": {
+                                    "spec": { "type": "object" }
+                                }
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        use crate::handlers::crd;
+        assert!(
+            crd::create_crd(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                crd_bytes
+            )
+            .await
+            .is_ok(),
+            "install CRD with required schema"
+        );
+
+        // CR without spec — must fail required constraint.
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "no-spec-widget", "namespace": "default" }
+            })
+            .to_string(),
+        );
+
+        let err = expect_err_status(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "default".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                cr_body,
+            )
+            .await,
+            "CR without required spec must be rejected",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 422, "missing required field must return 422");
+    }
+
+    // CRD without schema: any CR body is accepted (permissive mode).
+    // This preserves backward-compatible behaviour for CRDs that don't declare a schema.
+    #[tokio::test]
+    async fn create_cr_namespaced_without_schema_accepts_any_body() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        // Body with an unusual structure — must be accepted since no schema is declared.
+        let cr_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": "any-body-app", "namespace": "argocd" },
+                "weirdField": 42,
+                "anotherField": [1, 2, 3]
+            })
+            .to_string(),
+        );
+
+        let result = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            cr_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "CRD without schema must accept any body (permissive mode)"
         );
     }
 }
