@@ -1,38 +1,53 @@
 # Dashboard
-2026-05-21 12:00 UTC
+2026-05-22 (session active — coverage drive)
 `bd prime` in a fresh Claude Code session (or say "I am the Mayor now")
-Open beads: 3
+Open beads: 13 (12 coverage tasks + 1 investigation)
 
 ## What needs the operator now
 
-Nothing blocking. All decisions resolved this session.
+Nothing blocking. Merge policy: auto on green CI.
 
-PRs in flight:
-- **PR #128** (system:masters → ClusterRoleBinding) — CI running after rebase, merge pending
-- **PR #129** (SA token UID fix + round-trip test) — rebase worker running, merge pending after
+**Note for next mayor:** Workers using `isolation: worktree` get a worktree created but must explicitly `cd` into it. Always include the absolute worktree path in worker prompts and tell them to `cd` there as step 0. The session CWD stays at the mayor checkout even with `isolation: worktree`.
 
-## Forward-looking
+## Wave 1 — in flight (6 background agents)
 
-Next dispatch (awaiting your go-ahead per earlier agreement):
-- **mayor-o2py** (P2) — implement `certificates.k8s.io/v1` CSR API surface in u7s
-- **mayor-suf0** (P2) — integrate upstream kube-controller-manager into smoke test (blocked on mayor-o2py)
-- **mayor-2ni** (P3) — sonobuoy conformance audit (dispatchable now, no blockers)
+| Bead | File | Before | Worker |
+|------|------|--------|--------|
+| mayor-7v1m | handlers/scale.rs | 36%L/35%F | running (re-dispatched with explicit worktree cd) |
+| mayor-ditd | handlers/pods.rs | 51%L/42%F | running |
+| mayor-s6kt | client-util/src/lib.rs | 28%L/57%F | running |
+| mayor-o813+c8w4 | keys.rs + types.rs | 55%/69%L | running (cluster) |
+| mayor-y3i8 | handlers/mod.rs + serializer.rs | investigation | running (read-only) |
+
+## Wave 2 — queued (dispatch after wave 1 PRs land)
+
+| Bead | File | Before |
+|------|------|--------|
+| mayor-ykrv | handlers/authorization.rs | 73%L/60%F |
+| mayor-8o8f | handlers/generic.rs | 68%L/55%F |
+| mayor-5jnt | handlers/namespaces.rs | 73%L/62%F |
+| mayor-yo8x | handlers/tokens.rs | 79%L/68%F |
+
+## Wave 3 — queued (binary crate lib-extraction, structural)
+
+| Bead | Crate | Before |
+|------|-------|--------|
+| mayor-dbl7 | controller-manager | 9%L/12%F |
+| mayor-y70u | scheduler | 21%L/22%F |
+| mayor-izua | mcp-server | 0%/0% |
+
+## Coverage goals
+
+- Non-main.rs: ≥70% line, ≥95% function
+- main.rs: extract logic → lib.rs, test that; wiring exempt
+- Baseline: 74.58% line / 67.99% fn workspace total
 
 ## Recent progress
 
-Heavy session. All previously failing CI is now green:
-- **PR #127** (proto decoders + CRI-O/CNI smoke fix + `enableServiceLinks` defaulting) merged ✓
-- **PR #125** (CNI plugins + pod lifecycle test) merged ✓
-- **PR #110** (rusqlite 0.39) merged ✓ — worker fixed `u64`→`i64` cast for rusqlite API change
-- **PR #109** (rcgen 0.14) merged ✓ — worker fixed `signed_by` API change in `tls.rs`/`auth.rs`
-- **mayor-8c89** (coverage gate) closed as verified — `--fail-under-lines` already enforced
-- **mayor-22n6** (system:masters bypass) — PR #128 open, CI pending
-- **mayor-pudl** (SA token projection) — found and fixed empty UID in seeded SAs; PR #129 open
-- **mayor-z1bu** closed — superseded by architectural decision: full upstream CSR API + kube-controller-manager
-- Orphan branches: all 4 deleted after operator relaxed branch protection rules
-- Workers now required to run `cargo fmt --all` before pushing (memory saved)
-
-~6 beads closed, ~6 PRs merged this half-session. ~16 PRs merged total today.
+- 2026-05-22: 13 coverage beads filed. Wave 1 (5+1 workers) dispatched.
+  Testing conventions documented in `ai/prompts/rust-testing-conventions.md`.
+- Previous session: PRs #128 (RBAC seeded ClusterRoleBinding) and #129 (SA token projection) merged.
 
 ## Stance
+
 Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; flag security/API/architecture PRs for operator review first.
