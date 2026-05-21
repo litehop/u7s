@@ -355,6 +355,7 @@ jobs:
             --config=/etc/kubelet-config.yaml \
             --kubeconfig=/etc/kubelet-kubeconfig \
             --hostname-override=ci-node \
+            --logging-format=text \
             --v=2 \
             >"$TMPDIR/kubelet.log" 2>&1 &
           echo "KUBELET_PID=$!" >> "$GITHUB_ENV"
