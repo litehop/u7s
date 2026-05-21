@@ -9,6 +9,8 @@ on:
 jobs:
   kubectl:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -217,6 +219,8 @@ jobs:
 
   kubelet:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
