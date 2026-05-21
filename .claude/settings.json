@@ -81,7 +81,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -o '\"command\":\"[^\"]*\"' | head -1 | sed 's/\"command\":\"//;s/\"//'); case \"$cmd\" in \"git push\"*) cargo test --workspace --quiet && cargo clippy --workspace --quiet -- -D warnings ;; esac"
+            "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r '.command // \"\"' 2>/dev/null || echo ''); case \"$cmd\" in *\"git push\"*) cargo test --workspace --quiet && cargo clippy --workspace --quiet -- -D warnings && cargo fmt --check ;; esac"
           }
         ]
       }
