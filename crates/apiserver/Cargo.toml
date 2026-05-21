@@ -34,3 +34,4 @@ jsonwebtoken    = "9"
 rsa             = "0.9"
 x509-cert = "0.2"
 uuid        = { version = "1", features = ["v4"] }
+subtle      = "2"
