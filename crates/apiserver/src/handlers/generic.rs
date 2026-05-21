@@ -31,6 +31,11 @@ pub struct CollectionQuery {
     /// live changes. Used by kubelet (Kubernetes 1.27+) for efficient informer startup.
     #[serde(rename = "sendInitialEvents")]
     pub send_initial_events: Option<bool>,
+    /// When true, the server sends periodic BOOKMARK events to keep the connection alive
+    /// and advance the client's resourceVersion. When false or absent, bookmarks are suppressed
+    /// (except the end-of-list BOOKMARK from sendInitialEvents, which is always sent).
+    #[serde(rename = "allowWatchBookmarks")]
+    pub allow_watch_bookmarks: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +301,7 @@ pub(crate) async fn watch_generic(
     initial_items: Option<(Vec<serde_json::Value>, u64)>,
     label_selector: Option<String>,
     field_selector: Option<String>,
+    allow_watch_bookmarks: bool,
 ) -> Result<Response, crate::status::StatusError> {
     // Check compaction horizon BEFORE committing headers so clients get a synchronous HTTP 410.
     // If from_rv > 0 and below the horizon, the revision is expired — return 410 immediately.
@@ -411,17 +417,21 @@ pub(crate) async fn watch_generic(
                 }
 
                 _ = bookmark_tick.tick() => {
-                    let bookmark = format!(
-                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                    );
-                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
                 }
 
                 _ = &mut max_duration => {
-                    let bookmark = format!(
-                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                    );
-                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
                     break;
                 }
             }
@@ -627,6 +637,7 @@ pub async fn list_resource(
             initial,
             query.label_selector,
             query.field_selector,
+            query.allow_watch_bookmarks == Some(true),
         )
         .await;
     }
@@ -1077,6 +1088,7 @@ pub async fn list_namespaced_resource(
             initial,
             query.label_selector,
             query.field_selector,
+            query.allow_watch_bookmarks == Some(true),
         )
         .await;
     }
@@ -1670,6 +1682,7 @@ pub async fn core_list_resource(
                 initial,
                 query.label_selector,
                 query.field_selector,
+                query.allow_watch_bookmarks == Some(true),
             )
             .await
             .map(IntoResponse::into_response);
@@ -3245,6 +3258,7 @@ mod tests {
                 limit: None,
                 continue_token: None,
                 send_initial_events: None,
+                allow_watch_bookmarks: None,
             }),
         )
         .await
@@ -4122,6 +4136,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 
@@ -4168,6 +4183,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         )
         .await;
 
@@ -4175,6 +4191,65 @@ mod tests {
             result.is_ok(),
             "rv=0 (full watch) must not trigger the 410 expiry check, \
              even when a compaction horizon exists"
+        );
+    }
+
+    // -- allowWatchBookmarks: CollectionQuery field and bookmark suppression --
+
+    /// allowWatchBookmarks=Some(true) enables periodic bookmarks.
+    /// allowWatchBookmarks absent or Some(false) suppresses them.
+    /// This is the Kubernetes watch protocol: clients must opt-in to bookmark traffic.
+    #[test]
+    fn allow_watch_bookmarks_controls_bookmark_emission() {
+        // When Some(true): bookmarks are allowed.
+        let q_true = CollectionQuery {
+            watch: Some(true),
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: Some(true),
+        };
+        assert_eq!(
+            q_true.allow_watch_bookmarks == Some(true),
+            true,
+            "allowWatchBookmarks=true must enable periodic bookmarks"
+        );
+
+        // When None (absent): bookmarks are suppressed.
+        let q_none = CollectionQuery {
+            watch: Some(true),
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+        };
+        assert_ne!(
+            q_none.allow_watch_bookmarks,
+            Some(true),
+            "absent allowWatchBookmarks must suppress periodic bookmarks"
+        );
+
+        // When Some(false): bookmarks are suppressed.
+        let q_false = CollectionQuery {
+            watch: Some(true),
+            resource_version: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: Some(false),
+        };
+        assert_ne!(
+            q_false.allow_watch_bookmarks,
+            Some(true),
+            "allowWatchBookmarks=false must suppress periodic bookmarks"
         );
     }
 }

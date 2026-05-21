@@ -212,6 +212,7 @@ pub async fn list_cr(
             None,
             query.label_selector,
             query.field_selector,
+            query.allow_watch_bookmarks == Some(true),
         )
         .await;
     }
@@ -439,6 +440,7 @@ pub async fn list_cr_namespaced(
             None,
             query.label_selector,
             query.field_selector,
+            query.allow_watch_bookmarks == Some(true),
         )
         .await;
     }
@@ -769,6 +771,7 @@ mod tests {
             limit: None,
             continue_token: None,
             send_initial_events: None,
+            allow_watch_bookmarks: None,
         }
     }
 
@@ -1417,6 +1420,7 @@ mod tests {
             limit: None,
             continue_token: None,
             send_initial_events: None,
+            allow_watch_bookmarks: None,
         }
     }
 

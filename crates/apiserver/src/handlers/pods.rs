@@ -26,6 +26,10 @@ pub struct CollectionQuery {
     /// live changes. Used by kubelet (Kubernetes 1.27+) for efficient informer startup.
     #[serde(rename = "sendInitialEvents")]
     pub send_initial_events: Option<bool>,
+    /// When true, the server sends periodic BOOKMARK events. When false or absent,
+    /// bookmarks are suppressed (except the sendInitialEvents end-of-list BOOKMARK).
+    #[serde(rename = "allowWatchBookmarks")]
+    pub allow_watch_bookmarks: Option<bool>,
 }
 
 /// Extract a store-level FieldSelector from a raw field selector string.
@@ -175,6 +179,7 @@ pub async fn list_pods(
             from_rv,
             query.field_selector,
             initial_pods,
+            query.allow_watch_bookmarks == Some(true),
         )
         .await;
     }
@@ -225,6 +230,7 @@ async fn watch_pods(
     from_revision: u64,
     field_selector: Option<String>,
     initial_pods: Option<(Vec<serde_json::Value>, u64)>,
+    allow_watch_bookmarks: bool,
 ) -> Result<Response, crate::status::StatusError> {
     let event_stream = state
         .store
@@ -334,18 +340,22 @@ async fn watch_pods(
                 }
 
                 _ = bookmark_tick.tick() => {
-                    let bookmark = format!(
-                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                    );
-                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
                 }
 
                 _ = &mut max_duration => {
                     // Max watch duration reached — send a final BOOKMARK and close gracefully.
-                    let bookmark = format!(
-                        "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                    );
-                    yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Pod\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
                     break;
                 }
             }
@@ -1021,6 +1031,7 @@ mod watch_tests {
             resource_version: Some(42),
             field_selector: None,
             send_initial_events: None,
+            allow_watch_bookmarks: None,
         };
         assert!(q.watch == Some(true));
         assert_eq!(q.resource_version, Some(42));
@@ -1034,6 +1045,7 @@ mod watch_tests {
             resource_version: None,
             field_selector: None,
             send_initial_events: None,
+            allow_watch_bookmarks: None,
         };
         assert_eq!(q.watch, None);
         assert_eq!(q.resource_version, None);
