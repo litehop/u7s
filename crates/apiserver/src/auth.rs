@@ -133,8 +133,7 @@ fn ct_token_lookup<'a>(
         // 0 (not equal) without short-circuiting, so we can call it directly.
         // We use a manual length check first (which leaks whether lengths match,
         // but not token content) then the constant-time byte compare.
-        if stored_bytes.len() == candidate_bytes.len()
-            && stored_bytes.ct_eq(candidate_bytes).into()
+        if stored_bytes.len() == candidate_bytes.len() && stored_bytes.ct_eq(candidate_bytes).into()
         {
             found = Some(info);
             // Do NOT break: continue iterating so the loop takes the same time

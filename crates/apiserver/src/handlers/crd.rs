@@ -790,10 +790,7 @@ mod tests {
             "built-in group 'apps' must return 422 Unprocessable Entity"
         );
         assert!(
-            json["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("built-in"),
+            json["message"].as_str().unwrap_or("").contains("built-in"),
             "error must mention built-in group restriction"
         );
     }

@@ -31,6 +31,12 @@ use inflight::InflightLayer;
 use state::AppState;
 use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
 
+/// Maximum request body size in bytes. Applied as the outermost layer so
+/// unauthenticated requests are rejected before auth processing, preventing
+/// OOM attacks via large unauthenticated bodies. 4 MiB gives headroom above
+/// etcd's 1.5 MiB object limit while staying well below OOM risk.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Parser)]
 struct Args {
     #[arg(long, default_value = "./state.db")]
@@ -160,7 +166,10 @@ async fn main() -> anyhow::Result<()> {
     state.init().await;
 
     // 10. Build axum router and attach tower layers.
-    //     Order (outermost first): inflight → auth → content_type → handler.
+    //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
+    //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
+    //     auth processing — this prevents OOM via large unauthenticated request bodies.
+    //     4 MiB matches etcd's practical limit (~1.5 MiB) with headroom for kubectl manifests.
     let app = build_router(state.clone())
         .layer(ContentTypeLayer)
         .layer(AuthLayer::new(
@@ -168,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
         ))
-        .layer(InflightLayer::new());
+        .layer(InflightLayer::new())
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
 
     // 11. Bind TLS listener and serve.
     let listener = TcpListener::bind(&args.listen).await?;
@@ -986,5 +996,29 @@ mod tests {
         seed_serviceaccounts(&store)
             .await
             .expect("second seed must not fail");
+    }
+
+    /// The body size limit must be at least 1 MiB (to accommodate real kubectl
+    /// manifests and ConfigMaps) and at most 8 MiB (to prevent OOM from a single
+    /// large unauthenticated request). The current limit is 4 MiB.
+    ///
+    /// Without a body limit, an unauthenticated attacker can POST an arbitrarily
+    /// large body to any endpoint and cause the server to OOM before auth runs.
+    #[test]
+    fn body_limit_is_within_safe_range() {
+        // 1 MiB minimum: kubectl configmaps can be up to ~1 MiB in practice.
+        // 8 MiB maximum: etcd's default value limit; no valid object exceeds this.
+        const MIN_SAFE: usize = 1 * 1024 * 1024;
+        const MAX_SAFE: usize = 8 * 1024 * 1024;
+        assert!(
+            MAX_BODY_BYTES >= MIN_SAFE,
+            "body limit {} is too small; kubectl manifests can be up to 1 MiB",
+            MAX_BODY_BYTES
+        );
+        assert!(
+            MAX_BODY_BYTES <= MAX_SAFE,
+            "body limit {} is too large; risk of OOM from a single request",
+            MAX_BODY_BYTES
+        );
     }
 }

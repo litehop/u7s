@@ -608,7 +608,10 @@ mod tests {
     // own deduplication logic, independent of API validation.
     #[tokio::test]
     async fn crd_group_does_not_duplicate_static_groups() {
-        use crate::handlers::crd::{CrdMetadata, CustomResourceDefinitionNames, CustomResourceDefinitionSpec, CustomResourceDefinitionVersion};
+        use crate::handlers::crd::{
+            CrdMetadata, CustomResourceDefinitionNames, CustomResourceDefinitionSpec,
+            CustomResourceDefinitionVersion,
+        };
         let state = make_state();
 
         // Insert a CRD directly into the store, bypassing create_crd() validation,
@@ -649,7 +652,11 @@ mod tests {
         };
         let key = format!("/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.apps");
         let bytes = bytes::Bytes::from(serde_json::to_vec(&crd).unwrap());
-        state.store.put(&key, bytes, Some(0)).await.expect("direct store insert must succeed");
+        state
+            .store
+            .put(&key, bytes, Some(0))
+            .await
+            .expect("direct store insert must succeed");
 
         let Json(list) = api_group_list(State(state)).await;
         let apps_count = list.groups.iter().filter(|g| g.name == "apps").count();
