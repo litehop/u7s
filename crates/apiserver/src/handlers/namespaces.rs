@@ -2,12 +2,13 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
+    auth::UserInfo,
     keys::{cluster_list_prefix, cluster_object_key},
     proto,
     state::AppState,
@@ -49,6 +50,7 @@ fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusErro
 pub async fn list_namespaces(
     State(state): State<AppState>,
     Query(query): Query<super::generic::CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let prefix = cluster_list_prefix("namespaces");
 
@@ -63,6 +65,7 @@ pub async fn list_namespaces(
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
+            user.username,
         )
         .await;
     }
@@ -363,7 +366,17 @@ mod tests {
             allow_watch_bookmarks: None,
         };
 
-        let resp = match list_namespaces(State(state), Query(query)).await {
+        let resp = match list_namespaces(
+            State(state),
+            Query(query),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("watch must not error"),
         };

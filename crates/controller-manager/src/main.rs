@@ -7,19 +7,17 @@
 /// Uses the same kubeconfig/TLS stack as u7s-scheduler. The --token-file
 /// flag provides an alternative bearer-token bootstrap path when kubeconfig
 /// is unavailable (e.g. early cluster bootstrap).
-use std::sync::Arc;
-
 use anyhow::{bail, Context};
 use base64::Engine;
 use clap::Parser;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
+use u7s_client_util::{build_tls_connector, parse_kubeconfig};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -42,75 +40,6 @@ struct Args {
     /// API server address override. Takes precedence over kubeconfig server.
     #[arg(long)]
     server: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Kubeconfig parsing — identical to scheduler
-// ---------------------------------------------------------------------------
-
-struct ClientCreds {
-    server: String,
-    ca_cert: CertificateDer<'static>,
-    client_cert: CertificateDer<'static>,
-    client_key: PrivateKeyDer<'static>,
-}
-
-fn parse_kubeconfig(path: &str) -> anyhow::Result<ClientCreds> {
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("reading kubeconfig {path}"))?;
-    let b64 = base64::engine::general_purpose::STANDARD;
-
-    let server = extract_yaml_value(&raw, "server:").context("kubeconfig: missing server")?;
-    let ca_data = extract_yaml_value(&raw, "certificate-authority-data:")
-        .context("kubeconfig: missing certificate-authority-data")?;
-    let cert_data = extract_yaml_value(&raw, "client-certificate-data:")
-        .context("kubeconfig: missing client-certificate-data")?;
-    let key_data = extract_yaml_value(&raw, "client-key-data:")
-        .context("kubeconfig: missing client-key-data")?;
-
-    let ca_der = b64.decode(ca_data.trim()).context("decode CA cert")?;
-    let cert_der = b64.decode(cert_data.trim()).context("decode client cert")?;
-    let key_pem = b64.decode(key_data.trim()).context("decode client key")?;
-
-    let client_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .context("parse client key PEM")?
-        .context("no private key in kubeconfig client-key-data")?;
-
-    Ok(ClientCreds {
-        server: server.trim().to_owned(),
-        ca_cert: CertificateDer::from(ca_der),
-        client_cert: CertificateDer::from(cert_der),
-        client_key,
-    })
-}
-
-fn extract_yaml_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix(key) {
-            return Some(rest.trim());
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// TLS client setup
-// ---------------------------------------------------------------------------
-
-fn build_tls_connector(creds: &ClientCreds) -> anyhow::Result<TlsConnector> {
-    use rustls::ClientConfig;
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store
-        .add(creds.ca_cert.clone())
-        .context("add CA cert")?;
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(
-            vec![creds.client_cert.clone()],
-            creds.client_key.clone_key(),
-        )
-        .context("configure mTLS")?;
-    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 // ---------------------------------------------------------------------------

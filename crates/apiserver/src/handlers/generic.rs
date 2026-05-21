@@ -3,14 +3,16 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use serde::Deserialize;
 use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
 
 use crate::{
+    auth::UserInfo,
     keys::{group_list_prefix, group_object_key},
+    rbac::user_holds_all_rules,
     state::AppState,
     status::Status,
     types::{Object, ResourceKey},
@@ -39,25 +41,60 @@ pub struct CollectionQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Path parameter validation
+// ---------------------------------------------------------------------------
+
+/// Validate a Kubernetes resource name or namespace against DNS label rules.
+///
+/// Rules: 1–253 lowercase alphanumeric chars or hyphens. No `/`, no `..`,
+/// no uppercase. This prevents path-traversal attacks where a crafted `ns` or
+/// `name` value (e.g. `../../secrets`) could escape the expected key prefix in
+/// the store and read or overwrite unintended objects.
+///
+/// Returns `Err` with a 400 Bad Request StatusError if invalid.
+pub(crate) fn validate_name(label: &str, value: &str) -> Result<(), crate::status::StatusError> {
+    if value.is_empty() || value.len() > 253 {
+        return Err(Status::bad_request(format!(
+            "invalid {label} '{}': must be 1–253 characters",
+            value
+        )));
+    }
+    // Fast-path rejection: any slash or dot-dot is an immediate traversal indicator.
+    if value.contains('/') || value.contains("..") {
+        return Err(Status::bad_request(format!(
+            "invalid {label} '{}': must not contain '/' or '..'",
+            value
+        )));
+    }
+    // Full DNS-label charset check: lowercase alpha, digits, hyphens only.
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
+        return Err(Status::bad_request(format!(
+            "invalid {label} '{}': must match [a-z0-9.-]+",
+            value
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 pub(crate) fn generate_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut n = t ^ c.wrapping_mul(0x9e3779b97f4a7c15);
-    const CHARS: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
-    let mut out = [0u8; 5];
-    for b in out.iter_mut() {
-        *b = CHARS[(n % CHARS.len() as u64) as usize];
-        n = n.wrapping_div(CHARS.len() as u64);
-    }
-    String::from_utf8(out.to_vec()).unwrap()
+    // Use UUIDv4 (CSPRNG) as the entropy source. The previous implementation
+    // XOR'd system time with a counter — neither is cryptographically random,
+    // allowing an attacker to predict generated names. Take the first 5 hex
+    // chars of the UUID (no dashes) to preserve the existing 5-char suffix format.
+    let uuid = uuid::Uuid::new_v4().to_string();
+    // UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    // Take the first 5 chars of the first group (pure hex, no dashes).
+    uuid.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(5)
+        .collect()
 }
 
 pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::StatusError> {
@@ -248,10 +285,10 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
     true
 }
 
-/// Test whether a JSON object matches a field selector string (`key=value,...`).
-/// Supports `metadata.name` and `metadata.namespace` equality checks.
-/// Returns true if the selector is empty (pass-through) or all pairs match.
-/// Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
+/// Test whether a JSON object matches a field selector string (`key=value,...` or `key!=value,...`).
+/// Supports `metadata.name`, `metadata.namespace` (equality only), and `spec.nodeName`
+/// (equality and inequality). Returns true if the selector is empty (pass-through) or all
+/// terms match. Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
 pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &str) -> bool {
     if selector.is_empty() {
         return true;
@@ -261,9 +298,20 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
         if part.is_empty() {
             continue;
         }
-        if let Some(eq_pos) = part.find('=') {
-            let field = part[..eq_pos].trim();
-            let value = part[eq_pos + 1..].trim();
+        // Check for inequality (`!=`) before equality (`=`) to avoid misparse.
+        if let Some((field, value)) = part.split_once("!=") {
+            let field = field.trim();
+            let value = value.trim();
+            if field == "spec.nodeName" {
+                let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
+                if node_name == value {
+                    return false;
+                }
+            }
+            // Unknown fields: ignore (conservative).
+        } else if let Some((field, value)) = part.split_once('=') {
+            let field = field.trim();
+            let value = value.trim();
             match field {
                 "metadata.name" => {
                     let name = obj["metadata"]["name"].as_str().unwrap_or("");
@@ -274,6 +322,12 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
                 "metadata.namespace" => {
                     let ns = obj["metadata"]["namespace"].as_str().unwrap_or("");
                     if ns != value {
+                        return false;
+                    }
+                }
+                "spec.nodeName" => {
+                    let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
+                    if node_name != value {
                         return false;
                     }
                 }
@@ -291,6 +345,10 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
 /// When `initial_items` is Some, those items are emitted as ADDED events first
 /// (implementing the Kubernetes 1.27+ sendInitialEvents protocol), followed by a
 /// BOOKMARK, before streaming live changes from `from_revision`.
+///
+/// `username` is the authenticated client identity used to enforce the per-client
+/// watch stream concurrency limit (MAX_WATCHES_PER_CLIENT). Exceeding the limit
+/// returns HTTP 429 immediately without opening a watch stream.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn watch_generic(
     state: AppState,
@@ -302,7 +360,21 @@ pub(crate) async fn watch_generic(
     label_selector: Option<String>,
     field_selector: Option<String>,
     allow_watch_bookmarks: bool,
+    username: String,
 ) -> Result<Response, crate::status::StatusError> {
+    // Enforce per-client watch concurrency limit. Try to acquire a permit from
+    // this user's semaphore. If the semaphore is exhausted (client already has
+    // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
+    let sem = state.watch_limit.semaphore_for(&username);
+    let _watch_permit = sem.try_acquire_owned().map_err(|_| {
+        crate::status::Status::too_many_requests(format!(
+            "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
+            crate::state::MAX_WATCHES_PER_CLIENT
+        ))
+    })?;
+    // _watch_permit is held for the duration of the watch stream and released when
+    // this function returns (RAII drop).
+
     // Check compaction horizon BEFORE committing headers so clients get a synchronous HTTP 410.
     // If from_rv > 0 and below the horizon, the revision is expired — return 410 immediately.
     if from_revision > 0 {
@@ -591,6 +663,48 @@ pub(crate) fn stamp_metadata(obj: &mut Object) {
 }
 
 const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
+const CLUSTER_ROLE_BINDINGS: &str = "clusterrolebindings";
+
+/// Escalation prevention for ClusterRoleBinding writes.
+///
+/// A user may only create or update a ClusterRoleBinding if they already hold
+/// every permission enumerated in the referenced ClusterRole. If they don't,
+/// they could use the binding to grant themselves privileges they don't have.
+///
+/// Returns `Ok(())` if the check passes (or is not applicable), or
+/// `Err(StatusError)` with 403 Forbidden if the check fails.
+pub(crate) fn check_crb_escalation(
+    plural: &str,
+    group: &str,
+    user: &UserInfo,
+    body: &serde_json::Value,
+    state: &AppState,
+) -> Result<(), crate::status::StatusError> {
+    if group != RBAC_GROUP || plural != CLUSTER_ROLE_BINDINGS {
+        return Ok(());
+    }
+    // system:masters unconditionally bypasses the escalation check.
+    if user.groups.iter().any(|g| g == "system:masters") {
+        return Ok(());
+    }
+    let role_ref_name = body["roleRef"]["name"].as_str().unwrap_or("");
+    let role_rules = state.rbac_index.cluster_role_rules(role_ref_name);
+    // An empty rule set (role not found) means the user cannot hold all rules
+    // of a non-existent role — deny unless role_rules is truly empty from an
+    // existing role. We check: if role_ref_name is non-empty and rules are
+    // empty, the role does not exist → deny.
+    if !role_ref_name.is_empty() && role_rules.is_empty() {
+        return Err(Status::forbidden(format!(
+            "cannot escalate privileges: ClusterRole \"{role_ref_name}\" not found or has no rules"
+        )));
+    }
+    if !user_holds_all_rules(&user.username, &user.groups, &role_rules, &state.rbac_index) {
+        return Err(Status::forbidden(
+            "cannot escalate privileges: user does not hold all rules of the referenced ClusterRole".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Build the RBAC index key for a cluster-scoped object.
 fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
@@ -610,11 +724,18 @@ pub async fn list_resource(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
-            return super::cr::list_cr(State(state), Path((group, version, plural)), query).await;
+            return super::cr::list_cr(
+                State(state),
+                Path((group, version, plural)),
+                query,
+                user.username,
+            )
+            .await;
         }
     };
     let prefix = group_list_prefix(&group, &plural, None);
@@ -638,6 +759,7 @@ pub async fn list_resource(
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
+            user.username,
         )
         .await;
     }
@@ -694,6 +816,7 @@ pub async fn get_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -720,6 +843,7 @@ pub async fn get_resource(
 pub async fn create_resource(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -740,6 +864,11 @@ pub async fn create_resource(
 
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // Escalation prevention: before persisting a ClusterRoleBinding, verify the
+    // caller already holds all rules of the referenced ClusterRole. This prevents
+    // users from granting themselves permissions they don't currently have.
+    check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
 
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
@@ -770,9 +899,11 @@ pub async fn create_resource(
 pub async fn replace_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -790,6 +921,10 @@ pub async fn replace_resource(
 
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // Escalation prevention: before updating a ClusterRoleBinding, verify the
+    // caller already holds all rules of the referenced ClusterRole.
+    check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
 
     let obj_name = obj.name().unwrap_or("").to_string();
     if obj_name != name {
@@ -827,6 +962,7 @@ pub async fn delete_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1025,6 +1161,7 @@ pub async fn patch_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -1056,7 +1193,9 @@ pub async fn list_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1064,6 +1203,7 @@ pub async fn list_namespaced_resource(
                 State(state),
                 Path((group, version, ns, plural)),
                 query,
+                user.username,
             )
             .await;
         }
@@ -1089,6 +1229,7 @@ pub async fn list_namespaced_resource(
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
+            user.username,
         )
         .await;
     }
@@ -1145,6 +1286,8 @@ pub async fn get_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1178,6 +1321,7 @@ pub async fn create_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -1230,6 +1374,8 @@ pub async fn replace_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -1284,6 +1430,8 @@ pub async fn delete_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1351,6 +1499,8 @@ pub async fn patch_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -1414,6 +1564,7 @@ pub async fn put_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let meta = lookup(&state, &group, &version, &plural)?.clone();
     let body = extract_body(&body, content_type(&headers));
     let incoming =
@@ -1457,6 +1608,7 @@ pub async fn patch_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
     let meta = lookup(&state, &group, &version, &plural)?.clone();
     let patch_type = detect_patch_type(&headers)?;
 
@@ -1527,6 +1679,8 @@ pub async fn put_namespaced_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let body = extract_body(&body, content_type(&headers));
     let incoming =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -1587,6 +1741,8 @@ pub async fn patch_namespaced_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
 
     let key = match lookup(&state, &group, &version, &plural) {
@@ -1663,6 +1819,7 @@ pub async fn core_list_resource(
     State(state): State<AppState>,
     Path(plural): Path<String>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Pods are namespaced; the registry has no cluster-scoped "pods" entry.
     // Handle GET /api/v1/pods by scanning across all namespaces.
@@ -1683,6 +1840,7 @@ pub async fn core_list_resource(
                 query.label_selector,
                 query.field_selector,
                 query.allow_watch_bookmarks == Some(true),
+                user.username,
             )
             .await
             .map(IntoResponse::into_response);
@@ -1729,6 +1887,7 @@ pub async fn core_list_resource(
         State(state),
         Path(("".into(), "v1".into(), plural)),
         Query(query),
+        Extension(user),
     )
     .await
     .map(IntoResponse::into_response)
@@ -1744,12 +1903,14 @@ pub async fn core_get_resource(
 pub async fn core_create_resource(
     State(state): State<AppState>,
     Path(plural): Path<String>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     create_resource(
         State(state),
         Path(("".into(), "v1".into(), plural)),
+        Extension(user),
         headers,
         body,
     )
@@ -1759,12 +1920,14 @@ pub async fn core_create_resource(
 pub async fn core_replace_resource(
     State(state): State<AppState>,
     Path((plural, name)): Path<(String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     replace_resource(
         State(state),
         Path(("".into(), "v1".into(), plural, name)),
+        Extension(user),
         headers,
         body,
     )
@@ -1834,11 +1997,13 @@ pub async fn core_list_namespaced_resource(
     State(state): State<AppState>,
     Path((ns, plural)): Path<(String, String)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     list_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural)),
         Query(query),
+        Extension(user),
     )
     .await
 }
@@ -2639,12 +2804,15 @@ mod tests {
 
     #[test]
     fn generate_suffix_produces_5_chars_from_allowed_charset() {
-        // The suffix is used as a unique name component; must be 5 chars from the safe charset.
-        const ALLOWED: &str = "bcdfghjklmnpqrstvwxz2456789";
+        // The suffix is used as a unique name component; must be exactly 5 chars.
+        // Chars come from UUIDv4 hex digits (0-9, a-f) — valid in Kubernetes names.
         let suffix = generate_suffix();
         assert_eq!(suffix.len(), 5, "suffix must be exactly 5 characters");
         for c in suffix.chars() {
-            assert!(ALLOWED.contains(c), "suffix char '{c}' not in allowed set");
+            assert!(
+                c.is_ascii_hexdigit(),
+                "suffix char '{c}' must be a hex digit (UUIDv4 source)"
+            );
         }
     }
 
@@ -3260,6 +3428,11 @@ mod tests {
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
             }),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
         )
         .await
         .unwrap_or_else(|_| panic!("list runtimeclasses must not return 404"));
@@ -3529,6 +3702,12 @@ mod tests {
             "metadata": {"name": "cluster-admin"},
             "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
         });
+        // Use system:masters to bypass the escalation check in test setup.
+        let admin_user = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
         create_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((
@@ -3536,6 +3715,7 @@ mod tests {
                 version.to_string(),
                 "clusterroles".to_string(),
             )),
+            admin_user.clone(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&cr).unwrap()),
         )
@@ -3545,6 +3725,7 @@ mod tests {
         create_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((group.to_string(), version.to_string(), plural.to_string())),
+            admin_user,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),
         )
@@ -4096,10 +4277,41 @@ mod tests {
     #[test]
     fn field_selector_unknown_field_is_ignored() {
         let obj = serde_json::json!({ "metadata": { "name": "x" }, "spec": { "nodeName": "n1" } });
-        // spec.nodeName is not supported in object_matches_field_selector; must pass through.
+        // A truly unknown field must pass through — don't drop events we can't evaluate.
+        assert!(
+            object_matches_field_selector(&obj, "status.phase=Running"),
+            "unknown field selectors must be ignored (pass-through), not drop events"
+        );
+    }
+
+    /// spec.nodeName equality must filter to only pods on the matching node.
+    /// This is used by kubelet watches; without it, every kubelet receives every pod.
+    #[test]
+    fn field_selector_spec_node_name_eq_matches_correct_node() {
+        let obj =
+            serde_json::json!({ "metadata": { "name": "p" }, "spec": { "nodeName": "worker-1" } });
         assert!(
             object_matches_field_selector(&obj, "spec.nodeName=worker-1"),
-            "unknown field selectors must be ignored (pass-through), not drop events"
+            "spec.nodeName=worker-1 must match a pod on worker-1"
+        );
+        assert!(
+            !object_matches_field_selector(&obj, "spec.nodeName=worker-2"),
+            "spec.nodeName=worker-2 must NOT match a pod on worker-1"
+        );
+    }
+
+    /// spec.nodeName inequality must exclude pods on the specified node.
+    #[test]
+    fn field_selector_spec_node_name_ne_excludes_matching_node() {
+        let obj =
+            serde_json::json!({ "metadata": { "name": "p" }, "spec": { "nodeName": "worker-1" } });
+        assert!(
+            !object_matches_field_selector(&obj, "spec.nodeName!=worker-1"),
+            "spec.nodeName!=worker-1 must exclude a pod on worker-1"
+        );
+        assert!(
+            object_matches_field_selector(&obj, "spec.nodeName!=worker-2"),
+            "spec.nodeName!=worker-2 must pass through a pod on worker-1"
         );
     }
 
@@ -4137,6 +4349,7 @@ mod tests {
             None,
             None,
             false,
+            "test-user".into(),
         )
         .await;
 
@@ -4184,6 +4397,7 @@ mod tests {
             None,
             None,
             false,
+            "test-user".into(),
         )
         .await;
 
@@ -4302,5 +4516,393 @@ mod resolve_name_tests {
         let err = resolve_name(&mut obj).expect_err("must fail when no name and no generateName");
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 400, "must return 400 Bad Request");
+    }
+
+    // -- Per-client watch concurrency limit --
+    //
+    // A single client must not be able to exhaust global watch capacity by opening
+    // more than MAX_WATCHES_PER_CLIENT concurrent streams. The (MAX+1)th attempt from
+    // the same user identity must receive HTTP 429 immediately, while a different
+    // user's watch must still succeed.
+
+    /// The (MAX_WATCHES_PER_CLIENT + 1)th watch from the same user returns 429.
+    /// Without this limit a single client could hold all 50 InflightLayer slots
+    /// indefinitely and deny service to every other user.
+    #[tokio::test]
+    async fn watch_limit_per_client_returns_429_on_overflow() {
+        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Exhaust this user's permit budget by acquiring permits directly.
+        // watch_generic acquires one permit per call; we simulate MAX open streams
+        // by holding permits from the semaphore.
+        let sem = state.watch_limit.semaphore_for("alice");
+        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
+            .map(|_| {
+                sem.clone()
+                    .try_acquire_owned()
+                    .expect("permit must be available")
+            })
+            .collect();
+
+        // The (MAX+1)th watch from "alice" must be rejected with 429.
+        let result = watch_generic(
+            state.clone(),
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0,
+            None,
+            None,
+            None,
+            false,
+            "alice".into(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "watch_generic must return Err(429) when the per-client limit is exhausted"
+        );
+        let err_resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(
+            err_resp.status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "must return HTTP 429 when per-client watch limit is exhausted, not silently queue"
+        );
+    }
+
+    /// A different user's watch succeeds even when another user has exhausted their quota.
+    /// The per-client semaphore is independent per username — one user's cap must not
+    /// affect another user's ability to watch.
+    #[tokio::test]
+    async fn watch_limit_does_not_affect_other_users() {
+        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Exhaust alice's permits.
+        let sem_alice = state.watch_limit.semaphore_for("alice");
+        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
+            .map(|_| {
+                sem_alice
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("permit must be available")
+            })
+            .collect();
+
+        // bob's watch must succeed because bob has a separate semaphore.
+        let result = watch_generic(
+            state.clone(),
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0,
+            None,
+            None,
+            None,
+            false,
+            "bob".into(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "bob's watch must succeed even when alice has exhausted her per-client limit"
+        );
+    }
+
+    // -- validate_name (path traversal regression) --
+
+    /// A namespace value of "../../secrets" must return 400.
+    /// Without this check, a crafted request could escape the expected key prefix
+    /// in the SQLite store and read or overwrite arbitrary objects.
+    #[test]
+    fn validate_name_rejects_dotdot_traversal() {
+        let err = validate_name("namespace", "../../secrets")
+            .expect_err("path traversal must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 400,
+            "path traversal must return 400 Bad Request, not 200"
+        );
+    }
+
+    #[test]
+    fn validate_name_rejects_slash() {
+        let err = validate_name("name", "a/b").expect_err("slash in name must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400);
+    }
+
+    #[test]
+    fn validate_name_rejects_empty() {
+        let err = validate_name("name", "").expect_err("empty name must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400);
+    }
+
+    #[test]
+    fn validate_name_accepts_valid_dns_label() {
+        // Kubernetes names are DNS labels: lowercase alpha, digits, hyphens.
+        // Dots are also permitted (used in CRD names like "foo.example.com").
+        assert!(validate_name("name", "my-pod").is_ok());
+        assert!(validate_name("namespace", "kube-system").is_ok());
+        assert!(validate_name("name", "foo.example.com").is_ok());
+        assert!(validate_name("name", "a123").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod escalation_tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+    use u7s_store::SqliteStore;
+
+    fn json_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        h
+    }
+
+    fn make_state() -> crate::state::AppState {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    /// A user who can create ClusterRoleBindings but does NOT hold cluster-admin
+    /// rules must receive 403 Forbidden when creating a CRB that references
+    /// cluster-admin. This is Kubernetes RBAC escalation prevention (v1.17+):
+    /// you cannot grant permissions you don't already have.
+    #[tokio::test]
+    async fn create_clusterrolebinding_denied_for_unprivileged_user() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+
+        // Seed cluster-admin ClusterRole into the RBAC index.
+        let admin_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "cluster-admin"},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        // Use a privileged user to create the ClusterRole setup.
+        let admin_user = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterroles".to_string(),
+            )),
+            admin_user,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&admin_role).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seeding cluster-admin ClusterRole must succeed"));
+
+        // Give "carol" only create on clusterrolebindings — NOT cluster-admin rules.
+        let carol_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "crb-creator"},
+            "rules": [{
+                "apiGroups": ["rbac.authorization.k8s.io"],
+                "resources": ["clusterrolebindings"],
+                "verbs": ["create"]
+            }]
+        });
+        let carol_binding = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "carol-crb-creator"},
+            "subjects": [{"kind": "User", "name": "carol"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "crb-creator"
+            }
+        });
+        let admin_user2 = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterroles".to_string(),
+            )),
+            admin_user2.clone(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&carol_role).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seeding crb-creator ClusterRole must succeed"));
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterrolebindings".to_string(),
+            )),
+            admin_user2,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&carol_binding).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seeding carol's ClusterRoleBinding must succeed"));
+
+        // Now carol tries to create a CRB binding someone to cluster-admin.
+        // She has create on clusterrolebindings but NOT the cluster-admin rules.
+        // The escalation check must deny this with 403.
+        let escalating_crb = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "evil-binding"},
+            "subjects": [{"kind": "User", "name": "carol"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        let carol_user = Extension(crate::auth::UserInfo {
+            username: "carol".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
+        let result = create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterrolebindings".to_string(),
+            )),
+            carol_user,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&escalating_crb).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "carol must be denied: she cannot grant cluster-admin rules she doesn't hold"
+        );
+        // Verify the error is a 403 Forbidden, not a different status code.
+        // A wrong code (e.g. 500) would indicate an implementation bug.
+        if let Err(err) = result {
+            assert_eq!(
+                err.0,
+                StatusCode::FORBIDDEN,
+                "escalation attempt must return 403 Forbidden, not {}",
+                err.0
+            );
+        }
+    }
+
+    /// A system:masters user must be exempt from the escalation check and allowed
+    /// to create any ClusterRoleBinding regardless of the referenced role's rules.
+    /// system:masters is the cluster bootstrapper identity — blocking it would
+    /// make initial cluster setup impossible.
+    #[tokio::test]
+    async fn create_clusterrolebinding_allowed_for_system_masters() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+
+        // Seed cluster-admin ClusterRole.
+        let admin_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "cluster-admin"},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        let admin_user = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterroles".to_string(),
+            )),
+            admin_user.clone(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&admin_role).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("seeding cluster-admin ClusterRole must succeed"));
+
+        // system:masters user creates a CRB binding to cluster-admin — must succeed.
+        let crb = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "admin-binding"},
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        let result = create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterrolebindings".to_string(),
+            )),
+            admin_user,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "system:masters must always pass the escalation check and be allowed to create any CRB"
+        );
     }
 }

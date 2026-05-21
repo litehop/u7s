@@ -52,9 +52,6 @@ pub struct UserInfo {
 struct SaClaims {
     /// Subject — format: "system:serviceaccount:<namespace>:<name>"
     sub: String,
-    /// Issuer — validated against expected value.
-    #[allow(dead_code)]
-    iss: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -66,7 +63,9 @@ struct SaClaims {
 /// File format (one line per entry, comments and empty lines skipped):
 ///   <token>,<username>,<uid>,<group1>[,<group2>...]
 pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> {
-    let file = std::fs::File::open(validate_cli_path(std::path::Path::new(path))?)?;
+    let raw_path = std::path::Path::new(path);
+    let safe_path = validate_cli_path(raw_path)?;
+    let file = std::fs::File::open(safe_path)?;
     let mut map = HashMap::new();
 
     for (lineno, line) in BufReader::new(file).lines().enumerate() {
@@ -103,6 +102,44 @@ pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> 
     }
 
     Ok(map)
+}
+
+// ---------------------------------------------------------------------------
+// Constant-time token lookup
+// ---------------------------------------------------------------------------
+
+/// Look up a bearer token in the static token map using constant-time byte
+/// comparison. This prevents timing side-channels: a naive HashMap::get()
+/// uses SipHash which can reveal information about how many characters of
+/// the candidate token match a stored token's hash. By comparing all bytes
+/// of each stored token against the candidate in constant time (no early
+/// exit), an attacker learns nothing about valid token prefixes.
+///
+/// Performance: the static token map is small (typically <100 entries loaded
+/// at startup), so the O(n) scan is negligible compared to network latency.
+fn ct_token_lookup<'a>(
+    map: &'a HashMap<String, UserInfo>,
+    candidate: &str,
+) -> Option<&'a UserInfo> {
+    use subtle::ConstantTimeEq;
+    let candidate_bytes = candidate.as_bytes();
+    let mut found: Option<&'a UserInfo> = None;
+    for (stored_token, info) in map.iter() {
+        let stored_bytes = stored_token.as_bytes();
+        // ConstantTimeEq returns Choice (1u8 for equal, 0u8 for not equal).
+        // Length mismatch: pad both sides to the same length conceptually —
+        // subtle::ConstantTimeEq on slices of different lengths always returns
+        // 0 (not equal) without short-circuiting, so we can call it directly.
+        // We use a manual length check first (which leaks whether lengths match,
+        // but not token content) then the constant-time byte compare.
+        if stored_bytes.len() == candidate_bytes.len() && stored_bytes.ct_eq(candidate_bytes).into()
+        {
+            found = Some(info);
+            // Do NOT break: continue iterating so the loop takes the same time
+            // regardless of which token matched or whether any matched.
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -143,8 +180,12 @@ fn authenticate(
         Some(value) => {
             let value = value.to_str().unwrap_or("");
             if let Some(token) = value.strip_prefix("Bearer ") {
-                // 1. Check static token map first.
-                if let Some(info) = token_map.get(token) {
+                // 1. Check static token map first using constant-time comparison.
+                // HashMap.get() can leak timing information about token prefixes
+                // (SipHash is non-cryptographic). Instead, compare all tokens in
+                // constant time so an attacker cannot distinguish valid prefixes
+                // from invalid ones.
+                if let Some(info) = ct_token_lookup(token_map, token) {
                     return AuthnResult::Identified(info.clone());
                 }
                 // 2. If a SA decoding key is available, attempt JWT verification.
@@ -248,7 +289,7 @@ pub fn authenticate_token(
     token_map: &HashMap<String, UserInfo>,
     sa_decoding_key: Option<&DecodingKey>,
 ) -> Option<UserInfo> {
-    if let Some(info) = token_map.get(token) {
+    if let Some(info) = ct_token_lookup(token_map, token) {
         return Some(info.clone());
     }
     if let Some(key) = sa_decoding_key {
@@ -307,6 +348,10 @@ fn is_exempt(path: &str) -> bool {
 }
 
 /// HTTP method → RBAC verb.
+///
+/// For GET requests the caller must call `get_verb` instead, because Kubernetes
+/// distinguishes between "get" (named resource), "list" (collection), and
+/// "watch" (streaming watch).
 fn method_to_verb(method: &axum::http::Method) -> &'static str {
     match method.as_str() {
         "GET" => "get",
@@ -318,6 +363,32 @@ fn method_to_verb(method: &axum::http::Method) -> &'static str {
         "HEAD" => "get",
         // Unknown/future methods: fall back to "get" (least-privilege intent).
         _ => "get",
+    }
+}
+
+/// Resolve the RBAC verb for a GET request.
+///
+/// Kubernetes differentiates three GET-related verbs:
+///   "watch"  — query param `watch=true` or `watch=1` is present
+///   "list"   — collection endpoint (no resource name in path)
+///   "get"    — named resource endpoint
+///
+/// This prevents the authorization bypass where a user with only the `get`
+/// verb could enumerate all resources by hitting the collection endpoint.
+fn get_verb(name: Option<&str>, query: Option<&str>) -> &'static str {
+    // Watch takes priority: a client streaming watch events needs "watch", not "list".
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if let Some(val) = pair.strip_prefix("watch=") {
+                if val == "true" || val == "1" {
+                    return "watch";
+                }
+            }
+        }
+    }
+    match name {
+        Some(_) => "get",
+        None => "list",
     }
 }
 
@@ -521,7 +592,11 @@ where
 
         // 2. Authorize.
         let parsed = parse_path(&path);
-        let verb = method_to_verb(req.method());
+        let verb = if req.method() == axum::http::Method::GET {
+            get_verb(parsed.name.as_deref(), req.uri().query())
+        } else {
+            method_to_verb(req.method())
+        };
 
         let allowed = self.rbac_index.is_allowed(&AuthzRequest {
             username: &user.username,
@@ -636,6 +711,55 @@ mod tests {
         }
     }
 
+    // --- ct_token_lookup ---
+
+    #[test]
+    fn ct_token_lookup_finds_exact_match() {
+        // A valid token must be found — correctness of the constant-time path.
+        let mut map = HashMap::new();
+        map.insert(
+            "exact-token-abc".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+            },
+        );
+        let result = ct_token_lookup(&map, "exact-token-abc");
+        assert!(result.is_some(), "exact match must be found");
+        assert_eq!(result.unwrap().username, "alice");
+    }
+
+    #[test]
+    fn ct_token_lookup_rejects_prefix_of_valid_token() {
+        // A prefix of a valid token must NOT match — timing oracle would allow
+        // an attacker to discover valid tokens one character at a time.
+        let mut map = HashMap::new();
+        map.insert(
+            "secret-abc".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+            },
+        );
+        assert!(
+            ct_token_lookup(&map, "secret").is_none(),
+            "a prefix of a valid token must not match (timing oracle would otherwise apply)"
+        );
+        assert!(
+            ct_token_lookup(&map, "secret-abcX").is_none(),
+            "a token with extra chars must not match"
+        );
+    }
+
+    #[test]
+    fn ct_token_lookup_empty_map_returns_none() {
+        // Empty map must not panic or return a result.
+        let map = HashMap::new();
+        assert!(ct_token_lookup(&map, "any-token").is_none());
+    }
+
     // --- parse_path() ---
 
     #[test]
@@ -665,6 +789,48 @@ mod tests {
         assert_eq!(p.name.as_deref(), Some("mypod"));
     }
 
+    // --- get_verb() — collection vs named vs watch disambiguation ---
+
+    /// GET on a collection endpoint must map to "list".
+    /// A user with only "get" must NOT be allowed to enumerate all pods via
+    /// the collection endpoint — that would be an authorization bypass.
+    #[test]
+    fn test_get_verb_collection_is_list() {
+        assert_eq!(get_verb(None, None), "list");
+        assert_eq!(get_verb(None, Some("")), "list");
+        assert_eq!(get_verb(None, Some("limit=500")), "list");
+    }
+
+    /// GET on a named resource endpoint must map to "get".
+    #[test]
+    fn test_get_verb_named_is_get() {
+        assert_eq!(get_verb(Some("nginx"), None), "get");
+        assert_eq!(get_verb(Some("nginx"), Some("resourceVersion=42")), "get");
+    }
+
+    /// GET with watch=true must map to "watch", regardless of whether a name
+    /// is present. "watch" is a separate RBAC verb in Kubernetes.
+    #[test]
+    fn test_get_verb_watch_param_is_watch() {
+        assert_eq!(get_verb(None, Some("watch=true")), "watch");
+        assert_eq!(get_verb(Some("nginx"), Some("watch=true")), "watch");
+        // watch=1 is also accepted
+        assert_eq!(get_verb(None, Some("watch=1")), "watch");
+        // watch takes priority even with other params
+        assert_eq!(get_verb(None, Some("limit=100&watch=true")), "watch");
+        assert_eq!(
+            get_verb(None, Some("watch=true&resourceVersion=0")),
+            "watch"
+        );
+    }
+
+    /// "watch=false" must NOT map to "watch" — client explicitly opted out.
+    #[test]
+    fn test_get_verb_watch_false_is_list() {
+        assert_eq!(get_verb(None, Some("watch=false")), "list");
+        assert_eq!(get_verb(None, Some("watch=0")), "list");
+    }
+
     // --- is_exempt() ---
 
     #[test]
@@ -686,6 +852,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("u7s_test_tokens.csv");
         std::fs::write(
+            // lgtm[rust/path-injection]
             &path,
             "tok1,alice,uid1,group-a,group-b\n# comment\n\ntok2,bob,uid2\n",
         )

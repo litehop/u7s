@@ -10,6 +10,31 @@ use crate::util::validate_cli_path;
 use crate::Args;
 
 // ---------------------------------------------------------------------------
+// Private key write helper — always 0o600
+// ---------------------------------------------------------------------------
+
+/// Write `bytes` to `path` with mode 0o600 (owner read+write only).
+///
+/// Using std::fs::write() leaves the file world-readable by default (0o644
+/// or whatever the process umask allows). Private keys must be owner-only.
+///
+/// The path is validated against traversal (`..'` components) before opening,
+/// even when the caller has already validated it at the CLI boundary.
+fn write_private_key(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = validate_cli_path(path.as_ref())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+// ---------------------------------------------------------------------------
 // SA signing key — RSA 2048, persisted across restarts
 // ---------------------------------------------------------------------------
 
@@ -66,7 +91,7 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
         .to_public_key_pem(LineEnding::LF)
         .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
 
-    std::fs::write(
+    write_private_key(
         validate_cli_path(std::path::Path::new(sa_key_path))?,
         private_pem.as_bytes(),
     )?;
@@ -181,10 +206,10 @@ fn load_or_generate_ca(
 
     let ca_cert_der = ca_cert.der().to_vec();
 
-    // Persist: key as PEM, cert as DER.
-    std::fs::write(
+    // Persist: key as PEM with 0o600 (owner-only), cert as DER with default perms.
+    write_private_key(
         validate_cli_path(std::path::Path::new(ca_key_path))?,
-        ca_key.serialize_pem(),
+        ca_key.serialize_pem().as_bytes(),
     )
     .map_err(|e| anyhow::anyhow!("write CA key {ca_key_path}: {e}"))?;
     std::fs::write(
@@ -375,13 +400,20 @@ impl Kubeconfig {
 /// The default path ("./kubeconfig") is write-only on first run — it is not
 /// a read fixture. The file is generated fresh from the in-memory TLS material
 /// each time the server starts.
+///
+/// The kubeconfig contains embedded client certificate and private key material,
+/// so it is written with mode 0o600 (owner read+write only), matching the same
+/// permission applied to the SA and CA key files by `write_private_key`.
 pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, _args: &Args) -> anyhow::Result<()> {
     // Always write 127.0.0.1 as the server URL — this kubeconfig is for local use on the host.
     // lima-start.sh rewrites it to host.lima.internal when copying into the VM.
     // The cert SANs already include the advertise-address host so connections from either
     // address are valid.
     let kc = Kubeconfig::new("https://127.0.0.1:6443", tls);
-    std::fs::write(validate_cli_path(std::path::Path::new(path))?, kc.to_yaml())?;
+    write_private_key(
+        validate_cli_path(std::path::Path::new(path))?,
+        kc.to_yaml().as_bytes(),
+    )?;
     tracing::info!("kubeconfig written to {path}");
     Ok(())
 }
@@ -400,7 +432,7 @@ mod tests {
             .subsec_nanos();
         let tid = std::thread::current().id();
         let dir = std::env::temp_dir().join(format!("u7s-tls-{tag}-{nanos}-{tid:?}"));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::create_dir_all(&dir).expect("create temp dir"); // lgtm[rust/path-injection]
         dir
     }
 
@@ -576,7 +608,7 @@ mod tests {
         );
 
         // Clean up.
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     /// Helper: call load_or_generate_ca with paths inside `dir`.
@@ -600,7 +632,7 @@ mod tests {
         let ca_cert_path = dir.join("ca.crt");
 
         // Write only ca.key — no ca.crt.
-        std::fs::write(&ca_key_path, b"dummy-key-content").expect("write dummy ca.key");
+        std::fs::write(&ca_key_path, b"dummy-key-content").expect("write dummy ca.key"); // lgtm[rust/path-injection]
         assert!(ca_key_path.exists());
         assert!(!ca_cert_path.exists());
 
@@ -610,7 +642,7 @@ mod tests {
         assert!(ca_key_path.exists(), "ca.key must exist after recovery");
         assert!(ca_cert_path.exists(), "ca.crt must exist after recovery");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     #[test]
@@ -624,7 +656,7 @@ mod tests {
         let ca_cert_path = dir.join("ca.crt");
 
         // Write only ca.crt — no ca.key.
-        std::fs::write(&ca_cert_path, b"dummy-cert-content").expect("write dummy ca.crt");
+        std::fs::write(&ca_cert_path, b"dummy-cert-content").expect("write dummy ca.crt"); // lgtm[rust/path-injection]
         assert!(!ca_key_path.exists());
         assert!(ca_cert_path.exists());
 
@@ -634,6 +666,86 @@ mod tests {
         assert!(ca_key_path.exists(), "ca.key must exist after recovery");
         assert!(ca_cert_path.exists(), "ca.crt must exist after recovery");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// SA private key must be written with mode 0o600 (owner-only) so it is
+    /// not world-readable. A world-readable key file allows any local user to
+    /// forge service-account tokens.
+    #[test]
+    fn sa_private_key_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_temp_dir("sa-key-perms");
+        let key_path = dir.join("sa.key");
+
+        let bytes = b"fake-key-content";
+        write_private_key(key_path.clone(), bytes).expect("write_private_key must succeed");
+
+        let meta = std::fs::metadata(&key_path).expect("file must exist"); // lgtm[rust/path-injection]
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "SA private key must be mode 0o600 (got {:#o}); \
+             world-readable keys allow local users to forge SA tokens",
+            mode
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// Kubeconfig must be written with mode 0o600 (owner-only).
+    ///
+    /// The kubeconfig contains the admin client certificate and private key in
+    /// base64 form. A world-readable kubeconfig allows any local user to impersonate
+    /// the cluster admin — same severity as a world-readable CA private key.
+    #[test]
+    fn kubeconfig_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_temp_dir("kubeconfig-perms");
+        let kubeconfig_path = dir.join("kubeconfig");
+
+        let args = Args {
+            db: "./state.db".into(),
+            listen: "0.0.0.0:6443".into(),
+            kubeconfig: kubeconfig_path.to_string_lossy().into_owned(),
+            token_auth_file: None,
+            sa_key: "./sa.key".into(),
+            sa_pub: "./sa.pub".into(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            advertise_address: None,
+        };
+
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        write_kubeconfig(&kubeconfig_path.to_string_lossy(), &tls, &args)
+            .expect("write_kubeconfig must succeed");
+
+        let meta = std::fs::metadata(&kubeconfig_path).expect("kubeconfig file must exist"); // lgtm[rust/path-injection]
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "kubeconfig must be mode 0o600 (got {:#o}); \
+             world-readable kubeconfig allows any local user to impersonate cluster admin",
+            mode
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// CA private key must also be written with mode 0o600.
+    #[test]
+    fn ca_private_key_has_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_temp_dir("ca-key-perms");
+        let (_, _, _) = run_load_or_generate_ca(&dir).expect("generate CA");
+
+        let ca_key_path = dir.join("ca.key");
+        let meta = std::fs::metadata(&ca_key_path).expect("ca.key must exist"); // lgtm[rust/path-injection]
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "CA private key must be mode 0o600 (got {:#o}); \
+             world-readable CA keys allow anyone to sign rogue certs",
+            mode
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 }

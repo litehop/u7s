@@ -31,9 +31,6 @@ Before adding code, read exports, immediate callers, and shared utilities. "Look
 ### Rule 9 — Tests Verify Intent, Not Just Behavior
 Tests must encode WHY behavior matters, not just WHAT it does. A test that can't fail when business logic changes is wrong.
 
-### Rule 14 — Every Bug Fix Ships with a Regression Test
-A bug fix without a test is incomplete. The test must fail if the fix is reverted. If the fix touches an async handler that can't be called in isolation, extract the decision logic into a pure function and test that. Decision trees buried in handlers are a code smell — unit-testable functions are the goal.
-
 ### Rule 10 — Checkpoint After Every Significant Step
 Summarize what was done, what's verified, what's left. If you lose track, stop and restate before continuing.
 
@@ -43,11 +40,14 @@ Conformance > taste. If you genuinely think a convention is harmful, surface it.
 ### Rule 12 — Fail Loud
 "Completed" is wrong if anything was skipped silently. "Tests pass" is wrong if any were skipped. Default to surfacing uncertainty.
 
-### Rule 15 — Prefer Merge Commits for PRs
-Use `gh pr merge --merge` (a regular merge commit) by default. This preserves the full branch history and keeps individual commits readable in `git log`. Use `--squash` only when a branch has many noisy debug or fixup commits (e.g. repeated CI tweaks) that would clutter the log. Never use `--rebase` — it rewrites commit SHAs and makes history chaotic. When squashing, say why in the merge message.
-
 ### Rule 13 — Prefer Native Tooling
-Use Bash and Rust over Python. Do not introduce Python scripts or Python dependencies. For shell tasks (JSON extraction, text processing), use `jq`, `grep`, `sed`, `awk`. For anything more complex, write a Rust binary or use an existing Rust CLI tool.
+Use Bash and Rust over Python. Do not introduce Python scripts or Python dependencies. Prefer the agent's native tools for file operations. Read over cat/head/tail. Edit over sed/awk. Write over echo>/heredoc. Grep over shell grep/find. Bash is for runtime commands: git, test runners, builds, installs — not file I/O.
+
+### Rule 14 — Every Bug Fix Ships with a Regression Test
+A bug fix without a test is incomplete. The test must fail if the fix is reverted. If the fix touches an async handler that can't be called in isolation, extract the decision logic into a pure function and test that. Decision trees buried in handlers are a code smell — unit-testable functions are the goal.
+
+### Rule 15 — Prefer Merge Commits for PRs
+Use `gh pr merge --merge` (a regular merge commit) by default. This preserves the full branch history and keeps individual commits readable in `git log`. Use `--squash` only when a branch has many noisy debug or fixup commits (e.g. repeated CI tweaks) that would clutter the log. Never use `--rebase` — it rewrites commit SHAs and makes history chaotic. When squashing, say why in the merge message. Likewise, when trying to resolve a pull request conflict, do so by merging `main` into the branch and resolving conflicts in the merge commit. Force pushing is forbidden and blocked.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker

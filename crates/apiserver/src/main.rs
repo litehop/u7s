@@ -31,6 +31,12 @@ use inflight::InflightLayer;
 use state::AppState;
 use tls::{generate_tls, load_or_generate_sa_keys, write_kubeconfig};
 
+/// Maximum request body size in bytes. Applied as the outermost layer so
+/// unauthenticated requests are rejected before auth processing, preventing
+/// OOM attacks via large unauthenticated bodies. 4 MiB gives headroom above
+/// etcd's 1.5 MiB object limit while staying well below OOM risk.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Parser)]
 struct Args {
     #[arg(long, default_value = "./state.db")]
@@ -160,7 +166,10 @@ async fn main() -> anyhow::Result<()> {
     state.init().await;
 
     // 10. Build axum router and attach tower layers.
-    //     Order (outermost first): inflight → auth → content_type → handler.
+    //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
+    //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
+    //     auth processing — this prevents OOM via large unauthenticated request bodies.
+    //     4 MiB matches etcd's practical limit (~1.5 MiB) with headroom for kubectl manifests.
     let app = build_router(state.clone())
         .layer(ContentTypeLayer)
         .layer(AuthLayer::new(
@@ -168,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
         ))
-        .layer(InflightLayer::new());
+        .layer(InflightLayer::new())
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
 
     // 11. Bind TLS listener and serve.
     let listener = TcpListener::bind(&args.listen).await?;
@@ -337,11 +347,12 @@ fn build_router(state: AppState) -> Router {
                 .delete(handlers::generic::delete_namespaced_resource)
                 .patch(handlers::generic::patch_namespaced_resource),
         )
-        // Generic cluster-scoped — status subresource
+        // Cluster-scoped status subresource — CR-aware handler falls through to
+        // registry resources; generic GET/PATCH still handle non-CR resources.
         .route(
             "/apis/{group}/{version}/{resource}/{name}/status",
-            get(handlers::generic::get_resource_status)
-                .put(handlers::generic::put_resource_status)
+            get(handlers::cr::get_cr_status)
+                .put(handlers::cr::put_cr_status)
                 .patch(handlers::generic::patch_resource_status),
         )
         // Generic namespaced — status subresource
@@ -770,6 +781,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn system_nodes_group_is_authorized_after_rbac_seed_and_init() {
+        // Verifies the full chain: seed_rbac writes ClusterRole+ClusterRoleBinding,
+        // AppState::init() loads them into the RBAC index, and is_allowed returns
+        // true for a kubelet in system:nodes.
+        //
+        // Without this test the seeded data could be structurally correct (stored under
+        // the right key) but still broken at the authorization layer — e.g. if init()
+        // builds the wrong api_key or if subject_matches ignores the Group kind.
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        // Populate RBAC index from persisted seed data — mirrors what main() does.
+        state.init().await;
+
+        let groups = vec!["system:nodes".to_owned()];
+
+        // A kubelet in system:nodes must be able to GET a pod assigned to it.
+        let pod_read = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "pods",
+            subresource: "",
+            namespace: Some("default"),
+            name: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&pod_read),
+            "system:nodes must be allowed to GET pods — kubelet needs this to reconcile its pod list"
+        );
+
+        // A kubelet in system:nodes must be able to create a lease (heartbeat).
+        let lease_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "coordination.k8s.io",
+            resource: "leases",
+            subresource: "",
+            namespace: Some("kube-node-lease"),
+            name: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&lease_create),
+            "system:nodes must be allowed to create leases — kubelet heartbeat depends on this"
+        );
+
+        // A user NOT in system:nodes must be denied — the binding is group-specific.
+        let other_groups = vec!["system:authenticated".to_owned()];
+        let pod_read_other = rbac::AuthzRequest {
+            username: "someone-else",
+            groups: &other_groups,
+            verb: "get",
+            api_group: "",
+            resource: "pods",
+            subresource: "",
+            namespace: Some("default"),
+            name: None,
+        };
+        assert!(
+            !state.rbac_index.is_allowed(&pod_read_other),
+            "users not in system:nodes must not inherit kubelet permissions"
+        );
+    }
+
+    #[tokio::test]
     async fn seed_services_creates_kubernetes_and_kube_dns() {
         // Both Services are required for in-cluster communication:
         //   - default/kubernetes: pods reach the API server via kubernetes.default.svc.cluster.local
@@ -986,5 +1071,116 @@ mod tests {
         seed_serviceaccounts(&store)
             .await
             .expect("second seed must not fail");
+    }
+
+    /// The body size limit must be at least 1 MiB (to accommodate real kubectl
+    /// manifests and ConfigMaps) and at most 8 MiB (to prevent OOM from a single
+    /// large unauthenticated request). The current limit is 4 MiB.
+    ///
+    /// Without a body limit, an unauthenticated attacker can POST an arbitrarily
+    /// large body to any endpoint and cause the server to OOM before auth runs.
+    #[test]
+    fn body_limit_is_within_safe_range() {
+        // 1 MiB minimum: kubectl configmaps can be up to ~1 MiB in practice.
+        // 8 MiB maximum: etcd's default value limit; no valid object exceeds this.
+        const MIN_SAFE: usize = 1 * 1024 * 1024;
+        const MAX_SAFE: usize = 8 * 1024 * 1024;
+        assert!(
+            MAX_BODY_BYTES >= MIN_SAFE,
+            "body limit {} is too small; kubectl manifests can be up to 1 MiB",
+            MAX_BODY_BYTES
+        );
+        assert!(
+            MAX_BODY_BYTES <= MAX_SAFE,
+            "body limit {} is too large; risk of OOM from a single request",
+            MAX_BODY_BYTES
+        );
+    }
+
+    /// Verifies that POST /apis/storage.k8s.io/v1/csinodes creates a CSINode and
+    /// GET /apis/storage.k8s.io/v1/csinodes/{name} retrieves it.
+    ///
+    /// The kubelet sends PATCH (SSA) on first boot to register a CSINode. Without
+    /// the resource being in the registry, the generic handler falls through to the
+    /// CR handler which returns 404 (no CRD installed). This test encodes the
+    /// requirement that CSINode is served by the generic handler via the registry.
+    #[tokio::test]
+    async fn csinode_create_and_get_round_trip() {
+        use std::sync::Arc;
+
+        let store = Arc::new(make_store());
+        let state = state::AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "ci-node" },
+            "spec": { "drivers": [] }
+        });
+        let body_bytes = bytes::Bytes::from(body.to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        // POST creates the CSINode — this is what the kubelet does on first boot.
+        let create_result = handlers::generic::create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "csinodes".to_string(),
+            )),
+            axum::Extension(auth::UserInfo {
+                username: "system:node:ci-node".into(),
+                uid: "".into(),
+                groups: vec!["system:nodes".into()],
+            }),
+            headers,
+            body_bytes,
+        )
+        .await;
+        assert!(
+            create_result.is_ok(),
+            "POST /apis/storage.k8s.io/v1/csinodes must succeed"
+        );
+
+        // GET retrieves the CSINode — kubelet later reads it to verify registration.
+        let get_result = handlers::generic::get_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "csinodes".to_string(),
+                "ci-node".to_string(),
+            )),
+        )
+        .await;
+        assert!(
+            get_result.is_ok(),
+            "GET /apis/storage.k8s.io/v1/csinodes/ci-node must succeed"
+        );
+
+        // The CSINode must be stored under the correct key for RBAC to find it.
+        let store_key = keys::group_object_key("storage.k8s.io", "csinodes", None, "ci-node");
+        let stored = store
+            .get(&store_key)
+            .await
+            .expect("store.get must not fail");
+        assert!(
+            stored.is_some(),
+            "CSINode ci-node must be in the store at key {store_key}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&stored.unwrap().value).expect("valid json");
+        assert_eq!(parsed["kind"].as_str(), Some("CSINode"));
+        assert_eq!(parsed["metadata"]["name"].as_str(), Some("ci-node"));
     }
 }
