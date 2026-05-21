@@ -44,21 +44,17 @@ pub struct CollectionQuery {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn generate_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut n = t ^ c.wrapping_mul(0x9e3779b97f4a7c15);
-    const CHARS: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
-    let mut out = [0u8; 5];
-    for b in out.iter_mut() {
-        *b = CHARS[(n % CHARS.len() as u64) as usize];
-        n = n.wrapping_div(CHARS.len() as u64);
-    }
-    String::from_utf8(out.to_vec()).unwrap()
+    // Use UUIDv4 (CSPRNG) as the entropy source. The previous implementation
+    // XOR'd system time with a counter — neither is cryptographically random,
+    // allowing an attacker to predict generated names. Take the first 5 hex
+    // chars of the UUID (no dashes) to preserve the existing 5-char suffix format.
+    let uuid = uuid::Uuid::new_v4().to_string();
+    // UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    // Take the first 5 chars of the first group (pure hex, no dashes).
+    uuid.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(5)
+        .collect()
 }
 
 pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::StatusError> {
@@ -2674,12 +2670,15 @@ mod tests {
 
     #[test]
     fn generate_suffix_produces_5_chars_from_allowed_charset() {
-        // The suffix is used as a unique name component; must be 5 chars from the safe charset.
-        const ALLOWED: &str = "bcdfghjklmnpqrstvwxz2456789";
+        // The suffix is used as a unique name component; must be exactly 5 chars.
+        // Chars come from UUIDv4 hex digits (0-9, a-f) — valid in Kubernetes names.
         let suffix = generate_suffix();
         assert_eq!(suffix.len(), 5, "suffix must be exactly 5 characters");
         for c in suffix.chars() {
-            assert!(ALLOWED.contains(c), "suffix char '{c}' not in allowed set");
+            assert!(
+                c.is_ascii_hexdigit(),
+                "suffix char '{c}' must be a hex digit (UUIDv4 source)"
+            );
         }
     }
 

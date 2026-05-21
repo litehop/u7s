@@ -125,15 +125,11 @@ fn stamp_server_fields(crd: &mut CustomResourceDefinition) {
 }
 
 fn new_uid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!(
-        "{:016x}-{:08x}-crd0-0000-000000000000",
-        d.as_secs(),
-        d.subsec_nanos()
-    )
+    // Use UUIDv4 (CSPRNG) for uid generation. The previous implementation
+    // formatted system time as hex — two CRDs created in the same nanosecond
+    // would collide, and the value was predictable (no entropy). Kubernetes
+    // expects UIDs in UUID string format (RFC 4122).
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::StatusError> {
@@ -449,6 +445,22 @@ mod tests {
         );
         assert_eq!(crd.api_version, "apiextensions.k8s.io/v1");
         assert_eq!(crd.kind, "CustomResourceDefinition");
+    }
+
+    /// new_uid() must return a valid UUIDv4 string. Two calls must produce
+    /// different values — a time-based uid (the previous impl) would collide
+    /// for CRDs created in the same nanosecond and is also predictable.
+    #[test]
+    fn new_uid_returns_uuid_format() {
+        let uid1 = new_uid();
+        let uid2 = new_uid();
+        // UUID format: 8-4-4-4-12 hex chars separated by dashes, 36 total chars.
+        assert_eq!(uid1.len(), 36, "uid must be a 36-char UUID string");
+        assert!(
+            uid1.parse::<uuid::Uuid>().is_ok(),
+            "uid must parse as a valid UUID (got '{uid1}')"
+        );
+        assert_ne!(uid1, uid2, "consecutive UIDs must differ (CSPRNG source)");
     }
 
     // stamp_server_fields must not overwrite existing uid/timestamp.
