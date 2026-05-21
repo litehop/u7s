@@ -297,6 +297,17 @@ pub(crate) async fn watch_generic(
     label_selector: Option<String>,
     field_selector: Option<String>,
 ) -> Result<Response, crate::status::StatusError> {
+    // Check compaction horizon BEFORE committing headers so clients get a synchronous HTTP 410.
+    // If from_rv > 0 and below the horizon, the revision is expired — return 410 immediately.
+    if from_revision > 0 {
+        let horizon = state.store.compaction_horizon();
+        if from_revision < horizon {
+            return Err(Status::expired(format!(
+                "too old resource version: {from_revision} (current compaction horizon: {horizon})"
+            )));
+        }
+    }
+
     let event_stream = state
         .store
         .watch(&prefix, from_revision)
@@ -4075,6 +4086,95 @@ mod tests {
         assert!(
             object_matches_field_selector(&obj, "spec.nodeName=worker-1"),
             "unknown field selectors must be ignored (pass-through), not drop events"
+        );
+    }
+
+    // -- watch_generic: HTTP 410 before streaming for expired resourceVersion --
+
+    /// Regression test for mayor-e8fx: when a client opens a watch with a resourceVersion
+    /// below the compaction horizon, watch_generic must return HTTP 410 BEFORE committing
+    /// headers. Previously it emitted HTTP 200 then a JSON ERROR body, which clients cannot
+    /// detect synchronously (they see 200 and start parsing the stream).
+    #[tokio::test]
+    async fn watch_generic_returns_410_before_streaming_for_expired_rv() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        // Simulate compaction: horizon is 50, so any from_revision in 1..50 is expired.
+        store.set_compaction_horizon_for_test(50);
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // from_revision=10 is below horizon=50 — must get HTTP 410, not a streaming response.
+        let result = watch_generic(
+            state,
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            10, // expired
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "watch_generic must return Err(410) for expired resourceVersion, \
+             not Ok(streaming 200) — clients cannot detect failure from a stream header"
+        );
+        let err_resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(
+            err_resp.status(),
+            axum::http::StatusCode::GONE,
+            "HTTP 410 Gone must be returned synchronously so clients can retry without \
+             waiting for the stream body"
+        );
+    }
+
+    /// watch_generic with from_revision=0 (full watch) must NOT trigger the 410 check,
+    /// even when a compaction horizon exists. rv=0 means "watch from now", not from a
+    /// specific point, and cannot be expired.
+    #[tokio::test]
+    async fn watch_generic_rv_zero_does_not_trigger_410() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        store.set_compaction_horizon_for_test(50);
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // rv=0 is never expired — it means "watch all future events".
+        let result = watch_generic(
+            state,
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0, // not expired
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "rv=0 (full watch) must not trigger the 410 expiry check, \
+             even when a compaction horizon exists"
         );
     }
 }
