@@ -135,4 +135,18 @@ impl Status {
             },
         )
     }
+
+    pub fn too_many_requests(message: String) -> StatusError {
+        StatusError(
+            StatusCode::TOO_MANY_REQUESTS,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "TooManyRequests",
+                code: 429,
+            },
+        )
+    }
 }

@@ -2,13 +2,14 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
+    auth::UserInfo,
     state::AppState,
     status::Status,
     util::{extract_body, utc_now_rfc3339},
@@ -148,6 +149,7 @@ fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::Stat
 pub async fn list_crds(
     State(state): State<AppState>,
     Query(query): Query<super::generic::CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let prefix = list_prefix();
 
@@ -162,6 +164,7 @@ pub async fn list_crds(
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
+            user.username,
         )
         .await;
     }
@@ -561,6 +564,11 @@ mod tests {
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
             }),
+            Extension(UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
         )
         .await
         {
@@ -657,7 +665,17 @@ mod tests {
             allow_watch_bookmarks: None,
         });
 
-        let resp = match list_crds(State(state), query).await {
+        let resp = match list_crds(
+            State(state),
+            query,
+            Extension(UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("watch must not error"),
         };

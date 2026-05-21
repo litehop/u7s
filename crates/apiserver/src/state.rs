@@ -1,10 +1,39 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
 use u7s_store::{ListOptions, SqliteStore, Store as _};
 
 use crate::auth::UserInfo;
 use crate::rbac::RbacIndex;
 use crate::types::{ResourceKey, ResourceMeta};
+
+/// Maximum number of concurrent watch streams allowed per authenticated user.
+/// A client that already has this many open watches gets HTTP 429 on the next attempt.
+pub const MAX_WATCHES_PER_CLIENT: usize = 10;
+
+/// Per-client watch stream concurrency limiter.
+///
+/// Holds a Semaphore per authenticated username. Each watch stream acquires one
+/// permit for its lifetime and releases it when the stream ends (RAII). Attempts
+/// beyond MAX_WATCHES_PER_CLIENT are rejected with HTTP 429.
+#[derive(Clone, Default)]
+pub struct WatchLimitState {
+    inner: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+}
+
+impl WatchLimitState {
+    pub fn new() -> Self {
+        WatchLimitState::default()
+    }
+
+    /// Return the Semaphore for the given client key, creating one if absent.
+    pub fn semaphore_for(&self, client_key: &str) -> Arc<Semaphore> {
+        let mut map = self.inner.lock().unwrap();
+        map.entry(client_key.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(MAX_WATCHES_PER_CLIENT)))
+            .clone()
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,6 +48,8 @@ pub struct AppState {
     pub token_map: Arc<HashMap<String, UserInfo>>,
     /// Advertised server address returned in /api discovery (e.g. "https://1.2.3.4:6443").
     pub server_address: String,
+    /// Per-client watch stream concurrency limiter.
+    pub watch_limit: WatchLimitState,
 }
 
 impl AppState {
@@ -38,6 +69,7 @@ impl AppState {
             sa_decoding_key: sa_decoding_key.map(Arc::new),
             token_map: Arc::new(token_map),
             server_address,
+            watch_limit: WatchLimitState::new(),
         }
     }
 
