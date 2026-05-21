@@ -352,6 +352,32 @@ jobs:
           echo "Node registered:"
           kubectl get nodes
 
+      - name: Assert node reaches Ready
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          READY=0
+          for i in $(seq 1 60); do
+            STATUS=$(kubectl get node ci-node \
+              -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+            if [ "$STATUS" = "True" ]; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$READY" -eq 0 ]; then
+            echo "ERROR: ci-node did not reach Ready=True within 120s"
+            kubectl describe node ci-node || true
+            echo "--- server log ---"
+            cat "${{ env.SMOKE_TMPDIR }}/server.log"
+            echo "--- kubelet log ---"
+            cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+            exit 1
+          fi
+          echo "Node is Ready:"
+          kubectl get node ci-node
+
       - name: Assert kubelet not crash-looping
         run: |
           sleep 5
