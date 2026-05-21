@@ -1022,4 +1022,91 @@ mod tests {
             MAX_BODY_BYTES
         );
     }
+
+    /// Verifies that POST /apis/storage.k8s.io/v1/csinodes creates a CSINode and
+    /// GET /apis/storage.k8s.io/v1/csinodes/{name} retrieves it.
+    ///
+    /// The kubelet sends PATCH (SSA) on first boot to register a CSINode. Without
+    /// the resource being in the registry, the generic handler falls through to the
+    /// CR handler which returns 404 (no CRD installed). This test encodes the
+    /// requirement that CSINode is served by the generic handler via the registry.
+    #[tokio::test]
+    async fn csinode_create_and_get_round_trip() {
+        use std::sync::Arc;
+
+        let store = Arc::new(make_store());
+        let state = state::AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "ci-node" },
+            "spec": { "drivers": [] }
+        });
+        let body_bytes = bytes::Bytes::from(body.to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        // POST creates the CSINode — this is what the kubelet does on first boot.
+        let create_result = handlers::generic::create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "csinodes".to_string(),
+            )),
+            axum::Extension(auth::UserInfo {
+                username: "system:node:ci-node".into(),
+                uid: "".into(),
+                groups: vec!["system:nodes".into()],
+            }),
+            headers,
+            body_bytes,
+        )
+        .await;
+        assert!(
+            create_result.is_ok(),
+            "POST /apis/storage.k8s.io/v1/csinodes must succeed"
+        );
+
+        // GET retrieves the CSINode — kubelet later reads it to verify registration.
+        let get_result = handlers::generic::get_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "csinodes".to_string(),
+                "ci-node".to_string(),
+            )),
+        )
+        .await;
+        assert!(
+            get_result.is_ok(),
+            "GET /apis/storage.k8s.io/v1/csinodes/ci-node must succeed"
+        );
+
+        // The CSINode must be stored under the correct key for RBAC to find it.
+        let store_key = keys::group_object_key("storage.k8s.io", "csinodes", None, "ci-node");
+        let stored = store
+            .get(&store_key)
+            .await
+            .expect("store.get must not fail");
+        assert!(
+            stored.is_some(),
+            "CSINode ci-node must be in the store at key {store_key}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&stored.unwrap().value).expect("valid json");
+        assert_eq!(parsed["kind"].as_str(), Some("CSINode"));
+        assert_eq!(parsed["metadata"]["name"].as_str(), Some("ci-node"));
+    }
 }
