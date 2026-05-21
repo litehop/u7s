@@ -158,7 +158,10 @@ mod tests {
 
     #[test]
     fn store_err_to_status_revision_mismatch_is_409() {
-        let e = StoreError::RevisionMismatch { expected: 1, current: 2 };
+        let e = StoreError::RevisionMismatch {
+            expected: 1,
+            current: 2,
+        };
         assert_eq!(store_err_to_status(&e), StatusCode::CONFLICT);
     }
 
@@ -170,7 +173,10 @@ mod tests {
     #[test]
     fn content_type_present() {
         let mut h = HeaderMap::new();
-        h.insert(axum::http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
         assert_eq!(content_type(&h), "application/json");
     }
 

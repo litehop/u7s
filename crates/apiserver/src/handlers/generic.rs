@@ -777,6 +777,7 @@ pub async fn delete_resource(
 ///
 /// `ns` is `None` for cluster-scoped resources and `Some(namespace)` for namespaced ones.
 /// The caller supplies the pre-computed `key` and resolved `meta`.
+#[allow(clippy::too_many_arguments)]
 async fn do_patch(
     state: &AppState,
     key: &str,
@@ -841,8 +842,8 @@ async fn do_patch(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let mut patch: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let mut patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     // Strip status from the patch on the main endpoint for resources with a status subresource.
     if meta.has_status_subresource {
@@ -926,7 +927,10 @@ pub async fn patch_resource(
     };
 
     let key = group_object_key(&group, &plural, None, &name);
-    do_patch(&state, &key, &meta, &group, &version, &plural, None, &name, is_ssa, patch_type, body).await
+    do_patch(
+        &state, &key, &meta, &group, &version, &plural, None, &name, is_ssa, patch_type, body,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,7 +1250,20 @@ pub async fn patch_namespaced_resource(
     };
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
-    do_patch(&state, &key, &meta, &group, &version, &plural, Some(&ns), &name, is_ssa, patch_type, body).await
+    do_patch(
+        &state,
+        &key,
+        &meta,
+        &group,
+        &version,
+        &plural,
+        Some(&ns),
+        &name,
+        is_ssa,
+        patch_type,
+        body,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
