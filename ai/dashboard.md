@@ -1,26 +1,28 @@
 # Dashboard
-2026-05-21 06:58 UTC
+2026-05-21 08:35 UTC
 Resume: open Claude Code in /Users/balint.erdos/u7s, say "I am the Mayor now"
-Open beads: 5 (3 in_progress, 2 open)
+Open beads: 2 (both P3, no blockers)
 
 ## What needs the operator now
-- **PRs #97 and #103** both still failing kubelet smoke (pod stuck ContainerCreating, Events: <none>). Worker dispatched to investigate root cause — may surface a decision if the fix is architectural.
-- **Renovate PRs #109 (rcgen) and #110 (rusqlite)** are failing — not yet dispatched. Will handle after current batch.
+- **PR #125** (CNI smoke fix) — re-queued after fixing `--allow-overwrite` → `-o Dpkg::Options::="--force-overwrite"`. CI running. Merge when green.
+- **PR #127** (proto decoders) — Lease/CSINode/Event proto body decoding. CI running. Merge when green.
+- **Renovate PRs #109 (rcgen) and #110 (rusqlite)** — still failing, not yet dispatched.
+- **lima-node** — still NotReady; will reach Ready once PR #127 merges and server restarts with proto decode support.
+- **Nested worktree bug** — workers keep spawning inside each other's worktrees. Root cause: worker isolation spawns relative to CWD, not repo root. No operator action needed; mayor cleans up after each dispatch.
 
 ## Forward-looking
-3 workers running in parallel:
-1. **CodeQL fix** (mayor-47hf) — `auth.rs:66` split inline to locals; `tls.rs` test suppressions. Pure cleanup.
-2. **Kubelet smoke fix** (mayor-l90x) — pod stuck ContainerCreating. Investigating missing PATCH /pods/{name}/status endpoint or strategic-merge-patch gap. Will use CI artifact logs + lima-node locally.
-3. **jsonwebtoken v10 compat** (mayor-zxu4) — 5 test panics in auth.rs from missing CryptoProvider init. Enables Renovate PR #117 to merge.
-
-After these land: revisit Renovate PRs #109 and #110 (rcgen and rusqlite). Then sonobuoy gap audit (mayor-2ni) and protobuf bindings (mayor-pgdr).
+- Merge PRs #125 and #127 when CI goes green (no operator review needed — correctness fix + new feature below security/API surface threshold)
+- After #127 merges: restart lima-node u7s server → kubelet should reach Ready → sonobuoy audit (mayor-2ni) becomes unblocked
+- Dispatch Renovate PR fixes (#109 rcgen, #110 rusqlite)
+- CSR bootstrap flow (mayor-z1bu) — P3, scoped bead exists, awaiting operator decision on priority
 
 ## Recent progress
-- PR #121 (schemars v1) merged ✓
-- PR #122 (thiserror v2) merged ✓
-- PR #120 (CSINode round-trip test) merged ✓
-- PRs #97 and #103 open — kubelet smoke failing on new pod lifecycle assertion step
-- Previous session: ~120 PRs total merged; security sprint, CI hardening, feature work complete
+- **PR #123** (CodeQL dismissals) merged ✓ — 14 path-injection alerts cleared
+- **PR #124** (jsonwebtoken v10) merged ✓ — rust_crypto feature, tests no longer panic
+- **PR #126** (system:nodes RBAC test) merged ✓
+- **PR #125** (CNI + pod lifecycle smoke) — open, CI re-running after dpkg flag fix
+- **PR #127** (Lease/CSINode/Event proto decoders) — open, CI running (547 additions, 6 new tests)
+- Closed beads: mayor-47hf, mayor-zxu4, mayor-66s8, mayor-pgdr (work done, PR open)
 
 ## Stance
-Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Mayor merges on green CI; flags security/API/architecture PRs for operator review first.
+Pre-alpha/greenfield: break freely, no backward compat, correctness first, kubectl-compatible API, minimal crate deps. Merge on green CI; flag security/API/architecture PRs for operator review first.
