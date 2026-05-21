@@ -990,6 +990,140 @@ mod tests {
         assert_eq!(result["spec"]["podCIDR"], "10.0.1.0/24");
     }
 
+    /// Walk every tag in a proto message (non-recursive, top-level only) and assert that no
+    /// tag has an illegal wire type (3, 4, 6, or 7).  Called from regression tests below.
+    ///
+    /// Returns the list of fields encountered as `(field_number, wire_type, payload_len)`.
+    fn assert_valid_wire_types(msg: &[u8]) -> Vec<(u64, u64, usize)> {
+        let mut pos = 0;
+        let mut fields = Vec::new();
+        while pos < msg.len() {
+            let (tag, rest) = decode_varint(&msg[pos..])
+                .unwrap_or_else(|| panic!("truncated varint at pos {pos}"));
+            pos += msg[pos..].len() - rest.len();
+            let wire_type = tag & 0x7;
+            let field_number = tag >> 3;
+            assert!(
+                !matches!(wire_type, 3 | 4 | 6 | 7),
+                "illegal wire type {wire_type} at pos {}: tag=0x{tag:02x} field_number={field_number}\n\
+                 Full envelope hex: {}",
+                pos - 1,
+                msg.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+            );
+            match wire_type {
+                0 => {
+                    let (_, rest2) = decode_varint(&msg[pos..])
+                        .unwrap_or_else(|| panic!("truncated varint value at pos {pos}"));
+                    let consumed = msg[pos..].len() - rest2.len();
+                    fields.push((field_number, wire_type, consumed));
+                    pos += consumed;
+                }
+                2 => {
+                    let (len, rest2) = decode_varint(&msg[pos..])
+                        .unwrap_or_else(|| panic!("truncated length varint at pos {pos}"));
+                    pos += msg[pos..].len() - rest2.len();
+                    let len = len as usize;
+                    assert!(
+                        pos + len <= msg.len(),
+                        "field {field_number} payload extends past end: pos={pos} len={len} msg_len={}",
+                        msg.len()
+                    );
+                    fields.push((field_number, wire_type, len));
+                    pos += len;
+                }
+                _ => unreachable!("wire_type checked above"),
+            }
+        }
+        fields
+    }
+
+    /// Regression test: encode_proto_response must produce a valid Kubernetes protobuf envelope
+    /// for the exact JSON returned by the create_namespace handler (smoke-test scenario).
+    ///
+    /// This test reproduces the FULL response path:
+    ///   1. decode_namespace_proto (decodes kubectl's proto request body to JSON)
+    ///   2. handler adds status + resourceVersion
+    ///   3. middleware calls encode_proto_response on the JSON
+    ///   4. we walk every tag in the Unknown envelope and assert no illegal wire types
+    ///
+    /// A regression here means `kubectl create namespace smoke-test` would fail with
+    /// "proto: illegal wireType N" — the smoke CI gate failure this bead addresses.
+    #[test]
+    fn encode_proto_response_no_illegal_wire_types_namespace_create() {
+        // Reproduce what create_namespace returns after decode_namespace_proto:
+        let mut obj_meta = encode_length_delimited(1, b"smoke-test");
+        obj_meta.extend_from_slice(&encode_length_delimited(8, &[])); // creationTimestamp (empty Time{})
+        let namespace_proto = encode_length_delimited(1, &obj_meta);
+        let mut ns_json =
+            decode_namespace_proto(&namespace_proto).expect("decode_namespace_proto must succeed");
+        ns_json["status"] = serde_json::json!({ "phase": "Active" });
+        ns_json["metadata"]["resourceVersion"] = serde_json::Value::String("1".to_string());
+
+        // Simulate the middleware: parse JSON body then re-serialize via encode_proto_response.
+        let json_str = ns_json.to_string();
+        let val: serde_json::Value = serde_json::from_str(&json_str).expect("round-trip JSON");
+
+        let encoded = encode_proto_response(&val);
+        assert_eq!(
+            &encoded[..4],
+            &[0x6b, 0x38, 0x73, 0x00],
+            "must start with k8s proto magic"
+        );
+
+        let envelope = &encoded[4..];
+
+        // Walk the Unknown envelope: check top-level fields for illegal wire types.
+        let fields = assert_valid_wire_types(envelope);
+
+        // Verify the envelope has the three expected fields.
+        let field_numbers: Vec<u64> = fields.iter().map(|(fn_, _, _)| *fn_).collect();
+        assert!(
+            field_numbers.contains(&1),
+            "Unknown envelope must have field 1 (TypeMeta)"
+        );
+        assert!(
+            field_numbers.contains(&2),
+            "Unknown envelope must have field 2 (raw JSON)"
+        );
+        assert!(
+            field_numbers.contains(&4),
+            "Unknown envelope must have field 4 (contentType)"
+        );
+
+        // Also walk the TypeMeta sub-message.
+        let type_meta_payload: &[u8] = {
+            let mut p = envelope;
+            let mut result: &[u8] = &[];
+            let mut tmp_pos = 0;
+            while tmp_pos < envelope.len() {
+                let (tag, rest) = decode_varint(&envelope[tmp_pos..]).expect("valid tag");
+                tmp_pos += envelope[tmp_pos..].len() - rest.len();
+                let field_number = tag >> 3;
+                let wire_type = tag & 0x7;
+                if wire_type == 2 {
+                    let (len, rest2) = decode_varint(&envelope[tmp_pos..]).expect("valid len");
+                    tmp_pos += envelope[tmp_pos..].len() - rest2.len();
+                    if field_number == 1 {
+                        result = &envelope[tmp_pos..tmp_pos + len as usize];
+                        break;
+                    }
+                    tmp_pos += len as usize;
+                }
+                p = &p[1..]; // ensure p advances (unused after first iteration)
+            }
+            result
+        };
+        let _ = assert_valid_wire_types(type_meta_payload);
+
+        // Verify the encoded body is decodable end-to-end.
+        let env = decode_k8s_proto_envelope(&encoded).expect("must decode as k8s envelope");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&env.raw).expect("envelope raw must be valid JSON");
+        assert_eq!(recovered["kind"], "Namespace");
+        assert_eq!(recovered["metadata"]["name"], "smoke-test");
+        assert_eq!(env.content_type, "application/json");
+    }
+
     /// decode_core_proto_by_kind must dispatch to decode_node_proto for kind="Node".
     /// This is the dispatch fix that ensures extract_body can handle kubelet Node proto bodies.
     #[test]

@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::http::{HeaderMap, Request, Response, StatusCode, header};
+use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 use tower::Layer;
 use tower_service::Service;
 
@@ -30,14 +30,11 @@ const PROTO_CONTENT_TYPE: &str = "application/vnd.kubernetes.protobuf";
 
 /// Returns `true` if the Accept header contains `application/vnd.kubernetes.protobuf`.
 pub fn prefer_proto(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(header::ACCEPT)
-        .iter()
-        .any(|v| {
-            v.to_str()
-                .map(|s| s.contains(PROTO_CONTENT_TYPE))
-                .unwrap_or(false)
-        })
+    headers.get_all(header::ACCEPT).iter().any(|v| {
+        v.to_str()
+            .map(|s| s.contains(PROTO_CONTENT_TYPE))
+            .unwrap_or(false)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -134,16 +131,22 @@ where
 
             // Re-encode as protobuf.
             let proto_bytes = encode_proto_response(&json_val);
+            let proto_len = proto_bytes.len();
 
             let mut new_parts = parts;
             new_parts.headers.insert(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static(PROTO_CONTENT_TYPE),
             );
-            // Remove Content-Length: the re-encoded protobuf body is a different size
-            // than the original JSON. Sending the old length causes clients to read a
-            // truncated or padded payload, which produces "illegal wireType" errors.
-            new_parts.headers.remove(header::CONTENT_LENGTH);
+            // Replace Content-Length with the proto body length.
+            // The original JSON Content-Length is wrong for the re-encoded body.
+            // We set it explicitly so hyper does not use chunked transfer encoding,
+            // which can trigger "illegal wireType" errors in the Go proto decoder.
+            new_parts.headers.insert(
+                header::CONTENT_LENGTH,
+                header::HeaderValue::from_str(&proto_len.to_string())
+                    .expect("proto body length is a valid header value"),
+            );
 
             Ok(Response::from_parts(new_parts, Body::from(proto_bytes)))
         })
@@ -215,8 +218,7 @@ mod tests {
             .unwrap()
     }
 
-    const SAMPLE_JSON: &str =
-        r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"my-node"}}"#;
+    const SAMPLE_JSON: &str = r#"{"apiVersion":"v1","kind":"Node","metadata":{"name":"my-node"}}"#;
 
     /// A 2xx JSON response with Accept: protobuf must be re-encoded as protobuf.
     ///
@@ -235,14 +237,21 @@ mod tests {
         let resp = layer_svc.call(proto_accept_request()).await.unwrap();
 
         // Content-Type must be protobuf.
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(
             ct, "application/vnd.kubernetes.protobuf",
             "content-type must be updated to protobuf"
         );
 
         // Body must start with the k8s magic prefix.
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(
             &body[..4],
             &[0x6b, 0x38, 0x73, 0x00],
@@ -257,8 +266,8 @@ mod tests {
             envelope.content_type, "application/json",
             "envelope contentType must be application/json so client-go uses JSON decoder"
         );
-        let recovered: serde_json::Value = serde_json::from_slice(&envelope.raw)
-            .expect("raw field must contain valid JSON");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&envelope.raw).expect("raw field must contain valid JSON");
         assert_eq!(
             recovered["metadata"]["name"], "my-node",
             "original object data must survive the proto round-trip"
@@ -282,13 +291,20 @@ mod tests {
         let resp = layer_svc.call(proto_accept_request()).await.unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(
             ct, "application/json",
             "4xx responses must remain JSON even when client accepts protobuf"
         );
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(
             !body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
             "4xx response body must not start with k8s proto magic"
@@ -310,28 +326,36 @@ mod tests {
 
         let resp = layer_svc.call(json_accept_request()).await.unwrap();
 
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert_eq!(
             ct, "application/json",
             "response must remain JSON when client does not accept protobuf"
         );
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(
             !body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
             "body must not start with k8s proto magic when client does not accept protobuf"
         );
     }
 
-    /// Content-Length must be removed when re-encoding as protobuf.
+    /// Content-Length must be updated to the proto body length when re-encoding as protobuf.
     ///
     /// If the original JSON response carried a Content-Length header (e.g. set by axum's
     /// router), the re-encoded protobuf body will be a different size. Leaving the old
     /// Content-Length causes clients to read a truncated or zero-padded payload, which the
-    /// protobuf decoder reports as "illegal wireType". This is the regression for
-    /// https://github.com/valerauko/u7s/pull/84 CI failure.
+    /// protobuf decoder reports as "illegal wireType". We must set Content-Length to the proto
+    /// body length so hyper uses Content-Length framing (not chunked transfer encoding).
+    /// This is the regression for https://github.com/valerauko/u7s/pull/84 CI failure.
     #[tokio::test]
-    async fn content_length_is_removed_on_re_encode() {
+    async fn content_length_is_updated_to_proto_length_on_re_encode() {
         // FixedService does not set Content-Length by default, so use a custom builder.
         #[derive(Clone)]
         struct ServiceWithContentLength;
@@ -358,9 +382,31 @@ mod tests {
         let mut layer_svc = ContentTypeLayer.layer(ServiceWithContentLength);
         let resp = layer_svc.call(proto_accept_request()).await.unwrap();
 
-        assert!(
-            resp.headers().get(header::CONTENT_LENGTH).is_none(),
-            "Content-Length must be absent after proto re-encoding: old value causes truncated payload"
+        // Content-Length must be the proto body length (not the original JSON length).
+        let cl_header = resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .expect("Content-Length must be present after proto re-encoding")
+            .to_str()
+            .expect("Content-Length must be a valid string")
+            .parse::<usize>()
+            .expect("Content-Length must be a valid integer");
+
+        // The proto body is the re-encoded body from the response.
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cl_header,
+            body.len(),
+            "Content-Length must equal the proto body length; JSON length ({}) would cause truncation",
+            SAMPLE_JSON.len()
+        );
+        assert_ne!(
+            cl_header,
+            SAMPLE_JSON.len(),
+            "Content-Length must not be the old JSON length — that causes wireType 6 truncation"
         );
     }
 
@@ -411,8 +457,8 @@ mod tests {
         //    read all bytes and succeed.
         let envelope = crate::proto::decode_k8s_proto_envelope(&proto_bytes)
             .expect("full proto body must decode as a valid k8s envelope");
-        let recovered: serde_json::Value = serde_json::from_slice(&envelope.raw)
-            .expect("envelope raw field must be valid JSON");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&envelope.raw).expect("envelope raw field must be valid JSON");
         assert_eq!(
             recovered["metadata"]["name"], "smoke-test",
             "name must survive the proto round-trip"
@@ -446,8 +492,8 @@ mod tests {
             .expect("encode_proto_response must produce a decodable k8s envelope");
 
         // The raw field must contain the JSON.
-        let recovered: serde_json::Value = serde_json::from_slice(&envelope.raw)
-            .expect("raw field must be valid JSON");
+        let recovered: serde_json::Value =
+            serde_json::from_slice(&envelope.raw).expect("raw field must be valid JSON");
         assert_eq!(recovered["kind"], "CSINode");
         assert_eq!(recovered["metadata"]["name"], "worker-1");
 
