@@ -1,32 +1,37 @@
 # Dashboard
 
-2026-05-21T16:35 UTC
+2026-05-21 — session active
 `bd prime` in a fresh Claude Code session
-Open beads: 2 (mayor-1di P1, mayor-xy2 P3 deferred)
+Open beads: 6 (2 workers in flight)
 
 ## What needs the operator now
 
-**Root cause identified for all kubelet "invalid JSON" failures** — mayor-1di P1. Kubelet 1.36 sends `Accept: application/vnd.kubernetes.protobuf` on every request (CSINode, Lease, Events, Node). Our server always returns `content-type: application/json`. The Go client-go library fails to decode the response and emits "invalid JSON: expected value at line 1 column 1". Fix: detect the `Accept` header and encode responses as protobuf using the existing `proto.rs` infrastructure when protobuf is preferred. This is the only remaining blocker to node Ready and pod scheduling.
+Nothing blocking — no decisions queued.
 
-**CNI gap fixed** — bridge CNI config written to `/etc/cni/net.d/` in the lima VM during this session; NetworkReady is no longer in the error message.
+**Workers in flight:**
+- **proto encoder fix** (`mayor-cux`, worker `a5ae2b40566e07637`) — diagnosing wireType 6 in `proto.rs`; will push fix to PR #84 branch to re-trigger CI
+- **scheduler namespace-aware** (`mayor-chl`, worker `a8d6e55c0c72edca9`) — changing watch URL to cluster-wide `/api/v1/pods`
 
-**Next dispatch:** mayor-1di (protobuf response negotiation). Ready to dispatch on your signal.
-
-**CoreDNS / sonobuoy:** Agreed — seed a default DNS service (Deployment + ConfigMap + ClusterIP Service at `10.96.0.10`) in `kube-system` at startup. Operator can replace it with any DNS server; it doesn't have to be CoreDNS specifically. File as a separate bead once the kubelet e2e is unblocked.
+**PRs pending CI:**
+- **PR #84** (`worker/agent-a5fbeadb79a66a443`) — protobuf response negotiation. Still failing `kubectl` with wireType 6. Fix in-flight above.
+- **PR #86** (`worker/seed-services-mayor-lmz`) — seeds `default/kubernetes` + `kube-system/kube-dns` Services. Lint ✓, rest pending.
 
 ## Forward-looking
 
-1. **mayor-1di** — protobuf response negotiation → node reaches Ready → pod lifecycle test can proceed
-2. After node Ready: seed default DNS service (coredns or generic) for sonobuoy milestone
-3. CI smoke job: create pod, assert Succeeded within 60s
-4. mayor-xy2 (CR schema validation, P3) — deferred until Argo CD milestone
+1. **mayor-cux** (in-flight) → PR #84 goes green → merge → kubelet smoke unblocked
+2. **mayor-chl** (in-flight) → new PR → scheduler watches all namespaces
+3. **mayor-2dc** (P1) — CI: assert node reaches Ready. Dispatch after PR #84 merges.
+4. **mayor-v43** (P1) — CI: pod lifecycle smoke. Blocked on mayor-2dc.
+5. **mayor-6m3** (P2) — seed CoreDNS deployment. Blocked on PR #86 merge (mayor-lmz).
+6. **mayor-2ni** (P3) — sonobuoy audit. Blocked on pod lifecycle.
+7. **mayor-xy2** (P3) — CR schema validation. Deferred.
 
 ## Recent progress
 
-- **PR #83 merged**: `storage.k8s.io/csinodes` and `csidrivers` added to seeded `system:node` ClusterRole — RBAC was correct but underlying issue is protobuf response negotiation
-- Live e2e test run: node registers, CNI gap fixed, two blockers remain (protobuf responses, CSINode init)
-- Root cause of all "invalid JSON" errors traced and filed as mayor-1di
-- Test count: 260 (unchanged this round)
+- **PR #86 opened**: seeds `kubernetes` + `kube-dns` Services at startup (mayor-lmz). +2 tests, 262 total.
+- **6 roadmap beads filed** this session: mayor-2dc, mayor-v43, mayor-lmz, mayor-chl, mayor-6m3, mayor-2ni.
+- Full prior backlog drained: 50+ beads closed before this session.
+- Mayor switched to `main` branch (was on `fix/proto-content-length`).
 
 ## Stance
 
