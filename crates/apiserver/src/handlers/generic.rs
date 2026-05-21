@@ -159,7 +159,7 @@ fn encode_watch_event(event: &WatchEvent, api_version: &str, kind: &str) -> Opti
 /// Key format: /registry/<resource>/<namespace>/<name>  (namespaced)
 ///         or: /registry/<group>/<plural>/<name>        (cluster-scoped)
 /// We only need the final segment as name; second-to-last as namespace (may be empty).
-fn parse_key_name_ns(key: &str) -> (&str, &str) {
+pub(crate) fn parse_key_name_ns(key: &str) -> (&str, &str) {
     let parts: Vec<&str> = key.rsplitn(3, '/').collect();
     match parts.as_slice() {
         [name, namespace, ..] => (name, namespace),
