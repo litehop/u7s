@@ -644,6 +644,7 @@ mod tests {
                     served: true,
                     storage: true,
                     schema: None,
+                    subresources: None,
                 }],
                 conversion: None,
                 preserve_unknown_fields: false,

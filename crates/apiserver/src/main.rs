@@ -347,11 +347,12 @@ fn build_router(state: AppState) -> Router {
                 .delete(handlers::generic::delete_namespaced_resource)
                 .patch(handlers::generic::patch_namespaced_resource),
         )
-        // Generic cluster-scoped — status subresource
+        // Cluster-scoped status subresource — CR-aware handler falls through to
+        // registry resources; generic GET/PATCH still handle non-CR resources.
         .route(
             "/apis/{group}/{version}/{resource}/{name}/status",
-            get(handlers::generic::get_resource_status)
-                .put(handlers::generic::put_resource_status)
+            get(handlers::cr::get_cr_status)
+                .put(handlers::cr::put_cr_status)
                 .patch(handlers::generic::patch_resource_status),
         )
         // Generic namespaced — status subresource
