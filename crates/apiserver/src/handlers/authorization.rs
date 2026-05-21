@@ -1,17 +1,7 @@
-use axum::{
-    Extension,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    auth::UserInfo,
-    rbac::AuthzRequest,
-    state::AppState,
-};
+use crate::{auth::UserInfo, rbac::AuthzRequest, state::AppState};
 
 // ---------------------------------------------------------------------------
 // SelfSubjectAccessReview
@@ -64,8 +54,16 @@ pub async fn self_subject_access_review(
     Json(body): Json<SelfSubjectAccessReviewRequest>,
 ) -> impl IntoResponse {
     let allowed = if let Some(attrs) = body.spec.resource_attributes {
-        let ns = if attrs.namespace.is_empty() { None } else { Some(attrs.namespace.as_str()) };
-        let name = if attrs.name.is_empty() { None } else { Some(attrs.name.as_str()) };
+        let ns = if attrs.namespace.is_empty() {
+            None
+        } else {
+            Some(attrs.namespace.as_str())
+        };
+        let name = if attrs.name.is_empty() {
+            None
+        } else {
+            Some(attrs.name.as_str())
+        };
 
         state.rbac_index.is_allowed(&AuthzRequest {
             username: &user.username,
@@ -135,7 +133,9 @@ pub async fn self_subject_rules_review(
     Json(body): Json<SelfSubjectRulesReviewRequest>,
 ) -> impl IntoResponse {
     let namespace = &body.spec.namespace;
-    let policy_rules = state.rbac_index.enumerate_rules(&user.username, &user.groups, namespace);
+    let policy_rules = state
+        .rbac_index
+        .enumerate_rules(&user.username, &user.groups, namespace);
 
     let resource_rules = policy_rules
         .into_iter()
@@ -192,8 +192,16 @@ pub async fn subject_access_review(
 ) -> impl IntoResponse {
     let spec = body.spec;
     let allowed = if let Some(attrs) = spec.resource_attributes {
-        let ns = if attrs.namespace.is_empty() { None } else { Some(attrs.namespace.as_str()) };
-        let name = if attrs.name.is_empty() { None } else { Some(attrs.name.as_str()) };
+        let ns = if attrs.namespace.is_empty() {
+            None
+        } else {
+            Some(attrs.namespace.as_str())
+        };
+        let name = if attrs.name.is_empty() {
+            None
+        } else {
+            Some(attrs.name.as_str())
+        };
 
         state.rbac_index.is_allowed(&AuthzRequest {
             username: &spec.user,
@@ -260,11 +268,8 @@ pub async fn token_review(
     Json(body): Json<TokenReviewRequest>,
 ) -> impl IntoResponse {
     let token = body.spec.token;
-    let user_info = crate::auth::authenticate_token(
-        &token,
-        &state.token_map,
-        state.sa_decoding_key.as_deref(),
-    );
+    let user_info =
+        crate::auth::authenticate_token(&token, &state.token_map, state.sa_decoding_key.as_deref());
 
     let status = match user_info {
         Some(u) => TokenReviewStatus {
@@ -368,7 +373,10 @@ mod tests {
         let groups: Vec<String> = vec![];
         // bob has no binding — must receive empty rules
         let rules = idx.enumerate_rules("bob", &groups, "default");
-        assert!(rules.is_empty(), "bob must see no rules when he has no bindings");
+        assert!(
+            rules.is_empty(),
+            "bob must see no rules when he has no bindings"
+        );
     }
 
     #[test]

@@ -142,7 +142,10 @@ mod tests {
         // Must start with "20" for any year 2000+.
         assert!(now.starts_with("20"), "unexpected prefix: {now}");
         // Must be after 2024.
-        assert!(now.as_str() >= "2024-01-01T00:00:00Z", "implausibly old: {now}");
+        assert!(
+            now.as_str() >= "2024-01-01T00:00:00Z",
+            "implausibly old: {now}"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -282,7 +285,10 @@ mod tests {
 
         assert_eq!(json["kind"], "ConfigMap", "kind must be ConfigMap");
         assert_eq!(json["apiVersion"], "v1", "apiVersion must be v1");
-        assert_eq!(json["metadata"]["name"], "test-cm", "name must survive proto decode");
+        assert_eq!(
+            json["metadata"]["name"], "test-cm",
+            "name must survive proto decode"
+        );
         assert_eq!(
             json["metadata"]["namespace"], "test-ns",
             "namespace must survive proto decode"
@@ -369,20 +375,16 @@ mod tests {
     /// taken for non-core types sent via protobuf where the inner encoding is JSON.
     #[test]
     fn test_extract_body_proto_with_explicit_json_content_type() {
-        let inner_json = br#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-via-json"}}"#;
+        let inner_json =
+            br#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-via-json"}}"#;
 
         // Build envelope with explicit contentType=application/json
-        let body = build_kubectl_proto_body(
-            b"v1",
-            b"Namespace",
-            inner_json,
-            Some(b"application/json"),
-        );
+        let body =
+            build_kubectl_proto_body(b"v1", b"Namespace", inner_json, Some(b"application/json"));
         let bytes = Bytes::from(body);
 
         let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
-        let json: serde_json::Value =
-            serde_json::from_slice(&decoded).expect("must be valid JSON");
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect("must be valid JSON");
         assert_eq!(
             json["metadata"]["name"], "ns-via-json",
             "inner JSON must be returned as-is when contentType=application/json"

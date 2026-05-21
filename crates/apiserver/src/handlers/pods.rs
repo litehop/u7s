@@ -36,8 +36,13 @@ fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
         let term = term.trim();
         if !term.contains("!=") {
             term.split_once('=').and_then(|(field, value)| {
-                if field.is_empty() { return None; }
-                Some(u7s_store::FieldSelector { field: field.to_string(), value: value.to_string() })
+                if field.is_empty() {
+                    return None;
+                }
+                Some(u7s_store::FieldSelector {
+                    field: field.to_string(),
+                    value: value.to_string(),
+                })
             })
         } else {
             None
@@ -53,7 +58,10 @@ fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
 ///
 /// An empty or absent selector matches everything (pass-through).
 /// Unknown selector terms are ignored (conservative: don't drop pods on unrecognised fields).
-pub fn filter_pods_by_field_selector(pods: Vec<serde_json::Value>, selector: &str) -> Vec<serde_json::Value> {
+pub fn filter_pods_by_field_selector(
+    pods: Vec<serde_json::Value>,
+    selector: &str,
+) -> Vec<serde_json::Value> {
     if selector.is_empty() {
         return pods;
     }
@@ -133,13 +141,24 @@ pub async fn list_pods(
         let from_rv = query.resource_version.unwrap_or(0);
         let initial_pods = if query.send_initial_events == Some(true) {
             // Collect existing pods under this namespace prefix and filter by field selector.
-            let store_fs = query.field_selector.as_deref().and_then(pod_store_field_selector);
+            let store_fs = query
+                .field_selector
+                .as_deref()
+                .and_then(pod_store_field_selector);
             let resp = state
                 .store
-                .list(&prefix, ListOptions { field_selector: store_fs, ..Default::default() })
+                .list(
+                    &prefix,
+                    ListOptions {
+                        field_selector: store_fs,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let mut pods: Vec<serde_json::Value> = resp.items.iter()
+            let mut pods: Vec<serde_json::Value> = resp
+                .items
+                .iter()
                 .filter_map(|o| serde_json::from_slice(&o.value).ok())
                 .collect();
             if let Some(ref sel) = query.field_selector {
@@ -160,10 +179,19 @@ pub async fn list_pods(
         .await;
     }
 
-    let store_field_selector = query.field_selector.as_deref().and_then(pod_store_field_selector);
+    let store_field_selector = query
+        .field_selector
+        .as_deref()
+        .and_then(pod_store_field_selector);
     let resp = state
         .store
-        .list(&prefix, ListOptions { field_selector: store_field_selector, ..Default::default() })
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector: store_field_selector,
+                ..Default::default()
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -388,10 +416,7 @@ async fn watch_pods(
     let resp = Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .header(
-            axum::http::header::TRANSFER_ENCODING,
-            "chunked",
-        )
+        .header(axum::http::header::TRANSFER_ENCODING, "chunked")
         .body(body)
         .expect("response builder never fails with these headers");
 
@@ -405,10 +430,13 @@ pub async fn create_pod(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
-    let mut obj = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let name = {
         match obj.name().filter(|n| !n.is_empty()) {
@@ -416,7 +444,9 @@ pub async fn create_pod(
             None => {
                 let gen = obj.body["metadata"]["generateName"].as_str().unwrap_or("");
                 if gen.is_empty() {
-                    return Err(Status::bad_request("metadata.name or metadata.generateName is required".into()));
+                    return Err(Status::bad_request(
+                        "metadata.name or metadata.generateName is required".into(),
+                    ));
                 }
                 let generated = format!("{}{}", gen, crate::handlers::generic::generate_suffix());
                 obj.body["metadata"]["name"] = serde_json::Value::String(generated.clone());
@@ -426,8 +456,7 @@ pub async fn create_pod(
     };
 
     // Ensure namespace is set in the stored object
-    obj.body["metadata"]["namespace"] =
-        serde_json::Value::String(ns.as_str().to_owned());
+    obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.as_str().to_owned());
     crate::handlers::generic::stamp_metadata(&mut obj);
 
     let key = object_key("pods", ns.as_str(), &name);
@@ -471,10 +500,13 @@ pub async fn replace_pod(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
-    let mut obj = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let obj_name = obj.name().unwrap_or("").to_string();
     if obj_name != name {
@@ -523,8 +555,7 @@ pub async fn delete_pod(
 
     if has_finalizers {
         // Soft delete: stamp deletionTimestamp and write back.
-        obj.body["metadata"]["deletionTimestamp"] =
-            serde_json::Value::String(utc_now_rfc3339());
+        obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
             .store
@@ -583,8 +614,8 @@ pub async fn patch_pod(
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     if is_smp {
         crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
@@ -624,7 +655,6 @@ pub async fn patch_pod(
 }
 
 use crate::util::utc_now_rfc3339;
-
 
 #[cfg(test)]
 mod watch_tests {
@@ -728,10 +758,14 @@ mod watch_tests {
                 "metadata": {"resourceVersion": horizon.to_string()}
             }
         });
-        let rv = obj["object"]["metadata"]["resourceVersion"].as_str().unwrap();
-        assert_eq!(rv, "500",
+        let rv = obj["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            rv, "500",
             "410 ERROR must carry horizon as resourceVersion so clients relist from \
-             a valid point, not from last_rv which may predate the compaction horizon");
+             a valid point, not from last_rv which may predate the compaction horizon"
+        );
     }
 
     /// parse_key_name_ns correctly extracts name and namespace from a standard store key.
@@ -804,7 +838,11 @@ mod field_selector_tests {
     /// Kubelet depends on this when fieldSelector is absent.
     #[test]
     fn empty_selector_passes_all() {
-        let pods = vec![pod_with_node("worker-1"), pod_with_node("worker-2"), pod_without_node()];
+        let pods = vec![
+            pod_with_node("worker-1"),
+            pod_with_node("worker-2"),
+            pod_without_node(),
+        ];
         let result = filter_pods_by_field_selector(pods.clone(), "");
         assert_eq!(result.len(), pods.len());
     }
@@ -853,7 +891,10 @@ mod field_selector_tests {
     fn eq_filter_excludes_unscheduled_pods() {
         let pods = vec![pod_without_node()];
         let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1");
-        assert!(result.is_empty(), "unscheduled pods must not reach the kubelet");
+        assert!(
+            result.is_empty(),
+            "unscheduled pods must not reach the kubelet"
+        );
     }
 
     /// Unknown selector fields must be ignored (pass-through) rather than dropping pods.
@@ -871,7 +912,8 @@ mod field_selector_tests {
         // Only worker-1 pods should pass spec.nodeName=worker-1,spec.nodeName!=worker-2
         // (worker-1 != worker-2 is true, so worker-1 passes both)
         let pods = vec![pod_with_node("worker-1"), pod_with_node("worker-2")];
-        let result = filter_pods_by_field_selector(pods, "spec.nodeName=worker-1,spec.nodeName!=worker-2");
+        let result =
+            filter_pods_by_field_selector(pods, "spec.nodeName=worker-1,spec.nodeName!=worker-2");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["spec"]["nodeName"], "worker-1");
     }
@@ -944,7 +986,10 @@ pub async fn replace_pod_status(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
     let incoming: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -1032,8 +1077,8 @@ pub async fn patch_pod_status(
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     current_obj.body = apply_status_patch(&current_obj.body, &patch);
 
@@ -1107,7 +1152,8 @@ mod status_tests {
         crate::patch::merge_patch(&mut status, &patch_status);
 
         // null in merge patch means delete
-        assert!(status.get("hostIP").map_or(true, |v| v.is_null() || !status.as_object().unwrap().contains_key("hostIP")));
+        assert!(status.get("hostIP").map_or(true, |v| v.is_null()
+            || !status.as_object().unwrap().contains_key("hostIP")));
         assert_eq!(status["phase"], "Running");
     }
 
@@ -1172,8 +1218,10 @@ mod status_tests {
 
         let result = apply_status_patch(&stored, &patch);
 
-        assert_eq!(result["status"]["phase"], "Running",
-            "phase must transition Pending -> Running after kubelet patch");
+        assert_eq!(
+            result["status"]["phase"], "Running",
+            "phase must transition Pending -> Running after kubelet patch"
+        );
     }
 
     /// apply_status_patch must ignore spec fields in the patch body.
@@ -1195,10 +1243,14 @@ mod status_tests {
 
         let result = apply_status_patch(&stored, &patch);
 
-        assert_eq!(result["status"]["phase"], "Running",
-            "status phase must be updated");
-        assert_eq!(result["spec"]["nodeName"], "worker-1",
-            "spec.nodeName must not be changed — status subresource cannot modify spec");
+        assert_eq!(
+            result["status"]["phase"], "Running",
+            "status phase must be updated"
+        );
+        assert_eq!(
+            result["spec"]["nodeName"], "worker-1",
+            "spec.nodeName must not be changed — status subresource cannot modify spec"
+        );
     }
 
     /// apply_status_patch must preserve existing status fields not present in the patch.
@@ -1221,16 +1273,26 @@ mod status_tests {
 
         let result = apply_status_patch(&stored, &patch);
 
-        assert_eq!(result["status"]["phase"], "Running",
-            "phase must be updated");
-        assert_eq!(result["status"]["hostIP"], "10.0.0.1",
-            "pre-existing hostIP must not be clobbered");
-        let conditions = result["status"]["conditions"].as_array()
+        assert_eq!(
+            result["status"]["phase"], "Running",
+            "phase must be updated"
+        );
+        assert_eq!(
+            result["status"]["hostIP"], "10.0.0.1",
+            "pre-existing hostIP must not be clobbered"
+        );
+        let conditions = result["status"]["conditions"]
+            .as_array()
             .expect("conditions must still be an array");
-        assert_eq!(conditions.len(), 1,
-            "pre-existing conditions must be preserved");
-        assert_eq!(conditions[0]["type"], "Initialized",
-            "Initialized condition must survive the phase-only patch");
+        assert_eq!(
+            conditions.len(),
+            1,
+            "pre-existing conditions must be preserved"
+        );
+        assert_eq!(
+            conditions[0]["type"], "Initialized",
+            "Initialized condition must survive the phase-only patch"
+        );
     }
 
     /// apply_status_patch that adds a new condition to status.conditions merges correctly.
@@ -1266,18 +1328,28 @@ mod status_tests {
 
         let result = apply_status_patch(&stored, &patch);
 
-        let conditions = result["status"]["conditions"].as_array()
+        let conditions = result["status"]["conditions"]
+            .as_array()
             .expect("conditions must be an array");
         // Merge-patch replaces the array entirely with the patch value.
-        assert_eq!(conditions.len(), 3,
-            "conditions array must reflect the full patch (merge-patch replaces arrays)");
-        let ready = conditions.iter().find(|c| c["type"] == "Ready")
+        assert_eq!(
+            conditions.len(),
+            3,
+            "conditions array must reflect the full patch (merge-patch replaces arrays)"
+        );
+        let ready = conditions
+            .iter()
+            .find(|c| c["type"] == "Ready")
             .expect("Ready condition must be present");
-        assert_eq!(ready["status"], "True",
-            "Ready condition status must be updated to True");
+        assert_eq!(
+            ready["status"], "True",
+            "Ready condition status must be updated to True"
+        );
         let containers_ready = conditions.iter().find(|c| c["type"] == "ContainersReady");
-        assert!(containers_ready.is_some(),
-            "ContainersReady condition must be added by the patch");
+        assert!(
+            containers_ready.is_some(),
+            "ContainersReady condition must be added by the patch"
+        );
     }
 }
 
@@ -1288,7 +1360,10 @@ pub async fn bind_pod(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
     let binding: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;

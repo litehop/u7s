@@ -66,10 +66,7 @@ impl AppState {
                         let api_key = format!("/apis/{GROUP}/v1/{plural}/{name}");
                         match serde_json::from_slice::<serde_json::Value>(&obj.value) {
                             Ok(val) => self.rbac_index.apply_object(&api_key, &val),
-                            Err(e) => tracing::warn!(
-                                "rbac init: parse error for {}: {e}",
-                                obj.key
-                            ),
+                            Err(e) => tracing::warn!("rbac init: parse error for {}: {e}", obj.key),
                         }
                     }
                 }
@@ -94,19 +91,13 @@ impl AppState {
                                 format!("/apis/{GROUP}/v1/namespaces/{ns}/{plural}/{name}")
                             }
                             None => {
-                                tracing::warn!(
-                                    "rbac init: unexpected key format: {}",
-                                    obj.key
-                                );
+                                tracing::warn!("rbac init: unexpected key format: {}", obj.key);
                                 continue;
                             }
                         };
                         match serde_json::from_slice::<serde_json::Value>(&obj.value) {
                             Ok(val) => self.rbac_index.apply_object(&api_key, &val),
-                            Err(e) => tracing::warn!(
-                                "rbac init: parse error for {}: {e}",
-                                obj.key
-                            ),
+                            Err(e) => tracing::warn!("rbac init: parse error for {}: {e}", obj.key),
                         }
                     }
                 }
@@ -147,51 +138,119 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     let mut m = HashMap::new();
 
     // core/v1 — cluster-scoped
-    m.insert(rk("", "v1", "nodes"),           rm("Node",           false, true));
+    m.insert(rk("", "v1", "nodes"), rm("Node", false, true));
 
     // core/v1 — namespaced
-    m.insert(rk("", "v1", "services"),        rm("Service",        true,  false));
-    m.insert(rk("", "v1", "serviceaccounts"), rm("ServiceAccount", true,  false));
-    m.insert(rk("", "v1", "configmaps"),      rm("ConfigMap",      true,  false));
-    m.insert(rk("", "v1", "secrets"),         rm("Secret",         true,  false));
-    m.insert(rk("", "v1", "events"),          rm_cou("Event",      true));
+    m.insert(rk("", "v1", "services"), rm("Service", true, false));
+    m.insert(
+        rk("", "v1", "serviceaccounts"),
+        rm("ServiceAccount", true, false),
+    );
+    m.insert(rk("", "v1", "configmaps"), rm("ConfigMap", true, false));
+    m.insert(rk("", "v1", "secrets"), rm("Secret", true, false));
+    m.insert(rk("", "v1", "events"), rm_cou("Event", true));
 
     // apps/v1
-    m.insert(rk("apps", "v1", "deployments"),   rm("Deployment",  true,  true));
-    m.insert(rk("apps", "v1", "replicasets"),   rm("ReplicaSet",  true,  true));
-    m.insert(rk("apps", "v1", "statefulsets"),  rm("StatefulSet", true,  true));
+    m.insert(
+        rk("apps", "v1", "deployments"),
+        rm("Deployment", true, true),
+    );
+    m.insert(
+        rk("apps", "v1", "replicasets"),
+        rm("ReplicaSet", true, true),
+    );
+    m.insert(
+        rk("apps", "v1", "statefulsets"),
+        rm("StatefulSet", true, true),
+    );
 
     // rbac.authorization.k8s.io/v1
-    m.insert(rk("rbac.authorization.k8s.io", "v1", "clusterroles"),        rm("ClusterRole",        false, false));
-    m.insert(rk("rbac.authorization.k8s.io", "v1", "clusterrolebindings"), rm("ClusterRoleBinding", false, false));
-    m.insert(rk("rbac.authorization.k8s.io", "v1", "roles"),               rm("Role",               true,  false));
-    m.insert(rk("rbac.authorization.k8s.io", "v1", "rolebindings"),        rm("RoleBinding",        true,  false));
+    m.insert(
+        rk("rbac.authorization.k8s.io", "v1", "clusterroles"),
+        rm("ClusterRole", false, false),
+    );
+    m.insert(
+        rk("rbac.authorization.k8s.io", "v1", "clusterrolebindings"),
+        rm("ClusterRoleBinding", false, false),
+    );
+    m.insert(
+        rk("rbac.authorization.k8s.io", "v1", "roles"),
+        rm("Role", true, false),
+    );
+    m.insert(
+        rk("rbac.authorization.k8s.io", "v1", "rolebindings"),
+        rm("RoleBinding", true, false),
+    );
 
     // networking.k8s.io/v1
-    m.insert(rk("networking.k8s.io", "v1", "networkpolicies"), rm("NetworkPolicy", true,  false));
-    m.insert(rk("networking.k8s.io", "v1", "ingresses"),       rm("Ingress",       true,  true));
-    m.insert(rk("networking.k8s.io", "v1", "ingressclasses"),  rm("IngressClass",  false, false));
+    m.insert(
+        rk("networking.k8s.io", "v1", "networkpolicies"),
+        rm("NetworkPolicy", true, false),
+    );
+    m.insert(
+        rk("networking.k8s.io", "v1", "ingresses"),
+        rm("Ingress", true, true),
+    );
+    m.insert(
+        rk("networking.k8s.io", "v1", "ingressclasses"),
+        rm("IngressClass", false, false),
+    );
 
     // admissionregistration.k8s.io/v1
-    m.insert(rk("admissionregistration.k8s.io", "v1", "validatingwebhookconfigurations"), rm("ValidatingWebhookConfiguration", false, false));
-    m.insert(rk("admissionregistration.k8s.io", "v1", "mutatingwebhookconfigurations"),   rm("MutatingWebhookConfiguration",   false, false));
+    m.insert(
+        rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "validatingwebhookconfigurations",
+        ),
+        rm("ValidatingWebhookConfiguration", false, false),
+    );
+    m.insert(
+        rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "mutatingwebhookconfigurations",
+        ),
+        rm("MutatingWebhookConfiguration", false, false),
+    );
 
     // coordination.k8s.io/v1
-    m.insert(rk("coordination.k8s.io", "v1", "leases"), rm("Lease", true, false));
+    m.insert(
+        rk("coordination.k8s.io", "v1", "leases"),
+        rm("Lease", true, false),
+    );
 
     // policy/v1
-    m.insert(rk("policy", "v1", "poddisruptionbudgets"), rm("PodDisruptionBudget", true, false));
+    m.insert(
+        rk("policy", "v1", "poddisruptionbudgets"),
+        rm("PodDisruptionBudget", true, false),
+    );
 
     // storage.k8s.io/v1 — all cluster-scoped
     // kubelet uses create-or-update (PUT) semantics for csinodes
-    m.insert(rk("storage.k8s.io", "v1", "csinodes"),          rm_cou("CSINode",          false));
-    m.insert(rk("storage.k8s.io", "v1", "csidrivers"),        rm("CSIDriver",        false, false));
-    m.insert(rk("storage.k8s.io", "v1", "storageclasses"),    rm("StorageClass",     false, false));
-    m.insert(rk("storage.k8s.io", "v1", "volumeattachments"), rm("VolumeAttachment", false, true));
+    m.insert(
+        rk("storage.k8s.io", "v1", "csinodes"),
+        rm_cou("CSINode", false),
+    );
+    m.insert(
+        rk("storage.k8s.io", "v1", "csidrivers"),
+        rm("CSIDriver", false, false),
+    );
+    m.insert(
+        rk("storage.k8s.io", "v1", "storageclasses"),
+        rm("StorageClass", false, false),
+    );
+    m.insert(
+        rk("storage.k8s.io", "v1", "volumeattachments"),
+        rm("VolumeAttachment", false, true),
+    );
 
     // node.k8s.io/v1 — cluster-scoped
     // kubelet lists runtimeclasses on startup; serve as empty collection to stop the error loop.
-    m.insert(rk("node.k8s.io", "v1", "runtimeclasses"), rm("RuntimeClass", false, false));
+    m.insert(
+        rk("node.k8s.io", "v1", "runtimeclasses"),
+        rm("RuntimeClass", false, false),
+    );
 
     m
 }
@@ -204,10 +263,15 @@ mod tests {
     fn csinodes_registered_as_cluster_scoped_create_or_update() {
         let registry = build_registry();
         let key = rk("storage.k8s.io", "v1", "csinodes");
-        let meta = registry.get(&key).expect("csinodes must be in build_registry");
+        let meta = registry
+            .get(&key)
+            .expect("csinodes must be in build_registry");
         // kubelet PUTs CSINode on every boot; create_or_update must be true so the
         // handler doesn't reject the request when the object already exists.
-        assert!(meta.create_or_update, "csinodes must have create_or_update=true");
+        assert!(
+            meta.create_or_update,
+            "csinodes must have create_or_update=true"
+        );
         assert!(!meta.namespaced, "csinodes is cluster-scoped");
     }
 
@@ -219,16 +283,11 @@ mod tests {
     }
 
     // Helper: mirrors the namespaced key-to-api-path transformation used in init().
-    fn namespaced_key_to_api_path(
-        group: &str,
-        plural: &str,
-        store_key: &str,
-    ) -> Option<String> {
+    fn namespaced_key_to_api_path(group: &str, plural: &str, store_key: &str) -> Option<String> {
         let prefix = format!("/registry/{group}/{plural}/");
         let rest = store_key.strip_prefix(prefix.as_str()).unwrap_or(store_key);
-        rest.split_once('/').map(|(ns, name)| {
-            format!("/apis/{group}/v1/namespaces/{ns}/{plural}/{name}")
-        })
+        rest.split_once('/')
+            .map(|(ns, name)| format!("/apis/{group}/v1/namespaces/{ns}/{plural}/{name}"))
     }
 
     const GROUP: &str = "rbac.authorization.k8s.io";
@@ -253,9 +312,8 @@ mod tests {
         // path of /apis/<group>/v1/namespaces/<ns>/rolebindings/<name> so namespaced
         // RBAC policies are indexed under the right key at startup.
         let store_key = format!("/registry/{GROUP}/rolebindings/kube-system/my-binding");
-        let api_path =
-            namespaced_key_to_api_path(GROUP, "rolebindings", &store_key)
-                .expect("valid namespaced key must produce Some");
+        let api_path = namespaced_key_to_api_path(GROUP, "rolebindings", &store_key)
+            .expect("valid namespaced key must produce Some");
         assert_eq!(
             api_path,
             format!("/apis/{GROUP}/v1/namespaces/kube-system/rolebindings/my-binding"),
@@ -274,7 +332,8 @@ mod tests {
         let doubled = format!("{prefix}{prefix}");
         let name = doubled.strip_prefix(prefix.as_str()).unwrap_or(&doubled);
         assert_eq!(
-            name, prefix.as_str(),
+            name,
+            prefix.as_str(),
             "strip_prefix must strip exactly one prefix occurrence, not recursively"
         );
     }
@@ -286,9 +345,14 @@ mod tests {
     fn ingressclass_registered_as_cluster_scoped() {
         let registry = build_registry();
         let key = rk("networking.k8s.io", "v1", "ingressclasses");
-        let meta = registry.get(&key).expect("ingressclasses must be in build_registry");
+        let meta = registry
+            .get(&key)
+            .expect("ingressclasses must be in build_registry");
         assert!(!meta.namespaced, "IngressClass is cluster-scoped");
-        assert!(!meta.has_status_subresource, "IngressClass has no status subresource");
+        assert!(
+            !meta.has_status_subresource,
+            "IngressClass has no status subresource"
+        );
         assert_eq!(meta.kind, "IngressClass");
     }
 
@@ -299,7 +363,9 @@ mod tests {
     fn runtimeclasses_registered_as_cluster_scoped() {
         let registry = build_registry();
         let key = rk("node.k8s.io", "v1", "runtimeclasses");
-        let meta = registry.get(&key).expect("runtimeclasses must be in build_registry");
+        let meta = registry
+            .get(&key)
+            .expect("runtimeclasses must be in build_registry");
         assert!(!meta.namespaced, "runtimeclasses is cluster-scoped");
         assert_eq!(meta.kind, "RuntimeClass");
     }

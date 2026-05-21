@@ -24,7 +24,10 @@ fn validate_namespace_name(name: &str) -> Result<(), crate::status::StatusError>
             "invalid namespace name '{name}': must be 1–63 characters"
         )));
     }
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         return Err(Status::unprocessable_entity(format!(
             "invalid namespace name '{name}': must match [a-z0-9-]+"
         )));
@@ -42,7 +45,6 @@ fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusErro
         other => Status::internal(other.to_string()),
     }
 }
-
 
 pub async fn list_namespaces(
     State(state): State<AppState>,
@@ -90,7 +92,10 @@ pub async fn create_namespace(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     // Decode the request body. When kubectl sends Content-Type:
     // application/vnd.kubernetes.protobuf, the body is a k8s Unknown envelope. For core types
     // like Namespace, Unknown.raw is proto-encoded (contentType = protobuf), not JSON. We decode
@@ -121,8 +126,7 @@ pub async fn create_namespace(
             }
         }
     } else {
-        Object::from_bytes(&body)
-            .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?
     };
 
     let name = {
@@ -131,7 +135,9 @@ pub async fn create_namespace(
             None => {
                 let gen = obj.body["metadata"]["generateName"].as_str().unwrap_or("");
                 if gen.is_empty() {
-                    return Err(Status::bad_request("metadata.name or metadata.generateName is required".into()));
+                    return Err(Status::bad_request(
+                        "metadata.name or metadata.generateName is required".into(),
+                    ));
                 }
                 let generated = format!("{}{}", gen, crate::handlers::generic::generate_suffix());
                 obj.body["metadata"]["name"] = serde_json::Value::String(generated.clone());
@@ -191,10 +197,13 @@ pub async fn replace_namespace(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
-    let mut obj = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let obj_name = obj.name().unwrap_or("").to_string();
     if obj_name != name {
@@ -245,8 +254,8 @@ pub async fn patch_namespace(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     crate::patch::merge_patch(&mut current.body, &patch);
 
@@ -318,12 +327,18 @@ mod tests {
     // a watch on /api/v1/namespaces actually receive a streaming response.
     #[tokio::test]
     async fn list_namespaces_watch_returns_chunked_stream() {
+        use crate::state::AppState;
         use std::sync::Arc;
         use u7s_store::SqliteStore;
-        use crate::state::AppState;
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(store, None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
 
         let query = crate::handlers::generic::CollectionQuery {
             watch: Some(true),
@@ -343,7 +358,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // watch_generic always sets transfer-encoding: chunked
         assert_eq!(
-            resp.headers().get("transfer-encoding").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("transfer-encoding")
+                .and_then(|v| v.to_str().ok()),
             Some("chunked"),
             "watch response must use chunked transfer encoding"
         );

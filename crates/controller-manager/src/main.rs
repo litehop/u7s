@@ -26,7 +26,10 @@ use tracing::{error, info, warn};
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "u7s-controller-manager", about = "Minimal u7s controller manager")]
+#[command(
+    name = "u7s-controller-manager",
+    about = "Minimal u7s controller manager"
+)]
 struct Args {
     /// Path to kubeconfig file.
     #[arg(long, default_value = "./kubeconfig")]
@@ -53,12 +56,11 @@ struct ClientCreds {
 }
 
 fn parse_kubeconfig(path: &str) -> anyhow::Result<ClientCreds> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("reading kubeconfig {path}"))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading kubeconfig {path}"))?;
     let b64 = base64::engine::general_purpose::STANDARD;
 
-    let server = extract_yaml_value(&raw, "server:")
-        .context("kubeconfig: missing server")?;
+    let server = extract_yaml_value(&raw, "server:").context("kubeconfig: missing server")?;
     let ca_data = extract_yaml_value(&raw, "certificate-authority-data:")
         .context("kubeconfig: missing certificate-authority-data")?;
     let cert_data = extract_yaml_value(&raw, "client-certificate-data:")
@@ -98,7 +100,9 @@ fn extract_yaml_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 fn build_tls_connector(creds: &ClientCreds) -> anyhow::Result<TlsConnector> {
     use rustls::ClientConfig;
     let mut root_store = rustls::RootCertStore::empty();
-    root_store.add(creds.ca_cert.clone()).context("add CA cert")?;
+    root_store
+        .add(creds.ca_cert.clone())
+        .context("add CA cert")?;
     let config = ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_client_auth_cert(
@@ -129,7 +133,10 @@ async fn send_request(
         .await
         .with_context(|| format!("TCP connect {host}:{port}"))?;
     let server_name = host.clone().try_into().context("invalid DNS name")?;
-    let tls = connector.connect(server_name, stream).await.context("TLS")?;
+    let tls = connector
+        .connect(server_name, stream)
+        .await
+        .context("TLS")?;
     let io = TokioIo::new(tls);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -166,7 +173,12 @@ async fn send_request(
     let status = resp.status();
     use http_body_util::BodyExt;
     let text = String::from_utf8_lossy(
-        &resp.into_body().collect().await.context("read body")?.to_bytes(),
+        &resp
+            .into_body()
+            .collect()
+            .await
+            .context("read body")?
+            .to_bytes(),
     )
     .into_owned();
     Ok((status, text))
@@ -232,7 +244,10 @@ async fn stream_watch_events(
         .await
         .with_context(|| format!("TCP connect {host}:{port}"))?;
     let server_name = host.clone().try_into().context("invalid DNS name")?;
-    let tls = connector.connect(server_name, stream).await.context("TLS")?;
+    let tls = connector
+        .connect(server_name, stream)
+        .await
+        .context("TLS")?;
     let io = TokioIo::new(tls);
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
         .await
@@ -306,16 +321,13 @@ async fn provision_sa(
     bearer: Option<&str>,
 ) -> anyhow::Result<()> {
     // 1. Mint a JWT.
-    let token_path = format!(
-        "/api/v1/namespaces/{namespace}/serviceaccounts/{sa_name}/token"
-    );
+    let token_path = format!("/api/v1/namespaces/{namespace}/serviceaccounts/{sa_name}/token");
     let token_req = serde_json::json!({
         "apiVersion": "authentication.k8s.io/v1",
         "kind": "TokenRequest",
         "spec": { "expirationSeconds": 3600 }
     });
-    let (status, body) =
-        http_post_json(connector, server, &token_path, &token_req, bearer).await?;
+    let (status, body) = http_post_json(connector, server, &token_path, &token_req, bearer).await?;
     if !status.is_success() {
         bail!("TokenRequest for {namespace}/{sa_name} failed ({status}): {body}");
     }
@@ -338,9 +350,7 @@ async fn provision_sa(
         // Secret already exists — idempotent, not an error.
         info!("token secret for {namespace}/{sa_name} already exists, skipping");
     } else {
-        warn!(
-            "failed to create token secret for {namespace}/{sa_name} ({status}): {body}"
-        );
+        warn!("failed to create token secret for {namespace}/{sa_name} ({status}): {body}");
     }
     Ok(())
 }
@@ -353,8 +363,7 @@ async fn provision_sa(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 

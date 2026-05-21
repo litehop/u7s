@@ -1,11 +1,10 @@
 use anyhow::Result;
 use rmcp::{
-    ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ServerInfo},
-    schemars,
-    tool, tool_router,
+    schemars, tool, tool_router,
     transport::stdio,
+    ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 use std::process::Command;
@@ -41,7 +40,9 @@ impl U7sTools {
     }
 
     /// Run cargo check --workspace and return structured diagnostics as a JSON array.
-    #[tool(description = "Run cargo check --workspace and return structured diagnostics. Each item: {file, line, col, severity, message}.")]
+    #[tool(
+        description = "Run cargo check --workspace and return structured diagnostics. Each item: {file, line, col, severity, message}."
+    )]
     async fn get_diagnostics(
         &self,
         Parameters(p): Parameters<DiagnosticsParams>,
@@ -102,7 +103,9 @@ impl U7sTools {
     }
 
     /// Show full details of a bead issue by ID.
-    #[tool(description = "Show full details of a bead by ID (e.g. 'mayor-4z5'). Returns JSON with title, description, priority, status, notes.")]
+    #[tool(
+        description = "Show full details of a bead by ID (e.g. 'mayor-4z5'). Returns JSON with title, description, priority, status, notes."
+    )]
     async fn bd_show(
         &self,
         Parameters(p): Parameters<BdShowParams>,

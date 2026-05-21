@@ -302,8 +302,11 @@ mod tests {
         let resp = svc.call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("body must be valid JSON");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must be valid JSON");
 
         assert_eq!(json["apiVersion"], "v1");
         assert_eq!(json["kind"], "Status");

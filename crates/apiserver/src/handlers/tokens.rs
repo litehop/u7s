@@ -211,7 +211,10 @@ mod tests {
     fn unix_now_is_recent() {
         let now = unix_now();
         // 2024-01-01T00:00:00Z
-        assert!(now > 1_704_067_200, "unix_now() returned implausibly old timestamp: {now}");
+        assert!(
+            now > 1_704_067_200,
+            "unix_now() returned implausibly old timestamp: {now}"
+        );
     }
 
     /// JWT claims serialise with the correct field names, including the
@@ -239,7 +242,10 @@ mod tests {
         assert_eq!(v["sub"], "system:serviceaccount:default:my-sa");
         assert!(v["aud"].is_array());
         // The renamed field must appear as "kubernetes.io"
-        assert!(v["kubernetes.io"].is_object(), "kubernetes.io claim must be present");
+        assert!(
+            v["kubernetes.io"].is_object(),
+            "kubernetes.io claim must be present"
+        );
         assert_eq!(v["kubernetes.io"]["namespace"], "default");
         assert_eq!(v["kubernetes.io"]["serviceaccount"]["name"], "my-sa");
     }

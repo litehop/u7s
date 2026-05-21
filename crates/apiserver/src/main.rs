@@ -13,11 +13,14 @@ mod util;
 
 use std::sync::Arc;
 
-use axum::{Router, routing::{get, post}};
-use tower_service::Service;
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use tower_service::Service;
 use u7s_store::SqliteStore;
 
 use auth::{AuthLayer, PeerCertificate};
@@ -101,21 +104,28 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 7. Load or generate the SA signing key.
-    let (sa_encoding_key, sa_decoding_key) = match load_or_generate_sa_keys(&args.sa_key, &args.sa_pub) {
-        Ok(sa_keys) => {
-            let enc = jsonwebtoken::EncodingKey::from_rsa_pem(&sa_keys.private_key_pem)
-                .map_err(|e| { tracing::error!("failed to load SA signing key: {e}"); e })
-                .ok();
-            let dec = jsonwebtoken::DecodingKey::from_rsa_pem(&sa_keys.public_key_pem)
-                .map_err(|e| { tracing::error!("failed to load SA public key: {e}"); e })
-                .ok();
-            (enc, dec)
-        }
-        Err(e) => {
-            tracing::error!("SA key gen/load failed: {e}");
-            (None, None)
-        }
-    };
+    let (sa_encoding_key, sa_decoding_key) =
+        match load_or_generate_sa_keys(&args.sa_key, &args.sa_pub) {
+            Ok(sa_keys) => {
+                let enc = jsonwebtoken::EncodingKey::from_rsa_pem(&sa_keys.private_key_pem)
+                    .map_err(|e| {
+                        tracing::error!("failed to load SA signing key: {e}");
+                        e
+                    })
+                    .ok();
+                let dec = jsonwebtoken::DecodingKey::from_rsa_pem(&sa_keys.public_key_pem)
+                    .map_err(|e| {
+                        tracing::error!("failed to load SA public key: {e}");
+                        e
+                    })
+                    .ok();
+                (enc, dec)
+            }
+            Err(e) => {
+                tracing::error!("SA key gen/load failed: {e}");
+                (None, None)
+            }
+        };
 
     // 8. Compute advertised server address.
     let server_address = match args.advertise_address {
@@ -133,7 +143,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("advertised server address: {server_address}");
 
     // 9. Build app state (shared with the auth layer).
-    let state = AppState::new(Arc::clone(&store), sa_encoding_key, sa_decoding_key, token_map, server_address);
+    let state = AppState::new(
+        Arc::clone(&store),
+        sa_encoding_key,
+        sa_decoding_key,
+        token_map,
+        server_address,
+    );
 
     // 9a. Populate RBAC index from persisted objects before serving.
     state.init().await;
@@ -158,21 +174,20 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         // Server version — no auth required (sonobuoy, kubectl version)
         .route("/version", get(handlers::discovery::version))
-
         // Core discovery
-        .route("/api",    get(handlers::discovery::api_versions))
+        .route("/api", get(handlers::discovery::api_versions))
         .route("/api/v1", get(handlers::discovery::api_v1_resources))
-
         // Non-core group discovery
-        .route("/apis",                    get(handlers::discovery::api_group_list))
-        .route("/apis/{group}/{version}",    get(handlers::discovery::api_group_resources))
-
+        .route("/apis", get(handlers::discovery::api_group_list))
+        .route(
+            "/apis/{group}/{version}",
+            get(handlers::discovery::api_group_resources),
+        )
         // Namespaces — collection
         .route(
             "/api/v1/namespaces",
             get(handlers::namespaces::list_namespaces).post(handlers::namespaces::create_namespace),
         )
-
         // Namespaces — named resource
         .route(
             "/api/v1/namespaces/{name}",
@@ -181,13 +196,11 @@ fn build_router(state: AppState) -> Router {
                 .patch(handlers::namespaces::patch_namespace)
                 .delete(handlers::namespaces::delete_namespace),
         )
-
         // Pods — collection
         .route(
             "/api/v1/namespaces/{ns}/pods",
             get(handlers::pods::list_pods).post(handlers::pods::create_pod),
         )
-
         // Pods — named resource
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}",
@@ -196,13 +209,11 @@ fn build_router(state: AppState) -> Router {
                 .delete(handlers::pods::delete_pod)
                 .patch(handlers::pods::patch_pod),
         )
-
         // Pods — binding subresource (scheduler write path)
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/binding",
             axum::routing::post(handlers::pods::bind_pod),
         )
-
         // Pods — status subresource
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/status",
@@ -210,14 +221,12 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::pods::replace_pod_status)
                 .patch(handlers::pods::patch_pod_status),
         )
-
         // Core group (group="", apiVersion=v1) — cluster-scoped resources (e.g. nodes)
         .route(
             "/api/v1/{resource}",
             get(handlers::generic::core_list_resource)
                 .post(handlers::generic::core_create_resource),
         )
-
         // Core group — cluster-scoped named resource
         .route(
             "/api/v1/{resource}/{name}",
@@ -226,7 +235,6 @@ fn build_router(state: AppState) -> Router {
                 .delete(handlers::generic::core_delete_resource)
                 .patch(handlers::generic::core_patch_resource),
         )
-
         // Core group — cluster-scoped status subresource
         .route(
             "/api/v1/{resource}/{name}/status",
@@ -234,14 +242,12 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::generic::core_put_resource_status)
                 .patch(handlers::generic::core_patch_resource_status),
         )
-
         // Core group — namespaced resources collection (e.g. services, configmaps)
         .route(
             "/api/v1/namespaces/{ns}/{resource}",
             get(handlers::generic::core_list_namespaced_resource)
                 .post(handlers::generic::core_create_namespaced_resource),
         )
-
         // Core group — namespaced named resource
         .route(
             "/api/v1/namespaces/{ns}/{resource}/{name}",
@@ -250,7 +256,6 @@ fn build_router(state: AppState) -> Router {
                 .delete(handlers::generic::core_delete_namespaced_resource)
                 .patch(handlers::generic::core_patch_namespaced_resource),
         )
-
         // Core group — namespaced status subresource
         .route(
             "/api/v1/namespaces/{ns}/{resource}/{name}/status",
@@ -258,7 +263,6 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::generic::core_put_namespaced_resource_status)
                 .patch(handlers::generic::core_patch_namespaced_resource_status),
         )
-
         // CRDs — cluster-scoped, specific paths before generic catch-all
         .route(
             "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
@@ -270,7 +274,6 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::crd::replace_crd)
                 .delete(handlers::crd::delete_crd),
         )
-
         // Authorization reviews (specific paths before generic catch-all)
         .route(
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
@@ -288,20 +291,16 @@ fn build_router(state: AppState) -> Router {
             "/apis/authentication.k8s.io/v1/tokenreviews",
             post(handlers::authorization::token_review),
         )
-
         // ServiceAccounts — token subresource (TokenRequest API)
         .route(
             "/api/v1/namespaces/{ns}/serviceaccounts/{name}/token",
             axum::routing::post(handlers::tokens::create_token),
         )
-
         // Generic cluster-scoped resources — collection
         .route(
             "/apis/{group}/{version}/{resource}",
-            get(handlers::generic::list_resource)
-                .post(handlers::generic::create_resource),
+            get(handlers::generic::list_resource).post(handlers::generic::create_resource),
         )
-
         // Generic cluster-scoped resources — named
         .route(
             "/apis/{group}/{version}/{resource}/{name}",
@@ -310,14 +309,12 @@ fn build_router(state: AppState) -> Router {
                 .delete(handlers::generic::delete_resource)
                 .patch(handlers::generic::patch_resource),
         )
-
         // Generic namespaced resources — collection
         .route(
             "/apis/{group}/{version}/namespaces/{ns}/{resource}",
             get(handlers::generic::list_namespaced_resource)
                 .post(handlers::generic::create_namespaced_resource),
         )
-
         // Scale subresource — apps/v1 workloads (deployments, replicasets, statefulsets)
         // Must be registered before the generic namespaced named-resource catch-all.
         .route(
@@ -326,7 +323,6 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::scale::put_scale)
                 .patch(handlers::scale::patch_scale),
         )
-
         // Generic namespaced resources — named
         .route(
             "/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}",
@@ -335,7 +331,6 @@ fn build_router(state: AppState) -> Router {
                 .delete(handlers::generic::delete_namespaced_resource)
                 .patch(handlers::generic::patch_namespaced_resource),
         )
-
         // Generic cluster-scoped — status subresource
         .route(
             "/apis/{group}/{version}/{resource}/{name}/status",
@@ -343,7 +338,6 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::generic::put_resource_status)
                 .patch(handlers::generic::patch_resource_status),
         )
-
         // Generic namespaced — status subresource
         .route(
             "/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}/status",
@@ -351,7 +345,6 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::generic::put_namespaced_resource_status)
                 .patch(handlers::generic::patch_namespaced_resource_status),
         )
-
         .with_state(state)
 }
 
@@ -360,10 +353,10 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
     use u7s_store::Store;
     // Static UIDs — no uuid crate needed.
     const NS: &[(&str, &str)] = &[
-        ("default",          "00000000-0000-0000-0000-000000000001"),
-        ("kube-system",      "00000000-0000-0000-0000-000000000002"),
-        ("kube-node-lease",  "00000000-0000-0000-0000-000000000003"),
-        ("kube-public",      "00000000-0000-0000-0000-000000000004"),
+        ("default", "00000000-0000-0000-0000-000000000001"),
+        ("kube-system", "00000000-0000-0000-0000-000000000002"),
+        ("kube-node-lease", "00000000-0000-0000-0000-000000000003"),
+        ("kube-public", "00000000-0000-0000-0000-000000000004"),
     ];
     for (name, uid) in NS {
         let key = keys::cluster_object_key("namespaces", name);
@@ -416,7 +409,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] }
         ]
     });
-    store.put(&cr_key, Bytes::from(cr_body.to_string()), None).await
+    store
+        .put(&cr_key, Bytes::from(cr_body.to_string()), None)
+        .await
         .map_err(|e| anyhow::anyhow!("seed ClusterRole system:node: {e}"))?;
     tracing::info!("seeded ClusterRole: system:node");
 
@@ -429,7 +424,9 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:nodes" }],
         "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:node" }
     });
-    store.put(&crb_key, Bytes::from(crb_body.to_string()), None).await
+    store
+        .put(&crb_key, Bytes::from(crb_body.to_string()), None)
+        .await
         .map_err(|e| anyhow::anyhow!("seed ClusterRoleBinding system:node: {e}"))?;
     tracing::info!("seeded ClusterRoleBinding: system:node");
 
@@ -460,7 +457,10 @@ async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
             "type": "ClusterIP"
         }
     });
-    match store.put(&k8s_key, Bytes::from(k8s_body.to_string()), Some(0)).await {
+    match store
+        .put(&k8s_key, Bytes::from(k8s_body.to_string()), Some(0))
+        .await
+    {
         Ok(_) => tracing::info!("seeded Service: default/kubernetes"),
         Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
         Err(e) => return Err(anyhow::anyhow!("seed Service default/kubernetes: {e}")),
@@ -489,7 +489,10 @@ async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
             "type": "ClusterIP"
         }
     });
-    match store.put(&dns_key, Bytes::from(dns_body.to_string()), Some(0)).await {
+    match store
+        .put(&dns_key, Bytes::from(dns_body.to_string()), Some(0))
+        .await
+    {
         Ok(_) => tracing::info!("seeded Service: kube-system/kube-dns"),
         Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
         Err(e) => return Err(anyhow::anyhow!("seed Service kube-system/kube-dns: {e}")),
@@ -514,7 +517,10 @@ async fn serve_tls(
         tokio::spawn(async move {
             let tls_stream = match acceptor.accept(tcp_stream).await {
                 Ok(s) => s,
-                Err(e) => { tracing::warn!("TLS accept error: {e}"); return; }
+                Err(e) => {
+                    tracing::warn!("TLS accept error: {e}");
+                    return;
+                }
             };
 
             // Extract the peer certificate once per connection, then share it
@@ -552,7 +558,7 @@ async fn serve_tls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use u7s_store::{Store, SqliteStore};
+    use u7s_store::{SqliteStore, Store};
 
     fn make_store() -> SqliteStore {
         SqliteStore::new(":memory:").expect("open in-memory db")
@@ -567,10 +573,7 @@ mod tests {
         for name in ["default", "kube-system", "kube-node-lease", "kube-public"] {
             let key = keys::cluster_object_key("namespaces", name);
             let obj = store.get(&key).await.expect("get must not fail");
-            assert!(
-                obj.is_some(),
-                "namespace '{name}' must exist after seeding"
-            );
+            assert!(obj.is_some(), "namespace '{name}' must exist after seeding");
             let parsed: serde_json::Value =
                 serde_json::from_slice(&obj.unwrap().value).expect("valid json");
             assert_eq!(parsed["kind"].as_str(), Some("Namespace"));
@@ -583,8 +586,12 @@ mod tests {
     async fn seed_namespaces_is_idempotent() {
         // A second call must not error — CAS rv=0 returns AlreadyExists which is silently ignored.
         let store = make_store();
-        seed_namespaces(&store).await.expect("first seed must not fail");
-        seed_namespaces(&store).await.expect("second seed must not fail");
+        seed_namespaces(&store)
+            .await
+            .expect("first seed must not fail");
+        seed_namespaces(&store)
+            .await
+            .expect("second seed must not fail");
     }
 
     #[tokio::test]
@@ -601,7 +608,10 @@ mod tests {
         // ClusterRole must exist and have the expected structure.
         let cr_key = keys::group_object_key(GROUP, "clusterroles", None, "system:node");
         let cr_obj = store.get(&cr_key).await.expect("get must not fail");
-        assert!(cr_obj.is_some(), "ClusterRole system:node must exist after seeding");
+        assert!(
+            cr_obj.is_some(),
+            "ClusterRole system:node must exist after seeding"
+        );
         let cr: serde_json::Value =
             serde_json::from_slice(&cr_obj.unwrap().value).expect("valid json");
         assert_eq!(cr["kind"].as_str(), Some("ClusterRole"));
@@ -616,14 +626,28 @@ mod tests {
         // surfaces as "invalid JSON: expected value at line 1 column 1".
         let rules = cr["rules"].as_array().expect("rules must be an array");
         assert!(!rules.is_empty(), "ClusterRole must have at least one rule");
-        let resources: Vec<String> = rules.iter()
+        let resources: Vec<String> = rules
+            .iter()
             .flat_map(|r| {
-                r["resources"].as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<Vec<_>>())
+                r["resources"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default()
             })
             .collect();
-        for expected in ["nodes", "pods", "events", "configmaps", "secrets", "leases", "csinodes"] {
+        for expected in [
+            "nodes",
+            "pods",
+            "events",
+            "configmaps",
+            "secrets",
+            "leases",
+            "csinodes",
+        ] {
             assert!(
                 resources.iter().any(|r| r == expected),
                 "ClusterRole rules must cover resource '{expected}'"
@@ -633,7 +657,10 @@ mod tests {
         // ClusterRoleBinding must exist and bind system:nodes group.
         let crb_key = keys::group_object_key(GROUP, "clusterrolebindings", None, "system:node");
         let crb_obj = store.get(&crb_key).await.expect("get must not fail");
-        assert!(crb_obj.is_some(), "ClusterRoleBinding system:node must exist after seeding");
+        assert!(
+            crb_obj.is_some(),
+            "ClusterRoleBinding system:node must exist after seeding"
+        );
         let crb: serde_json::Value =
             serde_json::from_slice(&crb_obj.unwrap().value).expect("valid json");
         assert_eq!(crb["kind"].as_str(), Some("ClusterRoleBinding"));
@@ -643,7 +670,9 @@ mod tests {
             !crb["metadata"]["creationTimestamp"].is_null(),
             "ClusterRoleBinding metadata must contain a non-null creationTimestamp"
         );
-        let subjects = crb["subjects"].as_array().expect("subjects must be an array");
+        let subjects = crb["subjects"]
+            .as_array()
+            .expect("subjects must be an array");
         assert_eq!(subjects.len(), 1, "must have exactly one subject");
         assert_eq!(subjects[0]["kind"].as_str(), Some("Group"));
         assert_eq!(subjects[0]["name"].as_str(), Some("system:nodes"));
@@ -666,21 +695,32 @@ mod tests {
         //   - kube-system/kube-dns: kubelet advertises 10.96.0.10 as the nameserver in /etc/resolv.conf
         // Without them, any in-pod API call or DNS lookup fails.
         let store = make_store();
-        seed_namespaces(&store).await.expect("namespaces must be seeded first");
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
         seed_services(&store).await.expect("seed must not fail");
 
         // Verify default/kubernetes Service.
         let k8s_key = keys::object_key("services", "default", "kubernetes");
         let k8s_obj = store.get(&k8s_key).await.expect("get must not fail");
-        assert!(k8s_obj.is_some(), "Service default/kubernetes must exist after seeding");
+        assert!(
+            k8s_obj.is_some(),
+            "Service default/kubernetes must exist after seeding"
+        );
         let k8s: serde_json::Value =
             serde_json::from_slice(&k8s_obj.unwrap().value).expect("valid json");
         assert_eq!(k8s["kind"].as_str(), Some("Service"));
         assert_eq!(k8s["metadata"]["name"].as_str(), Some("kubernetes"));
         assert_eq!(k8s["metadata"]["namespace"].as_str(), Some("default"));
         assert_eq!(k8s["spec"]["clusterIP"].as_str(), Some("10.96.0.1"));
-        let k8s_ports = k8s["spec"]["ports"].as_array().expect("ports must be an array");
-        assert_eq!(k8s_ports.len(), 1, "kubernetes Service must have exactly one port");
+        let k8s_ports = k8s["spec"]["ports"]
+            .as_array()
+            .expect("ports must be an array");
+        assert_eq!(
+            k8s_ports.len(),
+            1,
+            "kubernetes Service must have exactly one port"
+        );
         assert_eq!(k8s_ports[0]["port"].as_u64(), Some(443));
         assert_eq!(k8s_ports[0]["targetPort"].as_u64(), Some(6443));
         assert_eq!(k8s_ports[0]["protocol"].as_str(), Some("TCP"));
@@ -688,22 +728,36 @@ mod tests {
         // Verify kube-system/kube-dns Service.
         let dns_key = keys::object_key("services", "kube-system", "kube-dns");
         let dns_obj = store.get(&dns_key).await.expect("get must not fail");
-        assert!(dns_obj.is_some(), "Service kube-system/kube-dns must exist after seeding");
+        assert!(
+            dns_obj.is_some(),
+            "Service kube-system/kube-dns must exist after seeding"
+        );
         let dns: serde_json::Value =
             serde_json::from_slice(&dns_obj.unwrap().value).expect("valid json");
         assert_eq!(dns["kind"].as_str(), Some("Service"));
         assert_eq!(dns["metadata"]["name"].as_str(), Some("kube-dns"));
         assert_eq!(dns["metadata"]["namespace"].as_str(), Some("kube-system"));
         assert_eq!(dns["spec"]["clusterIP"].as_str(), Some("10.96.0.10"));
-        let dns_ports = dns["spec"]["ports"].as_array().expect("ports must be an array");
-        assert_eq!(dns_ports.len(), 2, "kube-dns Service must have two ports (UDP and TCP)");
-        let protocols: Vec<&str> = dns_ports.iter()
+        let dns_ports = dns["spec"]["ports"]
+            .as_array()
+            .expect("ports must be an array");
+        assert_eq!(
+            dns_ports.len(),
+            2,
+            "kube-dns Service must have two ports (UDP and TCP)"
+        );
+        let protocols: Vec<&str> = dns_ports
+            .iter()
             .filter_map(|p| p["protocol"].as_str())
             .collect();
         assert!(protocols.contains(&"UDP"), "kube-dns must have a UDP port");
         assert!(protocols.contains(&"TCP"), "kube-dns must have a TCP port");
         for port in dns_ports {
-            assert_eq!(port["port"].as_u64(), Some(53), "kube-dns port number must be 53");
+            assert_eq!(
+                port["port"].as_u64(),
+                Some(53),
+                "kube-dns port number must be 53"
+            );
         }
     }
 
@@ -712,16 +766,28 @@ mod tests {
         // A second call must not error — CAS rv=0 returns AlreadyExists which is silently ignored.
         // This matches the startup guarantee: u7s may restart against an existing database.
         let store = make_store();
-        seed_namespaces(&store).await.expect("namespaces must be seeded first");
-        seed_services(&store).await.expect("first seed must not fail");
-        seed_services(&store).await.expect("second seed must not fail");
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
+        seed_services(&store)
+            .await
+            .expect("first seed must not fail");
+        seed_services(&store)
+            .await
+            .expect("second seed must not fail");
 
         // Data must still be correct after two calls.
         let k8s_key = keys::object_key("services", "default", "kubernetes");
         let k8s_obj = store.get(&k8s_key).await.expect("get must not fail");
-        assert!(k8s_obj.is_some(), "Service default/kubernetes must still exist");
+        assert!(
+            k8s_obj.is_some(),
+            "Service default/kubernetes must still exist"
+        );
         let dns_key = keys::object_key("services", "kube-system", "kube-dns");
         let dns_obj = store.get(&dns_key).await.expect("get must not fail");
-        assert!(dns_obj.is_some(), "Service kube-system/kube-dns must still exist");
+        assert!(
+            dns_obj.is_some(),
+            "Service kube-system/kube-dns must still exist"
+        );
     }
 }

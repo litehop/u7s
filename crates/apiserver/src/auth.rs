@@ -77,7 +77,10 @@ pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> 
         }
         let parts: Vec<&str> = line.splitn(4, ',').collect();
         if parts.len() < 3 {
-            tracing::warn!("token-auth-file line {}: too few fields, skipping", lineno + 1);
+            tracing::warn!(
+                "token-auth-file line {}: too few fields, skipping",
+                lineno + 1
+            );
             continue;
         }
         let token = parts[0].to_owned();
@@ -89,7 +92,14 @@ pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> 
             vec![]
         };
 
-        map.insert(token, UserInfo { username, uid, groups });
+        map.insert(
+            token,
+            UserInfo {
+                username,
+                uid,
+                groups,
+            },
+        );
     }
 
     Ok(map)
@@ -160,8 +170,8 @@ fn authenticate(
 /// The certificate is assumed to already be verified (rustls checked the
 /// signature and chain during TLS handshake).
 pub fn try_verify_client_cert(der: &[u8]) -> Option<UserInfo> {
-    use x509_cert::Certificate;
     use x509_cert::der::Decode as _;
+    use x509_cert::Certificate;
 
     let cert = Certificate::from_der(der)
         .map_err(|e| tracing::debug!("x509 cert parse failed: {e}"))
@@ -176,7 +186,7 @@ pub fn try_verify_client_cert(der: &[u8]) -> Option<UserInfo> {
     //   CN (CommonName)       = 2.5.4.3
     //   O  (OrganizationName) = 2.5.4.10
     const OID_CN: &str = "2.5.4.3";
-    const OID_O: &str  = "2.5.4.10";
+    const OID_O: &str = "2.5.4.10";
 
     for rdn in subject.0.iter() {
         for atv in rdn.0.iter() {
@@ -213,21 +223,18 @@ fn atv_string(value: &x509_cert::der::Any) -> Option<String> {
     use x509_cert::der::{Tag, Tagged as _};
 
     match value.tag() {
-        Tag::Utf8String => {
-            value.decode_as::<x509_cert::der::asn1::Utf8StringRef<'_>>()
-                .ok()
-                .map(|s| s.as_str().to_owned())
-        }
-        Tag::PrintableString => {
-            value.decode_as::<x509_cert::der::asn1::PrintableStringRef<'_>>()
-                .ok()
-                .map(|s| s.as_str().to_owned())
-        }
-        Tag::Ia5String => {
-            value.decode_as::<x509_cert::der::asn1::Ia5StringRef<'_>>()
-                .ok()
-                .map(|s| s.as_str().to_owned())
-        }
+        Tag::Utf8String => value
+            .decode_as::<x509_cert::der::asn1::Utf8StringRef<'_>>()
+            .ok()
+            .map(|s| s.as_str().to_owned()),
+        Tag::PrintableString => value
+            .decode_as::<x509_cert::der::asn1::PrintableStringRef<'_>>()
+            .ok()
+            .map(|s| s.as_str().to_owned()),
+        Tag::Ia5String => value
+            .decode_as::<x509_cert::der::asn1::Ia5StringRef<'_>>()
+            .ok()
+            .map(|s| s.as_str().to_owned()),
         _ => None,
     }
 }
@@ -284,7 +291,10 @@ fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
 
 /// Paths that skip auth entirely.
 fn is_exempt(path: &str) -> bool {
-    matches!(path, "/healthz" | "/readyz" | "/livez" | "/api" | "/apis" | "/version")
+    matches!(
+        path,
+        "/healthz" | "/readyz" | "/livez" | "/api" | "/apis" | "/version"
+    )
 }
 
 /// HTTP method → RBAC verb.
@@ -355,7 +365,13 @@ fn parse_path(path: &str) -> ParsedPath {
         (None, resource, name, subresource)
     };
 
-    ParsedPath { api_group, resource, subresource, namespace, name }
+    ParsedPath {
+        api_group,
+        resource,
+        subresource,
+        namespace,
+        name,
+    }
 }
 
 fn unknown_path() -> ParsedPath {
@@ -513,9 +529,7 @@ where
             let username = user.username.clone();
             let verb = verb.to_owned();
             let resource = parsed.resource.clone();
-            return Box::pin(async move {
-                Ok(forbidden_response(&username, &verb, &resource))
-            });
+            return Box::pin(async move { Ok(forbidden_response(&username, &verb, &resource)) });
         }
 
         // 3. Attach UserInfo to request extensions and pass through.
@@ -552,9 +566,13 @@ mod tests {
 
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::default();
-        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
         for org in orgs {
-            params.distinguished_name.push(rcgen::DnType::OrganizationName, *org);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::OrganizationName, *org);
         }
         let cert = params.signed_by(&key, &ca_cert, &ca_key).unwrap();
         cert.der().to_vec()
@@ -685,19 +703,23 @@ mod tests {
         use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
         let mut rng = rsa::rand_core::OsRng;
         let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
-        let priv_pem = private_key.to_pkcs8_pem(LineEnding::LF).expect("priv pem").as_bytes().to_vec();
-        let pub_pem = private_key.to_public_key().to_public_key_pem(LineEnding::LF).expect("pub pem").into_bytes();
+        let priv_pem = private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("priv pem")
+            .as_bytes()
+            .to_vec();
+        let pub_pem = private_key
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("pub pem")
+            .into_bytes();
         let enc = jsonwebtoken::EncodingKey::from_rsa_pem(&priv_pem).expect("enc key");
         let dec = jsonwebtoken::DecodingKey::from_rsa_pem(&pub_pem).expect("dec key");
         (enc, dec)
     }
 
     /// Mint a minimal SA JWT using the provided encoding key.
-    fn mint_sa_jwt(
-        enc: &jsonwebtoken::EncodingKey,
-        sub: &str,
-        exp_offset_secs: i64,
-    ) -> String {
+    fn mint_sa_jwt(enc: &jsonwebtoken::EncodingKey, sub: &str, exp_offset_secs: i64) -> String {
         use serde_json::json;
         use std::time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now()
@@ -721,7 +743,11 @@ mod tests {
         // This is the primary fix: SA JWTs are now verified, not rejected.
         let (enc, dec) = test_rsa_keypair();
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
-        let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
+        let req = make_req(
+            Method::GET,
+            "/api/v1/pods",
+            Some(&format!("Bearer {token}")),
+        );
         match authenticate(&req, &HashMap::new(), Some(&dec), None) {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:serviceaccount:default:my-sa");
@@ -742,7 +768,11 @@ mod tests {
         let mut token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
         let len = token.len();
         token.replace_range(len - 8.., "AAAAAAAA");
-        let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
+        let req = make_req(
+            Method::GET,
+            "/api/v1/pods",
+            Some(&format!("Bearer {token}")),
+        );
         match authenticate(&req, &HashMap::new(), Some(&dec), None) {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("tampered JWT must not succeed"),
@@ -754,7 +784,11 @@ mod tests {
         // An expired JWT must be rejected — not silently allowed.
         let (enc, dec) = test_rsa_keypair();
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", -1);
-        let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
+        let req = make_req(
+            Method::GET,
+            "/api/v1/pods",
+            Some(&format!("Bearer {token}")),
+        );
         match authenticate(&req, &HashMap::new(), Some(&dec), None) {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("expired JWT must not succeed"),
@@ -768,7 +802,11 @@ mod tests {
         let (enc, _dec) = test_rsa_keypair();
         let (_enc2, dec2) = test_rsa_keypair();
         let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
-        let req = make_req(Method::GET, "/api/v1/pods", Some(&format!("Bearer {token}")));
+        let req = make_req(
+            Method::GET,
+            "/api/v1/pods",
+            Some(&format!("Bearer {token}")),
+        );
         match authenticate(&req, &HashMap::new(), Some(&dec2), None) {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("JWT from wrong key must not succeed"),
@@ -782,7 +820,11 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "static-tok".to_owned(),
-            UserInfo { username: "static-user".to_owned(), uid: "0".to_owned(), groups: vec![] },
+            UserInfo {
+                username: "static-user".to_owned(),
+                uid: "0".to_owned(),
+                groups: vec![],
+            },
         );
         let (enc, dec) = test_rsa_keypair();
         // Use a static token string — not a JWT — to confirm static path fires.
@@ -854,7 +896,11 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "tok".to_owned(),
-            UserInfo { username: "bob".to_owned(), uid: "1".to_owned(), groups: vec![] },
+            UserInfo {
+                username: "bob".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+            },
         );
         let der = make_cert_der("alice", &["system:masters"]);
         let cert = PeerCertificate(der);

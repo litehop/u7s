@@ -40,7 +40,10 @@ pub struct CollectionQuery {
 pub(crate) fn generate_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
     let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut n = t ^ c.wrapping_mul(0x9e3779b97f4a7c15);
     const CHARS: &[u8] = b"bcdfghjklmnpqrstvwxz2456789";
@@ -58,7 +61,9 @@ fn resolve_name(obj: &mut Object) -> Result<String, crate::status::StatusError> 
         None => {
             let gen = obj.body["metadata"]["generateName"].as_str().unwrap_or("");
             if gen.is_empty() {
-                return Err(Status::bad_request("metadata.name or metadata.generateName is required".into()));
+                return Err(Status::bad_request(
+                    "metadata.name or metadata.generateName is required".into(),
+                ));
             }
             let name = format!("{}{}", gen, generate_suffix());
             obj.body["metadata"]["name"] = serde_json::Value::String(name.clone());
@@ -81,12 +86,7 @@ fn lookup<'a>(
     state
         .resource_registry
         .get(&key)
-        .ok_or_else(|| {
-            Status::not_found(
-                &format!("{}/{}/{}", group, version, plural),
-                "Resource",
-            )
-        })
+        .ok_or_else(|| Status::not_found(&format!("{}/{}/{}", group, version, plural), "Resource"))
 }
 
 fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusError {
@@ -306,11 +306,18 @@ fn parse_label_selector(selector: &str) -> Result<Vec<(&str, &str)>, crate::stat
         }
         let mut it = part.splitn(2, '=');
         let key = it.next().unwrap_or("").trim();
-        let val = it.next().ok_or_else(|| {
-            Status::bad_request(format!("invalid label selector '{part}': expected key=value"))
-        })?.trim();
+        let val = it
+            .next()
+            .ok_or_else(|| {
+                Status::bad_request(format!(
+                    "invalid label selector '{part}': expected key=value"
+                ))
+            })?
+            .trim();
         if key.is_empty() {
-            return Err(Status::bad_request(format!("invalid label selector '{part}': empty key")));
+            return Err(Status::bad_request(format!(
+                "invalid label selector '{part}': empty key"
+            )));
         }
         pairs.push((key, val));
     }
@@ -330,9 +337,9 @@ fn apply_label_selector(
         .into_iter()
         .filter(|item| {
             let labels = &item["metadata"]["labels"];
-            pairs.iter().all(|(k, v)| {
-                labels.get(*k).and_then(|lv| lv.as_str()) == Some(*v)
-            })
+            pairs
+                .iter()
+                .all(|(k, v)| labels.get(*k).and_then(|lv| lv.as_str()) == Some(*v))
         })
         .collect()
 }
@@ -344,11 +351,15 @@ fn parse_field_selector(s: &str) -> Result<u7s_store::FieldSelector, crate::stat
         Status::bad_request(format!("invalid fieldSelector '{s}': expected key=value"))
     })?;
     if field.is_empty() {
-        return Err(Status::bad_request(format!("invalid fieldSelector '{s}': empty key")));
+        return Err(Status::bad_request(format!(
+            "invalid fieldSelector '{s}': empty key"
+        )));
     }
-    Ok(u7s_store::FieldSelector { field: field.to_string(), value: value.to_string() })
+    Ok(u7s_store::FieldSelector {
+        field: field.to_string(),
+        value: value.to_string(),
+    })
 }
-
 
 /// Encode a store key as a URL-safe base64 continue token (no padding).
 fn encode_continue(key: &str) -> String {
@@ -361,9 +372,14 @@ fn decode_continue(token: &str) -> Result<String, crate::status::StatusError> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
-        .map_err(|_| Status::bad_request(format!("invalid continue token '{token}': base64 decode failed")))?;
-    String::from_utf8(bytes)
-        .map_err(|_| Status::bad_request(format!("invalid continue token '{token}': not valid UTF-8")))
+        .map_err(|_| {
+            Status::bad_request(format!(
+                "invalid continue token '{token}': base64 decode failed"
+            ))
+        })?;
+    String::from_utf8(bytes).map_err(|_| {
+        Status::bad_request(format!("invalid continue token '{token}': not valid UTF-8"))
+    })
 }
 
 fn build_list_response(
@@ -413,12 +429,10 @@ use crate::util::{extract_body, utc_now_rfc3339};
 
 pub(crate) fn stamp_metadata(obj: &mut Object) {
     if obj.body["metadata"]["uid"].is_null() {
-        obj.body["metadata"]["uid"] =
-            serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+        obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
     }
     if obj.body["metadata"]["creationTimestamp"].is_null() {
-        obj.body["metadata"]["creationTimestamp"] =
-            serde_json::Value::String(utc_now_rfc3339());
+        obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
     }
 }
 
@@ -446,12 +460,7 @@ pub async fn list_resource(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
-            return super::cr::list_cr(
-                State(state),
-                Path((group, version, plural)),
-                query,
-            )
-            .await;
+            return super::cr::list_cr(State(state), Path((group, version, plural)), query).await;
         }
     };
     let prefix = group_list_prefix(&group, &plural, None);
@@ -469,7 +478,9 @@ pub async fn list_resource(
                 .list(&prefix, ListOptions::default())
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let items: Vec<serde_json::Value> = resp.items.iter()
+            let items: Vec<serde_json::Value> = resp
+                .items
+                .iter()
                 .filter_map(|o| serde_json::from_slice(&o.value).ok())
                 .collect();
             Some((items, resp.revision))
@@ -487,11 +498,26 @@ pub async fn list_resource(
         .await;
     }
 
-    let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
-    let continue_key = query.continue_token.as_deref().map(decode_continue).transpose()?;
+    let field_selector = query
+        .field_selector
+        .as_deref()
+        .map(parse_field_selector)
+        .transpose()?;
+    let continue_key = query
+        .continue_token
+        .as_deref()
+        .map(decode_continue)
+        .transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions { field_selector, limit: query.limit, continue_key })
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector,
+                limit: query.limit,
+                continue_key,
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -509,7 +535,14 @@ pub async fn list_resource(
         items
     };
 
-    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items, resp.continue_key);
+    let body = build_list_response(
+        &meta.kind,
+        &group,
+        &version,
+        resp.revision,
+        items,
+        resp.continue_key,
+    );
     Ok(Json(body).into_response())
 }
 
@@ -520,11 +553,7 @@ pub async fn get_resource(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
-            return super::cr::get_cr(
-                State(state),
-                Path((group, version, plural, name)),
-            )
-            .await;
+            return super::cr::get_cr(State(state), Path((group, version, plural, name))).await;
         }
     };
 
@@ -550,7 +579,10 @@ pub async fn create_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -566,8 +598,8 @@ pub async fn create_resource(
         }
     };
 
-    let mut obj = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
@@ -601,7 +633,10 @@ pub async fn replace_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -617,8 +652,8 @@ pub async fn replace_resource(
         }
     };
 
-    let mut obj = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let obj_name = obj.name().unwrap_or("").to_string();
     if obj_name != name {
@@ -659,12 +694,9 @@ pub async fn delete_resource(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
-            return super::cr::delete_cr(
-                State(state),
-                Path((group, version, plural, name)),
-            )
-            .await
-            .map(IntoResponse::into_response);
+            return super::cr::delete_cr(State(state), Path((group, version, plural, name)))
+                .await
+                .map(IntoResponse::into_response);
         }
     };
 
@@ -716,7 +748,8 @@ pub async fn delete_resource(
         "apiVersion": "v1",
         "status": "Success",
         "code": 200
-    })).into_response())
+    }))
+    .into_response())
 }
 
 pub async fn patch_resource(
@@ -795,8 +828,8 @@ pub async fn patch_resource(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let mut patch: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let mut patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     // Strip status from the patch on the main endpoint for resources with a status subresource.
     if meta.has_status_subresource {
@@ -886,7 +919,9 @@ pub async fn list_namespaced_resource(
                 .list(&prefix, ListOptions::default())
                 .await
                 .map_err(|e| Status::internal(e.to_string()))?;
-            let items: Vec<serde_json::Value> = resp.items.iter()
+            let items: Vec<serde_json::Value> = resp
+                .items
+                .iter()
                 .filter_map(|o| serde_json::from_slice(&o.value).ok())
                 .collect();
             Some((items, resp.revision))
@@ -904,11 +939,26 @@ pub async fn list_namespaced_resource(
         .await;
     }
 
-    let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
-    let continue_key = query.continue_token.as_deref().map(decode_continue).transpose()?;
+    let field_selector = query
+        .field_selector
+        .as_deref()
+        .map(parse_field_selector)
+        .transpose()?;
+    let continue_key = query
+        .continue_token
+        .as_deref()
+        .map(decode_continue)
+        .transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions { field_selector, limit: query.limit, continue_key })
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector,
+                limit: query.limit,
+                continue_key,
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -926,7 +976,14 @@ pub async fn list_namespaced_resource(
         items
     };
 
-    let body = build_list_response(&meta.kind, &group, &version, resp.revision, items, resp.continue_key);
+    let body = build_list_response(
+        &meta.kind,
+        &group,
+        &version,
+        resp.revision,
+        items,
+        resp.continue_key,
+    );
     Ok(Json(body).into_response())
 }
 
@@ -967,7 +1024,10 @@ pub async fn create_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -983,8 +1043,8 @@ pub async fn create_namespaced_resource(
         }
     };
 
-    let mut obj = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let name = resolve_name(&mut obj)?;
 
@@ -1020,7 +1080,10 @@ pub async fn replace_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -1036,8 +1099,8 @@ pub async fn replace_namespaced_resource(
         }
     };
 
-    let mut obj = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let obj_name = obj.name().unwrap_or("").to_string();
     if obj_name != name {
@@ -1132,7 +1195,8 @@ pub async fn delete_namespaced_resource(
         "apiVersion": "v1",
         "status": "Success",
         "code": 200
-    })).into_response())
+    }))
+    .into_response())
 }
 
 pub async fn patch_namespaced_resource(
@@ -1211,8 +1275,8 @@ pub async fn patch_namespaced_resource(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let mut patch: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let mut patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     // Strip status from the patch on the main endpoint for resources with a status subresource.
     if meta.has_status_subresource {
@@ -1298,10 +1362,13 @@ pub async fn put_resource_status(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let meta = lookup(&state, &group, &version, &plural)?.clone();
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
-    let incoming = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let incoming =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     let key = group_object_key(&group, &plural, None, &name);
     let stored = state
@@ -1316,8 +1383,12 @@ pub async fn put_resource_status(
 
     // Replace only the status field; leave spec and metadata (except resourceVersion) untouched.
     match &incoming.body["status"] {
-        serde_json::Value::Null => { current.body.as_object_mut().map(|m| m.remove("status")); }
-        v => { current.body["status"] = v.clone(); }
+        serde_json::Value::Null => {
+            current.body.as_object_mut().map(|m| m.remove("status"));
+        }
+        v => {
+            current.body["status"] = v.clone();
+        }
     }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
@@ -1351,8 +1422,8 @@ pub async fn patch_resource_status(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let patch: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     match patch_type {
         PatchType::Json => {
@@ -1362,10 +1433,10 @@ pub async fn patch_resource_status(
         _ => {
             // Merge and strategic merge: only patch the status portion.
             if let Some(status_patch) = patch.get("status") {
-                let entry = current
-                    .body
-                    .as_object_mut()
-                    .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
+                let entry = current.body.as_object_mut().map(|m| {
+                    m.entry("status")
+                        .or_insert(serde_json::Value::Object(Default::default()))
+                });
                 if let Some(entry) = entry {
                     match patch_type {
                         PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
@@ -1407,16 +1478,22 @@ pub async fn put_namespaced_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let body = extract_body(&body, ct);
-    let incoming = Object::from_bytes(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let incoming =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     // CR fallback: if the resource is not in the registry (e.g. Gateway API CRDs), fall back
     // to the CR storage key. This allows Gateway/GatewayClass controllers to PUT status on
     // their custom resources using the same /status route as built-in types.
     let (key, kind_fallback) = match lookup(&state, &group, &version, &plural) {
-        Ok(meta) => (group_object_key(&group, &plural, Some(&ns), &name), meta.kind.clone()),
+        Ok(meta) => (
+            group_object_key(&group, &plural, Some(&ns), &name),
+            meta.kind.clone(),
+        ),
         Err(_) => {
             // CR fallback: CRs are stored under /registry/cr/<group>/<version>/<plural>/<ns>/<name>
             let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
@@ -1434,11 +1511,18 @@ pub async fn put_namespaced_resource_status(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let kind = current.body["kind"].as_str().map(str::to_owned).unwrap_or(kind_fallback);
+    let kind = current.body["kind"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or(kind_fallback);
 
     match &incoming.body["status"] {
-        serde_json::Value::Null => { current.body.as_object_mut().map(|m| m.remove("status")); }
-        v => { current.body["status"] = v.clone(); }
+        serde_json::Value::Null => {
+            current.body.as_object_mut().map(|m| m.remove("status"));
+        }
+        v => {
+            current.body["status"] = v.clone();
+        }
     }
 
     let expected_rv = parse_resource_version(current.resource_version())?;
@@ -1478,10 +1562,13 @@ pub async fn patch_namespaced_resource_status(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let kind = current.body["kind"].as_str().map(str::to_owned).unwrap_or_else(|| plural.clone());
+    let kind = current.body["kind"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| plural.clone());
 
-    let patch: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     match patch_type {
         PatchType::Json => {
@@ -1491,10 +1578,10 @@ pub async fn patch_namespaced_resource_status(
         _ => {
             // Merge and strategic merge: only patch the status portion.
             if let Some(status_patch) = patch.get("status") {
-                let entry = current
-                    .body
-                    .as_object_mut()
-                    .map(|m| m.entry("status").or_insert(serde_json::Value::Object(Default::default())));
+                let entry = current.body.as_object_mut().map(|m| {
+                    m.entry("status")
+                        .or_insert(serde_json::Value::Object(Default::default()))
+                });
                 if let Some(entry) = entry {
                     match patch_type {
                         PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
@@ -1544,29 +1631,39 @@ pub async fn core_list_resource(
                     .list(&prefix, ListOptions::default())
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
-                let items: Vec<serde_json::Value> = resp.items.iter()
+                let items: Vec<serde_json::Value> = resp
+                    .items
+                    .iter()
                     .filter_map(|o| serde_json::from_slice(&o.value).ok())
                     .collect();
                 Some((items, resp.revision))
             } else {
                 None
             };
-            return watch_generic(
-                state,
-                prefix,
-                "v1".into(),
-                "Pod".into(),
-                from_rv,
-                initial,
-            )
-            .await
-            .map(IntoResponse::into_response);
+            return watch_generic(state, prefix, "v1".into(), "Pod".into(), from_rv, initial)
+                .await
+                .map(IntoResponse::into_response);
         }
-        let field_selector = query.field_selector.as_deref().map(parse_field_selector).transpose()?;
-        let continue_key = query.continue_token.as_deref().map(decode_continue).transpose()?;
+        let field_selector = query
+            .field_selector
+            .as_deref()
+            .map(parse_field_selector)
+            .transpose()?;
+        let continue_key = query
+            .continue_token
+            .as_deref()
+            .map(decode_continue)
+            .transpose()?;
         let resp = state
             .store
-            .list(&prefix, ListOptions { field_selector, limit: query.limit, continue_key })
+            .list(
+                &prefix,
+                ListOptions {
+                    field_selector,
+                    limit: query.limit,
+                    continue_key,
+                },
+            )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         let mut items = Vec::with_capacity(resp.items.len());
@@ -1607,7 +1704,13 @@ pub async fn core_create_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    create_resource(State(state), Path(("".into(), "v1".into(), plural)), headers, body).await
+    create_resource(
+        State(state),
+        Path(("".into(), "v1".into(), plural)),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub async fn core_replace_resource(
@@ -1616,7 +1719,13 @@ pub async fn core_replace_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    replace_resource(State(state), Path(("".into(), "v1".into(), plural, name)), headers, body).await
+    replace_resource(
+        State(state),
+        Path(("".into(), "v1".into(), plural, name)),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub async fn core_delete_resource(
@@ -1632,7 +1741,13 @@ pub async fn core_patch_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    patch_resource(State(state), Path(("".into(), "v1".into(), plural, name)), headers, body).await
+    patch_resource(
+        State(state),
+        Path(("".into(), "v1".into(), plural, name)),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub async fn core_get_resource_status(
@@ -1648,7 +1763,13 @@ pub async fn core_put_resource_status(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    put_resource_status(State(state), Path(("".into(), "v1".into(), plural, name)), headers, body).await
+    put_resource_status(
+        State(state),
+        Path(("".into(), "v1".into(), plural, name)),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub async fn core_patch_resource_status(
@@ -1683,7 +1804,11 @@ pub async fn core_get_namespaced_resource(
     State(state): State<AppState>,
     Path((ns, plural, name)): Path<(String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
-    get_namespaced_resource(State(state), Path(("".into(), "v1".into(), ns, plural, name))).await
+    get_namespaced_resource(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural, name)),
+    )
+    .await
 }
 
 pub async fn core_create_namespaced_resource(
@@ -1692,7 +1817,13 @@ pub async fn core_create_namespaced_resource(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    create_namespaced_resource(State(state), Path(("".into(), "v1".into(), ns, plural)), headers, body).await
+    create_namespaced_resource(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural)),
+        headers,
+        body,
+    )
+    .await
 }
 
 pub async fn core_replace_namespaced_resource(
@@ -1714,7 +1845,11 @@ pub async fn core_delete_namespaced_resource(
     State(state): State<AppState>,
     Path((ns, plural, name)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    delete_namespaced_resource(State(state), Path(("".into(), "v1".into(), ns, plural, name))).await
+    delete_namespaced_resource(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural, name)),
+    )
+    .await
 }
 
 pub async fn core_patch_namespaced_resource(
@@ -1827,21 +1962,33 @@ fn apply_json_patch(
             Status::unprocessable_entity("each JSON patch operation must have an 'op' field".into())
         })?;
         let path = op["path"].as_str().ok_or_else(|| {
-            Status::unprocessable_entity("each JSON patch operation must have a 'path' field".into())
+            Status::unprocessable_entity(
+                "each JSON patch operation must have a 'path' field".into(),
+            )
         })?;
 
         match op_str {
             "add" => {
-                let value = op.get("value").ok_or_else(|| {
-                    Status::unprocessable_entity("'add' operation requires a 'value' field".into())
-                })?.clone();
+                let value = op
+                    .get("value")
+                    .ok_or_else(|| {
+                        Status::unprocessable_entity(
+                            "'add' operation requires a 'value' field".into(),
+                        )
+                    })?
+                    .clone();
                 // RFC 6902 §4.1: 'add' creates intermediate objects when missing.
                 json_patch_add(obj, path, value)?;
             }
             "replace" => {
-                let value = op.get("value").ok_or_else(|| {
-                    Status::unprocessable_entity("'replace' operation requires a 'value' field".into())
-                })?.clone();
+                let value = op
+                    .get("value")
+                    .ok_or_else(|| {
+                        Status::unprocessable_entity(
+                            "'replace' operation requires a 'value' field".into(),
+                        )
+                    })?
+                    .clone();
                 // 'replace' is strict: 422 if path does not exist.
                 json_patch_set(obj, path, value)?;
             }
@@ -1877,7 +2024,9 @@ fn json_patch_navigate_mut<'a>(
     segments: &[String],
 ) -> Result<(&'a mut serde_json::Value, String), crate::status::StatusError> {
     if segments.is_empty() {
-        return Err(Status::unprocessable_entity("cannot operate on root document".into()));
+        return Err(Status::unprocessable_entity(
+            "cannot operate on root document".into(),
+        ));
     }
     let (parents, last) = segments.split_at(segments.len() - 1);
     let mut cur = obj;
@@ -1892,14 +2041,14 @@ fn json_navigate_one<'a>(
     seg: &str,
 ) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
     match node {
-        serde_json::Value::Object(map) => {
-            map.get_mut(seg).ok_or_else(|| {
-                Status::unprocessable_entity(format!("path segment '{seg}' not found"))
-            })
-        }
+        serde_json::Value::Object(map) => map
+            .get_mut(seg)
+            .ok_or_else(|| Status::unprocessable_entity(format!("path segment '{seg}' not found"))),
         serde_json::Value::Array(arr) => {
             let idx: usize = seg.parse().map_err(|_| {
-                Status::unprocessable_entity(format!("path segment '{seg}' is not a valid array index"))
+                Status::unprocessable_entity(format!(
+                    "path segment '{seg}' is not a valid array index"
+                ))
             })?;
             arr.get_mut(idx).ok_or_else(|| {
                 Status::unprocessable_entity(format!("array index {idx} out of bounds"))
@@ -1919,7 +2068,8 @@ fn json_navigate_one_or_create<'a>(
 ) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
     match node {
         serde_json::Value::Object(map) => {
-            map.entry(seg).or_insert_with(|| serde_json::Value::Object(Default::default()));
+            map.entry(seg)
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
             Ok(map.get_mut(seg).unwrap())
         }
         _ => Err(Status::unprocessable_entity(format!(
@@ -1960,14 +2110,17 @@ fn json_patch_add(
                     arr.insert(idx, value);
                 } else {
                     return Err(Status::unprocessable_entity(format!(
-                        "array index {idx} out of bounds (len {})", arr.len()
+                        "array index {idx} out of bounds (len {})",
+                        arr.len()
                     )));
                 }
             }
         }
-        _ => return Err(Status::unprocessable_entity(
-            "cannot add value to non-object/array".into(),
-        )),
+        _ => {
+            return Err(Status::unprocessable_entity(
+                "cannot add value to non-object/array".into(),
+            ))
+        }
     }
     Ok(())
 }
@@ -2081,8 +2234,8 @@ mod tests {
             .expect("ADDED event must produce a chunk");
 
         let line = std::str::from_utf8(&chunk).unwrap().trim_end();
-        let decoded: serde_json::Value = serde_json::from_str(line)
-            .expect("chunk must be valid JSON");
+        let decoded: serde_json::Value =
+            serde_json::from_str(line).expect("chunk must be valid JSON");
 
         assert_eq!(decoded["type"], "ADDED", "event type must be ADDED");
 
@@ -2094,7 +2247,10 @@ mod tests {
             "object.metadata.resourceVersion must be non-empty in ADDED event; \
              Kubernetes watch clients cannot track progress without it"
         );
-        assert_eq!(rv, "42", "resourceVersion must match the value stamped by store.put()");
+        assert_eq!(
+            rv, "42",
+            "resourceVersion must match the value stamped by store.put()"
+        );
     }
 
     /// Mirror of the ADDED test for MODIFIED events: same conformance requirement.
@@ -2158,7 +2314,9 @@ mod tests {
         // This asserts the negative: if stamp_resource_version is NOT called, the field is absent.
         // The fact that the two tests above pass (with rv="42"/"99") proves encode_watch_event
         // does NOT inject the field itself — it relies entirely on store.put() to stamp it.
-        let rv = decoded["object"]["metadata"]["resourceVersion"].as_str().unwrap_or("");
+        let rv = decoded["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("");
         assert!(
             rv.is_empty(),
             "without stamping, resourceVersion must be absent — \
@@ -2170,10 +2328,7 @@ mod tests {
 
     fn headers_with_content_type(ct: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(
-            axum::http::header::CONTENT_TYPE,
-            ct.parse().unwrap(),
-        );
+        h.insert(axum::http::header::CONTENT_TYPE, ct.parse().unwrap());
         h
     }
 
@@ -2181,10 +2336,7 @@ mod tests {
     fn detect_patch_type_accepts_merge_patch() {
         // kubectl uses application/merge-patch+json — must be accepted
         let h = headers_with_content_type("application/merge-patch+json");
-        assert!(matches!(
-            detect_patch_type(&h),
-            Ok(PatchType::Merge)
-        ));
+        assert!(matches!(detect_patch_type(&h), Ok(PatchType::Merge)));
     }
 
     #[test]
@@ -2234,7 +2386,11 @@ mod tests {
         });
         crate::patch::strategic_merge_patch(&mut body, &patch).unwrap();
         let containers = body["spec"]["containers"].as_array().unwrap();
-        assert_eq!(containers.len(), 2, "SMP must merge containers by name, not replace the array");
+        assert_eq!(
+            containers.len(),
+            2,
+            "SMP must merge containers by name, not replace the array"
+        );
     }
 
     fn item_with_labels(labels: &[(&str, &str)]) -> serde_json::Value {
@@ -2367,7 +2523,10 @@ mod tests {
         let mut obj = serde_json::json!({"metadata": {"name": "x", "extra": "gone"}});
         let patch = serde_json::json!([{"op": "remove", "path": "/metadata/extra"}]);
         ok(apply_json_patch(&mut obj, &patch));
-        assert!(obj["metadata"]["extra"].is_null(), "field must be absent after remove");
+        assert!(
+            obj["metadata"]["extra"].is_null(),
+            "field must be absent after remove"
+        );
     }
 
     #[test]
@@ -2460,11 +2619,13 @@ mod tests {
     #[test]
     fn resolve_name_uses_existing_name() {
         // When metadata.name is already set, generateName is ignored and the existing name wins.
-        let mut obj = Object::from_bytes(
-            &bytes::Bytes::from(serde_json::json!({
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
                 "metadata": { "name": "my-pod", "generateName": "ignored-" }
-            }).to_string())
-        ).unwrap();
+            })
+            .to_string(),
+        ))
+        .unwrap();
         let name = ok(resolve_name(&mut obj));
         assert_eq!(name, "my-pod");
         assert_eq!(obj.body["metadata"]["name"], "my-pod");
@@ -2473,14 +2634,23 @@ mod tests {
     #[test]
     fn resolve_name_generates_from_generate_name() {
         // When metadata.name is absent but generateName is set, a name with the prefix is generated.
-        let mut obj = Object::from_bytes(
-            &bytes::Bytes::from(serde_json::json!({
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
                 "metadata": { "generateName": "test-" }
-            }).to_string())
-        ).unwrap();
+            })
+            .to_string(),
+        ))
+        .unwrap();
         let name = ok(resolve_name(&mut obj));
-        assert!(name.starts_with("test-"), "generated name must start with generateName prefix");
-        assert_eq!(name.len(), "test-".len() + 5, "generated name must be prefix + 5 char suffix");
+        assert!(
+            name.starts_with("test-"),
+            "generated name must start with generateName prefix"
+        );
+        assert_eq!(
+            name.len(),
+            "test-".len() + 5,
+            "generated name must be prefix + 5 char suffix"
+        );
         // The name must be written back into the object body.
         assert_eq!(obj.body["metadata"]["name"].as_str(), Some(name.as_str()));
     }
@@ -2488,9 +2658,10 @@ mod tests {
     #[test]
     fn resolve_name_returns_400_when_neither_set() {
         // Neither name nor generateName → must return 400 (not a panic, not 500).
-        let mut obj = Object::from_bytes(
-            &bytes::Bytes::from(serde_json::json!({ "metadata": {} }).to_string())
-        ).unwrap();
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({ "metadata": {} }).to_string(),
+        ))
+        .unwrap();
         let err = resolve_name(&mut obj).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
@@ -2507,7 +2678,13 @@ mod tests {
         use u7s_store::SqliteStore;
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(store.clone(), None, None, std::collections::HashMap::new(), "https://localhost:6443".into());
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
 
         // Seed a CR object using the CR store key format (matches cr.rs cr_store_key).
         let group = "argoproj.io";
@@ -2528,7 +2705,10 @@ mod tests {
             "spec": { "project": "default" }
         });
         let initial_bytes = bytes::Bytes::from(serde_json::to_vec(&initial).unwrap());
-        store.put(&cr_key, initial_bytes, None).await.expect("seed CR");
+        store
+            .put(&cr_key, initial_bytes, None)
+            .await
+            .expect("seed CR");
 
         // Issue a status PUT — group is not in static registry so the CR fallback fires.
         let put_body = serde_json::json!({
@@ -2559,25 +2739,29 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "CR status PUT must succeed for unregistered group");
+        assert!(
+            result.is_ok(),
+            "CR status PUT must succeed for unregistered group"
+        );
 
         // Verify the status was persisted in the store.
-        let stored = store.get(&cr_key).await.expect("store get").expect("object must exist");
+        let stored = store
+            .get(&cr_key)
+            .await
+            .expect("store get")
+            .expect("object must exist");
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(
-            v["status"]["health"]["status"],
-            "Healthy",
+            v["status"]["health"]["status"], "Healthy",
             "status.health.status must be persisted after CR status PUT"
         );
         assert_eq!(
-            v["status"]["sync"]["status"],
-            "Synced",
+            v["status"]["sync"]["status"], "Synced",
             "status.sync.status must be persisted after CR status PUT"
         );
         // spec must be preserved — PUT replaces only status, not the whole object
         assert_eq!(
-            v["spec"]["project"],
-            "default",
+            v["spec"]["project"], "default",
             "spec must be unchanged after status PUT"
         );
     }
@@ -2795,9 +2979,7 @@ mod tests {
                 "stale Lease PUT must return 409 Conflict — without OCC check, \
                  concurrent writers silently corrupt the lease"
             ),
-            Ok(_) => panic!(
-                "stale Lease PUT must be rejected with 409 Conflict, not succeed"
-            ),
+            Ok(_) => panic!("stale Lease PUT must be rejected with 409 Conflict, not succeed"),
         }
     }
 
@@ -2845,25 +3027,47 @@ mod tests {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
 
         let make_cm = |name: &str| {
-            bytes::Bytes::from(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": { "name": name, "namespace": "default" }
-            }).to_string())
+            bytes::Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": { "name": name, "namespace": "default" }
+                })
+                .to_string(),
+            )
         };
 
-        store.put("/registry/configmaps/default/foo", make_cm("foo"), Some(0)).await.unwrap();
-        store.put("/registry/configmaps/default/bar", make_cm("bar"), Some(0)).await.unwrap();
+        store
+            .put("/registry/configmaps/default/foo", make_cm("foo"), Some(0))
+            .await
+            .unwrap();
+        store
+            .put("/registry/configmaps/default/bar", make_cm("bar"), Some(0))
+            .await
+            .unwrap();
 
         let fs = ok(parse_field_selector("metadata.name=foo"));
-        let resp = store.list(
-            "/registry/configmaps/default/",
-            ListOptions { field_selector: Some(fs), ..Default::default() },
-        ).await.unwrap();
+        let resp = store
+            .list(
+                "/registry/configmaps/default/",
+                ListOptions {
+                    field_selector: Some(fs),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(resp.items.len(), 1, "fieldSelector=metadata.name=foo must return exactly one item");
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "fieldSelector=metadata.name=foo must return exactly one item"
+        );
         let parsed: serde_json::Value = serde_json::from_slice(&resp.items[0].value).unwrap();
-        assert_eq!(parsed["metadata"]["name"], "foo", "returned item must be the one named 'foo'");
+        assert_eq!(
+            parsed["metadata"]["name"], "foo",
+            "returned item must be the one named 'foo'"
+        );
     }
 
     // -- encode_continue / decode_continue --
@@ -2875,7 +3079,10 @@ mod tests {
         let key = "/registry/pods/default/my-pod";
         let token = encode_continue(key);
         let decoded = ok(decode_continue(&token));
-        assert_eq!(decoded, key, "decoded continue token must equal the original store key");
+        assert_eq!(
+            decoded, key,
+            "decoded continue token must equal the original store key"
+        );
     }
 
     #[test]
@@ -2889,9 +3096,19 @@ mod tests {
     fn build_list_response_with_continue_key_sets_metadata_continue() {
         // When there are more items, metadata.continue must be set to the base64-encoded cursor.
         // Kubernetes clients use this field to request the next page; missing it means no pagination.
-        let body = build_list_response("Pod", "", "v1", 5, vec![], Some("/registry/pods/default/foo".to_string()));
+        let body = build_list_response(
+            "Pod",
+            "",
+            "v1",
+            5,
+            vec![],
+            Some("/registry/pods/default/foo".to_string()),
+        );
         let token = body["metadata"]["continue"].as_str().unwrap_or("");
-        assert!(!token.is_empty(), "metadata.continue must be set when continue_key is Some");
+        assert!(
+            !token.is_empty(),
+            "metadata.continue must be set when continue_key is Some"
+        );
         let decoded = ok(decode_continue(token));
         assert_eq!(decoded, "/registry/pods/default/foo");
     }
@@ -2945,20 +3162,27 @@ mod tests {
             "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
         );
 
-        let decoded: serde_json::Value = serde_json::from_str(bookmark.trim_end())
-            .expect("BOOKMARK line must be valid JSON");
+        let decoded: serde_json::Value =
+            serde_json::from_str(bookmark.trim_end()).expect("BOOKMARK line must be valid JSON");
 
-        assert_eq!(decoded["type"], "BOOKMARK",
-            "initial-events-end event must be type BOOKMARK");
-        assert_eq!(decoded["object"]["apiVersion"], api_version,
-            "BOOKMARK must include correct apiVersion");
-        assert_eq!(decoded["object"]["kind"], kind,
-            "BOOKMARK must include correct kind");
-        assert_eq!(decoded["object"]["metadata"]["resourceVersion"], "0",
-            "BOOKMARK must include resourceVersion");
         assert_eq!(
-            decoded["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"],
-            "true",
+            decoded["type"], "BOOKMARK",
+            "initial-events-end event must be type BOOKMARK"
+        );
+        assert_eq!(
+            decoded["object"]["apiVersion"], api_version,
+            "BOOKMARK must include correct apiVersion"
+        );
+        assert_eq!(
+            decoded["object"]["kind"], kind,
+            "BOOKMARK must include correct kind"
+        );
+        assert_eq!(
+            decoded["object"]["metadata"]["resourceVersion"], "0",
+            "BOOKMARK must include resourceVersion"
+        );
+        assert_eq!(
+            decoded["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"], "true",
             "BOOKMARK must carry k8s.io/initial-events-end=true; \
              without it kubelet's informer never exits the list phase and times out"
         );
@@ -2999,15 +3223,25 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("list runtimeclasses must not return 404"));
 
-        assert_eq!(resp.status(), axum::http::StatusCode::OK,
-            "GET node.k8s.io/v1/runtimeclasses must return 200 — kubelet loops on 404");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET node.k8s.io/v1/runtimeclasses must return 200 — kubelet loops on 404"
+        );
 
         let body = to_bytes(resp.into_body(), 65536).await.expect("read body");
         let val: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
-        assert_eq!(val["kind"], "RuntimeClassList",
-            "response must be a RuntimeClassList");
-        assert!(val["items"].as_array().map(|a| a.is_empty()).unwrap_or(false),
-            "items must be an empty array");
+        assert_eq!(
+            val["kind"], "RuntimeClassList",
+            "response must be a RuntimeClassList"
+        );
+        assert!(
+            val["items"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "items must be an empty array"
+        );
     }
 
     // -- mayor-ofi: json-patch 'add' must create intermediate objects --
@@ -3028,7 +3262,8 @@ mod tests {
             "path": "/status/conditions",
             "value": []
         }]);
-        apply_json_patch(&mut obj, &patch).unwrap_or_else(|_| panic!("'add' must create intermediate 'status' object"));
+        apply_json_patch(&mut obj, &patch)
+            .unwrap_or_else(|_| panic!("'add' must create intermediate 'status' object"));
         assert_eq!(obj["status"]["conditions"], serde_json::json!([]));
     }
 
@@ -3051,10 +3286,14 @@ mod tests {
     #[test]
     fn json_patch_replace_on_missing_path_is_422() {
         let mut obj = serde_json::json!({"metadata": {"name": "x"}});
-        let patch = serde_json::json!([{"op": "replace", "path": "/status/conditions", "value": []}]);
+        let patch =
+            serde_json::json!([{"op": "replace", "path": "/status/conditions", "value": []}]);
         let err = apply_json_patch(&mut obj, &patch).unwrap_err();
-        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "'replace' on missing path must return 422, not silently create");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "'replace' on missing path must return 422, not silently create"
+        );
     }
 
     // -- mayor-iek: watch 410 ERROR must carry compaction horizon --
@@ -3078,10 +3317,14 @@ mod tests {
                 "metadata": {"resourceVersion": horizon.to_string()}
             }
         });
-        let rv = obj["object"]["metadata"]["resourceVersion"].as_str().unwrap();
-        assert_eq!(rv, "500",
+        let rv = obj["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            rv, "500",
             "410 ERROR must carry horizon as resourceVersion so clients relist from \
-             a valid point, not from last_rv which may predate the compaction horizon");
+             a valid point, not from last_rv which may predate the compaction horizon"
+        );
     }
 
     // -- mayor-br6: Gateway API CR status patch via generic handler fallback --
@@ -3130,7 +3373,10 @@ mod tests {
             "status": {}
         });
         let initial_bytes = bytes::Bytes::from(serde_json::to_vec(&initial).unwrap());
-        store.put(&cr_key, initial_bytes, None).await.expect("seed Gateway CR");
+        store
+            .put(&cr_key, initial_bytes, None)
+            .await
+            .expect("seed Gateway CR");
 
         // PATCH the status with a Ready condition — group not in registry → CR fallback fires.
         let patch = serde_json::json!({
@@ -3160,27 +3406,37 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "Gateway CR status PATCH must succeed via CR fallback");
+        assert!(
+            result.is_ok(),
+            "Gateway CR status PATCH must succeed via CR fallback"
+        );
 
-        let stored = store.get(&cr_key).await.expect("store get").expect("CR must exist");
+        let stored = store
+            .get(&cr_key)
+            .await
+            .expect("store get")
+            .expect("CR must exist");
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
 
         // Status must reflect the patched conditions.
-        let conds = v["status"]["conditions"].as_array()
+        let conds = v["status"]["conditions"]
+            .as_array()
             .expect("status.conditions must be an array after PATCH");
-        assert_eq!(conds.len(), 1, "exactly one condition must be present after PATCH");
+        assert_eq!(
+            conds.len(),
+            1,
+            "exactly one condition must be present after PATCH"
+        );
         assert_eq!(conds[0]["type"], "Ready", "condition type must be Ready");
         assert_eq!(conds[0]["status"], "True", "condition status must be True");
 
         // Spec must be completely unchanged — merge-patch must not touch spec.
         assert_eq!(
-            v["spec"]["gatewayClassName"],
-            "nginx",
+            v["spec"]["gatewayClassName"], "nginx",
             "spec.gatewayClassName must be unchanged after status PATCH"
         );
         assert_eq!(
-            v["spec"]["listeners"][0]["port"],
-            80,
+            v["spec"]["listeners"][0]["port"], 80,
             "spec.listeners must be unchanged after status PATCH"
         );
     }
@@ -3234,7 +3490,11 @@ mod tests {
         });
         create_resource(
             axum::extract::State(state.clone()),
-            axum::extract::Path((group.to_string(), version.to_string(), "clusterroles".to_string())),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterroles".to_string(),
+            )),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&cr).unwrap()),
         )
@@ -3260,7 +3520,12 @@ mod tests {
         // Issue soft-delete (object has finalizers, so deletionTimestamp is stamped).
         delete_resource(
             axum::extract::State(state.clone()),
-            axum::extract::Path((group.to_string(), version.to_string(), plural.to_string(), name.to_string())),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                name.to_string(),
+            )),
         )
         .await
         .unwrap_or_else(|_| panic!("soft-delete must succeed"));
@@ -3280,16 +3545,22 @@ mod tests {
         // Kubelet requires a non-empty pod UID to name the sandbox — the server must
         // assign a UUID v4 if the client did not supply one. Without this fix, cri-o
         // fails with "cannot generate pod name without uid in metadata".
-        let mut obj = Object::from_bytes(
-            &bytes::Bytes::from(serde_json::json!({
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
                 "metadata": { "name": "hello-world" }
-            }).to_string())
-        ).unwrap();
+            })
+            .to_string(),
+        ))
+        .unwrap();
         stamp_metadata(&mut obj);
         let uid = obj.body["metadata"]["uid"].as_str().unwrap_or("");
         assert!(!uid.is_empty(), "uid must be assigned by server");
         let parts: Vec<&str> = uid.split('-').collect();
-        assert_eq!(parts.len(), 5, "uid must be UUID with 5 hyphen-separated groups");
+        assert_eq!(
+            parts.len(),
+            5,
+            "uid must be UUID with 5 hyphen-separated groups"
+        );
         assert_eq!(parts[0].len(), 8);
         assert_eq!(parts[1].len(), 4);
         assert_eq!(parts[2].len(), 4);
@@ -3301,11 +3572,13 @@ mod tests {
     fn stamp_metadata_preserves_client_supplied_uid() {
         // If the client supplies a UID (e.g. during restore or testing), the server
         // must not overwrite it.
-        let mut obj = Object::from_bytes(
-            &bytes::Bytes::from(serde_json::json!({
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
                 "metadata": { "name": "hello-world", "uid": "my-custom-uid" }
-            }).to_string())
-        ).unwrap();
+            })
+            .to_string(),
+        ))
+        .unwrap();
         stamp_metadata(&mut obj);
         assert_eq!(
             obj.body["metadata"]["uid"].as_str().unwrap(),
@@ -3317,13 +3590,17 @@ mod tests {
     #[test]
     fn stamp_metadata_sets_creation_timestamp_when_absent() {
         // creationTimestamp must be a non-empty RFC3339 string after stamping.
-        let mut obj = Object::from_bytes(
-            &bytes::Bytes::from(serde_json::json!({
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
                 "metadata": { "name": "hello-world" }
-            }).to_string())
-        ).unwrap();
+            })
+            .to_string(),
+        ))
+        .unwrap();
         stamp_metadata(&mut obj);
-        let ts = obj.body["metadata"]["creationTimestamp"].as_str().unwrap_or("");
+        let ts = obj.body["metadata"]["creationTimestamp"]
+            .as_str()
+            .unwrap_or("");
         assert!(!ts.is_empty(), "creationTimestamp must be set");
         assert!(ts.contains('T'), "creationTimestamp must be RFC3339");
     }
@@ -3391,7 +3668,9 @@ mod tests {
         );
 
         // Response body must have a uid assigned (server stamped metadata).
-        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         let uid = v["metadata"]["uid"].as_str().unwrap_or("");
         assert!(
@@ -3473,7 +3752,9 @@ mod tests {
         );
 
         // Response body must have a uid assigned.
-        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         let uid = v["metadata"]["uid"].as_str().unwrap_or("");
         assert!(
@@ -3539,9 +3820,9 @@ mod tests {
                 "strategic-merge-patch+json on missing resource must return 404; \
                  only apply-patch+yaml (SSA) has upsert semantics"
             ),
-            Ok(_) => panic!(
-                "strategic-merge-patch on absent resource must return 404, not create it"
-            ),
+            Ok(_) => {
+                panic!("strategic-merge-patch on absent resource must return 404, not create it")
+            }
         }
     }
 
@@ -3633,11 +3914,14 @@ mod tests {
 
         // Verify that the patch was actually applied (renewTime updated).
         let key = "/registry/coordination.k8s.io/leases/kube-node-lease/worker-node-1";
-        let stored = store.get(key).await.expect("store get").expect("Lease must exist");
+        let stored = store
+            .get(key)
+            .await
+            .expect("store get")
+            .expect("Lease must exist");
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(
-            v["spec"]["renewTime"],
-            "2026-05-21T00:00:00Z",
+            v["spec"]["renewTime"], "2026-05-21T00:00:00Z",
             "spec.renewTime must be updated by the SSA patch"
         );
     }

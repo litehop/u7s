@@ -1,10 +1,10 @@
 use bytes::Bytes;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{broadcast, Mutex};
 
 /// A single stored Kubernetes object.
 #[derive(Debug, Clone)]
@@ -28,7 +28,9 @@ impl ObjectKey {
     /// Example: namespace="default", resource="pods", name="nginx"
     /// → "/registry/pods/default/nginx"
     pub fn namespaced(resource: &str, namespace: &str, name: &str) -> Self {
-        Self { key: format!("/registry/{}/{}/{}", resource, namespace, name) }
+        Self {
+            key: format!("/registry/{}/{}/{}", resource, namespace, name),
+        }
     }
 }
 
@@ -111,11 +113,18 @@ pub enum WatchEvent {
 
 pub trait Store: Send + Sync + 'static {
     /// Get a single object by exact key. Returns None if not found.
-    fn get(&self, key: &str) -> impl std::future::Future<Output = Result<Option<StoreObject>>> + Send;
+    fn get(
+        &self,
+        key: &str,
+    ) -> impl std::future::Future<Output = Result<Option<StoreObject>>> + Send;
 
     /// List all objects whose keys share the given prefix.
     /// Returns a consistent snapshot and the revision of that snapshot.
-    fn list(&self, prefix: &str, opts: ListOptions) -> impl std::future::Future<Output = Result<ListResponse>> + Send;
+    fn list(
+        &self,
+        prefix: &str,
+        opts: ListOptions,
+    ) -> impl std::future::Future<Output = Result<ListResponse>> + Send;
 
     /// Write an object with optimistic concurrency control.
     ///
@@ -135,7 +144,11 @@ pub trait Store: Send + Sync + 'static {
 
     /// Delete an object. Same optimistic concurrency semantics as put.
     /// Returns the new global revision on success (the deletion revision).
-    fn delete(&self, key: &str, expected_revision: Option<u64>) -> impl std::future::Future<Output = Result<u64>> + Send;
+    fn delete(
+        &self,
+        key: &str,
+        expected_revision: Option<u64>,
+    ) -> impl std::future::Future<Output = Result<u64>> + Send;
 
     /// Watch objects under prefix starting from (exclusive) from_revision.
     /// Yields historical events from the ring buffer then live broadcast events.
@@ -143,7 +156,9 @@ pub trait Store: Send + Sync + 'static {
         &self,
         prefix: &str,
         from_revision: u64,
-    ) -> impl std::future::Future<Output = Result<impl futures_core::Stream<Item = WatchEvent> + Send + 'static>> + Send;
+    ) -> impl std::future::Future<
+        Output = Result<impl futures_core::Stream<Item = WatchEvent> + Send + 'static>,
+    > + Send;
 }
 
 const RING_CAPACITY: usize = 1000;
@@ -171,7 +186,8 @@ impl SqliteStore {
         let write_conn = open_conn(db_path)?;
 
         // Run migrations on the write connection.
-        write_conn.execute_batch("
+        write_conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS objects (
                 key      TEXT    NOT NULL PRIMARY KEY,
                 value    BLOB    NOT NULL,
@@ -188,7 +204,8 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_pods_nodename
             ON objects (json_extract(value, '$.spec.nodeName'))
             WHERE key LIKE '/registry/pods/%';
-        ")?;
+        ",
+        )?;
 
         let write_conn = Arc::new(Mutex::new(write_conn));
 
@@ -224,7 +241,8 @@ impl SqliteStore {
                 guard.pop_front();
                 // Update compaction horizon to the revision of the oldest remaining entry.
                 if let Some(oldest) = guard.front() {
-                    self.compaction_horizon.store(oldest.revision, Ordering::Relaxed);
+                    self.compaction_horizon
+                        .store(oldest.revision, Ordering::Relaxed);
                 }
             }
         }
@@ -235,13 +253,15 @@ impl SqliteStore {
 
 fn open_conn(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("
+    conn.execute_batch(
+        "
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous  = NORMAL;
         PRAGMA cache_size   = -8000;
         PRAGMA busy_timeout = 5000;
         PRAGMA wal_autocheckpoint = 1000;
-    ")?;
+    ",
+    )?;
     Ok(conn)
 }
 
@@ -265,30 +285,40 @@ fn put_sync(
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
     // 2. Read current stored revision for optimistic concurrency check.
-    let stored: Option<u64> = conn.query_row(
-        "SELECT revision FROM objects WHERE key = ?1",
-        params![key],
-        |r| r.get(0),
-    ).optional()?;
+    let stored: Option<u64> = conn
+        .query_row(
+            "SELECT revision FROM objects WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?;
 
     let is_create = stored.is_none();
 
     // 3. Optimistic concurrency check.
     match (stored, expected_revision) {
-        (_, None) => {}                                                 // unconditional
-        (None, Some(0)) => {}                                          // create-only, absent: OK
+        (_, None) => {}       // unconditional
+        (None, Some(0)) => {} // create-only, absent: OK
         (Some(_), Some(0)) => {
             conn.execute_batch("ROLLBACK")?;
-            return Err(StoreError::AlreadyExists { key: key.to_string() });
+            return Err(StoreError::AlreadyExists {
+                key: key.to_string(),
+            });
         }
         (None, Some(exp)) => {
             conn.execute_batch("ROLLBACK")?;
-            return Err(StoreError::RevisionMismatch { expected: exp, current: 0 });
+            return Err(StoreError::RevisionMismatch {
+                expected: exp,
+                current: 0,
+            });
         }
-        (Some(stored_rv), Some(exp)) if stored_rv == exp => {}        // match: OK
+        (Some(stored_rv), Some(exp)) if stored_rv == exp => {} // match: OK
         (Some(stored_rv), Some(exp)) => {
             conn.execute_batch("ROLLBACK")?;
-            return Err(StoreError::RevisionMismatch { expected: exp, current: stored_rv });
+            return Err(StoreError::RevisionMismatch {
+                expected: exp,
+                current: stored_rv,
+            });
         }
     }
 
@@ -319,31 +349,34 @@ fn put_sync(
     Ok((new_revision, stamped_value, is_create))
 }
 
-fn delete_sync(
-    conn: &Connection,
-    key: &str,
-    expected_revision: Option<u64>,
-) -> Result<u64> {
+fn delete_sync(conn: &Connection, key: &str, expected_revision: Option<u64>) -> Result<u64> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
-    let stored: Option<u64> = conn.query_row(
-        "SELECT revision FROM objects WHERE key = ?1",
-        params![key],
-        |r| r.get(0),
-    ).optional()?;
+    let stored: Option<u64> = conn
+        .query_row(
+            "SELECT revision FROM objects WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?;
 
     // Optimistic concurrency check (same logic as put).
     match (stored, expected_revision) {
         (None, _) => {
             conn.execute_batch("ROLLBACK")?;
-            return Err(StoreError::NotFound { key: key.to_string() });
+            return Err(StoreError::NotFound {
+                key: key.to_string(),
+            });
         }
         (Some(_), None) => {}
         (Some(_), Some(0)) => {} // 0 means "must exist" for delete (unconditional)
         (Some(stored_rv), Some(exp)) if stored_rv == exp => {}
         (Some(stored_rv), Some(exp)) => {
             conn.execute_batch("ROLLBACK")?;
-            return Err(StoreError::RevisionMismatch { expected: exp, current: stored_rv });
+            return Err(StoreError::RevisionMismatch {
+                expected: exp,
+                current: stored_rv,
+            });
         }
     }
 
@@ -363,17 +396,19 @@ fn delete_sync(
 }
 
 fn get_sync(conn: &Connection, key: &str) -> Result<Option<StoreObject>> {
-    let result = conn.query_row(
-        "SELECT key, value, revision FROM objects WHERE key = ?1",
-        params![key],
-        |r| {
-            Ok(StoreObject {
-                key:      r.get::<_, String>(0)?,
-                value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
-                revision: r.get::<_, u64>(2)?,
-            })
-        },
-    ).optional()?;
+    let result = conn
+        .query_row(
+            "SELECT key, value, revision FROM objects WHERE key = ?1",
+            params![key],
+            |r| {
+                Ok(StoreObject {
+                    key: r.get::<_, String>(0)?,
+                    value: Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                    revision: r.get::<_, u64>(2)?,
+                })
+            },
+        )
+        .optional()?;
     Ok(result)
 }
 
@@ -394,13 +429,15 @@ fn prefix_upper_bound(prefix: &str) -> String {
 
 fn query_all(conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Result<Vec<StoreObject>> {
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(p, |r| {
-        Ok(StoreObject {
-            key:      r.get(0)?,
-            value:    Bytes::from(r.get::<_, Vec<u8>>(1)?),
-            revision: r.get(2)?,
-        })
-    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = stmt
+        .query_map(p, |r| {
+            Ok(StoreObject {
+                key: r.get(0)?,
+                value: Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                revision: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -420,14 +457,16 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         {
             let like_prefix = format!("{}%", prefix);
             let raw = if ck.is_empty() {
-                query_all(conn,
+                query_all(
+                    conn,
                     "SELECT key, value, revision FROM objects \
                      WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
                      ORDER BY key ASC",
                     &[&like_prefix, value as &dyn rusqlite::ToSql],
                 )?
             } else {
-                query_all(conn,
+                query_all(
+                    conn,
                     "SELECT key, value, revision FROM objects \
                      WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
                      AND key > ?3 ORDER BY key ASC",
@@ -441,7 +480,8 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         Some(FieldSelector { field, value }) => {
             let raw = if upper.is_empty() {
                 if ck.is_empty() {
-                    query_all(conn,
+                    query_all(
+                        conn,
                         "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
                         &[&prefix],
                     )?
@@ -465,19 +505,22 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
 
             // Walk the dot-separated path in the parsed JSON and compare to expected value.
             let path_parts: Vec<&str> = field.split('.').collect();
-            let filtered: Vec<StoreObject> = raw.into_iter().filter(|obj| {
-                let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
-                    return false;
-                };
-                let mut cur = &parsed;
-                for part in &path_parts {
-                    match cur.get(part) {
-                        Some(next) => cur = next,
-                        None => return false,
+            let filtered: Vec<StoreObject> = raw
+                .into_iter()
+                .filter(|obj| {
+                    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
+                        return false;
+                    };
+                    let mut cur = &parsed;
+                    for part in &path_parts {
+                        match cur.get(part) {
+                            Some(next) => cur = next,
+                            None => return false,
+                        }
                     }
-                }
-                cur.as_str().is_some_and(|s| s == value)
-            }).collect();
+                    cur.as_str().is_some_and(|s| s == value)
+                })
+                .collect();
             paginate_in_memory(filtered, opts.limit)
         }
 
@@ -540,12 +583,19 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
 
     conn.execute_batch("COMMIT")?;
 
-    Ok(ListResponse { items, revision: snapshot_revision, continue_key })
+    Ok(ListResponse {
+        items,
+        revision: snapshot_revision,
+        continue_key,
+    })
 }
 
 /// Apply in-memory pagination: if limit is set, return at most limit items and
 /// set continue_key to the last item's key if more remain.
-fn paginate_in_memory(mut items: Vec<StoreObject>, limit: Option<u64>) -> (Vec<StoreObject>, Option<String>) {
+fn paginate_in_memory(
+    mut items: Vec<StoreObject>,
+    limit: Option<u64>,
+) -> (Vec<StoreObject>, Option<String>) {
     if let Some(limit) = limit {
         let limit = limit as usize;
         if items.len() > limit {
@@ -567,7 +617,8 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             get_sync(&conn, &key)
-        }).await?
+        })
+        .await?
     }
 
     async fn list(&self, prefix: &str, opts: ListOptions) -> Result<ListResponse> {
@@ -576,7 +627,8 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             list_sync(&conn, &prefix, &opts)
-        }).await?
+        })
+        .await?
     }
 
     async fn put(&self, key: &str, value: Bytes, expected_revision: Option<u64>) -> Result<u64> {
@@ -585,7 +637,8 @@ impl Store for SqliteStore {
         let (revision, stamped_value, is_create) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             put_sync(&conn, &key_str, value, expected_revision)
-        }).await??;
+        })
+        .await??;
 
         self.push_event(Arc::new(InternalEvent {
             key: key.to_string(),
@@ -603,7 +656,8 @@ impl Store for SqliteStore {
         let revision = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             delete_sync(&conn, &key_str, expected_revision)
-        }).await??;
+        })
+        .await??;
 
         self.push_event(Arc::new(InternalEvent {
             key: key.to_string(),
@@ -714,33 +768,39 @@ mod tests {
     }
 
     fn pod_json(name: &str) -> Bytes {
-        Bytes::from(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": name,
-                "namespace": "default"
-            },
-            "spec": {
-                "nodeName": "test-node",
-                "containers": [{"name": "nginx", "image": "nginx:latest"}]
-            }
-        }).to_string())
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name,
+                    "namespace": "default"
+                },
+                "spec": {
+                    "nodeName": "test-node",
+                    "containers": [{"name": "nginx", "image": "nginx:latest"}]
+                }
+            })
+            .to_string(),
+        )
     }
 
     fn pod_json_with_node(name: &str, node: &str) -> Bytes {
-        Bytes::from(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": name,
-                "namespace": "default"
-            },
-            "spec": {
-                "nodeName": node,
-                "containers": [{"name": "nginx", "image": "nginx:latest"}]
-            }
-        }).to_string())
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name,
+                    "namespace": "default"
+                },
+                "spec": {
+                    "nodeName": node,
+                    "containers": [{"name": "nginx", "image": "nginx:latest"}]
+                }
+            })
+            .to_string(),
+        )
     }
 
     #[tokio::test]
@@ -749,7 +809,10 @@ mod tests {
         let key = "/registry/pods/default/nginx";
         let value = pod_json("nginx");
 
-        let rv = store.put(key, value.clone(), Some(0)).await.expect("create");
+        let rv = store
+            .put(key, value.clone(), Some(0))
+            .await
+            .expect("create");
         assert!(rv > 0, "revision should be positive after create");
 
         let obj = store.get(key).await.expect("get").expect("should exist");
@@ -770,9 +833,15 @@ mod tests {
         let key = "/registry/pods/default/nginx";
         let value = pod_json("nginx");
 
-        store.put(key, value.clone(), Some(0)).await.expect("first create");
+        store
+            .put(key, value.clone(), Some(0))
+            .await
+            .expect("first create");
 
-        let err = store.put(key, value, Some(0)).await.expect_err("should fail");
+        let err = store
+            .put(key, value, Some(0))
+            .await
+            .expect_err("should fail");
         assert!(matches!(err, StoreError::AlreadyExists { .. }));
     }
 
@@ -782,15 +851,26 @@ mod tests {
         let key = "/registry/pods/default/nginx";
         let value = pod_json("nginx");
 
-        let rv1 = store.put(key, value.clone(), Some(0)).await.expect("create");
+        let rv1 = store
+            .put(key, value.clone(), Some(0))
+            .await
+            .expect("create");
 
         // Advance the revision by doing a replace
-        let rv2 = store.put(key, value.clone(), Some(rv1)).await.expect("first replace");
+        let rv2 = store
+            .put(key, value.clone(), Some(rv1))
+            .await
+            .expect("first replace");
         assert!(rv2 > rv1);
 
         // Now try to replace with the stale rv1
-        let err = store.put(key, value, Some(rv1)).await.expect_err("should conflict");
-        assert!(matches!(err, StoreError::RevisionMismatch { expected, current } if expected == rv1 && current == rv2));
+        let err = store
+            .put(key, value, Some(rv1))
+            .await
+            .expect_err("should conflict");
+        assert!(
+            matches!(err, StoreError::RevisionMismatch { expected, current } if expected == rv1 && current == rv2)
+        );
     }
 
     #[tokio::test]
@@ -820,11 +900,23 @@ mod tests {
     async fn test_list() {
         let store = make_store();
 
-        store.put("/registry/pods/default/alpha", pod_json("alpha"), Some(0)).await.expect("create alpha");
-        store.put("/registry/pods/default/beta", pod_json("beta"), Some(0)).await.expect("create beta");
-        store.put("/registry/pods/other/gamma", pod_json("gamma"), Some(0)).await.expect("create gamma");
+        store
+            .put("/registry/pods/default/alpha", pod_json("alpha"), Some(0))
+            .await
+            .expect("create alpha");
+        store
+            .put("/registry/pods/default/beta", pod_json("beta"), Some(0))
+            .await
+            .expect("create beta");
+        store
+            .put("/registry/pods/other/gamma", pod_json("gamma"), Some(0))
+            .await
+            .expect("create gamma");
 
-        let resp = store.list("/registry/pods/default/", ListOptions::default()).await.expect("list");
+        let resp = store
+            .list("/registry/pods/default/", ListOptions::default())
+            .await
+            .expect("list");
         assert_eq!(resp.items.len(), 2);
 
         let keys: Vec<&str> = resp.items.iter().map(|o| o.key.as_str()).collect();
@@ -838,7 +930,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_empty() {
         let store = make_store();
-        let resp = store.list("/registry/pods/default/", ListOptions::default()).await.expect("list");
+        let resp = store
+            .list("/registry/pods/default/", ListOptions::default())
+            .await
+            .expect("list");
         assert_eq!(resp.items.len(), 0);
         assert_eq!(resp.revision, 0);
     }
@@ -850,11 +945,17 @@ mod tests {
         let value = pod_json("nginx");
 
         // Unconditional create
-        let rv1 = store.put(key, value.clone(), None).await.expect("unconditional create");
+        let rv1 = store
+            .put(key, value.clone(), None)
+            .await
+            .expect("unconditional create");
         assert!(rv1 > 0);
 
         // Unconditional overwrite
-        let rv2 = store.put(key, value, None).await.expect("unconditional overwrite");
+        let rv2 = store
+            .put(key, value, None)
+            .await
+            .expect("unconditional overwrite");
         assert!(rv2 > rv1);
     }
 
@@ -863,7 +964,7 @@ mod tests {
         stream: &mut Pin<Box<dyn Stream<Item = WatchEvent> + Send>>,
     ) -> Option<WatchEvent> {
         use std::future::poll_fn;
-        use tokio::time::{Duration, timeout};
+        use tokio::time::{timeout, Duration};
         timeout(
             Duration::from_secs(2),
             poll_fn(|cx| stream.as_mut().poll_next(cx)),
@@ -879,16 +980,23 @@ mod tests {
         let store = make_store();
         let key = "/registry/pods/default/nginx";
 
-        let rv = store.put(key, pod_json("nginx"), Some(0)).await.expect("create");
+        let rv = store
+            .put(key, pod_json("nginx"), Some(0))
+            .await
+            .expect("create");
 
         // Watch from before the put; ring buffer should have the event.
-        let stream = store.watch("/registry/pods/default/", 0).await.expect("watch");
+        let stream = store
+            .watch("/registry/pods/default/", 0)
+            .await
+            .expect("watch");
         let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
 
         let event = next_event(&mut stream).await.expect("should get event");
         assert!(
             matches!(&event, WatchEvent::Added(obj) if obj.key == key && obj.revision == rv),
-            "expected Added, got {:?}", event
+            "expected Added, got {:?}",
+            event
         );
     }
 
@@ -898,21 +1006,32 @@ mod tests {
         let store = make_store();
         let key = "/registry/pods/default/nginx";
 
-        let _rv1 = store.put(key, pod_json("nginx"), Some(0)).await.expect("create");
+        let _rv1 = store
+            .put(key, pod_json("nginx"), Some(0))
+            .await
+            .expect("create");
         let rv2 = store.delete(key, None).await.expect("delete");
 
-        let stream = store.watch("/registry/pods/default/", 0).await.expect("watch");
+        let stream = store
+            .watch("/registry/pods/default/", 0)
+            .await
+            .expect("watch");
         let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
 
         // First event is Added from the put.
         let ev1 = next_event(&mut stream).await.expect("added event");
-        assert!(matches!(ev1, WatchEvent::Added(_)), "expected Added, got {:?}", ev1);
+        assert!(
+            matches!(ev1, WatchEvent::Added(_)),
+            "expected Added, got {:?}",
+            ev1
+        );
 
         // Second event is Deleted from the delete.
         let ev2 = next_event(&mut stream).await.expect("deleted event");
         assert!(
             matches!(&ev2, WatchEvent::Deleted { key: k, revision: r } if k == key && *r == rv2),
-            "expected Deleted, got {:?}", ev2
+            "expected Deleted, got {:?}",
+            ev2
         );
     }
 
@@ -930,10 +1049,19 @@ mod tests {
         let stream = store.watch("/registry/pods/", 10).await.expect("watch");
         let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
 
-        let event = next_event(&mut stream).await.expect("should get compacted event");
+        let event = next_event(&mut stream)
+            .await
+            .expect("should get compacted event");
         assert!(
-            matches!(event, WatchEvent::Compacted { requested: 10, horizon: 50 }),
-            "expected Compacted, got {:?}", event
+            matches!(
+                event,
+                WatchEvent::Compacted {
+                    requested: 10,
+                    horizon: 50
+                }
+            ),
+            "expected Compacted, got {:?}",
+            event
         );
     }
 
@@ -943,22 +1071,33 @@ mod tests {
         let store = make_store();
         let key = "/registry/pods/default/nginx";
 
-        let rv1 = store.put(key, pod_json("nginx"), Some(0)).await.expect("create");
-        let rv2 = store.put(key, pod_json("nginx-v2"), Some(rv1)).await.expect("update");
+        let rv1 = store
+            .put(key, pod_json("nginx"), Some(0))
+            .await
+            .expect("create");
+        let rv2 = store
+            .put(key, pod_json("nginx-v2"), Some(rv1))
+            .await
+            .expect("update");
 
-        let stream = store.watch("/registry/pods/default/", 0).await.expect("watch");
+        let stream = store
+            .watch("/registry/pods/default/", 0)
+            .await
+            .expect("watch");
         let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
 
         let ev1 = next_event(&mut stream).await.expect("first event");
         assert!(
             matches!(&ev1, WatchEvent::Added(obj) if obj.revision == rv1),
-            "expected Added for create, got {:?}", ev1
+            "expected Added for create, got {:?}",
+            ev1
         );
 
         let ev2 = next_event(&mut stream).await.expect("second event");
         assert!(
             matches!(&ev2, WatchEvent::Modified(obj) if obj.revision == rv2),
-            "expected Modified for update, got {:?}", ev2
+            "expected Modified for update, got {:?}",
+            ev2
         );
     }
 
@@ -970,12 +1109,30 @@ mod tests {
         // pods assigned to the requested node, exercising the partial SQLite index.
         let store = make_store();
 
-        store.put("/registry/pods/default/pod-a", pod_json_with_node("pod-a", "node-1"), Some(0))
-            .await.expect("create pod-a");
-        store.put("/registry/pods/default/pod-b", pod_json_with_node("pod-b", "node-2"), Some(0))
-            .await.expect("create pod-b");
-        store.put("/registry/pods/default/pod-c", pod_json_with_node("pod-c", "node-1"), Some(0))
-            .await.expect("create pod-c");
+        store
+            .put(
+                "/registry/pods/default/pod-a",
+                pod_json_with_node("pod-a", "node-1"),
+                Some(0),
+            )
+            .await
+            .expect("create pod-a");
+        store
+            .put(
+                "/registry/pods/default/pod-b",
+                pod_json_with_node("pod-b", "node-2"),
+                Some(0),
+            )
+            .await
+            .expect("create pod-b");
+        store
+            .put(
+                "/registry/pods/default/pod-c",
+                pod_json_with_node("pod-c", "node-1"),
+                Some(0),
+            )
+            .await
+            .expect("create pod-c");
 
         let opts = ListOptions {
             field_selector: Some(FieldSelector {
@@ -986,11 +1143,18 @@ mod tests {
         };
         let resp = store.list("/registry/pods/", opts).await.expect("list");
 
-        assert_eq!(resp.items.len(), 2, "should return exactly the 2 pods on node-1");
+        assert_eq!(
+            resp.items.len(),
+            2,
+            "should return exactly the 2 pods on node-1"
+        );
         let keys: Vec<&str> = resp.items.iter().map(|o| o.key.as_str()).collect();
         assert!(keys.contains(&"/registry/pods/default/pod-a"));
         assert!(keys.contains(&"/registry/pods/default/pod-c"));
-        assert!(!keys.contains(&"/registry/pods/default/pod-b"), "pod-b is on node-2, must be excluded");
+        assert!(
+            !keys.contains(&"/registry/pods/default/pod-b"),
+            "pod-b is on node-2, must be excluded"
+        );
     }
 
     #[tokio::test]
@@ -999,14 +1163,30 @@ mod tests {
         // metadata.namespace is not indexed; the code must fall back to a full scan + filter.
         let store = make_store();
 
-        store.put("/registry/pods/default/pod-a", pod_json_with_node("pod-a", "node-1"), Some(0))
-            .await.expect("create pod-a");
-        store.put("/registry/pods/other/pod-b", Bytes::from(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "pod-b", "namespace": "other" },
-            "spec": { "nodeName": "node-2", "containers": [] }
-        }).to_string()), Some(0)).await.expect("create pod-b");
+        store
+            .put(
+                "/registry/pods/default/pod-a",
+                pod_json_with_node("pod-a", "node-1"),
+                Some(0),
+            )
+            .await
+            .expect("create pod-a");
+        store
+            .put(
+                "/registry/pods/other/pod-b",
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": { "name": "pod-b", "namespace": "other" },
+                        "spec": { "nodeName": "node-2", "containers": [] }
+                    })
+                    .to_string(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("create pod-b");
 
         let opts = ListOptions {
             field_selector: Some(FieldSelector {
@@ -1026,12 +1206,28 @@ mod tests {
         // Verifies that field_selector: None preserves the existing list behavior exactly.
         let store = make_store();
 
-        store.put("/registry/pods/default/alpha", pod_json("alpha"), Some(0)).await.expect("create alpha");
-        store.put("/registry/pods/default/beta",  pod_json("beta"),  Some(0)).await.expect("create beta");
-        store.put("/registry/pods/other/gamma",   pod_json("gamma"), Some(0)).await.expect("create gamma");
+        store
+            .put("/registry/pods/default/alpha", pod_json("alpha"), Some(0))
+            .await
+            .expect("create alpha");
+        store
+            .put("/registry/pods/default/beta", pod_json("beta"), Some(0))
+            .await
+            .expect("create beta");
+        store
+            .put("/registry/pods/other/gamma", pod_json("gamma"), Some(0))
+            .await
+            .expect("create gamma");
 
-        let resp = store.list("/registry/pods/default/", ListOptions::default()).await.expect("list");
-        assert_eq!(resp.items.len(), 2, "default() must behave identically to before this change");
+        let resp = store
+            .list("/registry/pods/default/", ListOptions::default())
+            .await
+            .expect("list");
+        assert_eq!(
+            resp.items.len(),
+            2,
+            "default() must behave identically to before this change"
+        );
         let keys: Vec<&str> = resp.items.iter().map(|o| o.key.as_str()).collect();
         assert!(keys.contains(&"/registry/pods/default/alpha"));
         assert!(keys.contains(&"/registry/pods/default/beta"));
@@ -1049,28 +1245,56 @@ mod tests {
         //      (no decimals, no non-numeric characters).
         let store = make_store();
 
-        let pod_value = Bytes::from(serde_json::json!({
-            "apiVersion": "v1", "kind": "Pod",
-            "metadata": { "name": "p1", "namespace": "default" },
-            "spec": { "containers": [] }
-        }).to_string());
+        let pod_value = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": { "name": "p1", "namespace": "default" },
+                "spec": { "containers": [] }
+            })
+            .to_string(),
+        );
 
-        let ns_value = Bytes::from(serde_json::json!({
-            "apiVersion": "v1", "kind": "Namespace",
-            "metadata": { "name": "staging" }
-        }).to_string());
+        let ns_value = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "Namespace",
+                "metadata": { "name": "staging" }
+            })
+            .to_string(),
+        );
 
-        let cm_value = Bytes::from(serde_json::json!({
-            "apiVersion": "v1", "kind": "ConfigMap",
-            "metadata": { "name": "cfg", "namespace": "default" },
-            "data": {}
-        }).to_string());
+        let cm_value = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": { "name": "cfg", "namespace": "default" },
+                "data": {}
+            })
+            .to_string(),
+        );
 
-        let rv1 = store.put("/registry/pods/default/p1",          pod_value.clone(), Some(0)).await.expect("create pod");
-        let rv2 = store.put("/registry/namespaces/staging",        ns_value.clone(),  Some(0)).await.expect("create namespace");
-        let rv3 = store.put("/registry/configmaps/default/cfg",    cm_value.clone(),  Some(0)).await.expect("create configmap");
-        let rv4 = store.put("/registry/pods/default/p2",          pod_value.clone(), Some(0)).await.expect("create pod 2");
-        let rv5 = store.put("/registry/namespaces/production",     ns_value.clone(),  Some(0)).await.expect("create namespace 2");
+        let rv1 = store
+            .put("/registry/pods/default/p1", pod_value.clone(), Some(0))
+            .await
+            .expect("create pod");
+        let rv2 = store
+            .put("/registry/namespaces/staging", ns_value.clone(), Some(0))
+            .await
+            .expect("create namespace");
+        let rv3 = store
+            .put(
+                "/registry/configmaps/default/cfg",
+                cm_value.clone(),
+                Some(0),
+            )
+            .await
+            .expect("create configmap");
+        let rv4 = store
+            .put("/registry/pods/default/p2", pod_value.clone(), Some(0))
+            .await
+            .expect("create pod 2");
+        let rv5 = store
+            .put("/registry/namespaces/production", ns_value.clone(), Some(0))
+            .await
+            .expect("create namespace 2");
 
         let revisions = [rv1, rv2, rv3, rv4, rv5];
 
@@ -1079,7 +1303,8 @@ mod tests {
             assert!(
                 window[1] > window[0],
                 "resourceVersion must be strictly increasing across resource kinds: {} → {}",
-                window[0], window[1]
+                window[0],
+                window[1]
             );
         }
 
@@ -1087,21 +1312,26 @@ mod tests {
         // Kubernetes clients parse it with strconv.ParseInt — any decimal or non-numeric
         // character would cause conformance failures.
         for (key, expected_rv) in [
-            ("/registry/pods/default/p1",        rv1),
-            ("/registry/namespaces/staging",       rv2),
-            ("/registry/configmaps/default/cfg",   rv3),
+            ("/registry/pods/default/p1", rv1),
+            ("/registry/namespaces/staging", rv2),
+            ("/registry/configmaps/default/cfg", rv3),
         ] {
             let obj = store.get(key).await.expect("get").expect("should exist");
             let parsed: serde_json::Value = serde_json::from_slice(&obj.value).unwrap();
             let rv_str = parsed["metadata"]["resourceVersion"]
                 .as_str()
-                .unwrap_or_else(|| panic!("metadata.resourceVersion must be a string for key {key}"));
+                .unwrap_or_else(|| {
+                    panic!("metadata.resourceVersion must be a string for key {key}")
+                });
 
             // Must parse as u64 (integer, no decimal point).
             let rv_int: u64 = rv_str.parse().unwrap_or_else(|_| {
                 panic!("metadata.resourceVersion '{rv_str}' is not a valid integer string for key {key}")
             });
-            assert_eq!(rv_int, expected_rv, "stamped resourceVersion must match returned revision for key {key}");
+            assert_eq!(
+                rv_int, expected_rv,
+                "stamped resourceVersion must match returned revision for key {key}"
+            );
         }
     }
 
@@ -1114,15 +1344,39 @@ mod tests {
         // whether it's the last page or pagination is simply broken.
         let store = make_store();
 
-        store.put("/registry/pods/default/aaa", pod_json("aaa"), Some(0)).await.expect("create aaa");
-        store.put("/registry/pods/default/bbb", pod_json("bbb"), Some(0)).await.expect("create bbb");
-        store.put("/registry/pods/default/ccc", pod_json("ccc"), Some(0)).await.expect("create ccc");
+        store
+            .put("/registry/pods/default/aaa", pod_json("aaa"), Some(0))
+            .await
+            .expect("create aaa");
+        store
+            .put("/registry/pods/default/bbb", pod_json("bbb"), Some(0))
+            .await
+            .expect("create bbb");
+        store
+            .put("/registry/pods/default/ccc", pod_json("ccc"), Some(0))
+            .await
+            .expect("create ccc");
 
-        let resp = store.list("/registry/pods/default/", ListOptions { limit: Some(2), ..Default::default() })
-            .await.expect("list page 1");
+        let resp = store
+            .list(
+                "/registry/pods/default/",
+                ListOptions {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list page 1");
 
-        assert_eq!(resp.items.len(), 2, "page 1 must return exactly limit items");
-        assert!(resp.continue_key.is_some(), "more items remain; continue_key must be set");
+        assert_eq!(
+            resp.items.len(),
+            2,
+            "page 1 must return exactly limit items"
+        );
+        assert!(
+            resp.continue_key.is_some(),
+            "more items remain; continue_key must be set"
+        );
     }
 
     #[tokio::test]
@@ -1131,24 +1385,64 @@ mod tests {
         // the last item of page 1. If continue_key is ignored, the client gets duplicates.
         let store = make_store();
 
-        store.put("/registry/pods/default/aaa", pod_json("aaa"), Some(0)).await.expect("create aaa");
-        store.put("/registry/pods/default/bbb", pod_json("bbb"), Some(0)).await.expect("create bbb");
-        store.put("/registry/pods/default/ccc", pod_json("ccc"), Some(0)).await.expect("create ccc");
+        store
+            .put("/registry/pods/default/aaa", pod_json("aaa"), Some(0))
+            .await
+            .expect("create aaa");
+        store
+            .put("/registry/pods/default/bbb", pod_json("bbb"), Some(0))
+            .await
+            .expect("create bbb");
+        store
+            .put("/registry/pods/default/ccc", pod_json("ccc"), Some(0))
+            .await
+            .expect("create ccc");
 
-        let page1 = store.list("/registry/pods/default/", ListOptions { limit: Some(2), ..Default::default() })
-            .await.expect("page 1");
-        let ck = page1.continue_key.clone().expect("must have continue_key after page 1");
+        let page1 = store
+            .list(
+                "/registry/pods/default/",
+                ListOptions {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("page 1");
+        let ck = page1
+            .continue_key
+            .clone()
+            .expect("must have continue_key after page 1");
 
-        let page2 = store.list("/registry/pods/default/", ListOptions { limit: Some(2), continue_key: Some(ck), ..Default::default() })
-            .await.expect("page 2");
+        let page2 = store
+            .list(
+                "/registry/pods/default/",
+                ListOptions {
+                    limit: Some(2),
+                    continue_key: Some(ck),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("page 2");
 
-        assert_eq!(page2.items.len(), 1, "page 2 must return the remaining 1 item");
-        assert!(page2.continue_key.is_none(), "no more items; last page must not have continue_key");
+        assert_eq!(
+            page2.items.len(),
+            1,
+            "page 2 must return the remaining 1 item"
+        );
+        assert!(
+            page2.continue_key.is_none(),
+            "no more items; last page must not have continue_key"
+        );
 
         // Verify no overlap: page 2 must not contain any item from page 1.
-        let page1_keys: std::collections::HashSet<&str> = page1.items.iter().map(|o| o.key.as_str()).collect();
+        let page1_keys: std::collections::HashSet<&str> =
+            page1.items.iter().map(|o| o.key.as_str()).collect();
         for item in &page2.items {
-            assert!(!page1_keys.contains(item.key.as_str()), "page 2 must not repeat items from page 1");
+            assert!(
+                !page1_keys.contains(item.key.as_str()),
+                "page 2 must not repeat items from page 1"
+            );
         }
     }
 
@@ -1159,14 +1453,31 @@ mod tests {
         // treat as an error rather than end-of-list.
         let store = make_store();
 
-        store.put("/registry/pods/default/aaa", pod_json("aaa"), Some(0)).await.expect("create aaa");
-        store.put("/registry/pods/default/bbb", pod_json("bbb"), Some(0)).await.expect("create bbb");
+        store
+            .put("/registry/pods/default/aaa", pod_json("aaa"), Some(0))
+            .await
+            .expect("create aaa");
+        store
+            .put("/registry/pods/default/bbb", pod_json("bbb"), Some(0))
+            .await
+            .expect("create bbb");
 
-        let resp = store.list("/registry/pods/default/", ListOptions { limit: Some(10), ..Default::default() })
-            .await.expect("list with limit > total");
+        let resp = store
+            .list(
+                "/registry/pods/default/",
+                ListOptions {
+                    limit: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list with limit > total");
 
         assert_eq!(resp.items.len(), 2);
-        assert!(resp.continue_key.is_none(), "all items fit in one page; continue_key must be absent");
+        assert!(
+            resp.continue_key.is_none(),
+            "all items fit in one page; continue_key must be absent"
+        );
     }
 
     #[test]

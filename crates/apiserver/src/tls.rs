@@ -1,6 +1,9 @@
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
-use rustls::{RootCertStore, ServerConfig, pki_types::{CertificateDer, PrivateKeyDer}};
 use rustls::server::WebPkiClientVerifier;
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer},
+    RootCertStore, ServerConfig,
+};
 use std::sync::Arc;
 
 use crate::Args;
@@ -131,8 +134,8 @@ fn load_or_generate_ca(
         // Load CA key from PEM.
         let key_pem = std::fs::read_to_string(ca_key_path)
             .map_err(|e| anyhow::anyhow!("read CA key {ca_key_path}: {e}"))?;
-        let ca_key = KeyPair::from_pem(&key_pem)
-            .map_err(|e| anyhow::anyhow!("parse CA key: {e}"))?;
+        let ca_key =
+            KeyPair::from_pem(&key_pem).map_err(|e| anyhow::anyhow!("parse CA key: {e}"))?;
 
         // Load the persisted CA cert DER (stable — handed to TlsMaterial as-is).
         let ca_cert_der = std::fs::read(ca_cert_path)
@@ -145,7 +148,9 @@ fn load_or_generate_ca(
         // the stable ca_cert_der loaded above.
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "u7s-ca");
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "u7s-ca");
         let ca_cert = ca_params
             .self_signed(&ca_key)
             .map_err(|e| anyhow::anyhow!("reconstruct CA cert: {e}"))?;
@@ -156,11 +161,12 @@ fn load_or_generate_ca(
 
     // Generate fresh CA.
     tracing::info!("generating new CA key+cert → {ca_key_path} / {ca_cert_path}");
-    let ca_key = KeyPair::generate()
-        .map_err(|e| anyhow::anyhow!("generate CA key: {e}"))?;
+    let ca_key = KeyPair::generate().map_err(|e| anyhow::anyhow!("generate CA key: {e}"))?;
     let mut ca_params = CertificateParams::default();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "u7s-ca");
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "u7s-ca");
     let ca_cert = ca_params
         .self_signed(&ca_key)
         .map_err(|e| anyhow::anyhow!("self-sign CA: {e}"))?;
@@ -197,7 +203,11 @@ fn advertise_host(advertise_address: Option<&str>) -> Option<String> {
         .trim_start_matches("http://");
     // Strip port suffix — split on ':' and take the first segment.
     let host = without_scheme.split(':').next()?;
-    if host.is_empty() { None } else { Some(host.to_owned()) }
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_owned())
+    }
 }
 
 /// Build the full SAN list for the server certificate.
@@ -234,17 +244,21 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // plus the advertise-address host if provided.
     let sans = build_server_sans(advertise_host(args.advertise_address.as_deref()).as_deref())?;
     server_params.subject_alt_names = sans;
-    server_params.distinguished_name.push(
-        rcgen::DnType::CommonName, "u7s-apiserver",
-    );
+    server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "u7s-apiserver");
     let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key)?;
 
     // --- Admin client cert ---
     let admin_key = KeyPair::generate()?;
     let mut admin_params = CertificateParams::default();
-    admin_params.distinguished_name.push(rcgen::DnType::CommonName, "admin");
+    admin_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "admin");
     // O=system:masters bypasses RBAC (Phase 3+). Harmless in Phase 1 (no RBAC).
-    admin_params.distinguished_name.push(rcgen::DnType::OrganizationName, "system:masters");
+    admin_params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, "system:masters");
     let admin_cert = admin_params.signed_by(&admin_key, &ca_cert, &ca_key)?;
 
     // --- Build rustls ServerConfig ---
@@ -273,8 +287,8 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     Ok(TlsMaterial {
         ca_cert_der,
         admin_cert_der: admin_cert.der().to_vec(),
-        admin_key_pem:  admin_key.serialize_pem().into_bytes(),
-        server_config:  Arc::new(server_config),
+        admin_key_pem: admin_key.serialize_pem().into_bytes(),
+        server_config: Arc::new(server_config),
     })
 }
 
@@ -438,7 +452,10 @@ mod tests {
         let _ = san_dns_names(&tls);
         // Verify host parses as DNS (not IP).
         let host = advertise_host(args.advertise_address.as_deref()).unwrap();
-        assert!(host.parse::<std::net::IpAddr>().is_err(), "expected DNS name, got IP");
+        assert!(
+            host.parse::<std::net::IpAddr>().is_err(),
+            "expected DNS name, got IP"
+        );
         assert_eq!(host, "host.lima.internal");
     }
 
@@ -448,7 +465,10 @@ mod tests {
         let tls = generate_tls(&args).expect("generate_tls failed");
         let _ = san_dns_names(&tls);
         let host = advertise_host(args.advertise_address.as_deref()).unwrap();
-        assert!(host.parse::<std::net::IpAddr>().is_ok(), "expected IP address");
+        assert!(
+            host.parse::<std::net::IpAddr>().is_ok(),
+            "expected IP address"
+        );
         assert_eq!(host, "192.168.1.10");
     }
 
@@ -475,10 +495,13 @@ mod tests {
     #[test]
     fn build_server_sans_always_includes_lima_host() {
         let sans = build_server_sans(None).expect("build_server_sans failed");
-        let has_lima = sans.iter().any(|s| {
-            matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal")
-        });
-        assert!(has_lima, "host.lima.internal must be in server SANs regardless of advertise_address");
+        let has_lima = sans
+            .iter()
+            .any(|s| matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal"));
+        assert!(
+            has_lima,
+            "host.lima.internal must be in server SANs regardless of advertise_address"
+        );
     }
 
     /// build_server_sans with an IP advertise_host must include both host.lima.internal
@@ -486,13 +509,16 @@ mod tests {
     #[test]
     fn build_server_sans_with_ip_includes_both() {
         let sans = build_server_sans(Some("192.168.5.1")).expect("build_server_sans failed");
-        let has_lima = sans.iter().any(|s| {
-            matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal")
-        });
-        assert!(has_lima, "host.lima.internal must be present even when advertise_address is an IP");
-        let has_ip = sans.iter().any(|s| {
-            matches!(s, SanType::IpAddress(ip) if ip.to_string() == "192.168.5.1")
-        });
+        let has_lima = sans
+            .iter()
+            .any(|s| matches!(s, SanType::DnsName(n) if n.as_ref() == "host.lima.internal"));
+        assert!(
+            has_lima,
+            "host.lima.internal must be present even when advertise_address is an IP"
+        );
+        let has_ip = sans
+            .iter()
+            .any(|s| matches!(s, SanType::IpAddress(ip) if ip.to_string() == "192.168.5.1"));
         assert!(has_ip, "advertise IP 192.168.5.1 must be in SANs");
     }
 
@@ -541,7 +567,9 @@ mod tests {
     }
 
     /// Helper: call load_or_generate_ca with paths inside `dir`.
-    fn run_load_or_generate_ca(dir: &std::path::Path) -> anyhow::Result<(KeyPair, rcgen::Certificate, Vec<u8>)> {
+    fn run_load_or_generate_ca(
+        dir: &std::path::Path,
+    ) -> anyhow::Result<(KeyPair, rcgen::Certificate, Vec<u8>)> {
         let ca_key_path = dir.join("ca.key").to_string_lossy().into_owned();
         let ca_cert_path = dir.join("ca.crt").to_string_lossy().into_owned();
         load_or_generate_ca(&ca_key_path, &ca_cert_path)
