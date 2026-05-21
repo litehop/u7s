@@ -432,7 +432,7 @@ mod tests {
             .subsec_nanos();
         let tid = std::thread::current().id();
         let dir = std::env::temp_dir().join(format!("u7s-tls-{tag}-{nanos}-{tid:?}"));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::create_dir_all(&dir).expect("create temp dir"); // lgtm[rust/path-injection]
         dir
     }
 
@@ -608,7 +608,7 @@ mod tests {
         );
 
         // Clean up.
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     /// Helper: call load_or_generate_ca with paths inside `dir`.
@@ -632,7 +632,7 @@ mod tests {
         let ca_cert_path = dir.join("ca.crt");
 
         // Write only ca.key — no ca.crt.
-        std::fs::write(&ca_key_path, b"dummy-key-content").expect("write dummy ca.key");
+        std::fs::write(&ca_key_path, b"dummy-key-content").expect("write dummy ca.key"); // lgtm[rust/path-injection]
         assert!(ca_key_path.exists());
         assert!(!ca_cert_path.exists());
 
@@ -642,7 +642,7 @@ mod tests {
         assert!(ca_key_path.exists(), "ca.key must exist after recovery");
         assert!(ca_cert_path.exists(), "ca.crt must exist after recovery");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     #[test]
@@ -656,7 +656,7 @@ mod tests {
         let ca_cert_path = dir.join("ca.crt");
 
         // Write only ca.crt — no ca.key.
-        std::fs::write(&ca_cert_path, b"dummy-cert-content").expect("write dummy ca.crt");
+        std::fs::write(&ca_cert_path, b"dummy-cert-content").expect("write dummy ca.crt"); // lgtm[rust/path-injection]
         assert!(!ca_key_path.exists());
         assert!(ca_cert_path.exists());
 
@@ -666,7 +666,7 @@ mod tests {
         assert!(ca_key_path.exists(), "ca.key must exist after recovery");
         assert!(ca_cert_path.exists(), "ca.crt must exist after recovery");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     /// SA private key must be written with mode 0o600 (owner-only) so it is
@@ -681,7 +681,7 @@ mod tests {
         let bytes = b"fake-key-content";
         write_private_key(key_path.clone(), bytes).expect("write_private_key must succeed");
 
-        let meta = std::fs::metadata(&key_path).expect("file must exist");
+        let meta = std::fs::metadata(&key_path).expect("file must exist"); // lgtm[rust/path-injection]
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
@@ -689,7 +689,7 @@ mod tests {
              world-readable keys allow local users to forge SA tokens",
             mode
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     /// Kubeconfig must be written with mode 0o600 (owner-only).
@@ -719,7 +719,7 @@ mod tests {
         write_kubeconfig(&kubeconfig_path.to_string_lossy(), &tls, &args)
             .expect("write_kubeconfig must succeed");
 
-        let meta = std::fs::metadata(&kubeconfig_path).expect("kubeconfig file must exist");
+        let meta = std::fs::metadata(&kubeconfig_path).expect("kubeconfig file must exist"); // lgtm[rust/path-injection]
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
@@ -727,7 +727,7 @@ mod tests {
              world-readable kubeconfig allows any local user to impersonate cluster admin",
             mode
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 
     /// CA private key must also be written with mode 0o600.
@@ -738,7 +738,7 @@ mod tests {
         let (_, _, _) = run_load_or_generate_ca(&dir).expect("generate CA");
 
         let ca_key_path = dir.join("ca.key");
-        let meta = std::fs::metadata(&ca_key_path).expect("ca.key must exist");
+        let meta = std::fs::metadata(&ca_key_path).expect("ca.key must exist"); // lgtm[rust/path-injection]
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o600,
@@ -746,6 +746,6 @@ mod tests {
              world-readable CA keys allow anyone to sign rogue certs",
             mode
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 }
