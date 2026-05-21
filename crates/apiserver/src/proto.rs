@@ -1205,7 +1205,10 @@ mod tests {
         let field_numbers: Vec<u64> = fields.iter().map(|(fn_, _, _)| *fn_).collect();
         assert!(field_numbers.contains(&1), "TypeMeta field must be present");
         assert!(field_numbers.contains(&2), "raw field must be present");
-        assert!(field_numbers.contains(&4), "contentType field must be present");
+        assert!(
+            field_numbers.contains(&4),
+            "contentType field must be present"
+        );
 
         let env = decode_k8s_proto_envelope(&encoded).expect("must decode as k8s envelope");
         let recovered: serde_json::Value =
@@ -1399,7 +1402,11 @@ mod tests {
         );
 
         // Also walk the TypeMeta sub-message.
-        let type_meta_len = fields.iter().find(|(fn_, _, _)| *fn_ == 1).map(|(_, _, l)| *l).unwrap();
+        let type_meta_len = fields
+            .iter()
+            .find(|(fn_, _, _)| *fn_ == 1)
+            .map(|(_, _, l)| *l)
+            .unwrap();
         let type_meta_start = {
             // field 1 tag byte (1 byte) + len varint (1 byte for len < 128)
             let mut p = 0;
