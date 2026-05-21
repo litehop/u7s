@@ -97,6 +97,57 @@ pub struct CustomResourceDefinition {
 }
 
 // ---------------------------------------------------------------------------
+// Built-in API group protection
+// ---------------------------------------------------------------------------
+
+/// API groups that CRDs must never shadow. Allowing a CRD to claim one of
+/// these groups would let an unprivileged actor intercept or replace built-in
+/// Kubernetes API objects (e.g. create a "pods" CRD in group "apps" and have
+/// it served instead of the real apps/v1 Deployments).
+const BUILTIN_GROUPS: &[&str] = &[
+    "",
+    "apps",
+    "batch",
+    "autoscaling",
+    "rbac.authorization.k8s.io",
+    "authorization.k8s.io",
+    "authentication.k8s.io",
+    "apiextensions.k8s.io",
+    "admissionregistration.k8s.io",
+    "networking.k8s.io",
+    "policy",
+    "storage.k8s.io",
+    "scheduling.k8s.io",
+    "coordination.k8s.io",
+    "node.k8s.io",
+    "discovery.k8s.io",
+    "events.k8s.io",
+    "flowcontrol.apiserver.k8s.io",
+    "internal.apiserver.k8s.io",
+];
+
+/// Validate that a CRD spec.group does not shadow a built-in API group and
+/// contains no path traversal characters.
+fn validate_crd_group(group: &str) -> Result<(), crate::status::StatusError> {
+    // Block path traversal in group name.
+    if group.contains('/') || group.contains("..") {
+        return Err(Status::unprocessable_entity(format!(
+            "spec.group '{}' must not contain '/' or '..'",
+            group
+        )));
+    }
+    // Block built-in groups.
+    if BUILTIN_GROUPS.contains(&group) {
+        return Err(Status::unprocessable_entity(format!(
+            "spec.group '{}' shadows a built-in Kubernetes API group and is not allowed; \
+             choose a group name you control (e.g. 'myapp.example.com')",
+            group
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -205,6 +256,8 @@ pub async fn create_crd(
             "metadata.name is required".into(),
         ));
     }
+
+    validate_crd_group(&crd.spec.group)?;
 
     let expected_name = format!("{}.{}", crd.spec.names.plural, crd.spec.group);
     if name != expected_name {
@@ -701,5 +754,103 @@ mod tests {
             Some("chunked"),
             "watch response must use chunked transfer encoding"
         );
+    }
+
+    // -- validate_crd_group: built-in group shadowing protection --
+
+    /// A CRD with spec.group="apps" must be rejected with 422.
+    /// Allowing it would let unprivileged users shadow the real apps/v1 API group
+    /// and intercept Deployment, ReplicaSet, etc. traffic.
+    #[tokio::test]
+    async fn create_crd_rejects_builtin_group_apps() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "foos.apps" },
+                "spec": {
+                    "group": "apps",
+                    "names": {
+                        "plural": "foos",
+                        "singular": "foo",
+                        "kind": "Foo"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+
+        let err = err_status(create_crd(State(state), HeaderMap::new(), body).await);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "built-in group 'apps' must return 422 Unprocessable Entity"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("built-in"),
+            "error must mention built-in group restriction"
+        );
+    }
+
+    /// A CRD with a valid user-controlled group must be accepted.
+    #[tokio::test]
+    async fn create_crd_accepts_user_controlled_group() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.myapp.example.com" },
+                "spec": {
+                    "group": "myapp.example.com",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            create_crd(State(state), HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "user-controlled group must be accepted"
+        );
+    }
+
+    /// validate_crd_group unit tests for all built-in groups and edge cases.
+    #[test]
+    fn validate_crd_group_blocks_all_builtin_groups() {
+        for group in BUILTIN_GROUPS {
+            let result = validate_crd_group(group);
+            assert!(
+                result.is_err(),
+                "built-in group '{group}' must be rejected by validate_crd_group"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_crd_group_rejects_path_traversal() {
+        assert!(validate_crd_group("../../etc").is_err());
+        assert!(validate_crd_group("foo/bar").is_err());
+    }
+
+    #[test]
+    fn validate_crd_group_accepts_valid_user_groups() {
+        assert!(validate_crd_group("example.com").is_ok());
+        assert!(validate_crd_group("argoproj.io").is_ok());
+        assert!(validate_crd_group("gateway.networking.x-k8s.io").is_ok());
     }
 }
