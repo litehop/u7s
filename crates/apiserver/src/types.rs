@@ -268,3 +268,180 @@ impl Object {
         Ok(Self { body })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use serde_json::json;
+
+    // APIVersions::v1 must set the correct kind, apiVersion, and embed the server address
+    #[test]
+    fn api_versions_v1_fields() {
+        let av = APIVersions::v1("192.168.1.1:6443".to_string());
+        assert_eq!(av.kind, "APIVersions");
+        assert_eq!(av.api_version, "v1");
+        assert_eq!(av.versions, &["v1"]);
+        assert_eq!(av.server_address_by_client_cidrs.len(), 1);
+        assert_eq!(
+            av.server_address_by_client_cidrs[0].server_address,
+            "192.168.1.1:6443"
+        );
+        assert_eq!(
+            av.server_address_by_client_cidrs[0].client_cidr,
+            "0.0.0.0/0"
+        );
+    }
+
+    // APIVersions::v1 must serialize to valid JSON with the correct field names kubectl expects
+    #[test]
+    fn api_versions_v1_serializes() {
+        let av = APIVersions::v1("localhost:6443".to_string());
+        let json = serde_json::to_value(&av).unwrap();
+        assert_eq!(json["kind"], "APIVersions");
+        assert_eq!(json["apiVersion"], "v1");
+        assert!(json["serverAddressByClientCIDRs"].is_array());
+        assert_eq!(
+            json["serverAddressByClientCIDRs"][0]["serverAddress"],
+            "localhost:6443"
+        );
+    }
+
+    // ApiResourceList::v1 must contain all expected core resources
+    #[test]
+    fn api_resource_list_v1_contains_core_resources() {
+        let list = ApiResourceList::v1();
+        assert_eq!(list.kind, "APIResourceList");
+        assert_eq!(list.api_version, "v1");
+        assert_eq!(list.group_version, "v1");
+        let names: Vec<&str> = list.resources.iter().map(|r| r.name).collect();
+        assert!(names.contains(&"pods"));
+        assert!(names.contains(&"nodes"));
+        assert!(names.contains(&"namespaces"));
+        assert!(names.contains(&"services"));
+        assert!(names.contains(&"secrets"));
+        assert!(names.contains(&"serviceaccounts"));
+        assert!(names.contains(&"configmaps"));
+        assert!(names.contains(&"events"));
+    }
+
+    // ApiResourceList::v1 must serialize with the correct camelCase field names
+    #[test]
+    fn api_resource_list_v1_serializes() {
+        let list = ApiResourceList::v1();
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(json["kind"], "APIResourceList");
+        assert_eq!(json["groupVersion"], "v1");
+        // shortNames must be omitted when None (events has no shortNames)
+        let resources = json["resources"].as_array().unwrap();
+        let events = resources.iter().find(|r| r["name"] == "events").unwrap();
+        assert!(events.get("shortNames").is_none());
+        // pods must have shortNames
+        let pods = resources.iter().find(|r| r["name"] == "pods").unwrap();
+        assert_eq!(pods["shortNames"][0], "po");
+    }
+
+    // Namespace::parse must accept valid lowercase-alphanumeric-hyphen names
+    #[test]
+    fn namespace_parse_valid() {
+        let ns = Namespace::parse("default").unwrap();
+        assert_eq!(ns.as_str(), "default");
+        let ns2 = Namespace::parse("kube-system").unwrap();
+        assert_eq!(ns2.as_str(), "kube-system");
+        let ns3 = Namespace::parse("ns123").unwrap();
+        assert_eq!(ns3.as_str(), "ns123");
+    }
+
+    // Namespace::parse must reject empty string — empty is not a valid namespace
+    #[test]
+    fn namespace_parse_empty_is_error() {
+        assert!(Namespace::parse("").is_err());
+    }
+
+    // Namespace::parse must reject names with uppercase letters
+    #[test]
+    fn namespace_parse_uppercase_is_error() {
+        let err = Namespace::parse("Default").unwrap_err();
+        assert!(err.contains("invalid namespace name"));
+    }
+
+    // Namespace::parse must reject names with special characters like underscores or dots
+    #[test]
+    fn namespace_parse_special_chars_is_error() {
+        assert!(Namespace::parse("my_ns").is_err());
+        assert!(Namespace::parse("my.ns").is_err());
+        assert!(Namespace::parse("my ns").is_err());
+    }
+
+    // Namespace::fmt must produce the bare string (used in log messages and error text)
+    #[test]
+    fn namespace_display() {
+        let ns = Namespace::parse("default").unwrap();
+        assert_eq!(format!("{ns}"), "default");
+    }
+
+    // Object::name must return the metadata.name field when present
+    #[test]
+    fn object_name_present() {
+        let obj = Object {
+            body: json!({"metadata": {"name": "my-pod"}}),
+        };
+        assert_eq!(obj.name(), Some("my-pod"));
+    }
+
+    // Object::name must return None when metadata.name is absent
+    #[test]
+    fn object_name_absent() {
+        let obj = Object {
+            body: json!({"metadata": {}}),
+        };
+        assert_eq!(obj.name(), None);
+    }
+
+    // Object::resource_version must return the metadata.resourceVersion string when present
+    #[test]
+    fn object_resource_version_present() {
+        let obj = Object {
+            body: json!({"metadata": {"resourceVersion": "42"}}),
+        };
+        assert_eq!(obj.resource_version(), Some("42"));
+    }
+
+    // Object::resource_version must return None when absent
+    #[test]
+    fn object_resource_version_absent() {
+        let obj = Object {
+            body: json!({"metadata": {}}),
+        };
+        assert_eq!(obj.resource_version(), None);
+    }
+
+    // Object::set_resource_version must overwrite the resourceVersion field
+    #[test]
+    fn object_set_resource_version() {
+        let mut obj = Object {
+            body: json!({"metadata": {"resourceVersion": "1"}}),
+        };
+        obj.set_resource_version(99);
+        assert_eq!(obj.resource_version(), Some("99"));
+    }
+
+    // Object::to_bytes / from_bytes round-trip must preserve the body exactly
+    #[test]
+    fn object_bytes_round_trip() {
+        let original = Object {
+            body: json!({"metadata": {"name": "pod-a", "resourceVersion": "7"}, "spec": {}}),
+        };
+        let bytes = original.to_bytes();
+        let restored = Object::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.name(), Some("pod-a"));
+        assert_eq!(restored.resource_version(), Some("7"));
+    }
+
+    // Object::from_bytes must return an error on malformed JSON
+    #[test]
+    fn object_from_bytes_invalid_json() {
+        let bad = Bytes::from_static(b"not json");
+        assert!(Object::from_bytes(&bad).is_err());
+    }
+}

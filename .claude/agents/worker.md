@@ -29,19 +29,28 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
 ## Workflow
 
 ```bash
-# 0. Verify you are in your isolated worktree — BEFORE touching any file
+# 0. Create and enter your worktree — BEFORE touching any file
 #
-# Your working directory must be ai/worktrees/<name>, NOT the repo root.
-# If you are in the repo root (/Users/balint.erdos/u7s or similar), STOP.
-# You are in the wrong place and will corrupt the mayor's main branch.
+# Your dispatch prompt will name your worktree. Create it, copy the
+# project settings so you inherit the permission allowlist, then cd in.
 #
-# Check:
+REPO=/Users/balint.erdos/u7s
+WORKTREE=$REPO/ai/worktrees/<your-worktree-name>
+BRANCH=worker/<your-worktree-name>
+
+cd $REPO
+git worktree add $WORKTREE -b $BRANCH
+
+# Copy project settings into the worktree so Bash permissions work
+mkdir -p $WORKTREE/.claude
+cp $REPO/.claude/settings.json $WORKTREE/.claude/settings.json
+
+cd $WORKTREE
 pwd                        # must end in ai/worktrees/<something>
-git branch --show-current  # must be worker/<slug>-<bead-id>
+git branch --show-current  # must be worker/<slug>
 git status --short         # must be clean
 
-# If you are NOT in a worktree, abort and report the issue to the mayor.
-# Do not attempt to create a branch or checkout in the repo root.
+# NEVER edit files from the repo root. Always cd to your worktree first.
 
 # 1. Claim the bead
 bd update <id> --claim
