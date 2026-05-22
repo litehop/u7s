@@ -9,6 +9,7 @@ pub mod generic;
 pub mod json_patch;
 pub mod namespaces;
 pub mod pods;
+pub mod proxy;
 pub mod resource;
 pub mod scale;
 pub mod status;
