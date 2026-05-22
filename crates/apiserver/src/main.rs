@@ -1289,6 +1289,89 @@ mod tests {
         );
     }
 
+    /// Verifies that POST /apis/batch/v1/namespaces/default/jobs creates a Job and
+    /// GET /apis/batch/v1/namespaces/default/jobs/{name} retrieves it.
+    ///
+    /// batch/v1 is a new API group. Without the registry entry, the generic handler
+    /// falls through to the CR handler which returns 404 (no CRD installed). This test
+    /// encodes the requirement that Job is served by the generic namespaced handler.
+    #[tokio::test]
+    async fn job_create_and_get_round_trip() {
+        use std::sync::Arc;
+
+        let store = Arc::new(make_store());
+        let state = state::AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let body = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "ci-job", "namespace": "default" },
+            "spec": { "template": { "spec": { "containers": [{ "name": "test", "image": "busybox" }], "restartPolicy": "Never" } } }
+        });
+        let body_bytes = bytes::Bytes::from(body.to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        // POST creates the Job.
+        let create_result = handlers::resource::create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "batch".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "jobs".to_string(),
+            )),
+            headers,
+            body_bytes,
+        )
+        .await;
+        assert!(
+            create_result.is_ok(),
+            "POST /apis/batch/v1/namespaces/default/jobs must succeed — batch/v1 Job must be in registry"
+        );
+
+        // GET retrieves the Job.
+        let get_result = handlers::resource::get_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "batch".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "jobs".to_string(),
+                "ci-job".to_string(),
+            )),
+        )
+        .await;
+        assert!(
+            get_result.is_ok(),
+            "GET /apis/batch/v1/namespaces/default/jobs/ci-job must succeed after create"
+        );
+
+        // Verify it's stored at the expected key.
+        let store_key = keys::group_object_key("batch", "jobs", Some("default"), "ci-job");
+        let stored = store
+            .get(&store_key)
+            .await
+            .expect("store.get must not fail");
+        assert!(
+            stored.is_some(),
+            "Job ci-job must be in the store at key {store_key}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&stored.unwrap().value).expect("valid json");
+        assert_eq!(parsed["kind"].as_str(), Some("Job"));
+        assert_eq!(parsed["metadata"]["name"].as_str(), Some("ci-job"));
+    }
+
     /// Verifies that POST /apis/storage.k8s.io/v1/csinodes creates a CSINode and
     /// GET /apis/storage.k8s.io/v1/csinodes/{name} retrieves it.
     ///

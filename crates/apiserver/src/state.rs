@@ -171,6 +171,10 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
 
     // core/v1 — cluster-scoped
     m.insert(rk("", "v1", "nodes"), rm("Node", false, true));
+    m.insert(
+        rk("", "v1", "persistentvolumes"),
+        rm("PersistentVolume", false, true),
+    );
 
     // core/v1 — namespaced
     m.insert(rk("", "v1", "services"), rm("Service", true, false));
@@ -181,8 +185,18 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     m.insert(rk("", "v1", "configmaps"), rm("ConfigMap", true, false));
     m.insert(rk("", "v1", "secrets"), rm("Secret", true, false));
     m.insert(rk("", "v1", "events"), rm_cou("Event", true));
+    m.insert(rk("", "v1", "endpoints"), rm("Endpoints", true, false));
+    m.insert(
+        rk("", "v1", "persistentvolumeclaims"),
+        rm("PersistentVolumeClaim", true, true),
+    );
+    m.insert(
+        rk("", "v1", "replicationcontrollers"),
+        rm("ReplicationController", true, true),
+    );
 
     // apps/v1
+    m.insert(rk("apps", "v1", "daemonsets"), rm("DaemonSet", true, true));
     m.insert(
         rk("apps", "v1", "deployments"),
         rm("Deployment", true, true),
@@ -194,6 +208,20 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     m.insert(
         rk("apps", "v1", "statefulsets"),
         rm("StatefulSet", true, true),
+    );
+
+    // batch/v1
+    m.insert(rk("batch", "v1", "jobs"), rm("Job", true, true));
+    m.insert(rk("batch", "v1", "cronjobs"), rm("CronJob", true, true));
+
+    // autoscaling/v1 and autoscaling/v2
+    m.insert(
+        rk("autoscaling", "v1", "horizontalpodautoscalers"),
+        rm("HorizontalPodAutoscaler", true, true),
+    );
+    m.insert(
+        rk("autoscaling", "v2", "horizontalpodautoscalers"),
+        rm("HorizontalPodAutoscaler", true, true),
     );
 
     // rbac.authorization.k8s.io/v1
@@ -407,5 +435,115 @@ mod tests {
             .expect("runtimeclasses must be in build_registry");
         assert!(!meta.namespaced, "runtimeclasses is cluster-scoped");
         assert_eq!(meta.kind, "RuntimeClass");
+    }
+
+    /// DaemonSet must be in apps/v1. Without this, POST/GET/LIST on
+    /// /apis/apps/v1/namespaces/{ns}/daemonsets falls through to the CR handler,
+    /// returning 404. System DaemonSets (CNI, kube-proxy) break silently.
+    #[test]
+    fn daemonset_registered_in_apps_v1() {
+        let registry = build_registry();
+        let key = rk("apps", "v1", "daemonsets");
+        let meta = registry
+            .get(&key)
+            .expect("daemonsets must be in build_registry");
+        assert!(meta.namespaced, "DaemonSet is namespaced");
+        assert!(
+            meta.has_status_subresource,
+            "DaemonSet has a status subresource"
+        );
+        assert_eq!(meta.kind, "DaemonSet");
+    }
+
+    /// Job and CronJob must be registered in batch/v1. Without these entries,
+    /// requests to /apis/batch/v1/namespaces/{ns}/jobs fall through to the CR handler
+    /// which returns 404, making `kubectl get jobs` fail.
+    #[test]
+    fn job_and_cronjob_registered_in_batch_v1() {
+        let registry = build_registry();
+
+        let job_key = rk("batch", "v1", "jobs");
+        let job_meta = registry
+            .get(&job_key)
+            .expect("jobs must be in build_registry");
+        assert!(job_meta.namespaced, "Job is namespaced");
+        assert!(
+            job_meta.has_status_subresource,
+            "Job has a status subresource"
+        );
+        assert_eq!(job_meta.kind, "Job");
+
+        let cj_key = rk("batch", "v1", "cronjobs");
+        let cj_meta = registry
+            .get(&cj_key)
+            .expect("cronjobs must be in build_registry");
+        assert!(cj_meta.namespaced, "CronJob is namespaced");
+        assert_eq!(cj_meta.kind, "CronJob");
+    }
+
+    /// HorizontalPodAutoscaler must be registered in both autoscaling/v1 and autoscaling/v2.
+    /// HPA controllers negotiate the version to use; if v2 is missing they may fall back to
+    /// v1, but both must be served to avoid 404 during version discovery.
+    #[test]
+    fn hpa_registered_in_autoscaling_v1_and_v2() {
+        let registry = build_registry();
+
+        let v1_key = rk("autoscaling", "v1", "horizontalpodautoscalers");
+        let v1_meta = registry
+            .get(&v1_key)
+            .expect("horizontalpodautoscalers must be in autoscaling/v1");
+        assert!(v1_meta.namespaced, "HPA is namespaced");
+        assert_eq!(v1_meta.kind, "HorizontalPodAutoscaler");
+
+        let v2_key = rk("autoscaling", "v2", "horizontalpodautoscalers");
+        let v2_meta = registry
+            .get(&v2_key)
+            .expect("horizontalpodautoscalers must be in autoscaling/v2");
+        assert!(v2_meta.namespaced, "HPA is namespaced");
+        assert_eq!(v2_meta.kind, "HorizontalPodAutoscaler");
+    }
+
+    /// Endpoints, PVC, and PV must be in the core/v1 registry. Without them,
+    /// requests fall through to the CR handler (no CRD) and return 404.
+    /// kube-proxy watches Endpoints; controllers watch PVCs and PVs.
+    #[test]
+    fn core_v1_storage_and_network_resources_registered() {
+        let registry = build_registry();
+
+        let ep_key = rk("", "v1", "endpoints");
+        let ep_meta = registry
+            .get(&ep_key)
+            .expect("endpoints must be in build_registry");
+        assert!(ep_meta.namespaced, "Endpoints is namespaced");
+        assert_eq!(ep_meta.kind, "Endpoints");
+
+        let pvc_key = rk("", "v1", "persistentvolumeclaims");
+        let pvc_meta = registry
+            .get(&pvc_key)
+            .expect("persistentvolumeclaims must be in build_registry");
+        assert!(pvc_meta.namespaced, "PVC is namespaced");
+        assert!(
+            pvc_meta.has_status_subresource,
+            "PVC has a status subresource"
+        );
+        assert_eq!(pvc_meta.kind, "PersistentVolumeClaim");
+
+        let pv_key = rk("", "v1", "persistentvolumes");
+        let pv_meta = registry
+            .get(&pv_key)
+            .expect("persistentvolumes must be in build_registry");
+        assert!(!pv_meta.namespaced, "PV is cluster-scoped");
+        assert!(
+            pv_meta.has_status_subresource,
+            "PV has a status subresource"
+        );
+        assert_eq!(pv_meta.kind, "PersistentVolume");
+
+        let rc_key = rk("", "v1", "replicationcontrollers");
+        let rc_meta = registry
+            .get(&rc_key)
+            .expect("replicationcontrollers must be in build_registry");
+        assert!(rc_meta.namespaced, "ReplicationController is namespaced");
+        assert_eq!(rc_meta.kind, "ReplicationController");
     }
 }

@@ -44,6 +44,8 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("apps", "v1"),
     ("authentication.k8s.io", "v1"),
     ("authorization.k8s.io", "v1"),
+    ("autoscaling", "v2"),
+    ("batch", "v1"),
     ("certificates.k8s.io", "v1"),
     ("coordination.k8s.io", "v1"),
     ("networking.k8s.io", "v1"),
@@ -56,7 +58,14 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
 pub async fn api_group_list(State(state): State<AppState>) -> Json<APIGroupList> {
     let mut groups: Vec<APIGroup> = STATIC_GROUPS
         .iter()
-        .map(|(name, version)| make_group(name, version, &[version]))
+        .map(|(name, version)| {
+            // autoscaling advertises both v2 (preferred) and v1.
+            if *name == "autoscaling" {
+                make_group(name, version, &["v2", "v1"])
+            } else {
+                make_group(name, version, &[version])
+            }
+        })
         .collect();
 
     if let Ok(resp) = state
@@ -145,6 +154,9 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("apps", "v1") => Some(apps_v1_resources()),
         ("authentication.k8s.io", "v1") => Some(authn_v1_resources()),
         ("authorization.k8s.io", "v1") => Some(authz_v1_resources()),
+        ("autoscaling", "v1") => Some(autoscaling_v1_resources()),
+        ("autoscaling", "v2") => Some(autoscaling_v2_resources()),
+        ("batch", "v1") => Some(batch_v1_resources()),
         ("certificates.k8s.io", "v1") => Some(certificates_v1_resources()),
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
         ("networking.k8s.io", "v1") => Some(networking_v1_resources()),
@@ -246,6 +258,13 @@ fn apps_v1_resources() -> serde_json::Value {
         "apiVersion": "v1",
         "groupVersion": "apps/v1",
         "resources": [
+            {
+                "name": "daemonsets",
+                "singularName": "daemonset",
+                "namespaced": true,
+                "kind": "DaemonSet",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
             {
                 "name": "deployments",
                 "singularName": "deployment",
@@ -449,10 +468,10 @@ fn networking_v1_resources() -> serde_json::Value {
         "groupVersion": "networking.k8s.io/v1",
         "resources": [
             {
-                "name": "networkpolicies",
-                "singularName": "networkpolicy",
-                "namespaced": true,
-                "kind": "NetworkPolicy",
+                "name": "ingressclasses",
+                "singularName": "ingressclass",
+                "namespaced": false,
+                "kind": "IngressClass",
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
@@ -460,6 +479,13 @@ fn networking_v1_resources() -> serde_json::Value {
                 "singularName": "ingress",
                 "namespaced": true,
                 "kind": "Ingress",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "networkpolicies",
+                "singularName": "networkpolicy",
+                "namespaced": true,
+                "kind": "NetworkPolicy",
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -494,6 +520,67 @@ fn node_v1_resources() -> serde_json::Value {
                 "singularName": "runtimeclass",
                 "namespaced": false,
                 "kind": "RuntimeClass",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn batch_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "batch/v1",
+        "resources": [
+            {
+                "name": "cronjobs",
+                "singularName": "cronjob",
+                "namespaced": true,
+                "kind": "CronJob",
+                "shortNames": ["cj"],
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "jobs",
+                "singularName": "job",
+                "namespaced": true,
+                "kind": "Job",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn autoscaling_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "autoscaling/v1",
+        "resources": [
+            {
+                "name": "horizontalpodautoscalers",
+                "singularName": "horizontalpodautoscaler",
+                "namespaced": true,
+                "kind": "HorizontalPodAutoscaler",
+                "shortNames": ["hpa"],
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn autoscaling_v2_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "autoscaling/v2",
+        "resources": [
+            {
+                "name": "horizontalpodautoscalers",
+                "singularName": "horizontalpodautoscaler",
+                "namespaced": true,
+                "kind": "HorizontalPodAutoscaler",
+                "shortNames": ["hpa"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -944,6 +1031,162 @@ mod tests {
         assert!(
             names.contains(&"runtimeclasses"),
             "runtimeclasses must be in node.k8s.io/v1; got: {names:?}"
+        );
+    }
+
+    // apps/v1 resource list must include daemonsets — DaemonSet is a first-class workload
+    // that the scheduler and node lifecycle controller depend on.
+    #[tokio::test]
+    async fn apps_v1_resources_includes_daemonsets() {
+        let state = make_state();
+        let resp =
+            api_group_resources(State(state), Path(("apps".to_string(), "v1".to_string()))).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"daemonsets"),
+            "daemonsets must be in apps/v1 — DaemonSet is required for system workloads like CNI and kube-proxy; got: {names:?}"
+        );
+    }
+
+    // batch/v1 must appear in /apis so kubectl can discover Job and CronJob resources.
+    // Without this, `kubectl get jobs` returns "the server doesn't have a resource type jobs".
+    #[tokio::test]
+    async fn batch_group_appears_in_api_group_list() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"batch"),
+            "batch must appear in /apis — Job and CronJob require it; got: {names:?}"
+        );
+    }
+
+    // batch/v1 resource list must include jobs and cronjobs.
+    #[tokio::test]
+    async fn batch_v1_resources_list() {
+        let state = make_state();
+        let resp =
+            api_group_resources(State(state), Path(("batch".to_string(), "v1".to_string()))).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"jobs"),
+            "jobs must be in batch/v1; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"cronjobs"),
+            "cronjobs must be in batch/v1; got: {names:?}"
+        );
+    }
+
+    // autoscaling must appear in /apis with both v1 and v2 advertised.
+    // HPA controllers probe the autoscaling group to determine which API version to use.
+    #[tokio::test]
+    async fn autoscaling_group_appears_in_api_group_list_with_both_versions() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let group = list
+            .groups
+            .iter()
+            .find(|g| g.name == "autoscaling")
+            .expect("autoscaling must appear in /apis — HPA requires it");
+
+        let version_names: Vec<&str> = group.versions.iter().map(|v| v.version.as_str()).collect();
+        assert!(
+            version_names.contains(&"v1"),
+            "autoscaling must list v1; got: {version_names:?}"
+        );
+        assert!(
+            version_names.contains(&"v2"),
+            "autoscaling must list v2 — HPA v2 is the preferred version since Kubernetes 1.23; got: {version_names:?}"
+        );
+        assert_eq!(
+            group.preferred_version.version, "v2",
+            "autoscaling preferredVersion must be v2"
+        );
+    }
+
+    // autoscaling/v1 resource list must include HPA.
+    #[tokio::test]
+    async fn autoscaling_v1_resources_list() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("autoscaling".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"horizontalpodautoscalers"),
+            "horizontalpodautoscalers must be in autoscaling/v1; got: {names:?}"
+        );
+    }
+
+    // networking.k8s.io/v1 must include ingressclasses (cluster-scoped) alongside ingresses
+    // and networkpolicies. Without IngressClass, ingress controllers cannot register themselves.
+    #[tokio::test]
+    async fn networking_v1_resources_includes_ingressclass() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("networking.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"ingressclasses"),
+            "ingressclasses must be in networking.k8s.io/v1 — ingress controllers require it; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"ingresses"),
+            "ingresses must be in networking.k8s.io/v1; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"networkpolicies"),
+            "networkpolicies must be in networking.k8s.io/v1; got: {names:?}"
         );
     }
 }
