@@ -1128,6 +1128,206 @@ mod tests {
         assert_eq!(v["status"]["phase"], "Bound");
     }
 
+    /// put_resource_status returns 409 Conflict when a concurrent writer bumps the stored
+    /// resourceVersion between the handler's read and write. OCC must reject the stale writer
+    /// so that controllers never silently overwrite each other's status.
+    #[tokio::test]
+    async fn put_resource_status_returns_409_on_occ_conflict() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "occ-node" },
+            "spec": { "drivers": [] },
+            "status": {}
+        });
+        let key = "/registry/storage.k8s.io/csinodes/occ-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state1 = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let state2 = state1.clone();
+
+        let body1 = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "CSINode",
+                "metadata": { "name": "occ-node" },
+                "status": { "phase": "writer-1" }
+            }))
+            .unwrap(),
+        );
+        let body2 = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "CSINode",
+                "metadata": { "name": "occ-node" },
+                "status": { "phase": "writer-2" }
+            }))
+            .unwrap(),
+        );
+
+        // Fire both PUTs concurrently; they both read the same stored rv then race to write.
+        // Exactly one must win (200 OK) and exactly one must lose (409 Conflict).
+        let (r1, r2) = tokio::join!(
+            put_resource_status(
+                axum::extract::State(state1),
+                axum::extract::Path((
+                    "storage.k8s.io".into(),
+                    "v1".into(),
+                    "csinodes".into(),
+                    "occ-node".into(),
+                )),
+                json_headers(),
+                body1,
+            ),
+            put_resource_status(
+                axum::extract::State(state2),
+                axum::extract::Path((
+                    "storage.k8s.io".into(),
+                    "v1".into(),
+                    "csinodes".into(),
+                    "occ-node".into(),
+                )),
+                json_headers(),
+                body2,
+            ),
+        );
+
+        let (ok_count, conflict_count) = [
+            r1.map(|_| ()).map_err(|e| e.0),
+            r2.map(|_| ()).map_err(|e| e.0),
+        ]
+        .into_iter()
+        .fold((0u32, 0u32), |(ok, conf), r| match r {
+            Ok(()) => (ok + 1, conf),
+            Err(axum::http::StatusCode::CONFLICT) => (ok, conf + 1),
+            Err(code) => panic!("unexpected status code: {code}"),
+        });
+
+        assert_eq!(
+            ok_count, 1,
+            "exactly one concurrent status PUT must succeed"
+        );
+        assert_eq!(
+            conflict_count, 1,
+            "exactly one concurrent status PUT must return 409 Conflict (OCC)"
+        );
+    }
+
+    /// put_namespaced_resource_status returns 409 Conflict when a concurrent writer bumps the
+    /// stored resourceVersion between the handler's read and write. OCC must reject the stale
+    /// writer so that namespaced controllers never silently overwrite each other's status.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_returns_409_on_occ_conflict() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "occ-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "occ-lease" },
+            "status": {}
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/occ-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state1 = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let state2 = state1.clone();
+
+        let body1 = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": "occ-lease", "namespace": "kube-node-lease" },
+                "status": { "phase": "writer-1" }
+            }))
+            .unwrap(),
+        );
+        let body2 = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": "occ-lease", "namespace": "kube-node-lease" },
+                "status": { "phase": "writer-2" }
+            }))
+            .unwrap(),
+        );
+
+        // Fire both PUTs concurrently; they both read the same stored rv then race to write.
+        // Exactly one must win (200 OK) and exactly one must lose (409 Conflict).
+        let (r1, r2) = tokio::join!(
+            put_namespaced_resource_status(
+                axum::extract::State(state1),
+                axum::extract::Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "kube-node-lease".into(),
+                    "leases".into(),
+                    "occ-lease".into(),
+                )),
+                json_headers(),
+                body1,
+            ),
+            put_namespaced_resource_status(
+                axum::extract::State(state2),
+                axum::extract::Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "kube-node-lease".into(),
+                    "leases".into(),
+                    "occ-lease".into(),
+                )),
+                json_headers(),
+                body2,
+            ),
+        );
+
+        let (ok_count, conflict_count) = [
+            r1.map(|_| ()).map_err(|e| e.0),
+            r2.map(|_| ()).map_err(|e| e.0),
+        ]
+        .into_iter()
+        .fold((0u32, 0u32), |(ok, conf), r| match r {
+            Ok(()) => (ok + 1, conf),
+            Err(axum::http::StatusCode::CONFLICT) => (ok, conf + 1),
+            Err(code) => panic!("unexpected status code: {code}"),
+        });
+
+        assert_eq!(
+            ok_count, 1,
+            "exactly one concurrent status PUT must succeed"
+        );
+        assert_eq!(
+            conflict_count, 1,
+            "exactly one concurrent namespaced status PUT must return 409 Conflict (OCC)"
+        );
+    }
+
     /// Gateway API controllers PATCH status on namespaced Gateway CRs via /status route.
     /// The group is not in the static resource registry, so patch_namespaced_resource_status
     /// must fall back to the CR store key.
