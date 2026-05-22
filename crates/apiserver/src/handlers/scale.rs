@@ -260,3 +260,481 @@ mod tests {
         assert!(require_scale_resource("configmaps").is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Handler integration tests (tower::ServiceExt::oneshot, in-memory store)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod handler_tests {
+    use std::sync::Arc;
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::{get, patch, put},
+        Router,
+    };
+    use bytes::Bytes;
+    use tower::ServiceExt;
+    use u7s_store::{SqliteStore, Store};
+
+    use super::*;
+    use crate::state::AppState;
+
+    /// Build a minimal in-memory AppState for handler tests.
+    fn make_state() -> (AppState, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        (state, store)
+    }
+
+    /// Seed a workload (Deployment/ReplicaSet/StatefulSet) into the store.
+    /// Uses the same key layout as group_object_key("apps", resource, ns, name).
+    async fn seed_workload(
+        store: &Arc<SqliteStore>,
+        resource: &str,
+        ns: &str,
+        name: &str,
+        replicas: i64,
+    ) {
+        let key = format!("/registry/apps/{resource}/{ns}/{name}");
+        let val = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+                "resourceVersion": "1"
+            },
+            "spec": { "replicas": replicas },
+            "status": {}
+        });
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .expect("seed workload");
+    }
+
+    fn json_body(v: &serde_json::Value) -> Body {
+        Body::from(Bytes::from(serde_json::to_vec(v).unwrap()))
+    }
+
+    // -----------------------------------------------------------------------
+    // get_scale
+    // -----------------------------------------------------------------------
+
+    /// GET scale on a valid resource type that exists returns 200 with
+    /// autoscaling/v1 Scale JSON containing the correct replica count.
+    /// This matters because kubectl scale and HPA both read this endpoint.
+    #[tokio::test]
+    async fn get_scale_returns_200_with_scale_object() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 3).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                get(get_scale),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["apiVersion"], "autoscaling/v1");
+        assert_eq!(json["kind"], "Scale");
+        assert_eq!(json["spec"]["replicas"], 3);
+        assert_eq!(json["metadata"]["name"], "my-deploy");
+        assert_eq!(json["metadata"]["namespace"], "default");
+    }
+
+    /// GET scale for a resource type that does not support scale (e.g. pods)
+    /// must return 404. Scale is only valid for deployments, replicasets, statefulsets.
+    #[tokio::test]
+    async fn get_scale_returns_404_for_unsupported_resource() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                get(get_scale),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/apis/apps/v1/namespaces/default/pods/nginx/scale")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// GET scale for a workload that does not exist must return 404.
+    #[tokio::test]
+    async fn get_scale_returns_404_for_missing_workload() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                get(get_scale),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/apis/apps/v1/namespaces/default/deployments/ghost/scale")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// GET scale for a replicaset must also work — all three scalable types must be supported.
+    #[tokio::test]
+    async fn get_scale_works_for_replicasets_and_statefulsets() {
+        let (state, store) = make_state();
+        seed_workload(&store, "replicasets", "default", "my-rs", 2).await;
+        seed_workload(&store, "statefulsets", "default", "my-sts", 5).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                get(get_scale),
+            )
+            .with_state(state);
+
+        // ReplicaSet
+        let req = Request::builder()
+            .method("GET")
+            .uri("/apis/apps/v1/namespaces/default/replicasets/my-rs/scale")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["spec"]["replicas"], 2);
+
+        // StatefulSet
+        let req = Request::builder()
+            .method("GET")
+            .uri("/apis/apps/v1/namespaces/default/statefulsets/my-sts/scale")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["spec"]["replicas"], 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // put_scale
+    // -----------------------------------------------------------------------
+
+    /// PUT scale with valid JSON body writes spec.replicas back to the stored
+    /// workload and returns the updated Scale.  HPA and kubectl scale both use
+    /// this path to change replica counts.
+    #[tokio::test]
+    async fn put_scale_updates_replicas_and_returns_scale() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 1).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "spec": { "replicas": 5 }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(json["spec"]["replicas"], 5);
+        assert_eq!(json["status"]["replicas"], 5);
+
+        // Confirm the workload in the store was actually updated.
+        let key = "/registry/apps/deployments/default/my-deploy";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(stored_obj["spec"]["replicas"], 5);
+    }
+
+    /// PUT scale with invalid JSON must return 400.
+    /// The handler must not panic or return 500 on malformed input.
+    #[tokio::test]
+    async fn put_scale_returns_400_for_invalid_json() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale")
+            .body(Body::from(Bytes::from_static(b"not json")))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// PUT scale without spec.replicas must return 400.
+    /// spec.replicas is required — without it the scale request is meaningless.
+    #[tokio::test]
+    async fn put_scale_returns_400_when_spec_replicas_missing() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": {} });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// PUT scale for a missing workload must return 404.
+    #[tokio::test]
+    async fn put_scale_returns_404_for_missing_workload() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "replicas": 3 } });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/deployments/ghost/scale")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// PUT scale for an unsupported resource type must return 404.
+    #[tokio::test]
+    async fn put_scale_returns_404_for_unsupported_resource() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "replicas": 3 } });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/daemonsets/my-ds/scale")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_scale
+    // -----------------------------------------------------------------------
+
+    /// PATCH scale with spec.replicas updates the stored replica count.
+    /// JSON merge-patch: only spec.replicas is extracted and applied.
+    #[tokio::test]
+    async fn patch_scale_updates_replicas_when_patch_contains_spec_replicas() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 1).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "replicas": 7 } });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(json["spec"]["replicas"], 7);
+    }
+
+    /// PATCH scale without spec.replicas in the patch body must keep the
+    /// existing replica count — the patch is a no-op on replicas.
+    #[tokio::test]
+    async fn patch_scale_keeps_current_replicas_when_patch_omits_spec_replicas() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "my-deploy", 4).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .with_state(state);
+
+        // Patch body has no spec.replicas — replicas should be preserved.
+        let body = serde_json::json!({ "metadata": { "annotations": { "note": "test" } } });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        // Original count must be preserved since the patch did not include spec.replicas.
+        assert_eq!(json["spec"]["replicas"], 4);
+    }
+
+    /// PATCH scale with invalid JSON must return 400.
+    #[tokio::test]
+    async fn patch_scale_returns_400_for_invalid_json() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/apis/apps/v1/namespaces/default/deployments/my-deploy/scale")
+            .body(Body::from(Bytes::from_static(b"{{bad json")))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// PATCH scale for a missing workload must return 404.
+    #[tokio::test]
+    async fn patch_scale_returns_404_for_missing_workload() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "replicas": 2 } });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/apis/apps/v1/namespaces/default/deployments/ghost/scale")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// PATCH scale for an unsupported resource type must return 404.
+    #[tokio::test]
+    async fn patch_scale_returns_404_for_unsupported_resource() {
+        let (state, _store) = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "replicas": 2 } });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/apis/apps/v1/namespaces/default/configmaps/my-cm/scale")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
