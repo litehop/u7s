@@ -2127,6 +2127,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
+name = "rustls-post-quantum"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0da3cd9229bac4fae1f589c8f875b3c891a058ddaa26eb3bde16b5e43dc174ce"
+dependencies = [
+ "aws-lc-rs",
+ "rustls",
+ "rustls-webpki",
+]
+
+[[package]]
 name = "rustls-webpki"
 version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2835,6 +2846,7 @@ dependencies = [
  "rsa",
  "rustls",
  "rustls-pemfile",
+ "rustls-post-quantum",
  "serde",
  "serde_json",
  "subtle",
@@ -2864,6 +2876,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "rustls-post-quantum",
  "serde_json",
  "tokio",
  "tokio-rustls",
