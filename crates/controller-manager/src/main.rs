@@ -10,14 +10,10 @@
 use anyhow::{bail, Context};
 use base64::Engine;
 use clap::Parser;
-use hyper::body::Incoming;
-use hyper::{Method, Request, Response, StatusCode, Uri};
-use hyper_util::rt::TokioIo;
+use hyper::Method;
 use serde_json::Value;
-use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
-use u7s_client_util::{build_tls_connector, parse_kubeconfig};
+use u7s_client_util::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use u7s_controller_manager::{
     build_sa_token_secret, parse_sa_added_event, secrets_path, token_request_path,
 };
@@ -46,175 +42,17 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP helpers — one connection per request (scaffold; reuse is a later opt)
+// HTTP helpers — delegates to HyperApiClient in client-util.
 // ---------------------------------------------------------------------------
-
-async fn send_request(
-    connector: &TlsConnector,
-    base: &str,
-    method: Method,
-    path: &str,
-    body: Option<String>,
-    bearer: Option<&str>,
-) -> anyhow::Result<(StatusCode, String)> {
-    let uri: Uri = format!("{base}{path}").parse().context("parse URI")?;
-    let host = uri.host().context("URI missing host")?.to_owned();
-    let port = uri.port_u16().unwrap_or(443);
-
-    let stream = TcpStream::connect(format!("{host}:{port}"))
-        .await
-        .with_context(|| format!("TCP connect {host}:{port}"))?;
-    let server_name = host.clone().try_into().context("invalid DNS name")?;
-    let tls = connector
-        .connect(server_name, stream)
-        .await
-        .context("TLS")?;
-    let io = TokioIo::new(tls);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .context("HTTP/1.1 handshake")?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            error!("connection error: {e}");
-        }
-    });
-
-    let body_bytes = body
-        .as_deref()
-        .map(|s| bytes::Bytes::from(s.to_owned()))
-        .unwrap_or_default();
-
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("Host", &host)
-        .header("Accept", "application/json");
-    if body.is_some() {
-        builder = builder
-            .header("Content-Type", "application/json")
-            .header("Content-Length", body_bytes.len().to_string());
-    }
-    if let Some(tok) = bearer {
-        builder = builder.header("Authorization", format!("Bearer {tok}"));
-    }
-    let req = builder
-        .body(http_body_util::Full::new(body_bytes))
-        .context("build request")?;
-
-    let resp: Response<Incoming> = sender.send_request(req).await.context("send")?;
-    let status = resp.status();
-    use http_body_util::BodyExt;
-    let text = String::from_utf8_lossy(
-        &resp
-            .into_body()
-            .collect()
-            .await
-            .context("read body")?
-            .to_bytes(),
-    )
-    .into_owned();
-    Ok((status, text))
-}
 
 async fn http_post_json(
-    connector: &TlsConnector,
-    base: &str,
+    client: &HyperApiClient,
     path: &str,
     payload: &Value,
-    bearer: Option<&str>,
-) -> anyhow::Result<(StatusCode, String)> {
-    send_request(
-        connector,
-        base,
-        Method::POST,
-        path,
-        Some(serde_json::to_string(payload)?),
-        bearer,
-    )
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// Watch streaming — identical to scheduler
-// ---------------------------------------------------------------------------
-
-async fn stream_watch_events(
-    connector: &TlsConnector,
-    base: &str,
-    path: &str,
-    bearer: Option<&str>,
-    mut handler: impl FnMut(Value),
-) -> anyhow::Result<()> {
-    let uri: Uri = format!("{base}{path}").parse().context("parse watch URI")?;
-    let host = uri.host().context("URI missing host")?.to_owned();
-    let port = uri.port_u16().unwrap_or(443);
-
-    let stream = TcpStream::connect(format!("{host}:{port}"))
+) -> anyhow::Result<(hyper::StatusCode, String)> {
+    client
+        .request(Method::POST, path, Some(serde_json::to_string(payload)?))
         .await
-        .with_context(|| format!("TCP connect {host}:{port}"))?;
-    let server_name = host.clone().try_into().context("invalid DNS name")?;
-    let tls = connector
-        .connect(server_name, stream)
-        .await
-        .context("TLS")?;
-    let io = TokioIo::new(tls);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .context("HTTP/1.1 handshake")?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            error!("watch connection error: {e}");
-        }
-    });
-
-    let mut builder = Request::builder()
-        .method(Method::GET)
-        .uri(path)
-        .header("Host", &host)
-        .header("Accept", "application/json");
-    if let Some(tok) = bearer {
-        builder = builder.header("Authorization", format!("Bearer {tok}"));
-    }
-    let req = builder
-        .body(http_body_util::Empty::<bytes::Bytes>::new())
-        .context("build watch request")?;
-
-    let resp: Response<Incoming> = sender.send_request(req).await.context("send watch")?;
-    if !resp.status().is_success() {
-        bail!("watch returned HTTP {}", resp.status());
-    }
-
-    use http_body_util::BodyExt;
-    let mut body = resp.into_body();
-    let mut buf = String::new();
-
-    loop {
-        match body.frame().await {
-            None => break,
-            Some(Err(e)) => {
-                warn!("watch stream error: {e}");
-                break;
-            }
-            Some(Ok(frame)) => {
-                let frame: hyper::body::Frame<bytes::Bytes> = frame;
-                if let Ok(data) = frame.into_data() {
-                    buf.push_str(&String::from_utf8_lossy(&data));
-                    while let Some(nl) = buf.find('\n') {
-                        let line = buf[..nl].trim().to_owned();
-                        buf = buf[nl + 1..].to_owned();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<Value>(&line) {
-                            Ok(v) => handler(v),
-                            Err(e) => warn!("parse watch event: {e}: {line}"),
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -223,11 +61,9 @@ async fn stream_watch_events(
 
 /// Mint a token and store it in a Secret for the given ServiceAccount.
 async fn provision_sa(
-    connector: &TlsConnector,
-    server: &str,
+    client: &HyperApiClient,
     namespace: &str,
     sa_name: &str,
-    bearer: Option<&str>,
 ) -> anyhow::Result<()> {
     // 1. Mint a JWT.
     let token_path = token_request_path(namespace, sa_name);
@@ -236,7 +72,7 @@ async fn provision_sa(
         "kind": "TokenRequest",
         "spec": { "expirationSeconds": 3600 }
     });
-    let (status, body) = http_post_json(connector, server, &token_path, &token_req, bearer).await?;
+    let (status, body) = http_post_json(client, &token_path, &token_req).await?;
     if !status.is_success() {
         bail!("TokenRequest for {namespace}/{sa_name} failed ({status}): {body}");
     }
@@ -251,7 +87,7 @@ async fn provision_sa(
     // 3. Store in a Secret.
     let secret = build_sa_token_secret(namespace, sa_name, &token_b64);
     let secret_path = secrets_path(namespace);
-    let (status, body) = http_post_json(connector, server, &secret_path, &secret, bearer).await?;
+    let (status, body) = http_post_json(client, &secret_path, &secret).await?;
 
     if status.is_success() {
         info!("provisioned token secret for {namespace}/{sa_name}");
@@ -297,34 +133,32 @@ async fn main() -> anyhow::Result<()> {
     loop {
         info!("starting ServiceAccount watch");
         let path = "/api/v1/serviceaccounts?watch=true";
-        let bearer_ref = bearer_token.as_deref();
-        let connector_ref = &connector;
-        let server_ref = &server;
 
-        let result = stream_watch_events(connector_ref, server_ref, path, bearer_ref, |event| {
-            let Some((namespace, sa_name)) = parse_sa_added_event(&event) else {
-                return;
-            };
-            info!("new ServiceAccount: {namespace}/{sa_name}");
+        let client = HyperApiClient {
+            server: server.clone(),
+            connector: connector.clone(),
+            bearer: bearer_token.clone(),
+        };
 
-            let connector_clone = connector_ref.clone();
-            let server_clone = server_ref.to_string();
-            let bearer_clone = bearer_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) = provision_sa(
-                    &connector_clone,
-                    &server_clone,
-                    &namespace,
-                    &sa_name,
-                    bearer_clone.as_deref(),
-                )
-                .await
-                {
-                    error!("provision_sa {namespace}/{sa_name}: {e}");
-                }
-            });
-        })
-        .await;
+        let result = client
+            .watch_stream(path, |event| {
+                let Some((namespace, sa_name)) = parse_sa_added_event(&event) else {
+                    return;
+                };
+                info!("new ServiceAccount: {namespace}/{sa_name}");
+
+                let client_clone = HyperApiClient {
+                    server: server.clone(),
+                    connector: connector.clone(),
+                    bearer: bearer_token.clone(),
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = provision_sa(&client_clone, &namespace, &sa_name).await {
+                        error!("provision_sa {namespace}/{sa_name}: {e}");
+                    }
+                });
+            })
+            .await;
 
         if let Err(e) = result {
             error!("watch error: {e} — reconnecting in 5s");

@@ -3,12 +3,16 @@
 /// /log: looks up the pod → node, then proxies GET to the kubelet log endpoint,
 ///        streaming the response body back to the client.
 ///
-/// /exec, /attach, /portforward: return 501 Not Implemented. These require a
-///        SPDY 3.1 or WebSocket upgrade that axum does not natively support.
-///        Returning 501 is more informative than 404 for kubectl users.
+/// /attach: WebSocket proxy — upgrades the inbound kubectl connection (v5.channel.k8s.io)
+///          and opens a matching WebSocket to the kubelet, then splices them.
+///
+/// /exec, /portforward: return 501 Not Implemented.
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{
+        ws::{WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -17,6 +21,7 @@ use serde::Deserialize;
 use u7s_store::Store as _;
 
 use crate::{
+    handlers::stream::{splice, AxumWs, TungsteniteWs},
     keys::{cluster_object_key, object_key},
     state::AppState,
     status::Status,
@@ -163,10 +168,16 @@ pub async fn pod_log(
     }
 
     // 6. Proxy via reqwest.
-    //    KNOWN GAP (pre-alpha): kubelet uses a self-signed certificate. We accept
-    //    invalid certs here. In production this should verify against the cluster CA.
+    //    Verify the kubelet's TLS certificate against the cluster CA. The CA DER bytes
+    //    are stored in AppState and loaded from disk at startup (stable across restarts).
+    let ca_der = state.cluster_ca_der.as_deref().ok_or_else(|| {
+        Status::internal("cluster CA not available — cannot verify kubelet TLS".to_owned())
+    })?;
+    let ca_cert = reqwest::Certificate::from_der(ca_der)
+        .map_err(|e| Status::internal(format!("invalid cluster CA certificate: {e}")))?;
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .use_rustls_tls()
+        .add_root_certificate(ca_cert)
         .build()
         .map_err(|e| Status::internal(format!("failed to build HTTP client: {e}")))?;
 
@@ -190,6 +201,211 @@ pub async fn pod_log(
 }
 
 // ---------------------------------------------------------------------------
+// /attach — WebSocket proxy to kubelet attach endpoint
+// ---------------------------------------------------------------------------
+
+/// Query parameters for /attach, matching the Kubernetes API.
+#[derive(Deserialize)]
+pub struct AttachQuery {
+    pub container: Option<String>,
+    pub stdin: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub tty: Option<String>,
+}
+
+/// Kubernetes attach subprotocol negotiated with both kubectl and kubelet.
+const ATTACH_SUBPROTOCOL: &str = "v5.channel.k8s.io";
+
+/// Resolved kubelet attach target — returned by the pure lookup helper so the
+/// handler can be tested without a real WebSocket upgrade.
+pub struct AttachTarget {
+    pub kubelet_ws_url: String,
+    pub node_ip: String,
+    pub tls_config: std::sync::Arc<rustls::ClientConfig>,
+}
+
+/// Pure lookup: pod → node → node_ip → kubelet WS URL + TLS config.
+///
+/// Extracted from `pod_attach` so the error paths (404, 400, 500) can be tested
+/// without going through the WebSocket upgrade machinery.  All I/O is either
+/// store reads (testable) or TLS config construction (deterministic).
+pub async fn resolve_attach_target(
+    state: &AppState,
+    raw_ns: &str,
+    pod_name: &str,
+    query: &AttachQuery,
+) -> Result<AttachTarget, crate::status::StatusError> {
+    // Look up the pod.
+    let pod_key = object_key("pods", raw_ns, pod_name);
+    let stored = state
+        .store
+        .get(&pod_key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
+
+    let pod: serde_json::Value = serde_json::from_slice(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
+
+    let node_name = pod["spec"]["nodeName"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Status::bad_request(format!(
+                "pod \"{pod_name}\" is not yet scheduled (spec.nodeName is empty)"
+            ))
+        })?;
+
+    let node_key = cluster_object_key("nodes", node_name);
+    let node_stored = state
+        .store
+        .get(&node_key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(node_name, "Node"))?;
+
+    let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
+
+    let node_ip = node_address(&node).ok_or_else(|| {
+        Status::internal(format!(
+            "node \"{node_name}\" has no usable address in status.addresses"
+        ))
+    })?;
+
+    // Determine container (first container if unspecified).
+    let container = match query.container.as_deref() {
+        Some(c) if !c.is_empty() => c.to_owned(),
+        _ => pod["spec"]["containers"][0]["name"]
+            .as_str()
+            .unwrap_or("default")
+            .to_owned(),
+    };
+
+    // Build kubelet attach URL.
+    //   Kubelet attach endpoint: wss://<node-ip>:10250/attach/<ns>/<pod>/<container>
+    let mut params: Vec<(&str, &str)> = vec![("container", container.as_str())];
+    if query.stdin.as_deref() == Some("true") || query.stdin.as_deref() == Some("1") {
+        params.push(("stdin", "1"));
+    }
+    if query.stdout.as_deref() == Some("true") || query.stdout.as_deref() == Some("1") {
+        params.push(("stdout", "1"));
+    }
+    if query.stderr.as_deref() == Some("true") || query.stderr.as_deref() == Some("1") {
+        params.push(("stderr", "1"));
+    }
+    if query.tty.as_deref() == Some("true") || query.tty.as_deref() == Some("1") {
+        params.push(("tty", "1"));
+    }
+    let qs: String = params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let kubelet_ws_url =
+        format!("wss://{node_ip}:10250/attach/{raw_ns}/{pod_name}/{container}?{qs}");
+
+    // Verify the kubelet TLS cert against the cluster CA.
+    let ca_der = state.cluster_ca_der.as_deref().ok_or_else(|| {
+        Status::internal("cluster CA not available — cannot verify kubelet TLS".to_owned())
+    })?;
+
+    let tls_config = build_kubelet_tls_config(ca_der)
+        .map_err(|e| Status::internal(format!("failed to build kubelet TLS config: {e}")))?;
+
+    Ok(AttachTarget {
+        kubelet_ws_url,
+        node_ip,
+        tls_config,
+    })
+}
+
+/// /attach — proxy kubectl's WebSocket attach session to the kubelet.
+///
+/// Flow:
+///   1. Look up pod → node → node_ip (via resolve_attach_target).
+///   2. Upgrade inbound request to WebSocket (kubectl side), subprotocol v5.channel.k8s.io.
+///   3. Open outbound WebSocket to kubelet attach endpoint with the same subprotocol.
+///   4. Splice the two connections bidirectionally via BiStream trait.
+///
+/// The v5 channel protocol multiplexes stdin/stdout/stderr/resize over a single
+/// WebSocket using a 1-byte channel prefix per message. The splice passes bytes
+/// through unchanged — kubelet handles the mux.
+pub async fn pod_attach(
+    State(state): State<AppState>,
+    Path((raw_ns, pod_name)): Path<(String, String)>,
+    Query(query): Query<AttachQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, crate::status::StatusError> {
+    let target = resolve_attach_target(&state, &raw_ns, &pod_name, &query).await?;
+
+    let resp =
+        ws.protocols([ATTACH_SUBPROTOCOL])
+            .on_upgrade(move |inbound: WebSocket| async move {
+                if let Err(e) = run_attach_proxy(inbound, target).await {
+                    tracing::warn!("attach proxy error: {e}");
+                }
+            });
+
+    Ok(resp)
+}
+
+/// Build a rustls ClientConfig that trusts a single DER-encoded CA certificate.
+///
+/// Used to verify the kubelet's TLS certificate. A separate config per request
+/// is cheap and keeps the logic self-contained (no shared mutable state).
+fn build_kubelet_tls_config(ca_der: &[u8]) -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::RootCertStore;
+
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from(ca_der.to_vec()))?;
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    Ok(std::sync::Arc::new(config))
+}
+
+/// Open outbound WebSocket to kubelet and splice with inbound kubectl WebSocket.
+async fn run_attach_proxy(inbound: WebSocket, target: AttachTarget) -> anyhow::Result<()> {
+    use rustls::pki_types::ServerName;
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
+    use tokio_tungstenite::{client_async_with_config, tungstenite::client::IntoClientRequest};
+
+    let AttachTarget {
+        kubelet_ws_url,
+        node_ip,
+        tls_config,
+    } = target;
+
+    // Resolve node_ip → TCP stream.
+    let addr = format!("{node_ip}:10250");
+    let tcp = TcpStream::connect(&addr).await?;
+
+    // TLS handshake.
+    let connector = TlsConnector::from(tls_config);
+    let server_name = ServerName::try_from(node_ip.clone())
+        .map_err(|_| anyhow::anyhow!("invalid server name: {node_ip}"))?;
+    let tls_stream = connector.connect(server_name, tcp).await?;
+
+    // WebSocket handshake over the TLS stream.
+    let mut request = kubelet_ws_url.into_client_request()?;
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        ATTACH_SUBPROTOCOL.parse().unwrap(),
+    );
+    let (outbound_ws, _resp) = client_async_with_config(request, tls_stream, None).await?;
+
+    // Splice the two WebSocket connections bidirectionally.
+    splice(AxumWs(inbound), TungsteniteWs(outbound_ws)).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 501 stubs
 // ---------------------------------------------------------------------------
 
@@ -197,12 +413,6 @@ pub async fn pod_log(
 /// Returns 501 so kubectl gets a clear error instead of 404.
 pub async fn pod_exec(Path((_ns, _name)): Path<(String, String)>) -> impl IntoResponse {
     not_implemented("exec")
-}
-
-/// attach requires SPDY 3.1 or WebSocket upgrade — not yet implemented.
-/// Returns 501 so kubectl gets a clear error instead of 404.
-pub async fn pod_attach(Path((_ns, _name)): Path<(String, String)>) -> impl IntoResponse {
-    not_implemented("attach")
 }
 
 /// portforward requires SPDY 3.1 or WebSocket upgrade — not yet implemented.
@@ -341,6 +551,67 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // pod_log: 500 when cluster CA is absent (prevents skipping cert verification)
+    // -----------------------------------------------------------------------
+
+    /// /log must return 500 when cluster_ca_der is None.
+    ///
+    /// This guards against accidentally disabling TLS certificate verification on
+    /// the kubelet proxy: if the CA is not in AppState, the handler fails loudly
+    /// rather than silently accepting any certificate (the old danger_accept_invalid_certs
+    /// behaviour). The 500 is surfaced before any kubelet connection is attempted.
+    #[tokio::test]
+    async fn pod_log_missing_ca_returns_500_for_scheduled_pod() {
+        let state = make_state(); // cluster_ca_der is None
+
+        // Seed a pod that IS scheduled so execution reaches the reqwest client build.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "scheduled-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        let key = crate::keys::object_key("pods", "default", "scheduled-pod");
+        state
+            .store
+            .put(&key, bytes::Bytes::from(pod.to_string()), Some(0))
+            .await
+            .expect("seed pod must not fail");
+
+        // Seed a node so the node lookup succeeds and reaches the CA check.
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {
+                "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]
+            }
+        });
+        let node_key = crate::keys::cluster_object_key("nodes", "node-1");
+        state
+            .store
+            .put(&node_key, bytes::Bytes::from(node.to_string()), Some(0))
+            .await
+            .expect("seed node must not fail");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/scheduled-pod/log")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "/log must return 500 when cluster CA is absent — \
+             the old danger_accept_invalid_certs(true) must not be silently used"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // pod_exec: 501 Not Implemented
     // -----------------------------------------------------------------------
 
@@ -379,21 +650,226 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pod_attach: 501 Not Implemented
+    // pod_attach: resolve_attach_target pure-function tests
+    //
+    // resolve_attach_target contains all error-path logic (404, 400, 500).
+    // We test it directly rather than through the router because the axum
+    // WebSocketUpgrade extractor rejects non-WS requests before the handler
+    // runs — making it impossible to reach the error paths via the router.
     // -----------------------------------------------------------------------
 
+    /// /attach must return 404 when the pod does not exist.
+    ///
+    /// Without this, a request for a non-existent pod would proceed to the
+    /// WebSocket upgrade and then fail with a confusing connection error.
     #[tokio::test]
-    async fn pod_attach_returns_501() {
+    async fn pod_attach_missing_pod_returns_404() {
         let state = make_state();
-        let mut router = make_router(state);
+        let query = AttachQuery {
+            container: None,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            tty: None,
+        };
+        match resolve_attach_target(&state, "default", "ghost", &query).await {
+            Ok(_) => panic!("expected error for missing pod"),
+            Err(e) => assert_eq!(
+                e.0,
+                StatusCode::NOT_FOUND,
+                "/attach on a non-existent pod must produce 404"
+            ),
+        };
+    }
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/namespaces/default/pods/mypod/attach")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = router.call(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    /// /attach must return 400 when the pod exists but is not yet scheduled.
+    ///
+    /// An unscheduled pod has no kubelet — returning 400 tells the caller
+    /// that the pod is pending rather than producing a confusing connect error.
+    #[tokio::test]
+    async fn pod_attach_unscheduled_pod_returns_400() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pending", "namespace": "default", "resourceVersion": "1"},
+            "spec": { "containers": [{"name": "app", "image": "nginx"}] }
+        });
+        let key = crate::keys::object_key("pods", "default", "pending");
+        state
+            .store
+            .put(&key, bytes::Bytes::from(pod.to_string()), Some(0))
+            .await
+            .expect("seed pod");
+
+        let query = AttachQuery {
+            container: None,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            tty: None,
+        };
+        match resolve_attach_target(&state, "default", "pending", &query).await {
+            Ok(_) => panic!("expected error for unscheduled pod"),
+            Err(e) => assert_eq!(
+                e.0,
+                StatusCode::BAD_REQUEST,
+                "/attach on an unscheduled pod must produce 400"
+            ),
+        };
+    }
+
+    /// /attach must return 500 when cluster CA is absent.
+    ///
+    /// Without a CA, we cannot verify the kubelet's TLS certificate.
+    /// Failing loudly here prevents accidentally skipping cert verification.
+    #[tokio::test]
+    async fn pod_attach_missing_ca_returns_500() {
+        let state = make_state(); // cluster_ca_der is None
+
+        // Seed a scheduled pod and its node.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let query = AttachQuery {
+            container: None,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            tty: None,
+        };
+        match resolve_attach_target(&state, "default", "mypod", &query).await {
+            Ok(_) => panic!("expected error when CA is absent"),
+            Err(e) => assert_eq!(
+                e.0,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "/attach must fail with 500 when cluster CA is absent"
+            ),
+        };
+    }
+
+    /// kubelet_ws_url is constructed correctly for a scheduled pod.
+    ///
+    /// The URL format is what kubelet expects: wss://<ip>:10250/attach/<ns>/<pod>/<container>.
+    /// An incorrect URL would silently connect to the wrong endpoint or fail opaquely.
+    #[tokio::test]
+    async fn resolve_attach_target_builds_correct_kubelet_url() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        // Build a state WITH a cluster CA so resolve_attach_target succeeds.
+        // Use a minimal self-signed DER cert produced by rcgen.
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new_with_ca(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+            Some(ca_der),
+        );
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "ns1", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "ns1", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let query = AttachQuery {
+            container: Some("app".into()),
+            stdin: Some("1".into()),
+            stdout: Some("1".into()),
+            stderr: None,
+            tty: None,
+        };
+        let target = match resolve_attach_target(&state, "ns1", "mypod", &query).await {
+            Ok(t) => t,
+            Err(_) => panic!("resolve must succeed for scheduled pod with CA"),
+        };
+
+        assert_eq!(target.node_ip, "10.0.0.1");
+        assert!(
+            target
+                .kubelet_ws_url
+                .starts_with("wss://10.0.0.1:10250/attach/ns1/mypod/app"),
+            "kubelet URL must use wss scheme on port 10250: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            target.kubelet_ws_url.contains("stdin=1"),
+            "kubelet URL must include stdin param: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            target.kubelet_ws_url.contains("stdout=1"),
+            "kubelet URL must include stdout param: {}",
+            target.kubelet_ws_url
+        );
     }
 
     // -----------------------------------------------------------------------

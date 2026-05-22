@@ -52,15 +52,37 @@ pub struct AppState {
     pub watch_limit: WatchLimitState,
     /// HTTP client for admission webhook calls.
     pub webhook_client: reqwest::Client,
+    /// DER-encoded cluster CA certificate used to verify kubelet TLS. None in tests.
+    pub cluster_ca_der: Option<Arc<Vec<u8>>>,
 }
 
 impl AppState {
+    /// Convenience constructor for tests: cluster_ca_der defaults to None.
+    #[cfg(test)]
     pub fn new(
         store: Arc<SqliteStore>,
         sa_key: Option<jsonwebtoken::EncodingKey>,
         sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
         token_map: HashMap<String, UserInfo>,
         server_address: String,
+    ) -> Self {
+        Self::new_with_ca(
+            store,
+            sa_key,
+            sa_decoding_key,
+            token_map,
+            server_address,
+            None,
+        )
+    }
+
+    pub fn new_with_ca(
+        store: Arc<SqliteStore>,
+        sa_key: Option<jsonwebtoken::EncodingKey>,
+        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+        token_map: HashMap<String, UserInfo>,
+        server_address: String,
+        cluster_ca_der: Option<Vec<u8>>,
     ) -> Self {
         let registry = build_registry();
         let webhook_client = reqwest::Client::builder()
@@ -77,6 +99,7 @@ impl AppState {
             server_address,
             watch_limit: WatchLimitState::new(),
             webhook_client,
+            cluster_ca_der: cluster_ca_der.map(Arc::new),
         }
     }
 

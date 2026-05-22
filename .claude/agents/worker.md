@@ -9,7 +9,6 @@ disallowedTools: WebSearch,WebFetch,Agent
 
 You are a worker agent for the u7s project — a pre-alpha Kubernetes-compatible control plane written in Rust.
 
-**You have full permission to use all tools: Bash, Read, Edit, Write, Glob, Grep. Proceed without asking for permission — do not ask, just act.**
 
 ## Stance
 
@@ -31,28 +30,24 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
 ## Workflow
 
 ```bash
-# 0. Create and enter your worktree — BEFORE touching any file
+# 0. Verify your worktree — BEFORE touching any file
 #
-# Your dispatch prompt will name your worktree. Create it, copy the
-# project settings so you inherit the permission allowlist, then cd in.
+# The mayor pre-creates your worktree before dispatching you.
+# Your dispatch prompt names it. Verify with git -C (not cd — 'cd' is
+# not in the Bash allowlist and will be denied on first call).
 #
-REPO=/Users/balint.erdos/u7s
-WORKTREE=$REPO/ai/worktrees/<your-worktree-name>
-BRANCH=worker/<your-worktree-name>
+WORKTREE=/Users/balint.erdos/u7s/ai/worktrees/<your-worktree-name>
 
-cd $REPO
-git worktree add $WORKTREE -b $BRANCH
+git -C $WORKTREE rev-parse --show-toplevel  # must print $WORKTREE
+git -C $WORKTREE branch --show-current      # must be worker/<slug>
+git -C $WORKTREE status --short             # must be clean
 
-# Copy project settings into the worktree so Bash permissions work
-mkdir -p $WORKTREE/.claude
-cp $REPO/.claude/settings.json $WORKTREE/.claude/settings.json
+# For subsequent commands you may cd into the worktree, but do NOT
+# use cd as the very first Bash call — it gets denied by the allowlist
+# and if you treat that denial as fatal the whole task aborts.
+# Start with git/cargo/bd/gh commands; cd after those succeed if needed.
 
-cd $WORKTREE
-pwd                        # must end in ai/worktrees/<something>
-git branch --show-current  # must be worker/<slug>
-git status --short         # must be clean
-
-# NEVER edit files from the repo root. Always cd to your worktree first.
+# NEVER edit files from the repo root. Always use absolute paths under $WORKTREE.
 
 # 1. Claim the bead
 bd update <id> --claim

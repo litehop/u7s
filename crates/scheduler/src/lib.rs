@@ -3,18 +3,15 @@
 /// Extracted from main.rs so that pure functions can be unit-tested without
 /// standing up an API server.
 use anyhow::{bail, Context};
-use hyper::body::Incoming;
-use hyper::{Method, Request, Response, StatusCode, Uri};
-use hyper_util::rt::TokioIo;
+use hyper::{Method, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+use u7s_client_util::HyperApiClient;
 
 // ---------------------------------------------------------------------------
-// HTTP helpers — one shot over a fresh TLS connection per request.
-// This is a scaffold; connection reuse is a later optimization.
+// HTTP helpers — delegates to HyperApiClient in client-util.
 // ---------------------------------------------------------------------------
 
 /// Parse `base` + `path` into (host, port, "host:port") for TCP connect.
@@ -34,8 +31,12 @@ pub async fn http_get(
     base: &str,
     path: &str,
 ) -> anyhow::Result<(StatusCode, String)> {
-    let body = send_request(connector, base, Method::GET, path, None).await?;
-    Ok(body)
+    let client = HyperApiClient {
+        server: base.to_owned(),
+        connector: connector.clone(),
+        bearer: None,
+    };
+    client.request(Method::GET, path, None).await
 }
 
 pub async fn http_post_json(
@@ -44,73 +45,13 @@ pub async fn http_post_json(
     path: &str,
     payload: &Value,
 ) -> anyhow::Result<(StatusCode, String)> {
-    let body_str = serde_json::to_string(payload)?;
-    send_request(connector, base, Method::POST, path, Some(body_str)).await
-}
-
-pub async fn send_request(
-    connector: &TlsConnector,
-    base: &str,
-    method: Method,
-    path: &str,
-    body: Option<String>,
-) -> anyhow::Result<(StatusCode, String)> {
-    let (host, _port, addr) = parse_uri_parts(base, path)?;
-
-    let stream = TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("TCP connect to {addr}"))?;
-    let server_name = host.clone().try_into().context("invalid DNS name")?;
-    let tls_stream = connector
-        .connect(server_name, stream)
-        .await
-        .context("TLS handshake")?;
-
-    let io = TokioIo::new(tls_stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .context("HTTP/1.1 handshake")?;
-
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            error!("HTTP connection error: {e}");
-        }
-    });
-
-    let body_bytes = match &body {
-        Some(s) => bytes::Bytes::from(s.clone()),
-        None => bytes::Bytes::new(),
+    let client = HyperApiClient {
+        server: base.to_owned(),
+        connector: connector.clone(),
+        bearer: None,
     };
-
-    let mut req_builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("Host", &host)
-        .header("Accept", "application/json");
-
-    if body.is_some() {
-        req_builder = req_builder
-            .header("Content-Type", "application/json")
-            .header("Content-Length", body_bytes.len().to_string());
-    }
-
-    let req = req_builder
-        .body(http_body_util::Full::new(body_bytes))
-        .context("build request")?;
-
-    let resp: Response<Incoming> = sender.send_request(req).await.context("send request")?;
-    let status = resp.status();
-
-    use http_body_util::BodyExt;
-    let bytes = resp
-        .into_body()
-        .collect()
-        .await
-        .context("read body")?
-        .to_bytes();
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-
-    Ok((status, text))
+    let body_str = serde_json::to_string(payload)?;
+    client.request(Method::POST, path, Some(body_str)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -143,71 +84,14 @@ pub async fn stream_watch_events(
     connector: &TlsConnector,
     base: &str,
     path: &str,
-    mut handler: impl FnMut(Value),
+    handler: impl FnMut(Value),
 ) -> anyhow::Result<()> {
-    let (host, _port, addr) = parse_uri_parts(base, path)?;
-
-    let stream = TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("TCP connect to {addr}"))?;
-    let server_name = host.clone().try_into().context("invalid DNS name")?;
-    let tls_stream = connector
-        .connect(server_name, stream)
-        .await
-        .context("TLS handshake")?;
-
-    let io = TokioIo::new(tls_stream);
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .context("HTTP/1.1 handshake")?;
-
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            error!("watch connection error: {e}");
-        }
-    });
-
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(path)
-        .header("Host", &host)
-        .header("Accept", "application/json")
-        .body(http_body_util::Empty::<bytes::Bytes>::new())
-        .context("build watch request")?;
-
-    let resp: Response<Incoming> = sender
-        .send_request(req)
-        .await
-        .context("send watch request")?;
-    if !resp.status().is_success() {
-        bail!("watch returned HTTP {}", resp.status());
-    }
-
-    // Stream the body as a series of newline-delimited JSON objects.
-    // We convert the Incoming body into an async reader via a channel.
-    use http_body_util::BodyExt;
-    let mut body = resp.into_body();
-
-    let mut buf = String::new();
-    loop {
-        match body.frame().await {
-            None => break, // stream ended
-            Some(Err(e)) => {
-                warn!("watch stream error: {e}");
-                break;
-            }
-            Some(Ok(frame)) => {
-                // frame.into_data() returns Result<D, Frame<D>>; we need an explicit type.
-                let frame: hyper::body::Frame<bytes::Bytes> = frame;
-                if let Ok(data) = frame.into_data() {
-                    buf.push_str(&String::from_utf8_lossy(&data));
-                    drain_watch_buffer(&mut buf, &mut handler);
-                }
-            }
-        }
-    }
-
-    Ok(())
+    let client = HyperApiClient {
+        server: base.to_owned(),
+        connector: connector.clone(),
+        bearer: None,
+    };
+    client.watch_stream(path, handler).await
 }
 
 // ---------------------------------------------------------------------------
