@@ -18,6 +18,9 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 use u7s_client_util::{build_tls_connector, parse_kubeconfig};
+use u7s_controller_manager::{
+    build_sa_token_secret, parse_sa_added_event, secrets_path, token_request_path,
+};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -132,29 +135,6 @@ async fn http_post_json(
 }
 
 // ---------------------------------------------------------------------------
-// Secret construction — pure, testable
-// ---------------------------------------------------------------------------
-
-/// Build the Secret object that holds a service-account token.
-pub fn build_sa_token_secret(namespace: &str, sa_name: &str, token_b64: &str) -> Value {
-    serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {
-            "name": format!("{sa_name}-token"),
-            "namespace": namespace,
-            "annotations": {
-                "kubernetes.io/service-account.name": sa_name
-            }
-        },
-        "type": "kubernetes.io/service-account-token",
-        "data": {
-            "token": token_b64
-        }
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Watch streaming — identical to scheduler
 // ---------------------------------------------------------------------------
 
@@ -250,7 +230,7 @@ async fn provision_sa(
     bearer: Option<&str>,
 ) -> anyhow::Result<()> {
     // 1. Mint a JWT.
-    let token_path = format!("/api/v1/namespaces/{namespace}/serviceaccounts/{sa_name}/token");
+    let token_path = token_request_path(namespace, sa_name);
     let token_req = serde_json::json!({
         "apiVersion": "authentication.k8s.io/v1",
         "kind": "TokenRequest",
@@ -270,7 +250,7 @@ async fn provision_sa(
 
     // 3. Store in a Secret.
     let secret = build_sa_token_secret(namespace, sa_name, &token_b64);
-    let secret_path = format!("/api/v1/namespaces/{namespace}/secrets");
+    let secret_path = secrets_path(namespace);
     let (status, body) = http_post_json(connector, server, &secret_path, &secret, bearer).await?;
 
     if status.is_success() {
@@ -322,21 +302,9 @@ async fn main() -> anyhow::Result<()> {
         let server_ref = &server;
 
         let result = stream_watch_events(connector_ref, server_ref, path, bearer_ref, |event| {
-            let event_type = event["type"].as_str().unwrap_or("").to_owned();
-            if event_type != "ADDED" {
+            let Some((namespace, sa_name)) = parse_sa_added_event(&event) else {
                 return;
-            }
-            let sa_name = event["object"]["metadata"]["name"]
-                .as_str()
-                .unwrap_or("")
-                .to_owned();
-            let namespace = event["object"]["metadata"]["namespace"]
-                .as_str()
-                .unwrap_or("default")
-                .to_owned();
-            if sa_name.is_empty() {
-                return;
-            }
+            };
             info!("new ServiceAccount: {namespace}/{sa_name}");
 
             let connector_clone = connector_ref.clone();
@@ -362,38 +330,5 @@ async fn main() -> anyhow::Result<()> {
             error!("watch error: {e} — reconnecting in 5s");
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_build_sa_token_secret_shape() {
-        // The Secret must carry the right type, annotation, and data key.
-        // This is the contract the API server and kubelet rely on.
-        let secret = build_sa_token_secret("default", "my-sa", "dG9rZW4=");
-        assert_eq!(secret["kind"], "Secret");
-        assert_eq!(secret["type"], "kubernetes.io/service-account-token");
-        assert_eq!(secret["metadata"]["name"], "my-sa-token");
-        assert_eq!(secret["metadata"]["namespace"], "default");
-        assert_eq!(
-            secret["metadata"]["annotations"]["kubernetes.io/service-account.name"],
-            "my-sa"
-        );
-        assert_eq!(secret["data"]["token"], "dG9rZW4=");
-    }
-
-    #[test]
-    fn test_build_sa_token_secret_name_format() {
-        // Secret name must be "<sa-name>-token" — tools like kubectl rely on this.
-        let secret = build_sa_token_secret("kube-system", "coredns", "abc");
-        assert_eq!(secret["metadata"]["name"], "coredns-token");
-        assert_eq!(secret["metadata"]["namespace"], "kube-system");
     }
 }
