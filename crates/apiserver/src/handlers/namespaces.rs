@@ -690,7 +690,7 @@ mod tests {
             "create must succeed"
         );
 
-        let resp = list_namespaces(
+        let resp = match list_namespaces(
             State(state.clone()),
             Query(crate::handlers::generic::CollectionQuery {
                 watch: None,
@@ -709,7 +709,10 @@ mod tests {
             }),
         )
         .await
-        .expect("list must not error");
+        {
+            Ok(r) => r,
+            Err(_) => panic!("list must not error"),
+        };
 
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -730,9 +733,10 @@ mod tests {
             "create must succeed"
         );
 
-        let resp = get_namespace(State(state.clone()), Path("get-ns".to_string()))
-            .await
-            .expect("get must not error");
+        let resp = match get_namespace(State(state.clone()), Path("get-ns".to_string())).await {
+            Ok(r) => r,
+            Err(_) => panic!("get must not error"),
+        };
 
         assert_eq!(
             resp.status(),
@@ -747,9 +751,11 @@ mod tests {
     async fn get_namespace_returns_404_for_missing() {
         let state = make_state();
 
-        let err = get_namespace(State(state.clone()), Path("no-such-ns".to_string()))
-            .await
-            .unwrap_err();
+        let result = get_namespace(State(state.clone()), Path("no-such-ns".to_string())).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
@@ -767,9 +773,12 @@ mod tests {
             .to_string(),
         );
 
-        let err = create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body)
-            .await
-            .unwrap_err();
+        let result =
+            create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
@@ -787,9 +796,12 @@ mod tests {
             .to_string(),
         );
 
-        let err = create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body)
-            .await
-            .unwrap_err();
+        let result =
+            create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -810,13 +822,16 @@ mod tests {
             "first create must succeed"
         );
 
-        let err = create_namespace(
+        let result = create_namespace(
             State(state.clone()),
             axum::http::HeaderMap::new(),
             namespace_body("dup-ns"),
         )
-        .await
-        .unwrap_err();
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         assert_eq!(
             err.0,
             StatusCode::CONFLICT,
@@ -839,14 +854,17 @@ mod tests {
             .to_string(),
         );
 
-        let err = replace_namespace(
+        let result = replace_namespace(
             State(state.clone()),
             Path("different-ns".to_string()),
             axum::http::HeaderMap::new(),
             body,
         )
-        .await
-        .unwrap_err();
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         assert_eq!(
             err.0,
             StatusCode::BAD_REQUEST,
@@ -867,14 +885,17 @@ mod tests {
             "application/json".parse().unwrap(),
         );
 
-        let err = patch_namespace(
+        let result = patch_namespace(
             State(state.clone()),
             Path("any-ns".to_string()),
             headers,
             patch_body,
         )
-        .await
-        .unwrap_err();
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         assert_eq!(
             err.0,
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -894,14 +915,17 @@ mod tests {
             "application/merge-patch+json".parse().unwrap(),
         );
 
-        let err = patch_namespace(
+        let result = patch_namespace(
             State(state.clone()),
             Path("no-such-ns".to_string()),
             headers,
             patch_body,
         )
-        .await
-        .unwrap_err();
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         assert_eq!(
             err.0,
             StatusCode::NOT_FOUND,
@@ -914,9 +938,11 @@ mod tests {
     async fn delete_namespace_returns_404_for_missing() {
         let state = make_state();
 
-        let err = delete_namespace(State(state.clone()), Path("ghost-ns".to_string()))
-            .await
-            .unwrap_err();
+        let result = delete_namespace(State(state.clone()), Path("ghost-ns".to_string())).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         assert_eq!(
             err.0,
             StatusCode::NOT_FOUND,
