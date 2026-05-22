@@ -9,7 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 u7s-store       = { path = "../store" }
-axum            = "0.8"
+axum            = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 tower           = "0.5"
 tower-service   = "0.3"
 hyper           = { version = "1", features = ["http1"] }
@@ -30,6 +31,7 @@ clap            = { version = "4", features = ["derive"] }
 anyhow          = "1"
 async-stream    = "0.3"
 futures-core    = "0.3"
+futures-util    = "0.3"
 jsonwebtoken    = { version = "10", features = ["rust_crypto"] }
 rsa             = "0.9"
 x509-cert = "0.2"

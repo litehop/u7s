@@ -13,5 +13,6 @@ pub mod proxy;
 pub mod resource;
 pub mod scale;
 pub mod status;
+pub mod stream;
 pub mod tokens;
 pub mod watch;

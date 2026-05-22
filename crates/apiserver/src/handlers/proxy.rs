@@ -3,12 +3,10 @@
 /// /log: looks up the pod → node, then proxies GET to the kubelet log endpoint,
 ///        streaming the response body back to the client.
 ///
-/// /exec, /attach, /portforward: return 501 Not Implemented. These require a
-///        SPDY 3.1 or WebSocket upgrade that axum does not natively support.
-///        Returning 501 is more informative than 404 for kubectl users.
+/// /exec, /attach: return 501 Not Implemented. Portforward is fully implemented.
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{ws::WebSocketUpgrade, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -17,6 +15,7 @@ use serde::Deserialize;
 use u7s_store::Store as _;
 
 use crate::{
+    handlers::stream::{splice, AxumWs, TungsteniteWs},
     keys::{cluster_object_key, object_key},
     state::AppState,
     status::Status,
@@ -211,10 +210,160 @@ pub async fn pod_attach(Path((_ns, _name)): Path<(String, String)>) -> impl Into
     not_implemented("attach")
 }
 
-/// portforward requires SPDY 3.1 or WebSocket upgrade — not yet implemented.
-/// Returns 501 so kubectl gets a clear error instead of 404.
-pub async fn pod_portforward(Path((_ns, _name)): Path<(String, String)>) -> impl IntoResponse {
-    not_implemented("portforward")
+/// Query parameters for portforward: only `ports` is required.
+///
+/// kubectl sends `?ports=<port>` (may repeat for multiple ports).
+/// We forward it verbatim to the kubelet.
+#[derive(Deserialize)]
+pub struct PortforwardQuery {
+    pub ports: Option<String>,
+}
+
+/// Validated portforward parameters after all pre-upgrade checks pass.
+#[derive(Debug)]
+pub(crate) struct PortforwardParams {
+    pub kubelet_url: String,
+    pub ca_der: Vec<u8>,
+}
+
+/// Validate portforward pre-conditions: pod exists, is scheduled, CA is present.
+///
+/// Returns the kubelet WebSocket URL and CA DER bytes if all checks pass.
+/// Separated from the handler so this decision logic can be unit-tested without
+/// a real HTTP connection (axum's WebSocketUpgrade extractor requires a live
+/// connection, so the upgrade itself cannot be exercised in unit tests).
+pub(crate) async fn validate_portforward(
+    state: &AppState,
+    ns: &str,
+    pod_name: &str,
+    ports: Option<&str>,
+) -> Result<PortforwardParams, crate::status::StatusError> {
+    // 1. Look up the pod.
+    let pod_key = object_key("pods", ns, pod_name);
+    let stored = state
+        .store
+        .get(&pod_key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
+
+    let pod: serde_json::Value = serde_json::from_slice(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
+
+    // 2. Extract spec.nodeName — empty means pod is not yet scheduled.
+    let node_name = pod["spec"]["nodeName"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Status::bad_request(format!(
+                "pod \"{pod_name}\" is not yet scheduled (spec.nodeName is empty)"
+            ))
+        })?
+        .to_owned();
+
+    // 3. Look up the Node to get its address.
+    let node_key = cluster_object_key("nodes", &node_name);
+    let node_stored = state
+        .store
+        .get(&node_key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&node_name, "Node"))?;
+
+    let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
+
+    let node_ip = node_address(&node).ok_or_else(|| {
+        Status::internal(format!(
+            "node \"{node_name}\" has no usable address in status.addresses"
+        ))
+    })?;
+
+    // 4. Require cluster CA for kubelet TLS verification.
+    let ca_der = state
+        .cluster_ca_der
+        .as_deref()
+        .ok_or_else(|| {
+            Status::internal("cluster CA not available — cannot verify kubelet TLS".to_owned())
+        })?
+        .to_vec();
+
+    // 5. Build the kubelet portForward URL.
+    //    wss://<node-ip>:10250/portForward/<ns>/<pod>[?ports=<port>]
+    let ports_qs = ports.map(|p| format!("?ports={p}")).unwrap_or_default();
+    let kubelet_url = format!("wss://{node_ip}:10250/portForward/{ns}/{pod_name}{ports_qs}");
+
+    Ok(PortforwardParams {
+        kubelet_url,
+        ca_der,
+    })
+}
+
+/// portforward WebSocket proxy: kubectl → apiserver → kubelet.
+///
+/// Upgrades the inbound connection to WebSocket (subprotocol v5.portforward.k8s.io),
+/// then opens an outbound WebSocket to the kubelet's portForward endpoint, and
+/// bidirectionally splices the two streams.
+pub async fn pod_portforward(
+    State(state): State<AppState>,
+    Path((raw_ns, pod_name)): Path<(String, String)>,
+    Query(query): Query<PortforwardQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, crate::status::StatusError> {
+    let params = validate_portforward(&state, &raw_ns, &pod_name, query.ports.as_deref()).await?;
+
+    let resp =
+        ws.protocols(["v5.portforward.k8s.io"])
+            .on_upgrade(move |inbound_socket| async move {
+                if let Err(e) =
+                    portforward_proxy(inbound_socket, params.kubelet_url, params.ca_der).await
+                {
+                    tracing::warn!("portforward proxy error: {e}");
+                }
+            });
+    Ok(resp)
+}
+
+/// Connect to the kubelet portForward endpoint and splice with the inbound socket.
+///
+/// Separated from the handler so errors can be logged without crashing the task.
+async fn portforward_proxy(
+    inbound: axum::extract::ws::WebSocket,
+    kubelet_url: String,
+    ca_der: Vec<u8>,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    // Build rustls ClientConfig trusting only our cluster CA.
+    let ca_cert = rustls::pki_types::CertificateDer::from(ca_der);
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store
+        .add(ca_cert)
+        .map_err(|e| anyhow::anyhow!("invalid cluster CA: {e}"))?;
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
+
+    // Build the request with the portforward subprotocol header.
+    let mut req = kubelet_url
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("invalid kubelet URL: {e}"))?;
+    req.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        "v5.portforward.k8s.io".parse().expect("valid header value"),
+    );
+
+    // Connect outbound WebSocket to the kubelet.
+    let (outbound_stream, _resp) =
+        tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector))
+            .await
+            .map_err(|e| anyhow::anyhow!("kubelet portforward connect failed: {e}"))?;
+
+    // Splice inbound ↔ outbound.
+    splice(AxumWs(inbound), TungsteniteWs(outbound_stream)).await;
+    Ok(())
 }
 
 fn not_implemented(subresource: &str) -> Response {
@@ -464,21 +613,183 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pod_portforward: 501 Not Implemented
+    // pod_portforward: validate_portforward unit tests
+    //
+    // The upgrade path itself (101 Switching Protocols) requires a real HTTP
+    // connection to be hijacked and cannot be exercised with axum's in-process
+    // tower::Service test harness. We therefore test the decision logic
+    // (validate_portforward) directly — this is the function that determines
+    // 404/400/500 vs. "proceed with upgrade". If this logic is correct, the
+    // upgrade will be offered to the right requests at runtime.
     // -----------------------------------------------------------------------
 
+    /// validate_portforward must return Err(404) when the pod does not exist.
+    ///
+    /// Without this guard the handler would attempt the upgrade and then fail
+    /// to connect to the kubelet, producing a confusing error instead of 404.
     #[tokio::test]
-    async fn pod_portforward_returns_501() {
+    async fn portforward_validation_missing_pod_returns_404() {
         let state = make_state();
-        let mut router = make_router(state);
+        let result = validate_portforward(&state, "default", "ghost", None).await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            404,
+            "validate_portforward must return 404 for a pod that does not exist"
+        );
+    }
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/namespaces/default/pods/mypod/portforward")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = router.call(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    /// validate_portforward must return Err(400) when pod has no nodeName.
+    ///
+    /// An unscheduled pod has no kubelet to proxy to; we must reject before
+    /// upgrading the connection so the client gets a clear error code.
+    #[tokio::test]
+    async fn portforward_validation_unscheduled_pod_returns_400() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pending", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            // no nodeName
+        });
+        let key = crate::keys::object_key("pods", "default", "pending");
+        state
+            .store
+            .put(&key, bytes::Bytes::from(pod.to_string()), Some(0))
+            .await
+            .expect("seed pod");
+
+        let err = validate_portforward(&state, "default", "pending", None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            400,
+            "validate_portforward must return 400 for an unscheduled pod (no nodeName)"
+        );
+    }
+
+    /// validate_portforward must return Err(500) when cluster CA is absent.
+    ///
+    /// We refuse to open an unverified TLS connection to the kubelet.
+    /// The 500 is returned before the upgrade so the client sees a clear error.
+    #[tokio::test]
+    async fn portforward_validation_missing_ca_returns_500() {
+        let state = make_state(); // cluster_ca_der is None
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "node-1", "containers": [{"name": "app", "image": "nginx"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let err = validate_portforward(&state, "default", "mypod", Some("8080"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            500,
+            "validate_portforward must return 500 when cluster CA is absent"
+        );
+    }
+
+    /// validate_portforward returns Ok with correct kubelet URL on the happy path.
+    ///
+    /// Verifies that when pod is scheduled, node has an InternalIP, and CA is
+    /// present, the returned kubelet URL uses the correct scheme, address, and
+    /// path format expected by the kubelet portForward endpoint.
+    #[tokio::test]
+    async fn portforward_validation_happy_path_produces_correct_kubelet_url() {
+        use rcgen::generate_simple_self_signed;
+
+        let cert =
+            generate_simple_self_signed(vec!["localhost".to_string()]).expect("generate test cert");
+        let ca_der = cert.cert.der().to_vec();
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new_with_ca(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+            Some(ca_der),
+        );
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "node-1", "containers": [{"name": "app", "image": "nginx"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let result = validate_portforward(&state, "default", "mypod", Some("8080")).await;
+        let params = match result {
+            Ok(p) => p,
+            Err(e) => panic!(
+                "happy-path validation must succeed, got HTTP {}",
+                e.0.as_u16()
+            ),
+        };
+
+        assert_eq!(
+            params.kubelet_url, "wss://10.0.0.1:10250/portForward/default/mypod?ports=8080",
+            "kubelet URL must use wss:// scheme, InternalIP, port 10250, \
+             /portForward/<ns>/<pod> path, and the ports query string"
+        );
     }
 
     // -----------------------------------------------------------------------
