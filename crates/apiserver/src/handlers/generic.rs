@@ -6,7 +6,7 @@ use crate::{
     rbac::user_holds_all_rules,
     state::AppState,
     status::Status,
-    types::{Object, ResourceKey},
+    types::{Object, ObjectMeta, ResourceKey},
     util::{store_err_to_status, utc_now_rfc3339},
 };
 
@@ -92,7 +92,9 @@ pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::St
     match obj.name().filter(|n| !n.is_empty()) {
         Some(n) => Ok(n.to_string()),
         None => {
-            let gen = obj.body["metadata"]["generateName"].as_str().unwrap_or("");
+            let meta: ObjectMeta =
+                serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+            let gen = meta.generate_name.as_deref().unwrap_or("");
             if gen.is_empty() {
                 return Err(Status::bad_request(
                     "metadata.name or metadata.generateName is required".into(),
@@ -189,10 +191,12 @@ pub(crate) fn apply_label_selector(
     items
         .into_iter()
         .filter(|item| {
-            let labels = &item["metadata"]["labels"];
+            let meta: ObjectMeta =
+                serde_json::from_value(item["metadata"].clone()).unwrap_or_default();
+            let labels = meta.labels.unwrap_or_default();
             pairs
                 .iter()
-                .all(|(k, v)| labels.get(*k).and_then(|lv| lv.as_str()) == Some(*v))
+                .all(|(k, v)| labels.get(*k).map(|s| s.as_str()) == Some(*v))
         })
         .collect()
 }
@@ -265,15 +269,13 @@ pub(crate) fn build_list_response(
 /// Check finalizers for delete: if non-empty, set deletionTimestamp and return modified object.
 /// Returns `None` if hard-delete should proceed, `Some(obj)` if soft-delete was applied.
 pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
-    let has_finalizers = obj.body["metadata"]["finalizers"]
-        .as_array()
-        .map(|arr| !arr.is_empty())
-        .unwrap_or(false);
+    let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+
+    let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
 
     if has_finalizers {
         // Soft delete: stamp deletionTimestamp.
-        let now = utc_now_rfc3339();
-        obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(now);
+        obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
         Some(obj.body.clone())
     } else {
         None
@@ -281,10 +283,11 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
 }
 
 pub(crate) fn stamp_metadata(obj: &mut Object) {
-    if obj.body["metadata"]["uid"].is_null() {
+    let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+    if meta.uid.is_none() {
         obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
     }
-    if obj.body["metadata"]["creationTimestamp"].is_null() {
+    if meta.creation_timestamp.is_none() {
         obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
     }
 }

@@ -13,7 +13,7 @@ use crate::{
     proto,
     state::AppState,
     status::Status,
-    types::Object,
+    types::{Object, ObjectMeta},
     util::{extract_body, parse_resource_version},
 };
 
@@ -139,7 +139,9 @@ pub async fn create_namespace(
         match obj.name().filter(|n| !n.is_empty()) {
             Some(n) => n.to_string(),
             None => {
-                let gen = obj.body["metadata"]["generateName"].as_str().unwrap_or("");
+                let meta: ObjectMeta =
+                    serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+                let gen = meta.generate_name.as_deref().unwrap_or("");
                 if gen.is_empty() {
                     return Err(Status::bad_request(
                         "metadata.name or metadata.generateName is required".into(),
@@ -166,12 +168,13 @@ pub async fn create_namespace(
     }
 
     // Assign a UID if none provided — required for owner references and garbage collection.
-    if obj.body["metadata"]["uid"]
-        .as_str()
-        .map(|s| s.is_empty())
-        .unwrap_or(true)
     {
-        obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+        let meta: ObjectMeta =
+            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
+            obj.body["metadata"]["uid"] =
+                serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+        }
     }
 
     let key = cluster_object_key("namespaces", &name);

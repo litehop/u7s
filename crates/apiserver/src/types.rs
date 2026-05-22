@@ -234,6 +234,53 @@ impl std::fmt::Display for Namespace {
 }
 
 // ---------------------------------------------------------------------------
+// ObjectMeta — typed metadata struct
+// ---------------------------------------------------------------------------
+
+/// Typed representation of Kubernetes `metadata`. Used to access metadata
+/// fields at a boundary rather than via raw string-keyed JSON indexing,
+/// which is invisible to the compiler and prone to silent typos.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ObjectMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(
+        rename = "generateName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub generate_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+    #[serde(
+        rename = "resourceVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resource_version: Option<String>,
+    #[serde(
+        rename = "creationTimestamp",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub creation_timestamp: Option<String>,
+    #[serde(
+        rename = "deletionTimestamp",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deletion_timestamp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalizers: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<std::collections::BTreeMap<String, String>>,
+}
+
+// ---------------------------------------------------------------------------
 // Kubernetes object store type
 // ---------------------------------------------------------------------------
 
@@ -266,6 +313,125 @@ impl Object {
     pub fn from_bytes(bytes: &Bytes) -> Result<Self, serde_json::Error> {
         let body: Value = serde_json::from_slice(bytes)?;
         Ok(Self { body })
+    }
+}
+
+#[cfg(test)]
+mod object_meta_tests {
+    use super::*;
+
+    /// ObjectMeta must deserialize all fields from a fully-populated JSON object.
+    /// Missing any field means the typed API cannot enforce correctness at the
+    /// conversion site — a typo in a raw string key is a silent data-loss path.
+    #[test]
+    fn object_meta_deserializes_all_fields() {
+        let json = serde_json::json!({
+            "name": "my-pod",
+            "generateName": "my-",
+            "namespace": "default",
+            "uid": "abc-123",
+            "resourceVersion": "42",
+            "creationTimestamp": "2024-01-01T00:00:00Z",
+            "deletionTimestamp": "2024-01-02T00:00:00Z",
+            "finalizers": ["my.io/cleanup"],
+            "labels": {"app": "nginx"},
+            "annotations": {"note": "val"}
+        });
+        let meta: ObjectMeta = serde_json::from_value(json).unwrap();
+        assert_eq!(meta.name.as_deref(), Some("my-pod"));
+        assert_eq!(meta.generate_name.as_deref(), Some("my-"));
+        assert_eq!(meta.namespace.as_deref(), Some("default"));
+        assert_eq!(meta.uid.as_deref(), Some("abc-123"));
+        assert_eq!(meta.resource_version.as_deref(), Some("42"));
+        assert_eq!(
+            meta.creation_timestamp.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            meta.deletion_timestamp.as_deref(),
+            Some("2024-01-02T00:00:00Z")
+        );
+        assert_eq!(
+            meta.finalizers.as_deref(),
+            Some(["my.io/cleanup".to_string()].as_slice())
+        );
+        assert_eq!(
+            meta.labels
+                .as_ref()
+                .and_then(|l| l.get("app"))
+                .map(|s| s.as_str()),
+            Some("nginx")
+        );
+        assert_eq!(
+            meta.annotations
+                .as_ref()
+                .and_then(|a| a.get("note"))
+                .map(|s| s.as_str()),
+            Some("val")
+        );
+    }
+
+    /// ObjectMeta must use Option::None for every field when the JSON object is empty.
+    /// This is the parse-at-boundary default: missing fields are absent, not panic-inducing.
+    #[test]
+    fn object_meta_defaults_missing_optional_fields() {
+        let meta: ObjectMeta = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(meta.name.is_none());
+        assert!(meta.generate_name.is_none());
+        assert!(meta.namespace.is_none());
+        assert!(meta.uid.is_none());
+        assert!(meta.resource_version.is_none());
+        assert!(meta.creation_timestamp.is_none());
+        assert!(meta.deletion_timestamp.is_none());
+        assert!(meta.finalizers.is_none());
+        assert!(meta.labels.is_none());
+        assert!(meta.annotations.is_none());
+    }
+
+    /// generateName and deletionTimestamp use Kubernetes camelCase names in the wire format.
+    /// A wrong rename annotation silently produces snake_case JSON, breaking all clients.
+    #[test]
+    fn object_meta_camel_case_round_trips() {
+        let original = serde_json::json!({
+            "generateName": "job-",
+            "deletionTimestamp": "2024-06-01T12:00:00Z"
+        });
+        let meta: ObjectMeta = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(meta.generate_name.as_deref(), Some("job-"));
+        assert_eq!(
+            meta.deletion_timestamp.as_deref(),
+            Some("2024-06-01T12:00:00Z")
+        );
+
+        let serialized = serde_json::to_value(&meta).unwrap();
+        assert_eq!(serialized["generateName"], "job-");
+        assert_eq!(serialized["deletionTimestamp"], "2024-06-01T12:00:00Z");
+        // Snake_case variants must be absent — they would not be understood by kubectl
+        assert!(serialized.get("generate_name").is_none());
+        assert!(serialized.get("deletion_timestamp").is_none());
+    }
+
+    /// ObjectMeta must omit None fields from serialization.
+    /// Emitting null for absent optional fields wastes bytes and confuses clients
+    /// that check for key presence to determine whether a field is set.
+    #[test]
+    fn object_meta_serialization_omits_none_fields() {
+        let meta = ObjectMeta {
+            name: Some("my-obj".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["name"], "my-obj");
+        // All other None fields must not appear in the serialized output
+        assert!(json.get("generateName").is_none());
+        assert!(json.get("namespace").is_none());
+        assert!(json.get("uid").is_none());
+        assert!(json.get("resourceVersion").is_none());
+        assert!(json.get("creationTimestamp").is_none());
+        assert!(json.get("deletionTimestamp").is_none());
+        assert!(json.get("finalizers").is_none());
+        assert!(json.get("labels").is_none());
+        assert!(json.get("annotations").is_none());
     }
 }
 

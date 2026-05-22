@@ -13,7 +13,7 @@ use crate::{
     keys::{cluster_object_key, list_prefix, object_key},
     state::AppState,
     status::Status,
-    types::{Namespace, Object},
+    types::{Namespace, Object, ObjectMeta},
     util::{extract_body, parse_resource_version},
 };
 
@@ -370,10 +370,8 @@ pub async fn delete_pod(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let has_finalizers = obj.body["metadata"]["finalizers"]
-        .as_array()
-        .map(|arr| !arr.is_empty())
-        .unwrap_or(false);
+    let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+    let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
 
     if has_finalizers {
         // Soft delete: stamp deletionTimestamp and write back.
@@ -440,11 +438,13 @@ pub async fn patch_pod(
     }
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
-    let deletion_ts_set = current_obj.body["metadata"]["deletionTimestamp"].is_string();
-    let finalizers_empty = current_obj.body["metadata"]["finalizers"]
-        .as_array()
-        .map(|arr| arr.is_empty())
-        .unwrap_or(true);
+    let post_patch_meta: ObjectMeta =
+        serde_json::from_value(current_obj.body["metadata"].clone()).unwrap_or_default();
+    let deletion_ts_set = post_patch_meta.deletion_timestamp.is_some();
+    let finalizers_empty = post_patch_meta
+        .finalizers
+        .as_ref()
+        .is_none_or(|f| f.is_empty());
 
     if deletion_ts_set && finalizers_empty {
         state
