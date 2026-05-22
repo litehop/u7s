@@ -17,6 +17,18 @@ use tracing::{error, info, warn};
 // This is a scaffold; connection reuse is a later optimization.
 // ---------------------------------------------------------------------------
 
+/// Parse `base` + `path` into (host, port, "host:port") for TCP connect.
+///
+/// Pure function extracted so URI-parsing logic can be unit-tested without
+/// network access.
+pub fn parse_uri_parts(base: &str, path: &str) -> anyhow::Result<(String, u16, String)> {
+    let uri: Uri = format!("{base}{path}").parse().context("parse URI")?;
+    let host = uri.host().context("URI missing host")?.to_owned();
+    let port = uri.port_u16().unwrap_or(443);
+    let addr = format!("{host}:{port}");
+    Ok((host, port, addr))
+}
+
 pub async fn http_get(
     connector: &TlsConnector,
     base: &str,
@@ -43,10 +55,7 @@ pub async fn send_request(
     path: &str,
     body: Option<String>,
 ) -> anyhow::Result<(StatusCode, String)> {
-    let uri: Uri = format!("{base}{path}").parse().context("parse URI")?;
-    let host = uri.host().context("URI missing host")?.to_owned();
-    let port = uri.port_u16().unwrap_or(443);
-    let addr = format!("{host}:{port}");
+    let (host, _port, addr) = parse_uri_parts(base, path)?;
 
     let stream = TcpStream::connect(&addr)
         .await
@@ -108,16 +117,35 @@ pub async fn send_request(
 // Watch streaming — reads newline-delimited JSON from a watch endpoint
 // ---------------------------------------------------------------------------
 
+/// Drain all complete newline-terminated JSON lines from `buf`, calling
+/// `handler` for each successfully parsed value.
+///
+/// Lines that fail to parse are logged and skipped. Incomplete lines (no
+/// trailing `\n`) are left in `buf` for the next call.
+///
+/// Pure function extracted so the line-parsing logic can be unit-tested
+/// without a network connection.
+pub fn drain_watch_buffer(buf: &mut String, handler: &mut impl FnMut(Value)) {
+    while let Some(nl) = buf.find('\n') {
+        let line = buf[..nl].trim().to_owned();
+        *buf = buf[nl + 1..].to_owned();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(&line) {
+            Ok(v) => handler(v),
+            Err(e) => warn!("failed to parse watch event: {e}: {line}"),
+        }
+    }
+}
+
 pub async fn stream_watch_events(
     connector: &TlsConnector,
     base: &str,
     path: &str,
     mut handler: impl FnMut(Value),
 ) -> anyhow::Result<()> {
-    let uri: Uri = format!("{base}{path}").parse().context("parse watch URI")?;
-    let host = uri.host().context("URI missing host")?.to_owned();
-    let port = uri.port_u16().unwrap_or(443);
-    let addr = format!("{host}:{port}");
+    let (host, _port, addr) = parse_uri_parts(base, path)?;
 
     let stream = TcpStream::connect(&addr)
         .await
@@ -173,18 +201,7 @@ pub async fn stream_watch_events(
                 let frame: hyper::body::Frame<bytes::Bytes> = frame;
                 if let Ok(data) = frame.into_data() {
                     buf.push_str(&String::from_utf8_lossy(&data));
-                    // Process complete lines
-                    while let Some(nl) = buf.find('\n') {
-                        let line = buf[..nl].trim().to_owned();
-                        buf = buf[nl + 1..].to_owned();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        match serde_json::from_str::<Value>(&line) {
-                            Ok(v) => handler(v),
-                            Err(e) => warn!("failed to parse watch event: {e}: {line}"),
-                        }
-                    }
+                    drain_watch_buffer(&mut buf, &mut handler);
                 }
             }
         }
@@ -240,6 +257,18 @@ pub struct NodeMetadata {
     pub name: String,
 }
 
+/// Select the first node name from a `NodeList`.
+///
+/// Pure function extracted from `pick_node` so the selection logic can be
+/// unit-tested without network access. Returns an error when no nodes exist.
+pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
+    list.items
+        .into_iter()
+        .next()
+        .map(|n| n.metadata.name)
+        .context("no nodes available")
+}
+
 /// Return the name of the first node returned by the API server.
 pub async fn pick_node(connector: &TlsConnector, server: &str) -> anyhow::Result<String> {
     let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
@@ -247,11 +276,7 @@ pub async fn pick_node(connector: &TlsConnector, server: &str) -> anyhow::Result
         bail!("GET /api/v1/nodes returned {status}: {body}");
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
-    list.items
-        .into_iter()
-        .next()
-        .map(|n| n.metadata.name)
-        .context("no nodes available")
+    select_first_node(list)
 }
 
 /// Build the binding path for a pod in a given namespace.
@@ -496,5 +521,120 @@ mod tests {
         let json = json!({ "items": [] });
         let list: NodeList = serde_json::from_value(json).expect("should deserialize");
         assert!(list.items.is_empty());
+    }
+
+    // parse_uri_parts tests — the URI-parsing logic is shared by send_request and
+    // stream_watch_events. A wrong host/port means every request goes to the wrong
+    // address silently.
+
+    #[test]
+    fn parse_uri_parts_extracts_host_and_default_port() {
+        // When no explicit port is given, HTTPS defaults to 443.
+        let (host, port, addr) =
+            parse_uri_parts("https://api.example.com", "/api/v1/pods").expect("should parse");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
+        assert_eq!(addr, "api.example.com:443");
+    }
+
+    #[test]
+    fn parse_uri_parts_uses_explicit_port() {
+        // When the server URL contains an explicit port, that port must be used.
+        // A common kubeconfig server address is https://host:6443.
+        let (host, port, addr) =
+            parse_uri_parts("https://10.0.0.1:6443", "/api/v1/nodes").expect("should parse");
+        assert_eq!(host, "10.0.0.1");
+        assert_eq!(port, 6443);
+        assert_eq!(addr, "10.0.0.1:6443");
+    }
+
+    #[test]
+    fn parse_uri_parts_fails_on_missing_host() {
+        // A relative URL (no scheme/host) must return an error — not silently
+        // produce an empty host, which would be an undetected misconfiguration.
+        let result = parse_uri_parts("", "/api/v1/pods");
+        assert!(result.is_err(), "expected error for empty base URL");
+    }
+
+    // drain_watch_buffer tests — the line-parsing logic drives the watch loop.
+    // Bugs here mean watch events are silently dropped or double-processed.
+
+    #[test]
+    fn drain_watch_buffer_calls_handler_for_each_complete_line() {
+        // Each newline-terminated JSON object must produce exactly one handler call.
+        let mut buf = "{\"type\":\"ADDED\"}\n{\"type\":\"MODIFIED\"}\n".to_owned();
+        let mut events: Vec<Value> = Vec::new();
+        drain_watch_buffer(&mut buf, &mut |v| events.push(v));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "ADDED");
+        assert_eq!(events[1]["type"], "MODIFIED");
+        assert!(buf.is_empty(), "complete lines must be consumed from buf");
+    }
+
+    #[test]
+    fn drain_watch_buffer_leaves_incomplete_line_in_buf() {
+        // If the last chunk does not end with '\n', it is a partial line and must
+        // be retained for the next frame — emitting it early would corrupt the JSON.
+        let mut buf = "{\"type\":\"ADDED\"}\n{\"partial\":".to_owned();
+        let mut events: Vec<Value> = Vec::new();
+        drain_watch_buffer(&mut buf, &mut |v| events.push(v));
+        assert_eq!(events.len(), 1);
+        assert_eq!(buf, "{\"partial\":", "incomplete line must stay in buf");
+    }
+
+    #[test]
+    fn drain_watch_buffer_skips_blank_lines() {
+        // Watch streams may include keep-alive blank lines; they must not trigger
+        // the handler or cause a parse error.
+        let mut buf = "\n{\"type\":\"ADDED\"}\n\n".to_owned();
+        let mut events: Vec<Value> = Vec::new();
+        drain_watch_buffer(&mut buf, &mut |v| events.push(v));
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn drain_watch_buffer_skips_invalid_json_lines() {
+        // Malformed lines (e.g. partial frames from a reconnect) must be skipped,
+        // not panic or corrupt subsequent good lines.
+        let mut buf = "not-json\n{\"type\":\"ADDED\"}\n".to_owned();
+        let mut events: Vec<Value> = Vec::new();
+        drain_watch_buffer(&mut buf, &mut |v| events.push(v));
+        // Only the valid line produces a handler call.
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "ADDED");
+    }
+
+    // select_first_node tests — the node-selection policy. The scheduler always
+    // picks the first node in the list; if none exist, the bind must not proceed.
+
+    #[test]
+    fn select_first_node_returns_first_item_name() {
+        // When multiple nodes exist, the first one must be chosen. Round-robin or
+        // other strategies are not implemented; first-wins is the intended policy.
+        let list = NodeList {
+            items: vec![
+                NodeItem {
+                    metadata: NodeMetadata {
+                        name: "node-a".to_owned(),
+                    },
+                },
+                NodeItem {
+                    metadata: NodeMetadata {
+                        name: "node-b".to_owned(),
+                    },
+                },
+            ],
+        };
+        let name = select_first_node(list).expect("should return a node");
+        assert_eq!(name, "node-a");
+    }
+
+    #[test]
+    fn select_first_node_errors_when_list_is_empty() {
+        // An empty node list must produce an error so the caller can log and retry,
+        // rather than silently proceeding with an empty node name.
+        let list = NodeList { items: vec![] };
+        let result = select_first_node(list);
+        assert!(result.is_err(), "expected error for empty node list");
     }
 }
