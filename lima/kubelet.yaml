@@ -44,15 +44,12 @@ provision:
         > /etc/apt/sources.list.d/cri-o.list
       apt-get update -qq
       apt-get install -y cri-o crun conmon
+      # Do NOT add a 10-crun.conf drop-in pointing at /usr/bin/crun.
+      # CRI-O ships its own crun at /usr/libexec/crio/crun that matches the OCI
+      # spec version it generates (1.2.x). The system crun only accepts 1.0/1.1
+      # and will fail with "unknown version specified" on every sandbox create.
+      # The 10-crio.conf shipped by the cri-o package already sets the correct path.
       mkdir -p /etc/crio/crio.conf.d
-      cat > /etc/crio/crio.conf.d/10-crun.conf <<'CRUN'
-      [crio.runtime]
-      default_runtime = "crun"
-      [crio.runtime.runtimes.crun]
-      runtime_path = "/usr/bin/crun"
-      runtime_type = "oci"
-      runtime_root = "/run/crun"
-      CRUN
       systemctl enable --now crio
 
       # Install kubelet 1.36 from pkgs.k8s.io
@@ -79,23 +76,23 @@ provision:
       # Write kubelet args — kubeconfig placed at /etc/kubelet-kubeconfig by lima-start.sh
       mkdir -p /etc/systemd/system/kubelet.service.d
       cat > /etc/kubelet-config.yaml <<'KUBECFG'
-      apiVersion: kubelet.config.k8s.io/v1beta1
-      kind: KubeletConfiguration
-      containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
-      registerNode: true
-      failSwapOn: false
-      resolvConf: ""
-      staticPodPath: /tmp/kubelet-pods
-      KUBECFG
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
+registerNode: true
+failSwapOn: false
+resolvConf: ""
+staticPodPath: /tmp/kubelet-pods
+KUBECFG
       cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<'UNIT'
-      [Service]
-      ExecStart=
-      ExecStart=/usr/bin/kubelet \
-        --config=/etc/kubelet-config.yaml \
-        --kubeconfig=/etc/kubelet-kubeconfig \
-        --hostname-override=lima-node \
-        --v=2
-      UNIT
+[Service]
+ExecStart=
+ExecStart=/usr/bin/kubelet \
+  --config=/etc/kubelet-config.yaml \
+  --kubeconfig=/etc/kubelet-kubeconfig \
+  --hostname-override=lima-node \
+  --v=2
+UNIT
       systemctl daemon-reload
 
 probes:
