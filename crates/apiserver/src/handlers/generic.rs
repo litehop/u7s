@@ -157,6 +157,9 @@ fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusEr
 
 /// Serialise a single watch event to NDJSON bytes (including trailing newline).
 /// Returns None on Compacted — the caller should close the stream.
+/// Returns None on corrupt object bytes (invalid UTF-8) — the event is skipped,
+/// a warning is logged, and the stream continues. Emitting null would send invalid
+/// data to Kubernetes clients that may panic or behave incorrectly.
 pub(crate) fn encode_watch_event(
     event: &WatchEvent,
     api_version: &str,
@@ -164,20 +167,24 @@ pub(crate) fn encode_watch_event(
 ) -> Option<Bytes> {
     let line = match event {
         WatchEvent::Added(obj) => {
-            let object: serde_json::Value =
-                serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
-            format!(
-                "{{\"type\":\"ADDED\",\"object\":{}}}\n",
-                serde_json::to_string(&object).unwrap_or_default()
-            )
+            let object_json = match std::str::from_utf8(&obj.value) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("watch ADDED event has invalid UTF-8, skipping: {e}");
+                    return None;
+                }
+            };
+            format!("{{\"type\":\"ADDED\",\"object\":{object_json}}}\n")
         }
         WatchEvent::Modified(obj) => {
-            let object: serde_json::Value =
-                serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null);
-            format!(
-                "{{\"type\":\"MODIFIED\",\"object\":{}}}\n",
-                serde_json::to_string(&object).unwrap_or_default()
-            )
+            let object_json = match std::str::from_utf8(&obj.value) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("watch MODIFIED event has invalid UTF-8, skipping: {e}");
+                    return None;
+                }
+            };
+            format!("{{\"type\":\"MODIFIED\",\"object\":{object_json}}}\n")
         }
         WatchEvent::Deleted { key, revision } => {
             // Reconstruct a minimal tombstone object from the store key.
@@ -2526,6 +2533,50 @@ mod tests {
             rv.is_empty(),
             "without stamping, resourceVersion must be absent — \
              encode_watch_event must not synthesize it from StoreObject.revision"
+        );
+    }
+
+    /// Regression: encode_watch_event must skip (return None) for ADDED events whose
+    /// stored bytes are not valid UTF-8, rather than emitting {"type":"ADDED","object":null}.
+    ///
+    /// Kubernetes clients (controller-runtime, client-go) do not expect null objects in
+    /// watch streams and may panic or enter a bad state when they receive one. A corrupt
+    /// store entry must not propagate to clients; the stream must continue for subsequent
+    /// valid events.
+    #[test]
+    fn encode_watch_event_added_with_invalid_utf8_is_skipped() {
+        let corrupt_bytes = bytes::Bytes::from(vec![0xFF, 0xFE, 0x00]);
+        let event = WatchEvent::Added(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/corrupt".into(),
+            value: corrupt_bytes,
+            revision: 1,
+        });
+
+        let result = encode_watch_event(&event, "v1", "ConfigMap");
+
+        assert!(
+            result.is_none(),
+            "encode_watch_event must skip (return None) for ADDED events with invalid UTF-8, \
+             not emit {{\"type\":\"ADDED\",\"object\":null}} which breaks Kubernetes watch clients"
+        );
+    }
+
+    /// Regression: same as above but for MODIFIED events.
+    #[test]
+    fn encode_watch_event_modified_with_invalid_utf8_is_skipped() {
+        let corrupt_bytes = bytes::Bytes::from(vec![0xFF, 0xFE]);
+        let event = WatchEvent::Modified(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/corrupt".into(),
+            value: corrupt_bytes,
+            revision: 2,
+        });
+
+        let result = encode_watch_event(&event, "v1", "ConfigMap");
+
+        assert!(
+            result.is_none(),
+            "encode_watch_event must skip (return None) for MODIFIED events with invalid UTF-8, \
+             not emit {{\"type\":\"MODIFIED\",\"object\":null}} which breaks Kubernetes watch clients"
         );
     }
 
