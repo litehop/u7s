@@ -11,9 +11,9 @@
       "Bash(limactl *)",
       "Bash(rustc *)",
       "Bash(rustup *)",
-      "mcp__git__*",
-      "mcp__lima_node__*",
-      "mcp__rust__*"
+      "mcp__lima-node__*",
+      "mcp__mcpls__*",
+      "mcp__u7s__*"
     ]
   },
   "worktree": {
@@ -76,19 +76,8 @@
       }
     ]
   },
-  "mcpServers": {
-    "lima-node": {
-      "command": "limactl",
-      "args": [
-        "mcp",
-        "serve",
-        "lima-node"
-      ]
-    }
-  },
   "enabledMcpjsonServers": [
     "lima-node",
-    "git",
-    "rust"
+    "mcpls"
   ]
 }

@@ -1,25 +1,29 @@
 {
   "mcpServers": {
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
-      }
+    "lima-node": {
+      "transport": "stdio",
+      "command": "limactl",
+      "args": [
+        "mcp",
+        "serve",
+        "lima-node"
+      ]
     },
-    "git": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-git", "--repository", "."]
-    },
-    "rust": {
-      "type": "stdio",
-      "command": "rust-mcp-server",
-      "args": ["--workspace", "/Users/balint.erdos/u7s"]
+    "mcpls": {
+      "command": "mcpls",
+      "args": []
     },
     "u7s": {
       "type": "stdio",
       "command": "cargo",
-      "args": ["run", "--quiet", "--manifest-path", "/Users/balint.erdos/u7s/Cargo.toml", "-p", "u7s-mcp-server"]
+      "args": [
+        "run",
+        "--quiet",
+        "--manifest-path",
+        "/Users/balint.erdos/u7s/Cargo.toml",
+        "-p",
+        "u7s-mcp-server"
+      ]
     }
   }
 }
