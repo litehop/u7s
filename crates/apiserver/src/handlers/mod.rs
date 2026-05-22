@@ -1,4 +1,5 @@
 pub mod authorization;
+pub mod core;
 pub mod cr;
 pub mod crd;
 pub mod discovery;
