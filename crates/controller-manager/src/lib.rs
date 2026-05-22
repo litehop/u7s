@@ -8,12 +8,25 @@ use serde_json::Value;
 // Secret construction
 // ---------------------------------------------------------------------------
 
+/// Typed `data` field for a `kubernetes.io/service-account-token` Secret.
+///
+/// Using a struct rather than a raw `json!` literal ensures that field names
+/// are checked at compile time — a typo like `"tokne"` would silently produce
+/// a wrong Secret that no client can consume.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SecretData {
+    pub token: String,
+}
+
 /// Build the Secret object that holds a service-account token.
 ///
 /// The Secret type and annotation are required by the Kubernetes SA token
 /// controller contract; tools like kubectl rely on the `<sa-name>-token`
 /// naming convention.
 pub fn build_sa_token_secret(namespace: &str, sa_name: &str, token_b64: &str) -> Value {
+    let data = SecretData {
+        token: token_b64.to_owned(),
+    };
     serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
@@ -25,9 +38,7 @@ pub fn build_sa_token_secret(namespace: &str, sa_name: &str, token_b64: &str) ->
             }
         },
         "type": "kubernetes.io/service-account-token",
-        "data": {
-            "token": token_b64
-        }
+        "data": serde_json::to_value(data).expect("SecretData serializes")
     })
 }
 
@@ -82,6 +93,36 @@ pub fn secrets_path(namespace: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- SecretData ---
+
+    /// SecretData must serialize to {"token":"<value>"} so that the SA token
+    /// controller stores data the kubelet and clients can read back.
+    /// A field rename regression ("tokne", "Token") silently breaks all SA auth.
+    #[test]
+    fn secret_data_serializes_token_field() {
+        let d = SecretData {
+            token: "dG9rZW4=".to_owned(),
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["token"], "dG9rZW4=");
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            1,
+            "SecretData must only emit 'token'"
+        );
+    }
+
+    /// SecretData must round-trip through JSON so stored values can be read back.
+    #[test]
+    fn secret_data_round_trips() {
+        let original = SecretData {
+            token: "abc123".to_owned(),
+        };
+        let v = serde_json::to_value(&original).unwrap();
+        let restored: SecretData = serde_json::from_value(v).unwrap();
+        assert_eq!(restored.token, "abc123");
+    }
 
     // --- build_sa_token_secret ---
 
