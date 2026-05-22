@@ -496,8 +496,10 @@ jobs:
           # Create a Deployment whose pod template mounts the ConfigMap.
           # nodeName bypasses the scheduler (not present in this job) while still
           # exercising the full Deployment → ReplicaSet → Pod → kubelet path,
-          # including ConfigMap volume projection.  nginx:alpine stays Running so
+          # including ConfigMap volume projection.  busybox sleep stays Running so
           # the pod reaches Running phase (vs Succeeded for the busybox one-shot).
+          # Using busybox (already pulled for the one-shot test) avoids a second
+          # heavy image pull and any port-conflict issues with nginx on hostNetwork.
           # hostNetwork+dnsPolicy:None avoids ClusterDNS errors.
           kubectl apply --validate=false -f - <<'EOF'
           apiVersion: apps/v1
@@ -521,7 +523,8 @@ jobs:
                 dnsConfig: {}
                 containers:
                   - name: hello
-                    image: nginx:alpine
+                    image: busybox:1.36
+                    command: ["sh", "-c", "sleep 300"]
                     volumeMounts:
                       - name: config-vol
                         mountPath: /etc/config
