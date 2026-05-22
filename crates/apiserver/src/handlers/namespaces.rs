@@ -13,7 +13,7 @@ use crate::{
     proto,
     state::AppState,
     status::Status,
-    types::{Object, ObjectMeta},
+    types::{NamespaceStatus, Object, ObjectMeta},
     util::{extract_body, parse_resource_version},
 };
 
@@ -164,7 +164,10 @@ pub async fn create_namespace(
         obj.body["apiVersion"] = serde_json::Value::String("v1".into());
     }
     if obj.body["status"].is_null() || obj.body.get("status").is_none() {
-        obj.body["status"] = serde_json::json!({ "phase": "Active" });
+        obj.body["status"] = serde_json::to_value(NamespaceStatus {
+            phase: "Active".to_owned(),
+        })
+        .expect("NamespaceStatus serializes");
     }
 
     // Assign a UID if none provided — required for owner references and garbage collection.
