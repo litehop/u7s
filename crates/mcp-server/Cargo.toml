@@ -3,6 +3,10 @@ name = "u7s-mcp-server"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "u7s_mcp_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "u7s-mcp-server"
 path = "src/main.rs"
