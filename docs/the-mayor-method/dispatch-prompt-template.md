@@ -7,7 +7,9 @@ Placeholders used throughout (substitute per project):
 
 - `<MAYOR_CHECKOUT>` — absolute path of the mayor's primary checkout
 - `<WORKTREE_ROOT>` — absolute path of the directory holding worker
-  worktrees (e.g. a sibling directory next to the mayor checkout)
+  worktrees. For this project: `<MAYOR_CHECKOUT>/ai/worktrees/` (inside
+  the repo so workers inherit `.claude/settings.json` permissions
+  automatically via the `WorktreeCreate` hook)
 - `<ASSIGNED_WORKTREE>` — absolute path of the worktree the worker should
   edit (always a subdirectory of `<WORKTREE_ROOT>`)
 - `<BEAD_ID>` — the bead identifier (project-specific prefix; here written
@@ -113,10 +115,12 @@ Per project policy, worker worktrees live under:
 <WORKTREE_ROOT>
 ```
 
-Not inside the mayor checkout (would mix worker edits into the mayor's
-working tree).
 Not `.claude/worktrees/agent-*` (forbidden — leaks edits to mayor checkout
 via tool-path-resolution quirks; see "Worktree boundary" above).
+Not a sibling directory outside the repo (workers would not inherit
+`.claude/settings.json` and would hit permission prompts on every tool call).
+For this project the correct root is `<MAYOR_CHECKOUT>/ai/worktrees/`,
+created by the `WorktreeCreate` hook in `scripts/create-worktree.sh`.
 
 ---
 

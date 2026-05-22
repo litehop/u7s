@@ -49,11 +49,13 @@ if [[ "$NORM_FILE" != "$NORM_ROOT"/* ]] && [[ "$NORM_FILE" != "$NORM_ROOT" ]]; t
 fi
 
 # In the main checkout (not a linked worktree), block edits into worker trees.
-ABS_GIT_DIR=$(git rev-parse --absolute-git-dir 2>/dev/null || true)
-COMMON_GIT_DIR=$(git rev-parse --git-common-dir 2>/dev/null || true)
+# Run git from RESOLVED_PARENT (the file's directory) so that linked worktrees
+# are correctly detected even when the shell's cwd is the main checkout.
+ABS_GIT_DIR=$(git -C "$RESOLVED_PARENT" rev-parse --absolute-git-dir 2>/dev/null || true)
+COMMON_GIT_DIR=$(git -C "$RESOLVED_PARENT" rev-parse --git-common-dir 2>/dev/null || true)
 # Normalize common dir (may be relative in older git)
 if [[ "$COMMON_GIT_DIR" != /* ]]; then
-  COMMON_GIT_DIR="$(cd "$GIT_ROOT" && pwd -P)/$COMMON_GIT_DIR"
+  COMMON_GIT_DIR="$(cd "$RESOLVED_PARENT" && pwd -P)/$COMMON_GIT_DIR"
 fi
 COMMON_GIT_DIR=$(cd "$COMMON_GIT_DIR" && pwd -P)
 
