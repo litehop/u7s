@@ -1130,9 +1130,9 @@ mod tests {
 
     // OCC is enforced by SqliteStore::put's CAS; tested in crates/store/src/lib.rs.
 
-    /// Gateway API controllers PATCH status on namespaced Gateway CRs via /status route.
-    /// The group is not in the static resource registry, so patch_namespaced_resource_status
-    /// must fall back to the CR store key.
+    /// Gateway API controllers PATCH status on namespaced Gateways via the /status route.
+    /// gateway.networking.k8s.io/v1 is in the static resource registry, so
+    /// patch_namespaced_resource_status must use the registry store key (not the CR fallback key).
     #[tokio::test]
     async fn gateway_cr_status_merge_patch_updates_status_only() {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
@@ -1149,7 +1149,8 @@ mod tests {
         let plural = "gateways";
         let ns = "default";
         let name = "my-gateway";
-        let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
+        // Gateway is in the registry, so the handler uses the registry key.
+        let registry_key = crate::keys::group_object_key(group, plural, Some(ns), name);
 
         let initial = serde_json::json!({
             "apiVersion": "gateway.networking.k8s.io/v1",
@@ -1163,9 +1164,9 @@ mod tests {
         });
         let initial_bytes = bytes::Bytes::from(serde_json::to_vec(&initial).unwrap());
         store
-            .put(&cr_key, initial_bytes, None)
+            .put(&registry_key, initial_bytes, None)
             .await
-            .expect("seed Gateway CR");
+            .expect("seed Gateway");
 
         let patch =
             serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "True"}]}});
@@ -1193,14 +1194,14 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "Gateway CR status PATCH must succeed via CR fallback"
+            "Gateway status PATCH must succeed via registry path"
         );
 
         let stored = store
-            .get(&cr_key)
+            .get(&registry_key)
             .await
             .expect("store get")
-            .expect("CR must exist");
+            .expect("Gateway must exist");
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
 
         let conds = v["status"]["conditions"]

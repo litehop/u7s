@@ -242,6 +242,26 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("RoleBinding", true, false),
     );
 
+    // gateway.networking.k8s.io/v1 — GA resources
+    m.insert(
+        rk("gateway.networking.k8s.io", "v1", "gatewayclasses"),
+        rm("GatewayClass", false, true),
+    );
+    m.insert(
+        rk("gateway.networking.k8s.io", "v1", "gateways"),
+        rm("Gateway", true, true),
+    );
+    m.insert(
+        rk("gateway.networking.k8s.io", "v1", "httproutes"),
+        rm("HTTPRoute", true, true),
+    );
+
+    // gateway.networking.k8s.io/v1beta1
+    m.insert(
+        rk("gateway.networking.k8s.io", "v1beta1", "referencegrants"),
+        rm("ReferenceGrant", true, false),
+    );
+
     // networking.k8s.io/v1
     m.insert(
         rk("networking.k8s.io", "v1", "networkpolicies"),
