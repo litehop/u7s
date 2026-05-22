@@ -12,7 +12,7 @@ use crate::{
     keys::{group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
-    types::Object,
+    types::{Object, ObjectMeta},
     util::{content_type, extract_body, parse_resource_version},
 };
 
@@ -308,9 +308,9 @@ pub async fn delete_resource(
             .put(&key, obj.to_bytes(), expected_rv)
             .await
             .map_err(|e| store_err(e, &name, &meta.kind))?;
-        let mut body = soft;
-        body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
-        return Ok(Json(body).into_response());
+        let mut body = Object { body: soft };
+        body.set_resource_version(new_rv);
+        return Ok(Json(body.body).into_response());
     }
 
     state
@@ -360,10 +360,14 @@ pub(crate) async fn do_patch(
     if is_ssa && stored_opt.is_none() {
         let mut obj = Object::from_bytes(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-        obj.body["metadata"]["name"] = serde_json::Value::String(name.to_string());
+        let mut obj_meta: ObjectMeta =
+            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        obj_meta.name = Some(name.to_string());
         if let Some(namespace) = ns {
-            obj.body["metadata"]["namespace"] = serde_json::Value::String(namespace.to_string());
+            obj_meta.namespace = Some(namespace.to_string());
         }
+        obj.body["metadata"] =
+            serde_json::to_value(obj_meta).map_err(|e| Status::internal(e.to_string()))?;
         stamp_metadata(&mut obj);
         let new_rv = match state.store.put(key, obj.to_bytes(), Some(0)).await {
             Ok(rv) => rv,
@@ -423,10 +427,13 @@ pub(crate) async fn do_patch(
     }
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
-    let deletion_ts_set = current.body["metadata"]["deletionTimestamp"].is_string();
-    let finalizers_empty = current.body["metadata"]["finalizers"]
-        .as_array()
-        .map(|arr| arr.is_empty())
+    let current_meta: ObjectMeta =
+        serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
+    let deletion_ts_set = current_meta.deletion_timestamp.is_some();
+    let finalizers_empty = current_meta
+        .finalizers
+        .as_deref()
+        .map(|f| f.is_empty())
         .unwrap_or(true);
 
     if deletion_ts_set && finalizers_empty {
@@ -650,7 +657,11 @@ pub async fn create_namespaced_resource(
 
     let name = resolve_name(&mut obj)?;
 
-    obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
+    let mut ns_meta: ObjectMeta =
+        serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+    ns_meta.namespace = Some(ns.clone());
+    obj.body["metadata"] =
+        serde_json::to_value(ns_meta).map_err(|e| Status::internal(e.to_string()))?;
     stamp_metadata(&mut obj);
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
@@ -777,9 +788,9 @@ pub async fn delete_namespaced_resource(
             .put(&key, obj.to_bytes(), expected_rv)
             .await
             .map_err(|e| store_err(e, &name, &meta.kind))?;
-        let mut body = soft;
-        body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
-        return Ok(Json(body).into_response());
+        let mut body = Object { body: soft };
+        body.set_resource_version(new_rv);
+        return Ok(Json(body.body).into_response());
     }
 
     state
