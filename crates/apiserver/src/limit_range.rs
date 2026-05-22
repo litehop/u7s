@@ -187,11 +187,11 @@ fn millivalue_to_quantity(milli: f64, resource: &str) -> String {
     } else {
         // Memory: millivalue = bytes * 1000; divide back to bytes
         let bytes = (milli / 1000.0) as u64;
-        if bytes >= 1024 * 1024 * 1024 && bytes % (1024 * 1024 * 1024) == 0 {
+        if bytes >= 1024 * 1024 * 1024 && bytes.is_multiple_of(1024 * 1024 * 1024) {
             format!("{}Gi", bytes / (1024 * 1024 * 1024))
-        } else if bytes >= 1024 * 1024 && bytes % (1024 * 1024) == 0 {
+        } else if bytes >= 1024 * 1024 && bytes.is_multiple_of(1024 * 1024) {
             format!("{}Mi", bytes / (1024 * 1024))
-        } else if bytes >= 1024 && bytes % 1024 == 0 {
+        } else if bytes >= 1024 && bytes.is_multiple_of(1024) {
             format!("{}Ki", bytes / 1024)
         } else {
             format!("{bytes}")
