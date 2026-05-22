@@ -4,9 +4,50 @@ use axum::{
     Json,
 };
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use u7s_store::Store as _;
 
 use crate::{keys::group_object_key, state::AppState, status::Status, types::Object};
+
+// ---------------------------------------------------------------------------
+// Typed Scale structs — local to this file (single-use, not in types.rs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ScaleMetadata {
+    name: Option<String>,
+    namespace: Option<String>,
+    #[serde(
+        rename = "resourceVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    resource_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ScaleSpec {
+    replicas: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ScaleStatus {
+    replicas: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Scale {
+    #[serde(rename = "apiVersion", default)]
+    api_version: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    metadata: ScaleMetadata,
+    #[serde(default)]
+    spec: ScaleSpec,
+    #[serde(default)]
+    status: ScaleStatus,
+}
 
 // ---------------------------------------------------------------------------
 // Scale subresource — GET/PUT/PATCH
@@ -59,7 +100,8 @@ pub fn build_scale(
 
 /// Extract spec.replicas from a stored workload object (default 0).
 pub fn extract_replicas(obj: &serde_json::Value) -> i64 {
-    obj["spec"]["replicas"].as_i64().unwrap_or(0)
+    let spec: ScaleSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
+    spec.replicas.unwrap_or(0) as i64
 }
 
 /// GET /apis/apps/v1/namespaces/:ns/:resource/:name/scale
@@ -100,12 +142,14 @@ pub async fn put_scale(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     require_scale_resource(&resource)?;
 
-    let scale_body: serde_json::Value = serde_json::from_slice(&body)
+    let scale: Scale = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let new_replicas = scale_body["spec"]["replicas"]
-        .as_i64()
-        .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?;
+    let new_replicas = scale
+        .spec
+        .replicas
+        .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?
+        as i64;
 
     let key = group_object_key("apps", &resource, Some(&ns), &name);
     let stored = state
@@ -146,8 +190,10 @@ pub async fn patch_scale(
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     require_scale_resource(&resource)?;
 
-    let scale_patch: serde_json::Value = serde_json::from_slice(&body)
+    let patch_body: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let patch_scale_spec: ScaleSpec =
+        serde_json::from_value(patch_body["spec"].clone()).unwrap_or_default();
 
     let key = group_object_key("apps", &resource, Some(&ns), &name);
     let stored = state
@@ -161,8 +207,9 @@ pub async fn patch_scale(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     // Extract replicas from patch if present; otherwise keep current value.
-    let new_replicas = if let Some(r) = scale_patch["spec"]["replicas"].as_i64() {
-        obj.body["spec"]["replicas"] = serde_json::Value::Number(r.into());
+    let new_replicas = if let Some(r) = patch_scale_spec.replicas {
+        let r = r as i64;
+        obj.body["spec"]["replicas"] = serde_json::json!(r);
         r
     } else {
         extract_replicas(&obj.body)
@@ -258,6 +305,32 @@ mod tests {
         assert!(require_scale_resource("daemonsets").is_err());
         assert!(require_scale_resource("pods").is_err());
         assert!(require_scale_resource("configmaps").is_err());
+    }
+
+    // -- ScaleSpec deserialization --
+
+    #[test]
+    fn scale_spec_deserializes_replicas() {
+        // The compiler now enforces the field name — a typo ("replikas") would
+        // be a compile error rather than a silent runtime zero.
+        let spec: ScaleSpec = serde_json::from_str(r#"{"replicas": 3}"#).unwrap();
+        assert_eq!(spec.replicas, Some(3));
+    }
+
+    #[test]
+    fn scale_spec_defaults_missing_replicas() {
+        // An absent replicas field must deserialize to None (not a panic or error).
+        // Callers use unwrap_or(0) to get the default, preserving explicit intent.
+        let spec: ScaleSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(spec.replicas, None);
+    }
+
+    #[test]
+    fn scale_spec_rejects_wrong_type() {
+        // i32 deserialization is strict — a string "three" must fail.
+        // This verifies the type guard that prevents silent coercions.
+        let result: Result<ScaleSpec, _> = serde_json::from_str(r#"{"replicas": "three"}"#);
+        assert!(result.is_err());
     }
 }
 
