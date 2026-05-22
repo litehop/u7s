@@ -7,5 +7,8 @@ pub mod generic;
 pub mod json_patch;
 pub mod namespaces;
 pub mod pods;
+pub mod resource;
 pub mod scale;
+pub mod status;
 pub mod tokens;
+pub mod watch;

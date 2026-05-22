@@ -55,7 +55,7 @@ pub async fn list_namespaces(
     let prefix = cluster_list_prefix("namespaces");
 
     if query.watch == Some(true) {
-        return super::generic::watch_generic(
+        return super::watch::watch_generic(
             state,
             prefix,
             "v1".to_string(),

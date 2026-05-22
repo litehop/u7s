@@ -1,0 +1,1767 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    Extension, Json,
+};
+use bytes::Bytes;
+use u7s_store::{ListOptions, Store, StoreError};
+
+use crate::{
+    auth::UserInfo,
+    keys::{group_list_prefix, group_object_key},
+    state::AppState,
+    status::Status,
+    types::Object,
+    util::{content_type, extract_body, parse_resource_version},
+};
+
+use super::generic::{
+    apply_delete_policy, apply_label_selector, build_list_response, check_crb_escalation,
+    decode_continue, lookup, parse_field_selector, parse_label_selector, resolve_name,
+    stamp_metadata, store_err, validate_name, CollectionQuery, RBAC_GROUP,
+};
+use super::json_patch::{apply_json_patch, detect_patch_type, PatchType};
+use super::watch::{fetch_initial_events, watch_generic};
+
+// ---------------------------------------------------------------------------
+// Cluster-scoped handlers  (group/version/resource)
+// ---------------------------------------------------------------------------
+
+pub async fn list_resource(
+    State(state): State<AppState>,
+    Path((group, version, plural)): Path<(String, String, String)>,
+    Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
+) -> Result<Response, crate::status::StatusError> {
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::list_cr(
+                State(state),
+                Path((group, version, plural)),
+                query,
+                user.username,
+            )
+            .await;
+        }
+    };
+    let prefix = group_list_prefix(&group, &plural, None);
+
+    if query.watch == Some(true) {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{}/{}", group, version)
+        };
+        let from_rv = query.resource_version.unwrap_or(0);
+        let initial =
+            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
+        return watch_generic(
+            state,
+            prefix,
+            api_version,
+            meta.kind.clone(),
+            from_rv,
+            initial,
+            query.label_selector,
+            query.field_selector,
+            query.allow_watch_bookmarks == Some(true),
+            user.username,
+        )
+        .await;
+    }
+
+    let field_selector = query
+        .field_selector
+        .as_deref()
+        .map(parse_field_selector)
+        .transpose()?;
+    let continue_key = query
+        .continue_token
+        .as_deref()
+        .map(decode_continue)
+        .transpose()?;
+    let resp = state
+        .store
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector,
+                limit: query.limit,
+                continue_key,
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut items = Vec::with_capacity(resp.items.len());
+    for obj in &resp.items {
+        let v: serde_json::Value =
+            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+        items.push(v);
+    }
+
+    let items = if let Some(ref sel) = query.label_selector {
+        let pairs = parse_label_selector(sel)?;
+        apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
+
+    let body = build_list_response(
+        &meta.kind,
+        &group,
+        &version,
+        resp.revision,
+        items,
+        resp.continue_key,
+    );
+    Ok(Json(body).into_response())
+}
+
+pub async fn get_resource(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    validate_name("name", &name)?;
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::get_cr(State(state), Path((group, version, plural, name))).await;
+        }
+    };
+
+    let key = group_object_key(&group, &plural, None, &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        stored.value,
+    )
+        .into_response())
+}
+
+pub async fn create_resource(
+    State(state): State<AppState>,
+    Path((group, version, plural)): Path<(String, String, String)>,
+    Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let body = extract_body(&body, content_type(&headers));
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::create_cr(
+                State(state),
+                Path((group, version, plural)),
+                headers,
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
+
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // Escalation prevention: before persisting a ClusterRoleBinding, verify the
+    // caller already holds all rules of the referenced ClusterRole. This prevents
+    // users from granting themselves permissions they don't currently have.
+    check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
+
+    let name = resolve_name(&mut obj)?;
+    stamp_metadata(&mut obj);
+
+    let key = group_object_key(&group, &plural, None, &name);
+    let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
+    let new_rv = match result {
+        Ok(rv) => rv,
+        Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
+            // createOrUpdate: replace existing object unconditionally.
+            state
+                .store
+                .put(&key, obj.to_bytes(), None)
+                .await
+                .map_err(|e| store_err(e, &name, &meta.kind))?
+        }
+        Err(e) => return Err(store_err(e, &name, &meta.kind)),
+    };
+
+    obj.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &obj.body);
+    }
+    Ok((StatusCode::CREATED, Json(obj.body)).into_response())
+}
+
+pub async fn replace_resource(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
+    let body = extract_body(&body, content_type(&headers));
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::replace_cr(
+                State(state),
+                Path((group, version, plural, name)),
+                headers,
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
+
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // Escalation prevention: before updating a ClusterRoleBinding, verify the
+    // caller already holds all rules of the referenced ClusterRole.
+    check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
+
+    let obj_name = obj.name().unwrap_or("").to_string();
+    if obj_name != name {
+        return Err(Status::bad_request(format!(
+            "the name of the object ({obj_name}) does not match the name on the URL ({name})"
+        )));
+    }
+
+    // Strip status from the incoming body on the main endpoint when the resource
+    // has a dedicated status subresource (clients must use /status for that).
+    if meta.has_status_subresource {
+        if let Some(map) = obj.body.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
+    let expected_revision = parse_resource_version(obj.resource_version())?;
+
+    let key = group_object_key(&group, &plural, None, &name);
+    let new_rv = state
+        .store
+        .put(&key, obj.to_bytes(), expected_revision)
+        .await
+        .map_err(|e| store_err(e, &name, &meta.kind))?;
+
+    obj.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &obj.body);
+    }
+    Ok(Json(obj.body).into_response())
+}
+
+pub async fn delete_resource(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::delete_cr(State(state), Path((group, version, plural, name)))
+                .await
+                .map(IntoResponse::into_response);
+        }
+    };
+
+    let key = group_object_key(&group, &plural, None, &name);
+
+    // Fetch current to check finalizers.
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    if let Some(soft) = apply_delete_policy(&mut obj) {
+        // Soft-delete: persist modified object, return it.
+        // Evict from RBAC index immediately — permissions must not outlast the deletion
+        // request even while finalizers are draining. Hard-delete path below also removes,
+        // so this is safe to call twice (remove_object is idempotent).
+        if group == RBAC_GROUP {
+            let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+            state.rbac_index.remove_object(&rbac_key);
+        }
+        let expected_rv = parse_resource_version(obj.resource_version())?;
+        let new_rv = state
+            .store
+            .put(&key, obj.to_bytes(), expected_rv)
+            .await
+            .map_err(|e| store_err(e, &name, &meta.kind))?;
+        let mut body = soft;
+        body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+        return Ok(Json(body).into_response());
+    }
+
+    state
+        .store
+        .delete(&key, None)
+        .await
+        .map_err(|e| store_err(e, &name, &meta.kind))?;
+
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+        state.rbac_index.remove_object(&rbac_key);
+    }
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "code": 200
+    }))
+    .into_response())
+}
+
+/// Shared patch logic for cluster-scoped and namespaced resources.
+///
+/// `ns` is `None` for cluster-scoped resources and `Some(namespace)` for namespaced ones.
+/// The caller supplies the pre-computed `key` and resolved `meta`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn do_patch(
+    state: &AppState,
+    key: &str,
+    meta: &crate::types::ResourceMeta,
+    group: &str,
+    version: &str,
+    plural: &str,
+    ns: Option<&str>,
+    name: &str,
+    is_ssa: bool,
+    patch_type: PatchType,
+    body: Bytes,
+) -> Result<Response, crate::status::StatusError> {
+    let stored_opt = state
+        .store
+        .get(key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // SSA upsert: apply-patch+yaml on a missing resource creates it.
+    if is_ssa && stored_opt.is_none() {
+        let mut obj = Object::from_bytes(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+        obj.body["metadata"]["name"] = serde_json::Value::String(name.to_string());
+        if let Some(namespace) = ns {
+            obj.body["metadata"]["namespace"] = serde_json::Value::String(namespace.to_string());
+        }
+        stamp_metadata(&mut obj);
+        let new_rv = match state.store.put(key, obj.to_bytes(), Some(0)).await {
+            Ok(rv) => rv,
+            Err(StoreError::AlreadyExists { .. }) => {
+                // Race: another writer created it; fall through to normal merge below.
+                let stored = state
+                    .store
+                    .get(key)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .ok_or_else(|| Status::not_found(name, &meta.kind))?;
+                let mut current = Object::from_bytes(&stored.value)
+                    .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+                let patch: serde_json::Value = serde_json::from_slice(&body)
+                    .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+                crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                    .map_err(|e| Status::bad_request(e.to_string()))?;
+                let expected_rv = parse_resource_version(current.resource_version())?;
+                let rv = state
+                    .store
+                    .put(key, current.to_bytes(), expected_rv)
+                    .await
+                    .map_err(|e| store_err(e, name, &meta.kind))?;
+                current.set_resource_version(rv);
+                return Ok(Json(current.body).into_response());
+            }
+            Err(e) => return Err(store_err(e, name, &meta.kind)),
+        };
+        obj.set_resource_version(new_rv);
+        return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
+    }
+
+    let stored = stored_opt.ok_or_else(|| Status::not_found(name, &meta.kind))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let mut patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    // Strip status from the patch on the main endpoint for resources with a status subresource.
+    if meta.has_status_subresource {
+        if let Some(map) = patch.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
+    match patch_type {
+        PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
+        PatchType::StrategicMerge => {
+            crate::patch::strategic_merge_patch(&mut current.body, &patch)
+                .map_err(|e| Status::bad_request(e.to_string()))?;
+        }
+        PatchType::Json => {
+            apply_json_patch(&mut current.body, &patch)?;
+        }
+    }
+
+    // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+    let deletion_ts_set = current.body["metadata"]["deletionTimestamp"].is_string();
+    let finalizers_empty = current.body["metadata"]["finalizers"]
+        .as_array()
+        .map(|arr| arr.is_empty())
+        .unwrap_or(true);
+
+    if deletion_ts_set && finalizers_empty {
+        state
+            .store
+            .delete(key, None)
+            .await
+            .map_err(|e| store_err(e, name, &meta.kind))?;
+        if group == RBAC_GROUP {
+            let rbac_key = match ns {
+                None => rbac_cluster_key(group, version, plural, name),
+                Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
+            };
+            state.rbac_index.remove_object(&rbac_key);
+        }
+        return Ok(Json(current.body).into_response());
+    }
+
+    let expected_rv = parse_resource_version(current.resource_version())?;
+    let new_rv = state
+        .store
+        .put(key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err(e, name, &meta.kind))?;
+
+    current.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = match ns {
+            None => rbac_cluster_key(group, version, plural, name),
+            Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
+        };
+        state.rbac_index.apply_object(&rbac_key, &current.body);
+    }
+    Ok(Json(current.body).into_response())
+}
+
+pub async fn patch_resource(
+    State(state): State<AppState>,
+    Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("name", &name)?;
+    let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::patch_cr(
+                State(state),
+                Path((group, version, plural, name)),
+                headers,
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
+
+    let key = group_object_key(&group, &plural, None, &name);
+    do_patch(
+        &state, &key, &meta, &group, &version, &plural, None, &name, is_ssa, patch_type, body,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Namespaced handlers  (group/version/namespaces/:ns/resource)
+// ---------------------------------------------------------------------------
+
+pub async fn list_namespaced_resource(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
+) -> Result<Response, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::list_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural)),
+                query,
+                user.username,
+            )
+            .await;
+        }
+    };
+    let prefix = group_list_prefix(&group, &plural, Some(&ns));
+
+    if query.watch == Some(true) {
+        let api_version = if group.is_empty() {
+            version.clone()
+        } else {
+            format!("{}/{}", group, version)
+        };
+        let from_rv = query.resource_version.unwrap_or(0);
+        let initial =
+            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
+        return watch_generic(
+            state,
+            prefix,
+            api_version,
+            meta.kind.clone(),
+            from_rv,
+            initial,
+            query.label_selector,
+            query.field_selector,
+            query.allow_watch_bookmarks == Some(true),
+            user.username,
+        )
+        .await;
+    }
+
+    let field_selector = query
+        .field_selector
+        .as_deref()
+        .map(parse_field_selector)
+        .transpose()?;
+    let continue_key = query
+        .continue_token
+        .as_deref()
+        .map(decode_continue)
+        .transpose()?;
+    let resp = state
+        .store
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector,
+                limit: query.limit,
+                continue_key,
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut items = Vec::with_capacity(resp.items.len());
+    for obj in &resp.items {
+        let v: serde_json::Value =
+            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+        items.push(v);
+    }
+
+    let items = if let Some(ref sel) = query.label_selector {
+        let pairs = parse_label_selector(sel)?;
+        apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
+
+    let body = build_list_response(
+        &meta.kind,
+        &group,
+        &version,
+        resp.revision,
+        items,
+        resp.continue_key,
+    );
+    Ok(Json(body).into_response())
+}
+
+pub async fn get_namespaced_resource(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::get_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural, name)),
+            )
+            .await;
+        }
+    };
+
+    let key = group_object_key(&group, &plural, Some(&ns), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        stored.value,
+    )
+        .into_response())
+}
+
+pub async fn create_namespaced_resource(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    let body = extract_body(&body, content_type(&headers));
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::create_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural)),
+                headers,
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
+
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let name = resolve_name(&mut obj)?;
+
+    obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
+    stamp_metadata(&mut obj);
+
+    let key = group_object_key(&group, &plural, Some(&ns), &name);
+    let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
+    let new_rv = match result {
+        Ok(rv) => rv,
+        Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
+            // createOrUpdate: replace existing object unconditionally.
+            state
+                .store
+                .put(&key, obj.to_bytes(), None)
+                .await
+                .map_err(|e| store_err(e, &name, &meta.kind))?
+        }
+        Err(e) => return Err(store_err(e, &name, &meta.kind)),
+    };
+
+    obj.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &obj.body);
+    }
+    Ok((StatusCode::CREATED, Json(obj.body)).into_response())
+}
+
+pub async fn replace_namespaced_resource(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
+    let body = extract_body(&body, content_type(&headers));
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::replace_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural, name)),
+                headers,
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
+
+    let mut obj =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let obj_name = obj.name().unwrap_or("").to_string();
+    if obj_name != name {
+        return Err(Status::bad_request(format!(
+            "the name of the object ({obj_name}) does not match the name on the URL ({name})"
+        )));
+    }
+
+    // Strip status from the incoming body on the main endpoint when the resource
+    // has a dedicated status subresource.
+    if meta.has_status_subresource {
+        if let Some(map) = obj.body.as_object_mut() {
+            map.remove("status");
+        }
+    }
+
+    let expected_revision = parse_resource_version(obj.resource_version())?;
+
+    let key = group_object_key(&group, &plural, Some(&ns), &name);
+    let new_rv = state
+        .store
+        .put(&key, obj.to_bytes(), expected_revision)
+        .await
+        .map_err(|e| store_err(e, &name, &meta.kind))?;
+
+    obj.set_resource_version(new_rv);
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+        state.rbac_index.apply_object(&rbac_key, &obj.body);
+    }
+    Ok(Json(obj.body).into_response())
+}
+
+pub async fn delete_namespaced_resource(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::delete_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural, name)),
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
+
+    let key = group_object_key(&group, &plural, Some(&ns), &name);
+
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    if let Some(soft) = apply_delete_policy(&mut obj) {
+        // Evict from RBAC index immediately on soft-delete — same rationale as
+        // delete_resource: permissions must not outlast the deletion request.
+        if group == RBAC_GROUP {
+            let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+            state.rbac_index.remove_object(&rbac_key);
+        }
+        let expected_rv = parse_resource_version(obj.resource_version())?;
+        let new_rv = state
+            .store
+            .put(&key, obj.to_bytes(), expected_rv)
+            .await
+            .map_err(|e| store_err(e, &name, &meta.kind))?;
+        let mut body = soft;
+        body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+        return Ok(Json(body).into_response());
+    }
+
+    state
+        .store
+        .delete(&key, None)
+        .await
+        .map_err(|e| store_err(e, &name, &meta.kind))?;
+
+    if group == RBAC_GROUP {
+        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+        state.rbac_index.remove_object(&rbac_key);
+    }
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "code": 200
+    }))
+    .into_response())
+}
+
+pub async fn patch_namespaced_resource(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    validate_name("name", &name)?;
+    let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
+    let meta = match lookup(&state, &group, &version, &plural) {
+        Ok(m) => m.clone(),
+        Err(_) => {
+            return super::cr::patch_cr_namespaced(
+                State(state),
+                Path((group, version, ns, plural, name)),
+                headers,
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
+        }
+    };
+
+    let key = group_object_key(&group, &plural, Some(&ns), &name);
+    do_patch(
+        &state,
+        &key,
+        &meta,
+        &group,
+        &version,
+        &plural,
+        Some(&ns),
+        &name,
+        is_ssa,
+        patch_type,
+        body,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers (duplicated from generic to avoid pub exposure)
+// ---------------------------------------------------------------------------
+
+fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
+    format!("/apis/{group}/{version}/{plural}/{name}")
+}
+
+fn rbac_namespaced_key(group: &str, version: &str, ns: &str, plural: &str, name: &str) -> String {
+    format!("/apis/{group}/{version}/namespaces/{ns}/{plural}/{name}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Extension;
+
+    fn json_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        h
+    }
+
+    fn make_lease_body(resource_version: Option<&str>) -> bytes::Bytes {
+        let mut meta = serde_json::json!({
+            "name": "worker-node-1",
+            "namespace": "kube-node-lease"
+        });
+        if let Some(rv) = resource_version {
+            meta["resourceVersion"] = serde_json::Value::String(rv.to_string());
+        }
+        let body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": meta,
+            "spec": {
+                "acquireTime": "2026-05-20T00:00:00Z",
+                "holderIdentity": "worker-node-1",
+                "leaseDurationSeconds": 40,
+                "renewTime": "2026-05-20T00:00:00Z"
+            }
+        });
+        bytes::Bytes::from(serde_json::to_vec(&body).unwrap())
+    }
+
+    fn make_state() -> crate::state::AppState {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    // -- cr_status_put_updates_status_field --
+
+    /// Verify that put_namespaced_resource_status works for CRD-backed resources whose group
+    /// is not in the static resource registry (e.g. argoproj.io/Application).
+    #[tokio::test]
+    async fn cr_status_put_updates_status_field() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let group = "argoproj.io";
+        let version = "v1alpha1";
+        let plural = "applications";
+        let ns = "argocd";
+        let name = "my-app";
+        let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
+
+        let initial = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+                "resourceVersion": "0"
+            },
+            "spec": { "project": "default" }
+        });
+        let initial_bytes = bytes::Bytes::from(serde_json::to_vec(&initial).unwrap());
+        store
+            .put(&cr_key, initial_bytes, None)
+            .await
+            .expect("seed CR");
+
+        let put_body = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": { "name": name, "namespace": ns },
+            "status": { "health": { "status": "Healthy" }, "sync": { "status": "Synced" } }
+        });
+        let body_bytes = bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap());
+
+        let result = super::super::status::put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                name.to_string(),
+            )),
+            json_headers(),
+            body_bytes,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "CR status PUT must succeed for unregistered group"
+        );
+
+        let stored = store
+            .get(&cr_key)
+            .await
+            .expect("store get")
+            .expect("object must exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["status"]["health"]["status"], "Healthy");
+        assert_eq!(v["status"]["sync"]["status"], "Synced");
+        assert_eq!(v["spec"]["project"], "default");
+    }
+
+    // -- Lease PUT: kubelet liveness signal --
+
+    /// Kubelet first PUT: no resourceVersion → unconditional write → must succeed.
+    #[tokio::test]
+    async fn lease_put_without_resource_version_creates_lease() {
+        let state = make_state();
+
+        let result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(None),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "first Lease PUT (no resourceVersion) must succeed — kubelet cannot \
+             become Ready if creation fails"
+        );
+    }
+
+    /// Kubelet renewal PUT: use resourceVersion returned from creation → must succeed.
+    #[tokio::test]
+    async fn lease_put_with_matching_resource_version_updates_lease() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let create_response = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(None),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("first Lease PUT must succeed"))
+        .into_response();
+
+        let body_bytes = axum::body::to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let rv = body["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("response must include metadata.resourceVersion")
+            .to_string();
+
+        let renew_result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(Some(&rv)),
+        )
+        .await;
+
+        assert!(
+            renew_result.is_ok(),
+            "Lease renewal PUT with matching resourceVersion must succeed"
+        );
+    }
+
+    /// Stale resourceVersion → 409 Conflict.
+    #[tokio::test]
+    async fn lease_put_with_stale_resource_version_returns_conflict() {
+        let state = make_state();
+
+        let create_result = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(None),
+        )
+        .await;
+        assert!(create_result.is_ok(), "first Lease PUT must succeed");
+
+        let stale_result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(Some("999")),
+        )
+        .await;
+
+        match stale_result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::CONFLICT,
+                "stale Lease PUT must return 409 Conflict"
+            ),
+            Ok(_) => panic!("stale Lease PUT must be rejected with 409 Conflict, not succeed"),
+        }
+    }
+
+    /// fieldSelector=metadata.name=foo must filter list to matching item.
+    #[tokio::test]
+    async fn field_selector_filters_list_to_matching_item() {
+        use std::sync::Arc;
+        use u7s_store::{ListOptions, SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let make_cm = |name: &str| {
+            bytes::Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": { "name": name, "namespace": "default" }
+                })
+                .to_string(),
+            )
+        };
+
+        store
+            .put("/registry/configmaps/default/foo", make_cm("foo"), Some(0))
+            .await
+            .unwrap();
+        store
+            .put("/registry/configmaps/default/bar", make_cm("bar"), Some(0))
+            .await
+            .unwrap();
+
+        let fs = parse_field_selector("metadata.name=foo")
+            .unwrap_or_else(|_| panic!("valid field selector must parse"));
+        let resp = store
+            .list(
+                "/registry/configmaps/default/",
+                ListOptions {
+                    field_selector: Some(fs),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.items.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_slice(&resp.items[0].value).unwrap();
+        assert_eq!(parsed["metadata"]["name"], "foo");
+    }
+
+    /// list_resource returns an empty RuntimeClassList (not 404) for runtimeclasses.
+    #[tokio::test]
+    async fn list_resource_returns_empty_list_for_runtimeclasses() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let resp = list_resource(
+            State(state),
+            Path(("node.k8s.io".into(), "v1".into(), "runtimeclasses".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("list runtimeclasses must not return 404"));
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 65536).await.expect("read body");
+        let val: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
+        assert_eq!(val["kind"], "RuntimeClassList");
+        assert!(val["items"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false));
+    }
+
+    /// strategic-merge-patch on absent resource returns 404.
+    #[tokio::test]
+    async fn strategic_merge_patch_on_absent_resource_returns_404() {
+        let state = make_state();
+
+        let patch = serde_json::json!({"spec": { "drivers": [] }});
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut smp_headers = axum::http::HeaderMap::new();
+        smp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+
+        let result = patch_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "csinodes".to_string(),
+                "nonexistent-node".to_string(),
+            )),
+            smp_headers,
+            patch_bytes,
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND),
+            Ok(_) => panic!("strategic-merge-patch on absent resource must return 404"),
+        }
+    }
+
+    /// apply-patch+yaml creates cluster-scoped resource when absent (SSA upsert).
+    #[tokio::test]
+    async fn apply_patch_yaml_creates_cluster_scoped_resource_when_absent() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "lima-node" },
+            "spec": { "drivers": [{"name": "driver.csi.k8s.io", "nodeID": "lima-node"}] }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "csinodes".to_string(),
+                "lima-node".to_string(),
+            )),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("apply-patch+yaml on absent CSINode must not return 404"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(!v["metadata"]["uid"].as_str().unwrap_or("").is_empty());
+
+        let key = "/registry/storage.k8s.io/csinodes/lima-node";
+        assert!(store.get(key).await.unwrap().is_some());
+    }
+
+    /// apply-patch+yaml creates namespaced resource when absent (SSA upsert).
+    #[tokio::test]
+    async fn apply_patch_yaml_creates_namespaced_resource_when_absent() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "lima-node", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "lima-node", "leaseDurationSeconds": 40, "renewTime": "2026-05-21T00:00:00Z" }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "lima-node".to_string(),
+            )),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("apply-patch+yaml on absent Lease must not return 404"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+
+        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(!v["metadata"]["uid"].as_str().unwrap_or("").is_empty());
+
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/lima-node";
+        assert!(store.get(key).await.unwrap().is_some());
+    }
+
+    /// apply-patch+yaml PATCH must upsert (create if not found) and update if existing.
+    #[tokio::test]
+    async fn apply_patch_yaml_accepted_and_updates_resource() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // Create the Lease via PUT first.
+        let _ = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            json_headers(),
+            make_lease_body(None),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Lease PUT must succeed"))
+        .into_response();
+
+        let patch = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "worker-node-1", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "worker-node-1", "leaseDurationSeconds": 40, "renewTime": "2026-05-21T00:00:00Z" }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let patch_result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "worker-node-1".to_string(),
+            )),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await;
+
+        assert!(
+            patch_result.is_ok(),
+            "PATCH with application/apply-patch+yaml must succeed"
+        );
+    }
+
+    /// get_resource returns 404 when the object does not exist in the store.
+    #[tokio::test]
+    async fn get_resource_returns_404_when_not_found() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = get_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "missing-node".into(),
+            )),
+        )
+        .await;
+
+        let err = result.expect_err("get on missing object must return error");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// get_resource returns the stored object when it exists.
+    #[tokio::test]
+    async fn get_resource_returns_stored_object() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-1" }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/worker-1",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = get_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-1".into(),
+            )),
+        )
+        .await;
+
+        let resp = result.unwrap_or_else(|_| panic!("get_resource must return 200"));
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// get_namespaced_resource returns 404 when the namespaced object does not exist.
+    #[tokio::test]
+    async fn get_namespaced_resource_returns_404_when_not_found() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = get_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "missing".into(),
+            )),
+        )
+        .await;
+
+        let err = result.expect_err("get on missing namespaced object must return error");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// list_namespaced_resource returns an empty list when no objects exist.
+    #[tokio::test]
+    async fn list_namespaced_resource_returns_empty_list() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let resp = list_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
+            axum::Extension(crate::auth::UserInfo {
+                username: "test".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("list must succeed"));
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["kind"], "LeaseList");
+        assert!(val["items"].as_array().unwrap().is_empty());
+    }
+
+    /// create_namespaced_resource must persist the object and return 201 Created.
+    #[tokio::test]
+    async fn create_namespaced_resource_creates_and_returns_201() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-a", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-a", "leaseDurationSeconds": 40 }
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("create_namespaced_resource must succeed"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/node-a";
+        assert!(store.get(key).await.unwrap().is_some());
+    }
+
+    /// delete_namespaced_resource must hard-delete objects without finalizers and return 200 Status.
+    #[tokio::test]
+    async fn delete_namespaced_resource_hard_deletes_and_returns_200() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-b", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-b" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/node-b";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "node-b".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("delete must succeed"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::OK);
+        assert!(store.get(key).await.unwrap().is_none());
+
+        let body = to_bytes(result.into_body(), 4096).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["kind"], "Status");
+        assert_eq!(val["status"], "Success");
+    }
+
+    /// delete_namespaced_resource must return 404 when the object does not exist.
+    #[tokio::test]
+    async fn delete_namespaced_resource_returns_404_when_not_found() {
+        let state = make_state();
+
+        let result = delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "nonexistent".into(),
+            )),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND),
+            Ok(_) => panic!("delete of missing object must return 404 error"),
+        }
+    }
+
+    /// Security invariant: a soft-deleted ClusterRoleBinding must be removed from the
+    /// RBAC index immediately when DELETE is requested.
+    #[tokio::test]
+    async fn rbac_index_evicted_on_soft_delete_of_clusterrolebinding() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+        let plural = "clusterrolebindings";
+        let name = "test-binding";
+
+        let crb = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {
+                "name": name,
+                "finalizers": ["test.io/cleanup"]
+            },
+            "subjects": [{"kind": "User", "name": "alice", "apiGroup": "rbac.authorization.k8s.io"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+
+        let cr = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "cluster-admin"},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        let admin_user = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                "clusterroles".to_string(),
+            )),
+            admin_user.clone(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cr).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("ClusterRole creation must succeed"));
+
+        create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((group.to_string(), version.to_string(), plural.to_string())),
+            admin_user,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("ClusterRoleBinding creation must succeed"));
+
+        let rules_before = state.rbac_index.enumerate_rules("alice", &[], "");
+        assert!(!rules_before.is_empty());
+
+        delete_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                name.to_string(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("soft-delete must succeed"));
+
+        let rules_after = state.rbac_index.enumerate_rules("alice", &[], "");
+        assert!(
+            rules_after.is_empty(),
+            "soft-deleted ClusterRoleBinding must be evicted from RBAC index immediately"
+        );
+    }
+
+    /// strategic_merge_patch merges arrays by name key (not replaces).
+    #[test]
+    fn strategic_merge_patch_applied_correctly_via_handler_logic() {
+        let mut body = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:1.0"}]
+            }
+        });
+        let patch = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "sidecar", "image": "sidecar:latest"}]
+            }
+        });
+        crate::patch::strategic_merge_patch(&mut body, &patch).unwrap();
+        let containers = body["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 2, "SMP must merge containers by name");
+    }
+}

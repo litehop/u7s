@@ -354,7 +354,7 @@ pub async fn list_cr(
 
     if query.watch == Some(true) {
         let api_version = format!("{group}/{version}");
-        return super::generic::watch_generic(
+        return super::watch::watch_generic(
             state,
             prefix,
             api_version,
@@ -584,7 +584,7 @@ pub async fn list_cr_namespaced(
 
     if query.watch == Some(true) {
         let api_version = format!("{group}/{version}");
-        return super::generic::watch_generic(
+        return super::watch::watch_generic(
             state,
             prefix,
             api_version,
@@ -1029,7 +1029,7 @@ pub async fn get_cr_status(
     };
     if state.resource_registry.contains_key(&registry_key) {
         // Delegate to the generic get handler for registry resources.
-        return super::generic::get_resource(State(state), Path((group, version, plural, name)))
+        return super::resource::get_resource(State(state), Path((group, version, plural, name)))
             .await;
     }
 
@@ -2163,7 +2163,7 @@ mod tests {
         );
 
         assert!(
-            super::super::generic::put_namespaced_resource_status(
+            super::super::status::put_namespaced_resource_status(
                 State(state.clone()),
                 Path((
                     group.clone(),

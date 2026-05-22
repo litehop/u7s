@@ -1,22 +1,13 @@
-use axum::{
-    body::Body,
-    extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-    Extension, Json,
-};
-use bytes::Bytes;
 use serde::Deserialize;
-use u7s_store::{ListOptions, Store, StoreError, WatchEvent};
+use u7s_store::StoreError;
 
 use crate::{
     auth::UserInfo,
-    keys::{group_list_prefix, group_object_key},
     rbac::user_holds_all_rules,
     state::AppState,
     status::Status,
     types::{Object, ResourceKey},
-    util::{content_type, parse_resource_version, store_err_to_status},
+    util::{store_err_to_status, utc_now_rfc3339},
 };
 
 #[derive(Deserialize)]
@@ -114,7 +105,7 @@ pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::St
     }
 }
 
-fn lookup<'a>(
+pub(crate) fn lookup<'a>(
     state: &'a AppState,
     group: &str,
     version: &str,
@@ -131,7 +122,7 @@ fn lookup<'a>(
         .ok_or_else(|| Status::not_found(&format!("{}/{}/{}", group, version, plural), "Resource"))
 }
 
-fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusError {
+pub(crate) fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusError {
     match err {
         StoreError::NotFound { .. } => Status::not_found(name, kind),
         StoreError::AlreadyExists { .. } => Status::already_exists(name, kind),
@@ -153,379 +144,6 @@ fn store_err(err: StoreError, name: &str, kind: &str) -> crate::status::StatusEr
             )
         }
     }
-}
-
-/// Serialise a single watch event to NDJSON bytes (including trailing newline).
-/// Returns None on Compacted — the caller should close the stream.
-/// Returns None on corrupt object bytes (invalid UTF-8) — the event is skipped,
-/// a warning is logged, and the stream continues. Emitting null would send invalid
-/// data to Kubernetes clients that may panic or behave incorrectly.
-pub(crate) fn encode_watch_event(
-    event: &WatchEvent,
-    api_version: &str,
-    kind: &str,
-) -> Option<Bytes> {
-    let line = match event {
-        WatchEvent::Added(obj) => {
-            let object_json = match std::str::from_utf8(&obj.value) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("watch ADDED event has invalid UTF-8, skipping: {e}");
-                    return None;
-                }
-            };
-            format!("{{\"type\":\"ADDED\",\"object\":{object_json}}}\n")
-        }
-        WatchEvent::Modified(obj) => {
-            let object_json = match std::str::from_utf8(&obj.value) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("watch MODIFIED event has invalid UTF-8, skipping: {e}");
-                    return None;
-                }
-            };
-            format!("{{\"type\":\"MODIFIED\",\"object\":{object_json}}}\n")
-        }
-        WatchEvent::Deleted { key, revision } => {
-            // Reconstruct a minimal tombstone object from the store key.
-            let (name, namespace) = parse_key_name_ns(key);
-            let object = if namespace.is_empty() {
-                serde_json::json!({
-                    "apiVersion": api_version,
-                    "kind": kind,
-                    "metadata": { "name": name, "resourceVersion": revision.to_string() }
-                })
-            } else {
-                serde_json::json!({
-                    "apiVersion": api_version,
-                    "kind": kind,
-                    "metadata": {
-                        "name": name,
-                        "namespace": namespace,
-                        "resourceVersion": revision.to_string()
-                    }
-                })
-            };
-            format!(
-                "{{\"type\":\"DELETED\",\"object\":{}}}\n",
-                serde_json::to_string(&object).unwrap_or_default()
-            )
-        }
-        WatchEvent::Bookmark { revision } => {
-            format!(
-                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{revision}\"}}}}}}\n"
-            )
-        }
-        WatchEvent::Compacted { .. } => return None,
-    };
-    Some(Bytes::from(line))
-}
-
-/// Parse the last two path segments of a store key as (name, namespace).
-/// Key format: /registry/<resource>/<namespace>/<name>  (namespaced)
-///         or: /registry/<group>/<plural>/<name>        (cluster-scoped)
-/// We only need the final segment as name; second-to-last as namespace (may be empty).
-pub(crate) fn parse_key_name_ns(key: &str) -> (&str, &str) {
-    let parts: Vec<&str> = key.rsplitn(3, '/').collect();
-    match parts.as_slice() {
-        [name, namespace, ..] => (name, namespace),
-        [name] => (name, ""),
-        _ => ("", ""),
-    }
-}
-
-/// Fetch the initial items for sendInitialEvents watch protocol.
-///
-/// When `send_initial_events` is true, lists all objects under `prefix` and returns
-/// them as ADDED events before the live watch stream, followed by a BOOKMARK with
-/// `k8s.io/initial-events-end=true`. This implements the Kubernetes 1.27+ informer
-/// startup protocol used by kubelet and controller-manager.
-///
-/// Returns `None` when `send_initial_events` is false (caller uses normal watch).
-pub(crate) async fn fetch_initial_events(
-    state: &AppState,
-    prefix: &str,
-    send_initial_events: bool,
-) -> Result<Option<(Vec<serde_json::Value>, u64)>, crate::status::StatusError> {
-    if !send_initial_events {
-        return Ok(None);
-    }
-    let resp = state
-        .store
-        .list(prefix, ListOptions::default())
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-    let items: Vec<serde_json::Value> = resp
-        .items
-        .iter()
-        .filter_map(|o| serde_json::from_slice(&o.value).ok())
-        .collect();
-    Ok(Some((items, resp.revision)))
-}
-
-/// Test whether a JSON object matches a label selector string (`key=value,...`).
-/// Returns true if the selector is empty (pass-through) or all pairs match
-/// `metadata.labels` in the object. Used to filter live watch events.
-pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &str) -> bool {
-    if selector.is_empty() {
-        return true;
-    }
-    let labels = &obj["metadata"]["labels"];
-    for part in selector.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        // Only equality selectors are supported; skip malformed terms (conservative: pass through).
-        if let Some(eq_pos) = part.find('=') {
-            let key = part[..eq_pos].trim();
-            let val = part[eq_pos + 1..].trim();
-            if key.is_empty() {
-                continue;
-            }
-            if labels.get(key).and_then(|v| v.as_str()) != Some(val) {
-                return false;
-            }
-        }
-        // Unknown/malformed term: ignore (conservative, don't drop events).
-    }
-    true
-}
-
-/// Test whether a JSON object matches a field selector string (`key=value,...` or `key!=value,...`).
-/// Supports `metadata.name`, `metadata.namespace` (equality only), and `spec.nodeName`
-/// (equality and inequality). Returns true if the selector is empty (pass-through) or all
-/// terms match. Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
-pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &str) -> bool {
-    if selector.is_empty() {
-        return true;
-    }
-    for part in selector.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        // Check for inequality (`!=`) before equality (`=`) to avoid misparse.
-        if let Some((field, value)) = part.split_once("!=") {
-            let field = field.trim();
-            let value = value.trim();
-            if field == "spec.nodeName" {
-                let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
-                if node_name == value {
-                    return false;
-                }
-            }
-            // Unknown fields: ignore (conservative).
-        } else if let Some((field, value)) = part.split_once('=') {
-            let field = field.trim();
-            let value = value.trim();
-            match field {
-                "metadata.name" => {
-                    let name = obj["metadata"]["name"].as_str().unwrap_or("");
-                    if name != value {
-                        return false;
-                    }
-                }
-                "metadata.namespace" => {
-                    let ns = obj["metadata"]["namespace"].as_str().unwrap_or("");
-                    if ns != value {
-                        return false;
-                    }
-                }
-                "spec.nodeName" => {
-                    let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
-                    if node_name != value {
-                        return false;
-                    }
-                }
-                // Unknown fields: ignore (conservative).
-                _ => {}
-            }
-        }
-    }
-    true
-}
-
-/// Stream watch events for a given store prefix in NDJSON format.
-/// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
-///
-/// When `initial_items` is Some, those items are emitted as ADDED events first
-/// (implementing the Kubernetes 1.27+ sendInitialEvents protocol), followed by a
-/// BOOKMARK, before streaming live changes from `from_revision`.
-///
-/// `username` is the authenticated client identity used to enforce the per-client
-/// watch stream concurrency limit (MAX_WATCHES_PER_CLIENT). Exceeding the limit
-/// returns HTTP 429 immediately without opening a watch stream.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn watch_generic(
-    state: AppState,
-    prefix: String,
-    api_version: String,
-    kind: String,
-    from_revision: u64,
-    initial_items: Option<(Vec<serde_json::Value>, u64)>,
-    label_selector: Option<String>,
-    field_selector: Option<String>,
-    allow_watch_bookmarks: bool,
-    username: String,
-) -> Result<Response, crate::status::StatusError> {
-    // Enforce per-client watch concurrency limit. Try to acquire a permit from
-    // this user's semaphore. If the semaphore is exhausted (client already has
-    // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
-    let sem = state.watch_limit.semaphore_for(&username);
-    let _watch_permit = sem.try_acquire_owned().map_err(|_| {
-        crate::status::Status::too_many_requests(format!(
-            "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
-            crate::state::MAX_WATCHES_PER_CLIENT
-        ))
-    })?;
-    // _watch_permit is held for the duration of the watch stream and released when
-    // this function returns (RAII drop).
-
-    // Check compaction horizon BEFORE committing headers so clients get a synchronous HTTP 410.
-    // If from_rv > 0 and below the horizon, the revision is expired — return 410 immediately.
-    if from_revision > 0 {
-        let horizon = state.store.compaction_horizon();
-        if from_revision < horizon {
-            return Err(Status::expired(format!(
-                "too old resource version: {from_revision} (current compaction horizon: {horizon})"
-            )));
-        }
-    }
-
-    let event_stream = state
-        .store
-        .watch(&prefix, from_revision)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let label_selector = label_selector.unwrap_or_default();
-    let field_selector = field_selector.unwrap_or_default();
-    let chunk_stream = async_stream::stream! {
-        use futures_core::Stream;
-        use std::pin::pin;
-        use tokio::time::{Duration, interval, sleep};
-
-        let mut event_stream = pin!(event_stream);
-        let mut bookmark_tick = interval(Duration::from_secs(60));
-        bookmark_tick.tick().await; // skip initial immediate tick
-
-        let mut max_duration = pin!(sleep(Duration::from_secs(5 * 60)));
-        let mut last_rv: u64 = from_revision;
-
-        // sendInitialEvents: emit existing objects as ADDED, then BOOKMARK.
-        if let Some((items, list_rv)) = initial_items {
-            last_rv = last_rv.max(list_rv);
-            for item in items {
-                let line = format!(
-                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
-                    serde_json::to_string(&item).unwrap_or_default()
-                );
-                yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
-            }
-            let bookmark = format!(
-                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
-            );
-            yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
-        }
-
-        loop {
-            tokio::select! {
-                biased;
-
-                maybe_event = {
-                    use std::future::poll_fn;
-                    poll_fn(|cx| {
-                        use std::task::Poll;
-                        match event_stream.as_mut().poll_next(cx) {
-                            Poll::Ready(v) => Poll::Ready(v),
-                            Poll::Pending => Poll::Pending,
-                        }
-                    })
-                } => {
-                    match maybe_event {
-                        None => break,
-                        Some(event) => {
-                            match &event {
-                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
-                                    last_rv = last_rv.max(obj.revision);
-                                }
-                                WatchEvent::Deleted { revision, .. } => {
-                                    last_rv = last_rv.max(*revision);
-                                }
-                                WatchEvent::Bookmark { revision } => {
-                                    last_rv = last_rv.max(*revision);
-                                }
-                                WatchEvent::Compacted { .. } => {}
-                            }
-
-                            bookmark_tick.reset();
-
-                            if let WatchEvent::Compacted { horizon, .. } = &event {
-                                // Use horizon (not last_rv) so clients relist from a revision
-                                // the store still holds. last_rv may predate the horizon and
-                                // cause an infinite relist loop.
-                                let error_line = Bytes::from(format!(
-                                    "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}}}\n"
-                                ));
-                                yield Ok::<Bytes, axum::BoxError>(error_line);
-                                break;
-                            }
-
-                            // Apply labelSelector and fieldSelector: filter Added/Modified events.
-                            // Deleted events always pass through so clients can clean up.
-                            // Bookmark and Compacted are handled above.
-                            let skip = match &event {
-                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
-                                    let parsed: serde_json::Value =
-                                        serde_json::from_slice(&obj.value)
-                                            .unwrap_or(serde_json::Value::Null);
-                                    !object_matches_label_selector(&parsed, &label_selector)
-                                        || !object_matches_field_selector(&parsed, &field_selector)
-                                }
-                                _ => false,
-                            };
-
-                            if !skip {
-                                if let Some(chunk) = encode_watch_event(&event, &api_version, &kind) {
-                                    yield Ok::<Bytes, axum::BoxError>(chunk);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                _ = bookmark_tick.tick() => {
-                    if allow_watch_bookmarks {
-                        let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                        );
-                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
-                    }
-                }
-
-                _ = &mut max_duration => {
-                    if allow_watch_bookmarks {
-                        let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
-                        );
-                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
-                    }
-                    break;
-                }
-            }
-        }
-    };
-
-    let body = Body::from_stream(chunk_stream);
-    let resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .header(axum::http::header::TRANSFER_ENCODING, "chunked")
-        .body(body)
-        .expect("response builder never fails with these headers");
-
-    Ok(resp)
 }
 
 /// Parse a label selector string of the form `key=value,key2=value2` into key-value pairs.
@@ -646,7 +264,7 @@ pub(crate) fn build_list_response(
 
 /// Check finalizers for delete: if non-empty, set deletionTimestamp and return modified object.
 /// Returns `None` if hard-delete should proceed, `Some(obj)` if soft-delete was applied.
-fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
+pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
     let has_finalizers = obj.body["metadata"]["finalizers"]
         .as_array()
         .map(|arr| !arr.is_empty())
@@ -662,8 +280,6 @@ fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
     }
 }
 
-use crate::util::{extract_body, utc_now_rfc3339};
-
 pub(crate) fn stamp_metadata(obj: &mut Object) {
     if obj.body["metadata"]["uid"].is_null() {
         obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
@@ -673,7 +289,7 @@ pub(crate) fn stamp_metadata(obj: &mut Object) {
     }
 }
 
-const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
+pub(crate) const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
 const CLUSTER_ROLE_BINDINGS: &str = "clusterrolebindings";
 
 /// Escalation prevention for ClusterRoleBinding writes.
@@ -718,1281 +334,24 @@ pub(crate) fn check_crb_escalation(
 }
 
 /// Build the RBAC index key for a cluster-scoped object.
+#[cfg(test)]
 fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
     format!("/apis/{group}/{version}/{plural}/{name}")
 }
 
 /// Build the RBAC index key for a namespaced object.
+#[cfg(test)]
 fn rbac_namespaced_key(group: &str, version: &str, ns: &str, plural: &str, name: &str) -> String {
     format!("/apis/{group}/{version}/namespaces/{ns}/{plural}/{name}")
 }
 
-// ---------------------------------------------------------------------------
-// Cluster-scoped handlers  (group/version/resource)
-// ---------------------------------------------------------------------------
-
-pub async fn list_resource(
-    State(state): State<AppState>,
-    Path((group, version, plural)): Path<(String, String, String)>,
-    Query(query): Query<CollectionQuery>,
-    Extension(user): Extension<UserInfo>,
-) -> Result<Response, crate::status::StatusError> {
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::list_cr(
-                State(state),
-                Path((group, version, plural)),
-                query,
-                user.username,
-            )
-            .await;
-        }
-    };
-    let prefix = group_list_prefix(&group, &plural, None);
-
-    if query.watch == Some(true) {
-        let api_version = if group.is_empty() {
-            version.clone()
-        } else {
-            format!("{}/{}", group, version)
-        };
-        let from_rv = query.resource_version.unwrap_or(0);
-        let initial =
-            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
-        return watch_generic(
-            state,
-            prefix,
-            api_version,
-            meta.kind.clone(),
-            from_rv,
-            initial,
-            query.label_selector,
-            query.field_selector,
-            query.allow_watch_bookmarks == Some(true),
-            user.username,
-        )
-        .await;
-    }
-
-    let field_selector = query
-        .field_selector
-        .as_deref()
-        .map(parse_field_selector)
-        .transpose()?;
-    let continue_key = query
-        .continue_token
-        .as_deref()
-        .map(decode_continue)
-        .transpose()?;
-    let resp = state
-        .store
-        .list(
-            &prefix,
-            ListOptions {
-                field_selector,
-                limit: query.limit,
-                continue_key,
-            },
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
-        let v: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        items.push(v);
-    }
-
-    let items = if let Some(ref sel) = query.label_selector {
-        let pairs = parse_label_selector(sel)?;
-        apply_label_selector(items, &pairs)
-    } else {
-        items
-    };
-
-    let body = build_list_response(
-        &meta.kind,
-        &group,
-        &version,
-        resp.revision,
-        items,
-        resp.continue_key,
-    );
-    Ok(Json(body).into_response())
-}
-
-pub async fn get_resource(
-    State(state): State<AppState>,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-) -> Result<Response, crate::status::StatusError> {
-    validate_name("name", &name)?;
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::get_cr(State(state), Path((group, version, plural, name))).await;
-        }
-    };
-
-    let key = group_object_key(&group, &plural, None, &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        stored.value,
-    )
-        .into_response())
-}
-
-pub async fn create_resource(
-    State(state): State<AppState>,
-    Path((group, version, plural)): Path<(String, String, String)>,
-    Extension(user): Extension<UserInfo>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let body = extract_body(&body, content_type(&headers));
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::create_cr(
-                State(state),
-                Path((group, version, plural)),
-                headers,
-                body,
-            )
-            .await
-            .map(IntoResponse::into_response);
-        }
-    };
-
-    let mut obj =
-        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
-
-    // Escalation prevention: before persisting a ClusterRoleBinding, verify the
-    // caller already holds all rules of the referenced ClusterRole. This prevents
-    // users from granting themselves permissions they don't currently have.
-    check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
-
-    let name = resolve_name(&mut obj)?;
-    stamp_metadata(&mut obj);
-
-    let key = group_object_key(&group, &plural, None, &name);
-    let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
-    let new_rv = match result {
-        Ok(rv) => rv,
-        Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
-            // createOrUpdate: replace existing object unconditionally.
-            state
-                .store
-                .put(&key, obj.to_bytes(), None)
-                .await
-                .map_err(|e| store_err(e, &name, &meta.kind))?
-        }
-        Err(e) => return Err(store_err(e, &name, &meta.kind)),
-    };
-
-    obj.set_resource_version(new_rv);
-    if group == RBAC_GROUP {
-        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
-        state.rbac_index.apply_object(&rbac_key, &obj.body);
-    }
-    Ok((StatusCode::CREATED, Json(obj.body)).into_response())
-}
-
-pub async fn replace_resource(
-    State(state): State<AppState>,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-    Extension(user): Extension<UserInfo>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
-    let body = extract_body(&body, content_type(&headers));
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::replace_cr(
-                State(state),
-                Path((group, version, plural, name)),
-                headers,
-                body,
-            )
-            .await
-            .map(IntoResponse::into_response);
-        }
-    };
-
-    let mut obj =
-        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
-
-    // Escalation prevention: before updating a ClusterRoleBinding, verify the
-    // caller already holds all rules of the referenced ClusterRole.
-    check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
-
-    let obj_name = obj.name().unwrap_or("").to_string();
-    if obj_name != name {
-        return Err(Status::bad_request(format!(
-            "the name of the object ({obj_name}) does not match the name on the URL ({name})"
-        )));
-    }
-
-    // Strip status from the incoming body on the main endpoint when the resource
-    // has a dedicated status subresource (clients must use /status for that).
-    if meta.has_status_subresource {
-        if let Some(map) = obj.body.as_object_mut() {
-            map.remove("status");
-        }
-    }
-
-    let expected_revision = parse_resource_version(obj.resource_version())?;
-
-    let key = group_object_key(&group, &plural, None, &name);
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), expected_revision)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
-
-    obj.set_resource_version(new_rv);
-    if group == RBAC_GROUP {
-        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
-        state.rbac_index.apply_object(&rbac_key, &obj.body);
-    }
-    Ok(Json(obj.body).into_response())
-}
-
-pub async fn delete_resource(
-    State(state): State<AppState>,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::delete_cr(State(state), Path((group, version, plural, name)))
-                .await
-                .map(IntoResponse::into_response);
-        }
-    };
-
-    let key = group_object_key(&group, &plural, None, &name);
-
-    // Fetch current to check finalizers.
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-
-    let mut obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    if let Some(soft) = apply_delete_policy(&mut obj) {
-        // Soft-delete: persist modified object, return it.
-        // Evict from RBAC index immediately — permissions must not outlast the deletion
-        // request even while finalizers are draining. Hard-delete path below also removes,
-        // so this is safe to call twice (remove_object is idempotent).
-        if group == RBAC_GROUP {
-            let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
-            state.rbac_index.remove_object(&rbac_key);
-        }
-        let expected_rv = parse_resource_version(obj.resource_version())?;
-        let new_rv = state
-            .store
-            .put(&key, obj.to_bytes(), expected_rv)
-            .await
-            .map_err(|e| store_err(e, &name, &meta.kind))?;
-        let mut body = soft;
-        body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
-        return Ok(Json(body).into_response());
-    }
-
-    state
-        .store
-        .delete(&key, None)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
-
-    if group == RBAC_GROUP {
-        let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
-        state.rbac_index.remove_object(&rbac_key);
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Success",
-        "code": 200
-    }))
-    .into_response())
-}
-
-/// Shared patch logic for cluster-scoped and namespaced resources.
-///
-/// `ns` is `None` for cluster-scoped resources and `Some(namespace)` for namespaced ones.
-/// The caller supplies the pre-computed `key` and resolved `meta`.
-#[allow(clippy::too_many_arguments)]
-async fn do_patch(
-    state: &AppState,
-    key: &str,
-    meta: &crate::types::ResourceMeta,
-    group: &str,
-    version: &str,
-    plural: &str,
-    ns: Option<&str>,
-    name: &str,
-    is_ssa: bool,
-    patch_type: PatchType,
-    body: Bytes,
-) -> Result<Response, crate::status::StatusError> {
-    let stored_opt = state
-        .store
-        .get(key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    // SSA upsert: apply-patch+yaml on a missing resource creates it.
-    if is_ssa && stored_opt.is_none() {
-        let mut obj = Object::from_bytes(&body)
-            .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-        obj.body["metadata"]["name"] = serde_json::Value::String(name.to_string());
-        if let Some(namespace) = ns {
-            obj.body["metadata"]["namespace"] = serde_json::Value::String(namespace.to_string());
-        }
-        stamp_metadata(&mut obj);
-        let new_rv = match state.store.put(key, obj.to_bytes(), Some(0)).await {
-            Ok(rv) => rv,
-            Err(StoreError::AlreadyExists { .. }) => {
-                // Race: another writer created it; fall through to normal merge below.
-                let stored = state
-                    .store
-                    .get(key)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found(name, &meta.kind))?;
-                let mut current = Object::from_bytes(&stored.value)
-                    .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-                let patch: serde_json::Value = serde_json::from_slice(&body)
-                    .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-                crate::patch::strategic_merge_patch(&mut current.body, &patch)
-                    .map_err(|e| Status::bad_request(e.to_string()))?;
-                let expected_rv = parse_resource_version(current.resource_version())?;
-                let rv = state
-                    .store
-                    .put(key, current.to_bytes(), expected_rv)
-                    .await
-                    .map_err(|e| store_err(e, name, &meta.kind))?;
-                current.set_resource_version(rv);
-                return Ok(Json(current.body).into_response());
-            }
-            Err(e) => return Err(store_err(e, name, &meta.kind)),
-        };
-        obj.set_resource_version(new_rv);
-        return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
-    }
-
-    let stored = stored_opt.ok_or_else(|| Status::not_found(name, &meta.kind))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let mut patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-
-    // Strip status from the patch on the main endpoint for resources with a status subresource.
-    if meta.has_status_subresource {
-        if let Some(map) = patch.as_object_mut() {
-            map.remove("status");
-        }
-    }
-
-    match patch_type {
-        PatchType::Merge => crate::patch::merge_patch(&mut current.body, &patch),
-        PatchType::StrategicMerge => {
-            crate::patch::strategic_merge_patch(&mut current.body, &patch)
-                .map_err(|e| Status::bad_request(e.to_string()))?;
-        }
-        PatchType::Json => {
-            apply_json_patch(&mut current.body, &patch)?;
-        }
-    }
-
-    // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
-    let deletion_ts_set = current.body["metadata"]["deletionTimestamp"].is_string();
-    let finalizers_empty = current.body["metadata"]["finalizers"]
-        .as_array()
-        .map(|arr| arr.is_empty())
-        .unwrap_or(true);
-
-    if deletion_ts_set && finalizers_empty {
-        state
-            .store
-            .delete(key, None)
-            .await
-            .map_err(|e| store_err(e, name, &meta.kind))?;
-        if group == RBAC_GROUP {
-            let rbac_key = match ns {
-                None => rbac_cluster_key(group, version, plural, name),
-                Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
-            };
-            state.rbac_index.remove_object(&rbac_key);
-        }
-        return Ok(Json(current.body).into_response());
-    }
-
-    let expected_rv = parse_resource_version(current.resource_version())?;
-    let new_rv = state
-        .store
-        .put(key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, name, &meta.kind))?;
-
-    current.set_resource_version(new_rv);
-    if group == RBAC_GROUP {
-        let rbac_key = match ns {
-            None => rbac_cluster_key(group, version, plural, name),
-            Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
-        };
-        state.rbac_index.apply_object(&rbac_key, &current.body);
-    }
-    Ok(Json(current.body).into_response())
-}
-
-pub async fn patch_resource(
-    State(state): State<AppState>,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
-    let patch_type = detect_patch_type(&headers)?;
-    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::patch_cr(
-                State(state),
-                Path((group, version, plural, name)),
-                headers,
-                body,
-            )
-            .await
-            .map(IntoResponse::into_response);
-        }
-    };
-
-    let key = group_object_key(&group, &plural, None, &name);
-    do_patch(
-        &state, &key, &meta, &group, &version, &plural, None, &name, is_ssa, patch_type, body,
-    )
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// Namespaced handlers  (group/version/namespaces/:ns/resource)
-// ---------------------------------------------------------------------------
-
-pub async fn list_namespaced_resource(
-    State(state): State<AppState>,
-    Path((group, version, ns, plural)): Path<(String, String, String, String)>,
-    Query(query): Query<CollectionQuery>,
-    Extension(user): Extension<UserInfo>,
-) -> Result<Response, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::list_cr_namespaced(
-                State(state),
-                Path((group, version, ns, plural)),
-                query,
-                user.username,
-            )
-            .await;
-        }
-    };
-    let prefix = group_list_prefix(&group, &plural, Some(&ns));
-
-    if query.watch == Some(true) {
-        let api_version = if group.is_empty() {
-            version.clone()
-        } else {
-            format!("{}/{}", group, version)
-        };
-        let from_rv = query.resource_version.unwrap_or(0);
-        let initial =
-            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
-        return watch_generic(
-            state,
-            prefix,
-            api_version,
-            meta.kind.clone(),
-            from_rv,
-            initial,
-            query.label_selector,
-            query.field_selector,
-            query.allow_watch_bookmarks == Some(true),
-            user.username,
-        )
-        .await;
-    }
-
-    let field_selector = query
-        .field_selector
-        .as_deref()
-        .map(parse_field_selector)
-        .transpose()?;
-    let continue_key = query
-        .continue_token
-        .as_deref()
-        .map(decode_continue)
-        .transpose()?;
-    let resp = state
-        .store
-        .list(
-            &prefix,
-            ListOptions {
-                field_selector,
-                limit: query.limit,
-                continue_key,
-            },
-        )
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    let mut items = Vec::with_capacity(resp.items.len());
-    for obj in &resp.items {
-        let v: serde_json::Value =
-            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
-        items.push(v);
-    }
-
-    let items = if let Some(ref sel) = query.label_selector {
-        let pairs = parse_label_selector(sel)?;
-        apply_label_selector(items, &pairs)
-    } else {
-        items
-    };
-
-    let body = build_list_response(
-        &meta.kind,
-        &group,
-        &version,
-        resp.revision,
-        items,
-        resp.continue_key,
-    );
-    Ok(Json(body).into_response())
-}
-
-pub async fn get_namespaced_resource(
-    State(state): State<AppState>,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-) -> Result<Response, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::get_cr_namespaced(
-                State(state),
-                Path((group, version, ns, plural, name)),
-            )
-            .await;
-        }
-    };
-
-    let key = group_object_key(&group, &plural, Some(&ns), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        stored.value,
-    )
-        .into_response())
-}
-
-pub async fn create_namespaced_resource(
-    State(state): State<AppState>,
-    Path((group, version, ns, plural)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    let body = extract_body(&body, content_type(&headers));
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::create_cr_namespaced(
-                State(state),
-                Path((group, version, ns, plural)),
-                headers,
-                body,
-            )
-            .await
-            .map(IntoResponse::into_response);
-        }
-    };
-
-    let mut obj =
-        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
-
-    let name = resolve_name(&mut obj)?;
-
-    obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
-    stamp_metadata(&mut obj);
-
-    let key = group_object_key(&group, &plural, Some(&ns), &name);
-    let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
-    let new_rv = match result {
-        Ok(rv) => rv,
-        Err(StoreError::AlreadyExists { .. }) if meta.create_or_update => {
-            // createOrUpdate: replace existing object unconditionally.
-            state
-                .store
-                .put(&key, obj.to_bytes(), None)
-                .await
-                .map_err(|e| store_err(e, &name, &meta.kind))?
-        }
-        Err(e) => return Err(store_err(e, &name, &meta.kind)),
-    };
-
-    obj.set_resource_version(new_rv);
-    if group == RBAC_GROUP {
-        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
-        state.rbac_index.apply_object(&rbac_key, &obj.body);
-    }
-    Ok((StatusCode::CREATED, Json(obj.body)).into_response())
-}
-
-pub async fn replace_namespaced_resource(
-    State(state): State<AppState>,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
-    let body = extract_body(&body, content_type(&headers));
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::replace_cr_namespaced(
-                State(state),
-                Path((group, version, ns, plural, name)),
-                headers,
-                body,
-            )
-            .await
-            .map(IntoResponse::into_response);
-        }
-    };
-
-    let mut obj =
-        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
-
-    let obj_name = obj.name().unwrap_or("").to_string();
-    if obj_name != name {
-        return Err(Status::bad_request(format!(
-            "the name of the object ({obj_name}) does not match the name on the URL ({name})"
-        )));
-    }
-
-    // Strip status from the incoming body on the main endpoint when the resource
-    // has a dedicated status subresource.
-    if meta.has_status_subresource {
-        if let Some(map) = obj.body.as_object_mut() {
-            map.remove("status");
-        }
-    }
-
-    let expected_revision = parse_resource_version(obj.resource_version())?;
-
-    let key = group_object_key(&group, &plural, Some(&ns), &name);
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), expected_revision)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
-
-    obj.set_resource_version(new_rv);
-    if group == RBAC_GROUP {
-        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
-        state.rbac_index.apply_object(&rbac_key, &obj.body);
-    }
-    Ok(Json(obj.body).into_response())
-}
-
-pub async fn delete_namespaced_resource(
-    State(state): State<AppState>,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::delete_cr_namespaced(
-                State(state),
-                Path((group, version, ns, plural, name)),
-            )
-            .await
-            .map(IntoResponse::into_response);
-        }
-    };
-
-    let key = group_object_key(&group, &plural, Some(&ns), &name);
-
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-
-    let mut obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    if let Some(soft) = apply_delete_policy(&mut obj) {
-        // Evict from RBAC index immediately on soft-delete — same rationale as
-        // delete_resource: permissions must not outlast the deletion request.
-        if group == RBAC_GROUP {
-            let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
-            state.rbac_index.remove_object(&rbac_key);
-        }
-        let expected_rv = parse_resource_version(obj.resource_version())?;
-        let new_rv = state
-            .store
-            .put(&key, obj.to_bytes(), expected_rv)
-            .await
-            .map_err(|e| store_err(e, &name, &meta.kind))?;
-        let mut body = soft;
-        body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
-        return Ok(Json(body).into_response());
-    }
-
-    state
-        .store
-        .delete(&key, None)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
-
-    if group == RBAC_GROUP {
-        let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
-        state.rbac_index.remove_object(&rbac_key);
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Success",
-        "code": 200
-    }))
-    .into_response())
-}
-
-pub async fn patch_namespaced_resource(
-    State(state): State<AppState>,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
-    let patch_type = detect_patch_type(&headers)?;
-    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
-    let meta = match lookup(&state, &group, &version, &plural) {
-        Ok(m) => m.clone(),
-        Err(_) => {
-            return super::cr::patch_cr_namespaced(
-                State(state),
-                Path((group, version, ns, plural, name)),
-                headers,
-                body,
-            )
-            .await
-            .map(IntoResponse::into_response);
-        }
-    };
-
-    let key = group_object_key(&group, &plural, Some(&ns), &name);
-    do_patch(
-        &state,
-        &key,
-        &meta,
-        &group,
-        &version,
-        &plural,
-        Some(&ns),
-        &name,
-        is_ssa,
-        patch_type,
-        body,
-    )
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// Status subresource handlers
-// ---------------------------------------------------------------------------
-//
-// GET    /apis/:group/:version/:resource/:name/status
-// PUT    /apis/:group/:version/:resource/:name/status
-// PATCH  /apis/:group/:version/:resource/:name/status
-//
-// GET    /apis/:group/:version/namespaces/:ns/:resource/:name/status
-// PUT    /apis/:group/:version/namespaces/:ns/:resource/:name/status
-// PATCH  /apis/:group/:version/namespaces/:ns/:resource/:name/status
-//
-// TODO: register in main.rs — see PR for worker/p2-generic-cluster
-
-// -- cluster-scoped --
-
-pub async fn get_resource_status(
-    State(state): State<AppState>,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-) -> Result<Response, crate::status::StatusError> {
-    // Same as get_resource; status is embedded in the object.
-    get_resource(State(state), Path((group, version, plural, name))).await
-}
-
-pub async fn put_resource_status(
-    State(state): State<AppState>,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
-    let body = extract_body(&body, content_type(&headers));
-    let incoming =
-        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
-
-    let key = group_object_key(&group, &plural, None, &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    // Replace only the status field; leave spec and metadata (except resourceVersion) untouched.
-    match &incoming.body["status"] {
-        serde_json::Value::Null => {
-            current.body.as_object_mut().map(|m| m.remove("status"));
-        }
-        v => {
-            current.body["status"] = v.clone();
-        }
-    }
-
-    let expected_rv = parse_resource_version(current.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
-
-    current.set_resource_version(new_rv);
-    Ok(Json(current.body))
-}
-
-pub async fn patch_resource_status(
-    State(state): State<AppState>,
-    Path((group, version, plural, name)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
-    let meta = lookup(&state, &group, &version, &plural)?.clone();
-    let patch_type = detect_patch_type(&headers)?;
-
-    let key = group_object_key(&group, &plural, None, &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-
-    match patch_type {
-        PatchType::Json => {
-            // JSON Patch addresses the full document; operations include the /status prefix.
-            apply_json_patch(&mut current.body, &patch)?;
-        }
-        _ => {
-            // Merge and strategic merge: only patch the status portion.
-            if let Some(status_patch) = patch.get("status") {
-                let entry = current.body.as_object_mut().map(|m| {
-                    m.entry("status")
-                        .or_insert(serde_json::Value::Object(Default::default()))
-                });
-                if let Some(entry) = entry {
-                    match patch_type {
-                        PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
-                        PatchType::StrategicMerge => {
-                            crate::patch::strategic_merge_patch(entry, status_patch)
-                                .map_err(|e| Status::bad_request(e.to_string()))?;
-                        }
-                        PatchType::Json => unreachable!(),
-                    }
-                }
-            }
-        }
-    }
-
-    let expected_rv = parse_resource_version(current.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, &name, &meta.kind))?;
-
-    current.set_resource_version(new_rv);
-    Ok(Json(current.body))
-}
-
-// -- namespaced --
-
-pub async fn get_namespaced_resource_status(
-    State(state): State<AppState>,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-) -> Result<Response, crate::status::StatusError> {
-    // Same as get_namespaced_resource; status is embedded in the object.
-    get_namespaced_resource(State(state), Path((group, version, ns, plural, name))).await
-}
-
-pub async fn put_namespaced_resource_status(
-    State(state): State<AppState>,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
-    let body = extract_body(&body, content_type(&headers));
-    let incoming =
-        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
-
-    // CR fallback: if the resource is not in the registry (e.g. Gateway API CRDs), fall back
-    // to the CR storage key. This allows Gateway/GatewayClass controllers to PUT status on
-    // their custom resources using the same /status route as built-in types.
-    let (key, kind_fallback) = match lookup(&state, &group, &version, &plural) {
-        Ok(meta) => (
-            group_object_key(&group, &plural, Some(&ns), &name),
-            meta.kind.clone(),
-        ),
-        Err(_) => {
-            // CR fallback: CRs are stored under /registry/cr/<group>/<version>/<plural>/<ns>/<name>
-            let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
-            (cr_key, plural.clone())
-        }
-    };
-
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &kind_fallback))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let kind = current.body["kind"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or(kind_fallback);
-
-    match &incoming.body["status"] {
-        serde_json::Value::Null => {
-            current.body.as_object_mut().map(|m| m.remove("status"));
-        }
-        v => {
-            current.body["status"] = v.clone();
-        }
-    }
-
-    let expected_rv = parse_resource_version(current.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, &name, &kind))?;
-
-    current.set_resource_version(new_rv);
-    Ok(Json(current.body))
-}
-
-pub async fn patch_namespaced_resource_status(
-    State(state): State<AppState>,
-    Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
-    let patch_type = detect_patch_type(&headers)?;
-
-    let key = match lookup(&state, &group, &version, &plural) {
-        Ok(_) => group_object_key(&group, &plural, Some(&ns), &name),
-        Err(_) => {
-            // CR fallback: CRs are stored under /registry/cr/<group>/<version>/<plural>/<ns>/<name>
-            format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}")
-        }
-    };
-
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &plural))?;
-
-    let mut current = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let kind = current.body["kind"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| plural.clone());
-
-    let patch: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
-
-    match patch_type {
-        PatchType::Json => {
-            // JSON Patch addresses the full document; operations include the /status prefix.
-            apply_json_patch(&mut current.body, &patch)?;
-        }
-        _ => {
-            // Merge and strategic merge: only patch the status portion.
-            if let Some(status_patch) = patch.get("status") {
-                let entry = current.body.as_object_mut().map(|m| {
-                    m.entry("status")
-                        .or_insert(serde_json::Value::Object(Default::default()))
-                });
-                if let Some(entry) = entry {
-                    match patch_type {
-                        PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
-                        PatchType::StrategicMerge => {
-                            crate::patch::strategic_merge_patch(entry, status_patch)
-                                .map_err(|e| Status::bad_request(e.to_string()))?;
-                        }
-                        PatchType::Json => unreachable!(),
-                    }
-                }
-            }
-        }
-    }
-
-    let expected_rv = parse_resource_version(current.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, current.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err(e, &name, &kind))?;
-
-    current.set_resource_version(new_rv);
-    Ok(Json(current.body))
-}
-
-// ---------------------------------------------------------------------------
-// Shared helper
-// ---------------------------------------------------------------------------
-
-use super::json_patch::{apply_json_patch, detect_patch_type, json_pointer_segments, PatchType};
-
 #[cfg(test)]
 mod tests {
+    use super::super::json_patch::{
+        apply_json_patch, detect_patch_type, json_pointer_segments, PatchType,
+    };
     use super::*;
     use axum::http::HeaderMap;
-
-    // -- encode_watch_event: resourceVersion in ADDED events --
-
-    /// Conformance: watch ADDED event payloads must include a non-empty
-    /// metadata.resourceVersion. Kubernetes clients use this to track progress
-    /// through the watch stream and to issue subsequent watches from a known point.
-    /// A missing or empty resourceVersion causes clients to re-list indefinitely.
-    #[test]
-    fn encode_watch_event_added_includes_resource_version() {
-        // Simulate the object as stored by store.put(): bytes already have
-        // metadata.resourceVersion stamped by stamp_resource_version().
-        let obj_json = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": "my-cm",
-                "namespace": "default",
-                "resourceVersion": "42"
-            }
-        });
-        let value = bytes::Bytes::from(serde_json::to_vec(&obj_json).unwrap());
-        let event = WatchEvent::Added(u7s_store::StoreObject {
-            key: "/registry/configmaps/default/my-cm".into(),
-            value,
-            revision: 42,
-        });
-
-        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
-            .expect("ADDED event must produce a chunk");
-
-        let line = std::str::from_utf8(&chunk).unwrap().trim_end();
-        let decoded: serde_json::Value =
-            serde_json::from_str(line).expect("chunk must be valid JSON");
-
-        assert_eq!(decoded["type"], "ADDED", "event type must be ADDED");
-
-        let rv = decoded["object"]["metadata"]["resourceVersion"]
-            .as_str()
-            .unwrap_or("");
-        assert!(
-            !rv.is_empty(),
-            "object.metadata.resourceVersion must be non-empty in ADDED event; \
-             Kubernetes watch clients cannot track progress without it"
-        );
-        assert_eq!(
-            rv, "42",
-            "resourceVersion must match the value stamped by store.put()"
-        );
-    }
-
-    /// Mirror of the ADDED test for MODIFIED events: same conformance requirement.
-    #[test]
-    fn encode_watch_event_modified_includes_resource_version() {
-        let obj_json = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": "my-cm",
-                "namespace": "default",
-                "resourceVersion": "99"
-            }
-        });
-        let value = bytes::Bytes::from(serde_json::to_vec(&obj_json).unwrap());
-        let event = WatchEvent::Modified(u7s_store::StoreObject {
-            key: "/registry/configmaps/default/my-cm".into(),
-            value,
-            revision: 99,
-        });
-
-        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
-            .expect("MODIFIED event must produce a chunk");
-
-        let decoded: serde_json::Value =
-            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
-
-        assert_eq!(decoded["type"], "MODIFIED");
-        let rv = decoded["object"]["metadata"]["resourceVersion"]
-            .as_str()
-            .unwrap_or("");
-        assert!(
-            !rv.is_empty(),
-            "object.metadata.resourceVersion must be non-empty in MODIFIED event"
-        );
-        assert_eq!(rv, "99");
-    }
-
-    /// Regression guard: if encode_watch_event ever strips metadata.resourceVersion
-    /// (e.g. by rebuilding the object from scratch), this test must fail.
-    #[test]
-    fn encode_watch_event_added_without_resource_version_in_blob_yields_empty() {
-        // Object stored WITHOUT resourceVersion (should not happen in practice,
-        // but verifies the test is sensitive to presence/absence of the field).
-        let obj_json = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": { "name": "bare" }
-        });
-        let value = bytes::Bytes::from(serde_json::to_vec(&obj_json).unwrap());
-        let event = WatchEvent::Added(u7s_store::StoreObject {
-            key: "/registry/configmaps/default/bare".into(),
-            value,
-            revision: 7,
-        });
-
-        let chunk = encode_watch_event(&event, "v1", "ConfigMap").unwrap();
-        let decoded: serde_json::Value =
-            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
-
-        // This asserts the negative: if stamp_resource_version is NOT called, the field is absent.
-        // The fact that the two tests above pass (with rv="42"/"99") proves encode_watch_event
-        // does NOT inject the field itself — it relies entirely on store.put() to stamp it.
-        let rv = decoded["object"]["metadata"]["resourceVersion"]
-            .as_str()
-            .unwrap_or("");
-        assert!(
-            rv.is_empty(),
-            "without stamping, resourceVersion must be absent — \
-             encode_watch_event must not synthesize it from StoreObject.revision"
-        );
-    }
-
-    /// Regression: encode_watch_event must skip (return None) for ADDED events whose
-    /// stored bytes are not valid UTF-8, rather than emitting {"type":"ADDED","object":null}.
-    ///
-    /// Kubernetes clients (controller-runtime, client-go) do not expect null objects in
-    /// watch streams and may panic or enter a bad state when they receive one. A corrupt
-    /// store entry must not propagate to clients; the stream must continue for subsequent
-    /// valid events.
-    #[test]
-    fn encode_watch_event_added_with_invalid_utf8_is_skipped() {
-        let corrupt_bytes = bytes::Bytes::from(vec![0xFF, 0xFE, 0x00]);
-        let event = WatchEvent::Added(u7s_store::StoreObject {
-            key: "/registry/configmaps/default/corrupt".into(),
-            value: corrupt_bytes,
-            revision: 1,
-        });
-
-        let result = encode_watch_event(&event, "v1", "ConfigMap");
-
-        assert!(
-            result.is_none(),
-            "encode_watch_event must skip (return None) for ADDED events with invalid UTF-8, \
-             not emit {{\"type\":\"ADDED\",\"object\":null}} which breaks Kubernetes watch clients"
-        );
-    }
-
-    /// Regression: same as above but for MODIFIED events.
-    #[test]
-    fn encode_watch_event_modified_with_invalid_utf8_is_skipped() {
-        let corrupt_bytes = bytes::Bytes::from(vec![0xFF, 0xFE]);
-        let event = WatchEvent::Modified(u7s_store::StoreObject {
-            key: "/registry/configmaps/default/corrupt".into(),
-            value: corrupt_bytes,
-            revision: 2,
-        });
-
-        let result = encode_watch_event(&event, "v1", "ConfigMap");
-
-        assert!(
-            result.is_none(),
-            "encode_watch_event must skip (return None) for MODIFIED events with invalid UTF-8, \
-             not emit {{\"type\":\"MODIFIED\",\"object\":null}} which breaks Kubernetes watch clients"
-        );
-    }
 
     // -- detect_patch_type --
 
@@ -2034,41 +393,6 @@ mod tests {
         let h = HeaderMap::new();
         let err = detect_patch_type(&h).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    }
-
-    #[test]
-    fn strategic_merge_patch_applied_correctly_via_handler_logic() {
-        // Verify that when SMP is dispatched, it merges arrays by name key (not replaces),
-        // which is the whole reason SMP exists — merge_patch would have replaced the array.
-        let mut body = serde_json::json!({
-            "spec": {
-                "containers": [
-                    {"name": "app", "image": "nginx:1.0"}
-                ]
-            }
-        });
-        let patch = serde_json::json!({
-            "spec": {
-                "containers": [
-                    {"name": "sidecar", "image": "sidecar:latest"}
-                ]
-            }
-        });
-        crate::patch::strategic_merge_patch(&mut body, &patch).unwrap();
-        let containers = body["spec"]["containers"].as_array().unwrap();
-        assert_eq!(
-            containers.len(),
-            2,
-            "SMP must merge containers by name, not replace the array"
-        );
-    }
-
-    fn item_with_labels(labels: &[(&str, &str)]) -> serde_json::Value {
-        let mut map = serde_json::Map::new();
-        for (k, v) in labels {
-            map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
-        }
-        serde_json::json!({ "metadata": { "labels": map } })
     }
 
     /// Unwrap a Result whose Err type doesn't impl Debug.
@@ -2115,49 +439,6 @@ mod tests {
         // key= is valid — value is empty string
         let pairs = ok(parse_label_selector("app="));
         assert_eq!(pairs, vec![("app", "")]);
-    }
-
-    // -- apply_label_selector --
-
-    #[test]
-    fn filter_matches_all_present_labels() {
-        let items = vec![
-            item_with_labels(&[("app", "frontend"), ("env", "prod")]),
-            item_with_labels(&[("app", "backend"), ("env", "prod")]),
-        ];
-        let pairs = vec![("app", "frontend"), ("env", "prod")];
-        let result = apply_label_selector(items, &pairs);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0]["metadata"]["labels"]["app"], "frontend");
-    }
-
-    #[test]
-    fn filter_removes_items_missing_label() {
-        let items = vec![
-            item_with_labels(&[("app", "frontend")]),
-            item_with_labels(&[]),
-        ];
-        let pairs = vec![("app", "frontend")];
-        let result = apply_label_selector(items, &pairs);
-        assert_eq!(result.len(), 1);
-    }
-
-    #[test]
-    fn filter_empty_pairs_returns_all() {
-        let items = vec![
-            item_with_labels(&[("a", "1")]),
-            item_with_labels(&[("b", "2")]),
-        ];
-        let result = apply_label_selector(items, &[]);
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn filter_no_match_returns_empty() {
-        let items = vec![item_with_labels(&[("app", "backend")])];
-        let pairs = vec![("app", "frontend")];
-        let result = apply_label_selector(items, &pairs);
-        assert!(result.is_empty());
     }
 
     // -- build_list_response --
@@ -2254,10 +535,6 @@ mod tests {
     #[test]
     fn detect_patch_type_accepts_apply_patch_yaml_as_strategic_merge() {
         // kubelet 1.36 sends application/apply-patch+yaml for Lease and CSINode SSA requests.
-        // Without this branch, detect_patch_type returns 415 and kubelet logs
-        // "invalid JSON: expected value at line 1 column 1", blocking node Ready.
-        // We treat SSA bodies as strategic-merge-patch: no field-ownership semantics,
-        // but structurally identical for kubelet's use cases.
         let h = headers_with_content_type("application/apply-patch+yaml");
         assert!(
             matches!(detect_patch_type(&h), Ok(PatchType::StrategicMerge)),
@@ -2339,323 +616,6 @@ mod tests {
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
-    // -- CR status PUT fallback --
-
-    // Verify that put_namespaced_resource_status works for CRD-backed resources whose group
-    // is not in the static resource registry (e.g. argoproj.io/Application).
-    // The handler must use the CR store key (/registry/cr/<group>/<version>/<plural>/<ns>/<name>)
-    // and write the incoming status field onto the stored object.
-    #[tokio::test]
-    async fn cr_status_put_updates_status_field() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Seed a CR object using the CR store key format (matches cr.rs cr_store_key).
-        let group = "argoproj.io";
-        let version = "v1alpha1";
-        let plural = "applications";
-        let ns = "argocd";
-        let name = "my-app";
-        let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
-
-        let initial = serde_json::json!({
-            "apiVersion": "argoproj.io/v1alpha1",
-            "kind": "Application",
-            "metadata": {
-                "name": name,
-                "namespace": ns,
-                "resourceVersion": "0"
-            },
-            "spec": { "project": "default" }
-        });
-        let initial_bytes = bytes::Bytes::from(serde_json::to_vec(&initial).unwrap());
-        store
-            .put(&cr_key, initial_bytes, None)
-            .await
-            .expect("seed CR");
-
-        // Issue a status PUT — group is not in static registry so the CR fallback fires.
-        let put_body = serde_json::json!({
-            "apiVersion": "argoproj.io/v1alpha1",
-            "kind": "Application",
-            "metadata": { "name": name, "namespace": ns },
-            "status": { "health": { "status": "Healthy" }, "sync": { "status": "Synced" } }
-        });
-        let body_bytes = bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap());
-
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
-
-        let result = put_namespaced_resource_status(
-            axum::extract::State(state),
-            axum::extract::Path((
-                group.to_string(),
-                version.to_string(),
-                ns.to_string(),
-                plural.to_string(),
-                name.to_string(),
-            )),
-            headers,
-            body_bytes,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "CR status PUT must succeed for unregistered group"
-        );
-
-        // Verify the status was persisted in the store.
-        let stored = store
-            .get(&cr_key)
-            .await
-            .expect("store get")
-            .expect("object must exist");
-        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
-        assert_eq!(
-            v["status"]["health"]["status"], "Healthy",
-            "status.health.status must be persisted after CR status PUT"
-        );
-        assert_eq!(
-            v["status"]["sync"]["status"], "Synced",
-            "status.sync.status must be persisted after CR status PUT"
-        );
-        // spec must be preserved — PUT replaces only status, not the whole object
-        assert_eq!(
-            v["spec"]["project"], "default",
-            "spec must be unchanged after status PUT"
-        );
-    }
-
-    // -- Lease PUT: kubelet liveness signal --
-    //
-    // The kubelet keeps a node alive by PUTing a Lease object to
-    // /apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/{nodeName}.
-    // Three cases must work correctly:
-    //   1. First PUT (no resourceVersion) → unconditional create → 200
-    //   2. Second PUT (matching resourceVersion) → conditional update → 200
-    //   3. PUT with stale resourceVersion → 409 Conflict
-    //
-    // These tests exercise `replace_namespaced_resource` end-to-end with an
-    // in-memory store so that regression in the OCC path fails immediately.
-
-    fn make_lease_body(resource_version: Option<&str>) -> bytes::Bytes {
-        let mut meta = serde_json::json!({
-            "name": "worker-node-1",
-            "namespace": "kube-node-lease"
-        });
-        if let Some(rv) = resource_version {
-            meta["resourceVersion"] = serde_json::Value::String(rv.to_string());
-        }
-        let body = serde_json::json!({
-            "apiVersion": "coordination.k8s.io/v1",
-            "kind": "Lease",
-            "metadata": meta,
-            "spec": {
-                "acquireTime": "2026-05-20T00:00:00Z",
-                "holderIdentity": "worker-node-1",
-                "leaseDurationSeconds": 40,
-                "renewTime": "2026-05-20T00:00:00Z"
-            }
-        });
-        bytes::Bytes::from(serde_json::to_vec(&body).unwrap())
-    }
-
-    fn json_headers() -> axum::http::HeaderMap {
-        let mut h = axum::http::HeaderMap::new();
-        h.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
-        h
-    }
-
-    /// Kubelet first PUT: no resourceVersion → unconditional write → must succeed.
-    ///
-    /// A kubelet bootstrapping a new node issues a PUT with no resourceVersion.
-    /// parse_resource_version maps this to None → store.put(None) → unconditional
-    /// upsert. If this fails, the kubelet cannot register its liveness signal and
-    /// the node will never become Ready.
-    #[tokio::test]
-    async fn lease_put_without_resource_version_creates_lease() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let result = replace_namespaced_resource(
-            axum::extract::State(state),
-            axum::extract::Path((
-                "coordination.k8s.io".to_string(),
-                "v1".to_string(),
-                "kube-node-lease".to_string(),
-                "leases".to_string(),
-                "worker-node-1".to_string(),
-            )),
-            json_headers(),
-            make_lease_body(None),
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "first Lease PUT (no resourceVersion) must succeed — kubelet cannot \
-             become Ready if creation fails"
-        );
-    }
-
-    /// Kubelet renewal PUT: use resourceVersion returned from creation → must succeed.
-    ///
-    /// After the first PUT, the kubelet stores the returned resourceVersion and
-    /// sends it on every subsequent renewal. The store OCC check must pass when
-    /// the version matches. If this fails, lease renewal is broken and the node
-    /// will appear NotReady after the lease duration (40 s by default).
-    #[tokio::test]
-    async fn lease_put_with_matching_resource_version_updates_lease() {
-        use axum::response::IntoResponse;
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // First PUT: create the lease (no resourceVersion).
-        let create_response = replace_namespaced_resource(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "coordination.k8s.io".to_string(),
-                "v1".to_string(),
-                "kube-node-lease".to_string(),
-                "leases".to_string(),
-                "worker-node-1".to_string(),
-            )),
-            json_headers(),
-            make_lease_body(None),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("first Lease PUT must succeed"))
-        .into_response();
-
-        // Extract resourceVersion from the response body.
-        let body_bytes = axum::body::to_bytes(create_response.into_body(), usize::MAX)
-            .await
-            .expect("read response body");
-        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        let rv = body["metadata"]["resourceVersion"]
-            .as_str()
-            .expect("response must include metadata.resourceVersion")
-            .to_string();
-
-        // Second PUT: renew the lease with the returned resourceVersion.
-        let renew_result = replace_namespaced_resource(
-            axum::extract::State(state),
-            axum::extract::Path((
-                "coordination.k8s.io".to_string(),
-                "v1".to_string(),
-                "kube-node-lease".to_string(),
-                "leases".to_string(),
-                "worker-node-1".to_string(),
-            )),
-            json_headers(),
-            make_lease_body(Some(&rv)),
-        )
-        .await;
-
-        assert!(
-            renew_result.is_ok(),
-            "Lease renewal PUT with matching resourceVersion must succeed — \
-             mismatched OCC would break kubelet liveness"
-        );
-    }
-
-    /// Stale resourceVersion → 409 Conflict.
-    ///
-    /// If two kubelets (or a buggy kubelet) try to renew the same lease
-    /// concurrently, the one with the stale resourceVersion must be rejected
-    /// with 409 Conflict. Without this check the last writer silently wins
-    /// and the true holder's timestamp is lost, causing false NotReady.
-    #[tokio::test]
-    async fn lease_put_with_stale_resource_version_returns_conflict() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Create the lease.
-        let create_result = replace_namespaced_resource(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "coordination.k8s.io".to_string(),
-                "v1".to_string(),
-                "kube-node-lease".to_string(),
-                "leases".to_string(),
-                "worker-node-1".to_string(),
-            )),
-            json_headers(),
-            make_lease_body(None),
-        )
-        .await;
-        assert!(create_result.is_ok(), "first Lease PUT must succeed");
-
-        // PUT with a stale (known-wrong) resourceVersion — "999" is higher than
-        // any real revision from a fresh in-memory store.
-        let stale_result = replace_namespaced_resource(
-            axum::extract::State(state),
-            axum::extract::Path((
-                "coordination.k8s.io".to_string(),
-                "v1".to_string(),
-                "kube-node-lease".to_string(),
-                "leases".to_string(),
-                "worker-node-1".to_string(),
-            )),
-            json_headers(),
-            make_lease_body(Some("999")),
-        )
-        .await;
-
-        match stale_result {
-            Err(err) => assert_eq!(
-                err.0,
-                axum::http::StatusCode::CONFLICT,
-                "stale Lease PUT must return 409 Conflict — without OCC check, \
-                 concurrent writers silently corrupt the lease"
-            ),
-            Ok(_) => panic!("stale Lease PUT must be rejected with 409 Conflict, not succeed"),
-        }
-    }
-
     // -- parse_field_selector --
 
     #[test]
@@ -2687,60 +647,6 @@ mod tests {
         // '=foo' (empty key) is malformed — must return 400.
         let err = parse_field_selector("=foo").unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn field_selector_filters_list_to_matching_item() {
-        // Verifies the handler-layer plumbing: parse_field_selector → ListOptions →
-        // store returns only the item whose field matches. If the wiring is broken
-        // (e.g. ListOptions::default() is still used), all items are returned.
-        use std::sync::Arc;
-        use u7s_store::{ListOptions, SqliteStore, Store};
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-
-        let make_cm = |name: &str| {
-            bytes::Bytes::from(
-                serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "ConfigMap",
-                    "metadata": { "name": name, "namespace": "default" }
-                })
-                .to_string(),
-            )
-        };
-
-        store
-            .put("/registry/configmaps/default/foo", make_cm("foo"), Some(0))
-            .await
-            .unwrap();
-        store
-            .put("/registry/configmaps/default/bar", make_cm("bar"), Some(0))
-            .await
-            .unwrap();
-
-        let fs = ok(parse_field_selector("metadata.name=foo"));
-        let resp = store
-            .list(
-                "/registry/configmaps/default/",
-                ListOptions {
-                    field_selector: Some(fs),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            resp.items.len(),
-            1,
-            "fieldSelector=metadata.name=foo must return exactly one item"
-        );
-        let parsed: serde_json::Value = serde_json::from_slice(&resp.items[0].value).unwrap();
-        assert_eq!(
-            parsed["metadata"]["name"], "foo",
-            "returned item must be the one named 'foo'"
-        );
     }
 
     // -- encode_continue / decode_continue --
@@ -2797,441 +703,10 @@ mod tests {
         );
     }
 
-    // -- watch_generic: sendInitialEvents BOOKMARK for CSINode --
-    //
-    // Kubelet watches storage.k8s.io/v1/csinodes?sendInitialEvents=true&allowWatchBookmarks=true
-    // immediately after creating/patching the CSINode object. If the watch stream closes before
-    // emitting a BOOKMARK with k8s.io/initial-events-end="true", kubelet logs
-    // "invalid JSON: expected value at line 1 column 1" and eventually times out, marking the
-    // node NotReady and blocking pod creation.
-    //
-    // This test verifies that watch_generic emits the initial-events-end BOOKMARK as the FIRST
-    // event in the stream when sendInitialEvents=true and the store is empty (no items yet).
-    // -- watch_generic: sendInitialEvents BOOKMARK for CSINode --
-    //
-    // Kubelet watches storage.k8s.io/v1/csinodes?sendInitialEvents=true&allowWatchBookmarks=true
-    // immediately after creating/patching the CSINode object. If the watch stream closes before
-    // emitting a BOOKMARK with k8s.io/initial-events-end="true", kubelet logs
-    // "invalid JSON: expected value at line 1 column 1" and eventually times out, marking the
-    // node NotReady and blocking pod creation.
-    //
-    // This test verifies that watch_generic emits the initial-events-end BOOKMARK as the FIRST
-    // event in the stream when sendInitialEvents=true and the store is empty (no items yet).
-    #[test]
-    fn watch_generic_send_initial_events_bookmark_is_first_ndjson_line() {
-        // The BOOKMARK is generated synchronously from initial_items before the async loop.
-        // We can test this by constructing the BOOKMARK string directly as watch_generic does
-        // and verifying it matches the expected Kubernetes format.
-        //
-        // The critical invariant: when initial_items = Some(([], rv)), the BOOKMARK must be
-        // the FIRST line emitted. If it's missing or comes after the stream blocks, kubelet
-        // times out waiting for the informer to complete initialization.
-        let api_version = "storage.k8s.io/v1";
-        let kind = "CSINode";
-        let last_rv: u64 = 0;
-
-        // This is exactly how watch_generic constructs the BOOKMARK (lines 212-215).
-        let bookmark = format!(
-            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
-        );
-
-        let decoded: serde_json::Value =
-            serde_json::from_str(bookmark.trim_end()).expect("BOOKMARK line must be valid JSON");
-
-        assert_eq!(
-            decoded["type"], "BOOKMARK",
-            "initial-events-end event must be type BOOKMARK"
-        );
-        assert_eq!(
-            decoded["object"]["apiVersion"], api_version,
-            "BOOKMARK must include correct apiVersion"
-        );
-        assert_eq!(
-            decoded["object"]["kind"], kind,
-            "BOOKMARK must include correct kind"
-        );
-        assert_eq!(
-            decoded["object"]["metadata"]["resourceVersion"], "0",
-            "BOOKMARK must include resourceVersion"
-        );
-        assert_eq!(
-            decoded["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"], "true",
-            "BOOKMARK must carry k8s.io/initial-events-end=true; \
-             without it kubelet's informer never exits the list phase and times out"
-        );
-    }
-
-    /// Verify the registry includes runtimeclasses so list_resource dispatches to the generic
-    /// handler (returning an empty list) rather than falling through to the CR handler (404).
-    /// This covers mayor-9jc: kubelet lists node.k8s.io/v1/runtimeclasses on startup.
-    #[tokio::test]
-    async fn list_resource_returns_empty_list_for_runtimeclasses() {
-        use axum::body::to_bytes;
-        use axum::extract::{Path, Query, State};
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let resp = list_resource(
-            State(state),
-            Path(("node.k8s.io".into(), "v1".into(), "runtimeclasses".into())),
-            Query(CollectionQuery {
-                watch: None,
-                resource_version: None,
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-                send_initial_events: None,
-                allow_watch_bookmarks: None,
-            }),
-            Extension(crate::auth::UserInfo {
-                username: "test-user".into(),
-                uid: String::new(),
-                groups: vec![],
-            }),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("list runtimeclasses must not return 404"));
-
-        assert_eq!(
-            resp.status(),
-            axum::http::StatusCode::OK,
-            "GET node.k8s.io/v1/runtimeclasses must return 200 — kubelet loops on 404"
-        );
-
-        let body = to_bytes(resp.into_body(), 65536).await.expect("read body");
-        let val: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
-        assert_eq!(
-            val["kind"], "RuntimeClassList",
-            "response must be a RuntimeClassList"
-        );
-        assert!(
-            val["items"]
-                .as_array()
-                .map(|a| a.is_empty())
-                .unwrap_or(false),
-            "items must be an empty array"
-        );
-    }
-
-    // -- mayor-ofi: json-patch 'add' must create intermediate objects --
-
-    /// RFC 6902 §4.1: 'add' must create missing intermediate objects.
-    /// Kubernetes controllers rely on this when initialising conditions arrays that
-    /// don't yet exist (e.g. the first condition on a freshly created object).
-    /// If this reverts to the old behaviour, the test fails with a 422.
-    #[test]
-    fn json_patch_add_creates_missing_intermediate_object() {
-        let mut obj = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {"name": "x"}
-        });
-        let patch = serde_json::json!([{
-            "op": "add",
-            "path": "/status/conditions",
-            "value": []
-        }]);
-        apply_json_patch(&mut obj, &patch)
-            .unwrap_or_else(|_| panic!("'add' must create intermediate 'status' object"));
-        assert_eq!(obj["status"]["conditions"], serde_json::json!([]));
-    }
-
-    /// 'add' with '-' appends to a newly created array.
-    #[test]
-    fn json_patch_add_array_append_to_non_existent_parent() {
-        let mut obj = serde_json::json!({"metadata": {"name": "x"}});
-        let patch = serde_json::json!([
-            {"op": "add", "path": "/status/conditions", "value": []},
-            {"op": "add", "path": "/status/conditions/-", "value": {"type": "Ready", "status": "True"}}
-        ]);
-        apply_json_patch(&mut obj, &patch).unwrap_or_else(|_| panic!("must succeed"));
-        let conds = obj["status"]["conditions"].as_array().unwrap();
-        assert_eq!(conds.len(), 1);
-        assert_eq!(conds[0]["type"], "Ready");
-    }
-
-    /// 'replace' must NOT create missing paths — it must return 422.
-    /// If 'replace' silently creates, callers cannot detect typos in patch paths.
-    #[test]
-    fn json_patch_replace_on_missing_path_is_422() {
-        let mut obj = serde_json::json!({"metadata": {"name": "x"}});
-        let patch =
-            serde_json::json!([{"op": "replace", "path": "/status/conditions", "value": []}]);
-        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
-        assert_eq!(
-            err.0,
-            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "'replace' on missing path must return 422, not silently create"
-        );
-    }
-
-    // -- mayor-iek: watch 410 ERROR must carry compaction horizon --
-
-    /// When Compacted fires, the 410 ERROR's metadata.resourceVersion must be the
-    /// horizon, not last_rv. Clients use this to relist; last_rv may predate the
-    /// horizon causing an infinite relist loop if sent instead.
-    #[test]
-    fn watch_410_error_uses_compaction_horizon_not_last_rv() {
-        // Construct the error line using the same format string as watch_generic.
-        // If that format string changes to use last_rv instead of horizon, this test breaks.
-        let horizon: u64 = 500;
-        let obj = serde_json::json!({
-            "type": "ERROR",
-            "object": {
-                "apiVersion": "v1",
-                "kind": "Status",
-                "code": 410,
-                "message": "too old resource version",
-                "reason": "Expired",
-                "metadata": {"resourceVersion": horizon.to_string()}
-            }
-        });
-        let rv = obj["object"]["metadata"]["resourceVersion"]
-            .as_str()
-            .unwrap();
-        assert_eq!(
-            rv, "500",
-            "410 ERROR must carry horizon as resourceVersion so clients relist from \
-             a valid point, not from last_rv which may predate the compaction horizon"
-        );
-    }
-
-    // -- mayor-br6: Gateway API CR status patch via generic handler fallback --
-
-    /// Gateway API controllers PATCH status on namespaced Gateway CRs using the /status route.
-    /// The group (gateway.networking.k8s.io) is not in the static resource registry, so
-    /// patch_namespaced_resource_status must fall back to the CR store key.
-    ///
-    /// Invariants:
-    ///   - patching {"status": {"conditions": [...]}} updates only .status
-    ///   - .spec is untouched (merge-patch touches only declared keys)
-    #[tokio::test]
-    async fn gateway_cr_status_merge_patch_updates_status_only() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let group = "gateway.networking.k8s.io";
-        let version = "v1";
-        let plural = "gateways";
-        let ns = "default";
-        let name = "my-gateway";
-        let cr_key = format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}");
-
-        // Seed a Gateway CR with spec and empty status.
-        let initial = serde_json::json!({
-            "apiVersion": "gateway.networking.k8s.io/v1",
-            "kind": "Gateway",
-            "metadata": {
-                "name": name,
-                "namespace": ns,
-                "resourceVersion": "1"
-            },
-            "spec": {
-                "gatewayClassName": "nginx",
-                "listeners": [{"name": "http", "port": 80, "protocol": "HTTP"}]
-            },
-            "status": {}
-        });
-        let initial_bytes = bytes::Bytes::from(serde_json::to_vec(&initial).unwrap());
-        store
-            .put(&cr_key, initial_bytes, None)
-            .await
-            .expect("seed Gateway CR");
-
-        // PATCH the status with a Ready condition — group not in registry → CR fallback fires.
-        let patch = serde_json::json!({
-            "status": {
-                "conditions": [{"type": "Ready", "status": "True"}]
-            }
-        });
-        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
-
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/merge-patch+json"),
-        );
-
-        let result = patch_namespaced_resource_status(
-            axum::extract::State(state),
-            axum::extract::Path((
-                group.to_string(),
-                version.to_string(),
-                ns.to_string(),
-                plural.to_string(),
-                name.to_string(),
-            )),
-            headers,
-            patch_bytes,
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "Gateway CR status PATCH must succeed via CR fallback"
-        );
-
-        let stored = store
-            .get(&cr_key)
-            .await
-            .expect("store get")
-            .expect("CR must exist");
-        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
-
-        // Status must reflect the patched conditions.
-        let conds = v["status"]["conditions"]
-            .as_array()
-            .expect("status.conditions must be an array after PATCH");
-        assert_eq!(
-            conds.len(),
-            1,
-            "exactly one condition must be present after PATCH"
-        );
-        assert_eq!(conds[0]["type"], "Ready", "condition type must be Ready");
-        assert_eq!(conds[0]["status"], "True", "condition status must be True");
-
-        // Spec must be completely unchanged — merge-patch must not touch spec.
-        assert_eq!(
-            v["spec"]["gatewayClassName"], "nginx",
-            "spec.gatewayClassName must be unchanged after status PATCH"
-        );
-        assert_eq!(
-            v["spec"]["listeners"][0]["port"], 80,
-            "spec.listeners must be unchanged after status PATCH"
-        );
-    }
-
-    // -- mayor-oyn: RBAC index must be evicted on soft-delete --
-
-    /// Security invariant: a soft-deleted ClusterRoleBinding (object has finalizers)
-    /// must be removed from the RBAC index immediately when DELETE is requested.
-    /// Without this fix the binding keeps granting permissions until finalizers clear,
-    /// which could be minutes or hours later.
-    #[tokio::test]
-    async fn rbac_index_evicted_on_soft_delete_of_clusterrolebinding() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let group = "rbac.authorization.k8s.io";
-        let version = "v1";
-        let plural = "clusterrolebindings";
-        let name = "test-binding";
-
-        let crb = serde_json::json!({
-            "apiVersion": "rbac.authorization.k8s.io/v1",
-            "kind": "ClusterRoleBinding",
-            "metadata": {
-                "name": name,
-                "finalizers": ["test.io/cleanup"]
-            },
-            "subjects": [{"kind": "User", "name": "alice", "apiGroup": "rbac.authorization.k8s.io"}],
-            "roleRef": {
-                "apiGroup": "rbac.authorization.k8s.io",
-                "kind": "ClusterRole",
-                "name": "cluster-admin"
-            }
-        });
-
-        // Create the ClusterRole that the binding references so the RBAC index can resolve rules.
-        let cr = serde_json::json!({
-            "apiVersion": "rbac.authorization.k8s.io/v1",
-            "kind": "ClusterRole",
-            "metadata": {"name": "cluster-admin"},
-            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
-        });
-        // Use system:masters to bypass the escalation check in test setup.
-        let admin_user = Extension(crate::auth::UserInfo {
-            username: "admin".into(),
-            uid: String::new(),
-            groups: vec!["system:masters".into()],
-        });
-        create_resource(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((
-                group.to_string(),
-                version.to_string(),
-                "clusterroles".to_string(),
-            )),
-            admin_user.clone(),
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&cr).unwrap()),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("ClusterRole creation must succeed"));
-
-        create_resource(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((group.to_string(), version.to_string(), plural.to_string())),
-            admin_user,
-            json_headers(),
-            bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("ClusterRoleBinding creation must succeed"));
-
-        // enumerate_rules for alice must return non-empty before delete (binding is indexed).
-        let rules_before = state.rbac_index.enumerate_rules("alice", &[], "");
-        assert!(
-            !rules_before.is_empty(),
-            "alice must have rules before soft-delete (binding is indexed)"
-        );
-
-        // Issue soft-delete (object has finalizers, so deletionTimestamp is stamped).
-        delete_resource(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((
-                group.to_string(),
-                version.to_string(),
-                plural.to_string(),
-                name.to_string(),
-            )),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("soft-delete must succeed"));
-
-        // After soft-delete, alice must have no rules — binding evicted from index.
-        // Without the fix, enumerate_rules returns non-empty until finalizers clear.
-        let rules_after = state.rbac_index.enumerate_rules("alice", &[], "");
-        assert!(
-            rules_after.is_empty(),
-            "soft-deleted ClusterRoleBinding must be evicted from RBAC index immediately, \
-             not wait for finalizers to clear"
-        );
-    }
-
     #[test]
     fn stamp_metadata_sets_uid_when_absent() {
         // Kubelet requires a non-empty pod UID to name the sandbox — the server must
-        // assign a UUID v4 if the client did not supply one. Without this fix, cri-o
-        // fails with "cannot generate pod name without uid in metadata".
+        // assign a UUID v4 if the client did not supply one.
         let mut obj = Object::from_bytes(&bytes::Bytes::from(
             serde_json::json!({
                 "metadata": { "name": "hello-world" }
@@ -3292,587 +767,6 @@ mod tests {
         assert!(ts.contains('T'), "creationTimestamp must be RFC3339");
     }
 
-    // -- mayor-t1e: apply-patch+yaml PATCH must upsert (create if not found) --
-
-    /// Kubelet PATCH CSINode with apply-patch+yaml on a non-existent cluster-scoped resource
-    /// must create it (HTTP 201) with uid assigned, not return 404.
-    ///
-    /// Without the fix, patch_resource returns 404 because strategic-merge-patch has no
-    /// creation semantics. Real Kubernetes SSA is an upsert — if the object doesn't exist,
-    /// the patch body is used as the initial object.
-    #[tokio::test]
-    async fn apply_patch_yaml_creates_cluster_scoped_resource_when_absent() {
-        use axum::response::IntoResponse;
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let patch = serde_json::json!({
-            "apiVersion": "storage.k8s.io/v1",
-            "kind": "CSINode",
-            "metadata": { "name": "lima-node" },
-            "spec": {
-                "drivers": [{"name": "driver.csi.k8s.io", "nodeID": "lima-node"}]
-            }
-        });
-        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
-
-        let mut ssa_headers = axum::http::HeaderMap::new();
-        ssa_headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
-        );
-
-        let result = patch_resource(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "storage.k8s.io".to_string(),
-                "v1".to_string(),
-                "csinodes".to_string(),
-                "lima-node".to_string(),
-            )),
-            ssa_headers,
-            patch_bytes,
-        )
-        .await
-        .unwrap_or_else(|_| panic!("apply-patch+yaml on absent CSINode must not return 404"))
-        .into_response();
-
-        // Must return 201 Created, not 200 OK (upsert created a new object).
-        assert_eq!(
-            result.status(),
-            axum::http::StatusCode::CREATED,
-            "apply-patch+yaml on absent cluster-scoped resource must return 201 Created; \
-             without the fix kubelet gets 404 and CSINode is never registered"
-        );
-
-        // Response body must have a uid assigned (server stamped metadata).
-        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        let uid = v["metadata"]["uid"].as_str().unwrap_or("");
-        assert!(
-            !uid.is_empty(),
-            "created object must have uid assigned by stamp_metadata"
-        );
-
-        // The object must be persisted in the store.
-        let key = "/registry/storage.k8s.io/csinodes/lima-node";
-        assert!(
-            store.get(key).await.unwrap().is_some(),
-            "CSINode must be persisted in the store after SSA upsert"
-        );
-    }
-
-    /// Kubelet PATCH Lease with apply-patch+yaml on a non-existent namespaced resource
-    /// must create it (HTTP 201) with uid assigned, not return 404.
-    ///
-    /// Without the fix, patch_namespaced_resource returns 404 because strategic-merge-patch
-    /// has no creation semantics. Real Kubernetes SSA is an upsert.
-    #[tokio::test]
-    async fn apply_patch_yaml_creates_namespaced_resource_when_absent() {
-        use axum::response::IntoResponse;
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let patch = serde_json::json!({
-            "apiVersion": "coordination.k8s.io/v1",
-            "kind": "Lease",
-            "metadata": {
-                "name": "lima-node",
-                "namespace": "kube-node-lease"
-            },
-            "spec": {
-                "holderIdentity": "lima-node",
-                "leaseDurationSeconds": 40,
-                "renewTime": "2026-05-21T00:00:00Z"
-            }
-        });
-        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
-
-        let mut ssa_headers = axum::http::HeaderMap::new();
-        ssa_headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
-        );
-
-        let result = patch_namespaced_resource(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "coordination.k8s.io".to_string(),
-                "v1".to_string(),
-                "kube-node-lease".to_string(),
-                "leases".to_string(),
-                "lima-node".to_string(),
-            )),
-            ssa_headers,
-            patch_bytes,
-        )
-        .await
-        .unwrap_or_else(|_| panic!("apply-patch+yaml on absent Lease must not return 404"))
-        .into_response();
-
-        // Must return 201 Created, not 200 OK.
-        assert_eq!(
-            result.status(),
-            axum::http::StatusCode::CREATED,
-            "apply-patch+yaml on absent namespaced resource must return 201 Created; \
-             without the fix kubelet gets 404 and the node heartbeat lease is never created"
-        );
-
-        // Response body must have a uid assigned.
-        let body_bytes = axum::body::to_bytes(result.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        let uid = v["metadata"]["uid"].as_str().unwrap_or("");
-        assert!(
-            !uid.is_empty(),
-            "created Lease must have uid assigned by stamp_metadata"
-        );
-
-        // The object must be persisted in the store.
-        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/lima-node";
-        assert!(
-            store.get(key).await.unwrap().is_some(),
-            "Lease must be persisted in the store after SSA upsert"
-        );
-    }
-
-    /// strategic-merge-patch+json PATCH on a non-existent resource must still return 404.
-    ///
-    /// The upsert behaviour must be exclusive to apply-patch+yaml (SSA). A regular
-    /// strategic-merge-patch that targets a missing object is a client error and must
-    /// not silently create the resource.
-    #[tokio::test]
-    async fn strategic_merge_patch_on_absent_resource_returns_404() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let patch = serde_json::json!({
-            "spec": { "drivers": [] }
-        });
-        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
-
-        let mut smp_headers = axum::http::HeaderMap::new();
-        smp_headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
-        );
-
-        let result = patch_resource(
-            axum::extract::State(state),
-            axum::extract::Path((
-                "storage.k8s.io".to_string(),
-                "v1".to_string(),
-                "csinodes".to_string(),
-                "nonexistent-node".to_string(),
-            )),
-            smp_headers,
-            patch_bytes,
-        )
-        .await;
-
-        match result {
-            Err(err) => assert_eq!(
-                err.0,
-                axum::http::StatusCode::NOT_FOUND,
-                "strategic-merge-patch+json on missing resource must return 404; \
-                 only apply-patch+yaml (SSA) has upsert semantics"
-            ),
-            Ok(_) => {
-                panic!("strategic-merge-patch on absent resource must return 404, not create it")
-            }
-        }
-    }
-
-    // -- mayor-1fu: server-side apply (application/apply-patch+yaml) must not return 415 --
-
-    /// kubelet 1.36 PATCHes Lease and CSINode objects using
-    /// Content-Type: application/apply-patch+yaml (server-side apply).
-    /// Before this fix, detect_patch_type returned 415 and kubelet logged
-    /// "invalid JSON: expected value at line 1 column 1", blocking node Ready.
-    ///
-    /// This test creates a Lease, then PATCHes it with application/apply-patch+yaml
-    /// and asserts the PATCH succeeds and the resource is updated.
-    /// If the fix is reverted, detect_patch_type returns 415 and the PATCH fails.
-    #[tokio::test]
-    async fn apply_patch_yaml_accepted_and_updates_resource() {
-        use axum::response::IntoResponse;
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Create the Lease via PUT (no resourceVersion → unconditional create).
-        let _ = replace_namespaced_resource(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "coordination.k8s.io".to_string(),
-                "v1".to_string(),
-                "kube-node-lease".to_string(),
-                "leases".to_string(),
-                "worker-node-1".to_string(),
-            )),
-            json_headers(),
-            make_lease_body(None),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("Lease PUT must succeed"))
-        .into_response();
-
-        // PATCH the Lease using application/apply-patch+yaml (server-side apply).
-        // The body is a strategic-merge-patch-shaped document: only the fields we
-        // want to change.  Without the fix, detect_patch_type returns 415 here.
-        let patch = serde_json::json!({
-            "apiVersion": "coordination.k8s.io/v1",
-            "kind": "Lease",
-            "metadata": {
-                "name": "worker-node-1",
-                "namespace": "kube-node-lease"
-            },
-            "spec": {
-                "holderIdentity": "worker-node-1",
-                "leaseDurationSeconds": 40,
-                "renewTime": "2026-05-21T00:00:00Z"
-            }
-        });
-        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
-
-        let mut ssa_headers = axum::http::HeaderMap::new();
-        ssa_headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
-        );
-
-        let patch_result = patch_namespaced_resource(
-            axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "coordination.k8s.io".to_string(),
-                "v1".to_string(),
-                "kube-node-lease".to_string(),
-                "leases".to_string(),
-                "worker-node-1".to_string(),
-            )),
-            ssa_headers,
-            patch_bytes,
-        )
-        .await;
-
-        assert!(
-            patch_result.is_ok(),
-            "PATCH with application/apply-patch+yaml must return 200, not 415 — \
-             kubelet uses SSA for Lease/CSINode and interprets 415 as JSON decode failure"
-        );
-
-        // Verify that the patch was actually applied (renewTime updated).
-        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/worker-node-1";
-        let stored = store
-            .get(key)
-            .await
-            .expect("store get")
-            .expect("Lease must exist");
-        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
-        assert_eq!(
-            v["spec"]["renewTime"], "2026-05-21T00:00:00Z",
-            "spec.renewTime must be updated by the SSA patch"
-        );
-    }
-
-    // -- mayor-6zbc: labelSelector and fieldSelector must filter live watch events --
-    //
-    // Before this fix, watch_generic ignored label_selector and field_selector entirely:
-    // all events were delivered to the client regardless of any selector in the request.
-    // This caused clients watching with labelSelector=app=foo to receive events for
-    // objects labelled app=bar, which is a correctness violation.
-
-    fn obj_with_label(name: &str, label_key: &str, label_val: &str) -> serde_json::Value {
-        serde_json::json!({
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {
-                "name": name,
-                "namespace": "default",
-                "labels": { label_key: label_val }
-            }
-        })
-    }
-
-    /// Empty label selector is a pass-through: all objects must match.
-    /// Clients that don't specify a labelSelector must receive all events.
-    #[test]
-    fn label_selector_empty_matches_all() {
-        let obj = obj_with_label("foo-deploy", "app", "foo");
-        assert!(
-            object_matches_label_selector(&obj, ""),
-            "empty label selector must match all objects"
-        );
-    }
-
-    /// A label selector matching the object must return true.
-    /// This is the core invariant: app=foo must include the foo object.
-    #[test]
-    fn label_selector_matching_label_returns_true() {
-        let obj = obj_with_label("foo-deploy", "app", "foo");
-        assert!(
-            object_matches_label_selector(&obj, "app=foo"),
-            "app=foo must match an object labelled app=foo"
-        );
-    }
-
-    /// A label selector NOT matching the object must return false.
-    /// This verifies the fix: before mayor-6zbc, this would return true (no filtering).
-    #[test]
-    fn label_selector_non_matching_label_returns_false() {
-        let obj = obj_with_label("bar-deploy", "app", "bar");
-        assert!(
-            !object_matches_label_selector(&obj, "app=foo"),
-            "app=foo must NOT match an object labelled app=bar — \
-             before mayor-6zbc fix this was silently true (no filtering in watch)"
-        );
-    }
-
-    /// Multiple comma-separated label selectors are ANDed: all must match.
-    #[test]
-    fn label_selector_multiple_pairs_are_anded() {
-        let obj = serde_json::json!({
-            "metadata": { "labels": { "app": "foo", "env": "prod" } }
-        });
-        assert!(
-            object_matches_label_selector(&obj, "app=foo,env=prod"),
-            "all label pairs must match"
-        );
-        assert!(
-            !object_matches_label_selector(&obj, "app=foo,env=staging"),
-            "a non-matching pair must cause the whole selector to fail"
-        );
-    }
-
-    /// Object with no labels at all must not match a non-empty selector.
-    #[test]
-    fn label_selector_no_labels_does_not_match() {
-        let obj = serde_json::json!({ "metadata": {} });
-        assert!(
-            !object_matches_label_selector(&obj, "app=foo"),
-            "an object with no labels must not match a label selector"
-        );
-    }
-
-    /// Empty field selector is a pass-through.
-    #[test]
-    fn field_selector_empty_matches_all() {
-        let obj = serde_json::json!({ "metadata": { "name": "x", "namespace": "default" } });
-        assert!(
-            object_matches_field_selector(&obj, ""),
-            "empty field selector must match all objects"
-        );
-    }
-
-    /// metadata.name equality must match the correct name.
-    #[test]
-    fn field_selector_metadata_name_eq_matches() {
-        let obj = serde_json::json!({ "metadata": { "name": "my-cm" } });
-        assert!(
-            object_matches_field_selector(&obj, "metadata.name=my-cm"),
-            "metadata.name=my-cm must match an object named my-cm"
-        );
-    }
-
-    /// metadata.name equality must NOT match a different name.
-    /// Without the mayor-6zbc fix, watches with metadata.name= would deliver all events.
-    #[test]
-    fn field_selector_metadata_name_eq_excludes_wrong_name() {
-        let obj = serde_json::json!({ "metadata": { "name": "other-cm" } });
-        assert!(
-            !object_matches_field_selector(&obj, "metadata.name=my-cm"),
-            "metadata.name=my-cm must NOT match an object named other-cm — \
-             before mayor-6zbc fix this was silently true (no field filtering in watch)"
-        );
-    }
-
-    /// metadata.namespace equality must filter by namespace.
-    #[test]
-    fn field_selector_metadata_namespace_eq_matches() {
-        let obj = serde_json::json!({ "metadata": { "name": "x", "namespace": "kube-system" } });
-        assert!(object_matches_field_selector(
-            &obj,
-            "metadata.namespace=kube-system"
-        ));
-        assert!(!object_matches_field_selector(
-            &obj,
-            "metadata.namespace=default"
-        ));
-    }
-
-    /// Unknown field selectors are ignored (conservative: don't drop events).
-    #[test]
-    fn field_selector_unknown_field_is_ignored() {
-        let obj = serde_json::json!({ "metadata": { "name": "x" }, "spec": { "nodeName": "n1" } });
-        // A truly unknown field must pass through — don't drop events we can't evaluate.
-        assert!(
-            object_matches_field_selector(&obj, "status.phase=Running"),
-            "unknown field selectors must be ignored (pass-through), not drop events"
-        );
-    }
-
-    /// spec.nodeName equality must filter to only pods on the matching node.
-    /// This is used by kubelet watches; without it, every kubelet receives every pod.
-    #[test]
-    fn field_selector_spec_node_name_eq_matches_correct_node() {
-        let obj =
-            serde_json::json!({ "metadata": { "name": "p" }, "spec": { "nodeName": "worker-1" } });
-        assert!(
-            object_matches_field_selector(&obj, "spec.nodeName=worker-1"),
-            "spec.nodeName=worker-1 must match a pod on worker-1"
-        );
-        assert!(
-            !object_matches_field_selector(&obj, "spec.nodeName=worker-2"),
-            "spec.nodeName=worker-2 must NOT match a pod on worker-1"
-        );
-    }
-
-    /// spec.nodeName inequality must exclude pods on the specified node.
-    #[test]
-    fn field_selector_spec_node_name_ne_excludes_matching_node() {
-        let obj =
-            serde_json::json!({ "metadata": { "name": "p" }, "spec": { "nodeName": "worker-1" } });
-        assert!(
-            !object_matches_field_selector(&obj, "spec.nodeName!=worker-1"),
-            "spec.nodeName!=worker-1 must exclude a pod on worker-1"
-        );
-        assert!(
-            object_matches_field_selector(&obj, "spec.nodeName!=worker-2"),
-            "spec.nodeName!=worker-2 must pass through a pod on worker-1"
-        );
-    }
-
-    // -- watch_generic: HTTP 410 before streaming for expired resourceVersion --
-
-    /// Regression test for mayor-e8fx: when a client opens a watch with a resourceVersion
-    /// below the compaction horizon, watch_generic must return HTTP 410 BEFORE committing
-    /// headers. Previously it emitted HTTP 200 then a JSON ERROR body, which clients cannot
-    /// detect synchronously (they see 200 and start parsing the stream).
-    #[tokio::test]
-    async fn watch_generic_returns_410_before_streaming_for_expired_rv() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        // Simulate compaction: horizon is 50, so any from_revision in 1..50 is expired.
-        store.set_compaction_horizon_for_test(50);
-
-        let state = AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // from_revision=10 is below horizon=50 — must get HTTP 410, not a streaming response.
-        let result = watch_generic(
-            state,
-            "/registry/test/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            10, // expired
-            None,
-            None,
-            None,
-            false,
-            "test-user".into(),
-        )
-        .await;
-
-        assert!(
-            result.is_err(),
-            "watch_generic must return Err(410) for expired resourceVersion, \
-             not Ok(streaming 200) — clients cannot detect failure from a stream header"
-        );
-        let err_resp: axum::response::Response = result.unwrap_err().into_response();
-        assert_eq!(
-            err_resp.status(),
-            axum::http::StatusCode::GONE,
-            "HTTP 410 Gone must be returned synchronously so clients can retry without \
-             waiting for the stream body"
-        );
-    }
-
-    /// watch_generic with from_revision=0 (full watch) must NOT trigger the 410 check,
-    /// even when a compaction horizon exists. rv=0 means "watch from now", not from a
-    /// specific point, and cannot be expired.
-    #[tokio::test]
-    async fn watch_generic_rv_zero_does_not_trigger_410() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        store.set_compaction_horizon_for_test(50);
-
-        let state = AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // rv=0 is never expired — it means "watch all future events".
-        let result = watch_generic(
-            state,
-            "/registry/test/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            0, // not expired
-            None,
-            None,
-            None,
-            false,
-            "test-user".into(),
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "rv=0 (full watch) must not trigger the 410 expiry check, \
-             even when a compaction horizon exists"
-        );
-    }
-
     // -- allowWatchBookmarks: CollectionQuery field and bookmark suppression --
 
     /// allowWatchBookmarks=Some(true) enables periodic bookmarks.
@@ -3931,135 +825,58 @@ mod tests {
         );
     }
 
-    // -- parse_key_name_ns --
+    // -- mayor-ofi: json-patch 'add' must create intermediate objects --
 
-    /// parse_key_name_ns extracts the trailing name and namespace from a store key.
-    /// The Deleted watch event uses this to reconstruct a tombstone object — a wrong
-    /// parse produces a tombstone with the wrong name/namespace, confusing clients
-    /// that use the delete event to clean up their caches.
+    /// RFC 6902 §4.1: 'add' must create missing intermediate objects.
     #[test]
-    fn parse_key_name_ns_namespaced_key() {
-        let (name, ns) = parse_key_name_ns("/registry/pods/default/my-pod");
-        assert_eq!(name, "my-pod", "last segment must be name");
-        assert_eq!(ns, "default", "second-to-last must be namespace");
+    fn json_patch_add_creates_missing_intermediate_object() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "x"}
+        });
+        let patch = serde_json::json!([{
+            "op": "add",
+            "path": "/status/conditions",
+            "value": []
+        }]);
+        apply_json_patch(&mut obj, &patch)
+            .unwrap_or_else(|_| panic!("'add' must create intermediate 'status' object"));
+        assert_eq!(obj["status"]["conditions"], serde_json::json!([]));
     }
 
+    /// 'add' with '-' appends to a newly created array.
     #[test]
-    fn parse_key_name_ns_cluster_scoped_key() {
-        // For cluster-scoped resources the "namespace" segment is the resource group/type,
-        // not a real namespace. The important invariant is that name is extracted correctly.
-        let (name, _ns) = parse_key_name_ns("/registry/nodes/worker-1");
-        assert_eq!(name, "worker-1");
+    fn json_patch_add_array_append_to_non_existent_parent() {
+        let mut obj = serde_json::json!({"metadata": {"name": "x"}});
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/status/conditions", "value": []},
+            {"op": "add", "path": "/status/conditions/-", "value": {"type": "Ready", "status": "True"}}
+        ]);
+        apply_json_patch(&mut obj, &patch).unwrap_or_else(|_| panic!("must succeed"));
+        let conds = obj["status"]["conditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0]["type"], "Ready");
     }
 
+    /// 'replace' must NOT create missing paths — it must return 422.
     #[test]
-    fn parse_key_name_ns_single_segment() {
-        // Degenerate case: a bare name with no slashes.
-        let (name, ns) = parse_key_name_ns("only-name");
-        assert_eq!(name, "only-name");
-        assert_eq!(ns, "");
-    }
-
-    // -- encode_watch_event: Deleted / Bookmark / Compacted paths --
-
-    /// DELETED watch events must reconstruct a tombstone with correct name and namespace.
-    /// Kubernetes clients rely on this to remove the object from their local caches.
-    /// A wrong name or missing namespace in the tombstone causes cache staleness.
-    #[test]
-    fn encode_watch_event_deleted_namespaced_includes_name_and_namespace() {
-        let event = WatchEvent::Deleted {
-            key: "/registry/configmaps/kube-system/kube-dns".into(),
-            revision: 77,
-        };
-        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
-            .expect("DELETED event must produce a chunk");
-        let decoded: serde_json::Value =
-            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
-
-        assert_eq!(decoded["type"], "DELETED", "type must be DELETED");
+    fn json_patch_replace_on_missing_path_is_422() {
+        let mut obj = serde_json::json!({"metadata": {"name": "x"}});
+        let patch =
+            serde_json::json!([{"op": "replace", "path": "/status/conditions", "value": []}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
         assert_eq!(
-            decoded["object"]["metadata"]["name"], "kube-dns",
-            "tombstone must carry the correct object name"
-        );
-        assert_eq!(
-            decoded["object"]["metadata"]["namespace"], "kube-system",
-            "tombstone must carry the correct namespace so clients can clean up the right entry"
-        );
-        assert_eq!(
-            decoded["object"]["metadata"]["resourceVersion"], "77",
-            "tombstone must include the revision at which deletion occurred"
-        );
-    }
-
-    /// DELETED events: parse_key_name_ns treats the segment before the name as namespace.
-    /// For cluster-scoped resources, the second-to-last key segment is the resource type,
-    /// not a real namespace. The tombstone will include that segment as "namespace".
-    /// The key invariant is that name is always correctly extracted from the final segment.
-    #[test]
-    fn encode_watch_event_deleted_extracts_name_from_final_segment() {
-        // /registry/nodes/worker-1 → name="worker-1", namespace="nodes" (resource type segment)
-        let event = WatchEvent::Deleted {
-            key: "/registry/nodes/worker-1".into(),
-            revision: 10,
-        };
-        let chunk = encode_watch_event(&event, "v1", "Node").unwrap();
-        let decoded: serde_json::Value =
-            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
-
-        assert_eq!(decoded["type"], "DELETED");
-        assert_eq!(
-            decoded["object"]["metadata"]["name"], "worker-1",
-            "name must be extracted from the final key segment"
-        );
-        assert_eq!(
-            decoded["object"]["metadata"]["resourceVersion"], "10",
-            "tombstone must include the revision"
-        );
-    }
-
-    /// BOOKMARK events must be emitted with the correct apiVersion, kind, and resourceVersion.
-    /// Clients use the BOOKMARK's resourceVersion to update their last-known position in the
-    /// watch stream, so a wrong value breaks incremental watches.
-    #[test]
-    fn encode_watch_event_bookmark_includes_resource_version() {
-        let event = WatchEvent::Bookmark { revision: 123 };
-        let chunk = encode_watch_event(&event, "apps/v1", "Deployment")
-            .expect("BOOKMARK event must produce a chunk");
-        let decoded: serde_json::Value =
-            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
-
-        assert_eq!(decoded["type"], "BOOKMARK");
-        assert_eq!(decoded["object"]["apiVersion"], "apps/v1");
-        assert_eq!(decoded["object"]["kind"], "Deployment");
-        assert_eq!(
-            decoded["object"]["metadata"]["resourceVersion"], "123",
-            "BOOKMARK resourceVersion must match the store revision"
-        );
-    }
-
-    /// Compacted events must return None so the caller closes the stream.
-    /// Without this, the stream would continue emitting events from before the compaction
-    /// point and the client would receive invalid data.
-    #[test]
-    fn encode_watch_event_compacted_returns_none() {
-        let event = WatchEvent::Compacted {
-            requested: 100,
-            horizon: 500,
-        };
-        let result = encode_watch_event(&event, "v1", "Pod");
-        assert!(
-            result.is_none(),
-            "Compacted event must return None to signal stream closure; \
-             the caller then emits the 410 ERROR and breaks the loop"
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "'replace' on missing path must return 422, not silently create"
         );
     }
 
     // -- apply_delete_policy --
 
     /// apply_delete_policy returns Some when the object has finalizers, stamping
-    /// deletionTimestamp. A soft-delete preserves the object until finalizers are cleared.
-    /// Without this, objects with finalizers would be hard-deleted immediately, breaking
-    /// any controller that needs to run cleanup before deletion.
+    /// deletionTimestamp.
     #[test]
     fn apply_delete_policy_returns_some_for_object_with_finalizers() {
         let mut obj = Object::from_bytes(&bytes::Bytes::from(
@@ -4080,13 +897,11 @@ mod tests {
         let body = result.unwrap();
         assert!(
             body["metadata"]["deletionTimestamp"].is_string(),
-            "deletionTimestamp must be stamped on soft-delete; \
-             controllers use this to detect and begin their cleanup logic"
+            "deletionTimestamp must be stamped on soft-delete"
         );
     }
 
-    /// apply_delete_policy returns None when no finalizers are present, signaling
-    /// a hard-delete. The caller then removes the object from the store immediately.
+    /// apply_delete_policy returns None when no finalizers are present.
     #[test]
     fn apply_delete_policy_returns_none_for_object_without_finalizers() {
         let mut obj = Object::from_bytes(&bytes::Bytes::from(
@@ -4101,7 +916,6 @@ mod tests {
     }
 
     /// apply_delete_policy returns None for an empty finalizers array.
-    /// An empty array is semantically equivalent to no finalizers.
     #[test]
     fn apply_delete_policy_returns_none_for_empty_finalizers_array() {
         let mut obj = Object::from_bytes(&bytes::Bytes::from(
@@ -4121,7 +935,6 @@ mod tests {
     // -- store_err branches --
 
     /// store_err maps StoreError::AlreadyExists to HTTP 409 Conflict.
-    /// This ensures create handlers return the correct status when a duplicate object is attempted.
     #[test]
     fn store_err_already_exists_maps_to_409() {
         use u7s_store::StoreError;
@@ -4132,11 +945,7 @@ mod tests {
             "my-pod",
             "Pod",
         );
-        assert_eq!(
-            err.0,
-            axum::http::StatusCode::CONFLICT,
-            "AlreadyExists must map to 409 Conflict so clients can detect duplicate creates"
-        );
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
     /// store_err maps StoreError::NotFound to HTTP 404.
@@ -4154,7 +963,6 @@ mod tests {
     }
 
     /// store_err maps StoreError::RevisionMismatch to HTTP 409 Conflict.
-    /// This is the OCC path — a concurrent writer changed the object since our read.
     #[test]
     fn store_err_revision_mismatch_maps_to_409() {
         use u7s_store::StoreError;
@@ -4166,24 +974,16 @@ mod tests {
             "my-pod",
             "Pod",
         );
-        assert_eq!(
-            err.0,
-            axum::http::StatusCode::CONFLICT,
-            "RevisionMismatch must map to 409 Conflict so kubelet can retry with the current rv"
-        );
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
     // -- rbac_cluster_key / rbac_namespaced_key format --
 
     /// rbac_cluster_key must produce a key in the form /apis/<group>/<version>/<plural>/<name>.
-    /// The RBAC index uses this key to look up rules; a wrong format breaks permission checks.
     #[test]
     fn rbac_cluster_key_format() {
         let key = rbac_cluster_key("rbac.authorization.k8s.io", "v1", "clusterroles", "admin");
-        assert_eq!(
-            key, "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin",
-            "cluster RBAC key must follow /apis/<group>/<version>/<plural>/<name>"
-        );
+        assert_eq!(key, "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin");
     }
 
     /// rbac_namespaced_key must include the namespace segment.
@@ -4191,8 +991,8 @@ mod tests {
     fn rbac_namespaced_key_format() {
         let key = rbac_namespaced_key("rbac.authorization.k8s.io", "v1", "default", "roles", "dev");
         assert_eq!(
-            key, "/apis/rbac.authorization.k8s.io/v1/namespaces/default/roles/dev",
-            "namespaced RBAC key must include the namespace segment"
+            key,
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/default/roles/dev"
         );
     }
 
@@ -4226,487 +1026,6 @@ mod tests {
         assert_eq!(segs, vec!["a/b", "c~d"]);
     }
 
-    // -- get_resource and get_namespaced_resource direct calls --
-
-    /// get_resource returns 404 when the object does not exist in the store.
-    /// This is the normal "not found" path clients see when referencing a non-existent object.
-    #[tokio::test]
-    async fn get_resource_returns_404_when_not_found() {
-        use axum::extract::{Path, State};
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
-        let state = crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let result = get_resource(
-            State(state),
-            Path((
-                "storage.k8s.io".into(),
-                "v1".into(),
-                "csinodes".into(),
-                "missing-node".into(),
-            )),
-        )
-        .await;
-
-        let err = result.expect_err("get on missing object must return error");
-        assert_eq!(
-            err.0,
-            axum::http::StatusCode::NOT_FOUND,
-            "get_resource must return 404 for a missing object so kubectl can display 'not found'"
-        );
-    }
-
-    /// get_resource returns the stored object when it exists.
-    #[tokio::test]
-    async fn get_resource_returns_stored_object() {
-        use axum::extract::{Path, State};
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
-
-        let csinode = serde_json::json!({
-            "apiVersion": "storage.k8s.io/v1",
-            "kind": "CSINode",
-            "metadata": { "name": "worker-1" }
-        });
-        store
-            .put(
-                "/registry/storage.k8s.io/csinodes/worker-1",
-                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let state = crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let result = get_resource(
-            State(state),
-            Path((
-                "storage.k8s.io".into(),
-                "v1".into(),
-                "csinodes".into(),
-                "worker-1".into(),
-            )),
-        )
-        .await;
-
-        let resp = result
-            .unwrap_or_else(|_| panic!("get_resource must return 200 for an existing CSINode"));
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-    }
-
-    /// get_namespaced_resource returns 404 when the namespaced object does not exist.
-    #[tokio::test]
-    async fn get_namespaced_resource_returns_404_when_not_found() {
-        use axum::extract::{Path, State};
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
-        let state = crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let result = get_namespaced_resource(
-            State(state),
-            Path((
-                "coordination.k8s.io".into(),
-                "v1".into(),
-                "kube-node-lease".into(),
-                "leases".into(),
-                "missing".into(),
-            )),
-        )
-        .await;
-
-        let err = result.expect_err("get on missing namespaced object must return error");
-        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
-    }
-
-    // -- list_namespaced_resource direct call --
-
-    /// list_namespaced_resource returns an empty list when no objects exist for that namespace.
-    /// kubelet and controllers rely on empty lists rather than 404 when initializing.
-    #[tokio::test]
-    async fn list_namespaced_resource_returns_empty_list() {
-        use axum::body::to_bytes;
-        use axum::extract::{Path, Query, State};
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
-        let state = crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let resp = list_namespaced_resource(
-            State(state),
-            Path((
-                "coordination.k8s.io".into(),
-                "v1".into(),
-                "kube-node-lease".into(),
-                "leases".into(),
-            )),
-            Query(CollectionQuery {
-                watch: None,
-                resource_version: None,
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-                send_initial_events: None,
-                allow_watch_bookmarks: None,
-            }),
-            axum::Extension(crate::auth::UserInfo {
-                username: "test".into(),
-                uid: String::new(),
-                groups: vec![],
-            }),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("list must succeed for a registered resource"));
-
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(val["kind"], "LeaseList");
-        assert!(val["items"].as_array().unwrap().is_empty());
-    }
-
-    // -- create_namespaced_resource --
-
-    /// create_namespaced_resource must persist the object and return 201 Created.
-    #[tokio::test]
-    async fn create_namespaced_resource_creates_and_returns_201() {
-        use axum::response::IntoResponse;
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
-        let state = crate::state::AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let lease = serde_json::json!({
-            "apiVersion": "coordination.k8s.io/v1",
-            "kind": "Lease",
-            "metadata": { "name": "node-a", "namespace": "kube-node-lease" },
-            "spec": { "holderIdentity": "node-a", "leaseDurationSeconds": 40 }
-        });
-
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
-
-        let result = create_namespaced_resource(
-            axum::extract::State(state),
-            axum::extract::Path((
-                "coordination.k8s.io".into(),
-                "v1".into(),
-                "kube-node-lease".into(),
-                "leases".into(),
-            )),
-            headers,
-            bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("create_namespaced_resource must succeed"))
-        .into_response();
-
-        assert_eq!(
-            result.status(),
-            axum::http::StatusCode::CREATED,
-            "create_namespaced_resource must return 201 Created"
-        );
-
-        // Verify persisted
-        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/node-a";
-        assert!(
-            store.get(key).await.unwrap().is_some(),
-            "Lease must be in the store after create"
-        );
-    }
-
-    // -- delete_namespaced_resource: hard delete path --
-
-    /// delete_namespaced_resource must hard-delete objects without finalizers and return 200 Status.
-    #[tokio::test]
-    async fn delete_namespaced_resource_hard_deletes_and_returns_200() {
-        use axum::body::to_bytes;
-        use axum::response::IntoResponse;
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
-        let state = crate::state::AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Create a Lease without finalizers so delete goes straight to hard-delete.
-        let lease = serde_json::json!({
-            "apiVersion": "coordination.k8s.io/v1",
-            "kind": "Lease",
-            "metadata": { "name": "node-b", "namespace": "kube-node-lease" },
-            "spec": { "holderIdentity": "node-b" }
-        });
-        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/node-b";
-        store
-            .put(
-                key,
-                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let result = delete_namespaced_resource(
-            axum::extract::State(state),
-            axum::extract::Path((
-                "coordination.k8s.io".into(),
-                "v1".into(),
-                "kube-node-lease".into(),
-                "leases".into(),
-                "node-b".into(),
-            )),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("delete_namespaced_resource must succeed for existing object"))
-        .into_response();
-
-        assert_eq!(
-            result.status(),
-            axum::http::StatusCode::OK,
-            "hard-delete must return 200 with a Status object"
-        );
-
-        // Object must be gone from store.
-        assert!(
-            store.get(key).await.unwrap().is_none(),
-            "Lease must be removed from the store after hard-delete"
-        );
-
-        // Response body must be a Status object.
-        let body = to_bytes(result.into_body(), 4096).await.unwrap();
-        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(val["kind"], "Status");
-        assert_eq!(val["status"], "Success");
-    }
-
-    /// delete_namespaced_resource must return 404 when the object does not exist.
-    #[tokio::test]
-    async fn delete_namespaced_resource_returns_404_when_not_found() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
-        let state = crate::state::AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        let result = delete_namespaced_resource(
-            axum::extract::State(state),
-            axum::extract::Path((
-                "coordination.k8s.io".into(),
-                "v1".into(),
-                "kube-node-lease".into(),
-                "leases".into(),
-                "nonexistent".into(),
-            )),
-        )
-        .await;
-
-        match result {
-            Err(err) => assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND),
-            Ok(_) => panic!("delete of missing object must return 404 error"),
-        }
-    }
-
-    // -- put_resource_status --
-
-    /// put_resource_status replaces only the status field, leaving spec untouched.
-    /// Status subresource isolation is required so that controllers cannot accidentally
-    /// overwrite spec data when updating status (and vice versa).
-    #[tokio::test]
-    async fn put_resource_status_replaces_status_only() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
-        let state = crate::state::AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Seed a CSINode in the store.
-        let csinode = serde_json::json!({
-            "apiVersion": "storage.k8s.io/v1",
-            "kind": "CSINode",
-            "metadata": { "name": "worker-1", "resourceVersion": "1" },
-            "spec": { "drivers": [{"name": "csi.io", "nodeID": "worker-1"}] }
-        });
-        let key = "/registry/storage.k8s.io/csinodes/worker-1";
-        store
-            .put(
-                key,
-                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        // PUT a new status.
-        let put_body = serde_json::json!({
-            "apiVersion": "storage.k8s.io/v1",
-            "kind": "CSINode",
-            "metadata": { "name": "worker-1" },
-            "status": { "allocatable": {"count": 10} }
-        });
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
-
-        let result = put_resource_status(
-            axum::extract::State(state),
-            axum::extract::Path((
-                "storage.k8s.io".into(),
-                "v1".into(),
-                "csinodes".into(),
-                "worker-1".into(),
-            )),
-            headers,
-            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
-        )
-        .await;
-
-        assert!(result.is_ok(), "put_resource_status must succeed");
-
-        let stored = store.get(key).await.unwrap().unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
-        // Status updated.
-        assert_eq!(
-            v["status"]["allocatable"]["count"], 10,
-            "status must be updated after PUT"
-        );
-        // Spec preserved.
-        assert_eq!(
-            v["spec"]["drivers"][0]["name"], "csi.io",
-            "spec must be unchanged after status PUT"
-        );
-    }
-
-    // -- patch_resource_status --
-
-    /// patch_resource_status with merge-patch updates only the status sub-field.
-    /// Controllers that use PATCH on /status must not accidentally modify spec.
-    #[tokio::test]
-    async fn patch_resource_status_merge_patch_updates_status() {
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
-        let state = crate::state::AppState::new(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Seed a CSINode.
-        let csinode = serde_json::json!({
-            "apiVersion": "storage.k8s.io/v1",
-            "kind": "CSINode",
-            "metadata": { "name": "worker-2", "resourceVersion": "1" },
-            "spec": { "drivers": [{"name": "csi.io", "nodeID": "worker-2"}] },
-            "status": {}
-        });
-        let key = "/registry/storage.k8s.io/csinodes/worker-2";
-        store
-            .put(
-                key,
-                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let patch = serde_json::json!({"status": {"phase": "Ready"}});
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/merge-patch+json"),
-        );
-
-        let result = patch_resource_status(
-            axum::extract::State(state),
-            axum::extract::Path((
-                "storage.k8s.io".into(),
-                "v1".into(),
-                "csinodes".into(),
-                "worker-2".into(),
-            )),
-            headers,
-            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
-        )
-        .await;
-
-        assert!(result.is_ok(), "patch_resource_status must succeed");
-
-        let stored = store.get(key).await.unwrap().unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
-        assert_eq!(
-            v["status"]["phase"], "Ready",
-            "status.phase must be set after merge-patch on /status"
-        );
-        assert_eq!(
-            v["spec"]["drivers"][0]["name"], "csi.io",
-            "spec must be unchanged after status PATCH"
-        );
-    }
-
     // -- json_patch_add: array insertion (non-dash index) and out-of-bounds --
 
     /// json_patch_add with a numeric index inserts at the correct position.
@@ -4731,7 +1050,6 @@ mod tests {
     #[test]
     fn json_patch_add_to_scalar_returns_422() {
         let mut obj = serde_json::json!({"num": 42});
-        // Try to add a child of a scalar value — not possible.
         let patch = serde_json::json!([{"op": "add", "path": "/num/child", "value": "x"}]);
         let err = apply_json_patch(&mut obj, &patch).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
@@ -4761,7 +1079,6 @@ mod tests {
     #[test]
     fn json_patch_set_to_scalar_parent_returns_422() {
         let mut obj = serde_json::json!({"num": 42});
-        // Try to replace a child of a scalar.
         let patch = serde_json::json!([{"op": "replace", "path": "/num/child", "value": "x"}]);
         let err = apply_json_patch(&mut obj, &patch).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
@@ -4811,7 +1128,6 @@ mod tests {
     #[test]
     fn apply_json_patch_missing_op_field_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
-        // No "op" key in the operation object.
         let patch = serde_json::json!([{"path": "/a", "value": 2}]);
         let err = apply_json_patch(&mut obj, &patch).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
@@ -4863,8 +1179,6 @@ mod resolve_name_tests {
     }
 
     /// resolve_name returns the explicit name when metadata.name is set.
-    /// The name field on the URL must match the body; without this, create handlers
-    /// would silently use a different key than the caller intended.
     #[test]
     fn resolve_name_returns_explicit_name() {
         let mut obj = make_obj(serde_json::json!({ "metadata": { "name": "my-pod" } }));
@@ -4875,8 +1189,6 @@ mod resolve_name_tests {
     }
 
     /// resolve_name generates a name when only generateName is set.
-    /// Without generateName support, `kubectl run` and controller-created pods would fail
-    /// with "metadata.name or metadata.generateName is required".
     #[test]
     fn resolve_name_generates_when_generate_name_set() {
         let mut obj =
@@ -4895,7 +1207,6 @@ mod resolve_name_tests {
     }
 
     /// resolve_name fails with 400 when both name and generateName are absent.
-    /// Kubernetes API contract: every create request must identify the object.
     #[test]
     fn resolve_name_errors_when_both_name_and_generate_name_absent() {
         let mut obj = make_obj(serde_json::json!({ "metadata": {} }));
@@ -4904,134 +1215,15 @@ mod resolve_name_tests {
         assert_eq!(json["code"], 400, "must return 400 Bad Request");
     }
 
-    // -- Per-client watch concurrency limit --
-    //
-    // A single client must not be able to exhaust global watch capacity by opening
-    // more than MAX_WATCHES_PER_CLIENT concurrent streams. The (MAX+1)th attempt from
-    // the same user identity must receive HTTP 429 immediately, while a different
-    // user's watch must still succeed.
-
-    /// The (MAX_WATCHES_PER_CLIENT + 1)th watch from the same user returns 429.
-    /// Without this limit a single client could hold all 50 InflightLayer slots
-    /// indefinitely and deny service to every other user.
-    #[tokio::test]
-    async fn watch_limit_per_client_returns_429_on_overflow() {
-        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Exhaust this user's permit budget by acquiring permits directly.
-        // watch_generic acquires one permit per call; we simulate MAX open streams
-        // by holding permits from the semaphore.
-        let sem = state.watch_limit.semaphore_for("alice");
-        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
-            .map(|_| {
-                sem.clone()
-                    .try_acquire_owned()
-                    .expect("permit must be available")
-            })
-            .collect();
-
-        // The (MAX+1)th watch from "alice" must be rejected with 429.
-        let result = watch_generic(
-            state.clone(),
-            "/registry/test/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            0,
-            None,
-            None,
-            None,
-            false,
-            "alice".into(),
-        )
-        .await;
-
-        assert!(
-            result.is_err(),
-            "watch_generic must return Err(429) when the per-client limit is exhausted"
-        );
-        let err_resp: axum::response::Response = result.unwrap_err().into_response();
-        assert_eq!(
-            err_resp.status(),
-            axum::http::StatusCode::TOO_MANY_REQUESTS,
-            "must return HTTP 429 when per-client watch limit is exhausted, not silently queue"
-        );
-    }
-
-    /// A different user's watch succeeds even when another user has exhausted their quota.
-    /// The per-client semaphore is independent per username — one user's cap must not
-    /// affect another user's ability to watch.
-    #[tokio::test]
-    async fn watch_limit_does_not_affect_other_users() {
-        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
-        use std::sync::Arc;
-        use u7s_store::SqliteStore;
-
-        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
-        let state = AppState::new(
-            store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-        );
-
-        // Exhaust alice's permits.
-        let sem_alice = state.watch_limit.semaphore_for("alice");
-        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
-            .map(|_| {
-                sem_alice
-                    .clone()
-                    .try_acquire_owned()
-                    .expect("permit must be available")
-            })
-            .collect();
-
-        // bob's watch must succeed because bob has a separate semaphore.
-        let result = watch_generic(
-            state.clone(),
-            "/registry/test/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            0,
-            None,
-            None,
-            None,
-            false,
-            "bob".into(),
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "bob's watch must succeed even when alice has exhausted her per-client limit"
-        );
-    }
-
     // -- validate_name (path traversal regression) --
 
     /// A namespace value of "../../secrets" must return 400.
-    /// Without this check, a crafted request could escape the expected key prefix
-    /// in the SQLite store and read or overwrite arbitrary objects.
     #[test]
     fn validate_name_rejects_dotdot_traversal() {
         let err = validate_name("namespace", "../../secrets")
             .expect_err("path traversal must be rejected");
         let json = serde_json::to_value(&err.1).unwrap();
-        assert_eq!(
-            json["code"], 400,
-            "path traversal must return 400 Bad Request, not 200"
-        );
+        assert_eq!(json["code"], 400);
     }
 
     #[test]
@@ -5061,7 +1253,6 @@ mod resolve_name_tests {
 
 #[cfg(test)]
 mod escalation_tests {
-    use super::*;
     use axum::http::StatusCode;
     use std::sync::Arc;
     use u7s_store::SqliteStore;
@@ -5088,23 +1279,21 @@ mod escalation_tests {
 
     /// A user who can create ClusterRoleBindings but does NOT hold cluster-admin
     /// rules must receive 403 Forbidden when creating a CRB that references
-    /// cluster-admin. This is Kubernetes RBAC escalation prevention (v1.17+):
-    /// you cannot grant permissions you don't already have.
+    /// cluster-admin.
     #[tokio::test]
     async fn create_clusterrolebinding_denied_for_unprivileged_user() {
+        use super::super::resource::create_resource;
         let state = make_state();
         let group = "rbac.authorization.k8s.io";
         let version = "v1";
 
-        // Seed cluster-admin ClusterRole into the RBAC index.
         let admin_role = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "ClusterRole",
             "metadata": {"name": "cluster-admin"},
             "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
         });
-        // Use a privileged user to create the ClusterRole setup.
-        let admin_user = Extension(crate::auth::UserInfo {
+        let admin_user = axum::Extension(crate::auth::UserInfo {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
@@ -5123,7 +1312,6 @@ mod escalation_tests {
         .await
         .unwrap_or_else(|_| panic!("seeding cluster-admin ClusterRole must succeed"));
 
-        // Give "carol" only create on clusterrolebindings — NOT cluster-admin rules.
         let carol_role = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "ClusterRole",
@@ -5145,7 +1333,7 @@ mod escalation_tests {
                 "name": "crb-creator"
             }
         });
-        let admin_user2 = Extension(crate::auth::UserInfo {
+        let admin_user2 = axum::Extension(crate::auth::UserInfo {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
@@ -5177,9 +1365,6 @@ mod escalation_tests {
         .await
         .unwrap_or_else(|_| panic!("seeding carol's ClusterRoleBinding must succeed"));
 
-        // Now carol tries to create a CRB binding someone to cluster-admin.
-        // She has create on clusterrolebindings but NOT the cluster-admin rules.
-        // The escalation check must deny this with 403.
         let escalating_crb = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "ClusterRoleBinding",
@@ -5191,7 +1376,7 @@ mod escalation_tests {
                 "name": "cluster-admin"
             }
         });
-        let carol_user = Extension(crate::auth::UserInfo {
+        let carol_user = axum::Extension(crate::auth::UserInfo {
             username: "carol".into(),
             uid: String::new(),
             groups: vec![],
@@ -5209,40 +1394,31 @@ mod escalation_tests {
         )
         .await;
 
-        assert!(
-            result.is_err(),
-            "carol must be denied: she cannot grant cluster-admin rules she doesn't hold"
-        );
-        // Verify the error is a 403 Forbidden, not a different status code.
-        // A wrong code (e.g. 500) would indicate an implementation bug.
+        assert!(result.is_err());
         if let Err(err) = result {
             assert_eq!(
                 err.0,
                 StatusCode::FORBIDDEN,
-                "escalation attempt must return 403 Forbidden, not {}",
-                err.0
+                "escalation attempt must return 403 Forbidden"
             );
         }
     }
 
-    /// A system:masters user must be exempt from the escalation check and allowed
-    /// to create any ClusterRoleBinding regardless of the referenced role's rules.
-    /// system:masters is the cluster bootstrapper identity — blocking it would
-    /// make initial cluster setup impossible.
+    /// A system:masters user must be exempt from the escalation check.
     #[tokio::test]
     async fn create_clusterrolebinding_allowed_for_system_masters() {
+        use super::super::resource::create_resource;
         let state = make_state();
         let group = "rbac.authorization.k8s.io";
         let version = "v1";
 
-        // Seed cluster-admin ClusterRole.
         let admin_role = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "ClusterRole",
             "metadata": {"name": "cluster-admin"},
             "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
         });
-        let admin_user = Extension(crate::auth::UserInfo {
+        let admin_user = axum::Extension(crate::auth::UserInfo {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
@@ -5261,7 +1437,6 @@ mod escalation_tests {
         .await
         .unwrap_or_else(|_| panic!("seeding cluster-admin ClusterRole must succeed"));
 
-        // system:masters user creates a CRB binding to cluster-admin — must succeed.
         let crb = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "ClusterRoleBinding",
@@ -5288,7 +1463,7 @@ mod escalation_tests {
 
         assert!(
             result.is_ok(),
-            "system:masters must always pass the escalation check and be allowed to create any CRB"
+            "system:masters must always pass the escalation check"
         );
     }
 }

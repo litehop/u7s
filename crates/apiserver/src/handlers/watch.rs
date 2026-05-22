@@ -1,0 +1,850 @@
+use axum::{body::Body, http::StatusCode, response::Response};
+use bytes::Bytes;
+use u7s_store::{ListOptions, Store, WatchEvent};
+
+use crate::{state::AppState, status::Status};
+
+/// Serialise a single watch event to NDJSON bytes (including trailing newline).
+/// Returns None on Compacted — the caller should close the stream.
+/// Returns None on corrupt object bytes (invalid UTF-8) — the event is skipped,
+/// a warning is logged, and the stream continues. Emitting null would send invalid
+/// data to Kubernetes clients that may panic or behave incorrectly.
+pub(crate) fn encode_watch_event(
+    event: &WatchEvent,
+    api_version: &str,
+    kind: &str,
+) -> Option<Bytes> {
+    let line = match event {
+        WatchEvent::Added(obj) => {
+            let object_json = match std::str::from_utf8(&obj.value) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("watch ADDED event has invalid UTF-8, skipping: {e}");
+                    return None;
+                }
+            };
+            format!("{{\"type\":\"ADDED\",\"object\":{object_json}}}\n")
+        }
+        WatchEvent::Modified(obj) => {
+            let object_json = match std::str::from_utf8(&obj.value) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("watch MODIFIED event has invalid UTF-8, skipping: {e}");
+                    return None;
+                }
+            };
+            format!("{{\"type\":\"MODIFIED\",\"object\":{object_json}}}\n")
+        }
+        WatchEvent::Deleted { key, revision } => {
+            // Reconstruct a minimal tombstone object from the store key.
+            let (name, namespace) = parse_key_name_ns(key);
+            let object = if namespace.is_empty() {
+                serde_json::json!({
+                    "apiVersion": api_version,
+                    "kind": kind,
+                    "metadata": { "name": name, "resourceVersion": revision.to_string() }
+                })
+            } else {
+                serde_json::json!({
+                    "apiVersion": api_version,
+                    "kind": kind,
+                    "metadata": {
+                        "name": name,
+                        "namespace": namespace,
+                        "resourceVersion": revision.to_string()
+                    }
+                })
+            };
+            format!(
+                "{{\"type\":\"DELETED\",\"object\":{}}}\n",
+                serde_json::to_string(&object).unwrap_or_default()
+            )
+        }
+        WatchEvent::Bookmark { revision } => {
+            format!(
+                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{revision}\"}}}}}}\n"
+            )
+        }
+        WatchEvent::Compacted { .. } => return None,
+    };
+    Some(Bytes::from(line))
+}
+
+/// Parse the last two path segments of a store key as (name, namespace).
+/// Key format: /registry/<resource>/<namespace>/<name>  (namespaced)
+///         or: /registry/<group>/<plural>/<name>        (cluster-scoped)
+/// We only need the final segment as name; second-to-last as namespace (may be empty).
+pub(crate) fn parse_key_name_ns(key: &str) -> (&str, &str) {
+    let parts: Vec<&str> = key.rsplitn(3, '/').collect();
+    match parts.as_slice() {
+        [name, namespace, ..] => (name, namespace),
+        [name] => (name, ""),
+        _ => ("", ""),
+    }
+}
+
+/// Fetch the initial items for sendInitialEvents watch protocol.
+///
+/// When `send_initial_events` is true, lists all objects under `prefix` and returns
+/// them as ADDED events before the live watch stream, followed by a BOOKMARK with
+/// `k8s.io/initial-events-end=true`. This implements the Kubernetes 1.27+ informer
+/// startup protocol used by kubelet and controller-manager.
+///
+/// Returns `None` when `send_initial_events` is false (caller uses normal watch).
+pub(crate) async fn fetch_initial_events(
+    state: &AppState,
+    prefix: &str,
+    send_initial_events: bool,
+) -> Result<Option<(Vec<serde_json::Value>, u64)>, crate::status::StatusError> {
+    if !send_initial_events {
+        return Ok(None);
+    }
+    let resp = state
+        .store
+        .list(prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let items: Vec<serde_json::Value> = resp
+        .items
+        .iter()
+        .filter_map(|o| serde_json::from_slice(&o.value).ok())
+        .collect();
+    Ok(Some((items, resp.revision)))
+}
+
+/// Test whether a JSON object matches a label selector string (`key=value,...`).
+/// Returns true if the selector is empty (pass-through) or all pairs match
+/// `metadata.labels` in the object. Used to filter live watch events.
+pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &str) -> bool {
+    if selector.is_empty() {
+        return true;
+    }
+    let labels = &obj["metadata"]["labels"];
+    for part in selector.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Only equality selectors are supported; skip malformed terms (conservative: pass through).
+        if let Some(eq_pos) = part.find('=') {
+            let key = part[..eq_pos].trim();
+            let val = part[eq_pos + 1..].trim();
+            if key.is_empty() {
+                continue;
+            }
+            if labels.get(key).and_then(|v| v.as_str()) != Some(val) {
+                return false;
+            }
+        }
+        // Unknown/malformed term: ignore (conservative, don't drop events).
+    }
+    true
+}
+
+/// Test whether a JSON object matches a field selector string (`key=value,...` or `key!=value,...`).
+/// Supports `metadata.name`, `metadata.namespace` (equality only), and `spec.nodeName`
+/// (equality and inequality). Returns true if the selector is empty (pass-through) or all
+/// terms match. Unknown fields are ignored (conservative: don't drop events on unrecognised fields).
+pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &str) -> bool {
+    if selector.is_empty() {
+        return true;
+    }
+    for part in selector.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Check for inequality (`!=`) before equality (`=`) to avoid misparse.
+        if let Some((field, value)) = part.split_once("!=") {
+            let field = field.trim();
+            let value = value.trim();
+            if field == "spec.nodeName" {
+                let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
+                if node_name == value {
+                    return false;
+                }
+            }
+            // Unknown fields: ignore (conservative).
+        } else if let Some((field, value)) = part.split_once('=') {
+            let field = field.trim();
+            let value = value.trim();
+            match field {
+                "metadata.name" => {
+                    let name = obj["metadata"]["name"].as_str().unwrap_or("");
+                    if name != value {
+                        return false;
+                    }
+                }
+                "metadata.namespace" => {
+                    let ns = obj["metadata"]["namespace"].as_str().unwrap_or("");
+                    if ns != value {
+                        return false;
+                    }
+                }
+                "spec.nodeName" => {
+                    let node_name = obj["spec"]["nodeName"].as_str().unwrap_or("");
+                    if node_name != value {
+                        return false;
+                    }
+                }
+                // Unknown fields: ignore (conservative).
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+/// Stream watch events for a given store prefix in NDJSON format.
+/// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
+///
+/// When `initial_items` is Some, those items are emitted as ADDED events first
+/// (implementing the Kubernetes 1.27+ sendInitialEvents protocol), followed by a
+/// BOOKMARK, before streaming live changes from `from_revision`.
+///
+/// `username` is the authenticated client identity used to enforce the per-client
+/// watch stream concurrency limit (MAX_WATCHES_PER_CLIENT). Exceeding the limit
+/// returns HTTP 429 immediately without opening a watch stream.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn watch_generic(
+    state: AppState,
+    prefix: String,
+    api_version: String,
+    kind: String,
+    from_revision: u64,
+    initial_items: Option<(Vec<serde_json::Value>, u64)>,
+    label_selector: Option<String>,
+    field_selector: Option<String>,
+    allow_watch_bookmarks: bool,
+    username: String,
+) -> Result<Response, crate::status::StatusError> {
+    // Enforce per-client watch concurrency limit. Try to acquire a permit from
+    // this user's semaphore. If the semaphore is exhausted (client already has
+    // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
+    let sem = state.watch_limit.semaphore_for(&username);
+    let _watch_permit = sem.try_acquire_owned().map_err(|_| {
+        crate::status::Status::too_many_requests(format!(
+            "watch limit exceeded for user \"{username}\": maximum {} concurrent watch streams",
+            crate::state::MAX_WATCHES_PER_CLIENT
+        ))
+    })?;
+    // _watch_permit is held for the duration of the watch stream and released when
+    // this function returns (RAII drop).
+
+    // Check compaction horizon BEFORE committing headers so clients get a synchronous HTTP 410.
+    // If from_rv > 0 and below the horizon, the revision is expired — return 410 immediately.
+    if from_revision > 0 {
+        let horizon = state.store.compaction_horizon();
+        if from_revision < horizon {
+            return Err(Status::expired(format!(
+                "too old resource version: {from_revision} (current compaction horizon: {horizon})"
+            )));
+        }
+    }
+
+    let event_stream = state
+        .store
+        .watch(&prefix, from_revision)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let label_selector = label_selector.unwrap_or_default();
+    let field_selector = field_selector.unwrap_or_default();
+    let chunk_stream = async_stream::stream! {
+        use futures_core::Stream;
+        use std::pin::pin;
+        use tokio::time::{Duration, interval, sleep};
+
+        let mut event_stream = pin!(event_stream);
+        let mut bookmark_tick = interval(Duration::from_secs(60));
+        bookmark_tick.tick().await; // skip initial immediate tick
+
+        let mut max_duration = pin!(sleep(Duration::from_secs(5 * 60)));
+        let mut last_rv: u64 = from_revision;
+
+        // sendInitialEvents: emit existing objects as ADDED, then BOOKMARK.
+        if let Some((items, list_rv)) = initial_items {
+            last_rv = last_rv.max(list_rv);
+            for item in items {
+                let line = format!(
+                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
+                    serde_json::to_string(&item).unwrap_or_default()
+                );
+                yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
+            }
+            let bookmark = format!(
+                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
+            );
+            yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+        }
+
+        loop {
+            tokio::select! {
+                biased;
+
+                maybe_event = {
+                    use std::future::poll_fn;
+                    poll_fn(|cx| {
+                        use std::task::Poll;
+                        match event_stream.as_mut().poll_next(cx) {
+                            Poll::Ready(v) => Poll::Ready(v),
+                            Poll::Pending => Poll::Pending,
+                        }
+                    })
+                } => {
+                    match maybe_event {
+                        None => break,
+                        Some(event) => {
+                            match &event {
+                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
+                                    last_rv = last_rv.max(obj.revision);
+                                }
+                                WatchEvent::Deleted { revision, .. } => {
+                                    last_rv = last_rv.max(*revision);
+                                }
+                                WatchEvent::Bookmark { revision } => {
+                                    last_rv = last_rv.max(*revision);
+                                }
+                                WatchEvent::Compacted { .. } => {}
+                            }
+
+                            bookmark_tick.reset();
+
+                            if let WatchEvent::Compacted { horizon, .. } = &event {
+                                // Use horizon (not last_rv) so clients relist from a revision
+                                // the store still holds. last_rv may predate the horizon and
+                                // cause an infinite relist loop.
+                                let error_line = Bytes::from(format!(
+                                    "{{\"type\":\"ERROR\",\"object\":{{\"apiVersion\":\"v1\",\"kind\":\"Status\",\"code\":410,\"message\":\"too old resource version\",\"reason\":\"Expired\",\"metadata\":{{\"resourceVersion\":\"{horizon}\"}}}}}}}}\n"
+                                ));
+                                yield Ok::<Bytes, axum::BoxError>(error_line);
+                                break;
+                            }
+
+                            // Apply labelSelector and fieldSelector: filter Added/Modified events.
+                            // Deleted events always pass through so clients can clean up.
+                            // Bookmark and Compacted are handled above.
+                            let skip = match &event {
+                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_slice(&obj.value)
+                                            .unwrap_or(serde_json::Value::Null);
+                                    !object_matches_label_selector(&parsed, &label_selector)
+                                        || !object_matches_field_selector(&parsed, &field_selector)
+                                }
+                                _ => false,
+                            };
+
+                            if !skip {
+                                if let Some(chunk) = encode_watch_event(&event, &api_version, &kind) {
+                                    yield Ok::<Bytes, axum::BoxError>(chunk);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                _ = bookmark_tick.tick() => {
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
+                }
+
+                _ = &mut max_duration => {
+                    if allow_watch_bookmarks {
+                        let bookmark = format!(
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                        );
+                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                    }
+                    break;
+                }
+            }
+        }
+    };
+
+    let body = Body::from_stream(chunk_stream);
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::TRANSFER_ENCODING, "chunked")
+        .body(body)
+        .expect("response builder never fails with these headers");
+
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::generic::apply_label_selector;
+    use super::*;
+    use u7s_store::WatchEvent;
+
+    // -- encode_watch_event: resourceVersion in ADDED events --
+
+    /// Conformance: watch ADDED event payloads must include a non-empty
+    /// metadata.resourceVersion. Kubernetes clients use this to track progress
+    /// through the watch stream and to issue subsequent watches from a known point.
+    /// A missing or empty resourceVersion causes clients to re-list indefinitely.
+    #[test]
+    fn encode_watch_event_added_includes_resource_version() {
+        // Simulate the object as stored by store.put(): bytes already have
+        // metadata.resourceVersion stamped by stamp_resource_version().
+        let obj_json = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "my-cm",
+                "namespace": "default",
+                "resourceVersion": "42"
+            }
+        });
+        let value = bytes::Bytes::from(serde_json::to_vec(&obj_json).unwrap());
+        let event = WatchEvent::Added(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/my-cm".into(),
+            value,
+            revision: 42,
+        });
+
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
+            .expect("ADDED event must produce a chunk");
+
+        let line = std::str::from_utf8(&chunk).unwrap().trim_end();
+        let decoded: serde_json::Value =
+            serde_json::from_str(line).expect("chunk must be valid JSON");
+
+        assert_eq!(decoded["type"], "ADDED", "event type must be ADDED");
+
+        let rv = decoded["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !rv.is_empty(),
+            "object.metadata.resourceVersion must be non-empty in ADDED event; \
+             Kubernetes watch clients cannot track progress without it"
+        );
+        assert_eq!(
+            rv, "42",
+            "resourceVersion must match the value stamped by store.put()"
+        );
+    }
+
+    /// Mirror of the ADDED test for MODIFIED events: same conformance requirement.
+    #[test]
+    fn encode_watch_event_modified_includes_resource_version() {
+        let obj_json = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "my-cm",
+                "namespace": "default",
+                "resourceVersion": "99"
+            }
+        });
+        let value = bytes::Bytes::from(serde_json::to_vec(&obj_json).unwrap());
+        let event = WatchEvent::Modified(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/my-cm".into(),
+            value,
+            revision: 99,
+        });
+
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
+            .expect("MODIFIED event must produce a chunk");
+
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
+
+        assert_eq!(decoded["type"], "MODIFIED");
+        let rv = decoded["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            !rv.is_empty(),
+            "object.metadata.resourceVersion must be non-empty in MODIFIED event"
+        );
+        assert_eq!(rv, "99");
+    }
+
+    /// Regression guard: if encode_watch_event ever strips metadata.resourceVersion
+    /// (e.g. by rebuilding the object from scratch), this test must fail.
+    #[test]
+    fn encode_watch_event_added_without_resource_version_in_blob_yields_empty() {
+        // Object stored WITHOUT resourceVersion (should not happen in practice,
+        // but verifies the test is sensitive to presence/absence of the field).
+        let obj_json = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "bare" }
+        });
+        let value = bytes::Bytes::from(serde_json::to_vec(&obj_json).unwrap());
+        let event = WatchEvent::Added(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/bare".into(),
+            value,
+            revision: 7,
+        });
+
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap").unwrap();
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
+
+        // This asserts the negative: if stamp_resource_version is NOT called, the field is absent.
+        // The fact that the two tests above pass (with rv="42"/"99") proves encode_watch_event
+        // does NOT inject the field itself — it relies entirely on store.put() to stamp it.
+        let rv = decoded["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            rv.is_empty(),
+            "without stamping, resourceVersion must be absent — \
+             encode_watch_event must not synthesize it from StoreObject.revision"
+        );
+    }
+
+    /// Regression: encode_watch_event must skip (return None) for ADDED events whose
+    /// stored bytes are not valid UTF-8, rather than emitting {"type":"ADDED","object":null}.
+    ///
+    /// Kubernetes clients (controller-runtime, client-go) do not expect null objects in
+    /// watch streams and may panic or enter a bad state when they receive one. A corrupt
+    /// store entry must not propagate to clients; the stream must continue for subsequent
+    /// valid events.
+    #[test]
+    fn encode_watch_event_added_with_invalid_utf8_is_skipped() {
+        let corrupt_bytes = bytes::Bytes::from(vec![0xFF, 0xFE, 0x00]);
+        let event = WatchEvent::Added(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/corrupt".into(),
+            value: corrupt_bytes,
+            revision: 1,
+        });
+
+        let result = encode_watch_event(&event, "v1", "ConfigMap");
+
+        assert!(
+            result.is_none(),
+            "encode_watch_event must skip (return None) for ADDED events with invalid UTF-8, \
+             not emit {{\"type\":\"ADDED\",\"object\":null}} which breaks Kubernetes watch clients"
+        );
+    }
+
+    /// Regression: same as above but for MODIFIED events.
+    #[test]
+    fn encode_watch_event_modified_with_invalid_utf8_is_skipped() {
+        let corrupt_bytes = bytes::Bytes::from(vec![0xFF, 0xFE]);
+        let event = WatchEvent::Modified(u7s_store::StoreObject {
+            key: "/registry/configmaps/default/corrupt".into(),
+            value: corrupt_bytes,
+            revision: 2,
+        });
+
+        let result = encode_watch_event(&event, "v1", "ConfigMap");
+
+        assert!(
+            result.is_none(),
+            "encode_watch_event must skip (return None) for MODIFIED events with invalid UTF-8, \
+             not emit {{\"type\":\"MODIFIED\",\"object\":null}} which breaks Kubernetes watch clients"
+        );
+    }
+
+    /// Verify the BOOKMARK for sendInitialEvents is constructed correctly.
+    #[test]
+    fn watch_generic_send_initial_events_bookmark_is_first_ndjson_line() {
+        let api_version = "storage.k8s.io/v1";
+        let kind = "CSINode";
+        let last_rv: u64 = 0;
+
+        // This is exactly how watch_generic constructs the BOOKMARK.
+        let bookmark = format!(
+            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
+        );
+
+        let decoded: serde_json::Value =
+            serde_json::from_str(bookmark.trim_end()).expect("BOOKMARK line must be valid JSON");
+
+        assert_eq!(
+            decoded["type"], "BOOKMARK",
+            "initial-events-end event must be type BOOKMARK"
+        );
+        assert_eq!(
+            decoded["object"]["apiVersion"], api_version,
+            "BOOKMARK must include correct apiVersion"
+        );
+        assert_eq!(
+            decoded["object"]["kind"], kind,
+            "BOOKMARK must include correct kind"
+        );
+        assert_eq!(
+            decoded["object"]["metadata"]["resourceVersion"], "0",
+            "BOOKMARK must include resourceVersion"
+        );
+        assert_eq!(
+            decoded["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"], "true",
+            "BOOKMARK must carry k8s.io/initial-events-end=true; \
+             without it kubelet's informer never exits the list phase and times out"
+        );
+    }
+
+    /// Regression test for mayor-e8fx: when a client opens a watch with a resourceVersion
+    /// below the compaction horizon, watch_generic must return HTTP 410 BEFORE committing
+    /// headers.
+    #[tokio::test]
+    async fn watch_generic_returns_410_before_streaming_for_expired_rv() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        store.set_compaction_horizon_for_test(50);
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = watch_generic(
+            state,
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            10, // expired
+            None,
+            None,
+            None,
+            false,
+            "test-user".into(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "watch_generic must return Err(410) for expired resourceVersion, \
+             not Ok(streaming 200) — clients cannot detect failure from a stream header"
+        );
+        use axum::response::IntoResponse;
+        let err_resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(
+            err_resp.status(),
+            axum::http::StatusCode::GONE,
+            "HTTP 410 Gone must be returned synchronously so clients can retry without \
+             waiting for the stream body"
+        );
+    }
+
+    /// watch_generic with from_revision=0 (full watch) must NOT trigger the 410 check.
+    #[tokio::test]
+    async fn watch_generic_rv_zero_does_not_trigger_410() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        store.set_compaction_horizon_for_test(50);
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = watch_generic(
+            state,
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0, // not expired
+            None,
+            None,
+            None,
+            false,
+            "test-user".into(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "rv=0 (full watch) must not trigger the 410 expiry check, \
+             even when a compaction horizon exists"
+        );
+    }
+
+    /// When Compacted fires, the 410 ERROR's metadata.resourceVersion must be the
+    /// horizon, not last_rv.
+    #[test]
+    fn watch_410_error_uses_compaction_horizon_not_last_rv() {
+        let horizon: u64 = 500;
+        let obj = serde_json::json!({
+            "type": "ERROR",
+            "object": {
+                "apiVersion": "v1",
+                "kind": "Status",
+                "code": 410,
+                "message": "too old resource version",
+                "reason": "Expired",
+                "metadata": {"resourceVersion": horizon.to_string()}
+            }
+        });
+        let rv = obj["object"]["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            rv, "500",
+            "410 ERROR must carry horizon as resourceVersion so clients relist from \
+             a valid point, not from last_rv which may predate the compaction horizon"
+        );
+    }
+
+    /// The (MAX_WATCHES_PER_CLIENT + 1)th watch from the same user returns 429.
+    #[tokio::test]
+    async fn watch_limit_per_client_returns_429_on_overflow() {
+        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let sem = state.watch_limit.semaphore_for("alice");
+        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
+            .map(|_| {
+                sem.clone()
+                    .try_acquire_owned()
+                    .expect("permit must be available")
+            })
+            .collect();
+
+        let result = watch_generic(
+            state.clone(),
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0,
+            None,
+            None,
+            None,
+            false,
+            "alice".into(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "watch_generic must return Err(429) when the per-client limit is exhausted"
+        );
+        use axum::response::IntoResponse;
+        let err_resp: axum::response::Response = result.unwrap_err().into_response();
+        assert_eq!(
+            err_resp.status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "must return HTTP 429 when per-client watch limit is exhausted, not silently queue"
+        );
+    }
+
+    /// A different user's watch succeeds even when another user has exhausted their quota.
+    #[tokio::test]
+    async fn watch_limit_does_not_affect_other_users() {
+        use crate::state::{AppState, MAX_WATCHES_PER_CLIENT};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let sem_alice = state.watch_limit.semaphore_for("alice");
+        let _permits: Vec<_> = (0..MAX_WATCHES_PER_CLIENT)
+            .map(|_| {
+                sem_alice
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("permit must be available")
+            })
+            .collect();
+
+        let result = watch_generic(
+            state.clone(),
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0,
+            None,
+            None,
+            None,
+            false,
+            "bob".into(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "bob's watch must succeed even when alice has exhausted her per-client limit"
+        );
+    }
+
+    // -- object_matches_label_selector / object_matches_field_selector tests --
+
+    fn item_with_labels(labels: &[(&str, &str)]) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        for (k, v) in labels {
+            map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+        }
+        serde_json::json!({ "metadata": { "labels": map } })
+    }
+
+    #[test]
+    fn filter_matches_all_present_labels() {
+        let items = vec![
+            item_with_labels(&[("app", "frontend"), ("env", "prod")]),
+            item_with_labels(&[("app", "backend"), ("env", "prod")]),
+        ];
+        let pairs = vec![("app", "frontend"), ("env", "prod")];
+        let result = apply_label_selector(items, &pairs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["metadata"]["labels"]["app"], "frontend");
+    }
+
+    #[test]
+    fn filter_removes_items_missing_label() {
+        let items = vec![
+            item_with_labels(&[("app", "frontend")]),
+            item_with_labels(&[]),
+        ];
+        let pairs = vec![("app", "frontend")];
+        let result = apply_label_selector(items, &pairs);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn filter_empty_pairs_returns_all() {
+        let items = vec![
+            item_with_labels(&[("a", "1")]),
+            item_with_labels(&[("b", "2")]),
+        ];
+        let result = apply_label_selector(items, &[]);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn filter_no_match_returns_empty() {
+        let items = vec![item_with_labels(&[("app", "backend")])];
+        let pairs = vec![("app", "frontend")];
+        let result = apply_label_selector(items, &pairs);
+        assert!(result.is_empty());
+    }
+}
