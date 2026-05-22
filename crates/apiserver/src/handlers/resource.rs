@@ -8,6 +8,7 @@ use bytes::Bytes;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext};
+use crate::{limit_range, quota};
 
 use crate::{
     auth::UserInfo,
@@ -713,6 +714,12 @@ pub async fn create_namespaced_resource(
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+
+    // LimitRange: inject defaults then validate min/max bounds (pods only).
+    obj.body = limit_range::apply_limit_ranges(&state, obj.body, &ns, &plural).await?;
+
+    // ResourceQuota: ensure object count does not exceed hard limits.
+    quota::check_resource_quota(&state, &ns, &group, &plural).await?;
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
