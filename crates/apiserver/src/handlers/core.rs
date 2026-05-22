@@ -17,14 +17,19 @@ use u7s_store::{ListOptions, Store};
 use crate::{auth::UserInfo, state::AppState, status::Status};
 
 use super::generic::{
-    apply_label_selector, build_list_response, create_namespaced_resource, create_resource,
-    decode_continue, delete_namespaced_resource, delete_resource, fetch_initial_events,
-    get_namespaced_resource, get_namespaced_resource_status, get_resource, get_resource_status,
-    list_namespaced_resource, list_resource, parse_field_selector, parse_label_selector,
-    patch_namespaced_resource, patch_namespaced_resource_status, patch_resource,
-    patch_resource_status, put_namespaced_resource_status, put_resource_status,
-    replace_namespaced_resource, replace_resource, watch_generic, CollectionQuery,
+    apply_label_selector, build_list_response, decode_continue, parse_field_selector,
+    parse_label_selector, CollectionQuery,
 };
+use super::resource::{
+    create_namespaced_resource, create_resource, delete_namespaced_resource, delete_resource,
+    get_namespaced_resource, get_resource, list_namespaced_resource, list_resource,
+    patch_namespaced_resource, patch_resource, replace_namespaced_resource, replace_resource,
+};
+use super::status::{
+    get_namespaced_resource_status, get_resource_status, patch_namespaced_resource_status,
+    patch_resource_status, put_namespaced_resource_status, put_resource_status,
+};
+use super::watch::{fetch_initial_events, watch_generic};
 
 pub async fn core_list_resource(
     State(state): State<AppState>,

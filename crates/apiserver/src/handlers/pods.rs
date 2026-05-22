@@ -243,7 +243,7 @@ async fn watch_pods(
     allow_watch_bookmarks: bool,
     username: String,
 ) -> Result<Response, crate::status::StatusError> {
-    super::generic::watch_generic(
+    super::watch::watch_generic(
         state,
         prefix,
         "v1".into(),
@@ -495,7 +495,7 @@ mod watch_tests {
             serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx","resourceVersion":"5"}}),
         );
         let bytes =
-            crate::handlers::generic::encode_watch_event(&WatchEvent::Added(obj), "v1", "Pod")
+            crate::handlers::watch::encode_watch_event(&WatchEvent::Added(obj), "v1", "Pod")
                 .expect("should encode");
         let line = std::str::from_utf8(&bytes).unwrap();
         assert!(line.ends_with('\n'), "NDJSON must end with newline");
@@ -514,7 +514,7 @@ mod watch_tests {
             serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx","resourceVersion":"7"}}),
         );
         let bytes =
-            crate::handlers::generic::encode_watch_event(&WatchEvent::Modified(obj), "v1", "Pod")
+            crate::handlers::watch::encode_watch_event(&WatchEvent::Modified(obj), "v1", "Pod")
                 .expect("should encode");
         let parsed: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
@@ -525,7 +525,7 @@ mod watch_tests {
     /// The emitted object must contain name and namespace derived from the key.
     #[test]
     fn encode_deleted_reconstructs_metadata() {
-        let bytes = crate::handlers::generic::encode_watch_event(
+        let bytes = crate::handlers::watch::encode_watch_event(
             &WatchEvent::Deleted {
                 key: "/registry/pods/default/nginx".to_string(),
                 revision: 9,
@@ -545,7 +545,7 @@ mod watch_tests {
     /// encode_watch_event for Bookmark emits the correct structure.
     #[test]
     fn encode_bookmark() {
-        let bytes = crate::handlers::generic::encode_watch_event(
+        let bytes = crate::handlers::watch::encode_watch_event(
             &WatchEvent::Bookmark { revision: 42 },
             "v1",
             "Pod",
@@ -561,7 +561,7 @@ mod watch_tests {
     /// encode_watch_event for Compacted returns None — the caller must close the stream.
     #[test]
     fn encode_compacted_returns_none() {
-        let result = crate::handlers::generic::encode_watch_event(
+        let result = crate::handlers::watch::encode_watch_event(
             &WatchEvent::Compacted {
                 requested: 5,
                 horizon: 50,
@@ -602,8 +602,7 @@ mod watch_tests {
     /// parse_key_name_ns (shared via generic) correctly extracts name and namespace.
     #[test]
     fn parse_key_standard() {
-        let (name, ns) =
-            crate::handlers::generic::parse_key_name_ns("/registry/pods/default/nginx");
+        let (name, ns) = crate::handlers::watch::parse_key_name_ns("/registry/pods/default/nginx");
         assert_eq!(name, "nginx");
         assert_eq!(ns, "default");
     }
@@ -612,7 +611,7 @@ mod watch_tests {
     #[test]
     fn parse_key_custom_namespace() {
         let (name, ns) =
-            crate::handlers::generic::parse_key_name_ns("/registry/pods/kube-system/coredns");
+            crate::handlers::watch::parse_key_name_ns("/registry/pods/kube-system/coredns");
         assert_eq!(name, "coredns");
         assert_eq!(ns, "kube-system");
     }

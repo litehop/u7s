@@ -205,7 +205,7 @@ pub async fn list_crds(
     let prefix = list_prefix();
 
     if query.watch == Some(true) {
-        return super::generic::watch_generic(
+        return super::watch::watch_generic(
             state,
             prefix,
             API_VERSION.to_string(),

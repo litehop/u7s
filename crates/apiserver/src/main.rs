@@ -313,21 +313,21 @@ fn build_router(state: AppState) -> Router {
         // Generic cluster-scoped resources — collection
         .route(
             "/apis/{group}/{version}/{resource}",
-            get(handlers::generic::list_resource).post(handlers::generic::create_resource),
+            get(handlers::resource::list_resource).post(handlers::resource::create_resource),
         )
         // Generic cluster-scoped resources — named
         .route(
             "/apis/{group}/{version}/{resource}/{name}",
-            get(handlers::generic::get_resource)
-                .put(handlers::generic::replace_resource)
-                .delete(handlers::generic::delete_resource)
-                .patch(handlers::generic::patch_resource),
+            get(handlers::resource::get_resource)
+                .put(handlers::resource::replace_resource)
+                .delete(handlers::resource::delete_resource)
+                .patch(handlers::resource::patch_resource),
         )
         // Generic namespaced resources — collection
         .route(
             "/apis/{group}/{version}/namespaces/{ns}/{resource}",
-            get(handlers::generic::list_namespaced_resource)
-                .post(handlers::generic::create_namespaced_resource),
+            get(handlers::resource::list_namespaced_resource)
+                .post(handlers::resource::create_namespaced_resource),
         )
         // Scale subresource — apps/v1 workloads (deployments, replicasets, statefulsets)
         // Must be registered before the generic namespaced named-resource catch-all.
@@ -340,10 +340,10 @@ fn build_router(state: AppState) -> Router {
         // Generic namespaced resources — named
         .route(
             "/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}",
-            get(handlers::generic::get_namespaced_resource)
-                .put(handlers::generic::replace_namespaced_resource)
-                .delete(handlers::generic::delete_namespaced_resource)
-                .patch(handlers::generic::patch_namespaced_resource),
+            get(handlers::resource::get_namespaced_resource)
+                .put(handlers::resource::replace_namespaced_resource)
+                .delete(handlers::resource::delete_namespaced_resource)
+                .patch(handlers::resource::patch_namespaced_resource),
         )
         // Cluster-scoped status subresource — CR-aware handler falls through to
         // registry resources; generic GET/PATCH still handle non-CR resources.
@@ -351,14 +351,14 @@ fn build_router(state: AppState) -> Router {
             "/apis/{group}/{version}/{resource}/{name}/status",
             get(handlers::cr::get_cr_status)
                 .put(handlers::cr::put_cr_status)
-                .patch(handlers::generic::patch_resource_status),
+                .patch(handlers::status::patch_resource_status),
         )
         // Generic namespaced — status subresource
         .route(
             "/apis/{group}/{version}/namespaces/{ns}/{resource}/{name}/status",
-            get(handlers::generic::get_namespaced_resource_status)
-                .put(handlers::generic::put_namespaced_resource_status)
-                .patch(handlers::generic::patch_namespaced_resource_status),
+            get(handlers::status::get_namespaced_resource_status)
+                .put(handlers::status::put_namespaced_resource_status)
+                .patch(handlers::status::patch_namespaced_resource_status),
         )
         .with_state(state)
 }
@@ -1245,7 +1245,7 @@ mod tests {
         );
 
         // POST creates the CSINode — this is what the kubelet does on first boot.
-        let create_result = handlers::generic::create_resource(
+        let create_result = handlers::resource::create_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((
                 "storage.k8s.io".to_string(),
@@ -1267,7 +1267,7 @@ mod tests {
         );
 
         // GET retrieves the CSINode — kubelet later reads it to verify registration.
-        let get_result = handlers::generic::get_resource(
+        let get_result = handlers::resource::get_resource(
             axum::extract::State(state),
             axum::extract::Path((
                 "storage.k8s.io".to_string(),
