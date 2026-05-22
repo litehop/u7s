@@ -1,33 +1,36 @@
 # Dashboard
-2026-05-22 (session active — holding on feature dispatch per operator)
+2026-05-22 (session active — refactoring wave complete, CSR API next)
 `bd prime` in a fresh Claude Code session (or say "I am the Mayor now")
-Open beads: 3
+Open beads: 4
 
 ## What needs the operator now
 
-**Holding on feature work per operator instruction.**
-- **mayor-o2py (P2)** — CSR API (`certificates.k8s.io/v1`) CRUD + status write-back. New API surface — requires operator review before dispatch.
+- **mayor-o2py (P2)** — CSR API (`certificates.k8s.io/v1`). Generic handler confirmed sufficient. Testing must include rejection paths (malformed PEM, denial, OCC conflict). Awaiting explicit "go" to dispatch.
 - **mayor-suf0 (P2)** — kube-controller-manager smoke test. Blocked on mayor-o2py.
-- **mayor-2ni (P3)** — sonobuoy conformance audit (read-only). Operator has asked to hold on dispatch.
+- **mayor-2ni (P3)** — sonobuoy conformance audit. Operator asked to hold.
 
-Say the word when ready to proceed with any of the above.
+## In-flight work
 
-## In-flight
+None.
 
-Nothing running. No open PRs.
+## Forward look
 
-## Recent progress (this session)
+- Dispatch mayor-o2py (CSR API) once operator gives green-light.
+- Re-assess coverage on `handlers/generic.rs` and new sub-modules (`core.rs`, `json_patch.rs`) — smaller per-file targets now achievable.
+- After mayor-o2py lands: dispatch mayor-suf0 (kube-controller-manager smoke test).
 
-Coverage drive complete. 14 PRs merged (#131, #133, #135–#148), 13 beads closed.
+## Recent progress
 
-Key wins:
-- All apiserver handlers covered (authorization, namespaces, scale, generic, tokens, pods, cr)
-- Binary crates extracted to lib.rs: scheduler, controller-manager, mcp-server
-- CI/hook quality gates tightened: fmt check + clippy --tests added
-- Dead serializer.rs removed
-- scheduler/src/lib.rs: pure helpers extracted (parse_uri_parts, drain_watch_buffer, select_first_node), 25 tests
-- handlers/cr.rs: 27 tests added, 67%→78%F coverage
-- Overall workspace: 83.9%L / 79.9%F
+Refactoring wave complete (PRs #151–#153):
+- PR #151 (mayor-5vam): `tls.rs` dead code removed; 3 tests added (PEM encode, kubeconfig YAML, load-from-disk round-trip)
+- PR #152 (mayor-6huu): JSON Patch extracted to `handlers/json_patch.rs`; ~240 lines of verbatim duplication in `pods.rs` deleted
+- PR #153 (mayor-untj): `core_*` handler wrappers extracted to `handlers/core.rs` (328 lines); 5 helpers promoted to `pub(crate)`
+
+Bug fixes (PRs #149–#150):
+- PR #149 (mayor-f3ru): `encode_watch_event` skips corrupt events; JSON round-trip alloc eliminated
+- PR #150 (mayor-5yfc + mayor-q04t): `store_err_cr` returns 409 on `RevisionMismatch`; `build_list_response` made `pub(crate)`
+
+All P1 correctness bugs resolved. 19 PRs merged this session (#135–#153).
 
 ## Stance
 
