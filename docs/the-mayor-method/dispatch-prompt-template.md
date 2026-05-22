@@ -99,12 +99,29 @@ mayor tells you what to do.
 - Only restore specific known files after preservation. Do **not** use
   broad destructive reset commands.
 
+## Mayor pre-dispatch checklist (run BEFORE calling Agent)
+
+```bash
+# 1. Create the worktree
+git worktree add ai/worktrees/<name> -b worker/<name>
+# 2. Copy settings so the subagent inherits the permission allowlist
+mkdir -p ai/worktrees/<name>/.claude
+cp .claude/settings.json ai/worktrees/<name>/.claude/settings.json
+# 3. Verify clean
+git -C ai/worktrees/<name> status --short --branch
+```
+
+Workers block on their first Bash call if step 2 is skipped — the subagent
+launches from the mayor's CWD and never loads the worktree's settings.json.
+
 ## Common preamble (every dispatch)
 
 ```
 You are implementing bead **<BEAD_ID>** in <project description>.
 
 <include project stance obtained from operator>
+
+You have full permission to use all tools: Bash, Read, Edit, Write, Glob, Grep. Proceed without asking for permission — do not ask, just act.
 ```
 
 ## Worktree path convention
@@ -146,15 +163,19 @@ created by the `WorktreeCreate` hook in `scripts/create-worktree.sh`.
 
 ## Process
 
-1. Worktree off origin/main at
-   `<WORKTREE_ROOT>/<descriptive>-<BEAD_ID>`
-   with branch `worker/<descriptive>-<BEAD_ID>`.
-   Do NOT use `.claude/worktrees/`.
-2. Include worktree-boundary block (see Constraints).
-3. `bd update <BEAD_ID> --claim` then `bd update <BEAD_ID> --status=in_progress`.
-4. Implement.
-5. Run quality gates: `<exact commands>`.
-6. Push branch + `gh pr create` with title `<scope>(<artefact>): <summary> (<BEAD_ID>)`.
+**Your worktree is already created by the mayor at `<WORKTREE_ROOT>/<descriptive>-<BEAD_ID>`, branch `worker/<descriptive>-<BEAD_ID>`.**
+
+Step 0 — verify and enter:
+```bash
+cd /Users/balint.erdos/u7s/ai/worktrees/<descriptive>-<BEAD_ID>
+pwd; git rev-parse --show-toplevel; git branch --show-current
+```
+Only proceed if show-toplevel prints `/Users/balint.erdos/u7s/ai/worktrees/<descriptive>-<BEAD_ID>`.
+
+1. `bd update <BEAD_ID> --claim` then `bd update <BEAD_ID> --status=in_progress`.
+2. Implement.
+3. Run quality gates: `<exact commands>`.
+4. Push branch + `gh pr create` with title `<scope>(<artefact>): <summary> (<BEAD_ID>)`.
 
 ## Return
 
@@ -186,14 +207,19 @@ N. **<BEAD_ID-N> (P1 BUG)** — <one-line + concrete fix sketch + regression tes
 
 ## Process
 
-1. Worktree at
-   `<WORKTREE_ROOT>/<cluster-name>-<HEAD_BEAD_ID>`
-   with branch `worker/<cluster-name>-<HEAD_BEAD_ID>`.
-2. Include worktree-boundary block.
-3. For each bead: `bd update <BEAD_ID> --claim` + `--status=in_progress`
+**Your worktree is already created by the mayor at `<WORKTREE_ROOT>/<cluster-name>-<HEAD_BEAD_ID>`, branch `worker/<cluster-name>-<HEAD_BEAD_ID>`.**
+
+Step 0 — verify and enter:
+```bash
+cd /Users/balint.erdos/u7s/ai/worktrees/<cluster-name>-<HEAD_BEAD_ID>
+pwd; git rev-parse --show-toplevel; git branch --show-current
+```
+Only proceed if show-toplevel prints `/Users/balint.erdos/u7s/ai/worktrees/<cluster-name>-<HEAD_BEAD_ID>`.
+
+1. For each bead: `bd update <BEAD_ID> --claim` + `--status=in_progress`
    BEFORE that bead's commit.
-4. Run quality gates after EACH commit. After ALL: full regression.
-5. Push + `gh pr create` with title
+2. Run quality gates after EACH commit. After ALL: full regression.
+3. Push + `gh pr create` with title
    `<scope>(<artefact>): <cluster name> (N beads incl. <P1 highlights>)`.
 
 ## Return
@@ -240,6 +266,15 @@ Read `<surface>` end-to-end and produce a findings report identifying:
 - <prior audit findings docs to avoid re-discovering>
 
 ## Process
+
+**Your worktree is already created by the mayor at `<WORKTREE_ROOT>/<surface>-audit-<BEAD_ID>`, branch `worker/<surface>-audit-<BEAD_ID>`.**
+
+Step 0 — verify and enter:
+```bash
+cd /Users/balint.erdos/u7s/ai/worktrees/<surface>-audit-<BEAD_ID>
+pwd; git rev-parse --show-toplevel; git branch --show-current
+```
+Only proceed if show-toplevel prints `/Users/balint.erdos/u7s/ai/worktrees/<surface>-audit-<BEAD_ID>`.
 
 1. Worktree at
    `<WORKTREE_ROOT>/<surface>-audit-<BEAD_ID>`
