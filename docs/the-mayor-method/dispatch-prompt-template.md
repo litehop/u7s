@@ -102,19 +102,15 @@ mayor tells you what to do.
 ## Mayor pre-dispatch checklist (run BEFORE calling Agent)
 
 ```bash
-# 1. Create the worktree
+# 1. Create the worktree (settings.json is already present — it's tracked in git)
 git worktree add ai/worktrees/<name> -b worker/<name>
-# 2. Copy settings AND agents dir — both are required
-mkdir -p ai/worktrees/<name>/.claude/agents
-cp .claude/settings.json ai/worktrees/<name>/.claude/settings.json
-cp -r .claude/agents/ ai/worktrees/<name>/.claude/agents/
-# 3. Verify clean
+# 2. Verify clean
 git -C ai/worktrees/<name> status --short --branch
 ```
 
-**Both files are required.** Without `settings.json` the allowlist is missing.
-Without `agents/worker.md` the subagent spawns without `permissionMode:auto`
-and blocks on its first Bash call regardless of what the prompt says.
+No file copying needed: `settings.json` is tracked in git and present in every
+fresh worktree. `agents/worker.md` is loaded from the mayor's `.claude/agents/`
+by the harness, not from the worktree.
 
 ## Common preamble (every dispatch)
 
@@ -122,8 +118,6 @@ and blocks on its first Bash call regardless of what the prompt says.
 You are implementing bead **<BEAD_ID>** in <project description>.
 
 <include project stance obtained from operator>
-
-You have full permission to use all tools: Bash, Read, Edit, Write, Glob, Grep. Proceed without asking for permission — do not ask, just act.
 ```
 
 ## Worktree path convention
@@ -136,10 +130,9 @@ Per project policy, worker worktrees live under:
 
 Not `.claude/worktrees/agent-*` (forbidden — leaks edits to mayor checkout
 via tool-path-resolution quirks; see "Worktree boundary" above).
-Not a sibling directory outside the repo (workers would not inherit
-`.claude/settings.json` and would hit permission prompts on every tool call).
-For this project the correct root is `<MAYOR_CHECKOUT>/ai/worktrees/`,
-created by the `WorktreeCreate` hook in `scripts/create-worktree.sh`.
+Not a sibling directory outside the repo (`.claude/settings.json` is tracked
+in git and present in any worktree inside the repo — no copying needed).
+For this project the correct root is `<MAYOR_CHECKOUT>/ai/worktrees/`.
 
 ---
 
@@ -167,12 +160,14 @@ created by the `WorktreeCreate` hook in `scripts/create-worktree.sh`.
 
 **Your worktree is already created by the mayor at `<WORKTREE_ROOT>/<descriptive>-<BEAD_ID>`, branch `worker/<descriptive>-<BEAD_ID>`.**
 
-Step 0 — verify and enter:
+Step 0 — verify (do NOT start with `cd` — it is not in the Bash allowlist and will be denied):
 ```bash
-cd /Users/balint.erdos/u7s/ai/worktrees/<descriptive>-<BEAD_ID>
-pwd; git rev-parse --show-toplevel; git branch --show-current
+git -C <ASSIGNED_WORKTREE> rev-parse --show-toplevel
+git -C <ASSIGNED_WORKTREE> branch --show-current
+git -C <ASSIGNED_WORKTREE> status --short
 ```
-Only proceed if show-toplevel prints `/Users/balint.erdos/u7s/ai/worktrees/<descriptive>-<BEAD_ID>`.
+Only proceed if `rev-parse --show-toplevel` prints exactly `<ASSIGNED_WORKTREE>`.
+You may `cd` into the worktree after these pass — but not as your first command.
 
 1. `bd update <BEAD_ID> --claim` then `bd update <BEAD_ID> --status=in_progress`.
 2. Implement.
