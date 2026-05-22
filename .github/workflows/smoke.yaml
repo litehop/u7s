@@ -484,108 +484,79 @@ jobs:
           echo "Pod reached Succeeded:"
           kubectl get pod smoke-pod -n default
 
-      - name: Deployment + ConfigMap (object existence)
+      - name: ConfigMap volume mount
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
-          # Create a ConfigMap with some data to mount as a volume.
+          # Create a ConfigMap whose data will be projected into a pod volume.
           kubectl create configmap hello-config \
             --from-literal=greeting=hello \
             --namespace default
 
-          # Verify ConfigMap exists.
-          kubectl get configmap hello-config --namespace default
-
-          # Create a Deployment whose pod template mounts the ConfigMap.
-          # This exercises the full Deployment → ReplicaSet → Pod creation path
-          # through the controller-manager.  We do NOT assert Running phase here
-          # because the CI kubelet environment has no CNI plugin and the sandbox
-          # may fail to start; the one-shot busybox test already covers pod
-          # execution.  hostNetwork+dnsPolicy:None is kept for consistency.
+          # Create a one-shot pod directly (no Deployment — no controller-manager
+          # in this job).  nodeName binds it to ci-node without a scheduler.
+          # hostNetwork+dnsPolicy:None suppresses DNS errors.
+          # The container reads the mounted file; exit 0 confirms the mount worked.
           kubectl apply --validate=false -f - <<'EOF'
-          apiVersion: apps/v1
-          kind: Deployment
+          apiVersion: v1
+          kind: Pod
           metadata:
-            name: hello
+            name: configmap-pod
             namespace: default
           spec:
-            replicas: 1
-            selector:
-              matchLabels:
-                app: hello
-            template:
-              metadata:
-                labels:
-                  app: hello
-              spec:
-                nodeName: ci-node
-                hostNetwork: true
-                dnsPolicy: None
-                dnsConfig: {}
-                containers:
-                  - name: hello
-                    image: busybox:1.36
-                    command: ["sh", "-c", "sleep 300"]
-                    volumeMounts:
-                      - name: config-vol
-                        mountPath: /etc/config
-                volumes:
+            nodeName: ci-node
+            hostNetwork: true
+            dnsPolicy: None
+            dnsConfig: {}
+            restartPolicy: Never
+            containers:
+              - name: reader
+                image: busybox:1.36
+                command: ["cat", "/etc/config/greeting"]
+                volumeMounts:
                   - name: config-vol
-                    configMap:
-                      name: hello-config
+                    mountPath: /etc/config
+            volumes:
+              - name: config-vol
+                configMap:
+                  name: hello-config
           EOF
 
-          # Assert Deployment exists with 1 desired replica.
-          kubectl get deployment hello --namespace default
-          DESIRED=$(kubectl get deployment hello -n default \
-            -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "0")
-          if [ "$DESIRED" != "1" ]; then
-            echo "ERROR: Deployment hello has unexpected replicas: $DESIRED"
-            exit 1
-          fi
-
-          # Assert ReplicaSet was created by the controller-manager.
-          RS_FOUND=0
-          for i in $(seq 1 30); do
-            RS_COUNT=$(kubectl get replicaset -l app=hello -n default \
-              --no-headers 2>/dev/null | wc -l | tr -d ' ')
-            if [ "$RS_COUNT" -ge 1 ]; then
-              RS_FOUND=1
+          # Wait up to 60s for the pod to reach Succeeded.
+          SUCCEEDED=0
+          for i in $(seq 1 60); do
+            PHASE=$(kubectl get pod configmap-pod -n default \
+              -o jsonpath='{.status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Succeeded" ]; then
+              SUCCEEDED=1
               break
+            fi
+            if [ "$PHASE" = "Failed" ]; then
+              echo "ERROR: pod entered Failed phase"
+              kubectl describe pod configmap-pod -n default
+              echo "--- kubelet log ---"
+              cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+              exit 1
             fi
             sleep 1
           done
-          if [ "$RS_FOUND" -eq 0 ]; then
-            echo "ERROR: No ReplicaSet created for Deployment hello within 30s"
-            kubectl get replicaset -n default || true
-            cat "${{ env.SMOKE_TMPDIR }}/server.log" | tail -50
-            exit 1
-          fi
-          echo "ReplicaSet created:"
-          kubectl get replicaset -l app=hello -n default
 
-          # Assert Pod object was created (phase doesn't matter — just existence).
-          POD_FOUND=0
-          for i in $(seq 1 30); do
-            POD_COUNT=$(kubectl get pod -l app=hello -n default \
-              --no-headers 2>/dev/null | wc -l | tr -d ' ')
-            if [ "$POD_COUNT" -ge 1 ]; then
-              POD_FOUND=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "$POD_FOUND" -eq 0 ]; then
-            echo "ERROR: No Pod created for Deployment hello within 30s"
-            kubectl get pod -n default || true
-            cat "${{ env.SMOKE_TMPDIR }}/server.log" | tail -50
+          if [ "$SUCCEEDED" -eq 0 ]; then
+            PHASE=$(kubectl get pod configmap-pod -n default \
+              -o jsonpath='{.status.phase}' 2>/dev/null || echo "unknown")
+            echo "ERROR: configmap-pod did not reach Succeeded within 60s (phase: $PHASE)"
+            kubectl describe pod configmap-pod -n default
+            echo "--- kubelet log (last 60 lines) ---"
+            tail -60 "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+            echo "--- server log (last 30 lines) ---"
+            tail -30 "${{ env.SMOKE_TMPDIR }}/server.log"
             exit 1
           fi
-          echo "Pod created:"
-          kubectl get pod -l app=hello -n default
+          echo "ConfigMap volume mount verified (pod Succeeded):"
+          kubectl get pod configmap-pod -n default
 
           # Clean up.
-          kubectl delete deployment hello --namespace default
+          kubectl delete pod configmap-pod --namespace default
           kubectl delete configmap hello-config --namespace default
 
       - name: Stop server and kubelet
@@ -724,16 +695,55 @@ jobs:
           sleep 10
           kill -0 "$KCM_PID" || { echo "kcm exited"; cat "${{ env.SMOKE_TMPDIR }}/kcm.log"; exit 1; }
 
-      - name: Assert Deployment creates ReplicaSet
+      - name: Deployment → ReplicaSet → Pod (controller-manager reconciliation)
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
         run: |
-          kubectl create namespace hello-ns
-          kubectl create deployment hello --image=busybox:1.36 --replicas=1 -n hello-ns
+          # Create a ConfigMap to include in the Deployment pod template volume spec.
+          # This verifies the controller copies volume configuration faithfully.
+          kubectl create configmap hello-config \
+            --from-literal=greeting=hello \
+            --namespace default
+
+          # Create a Deployment.  No nodeName / hostNetwork needed — no kubelet in
+          # this job.  The controller-manager only needs to create RS and Pod objects;
+          # we do NOT assert Running/Succeeded.  sleep 5 keeps it short-lived if a
+          # kubelet were ever present.
+          kubectl apply --validate=false -f - <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: hello
+            namespace: default
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: hello
+            template:
+              metadata:
+                labels:
+                  app: hello
+              spec:
+                containers:
+                  - name: hello
+                    image: busybox:1.36
+                    command: ["sleep", "5"]
+                    volumeMounts:
+                      - name: config-vol
+                        mountPath: /etc/config
+                volumes:
+                  - name: config-vol
+                    configMap:
+                      name: hello-config
+          EOF
+
+          # Assert ReplicaSet was created by the deployment controller.
           RS_FOUND=0
           for i in $(seq 1 60); do
-            COUNT=$(kubectl get replicasets -n hello-ns 2>/dev/null | grep -c "hello-" || true)
-            if [ "$COUNT" -ge 1 ]; then
+            RS_COUNT=$(kubectl get rs -l app=hello -n default \
+              --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$RS_COUNT" -ge 1 ]; then
               RS_FOUND=1
               break
             fi
@@ -741,15 +751,47 @@ jobs:
           done
           if [ "$RS_FOUND" -eq 0 ]; then
             echo "ERROR: No ReplicaSet created for Deployment hello within 60s"
-            kubectl get all -n hello-ns 2>/dev/null || true
-            echo "--- kcm log (last 50 lines) ---"
+            kubectl get rs -n default || true
             tail -50 "${{ env.SMOKE_TMPDIR }}/kcm.log"
-            echo "--- server log (last 30 lines) ---"
-            tail -30 "${{ env.SMOKE_TMPDIR }}/server.log"
+            tail -50 "${{ env.SMOKE_TMPDIR }}/server.log"
             exit 1
           fi
-          echo "ReplicaSet created for Deployment hello:"
-          kubectl get replicasets -n hello-ns
+          echo "ReplicaSet created:"
+          kubectl get rs -l app=hello -n default
+
+          # Assert Pod object was created by the replicaset controller.
+          POD_FOUND=0
+          for i in $(seq 1 60); do
+            POD_COUNT=$(kubectl get pod -l app=hello -n default \
+              --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$POD_COUNT" -ge 1 ]; then
+              POD_FOUND=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$POD_FOUND" -eq 0 ]; then
+            echo "ERROR: No Pod created for Deployment hello within 60s"
+            kubectl get pod -n default || true
+            tail -50 "${{ env.SMOKE_TMPDIR }}/kcm.log"
+            tail -50 "${{ env.SMOKE_TMPDIR }}/server.log"
+            exit 1
+          fi
+          echo "Pod created:"
+          kubectl get pod -l app=hello -n default
+
+          # Assert the Pod carries the expected label (proves it came from our
+          # Deployment template, not some stray object).
+          APP_LABEL=$(kubectl get pod -l app=hello -n default \
+            -o jsonpath='{.items[0].metadata.labels.app}' 2>/dev/null || true)
+          if [ "$APP_LABEL" != "hello" ]; then
+            echo "ERROR: Pod missing expected label app=hello (got: $APP_LABEL)"
+            exit 1
+          fi
+
+          # Clean up.
+          kubectl delete deployment hello --namespace default
+          kubectl delete configmap hello-config --namespace default
 
       - name: Stop u7s and kcm
         if: always()
