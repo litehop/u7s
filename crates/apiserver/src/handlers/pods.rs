@@ -1364,6 +1364,20 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
         pod["spec"]["enableServiceLinks"] =
             serde_json::to_value(spec.enable_service_links).expect("bool is always serializable");
     }
+
+    // Default defaultMode for volume sources that require it.
+    // The kubelet refuses to mount ConfigMap/Secret volumes whose defaultMode is absent:
+    //   "no defaultMode used, not even the default value for it"
+    // Real kube-apiserver defaults these to 0644 (420 decimal).
+    if let Some(volumes) = pod["spec"]["volumes"].as_array_mut() {
+        for vol in volumes {
+            for key in &["configMap", "secret", "projected"] {
+                if !vol[key].is_null() && vol[key]["defaultMode"].is_null() {
+                    vol[key]["defaultMode"] = serde_json::Value::Number(420.into());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1416,6 +1430,54 @@ mod create_defaults_tests {
             pod["spec"]["enableServiceLinks"],
             serde_json::Value::Bool(false),
             "an explicit enableServiceLinks=false must not be overridden by the default"
+        );
+    }
+
+    /// Kubelet refuses to mount a ConfigMap volume whose defaultMode is absent:
+    /// "no defaultMode used, not even the default value for it"
+    /// Real kube-apiserver defaults it to 0644 (420 decimal).
+    #[test]
+    fn configmap_volume_default_mode_is_set_when_absent() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "volumes": [{"name": "cfg", "configMap": {"name": "my-cm"}}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["volumes"][0]["configMap"]["defaultMode"],
+            serde_json::Value::Number(420.into()),
+            "configMap volume defaultMode must be set to 0644 (420) when absent"
+        );
+    }
+
+    #[test]
+    fn configmap_volume_explicit_default_mode_is_preserved() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "volumes": [{"name": "cfg", "configMap": {"name": "my-cm", "defaultMode": 256}}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["volumes"][0]["configMap"]["defaultMode"],
+            serde_json::Value::Number(256.into()),
+            "explicit defaultMode must not be overridden"
+        );
+    }
+
+    #[test]
+    fn secret_volume_default_mode_is_set_when_absent() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "volumes": [{"name": "sec", "secret": {"secretName": "my-sec"}}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["volumes"][0]["secret"]["defaultMode"],
+            serde_json::Value::Number(420.into()),
+            "secret volume defaultMode must be set to 0644 (420) when absent"
         );
     }
 }
