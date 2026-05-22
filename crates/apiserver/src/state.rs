@@ -224,6 +224,11 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rk("", "v1", "replicationcontrollers"),
         rm("ReplicationController", true, true),
     );
+    m.insert(
+        rk("", "v1", "resourcequotas"),
+        rm("ResourceQuota", true, true),
+    );
+    m.insert(rk("", "v1", "limitranges"), rm("LimitRange", true, false));
 
     // apps/v1
     m.insert(rk("apps", "v1", "daemonsets"), rm("DaemonSet", true, true));
