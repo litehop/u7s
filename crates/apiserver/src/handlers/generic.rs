@@ -608,7 +608,7 @@ fn decode_continue(token: &str) -> Result<String, crate::status::StatusError> {
     })
 }
 
-fn build_list_response(
+pub(crate) fn build_list_response(
     kind: &str,
     group: &str,
     version: &str,
