@@ -257,6 +257,10 @@ fn build_server_sans(advertise_host_str: Option<&str>) -> anyhow::Result<Vec<San
 }
 
 pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
+    // Install the ML-KEM-768 hybrid post-quantum crypto provider.
+    // `.ok()` makes this idempotent: a second call (e.g. in tests) is a no-op.
+    rustls_post_quantum::provider().install_default().ok();
+
     // --- CA: load-or-generate ---
     // If both ca.key (PEM) and ca.crt (DER) exist on disk, load them so the CA
     // stays stable across restarts. If either is missing, generate fresh and write.
@@ -752,6 +756,39 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// generate_tls must succeed when the PQC provider is active.
+    ///
+    /// This test exists to catch provider-installation failures early: if
+    /// rustls_post_quantum::provider() is incompatible with the rustls version
+    /// in use, ServerConfig::builder() will panic or return an error rather than
+    /// silently falling back to ring. Catching that here is better than a
+    /// mysterious runtime crash.
+    #[test]
+    fn generate_tls_succeeds_with_pqc_provider() {
+        // install_default returns Err if already installed — that's fine here.
+        rustls_post_quantum::provider().install_default().ok();
+
+        let dir = test_temp_dir("pqc-provider");
+        let args = Args {
+            db: "./state.db".into(),
+            listen: "0.0.0.0:6443".into(),
+            kubeconfig: "./kubeconfig".into(),
+            token_auth_file: None,
+            sa_key: "./sa.key".into(),
+            sa_pub: "./sa.pub".into(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            advertise_address: None,
+        };
+        let result = generate_tls(&args);
+        assert!(
+            result.is_ok(),
+            "generate_tls must succeed with PQC provider active; got: {:?}",
+            result.err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// pem_encode must produce a valid PEM block with the correct header and footer.
