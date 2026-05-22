@@ -333,7 +333,11 @@ mod tests {
 
     #[test]
     fn invalid_returns_422() {
-        let err = validate_namespace_name("Bad_Name").unwrap_err();
+        let result = validate_namespace_name("Bad_Name");
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -605,9 +609,11 @@ mod tests {
             "delete must succeed"
         );
 
-        let err = get_namespace(State(state.clone()), Path("del-ns".to_string()))
-            .await
-            .unwrap_err();
+        let result = get_namespace(State(state.clone()), Path("del-ns".to_string())).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(
             json["code"], 404,
