@@ -104,15 +104,17 @@ mayor tells you what to do.
 ```bash
 # 1. Create the worktree
 git worktree add ai/worktrees/<name> -b worker/<name>
-# 2. Copy settings so the subagent inherits the permission allowlist
-mkdir -p ai/worktrees/<name>/.claude
+# 2. Copy settings AND agents dir — both are required
+mkdir -p ai/worktrees/<name>/.claude/agents
 cp .claude/settings.json ai/worktrees/<name>/.claude/settings.json
+cp -r .claude/agents/ ai/worktrees/<name>/.claude/agents/
 # 3. Verify clean
 git -C ai/worktrees/<name> status --short --branch
 ```
 
-Workers block on their first Bash call if step 2 is skipped — the subagent
-launches from the mayor's CWD and never loads the worktree's settings.json.
+**Both files are required.** Without `settings.json` the allowlist is missing.
+Without `agents/worker.md` the subagent spawns without `permissionMode:auto`
+and blocks on its first Bash call regardless of what the prompt says.
 
 ## Common preamble (every dispatch)
 
