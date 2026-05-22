@@ -440,24 +440,6 @@ mod tests {
         }
     }
 
-    fn san_dns_names(tls: &TlsMaterial) -> Vec<String> {
-        // Re-parse the DER server cert to extract SANs.
-        // We use rcgen's own params round-trip isn't available, so we check via
-        // rustls's ServerConfig — easier: just re-generate and inspect by running
-        // the test against the returned TlsMaterial's server_config chain.
-        // Simpler approach: call generate_tls and verify via the server_config's
-        // cert chain DER, parsed with x509_parser if available — but we have no
-        // x509_parser dep. Instead, test advertise_host() directly for unit coverage,
-        // and do an integration check by asserting generate_tls() does not error.
-        //
-        // Because parsing raw DER SANs without an x509 dep is fragile, we test
-        // advertise_host() (the extraction logic) directly and trust rcgen to
-        // encode what we pass. The generate_tls integration path is exercised to
-        // ensure no panics/errors.
-        let _ = tls; // integration: no panics
-        vec![]
-    }
-
     #[test]
     fn advertise_host_extracts_dns_name() {
         assert_eq!(
@@ -483,8 +465,7 @@ mod tests {
     fn san_includes_advertise_dns_name() {
         let args = args_with(Some("https://host.lima.internal:6443"));
         // generate_tls must succeed and produce a cert that includes the DNS SAN.
-        let tls = generate_tls(&args).expect("generate_tls failed");
-        let _ = san_dns_names(&tls);
+        let _tls = generate_tls(&args).expect("generate_tls failed");
         // Verify host parses as DNS (not IP).
         let host = advertise_host(args.advertise_address.as_deref()).unwrap();
         assert!(
@@ -497,8 +478,7 @@ mod tests {
     #[test]
     fn san_includes_advertise_ip() {
         let args = args_with(Some("https://192.168.1.10:6443"));
-        let tls = generate_tls(&args).expect("generate_tls failed");
-        let _ = san_dns_names(&tls);
+        let _tls = generate_tls(&args).expect("generate_tls failed");
         let host = advertise_host(args.advertise_address.as_deref()).unwrap();
         assert!(
             host.parse::<std::net::IpAddr>().is_ok(),
@@ -736,6 +716,98 @@ mod tests {
              world-readable CA keys allow anyone to sign rogue certs",
             mode
         );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// load_or_generate_sa_keys must reload the same key material on a second call
+    /// rather than generating a new key pair. This is the core correctness property:
+    /// tokens minted before a restart must remain valid after restart because the
+    /// signing key is loaded from disk, not regenerated.
+    #[test]
+    fn sa_keys_load_from_disk_returns_same_private_key() {
+        let dir = test_temp_dir("sa-keys-load");
+        let key_path = dir.join("sa.key").to_string_lossy().into_owned();
+        let pub_path = dir.join("sa.pub").to_string_lossy().into_owned();
+
+        // First call: generates and writes sa.key / sa.pub.
+        let first = load_or_generate_sa_keys(&key_path, &pub_path)
+            .expect("first load_or_generate_sa_keys must succeed");
+        assert!(
+            std::path::Path::new(&key_path).exists(),
+            "sa.key must exist after first call"
+        );
+
+        // Second call: must load from disk, not generate a new key.
+        let second = load_or_generate_sa_keys(&key_path, &pub_path)
+            .expect("second load_or_generate_sa_keys must succeed");
+
+        assert_eq!(
+            first.private_key_pem, second.private_key_pem,
+            "private key PEM must be identical on load — \
+             generating a new key would invalidate tokens minted before restart"
+        );
+        assert_eq!(
+            first.public_key_pem, second.public_key_pem,
+            "public key PEM must be identical on load"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// pem_encode must produce a valid PEM block with the correct header and footer.
+    /// kubeconfig fields rely on pem_encode to wrap DER bytes in PEM armour before
+    /// base64-encoding them. A broken header or footer would make kubectl reject the
+    /// embedded certificates.
+    #[test]
+    fn pem_encode_produces_valid_pem_armour() {
+        let der = vec![0x01u8, 0x02, 0x03];
+        let pem = pem_encode("CERTIFICATE", &der);
+        let pem_str = std::str::from_utf8(&pem).expect("pem output must be valid UTF-8");
+        assert!(
+            pem_str.starts_with("-----BEGIN CERTIFICATE-----"),
+            "PEM must start with BEGIN header; got: {pem_str:?}"
+        );
+        assert!(
+            pem_str.contains("-----END CERTIFICATE-----"),
+            "PEM must contain END footer; got: {pem_str:?}"
+        );
+    }
+
+    /// Kubeconfig::new and to_yaml must produce a YAML document that contains the
+    /// server URL and the base64-encoded CA certificate. kubectl parses these fields
+    /// to establish a TLS connection to the API server.
+    #[test]
+    fn kubeconfig_yaml_contains_server_and_ca_data() {
+        let dir = test_temp_dir("kubeconfig-yaml");
+        let args = Args {
+            db: "./state.db".into(),
+            listen: "0.0.0.0:6443".into(),
+            kubeconfig: "./kubeconfig".into(),
+            token_auth_file: None,
+            sa_key: "./sa.key".into(),
+            sa_pub: "./sa.pub".into(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            advertise_address: None,
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        let server_url = "https://127.0.0.1:6443";
+        let kc = Kubeconfig::new(server_url, &tls);
+        let yaml = kc.to_yaml();
+
+        assert!(
+            yaml.contains("server:"),
+            "kubeconfig YAML must contain 'server:' field; got: {yaml}"
+        );
+        assert!(
+            yaml.contains(server_url),
+            "kubeconfig YAML must contain the server URL; got: {yaml}"
+        );
+        assert!(
+            yaml.contains("certificate-authority-data:"),
+            "kubeconfig YAML must contain 'certificate-authority-data:' field; got: {yaml}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
 }
