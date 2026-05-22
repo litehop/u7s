@@ -241,6 +241,24 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::pods::replace_pod_status)
                 .patch(handlers::pods::patch_pod_status),
         )
+        // Pods — log subresource (kubelet proxy): must be before generic catch-all
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/log",
+            get(handlers::proxy::pod_log),
+        )
+        // Pods — exec/attach/portforward: 501 stubs until SPDY/WebSocket is implemented
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/exec",
+            get(handlers::proxy::pod_exec).post(handlers::proxy::pod_exec),
+        )
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/attach",
+            get(handlers::proxy::pod_attach).post(handlers::proxy::pod_attach),
+        )
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/portforward",
+            get(handlers::proxy::pod_portforward).post(handlers::proxy::pod_portforward),
+        )
         // Core group (group="", apiVersion=v1) — cluster-scoped resources (e.g. nodes)
         .route(
             "/api/v1/{resource}",
