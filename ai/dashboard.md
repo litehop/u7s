@@ -1,36 +1,37 @@
 # Dashboard
-2026-05-22 (session active — refactoring wave complete, CSR API next)
+2026-05-22 (mayor session active — typing wave complete, iwyr dispatching)
 `bd prime` in a fresh Claude Code session (or say "I am the Mayor now")
 Open beads: 4
 
 ## What needs the operator now
 
-- **mayor-o2py (P2)** — CSR API (`certificates.k8s.io/v1`). Generic handler confirmed sufficient. Testing must include rejection paths (malformed PEM, denial, OCC conflict). Awaiting explicit "go" to dispatch.
+- **mayor-o2py (P2)** — CSR API (`certificates.k8s.io/v1`). Generic handler sufficient. Rejection tests required (malformed PEM, denial, OCC conflict). Awaiting your "go".
 - **mayor-suf0 (P2)** — kube-controller-manager smoke test. Blocked on mayor-o2py.
-- **mayor-2ni (P3)** — sonobuoy conformance audit. Operator asked to hold.
+- **mayor-2ni (P3)** — sonobuoy conformance audit. On hold per your request.
 
 ## In-flight work
 
-None.
+| Worker | Bead | Surface | Status |
+|--------|------|---------|--------|
+| iwyr | mayor-iwyr | `scheduler/src/lib.rs`, `controller-manager/src/lib.rs` | dispatching |
 
 ## Forward look
 
-- Dispatch mayor-o2py (CSR API) once operator gives green-light.
-- Re-assess coverage on `handlers/generic.rs` and new sub-modules (`core.rs`, `json_patch.rs`) — smaller per-file targets now achievable.
-- After mayor-o2py lands: dispatch mayor-suf0 (kube-controller-manager smoke test).
+**HOLD — operator instruction**: reassess code quality and test coverage after in-flight work lands before dispatching further.
+
+1. Merge mayor-iwyr PR when CI goes green.
+2. Run quality/coverage assessment; bring findings to operator.
+3. Operator decides next: mayor-o2py (CSR API) on your go, mayor-2ni when hold lifted.
 
 ## Recent progress
 
-Refactoring wave complete (PRs #151–#153):
-- PR #151 (mayor-5vam): `tls.rs` dead code removed; 3 tests added (PEM encode, kubeconfig YAML, load-from-disk round-trip)
-- PR #152 (mayor-6huu): JSON Patch extracted to `handlers/json_patch.rs`; ~240 lines of verbatim duplication in `pods.rs` deleted
-- PR #153 (mayor-untj): `core_*` handler wrappers extracted to `handlers/core.rs` (328 lines); 5 helpers promoted to `pub(crate)`
+Typing wave complete (PRs #158, #159):
+- PR #158 (mayor-1aoj + mayor-ln00): typed `NamespaceStatus` in namespaces.rs, typed `SecretData` in controller-manager. +4 tests.
+- PR #159 (mayor-vnmv): typed `PodSpec`, `BindingTarget`, `Binding` in pods.rs + scheduler. +8 tests.
+- mayor-cumk: closed as already-done (tokens.rs already used typed ObjectMeta, landed in PR #157).
 
-Bug fixes (PRs #149–#150):
-- PR #149 (mayor-f3ru): `encode_watch_event` skips corrupt events; JSON round-trip alloc eliminated
-- PR #150 (mayor-5yfc + mayor-q04t): `store_err_cr` returns 409 on `RevisionMismatch`; `build_list_response` made `pub(crate)`
-
-All P1 correctness bugs resolved. 19 PRs merged this session (#135–#153).
+Closed this session: mayor-vnmv, mayor-1aoj, mayor-ln00, mayor-cumk (4 beads).
+Merged PRs this session: #154, #155, #156, #157, #158, #159.
 
 ## Stance
 
