@@ -214,6 +214,15 @@ pub async fn stream_watch_events(
 // Scheduling logic
 // ---------------------------------------------------------------------------
 
+/// Local typed view of the fields in a Pod's `spec` that the scheduler reads.
+/// Parsing at the boundary means a typo in `nodeName` is a compile error,
+/// not a silent None that leaves pods unscheduled forever.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PodSpec {
+    node_name: Option<String>,
+}
+
 /// Determine whether a watch event represents a pod that needs scheduling.
 ///
 /// Returns `Some((namespace, pod_name))` when the event is an ADDED or
@@ -230,8 +239,8 @@ pub fn needs_scheduling(event: &Value) -> Option<(String, String)> {
     if pod_name.is_empty() {
         return None;
     }
-    let node_name = &event["object"]["spec"]["nodeName"];
-    let already_scheduled = node_name.is_string() && !node_name.as_str().unwrap_or("").is_empty();
+    let spec: PodSpec = serde_json::from_value(event["object"]["spec"].clone()).unwrap_or_default();
+    let already_scheduled = spec.node_name.as_deref().is_some_and(|n| !n.is_empty());
     if already_scheduled {
         return None;
     }

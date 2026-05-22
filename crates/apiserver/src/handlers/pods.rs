@@ -13,7 +13,7 @@ use crate::{
     keys::{cluster_object_key, list_prefix, object_key},
     state::AppState,
     status::Status,
-    types::{Namespace, Object, ObjectMeta},
+    types::{Binding, Namespace, Object, ObjectMeta, PodSpec},
     util::{extract_body, parse_resource_version},
 };
 
@@ -75,25 +75,21 @@ pub fn filter_pods_by_field_selector(
 }
 
 fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
+    let spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
+    let node_name = spec.node_name.as_deref().unwrap_or("");
     for term in selector.split(',') {
         let term = term.trim();
         if term.is_empty() {
             continue;
         }
         if let Some((field, value)) = term.split_once("!=") {
-            if field == "spec.nodeName" {
-                let node_name = pod["spec"]["nodeName"].as_str().unwrap_or("");
-                if node_name == value {
-                    return false;
-                }
+            if field == "spec.nodeName" && node_name == value {
+                return false;
             }
             // Unknown fields: ignore (don't filter out)
         } else if let Some((field, value)) = term.split_once('=') {
-            if field == "spec.nodeName" {
-                let node_name = pod["spec"]["nodeName"].as_str().unwrap_or("");
-                if node_name != value {
-                    return false;
-                }
+            if field == "spec.nodeName" && node_name != value {
+                return false;
             }
             // Unknown fields: ignore (don't filter out)
         }
@@ -1393,11 +1389,12 @@ mod create_defaults_tests {
 pub fn extract_binding_node_name(
     binding: &serde_json::Value,
 ) -> Result<String, crate::status::StatusError> {
-    binding["target"]["name"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Status::bad_request("target.name is required".into()))
-        .map(str::to_string)
+    let parsed: Binding = serde_json::from_value(binding.clone())
+        .map_err(|_| Status::bad_request("target.name is required".into()))?;
+    if parsed.target.name.is_empty() {
+        return Err(Status::bad_request("target.name is required".into()));
+    }
+    Ok(parsed.target.name)
 }
 
 pub async fn bind_pod(
