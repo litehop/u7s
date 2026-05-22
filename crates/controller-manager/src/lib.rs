@@ -2,6 +2,7 @@
 ///
 /// All async I/O stays in main.rs. This module contains only functions
 /// that can be exercised without a live API server.
+use serde::Deserialize;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,31 @@ pub fn build_sa_token_secret(namespace: &str, sa_name: &str, token_b64: &str) ->
 // Watch event parsing
 // ---------------------------------------------------------------------------
 
+/// Typed envelope for a Kubernetes watch event.
+///
+/// Using a struct rather than raw `event["type"]` / `event["object"][...]`
+/// indexing means a missing or mistyped field is a deserialization error,
+/// not a silent empty string that causes service accounts to be skipped.
+#[derive(Debug, Deserialize)]
+struct WatchEvent<T> {
+    #[serde(rename = "type")]
+    event_type: String,
+    object: T,
+}
+
+/// Minimal typed view of a ServiceAccount's metadata in a watch event.
+#[derive(Debug, Default, Deserialize)]
+struct SaMetadata {
+    name: Option<String>,
+    namespace: Option<String>,
+}
+
+/// Minimal typed view of a ServiceAccount object in a watch event.
+#[derive(Debug, Default, Deserialize)]
+struct SaObject {
+    metadata: SaMetadata,
+}
+
 /// Extract (namespace, sa_name) from a ServiceAccount ADDED watch event.
 ///
 /// Returns `None` if:
@@ -54,22 +80,24 @@ pub fn build_sa_token_secret(namespace: &str, sa_name: &str, token_b64: &str) ->
 ///
 /// Namespace defaults to "default" when missing, matching Kubernetes behaviour.
 pub fn parse_sa_added_event(event: &Value) -> Option<(String, String)> {
-    let event_type = event["type"].as_str().unwrap_or("");
-    if event_type != "ADDED" {
+    let watch_event: WatchEvent<SaObject> =
+        serde_json::from_value(event.clone()).unwrap_or_else(|_| WatchEvent {
+            event_type: String::new(),
+            object: SaObject::default(),
+        });
+    if watch_event.event_type != "ADDED" {
         return None;
     }
-    let sa_name = event["object"]["metadata"]["name"]
-        .as_str()
-        .unwrap_or("")
-        .to_owned();
+    let sa_name = watch_event.object.metadata.name.as_deref().unwrap_or("");
     if sa_name.is_empty() {
         return None;
     }
-    let namespace = event["object"]["metadata"]["namespace"]
-        .as_str()
-        .unwrap_or("default")
-        .to_owned();
-    Some((namespace, sa_name))
+    let namespace = watch_event
+        .object
+        .metadata
+        .namespace
+        .unwrap_or_else(|| "default".to_owned());
+    Some((namespace, sa_name.to_owned()))
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +197,26 @@ mod tests {
     fn secret_api_version_is_v1() {
         let s = build_sa_token_secret("default", "svc", "x");
         assert_eq!(s["apiVersion"], "v1");
+    }
+
+    // --- WatchEvent deserialization ---
+
+    // Verifies that the typed envelope correctly maps "type" → event_type and
+    // "object" → object. A rename or missing field would cause every watch event
+    // to be silently ignored (parse failure falls back to empty event_type).
+    #[test]
+    fn watch_event_deserializes_type_and_object() {
+        let json = serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "my-sa", "namespace": "production" }
+            }
+        });
+        let we: WatchEvent<SaObject> =
+            serde_json::from_value(json).expect("WatchEvent should deserialize");
+        assert_eq!(we.event_type, "ADDED");
+        assert_eq!(we.object.metadata.name.as_deref(), Some("my-sa"));
+        assert_eq!(we.object.metadata.namespace.as_deref(), Some("production"));
     }
 
     // --- parse_sa_added_event ---

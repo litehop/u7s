@@ -214,6 +214,18 @@ pub async fn stream_watch_events(
 // Scheduling logic
 // ---------------------------------------------------------------------------
 
+/// Typed envelope for a Kubernetes watch event.
+///
+/// Using a struct rather than raw `event["type"]` / `event["object"][...]`
+/// indexing means a missing or mistyped field is a deserialization error,
+/// not a silent empty string that causes pods to be skipped forever.
+#[derive(Debug, Deserialize)]
+struct WatchEvent<T> {
+    #[serde(rename = "type")]
+    event_type: String,
+    object: T,
+}
+
 /// Local typed view of the fields in a Pod's `spec` that the scheduler reads.
 /// Parsing at the boundary means a typo in `nodeName` is a compile error,
 /// not a silent None that leaves pods unscheduled forever.
@@ -221,6 +233,20 @@ pub async fn stream_watch_events(
 #[serde(rename_all = "camelCase")]
 struct PodSpec {
     node_name: Option<String>,
+}
+
+/// Minimal typed view of a Pod's metadata needed by the scheduler.
+#[derive(Debug, Default, Deserialize)]
+struct PodMetadata {
+    name: Option<String>,
+    namespace: Option<String>,
+}
+
+/// Minimal typed view of a Pod object in a watch event.
+#[derive(Debug, Default, Deserialize)]
+struct PodObject {
+    metadata: PodMetadata,
+    spec: PodSpec,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -231,23 +257,32 @@ struct PodSpec {
 /// Extracted as a pure function so the decision can be unit-tested without
 /// standing up an API server.
 pub fn needs_scheduling(event: &Value) -> Option<(String, String)> {
-    let event_type = event["type"].as_str().unwrap_or("");
-    if event_type != "ADDED" && event_type != "MODIFIED" {
+    let watch_event: WatchEvent<PodObject> =
+        serde_json::from_value(event.clone()).unwrap_or_else(|_| WatchEvent {
+            event_type: String::new(),
+            object: PodObject::default(),
+        });
+    if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
         return None;
     }
-    let pod_name = event["object"]["metadata"]["name"].as_str().unwrap_or("");
+    let pod_name = watch_event.object.metadata.name.as_deref().unwrap_or("");
     if pod_name.is_empty() {
         return None;
     }
-    let spec: PodSpec = serde_json::from_value(event["object"]["spec"].clone()).unwrap_or_default();
-    let already_scheduled = spec.node_name.as_deref().is_some_and(|n| !n.is_empty());
+    let already_scheduled = watch_event
+        .object
+        .spec
+        .node_name
+        .as_deref()
+        .is_some_and(|n| !n.is_empty());
     if already_scheduled {
         return None;
     }
-    let namespace = event["object"]["metadata"]["namespace"]
-        .as_str()
-        .unwrap_or("default")
-        .to_owned();
+    let namespace = watch_event
+        .object
+        .metadata
+        .namespace
+        .unwrap_or_else(|| "default".to_owned());
     Some((namespace, pod_name.to_owned()))
 }
 
@@ -336,6 +371,26 @@ pub async fn bind_pod(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // WatchEvent deserialization — verifies that the typed envelope correctly
+    // maps "type" → event_type and "object" → object. A rename or missing field
+    // would cause every watch event to be silently ignored.
+    #[test]
+    fn watch_event_deserializes_type_and_object() {
+        let json = serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "my-pod", "namespace": "staging" },
+                "spec": { "nodeName": "" }
+            }
+        });
+        let we: WatchEvent<PodObject> =
+            serde_json::from_value(json).expect("WatchEvent should deserialize");
+        assert_eq!(we.event_type, "ADDED");
+        assert_eq!(we.object.metadata.name.as_deref(), Some("my-pod"));
+        assert_eq!(we.object.metadata.namespace.as_deref(), Some("staging"));
+        assert_eq!(we.object.spec.node_name.as_deref(), Some(""));
+    }
 
     // Regression test: the cluster-wide watch path must NOT be scoped to a
     // specific namespace.  If this constant ever reverts to the old
