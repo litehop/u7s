@@ -4465,6 +4465,928 @@ mod tests {
             "allowWatchBookmarks=false must suppress periodic bookmarks"
         );
     }
+
+    // -- parse_key_name_ns --
+
+    /// parse_key_name_ns extracts the trailing name and namespace from a store key.
+    /// The Deleted watch event uses this to reconstruct a tombstone object — a wrong
+    /// parse produces a tombstone with the wrong name/namespace, confusing clients
+    /// that use the delete event to clean up their caches.
+    #[test]
+    fn parse_key_name_ns_namespaced_key() {
+        let (name, ns) = parse_key_name_ns("/registry/pods/default/my-pod");
+        assert_eq!(name, "my-pod", "last segment must be name");
+        assert_eq!(ns, "default", "second-to-last must be namespace");
+    }
+
+    #[test]
+    fn parse_key_name_ns_cluster_scoped_key() {
+        // For cluster-scoped resources the "namespace" segment is the resource group/type,
+        // not a real namespace. The important invariant is that name is extracted correctly.
+        let (name, _ns) = parse_key_name_ns("/registry/nodes/worker-1");
+        assert_eq!(name, "worker-1");
+    }
+
+    #[test]
+    fn parse_key_name_ns_single_segment() {
+        // Degenerate case: a bare name with no slashes.
+        let (name, ns) = parse_key_name_ns("only-name");
+        assert_eq!(name, "only-name");
+        assert_eq!(ns, "");
+    }
+
+    // -- encode_watch_event: Deleted / Bookmark / Compacted paths --
+
+    /// DELETED watch events must reconstruct a tombstone with correct name and namespace.
+    /// Kubernetes clients rely on this to remove the object from their local caches.
+    /// A wrong name or missing namespace in the tombstone causes cache staleness.
+    #[test]
+    fn encode_watch_event_deleted_namespaced_includes_name_and_namespace() {
+        let event = WatchEvent::Deleted {
+            key: "/registry/configmaps/kube-system/kube-dns".into(),
+            revision: 77,
+        };
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
+            .expect("DELETED event must produce a chunk");
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
+
+        assert_eq!(decoded["type"], "DELETED", "type must be DELETED");
+        assert_eq!(
+            decoded["object"]["metadata"]["name"], "kube-dns",
+            "tombstone must carry the correct object name"
+        );
+        assert_eq!(
+            decoded["object"]["metadata"]["namespace"], "kube-system",
+            "tombstone must carry the correct namespace so clients can clean up the right entry"
+        );
+        assert_eq!(
+            decoded["object"]["metadata"]["resourceVersion"], "77",
+            "tombstone must include the revision at which deletion occurred"
+        );
+    }
+
+    /// DELETED events: parse_key_name_ns treats the segment before the name as namespace.
+    /// For cluster-scoped resources, the second-to-last key segment is the resource type,
+    /// not a real namespace. The tombstone will include that segment as "namespace".
+    /// The key invariant is that name is always correctly extracted from the final segment.
+    #[test]
+    fn encode_watch_event_deleted_extracts_name_from_final_segment() {
+        // /registry/nodes/worker-1 → name="worker-1", namespace="nodes" (resource type segment)
+        let event = WatchEvent::Deleted {
+            key: "/registry/nodes/worker-1".into(),
+            revision: 10,
+        };
+        let chunk = encode_watch_event(&event, "v1", "Node").unwrap();
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
+
+        assert_eq!(decoded["type"], "DELETED");
+        assert_eq!(
+            decoded["object"]["metadata"]["name"], "worker-1",
+            "name must be extracted from the final key segment"
+        );
+        assert_eq!(
+            decoded["object"]["metadata"]["resourceVersion"], "10",
+            "tombstone must include the revision"
+        );
+    }
+
+    /// BOOKMARK events must be emitted with the correct apiVersion, kind, and resourceVersion.
+    /// Clients use the BOOKMARK's resourceVersion to update their last-known position in the
+    /// watch stream, so a wrong value breaks incremental watches.
+    #[test]
+    fn encode_watch_event_bookmark_includes_resource_version() {
+        let event = WatchEvent::Bookmark { revision: 123 };
+        let chunk = encode_watch_event(&event, "apps/v1", "Deployment")
+            .expect("BOOKMARK event must produce a chunk");
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
+
+        assert_eq!(decoded["type"], "BOOKMARK");
+        assert_eq!(decoded["object"]["apiVersion"], "apps/v1");
+        assert_eq!(decoded["object"]["kind"], "Deployment");
+        assert_eq!(
+            decoded["object"]["metadata"]["resourceVersion"], "123",
+            "BOOKMARK resourceVersion must match the store revision"
+        );
+    }
+
+    /// Compacted events must return None so the caller closes the stream.
+    /// Without this, the stream would continue emitting events from before the compaction
+    /// point and the client would receive invalid data.
+    #[test]
+    fn encode_watch_event_compacted_returns_none() {
+        let event = WatchEvent::Compacted {
+            requested: 100,
+            horizon: 500,
+        };
+        let result = encode_watch_event(&event, "v1", "Pod");
+        assert!(
+            result.is_none(),
+            "Compacted event must return None to signal stream closure; \
+             the caller then emits the 410 ERROR and breaks the loop"
+        );
+    }
+
+    // -- apply_delete_policy --
+
+    /// apply_delete_policy returns Some when the object has finalizers, stamping
+    /// deletionTimestamp. A soft-delete preserves the object until finalizers are cleared.
+    /// Without this, objects with finalizers would be hard-deleted immediately, breaking
+    /// any controller that needs to run cleanup before deletion.
+    #[test]
+    fn apply_delete_policy_returns_some_for_object_with_finalizers() {
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
+                "metadata": {
+                    "name": "my-obj",
+                    "finalizers": ["my.io/cleanup"]
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        let result = apply_delete_policy(&mut obj);
+        assert!(
+            result.is_some(),
+            "apply_delete_policy must return Some (soft-delete) when finalizers are present"
+        );
+        let body = result.unwrap();
+        assert!(
+            body["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must be stamped on soft-delete; \
+             controllers use this to detect and begin their cleanup logic"
+        );
+    }
+
+    /// apply_delete_policy returns None when no finalizers are present, signaling
+    /// a hard-delete. The caller then removes the object from the store immediately.
+    #[test]
+    fn apply_delete_policy_returns_none_for_object_without_finalizers() {
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({ "metadata": { "name": "my-obj" } }).to_string(),
+        ))
+        .unwrap();
+        let result = apply_delete_policy(&mut obj);
+        assert!(
+            result.is_none(),
+            "apply_delete_policy must return None (hard-delete) when no finalizers are present"
+        );
+    }
+
+    /// apply_delete_policy returns None for an empty finalizers array.
+    /// An empty array is semantically equivalent to no finalizers.
+    #[test]
+    fn apply_delete_policy_returns_none_for_empty_finalizers_array() {
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
+                "metadata": { "name": "my-obj", "finalizers": [] }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        let result = apply_delete_policy(&mut obj);
+        assert!(
+            result.is_none(),
+            "empty finalizers array must be treated as no finalizers (hard-delete)"
+        );
+    }
+
+    // -- store_err branches --
+
+    /// store_err maps StoreError::AlreadyExists to HTTP 409 Conflict.
+    /// This ensures create handlers return the correct status when a duplicate object is attempted.
+    #[test]
+    fn store_err_already_exists_maps_to_409() {
+        use u7s_store::StoreError;
+        let err = store_err(
+            StoreError::AlreadyExists {
+                key: "/registry/pods/default/my-pod".into(),
+            },
+            "my-pod",
+            "Pod",
+        );
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "AlreadyExists must map to 409 Conflict so clients can detect duplicate creates"
+        );
+    }
+
+    /// store_err maps StoreError::NotFound to HTTP 404.
+    #[test]
+    fn store_err_not_found_maps_to_404() {
+        use u7s_store::StoreError;
+        let err = store_err(
+            StoreError::NotFound {
+                key: "/registry/pods/default/gone".into(),
+            },
+            "gone",
+            "Pod",
+        );
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// store_err maps StoreError::RevisionMismatch to HTTP 409 Conflict.
+    /// This is the OCC path — a concurrent writer changed the object since our read.
+    #[test]
+    fn store_err_revision_mismatch_maps_to_409() {
+        use u7s_store::StoreError;
+        let err = store_err(
+            StoreError::RevisionMismatch {
+                expected: 5,
+                current: 10,
+            },
+            "my-pod",
+            "Pod",
+        );
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "RevisionMismatch must map to 409 Conflict so kubelet can retry with the current rv"
+        );
+    }
+
+    // -- rbac_cluster_key / rbac_namespaced_key format --
+
+    /// rbac_cluster_key must produce a key in the form /apis/<group>/<version>/<plural>/<name>.
+    /// The RBAC index uses this key to look up rules; a wrong format breaks permission checks.
+    #[test]
+    fn rbac_cluster_key_format() {
+        let key = rbac_cluster_key("rbac.authorization.k8s.io", "v1", "clusterroles", "admin");
+        assert_eq!(
+            key, "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin",
+            "cluster RBAC key must follow /apis/<group>/<version>/<plural>/<name>"
+        );
+    }
+
+    /// rbac_namespaced_key must include the namespace segment.
+    #[test]
+    fn rbac_namespaced_key_format() {
+        let key = rbac_namespaced_key("rbac.authorization.k8s.io", "v1", "default", "roles", "dev");
+        assert_eq!(
+            key, "/apis/rbac.authorization.k8s.io/v1/namespaces/default/roles/dev",
+            "namespaced RBAC key must include the namespace segment"
+        );
+    }
+
+    // -- json_pointer_segments --
+
+    /// An empty pointer must return an empty segment list (represents root document).
+    #[test]
+    fn json_pointer_segments_empty_returns_empty() {
+        let segs = json_pointer_segments("");
+        assert!(segs.is_empty(), "empty pointer must produce no segments");
+    }
+
+    /// A pointer with one segment must return that segment.
+    #[test]
+    fn json_pointer_segments_single() {
+        let segs = json_pointer_segments("/foo");
+        assert_eq!(segs, vec!["foo"]);
+    }
+
+    /// A pointer with multiple segments must split on '/'.
+    #[test]
+    fn json_pointer_segments_nested() {
+        let segs = json_pointer_segments("/metadata/name");
+        assert_eq!(segs, vec!["metadata", "name"]);
+    }
+
+    /// RFC 6901 escape sequences must be unescaped: ~1→'/', ~0→'~'.
+    #[test]
+    fn json_pointer_segments_rfc6901_unescaping() {
+        let segs = json_pointer_segments("/a~1b/c~0d");
+        assert_eq!(segs, vec!["a/b", "c~d"]);
+    }
+
+    // -- get_resource and get_namespaced_resource direct calls --
+
+    /// get_resource returns 404 when the object does not exist in the store.
+    /// This is the normal "not found" path clients see when referencing a non-existent object.
+    #[tokio::test]
+    async fn get_resource_returns_404_when_not_found() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = get_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "missing-node".into(),
+            )),
+        )
+        .await;
+
+        let err = result.expect_err("get on missing object must return error");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::NOT_FOUND,
+            "get_resource must return 404 for a missing object so kubectl can display 'not found'"
+        );
+    }
+
+    /// get_resource returns the stored object when it exists.
+    #[tokio::test]
+    async fn get_resource_returns_stored_object() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-1" }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/worker-1",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = get_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-1".into(),
+            )),
+        )
+        .await;
+
+        let resp = result
+            .unwrap_or_else(|_| panic!("get_resource must return 200 for an existing CSINode"));
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// get_namespaced_resource returns 404 when the namespaced object does not exist.
+    #[tokio::test]
+    async fn get_namespaced_resource_returns_404_when_not_found() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = get_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "missing".into(),
+            )),
+        )
+        .await;
+
+        let err = result.expect_err("get on missing namespaced object must return error");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    // -- list_namespaced_resource direct call --
+
+    /// list_namespaced_resource returns an empty list when no objects exist for that namespace.
+    /// kubelet and controllers rely on empty lists rather than 404 when initializing.
+    #[tokio::test]
+    async fn list_namespaced_resource_returns_empty_list() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let resp = list_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
+            axum::Extension(crate::auth::UserInfo {
+                username: "test".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("list must succeed for a registered resource"));
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["kind"], "LeaseList");
+        assert!(val["items"].as_array().unwrap().is_empty());
+    }
+
+    // -- create_namespaced_resource --
+
+    /// create_namespaced_resource must persist the object and return 201 Created.
+    #[tokio::test]
+    async fn create_namespaced_resource_creates_and_returns_201() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-a", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-a", "leaseDurationSeconds": 40 }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("create_namespaced_resource must succeed"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "create_namespaced_resource must return 201 Created"
+        );
+
+        // Verify persisted
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/node-a";
+        assert!(
+            store.get(key).await.unwrap().is_some(),
+            "Lease must be in the store after create"
+        );
+    }
+
+    // -- delete_namespaced_resource: hard delete path --
+
+    /// delete_namespaced_resource must hard-delete objects without finalizers and return 200 Status.
+    #[tokio::test]
+    async fn delete_namespaced_resource_hard_deletes_and_returns_200() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Create a Lease without finalizers so delete goes straight to hard-delete.
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-b", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-b" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/node-b";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "node-b".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("delete_namespaced_resource must succeed for existing object"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::OK,
+            "hard-delete must return 200 with a Status object"
+        );
+
+        // Object must be gone from store.
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "Lease must be removed from the store after hard-delete"
+        );
+
+        // Response body must be a Status object.
+        let body = to_bytes(result.into_body(), 4096).await.unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["kind"], "Status");
+        assert_eq!(val["status"], "Success");
+    }
+
+    /// delete_namespaced_resource must return 404 when the object does not exist.
+    #[tokio::test]
+    async fn delete_namespaced_resource_returns_404_when_not_found() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "nonexistent".into(),
+            )),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND),
+            Ok(_) => panic!("delete of missing object must return 404 error"),
+        }
+    }
+
+    // -- put_resource_status --
+
+    /// put_resource_status replaces only the status field, leaving spec untouched.
+    /// Status subresource isolation is required so that controllers cannot accidentally
+    /// overwrite spec data when updating status (and vice versa).
+    #[tokio::test]
+    async fn put_resource_status_replaces_status_only() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a CSINode in the store.
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-1", "resourceVersion": "1" },
+            "spec": { "drivers": [{"name": "csi.io", "nodeID": "worker-1"}] }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/worker-1";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // PUT a new status.
+        let put_body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-1" },
+            "status": { "allocatable": {"count": 10} }
+        });
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-1".into(),
+            )),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+
+        assert!(result.is_ok(), "put_resource_status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        // Status updated.
+        assert_eq!(
+            v["status"]["allocatable"]["count"], 10,
+            "status must be updated after PUT"
+        );
+        // Spec preserved.
+        assert_eq!(
+            v["spec"]["drivers"][0]["name"], "csi.io",
+            "spec must be unchanged after status PUT"
+        );
+    }
+
+    // -- patch_resource_status --
+
+    /// patch_resource_status with merge-patch updates only the status sub-field.
+    /// Controllers that use PATCH on /status must not accidentally modify spec.
+    #[tokio::test]
+    async fn patch_resource_status_merge_patch_updates_status() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a CSINode.
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-2", "resourceVersion": "1" },
+            "spec": { "drivers": [{"name": "csi.io", "nodeID": "worker-2"}] },
+            "status": {}
+        });
+        let key = "/registry/storage.k8s.io/csinodes/worker-2";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let patch = serde_json::json!({"status": {"phase": "Ready"}});
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-2".into(),
+            )),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        assert!(result.is_ok(), "patch_resource_status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["phase"], "Ready",
+            "status.phase must be set after merge-patch on /status"
+        );
+        assert_eq!(
+            v["spec"]["drivers"][0]["name"], "csi.io",
+            "spec must be unchanged after status PATCH"
+        );
+    }
+
+    // -- json_patch_add: array insertion (non-dash index) and out-of-bounds --
+
+    /// json_patch_add with a numeric index inserts at the correct position.
+    #[test]
+    fn json_patch_add_inserts_at_numeric_index() {
+        let mut obj = serde_json::json!({"arr": ["a", "c"]});
+        let patch = serde_json::json!([{"op": "add", "path": "/arr/1", "value": "b"}]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert_eq!(obj["arr"], serde_json::json!(["a", "b", "c"]));
+    }
+
+    /// json_patch_add with an out-of-bounds index returns 422.
+    #[test]
+    fn json_patch_add_out_of_bounds_index_returns_422() {
+        let mut obj = serde_json::json!({"arr": ["a"]});
+        let patch = serde_json::json!([{"op": "add", "path": "/arr/99", "value": "x"}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// json_patch_add to a non-object/array (scalar) returns 422.
+    #[test]
+    fn json_patch_add_to_scalar_returns_422() {
+        let mut obj = serde_json::json!({"num": 42});
+        // Try to add a child of a scalar value — not possible.
+        let patch = serde_json::json!([{"op": "add", "path": "/num/child", "value": "x"}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// json_patch_add to root (empty pointer) replaces the entire document.
+    #[test]
+    fn json_patch_add_to_root_replaces_document() {
+        let mut obj = serde_json::json!({"old": true});
+        let patch = serde_json::json!([{"op": "add", "path": "", "value": {"new": true}}]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert_eq!(obj, serde_json::json!({"new": true}));
+    }
+
+    // -- json_patch_set: edge cases --
+
+    /// json_patch_set (replace) to root (empty pointer) replaces the entire document.
+    #[test]
+    fn json_patch_set_to_root_replaces_document() {
+        let mut obj = serde_json::json!({"old": 1});
+        let patch = serde_json::json!([{"op": "replace", "path": "", "value": {"new": 2}}]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert_eq!(obj, serde_json::json!({"new": 2}));
+    }
+
+    /// json_patch_set to a scalar parent returns 422 (cannot navigate).
+    #[test]
+    fn json_patch_set_to_scalar_parent_returns_422() {
+        let mut obj = serde_json::json!({"num": 42});
+        // Try to replace a child of a scalar.
+        let patch = serde_json::json!([{"op": "replace", "path": "/num/child", "value": "x"}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // -- json_patch_remove: edge cases --
+
+    /// json_patch_remove on root (empty path) returns 422 — cannot remove root.
+    #[test]
+    fn json_patch_remove_on_root_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "remove", "path": ""}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// json_patch_remove on an array index removes the element at that index.
+    #[test]
+    fn json_patch_remove_array_element() {
+        let mut obj = serde_json::json!({"arr": ["a", "b", "c"]});
+        let patch = serde_json::json!([{"op": "remove", "path": "/arr/1"}]);
+        ok(apply_json_patch(&mut obj, &patch));
+        assert_eq!(obj["arr"], serde_json::json!(["a", "c"]));
+    }
+
+    /// json_patch_remove on an out-of-bounds array index returns 422.
+    #[test]
+    fn json_patch_remove_out_of_bounds_array_returns_422() {
+        let mut obj = serde_json::json!({"arr": ["a"]});
+        let patch = serde_json::json!([{"op": "remove", "path": "/arr/99"}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// json_patch_remove from a non-object/array scalar returns 422.
+    #[test]
+    fn json_patch_remove_from_scalar_parent_returns_422() {
+        let mut obj = serde_json::json!({"num": 42});
+        let patch = serde_json::json!([{"op": "remove", "path": "/num/child"}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // -- apply_json_patch: missing required fields --
+
+    /// apply_json_patch returns 422 when an operation is missing the 'op' field.
+    #[test]
+    fn apply_json_patch_missing_op_field_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        // No "op" key in the operation object.
+        let patch = serde_json::json!([{"path": "/a", "value": 2}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// apply_json_patch returns 422 when an operation is missing the 'path' field.
+    #[test]
+    fn apply_json_patch_missing_path_field_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "add", "value": 2}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// apply_json_patch returns 422 when patch is not an array.
+    #[test]
+    fn apply_json_patch_non_array_patch_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!({"op": "add", "path": "/b", "value": 2});
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// apply_json_patch 'add' returns 422 when the 'value' field is missing.
+    #[test]
+    fn apply_json_patch_add_missing_value_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "add", "path": "/b"}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// apply_json_patch 'replace' returns 422 when the 'value' field is missing.
+    #[test]
+    fn apply_json_patch_replace_missing_value_returns_422() {
+        let mut obj = serde_json::json!({"a": 1});
+        let patch = serde_json::json!([{"op": "replace", "path": "/a"}]);
+        let err = apply_json_patch(&mut obj, &patch).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }
 
 #[cfg(test)]
