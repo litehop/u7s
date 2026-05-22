@@ -2826,4 +2826,824 @@ mod tests {
             "CRD without schema must accept any body (permissive mode)"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Cluster-scoped replace_cr tests
+    // ---------------------------------------------------------------------------
+
+    // replace_cr (cluster-scoped) must update the stored object and return 200.
+    // This is the happy-path for cluster-scoped CR updates — controllers call PUT
+    // on the main endpoint to change spec.
+    #[tokio::test]
+    async fn cluster_scoped_replace_cr_round_trip() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "my-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name },
+                "spec": { "color": "red" }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            replace_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                axum::http::HeaderMap::new(),
+                update_body,
+            )
+            .await
+            .is_ok(),
+            "cluster-scoped replace must succeed"
+        );
+
+        // Verify the update was persisted.
+        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed after replace"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["spec"]["color"], "red",
+            "spec must be updated by replace"
+        );
+    }
+
+    // replace_cr on a non-existent object must return 404.
+    // Cluster-scoped PUT must not create resources that don't exist — that is
+    // only the job of POST (create).
+    #[tokio::test]
+    async fn cluster_scoped_replace_cr_missing_returns_404() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let err = expect_err_status(
+            replace_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "nonexistent".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "example.io/v1",
+                        "kind": "Widget",
+                        "metadata": { "name": "nonexistent" },
+                        "spec": {}
+                    })
+                    .to_string(),
+                ),
+            )
+            .await,
+            "replace on missing object must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+        assert_eq!(json["reason"], "NotFound");
+    }
+
+    // replace_cr with a name mismatch between URL and body must return 400.
+    // Kubernetes enforces that the object name in the body matches the URL segment.
+    #[tokio::test]
+    async fn cluster_scoped_replace_cr_name_mismatch_returns_400() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        // First create the object.
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                widget_body("actual-name"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Attempt replace with body.metadata.name != URL segment.
+        let err = expect_err_status(
+            replace_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "actual-name".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "example.io/v1",
+                        "kind": "Widget",
+                        "metadata": { "name": "different-name" },
+                        "spec": {}
+                    })
+                    .to_string(),
+                ),
+            )
+            .await,
+            "name mismatch must return 400",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 400,
+            "name mismatch must return 400 Bad Request"
+        );
+    }
+
+    // replace_cr with a namespaced CRD must return 404 (wrong scope).
+    // The cluster-scoped endpoint must not serve namespaced CRDs.
+    #[tokio::test]
+    async fn cluster_scoped_replace_cr_with_namespaced_crd_returns_404() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let err = expect_err_status(
+            replace_cr(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    "applications".to_string(),
+                    "my-app".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "argoproj.io/v1alpha1",
+                        "kind": "Application",
+                        "metadata": { "name": "my-app" },
+                        "spec": {}
+                    })
+                    .to_string(),
+                ),
+            )
+            .await,
+            "namespaced CRD on cluster-scoped replace must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+    }
+
+    // replace_cr strips .status when the CRD declares a status subresource.
+    // This is symmetric to the namespaced case tested in
+    // `namespaced_main_put_strips_status_when_has_status_subresource`.
+    #[tokio::test]
+    async fn cluster_scoped_replace_cr_strips_status_when_has_status_subresource() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "my-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name },
+                "spec": { "color": "green" },
+                "status": { "ready": true, "message": "MUST_NOT_BE_STORED" }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            replace_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                axum::http::HeaderMap::new(),
+                update_body,
+            )
+            .await
+            .is_ok(),
+            "replace must succeed"
+        );
+
+        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            obj["status"].is_null() || obj.get("status").is_none(),
+            "status must NOT be stored by main PUT when status subresource is declared"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Cluster-scoped delete_cr tests
+    // ---------------------------------------------------------------------------
+
+    // delete_cr must remove the object from the store; a subsequent get must return 404.
+    // This is the happy-path for cluster-scoped CR deletion.
+    #[tokio::test]
+    async fn cluster_scoped_delete_cr_success() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "to-delete".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        assert!(
+            delete_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+            )
+            .await
+            .is_ok(),
+            "delete must succeed"
+        );
+
+        // Subsequent get must return 404.
+        let err = expect_err_status(
+            get_cr(State(state.clone()), Path((group, version, plural, name))).await,
+            "get after delete must return 404",
+        );
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+    }
+
+    // delete_cr on a non-existent object must return 404.
+    // Deleting a missing cluster-scoped CR must not silently succeed.
+    #[tokio::test]
+    async fn cluster_scoped_delete_cr_missing_returns_404() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let err = expect_err_status(
+            delete_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "nonexistent".to_string(),
+                )),
+            )
+            .await,
+            "delete on missing object must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+        assert_eq!(json["reason"], "NotFound");
+    }
+
+    // delete_cr with a namespaced CRD must return 404 (wrong scope).
+    #[tokio::test]
+    async fn cluster_scoped_delete_cr_with_namespaced_crd_returns_404() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let err = expect_err_status(
+            delete_cr(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    "applications".to_string(),
+                    "my-app".to_string(),
+                )),
+            )
+            .await,
+            "namespaced CRD on cluster-scoped delete must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Cluster-scoped patch_cr tests
+    // ---------------------------------------------------------------------------
+
+    // patch_cr must apply the merge patch and return the updated object.
+    // This verifies the cluster-scoped patch handler — symmetric to
+    // `patch_cr_namespaced_applies_merge_patch`.
+    #[tokio::test]
+    async fn cluster_scoped_patch_cr_applies_merge_patch() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "patch-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body =
+            Bytes::from(serde_json::json!({ "spec": { "color": "purple" } }).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "cluster-scoped patch must succeed"
+        );
+
+        // Verify the patch was applied.
+        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed after patch"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["spec"]["color"], "purple",
+            "spec.color must be updated by patch"
+        );
+    }
+
+    // patch_cr with wrong Content-Type must return 415.
+    // This verifies validate_patch_content_type fires on the cluster-scoped path.
+    #[tokio::test]
+    async fn cluster_scoped_patch_cr_rejects_wrong_content_type() {
+        let state = make_state();
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let err = expect_err_status(
+            patch_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "my-widget".to_string(),
+                )),
+                headers,
+                Bytes::from(b"{}".to_vec()),
+            )
+            .await,
+            "wrong content type must return 415",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 415, "wrong content type must return 415");
+    }
+
+    // patch_cr on a non-existent object must return 404.
+    #[tokio::test]
+    async fn cluster_scoped_patch_cr_missing_returns_404() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let err = expect_err_status(
+            patch_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "nonexistent".to_string(),
+                )),
+                headers,
+                Bytes::from(serde_json::json!({ "spec": {} }).to_string()),
+            )
+            .await,
+            "patch on missing object must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+        assert_eq!(json["reason"], "NotFound");
+    }
+
+    // patch_cr with a namespaced CRD must return 404 (wrong scope).
+    #[tokio::test]
+    async fn cluster_scoped_patch_cr_with_namespaced_crd_returns_404() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let err = expect_err_status(
+            patch_cr(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    "applications".to_string(),
+                    "my-app".to_string(),
+                )),
+                headers,
+                Bytes::from(serde_json::json!({ "spec": {} }).to_string()),
+            )
+            .await,
+            "namespaced CRD on cluster-scoped patch must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+    }
+
+    // patch_cr strips .status when the CRD declares a status subresource.
+    // Controllers must use PATCH /status for status updates; the main patch endpoint
+    // must silently drop any .status in the patch to prevent accidental overwrites.
+    #[tokio::test]
+    async fn cluster_scoped_patch_cr_strips_status_when_has_status_subresource() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "status-patch-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "spec": { "color": "orange" },
+                "status": { "ready": true, "message": "MUST_NOT_BE_STORED" }
+            })
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "patch must succeed"
+        );
+
+        let resp = match get_cr(State(state.clone()), Path((group, version, plural, name))).await {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            obj["status"].is_null() || obj.get("status").is_none(),
+            "status must NOT be stored by main PATCH when status subresource is declared"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // get_cr_status tests
+    // ---------------------------------------------------------------------------
+
+    // get_cr_status must return the full object for a cluster-scoped CR.
+    // The status field is embedded in the object — this handler is equivalent to
+    // get_cr for CRs (there is no separate .status document).
+    #[tokio::test]
+    async fn get_cr_status_cluster_scoped_returns_object() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "status-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let resp =
+            match get_cr_status(State(state.clone()), Path((group, version, plural, name))).await {
+                Ok(r) => r,
+                Err(_) => panic!("get_cr_status must succeed for existing cluster-scoped CR"),
+            };
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "get_cr_status must return 200 for existing object"
+        );
+    }
+
+    // get_cr_status for a missing cluster-scoped CR must return 404.
+    #[tokio::test]
+    async fn get_cr_status_missing_cluster_scoped_returns_404() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let err = expect_err_status(
+            get_cr_status(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "nonexistent".to_string(),
+                )),
+            )
+            .await,
+            "get_cr_status on missing object must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+        assert_eq!(json["reason"], "NotFound");
+    }
+
+    // get_cr_status for a namespaced CRD via the cluster-scoped path must return 404.
+    // The cluster-scoped status endpoint must not serve namespaced CRDs.
+    #[tokio::test]
+    async fn get_cr_status_with_namespaced_crd_returns_404() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let err = expect_err_status(
+            get_cr_status(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    "applications".to_string(),
+                    "my-app".to_string(),
+                )),
+            )
+            .await,
+            "get_cr_status with namespaced CRD must return 404",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Additional coverage for validate_cr_name and list_cr normal path
+    // ---------------------------------------------------------------------------
+
+    // validate_cr_name must reject names with invalid characters (e.g. spaces or underscores).
+    // Only ASCII alphanumeric, hyphens, and dots are permitted in CR names; other characters
+    // would create objects that can't be round-tripped through standard Kubernetes tooling.
+    #[test]
+    fn validate_cr_name_rejects_invalid_chars() {
+        let err = match validate_cr_name("invalid name!") {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for name with invalid chars"),
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 400,
+            "invalid chars must return 400 Bad Request"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("invalid characters"),
+            "error message must mention invalid characters"
+        );
+    }
+
+    // list_cr (cluster-scoped, non-watch) must return an empty list when no CRs exist.
+    // This tests the normal list path — distinct from the watch and 404 paths already
+    // covered by other tests.
+    #[tokio::test]
+    async fn cluster_scoped_list_cr_empty() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let resp = match list_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            no_watch_query(),
+            "test-user".to_string(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("list must succeed even when empty"),
+        };
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "cluster-scoped list must return 200"
+        );
+    }
+
+    // list_cr (cluster-scoped, non-watch) must include created items.
+    #[tokio::test]
+    async fn cluster_scoped_list_cr_returns_created_items() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                widget_body("listed-widget"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let resp = match list_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            no_watch_query(),
+            "test-user".to_string(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("list must succeed after create"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Additional validate_against_schema branch coverage
+    // ---------------------------------------------------------------------------
+
+    // validate_against_schema must report the correct type name for null.
+    // json_type_name(Null) → "null"; type:string with null value must fail with "null" in the message.
+    #[test]
+    fn schema_null_value_type_error_mentions_null() {
+        let schema = serde_json::json!({ "type": "string" });
+        let err = validate_against_schema(&serde_json::Value::Null, &schema, "f").unwrap_err();
+        assert!(
+            err.contains("null"),
+            "type error for null must mention 'null' (got: {err})"
+        );
+    }
+
+    // validate_against_schema must report the correct type name for an array.
+    // json_type_name(Array) → "array"; type:string with array value must fail with "array" in message.
+    #[test]
+    fn schema_array_value_type_error_mentions_array() {
+        let schema = serde_json::json!({ "type": "string" });
+        let err = validate_against_schema(&serde_json::json!([1, 2, 3]), &schema, "f").unwrap_err();
+        assert!(
+            err.contains("array"),
+            "type error for array must mention 'array' (got: {err})"
+        );
+    }
+
+    // validate_against_schema: type:number accepts floats.
+    // json_type_name for a float is "number", and the type constraint "number" accepts it.
+    #[test]
+    fn schema_number_type_accepts_float() {
+        let schema = serde_json::json!({ "type": "number" });
+        assert!(
+            validate_against_schema(&serde_json::json!(1.5), &schema, "f").is_ok(),
+            "type:number must accept a float value"
+        );
+    }
+
+    // validate_against_schema: type:number rejects a string.
+    // The error message must include "number" as the expected type.
+    #[test]
+    fn schema_number_type_rejects_string() {
+        let schema = serde_json::json!({ "type": "number" });
+        let err =
+            validate_against_schema(&serde_json::json!("not-a-number"), &schema, "f").unwrap_err();
+        assert!(
+            err.contains("number"),
+            "type error must mention 'number' (got: {err})"
+        );
+    }
 }
