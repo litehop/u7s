@@ -18,6 +18,7 @@ use crate::{
     keys::{cluster_object_key, object_key},
     state::AppState,
     status::Status,
+    types::ObjectMeta,
 };
 
 // ---------------------------------------------------------------------------
@@ -128,7 +129,11 @@ pub async fn create_token(
     // 5. Extract UID from the stored ServiceAccount object.
     let uid = serde_json::from_slice::<serde_json::Value>(&sa.value)
         .ok()
-        .and_then(|v| v["metadata"]["uid"].as_str().map(str::to_owned))
+        .and_then(|v| {
+            let meta: ObjectMeta =
+                serde_json::from_value(v["metadata"].clone()).unwrap_or_default();
+            meta.uid
+        })
         .unwrap_or_default();
 
     // 6. Mint JWT.
