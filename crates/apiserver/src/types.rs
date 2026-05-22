@@ -281,6 +281,15 @@ pub struct ObjectMeta {
 }
 
 // ---------------------------------------------------------------------------
+// NamespaceStatus — typed status for Namespace objects
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamespaceStatus {
+    pub phase: String,
+}
+
+// ---------------------------------------------------------------------------
 // Kubernetes object store type
 // ---------------------------------------------------------------------------
 
@@ -313,6 +322,40 @@ impl Object {
     pub fn from_bytes(bytes: &Bytes) -> Result<Self, serde_json::Error> {
         let body: Value = serde_json::from_slice(bytes)?;
         Ok(Self { body })
+    }
+}
+
+#[cfg(test)]
+mod namespace_status_tests {
+    use super::*;
+
+    /// NamespaceStatus must serialize to {"phase":"<value>"} so that a Namespace stored
+    /// with typed construction matches what clients (kubectl) expect to read back.
+    /// A field rename regression would silently produce wrong JSON without this test.
+    #[test]
+    fn namespace_status_serializes_to_phase_key() {
+        let s = NamespaceStatus {
+            phase: "Active".to_owned(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["phase"], "Active");
+        // Must not emit any extra or renamed keys
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            1,
+            "NamespaceStatus must only emit 'phase'"
+        );
+    }
+
+    /// NamespaceStatus must round-trip through JSON so stored values can be read back.
+    #[test]
+    fn namespace_status_round_trips() {
+        let original = NamespaceStatus {
+            phase: "Terminating".to_owned(),
+        };
+        let v = serde_json::to_value(&original).unwrap();
+        let restored: NamespaceStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(restored.phase, "Terminating");
     }
 }
 
