@@ -1198,17 +1198,18 @@ mod tests {
     fn body_limit_is_within_safe_range() {
         // 1 MiB minimum: kubectl configmaps can be up to ~1 MiB in practice.
         // 8 MiB maximum: etcd's default value limit; no valid object exceeds this.
-        const MIN_SAFE: usize = 1 * 1024 * 1024;
-        const MAX_SAFE: usize = 8 * 1024 * 1024;
+        let limit = MAX_BODY_BYTES;
+        let min_safe: usize = 1024 * 1024;
+        let max_safe: usize = 8 * 1024 * 1024;
         assert!(
-            MAX_BODY_BYTES >= MIN_SAFE,
+            limit >= min_safe,
             "body limit {} is too small; kubectl manifests can be up to 1 MiB",
-            MAX_BODY_BYTES
+            limit
         );
         assert!(
-            MAX_BODY_BYTES <= MAX_SAFE,
+            limit <= max_safe,
             "body limit {} is too large; risk of OOM from a single request",
-            MAX_BODY_BYTES
+            limit
         );
     }
 

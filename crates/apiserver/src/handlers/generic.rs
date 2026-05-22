@@ -4074,7 +4074,7 @@ mod tests {
         );
 
         // Create the Lease via PUT (no resourceVersion → unconditional create).
-        replace_namespaced_resource(
+        let _ = replace_namespaced_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((
                 "coordination.k8s.io".to_string(),
@@ -4426,9 +4426,8 @@ mod tests {
             send_initial_events: None,
             allow_watch_bookmarks: Some(true),
         };
-        assert_eq!(
+        assert!(
             q_true.allow_watch_bookmarks == Some(true),
-            true,
             "allowWatchBookmarks=true must enable periodic bookmarks"
         );
 

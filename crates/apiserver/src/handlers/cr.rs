@@ -1827,7 +1827,7 @@ mod tests {
             "status body code field must be 415"
         );
         assert!(
-            body.to_lowercase().find("phase").is_none(),
+            !body.to_lowercase().contains("phase"),
             "error message must not contain 'phase' (got: {body})"
         );
     }
@@ -1938,19 +1938,6 @@ mod tests {
             .is_ok(),
             "install cluster CRD with status subresource"
         );
-    }
-
-    fn app_body_with_spec_and_status(name: &str, ns: &str) -> Bytes {
-        Bytes::from(
-            serde_json::json!({
-                "apiVersion": "argoproj.io/v1alpha1",
-                "kind": "Application",
-                "metadata": { "name": name, "namespace": ns },
-                "spec": { "destination": { "namespace": "default" } },
-                "status": { "phase": "Running", "health": "Healthy" }
-            })
-            .to_string(),
-        )
     }
 
     // PUT to the main endpoint for a CR whose CRD declares a status subresource must
