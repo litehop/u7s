@@ -3754,6 +3754,75 @@ mod tests {
         );
     }
 
+    // replace_cr_namespaced with a stale resourceVersion must return 409 Conflict (mayor-gg9u).
+    // Optimistic concurrency control (OCC) protects against lost updates: if a client sends
+    // a PUT with a resourceVersion that no longer matches the stored revision, the server
+    // must reject the write with 409 rather than silently overwriting concurrent changes.
+    #[tokio::test]
+    async fn replace_cr_namespaced_with_stale_resource_version_returns_409() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "occ-app".to_string();
+
+        // Create the CR — this assigns an initial resourceVersion.
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Attempt replace with resourceVersion: "999" — a non-zero value that won't match
+        // the actual stored revision. The store rejects this with RevisionMismatch, which
+        // must produce HTTP 409 (not 500). Using "0" would yield AlreadyExists instead.
+        let stale_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": &name, "namespace": &ns, "resourceVersion": "999" },
+                "spec": { "destination": { "namespace": "production" } }
+            })
+            .to_string(),
+        );
+
+        let err = expect_err_status(
+            replace_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    group.clone(),
+                    version.clone(),
+                    ns.clone(),
+                    plural.clone(),
+                    name.clone(),
+                )),
+                axum::http::HeaderMap::new(),
+                stale_body,
+            )
+            .await,
+            "replace with stale resourceVersion must return 409",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 409,
+            "stale resourceVersion must return 409 Conflict (got: {json})"
+        );
+        assert_eq!(
+            json["reason"], "Conflict",
+            "reason must be Conflict (got: {json})"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Regression: empty-group list response must not produce "/v1alpha1" apiVersion (mayor-q04t)
     // ---------------------------------------------------------------------------
