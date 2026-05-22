@@ -281,6 +281,43 @@ pub struct ObjectMeta {
 }
 
 // ---------------------------------------------------------------------------
+// PodSpec — typed pod spec (fields accessed by handlers and scheduler)
+// ---------------------------------------------------------------------------
+
+fn default_true() -> bool {
+    true
+}
+
+/// Typed representation of the fields in a Pod's `spec` that are read by
+/// handlers. Parsing at the handler boundary catches typos the compiler
+/// cannot see in raw `["nodeName"]` indexing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PodSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    #[serde(default = "default_true")]
+    pub enable_service_links: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Binding — typed Binding subresource body
+// ---------------------------------------------------------------------------
+
+/// The `target` field of a Binding object.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BindingTarget {
+    pub name: String,
+}
+
+/// Typed representation of the Binding subresource body POSTed by the
+/// scheduler. Using this instead of raw `binding["target"]["name"]` indexing
+/// means a typo in the field path is a compile error, not a silent None.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Binding {
+    pub target: BindingTarget,
+}
+
 // NamespaceStatus — typed status for Namespace objects
 // ---------------------------------------------------------------------------
 
@@ -652,5 +689,107 @@ mod tests {
     fn object_from_bytes_invalid_json() {
         let bad = Bytes::from_static(b"not json");
         assert!(Object::from_bytes(&bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pod_spec_tests {
+    use super::*;
+
+    /// PodSpec must deserialize `nodeName` from camelCase JSON.
+    /// The scheduler and field-selector handler read `node_name` to route pods;
+    /// a wrong rename annotation silently leaves all pods unscheduled.
+    #[test]
+    fn pod_spec_deserializes_node_name() {
+        let json = serde_json::json!({"nodeName": "worker-1"});
+        let spec: PodSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.node_name.as_deref(), Some("worker-1"));
+    }
+
+    /// PodSpec must default `node_name` to None when the field is absent.
+    /// An unscheduled pod has no nodeName; None must not be confused with "".
+    #[test]
+    fn pod_spec_node_name_defaults_to_none() {
+        let spec: PodSpec = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(spec.node_name.is_none());
+    }
+
+    /// PodSpec must default `enable_service_links` to true when absent.
+    /// Kubernetes always defaults this field on create; the kubelet panics if it
+    /// is nil (CreateContainerConfigError). Defaulting here ensures typed structs
+    /// match the wire behaviour.
+    #[test]
+    fn pod_spec_enable_service_links_defaults_to_true() {
+        let spec: PodSpec = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(
+            spec.enable_service_links,
+            "enableServiceLinks must default to true to match real kube-apiserver behaviour"
+        );
+    }
+
+    /// PodSpec must respect an explicit `enableServiceLinks: false`.
+    #[test]
+    fn pod_spec_enable_service_links_false_is_preserved() {
+        let json = serde_json::json!({"enableServiceLinks": false});
+        let spec: PodSpec = serde_json::from_value(json).unwrap();
+        assert!(!spec.enable_service_links);
+    }
+
+    /// PodSpec must not emit `nodeName` in serialized output when it is None.
+    /// Emitting null would confuse clients that check for key presence.
+    #[test]
+    fn pod_spec_serialization_omits_absent_node_name() {
+        let spec = PodSpec {
+            node_name: None,
+            enable_service_links: true,
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert!(v.get("nodeName").is_none());
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    /// Binding must deserialize `target.name` from a full Kubernetes Binding body.
+    /// The scheduler POSTs this shape to bind a pod to a node; a wrong field
+    /// path silently leaves pods unscheduled.
+    #[test]
+    fn binding_deserializes_target_name() {
+        let json = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Binding",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "target": {"kind": "Node", "name": "worker-1"}
+        });
+        let binding: Binding = serde_json::from_value(json).unwrap();
+        assert_eq!(binding.target.name, "worker-1");
+    }
+
+    /// Binding deserialization must fail when `target` is absent.
+    /// An absent target cannot produce a valid node name; the handler must
+    /// reject the request with 400, not silently bind to an empty node name.
+    #[test]
+    fn binding_fails_without_target() {
+        let json = serde_json::json!({"apiVersion": "v1", "kind": "Binding"});
+        let result = serde_json::from_value::<Binding>(json);
+        assert!(
+            result.is_err(),
+            "Binding without target must fail deserialization"
+        );
+    }
+
+    /// Binding deserialization must fail when `target.name` is absent.
+    /// BindingTarget.name is a required String field; missing it means the
+    /// scheduler sent a malformed request that must not proceed.
+    #[test]
+    fn binding_target_fails_without_name() {
+        let json = serde_json::json!({"target": {}});
+        let result = serde_json::from_value::<Binding>(json);
+        assert!(
+            result.is_err(),
+            "Binding with empty target must fail deserialization — name is required"
+        );
     }
 }
