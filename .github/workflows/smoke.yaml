@@ -465,3 +465,133 @@ jobs:
           path: |
             ${{ env.SMOKE_TMPDIR }}/server.log
             ${{ env.SMOKE_TMPDIR }}/kubelet.log
+
+  kcm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        k8s: ["1.34.8", "1.35.5", "1.36.1"]
+    name: kcm ${{ matrix.k8s }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install kubectl ${{ matrix.k8s }}
+        run: |
+          MINOR=$(echo "${{ matrix.k8s }}" | cut -d. -f1-2)
+          curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/Release.key" \
+            | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/ /" \
+            | sudo tee /etc/apt/sources.list.d/kubernetes.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --allow-downgrades "kubectl=${{ matrix.k8s }}-*"
+          sudo apt-mark hold kubectl
+
+      - name: Build release binary
+        run: cargo build --release -p u7s-apiserver
+
+      - name: Start apiserver
+        env:
+          RUST_LOG: info
+        run: |
+          TMPDIR=$(mktemp -d)
+          echo "SMOKE_TMPDIR=$TMPDIR" >> "$GITHUB_ENV"
+          SMOKE_TOKEN="kcm-admin-token-$(date +%s)"
+          echo "$SMOKE_TOKEN,kcm-admin,uid0,system:masters" > "$TMPDIR/token-auth.csv"
+          ./target/release/u7s-apiserver \
+            --db "$TMPDIR/state.db" \
+            --kubeconfig "$TMPDIR/kubeconfig" \
+            --sa-key "$TMPDIR/sa.key" \
+            --sa-pub "$TMPDIR/sa.pub" \
+            --ca-key "$TMPDIR/ca.key" \
+            --ca-cert "$TMPDIR/ca.crt" \
+            --token-auth-file "$TMPDIR/token-auth.csv" \
+            --advertise-address https://127.0.0.1:6443 \
+            >"$TMPDIR/server.log" 2>&1 &
+          echo "SERVER_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            nc -z 127.0.0.1 6443 2>/dev/null && break
+            sleep 1
+          done
+          nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$TMPDIR/server.log"; exit 1; }
+          # Save cert-based kubeconfig before overwriting with token kubeconfig.
+          cp "$TMPDIR/kubeconfig" "$TMPDIR/kubeconfig-cert"
+          CA_DATA=$(grep "certificate-authority-data" "$TMPDIR/kubeconfig" | awk '{print $2}')
+          echo "SMOKE_TOKEN=$SMOKE_TOKEN" >> "$GITHUB_ENV"
+          printf '%s\n' \
+            'apiVersion: v1' \
+            'kind: Config' \
+            'clusters:' \
+            '- cluster:' \
+            '    server: https://127.0.0.1:6443' \
+            "    certificate-authority-data: $CA_DATA" \
+            '  name: u7s' \
+            'contexts:' \
+            '- context:' \
+            '    cluster: u7s' \
+            '    user: kcm-admin' \
+            '  name: u7s' \
+            'current-context: u7s' \
+            'users:' \
+            '- name: kcm-admin' \
+            '  user:' \
+            "    token: $SMOKE_TOKEN" \
+            > "$TMPDIR/kubeconfig"
+
+      - name: Download kube-controller-manager
+        run: |
+          TMPDIR="${{ env.SMOKE_TMPDIR }}"
+          K8S_VERSION="${{ matrix.k8s }}"
+          curl -fsSL "https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/amd64/kube-controller-manager" \
+            -o "$TMPDIR/kube-controller-manager"
+          chmod +x "$TMPDIR/kube-controller-manager"
+
+      - name: Extract CA cert and start kcm
+        run: |
+          TMPDIR="${{ env.SMOKE_TMPDIR }}"
+          grep "certificate-authority-data" "$TMPDIR/kubeconfig-cert" | awk '{print $2}' | base64 -d > "$TMPDIR/ca.pem"
+          "$TMPDIR/kube-controller-manager" \
+            --kubeconfig="$TMPDIR/kubeconfig-cert" \
+            --cluster-signing-cert-file="$TMPDIR/ca.pem" \
+            --cluster-signing-key-file="$TMPDIR/ca.key" \
+            --service-account-private-key-file="$TMPDIR/sa.key" \
+            --root-ca-file="$TMPDIR/ca.pem" \
+            --controllers=csrapproving,csrsigning,garbagecollector \
+            --use-service-account-credentials=false \
+            --leader-elect=false \
+            --bind-address=127.0.0.1 \
+            >"$TMPDIR/kcm.log" 2>&1 &
+          echo "KCM_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for kcm to be alive
+        run: |
+          TMPDIR="${{ env.SMOKE_TMPDIR }}"
+          for i in $(seq 1 30); do
+            kill -0 "$KCM_PID" 2>/dev/null && break
+            sleep 1
+          done
+          kill -0 "$KCM_PID" 2>/dev/null || { echo "kcm failed to start"; cat "$TMPDIR/kcm.log"; exit 1; }
+
+      - name: Assert kcm stays alive for 10s
+        run: |
+          sleep 10
+          kill -0 "$KCM_PID" || { echo "kcm exited"; cat "${{ env.SMOKE_TMPDIR }}/kcm.log"; exit 1; }
+
+      - name: Stop u7s and kcm
+        if: always()
+        run: |
+          [ -n "$KCM_PID" ] && kill "$KCM_PID" 2>/dev/null || true
+          [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kcm-smoke-logs-${{ matrix.k8s }}
+          path: |
+            ${{ env.SMOKE_TMPDIR }}/kcm.log
+            ${{ env.SMOKE_TMPDIR }}/server.log

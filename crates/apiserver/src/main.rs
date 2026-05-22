@@ -187,6 +187,11 @@ async fn main() -> anyhow::Result<()> {
 
 fn build_router(state: AppState) -> Router {
     Router::new()
+        // Health endpoints — no auth required; kube-controller-manager polls these
+        // before declaring the apiserver ready. Listed in is_exempt() in auth.rs.
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/livez", get(|| async { "ok" }))
+        .route("/readyz", get(|| async { "ok" }))
         // Server version — no auth required (sonobuoy, kubectl version)
         .route("/version", get(handlers::discovery::version))
         // Core discovery
@@ -1199,6 +1204,46 @@ mod tests {
         seed_serviceaccounts(&store)
             .await
             .expect("second seed must not fail");
+    }
+
+    /// Health endpoints must return 200 OK with body "ok".
+    ///
+    /// kube-controller-manager polls /healthz before it considers the apiserver
+    /// ready and starts its control loops. If these routes are absent, kcm
+    /// exits immediately after startup with "failed to contact apiserver".
+    /// /livez and /readyz are polled by infrastructure health probes.
+    #[tokio::test]
+    async fn health_endpoints_return_200_ok() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        for path in ["/healthz", "/livez", "/readyz"] {
+            let req = Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .expect("request build must not fail");
+            let resp = router.call(req).await.expect("router must not error");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} must return 200 OK — kcm polls this before starting its control loops"
+            );
+            let body = to_bytes(resp.into_body(), 64)
+                .await
+                .expect("body collect must not fail");
+            assert_eq!(body.as_ref(), b"ok", "{path} body must be 'ok'");
+        }
     }
 
     /// The body size limit must be at least 1 MiB (to accommodate real kubectl
