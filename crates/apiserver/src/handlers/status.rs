@@ -294,6 +294,607 @@ mod tests {
         h
     }
 
+    fn merge_patch_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        h
+    }
+
+    fn make_state() -> crate::state::AppState {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    /// get_resource_status returns 404 when the cluster-scoped object does not exist.
+    /// Status reads delegate to get_resource; a missing object must never return 200.
+    #[tokio::test]
+    async fn get_resource_status_returns_404_for_missing() {
+        let state = make_state();
+        let result = get_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "nonexistent".into(),
+            )),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 404 error"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// get_resource_status returns the stored object (same as get_resource) when it exists.
+    /// Controllers read status via this path; returning the full object is correct.
+    #[tokio::test]
+    async fn get_resource_status_returns_stored_object() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-1" },
+            "spec": { "drivers": [] },
+            "status": { "ready": true }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/worker-1",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let result = get_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-1".into(),
+            )),
+        )
+        .await;
+        let resp = match result {
+            Ok(r) => r,
+            Err(_) => panic!("get_resource_status must succeed when object exists"),
+        };
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// put_resource_status returns 404 when the cluster-scoped object does not exist.
+    /// Controllers must not create objects via the status subresource.
+    #[tokio::test]
+    async fn put_resource_status_returns_404_for_missing_resource() {
+        let state = make_state();
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "nonexistent" },
+            "status": { "ready": true }
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "nonexistent".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 404 error"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// put_resource_status with a null status body removes the status field.
+    /// When a controller explicitly sets status=null, the field must be removed
+    /// rather than set to null — Kubernetes serializes absent and null fields differently.
+    #[tokio::test]
+    async fn put_resource_status_null_status_removes_field() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-3" },
+            "spec": { "drivers": [] },
+            "status": { "ready": true }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/worker-3";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // PUT body with explicit null status (JSON: "status": null)
+        let null_body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "worker-3" },
+            "status": null
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "worker-3".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&null_body).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "put with null status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v.get("status").is_none(),
+            "null status in PUT body must remove the status field from the stored object"
+        );
+    }
+
+    /// patch_resource_status returns 404 when cluster-scoped object does not exist.
+    /// Controllers must receive an unambiguous error so they know the resource is gone.
+    #[tokio::test]
+    async fn patch_resource_status_returns_404_for_missing_resource() {
+        let state = make_state();
+        let patch = serde_json::json!({"status": {"phase": "Failed"}});
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "nonexistent".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 404 error"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// get_namespaced_resource_status returns the stored object when it exists.
+    /// Namespaced controllers (e.g. Deployment controller) read status via this path.
+    #[tokio::test]
+    async fn get_namespaced_resource_status_returns_stored_object() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-x", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-x" }
+        });
+        store
+            .put(
+                "/registry/coordination.k8s.io/leases/kube-node-lease/node-x",
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let result = get_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "node-x".into(),
+            )),
+        )
+        .await;
+        let resp = match result {
+            Ok(r) => r,
+            Err(_) => panic!("get_namespaced_resource_status must succeed when object exists"),
+        };
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// get_namespaced_resource_status returns 404 when the object does not exist.
+    #[tokio::test]
+    async fn get_namespaced_resource_status_returns_404_for_missing() {
+        let state = make_state();
+        let result = get_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "nonexistent".into(),
+            )),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 404 error"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// put_namespaced_resource_status updates only the status field for a registered resource.
+    /// The spec must remain unchanged — status isolation is critical for controllers.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_updates_status() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-y", "namespace": "kube-node-lease", "resourceVersion": "1" },
+            "spec": { "holderIdentity": "node-y", "leaseDurationSeconds": 40 }
+        });
+        store
+            .put(
+                "/registry/coordination.k8s.io/leases/kube-node-lease/node-y",
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let put_body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-y", "namespace": "kube-node-lease" },
+            "status": { "phase": "Active" }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "node-y".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "put_namespaced_resource_status must succeed"
+        );
+        let stored = store
+            .get("/registry/coordination.k8s.io/leases/kube-node-lease/node-y")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["status"]["phase"], "Active");
+        assert_eq!(v["spec"]["holderIdentity"], "node-y");
+    }
+
+    /// put_namespaced_resource_status returns 404 when the object does not exist.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_returns_404_for_missing() {
+        let state = make_state();
+        let body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "missing", "namespace": "kube-node-lease" },
+            "status": { "phase": "Active" }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "missing".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 404 error"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// put_namespaced_resource_status with null status removes the status field.
+    /// Same semantics as the cluster-scoped variant — controllers can clear status.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_null_status_removes_field() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-z", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node-z" },
+            "status": { "phase": "Active" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/node-z";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let null_body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-z", "namespace": "kube-node-lease" },
+            "status": null
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "node-z".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&null_body).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "put with null status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v.get("status").is_none(),
+            "null status in PUT body must remove the status field"
+        );
+    }
+
+    /// patch_namespaced_resource_status with merge-patch updates the status field.
+    /// This is the primary path used by namespaced controllers to report status.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_with_merge_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "node-w", "namespace": "kube-node-lease", "resourceVersion": "1" },
+            "spec": { "holderIdentity": "node-w" },
+            "status": {}
+        });
+        store
+            .put(
+                "/registry/coordination.k8s.io/leases/kube-node-lease/node-w",
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let patch = serde_json::json!({"status": {"phase": "Bound"}});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "node-w".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "patch_namespaced_resource_status must succeed"
+        );
+        let stored = store
+            .get("/registry/coordination.k8s.io/leases/kube-node-lease/node-w")
+            .await
+            .unwrap()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["status"]["phase"], "Bound");
+        assert_eq!(v["spec"]["holderIdentity"], "node-w");
+    }
+
+    /// patch_resource_status with strategic-merge-patch applies the status portion only.
+    #[tokio::test]
+    async fn patch_resource_status_with_strategic_merge_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "smp-node" },
+            "spec": { "drivers": [] },
+            "status": {}
+        });
+        let key = "/registry/storage.k8s.io/csinodes/smp-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut smp_headers = axum::http::HeaderMap::new();
+        smp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let patch =
+            serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "True"}]}});
+
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "smp-node".into(),
+            )),
+            smp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "strategic-merge-patch on status must succeed"
+        );
+    }
+
+    /// patch_namespaced_resource_status with strategic-merge-patch.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_with_strategic_merge_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "smp-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "smp-lease" },
+            "status": {}
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/smp-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut smp_headers = axum::http::HeaderMap::new();
+        smp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        let patch = serde_json::json!({"status": {"conditions": [{"type": "Available", "status": "True"}]}});
+
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "smp-lease".into(),
+            )),
+            smp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "strategic-merge-patch on namespaced status must succeed"
+        );
+    }
+
+    /// patch_namespaced_resource_status returns 404 when the object does not exist.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_returns_404_for_missing() {
+        let state = make_state();
+        let patch = serde_json::json!({"status": {"phase": "Failed"}});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "nonexistent".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 404 error"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
     /// put_resource_status replaces only the status field, leaving spec untouched.
     /// Status subresource isolation is required so that controllers cannot accidentally
     /// overwrite spec data when updating status (and vice versa).
@@ -408,6 +1009,123 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(v["status"]["phase"], "Ready");
         assert_eq!(v["spec"]["drivers"][0]["name"], "csi.io");
+    }
+
+    /// patch_resource_status with JSON Patch (`application/json-patch+json`) applies operations
+    /// on the full document. JSON Patch addresses the /status prefix explicitly.
+    #[tokio::test]
+    async fn patch_resource_status_with_json_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "jp-node" },
+            "spec": { "drivers": [] },
+            "status": {}
+        });
+        let key = "/registry/storage.k8s.io/csinodes/jp-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut jp_headers = axum::http::HeaderMap::new();
+        jp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/status/ready", "value": true}
+        ]);
+
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "jp-node".into(),
+            )),
+            jp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "JSON patch on status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["status"]["ready"], true);
+    }
+
+    /// patch_namespaced_resource_status with JSON Patch applies operations on the full document.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_with_json_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "jp-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "jp-lease" },
+            "status": {}
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/jp-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut jp_headers = axum::http::HeaderMap::new();
+        jp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/status/phase", "value": "Bound"}
+        ]);
+
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "jp-lease".into(),
+            )),
+            jp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "JSON patch on namespaced status must succeed"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(v["status"]["phase"], "Bound");
     }
 
     /// Gateway API controllers PATCH status on namespaced Gateway CRs via /status route.
