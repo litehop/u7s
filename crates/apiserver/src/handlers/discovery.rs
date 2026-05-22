@@ -44,6 +44,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("apps", "v1"),
     ("authentication.k8s.io", "v1"),
     ("authorization.k8s.io", "v1"),
+    ("certificates.k8s.io", "v1"),
     ("coordination.k8s.io", "v1"),
     ("networking.k8s.io", "v1"),
     ("node.k8s.io", "v1"),
@@ -144,6 +145,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("apps", "v1") => Some(apps_v1_resources()),
         ("authentication.k8s.io", "v1") => Some(authn_v1_resources()),
         ("authorization.k8s.io", "v1") => Some(authz_v1_resources()),
+        ("certificates.k8s.io", "v1") => Some(certificates_v1_resources()),
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
         ("networking.k8s.io", "v1") => Some(networking_v1_resources()),
         ("node.k8s.io", "v1") => Some(node_v1_resources()),
@@ -386,6 +388,38 @@ fn admissionregistration_v1_resources() -> serde_json::Value {
                 "namespaced": false,
                 "kind": "MutatingWebhookConfiguration",
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn certificates_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "certificates.k8s.io/v1",
+        "resources": [
+            {
+                "name": "certificatesigningrequests",
+                "singularName": "certificatesigningrequest",
+                "namespaced": false,
+                "kind": "CertificateSigningRequest",
+                "shortNames": ["csr"],
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "certificatesigningrequests/approval",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "CertificateSigningRequest",
+                "verbs": ["get", "patch", "update"]
+            },
+            {
+                "name": "certificatesigningrequests/status",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "CertificateSigningRequest",
+                "verbs": ["get", "patch", "update"]
             }
         ]
     })

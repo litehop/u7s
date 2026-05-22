@@ -310,6 +310,21 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/namespaces/{ns}/serviceaccounts/{name}/token",
             axum::routing::post(handlers::tokens::create_token),
         )
+        // CertificateSigningRequests — dedicated POST handler with strict validation
+        // Must be registered before the generic cluster-scoped catch-all.
+        .route(
+            "/apis/certificates.k8s.io/v1/certificatesigningrequests",
+            get(handlers::resource::list_resource).post(handlers::csr::create_csr),
+        )
+        // CSR /approval subresource — PUT and PATCH only merge status.conditions;
+        // spec and status.certificate are never touched. Must be before the named
+        // resource catch-all so axum doesn't interpret "approval" as a resource name.
+        .route(
+            "/apis/certificates.k8s.io/v1/certificatesigningrequests/{name}/approval",
+            get(handlers::resource::get_resource)
+                .put(handlers::approval::put_approval)
+                .patch(handlers::approval::patch_approval),
+        )
         // Generic cluster-scoped resources — collection
         .route(
             "/apis/{group}/{version}/{resource}",
@@ -1420,6 +1435,240 @@ mod tests {
             user.groups
                 .contains(&"system:serviceaccounts:default".to_owned()),
             "namespace-scoped SA group must be present for namespace-scoped RBAC policies"
+        );
+    }
+
+    /// Full CSR lifecycle: POST → GET → PUT /approval (Approved) → PUT /status (cert) → GET confirms cert.
+    ///
+    /// This test exercises the entire CertificateSigningRequest flow end-to-end:
+    ///   1. Client submits a CSR (POST) — only signerName + valid DER spec.request allowed.
+    ///   2. GET confirms the CSR is stored and spec is immutable (no status yet).
+    ///   3. Approver writes Approved condition via PUT /approval — certificate must NOT appear.
+    ///   4. Signer writes status.certificate via PUT /status — certificate appears.
+    ///   5. GET confirms final state: Approved condition + certificate present.
+    ///
+    /// If any step breaks, the automated cert-provisioning pipeline silently stops working.
+    #[tokio::test]
+    async fn csr_full_lifecycle() {
+        use axum::response::IntoResponse as _;
+        use base64::Engine as _;
+        use rcgen::{CertificateParams, KeyPair};
+        use std::sync::Arc;
+
+        // Generate a real DER PKCS#10 CSR — same approach used in csr.rs unit tests.
+        let key_pair = KeyPair::generate().expect("key generation must succeed");
+        let params = CertificateParams::default();
+        let csr = params
+            .serialize_request(&key_pair)
+            .expect("CSR generation must succeed");
+        let csr_b64 = base64::engine::general_purpose::STANDARD.encode(csr.der());
+
+        let store = Arc::new(make_store());
+        let state = state::AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut json_headers = axum::http::HeaderMap::new();
+        json_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let user = auth::UserInfo {
+            username: "test-user".into(),
+            uid: "".into(),
+            groups: vec![],
+        };
+
+        // --- Step 1: POST — create the CSR ---
+        let create_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "lifecycle-csr"},
+            "spec": {
+                "request": csr_b64,
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            }
+        });
+        let create_result = handlers::csr::create_csr(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "certificates.k8s.io".into(),
+                "v1".into(),
+                "certificatesigningrequests".into(),
+            )),
+            axum::Extension(user),
+            json_headers.clone(),
+            bytes::Bytes::from(create_body.to_string()),
+        )
+        .await;
+        let create_resp = match create_result {
+            Ok(r) => r.into_response(),
+            Err(e) => panic!("POST CSR must succeed, got status={}", e.0),
+        };
+        assert_eq!(
+            create_resp.status(),
+            axum::http::StatusCode::CREATED,
+            "POST /certificatesigningrequests must return 201"
+        );
+
+        // Extract resourceVersion from the stored object for OCC in subsequent calls.
+        let store_key = keys::group_object_key(
+            "certificates.k8s.io",
+            "certificatesigningrequests",
+            None,
+            "lifecycle-csr",
+        );
+        let stored = store
+            .get(&store_key)
+            .await
+            .expect("store.get must not fail")
+            .expect("CSR must be in store after POST");
+        let stored_v: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("valid json");
+        assert!(
+            stored_v["status"].is_null() || stored_v.get("status").is_none(),
+            "POST must not store a status field — spec is immutable, status starts empty"
+        );
+        let rv1 = stored_v["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("resourceVersion must be set after POST")
+            .to_owned();
+
+        // --- Step 2: GET — confirm CSR is retrievable ---
+        let get_result = handlers::resource::get_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "certificates.k8s.io".into(),
+                "v1".into(),
+                "certificatesigningrequests".into(),
+                "lifecycle-csr".into(),
+            )),
+        )
+        .await;
+        assert!(get_result.is_ok(), "GET must succeed after POST");
+
+        // --- Step 3: PUT /approval — write Approved condition ---
+        let approval_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "lifecycle-csr", "resourceVersion": rv1},
+            "spec": {
+                "request": csr_b64,
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            },
+            "status": {
+                "conditions": [{
+                    "type": "Approved",
+                    "status": "True",
+                    "reason": "ManualApproval",
+                    "message": "approved by lifecycle test"
+                }]
+            }
+        });
+        let approval_result = handlers::approval::put_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "certificates.k8s.io".into(),
+                "v1".into(),
+                "certificatesigningrequests".into(),
+                "lifecycle-csr".into(),
+            )),
+            json_headers.clone(),
+            bytes::Bytes::from(approval_body.to_string()),
+        )
+        .await;
+        assert!(
+            approval_result.is_ok(),
+            "PUT /approval must succeed after POST"
+        );
+
+        // Verify: Approved condition stored, no certificate yet.
+        let stored2 = store
+            .get(&store_key)
+            .await
+            .expect("store.get must not fail")
+            .expect("CSR must still be in store after approval");
+        let v2: serde_json::Value = serde_json::from_slice(&stored2.value).expect("valid json");
+        let conds = v2["status"]["conditions"]
+            .as_array()
+            .expect("conditions must be an array after approval");
+        assert_eq!(
+            conds[0]["type"], "Approved",
+            "Approved condition must be stored"
+        );
+        assert!(
+            v2["status"]["certificate"].is_null() || v2["status"].get("certificate").is_none(),
+            "PUT /approval must NOT write status.certificate — only the signer may do that"
+        );
+        let rv2 = v2["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("resourceVersion must be set after approval")
+            .to_owned();
+
+        // --- Step 4: PUT /status — signer writes the certificate ---
+        let fake_cert = base64::engine::general_purpose::STANDARD.encode(b"FAKE_CERT_PEM");
+        let status_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "lifecycle-csr", "resourceVersion": rv2},
+            "status": {
+                "certificate": fake_cert,
+                "conditions": [{
+                    "type": "Approved",
+                    "status": "True",
+                    "reason": "ManualApproval",
+                    "message": "approved by lifecycle test"
+                }]
+            }
+        });
+        let status_result = handlers::status::put_resource_status(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "certificates.k8s.io".into(),
+                "v1".into(),
+                "certificatesigningrequests".into(),
+                "lifecycle-csr".into(),
+            )),
+            json_headers.clone(),
+            bytes::Bytes::from(status_body.to_string()),
+        )
+        .await;
+        assert!(
+            status_result.is_ok(),
+            "PUT /status must succeed for the signer to write the certificate"
+        );
+
+        // --- Step 5: GET — confirm final state: Approved + certificate ---
+        let final_stored = store
+            .get(&store_key)
+            .await
+            .expect("store.get must not fail")
+            .expect("CSR must be in store after status write");
+        let v_final: serde_json::Value =
+            serde_json::from_slice(&final_stored.value).expect("valid json");
+
+        let final_cert = v_final["status"]["certificate"].as_str();
+        assert!(
+            final_cert.is_some() && !final_cert.unwrap().is_empty(),
+            "status.certificate must be present after signer writes via PUT /status"
+        );
+        assert_eq!(
+            final_cert.unwrap(),
+            fake_cert,
+            "stored certificate must match what the signer wrote"
+        );
+
+        let final_conds = v_final["status"]["conditions"]
+            .as_array()
+            .expect("conditions must still be present in final state");
+        assert_eq!(
+            final_conds[0]["type"], "Approved",
+            "Approved condition must survive PUT /status — signer must not erase approver's decision"
         );
     }
 }

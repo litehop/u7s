@@ -284,6 +284,13 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("RuntimeClass", false, false),
     );
 
+    // certificates.k8s.io/v1 — cluster-scoped
+    // has_status=true: spec is immutable after create; status.certificate is written via /status.
+    m.insert(
+        rk("certificates.k8s.io", "v1", "certificatesigningrequests"),
+        rm("CertificateSigningRequest", false, true),
+    );
+
     m
 }
 
