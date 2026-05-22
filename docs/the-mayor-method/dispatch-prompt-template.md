@@ -54,7 +54,7 @@ relative patch paths can land in the mayor checkout.
 
 Before every file edit, run:
 
-Get-Location; git rev-parse --show-toplevel; git status --short --branch
+pwd; git rev-parse --show-toplevel; git status --short --branch
 
 Only edit if git rev-parse --show-toplevel prints exactly:
 <ASSIGNED_WORKTREE>

@@ -200,18 +200,10 @@ it isn't take remedial action.
 
 Procedure:
 1. `gh pr view <num> --json statusCheckRollup` for each open PR.
-2. If green: merge with `--squash --admin --delete-branch`.
+2. If green: merge with `--merge --delete-branch`.
 3. If pending: hold; re-check on next firing.
 4. If failing: read the failure. Is it structurally relevant to
    the PR's diff?
-
-`--admin` on irrelevant gates: when a PR's stuck pending check is
-a browser sweep for a surface the PR doesn't touch — e.g. a
-test-only PR waiting on a feature-area browser gate — merge with
-`--admin`. The gate exists to catch regressions in code the PR
-doesn't change. Discipline: name the specific gate, name why the
-PR's diff cannot affect it, then merge. A failing test on the
-touched surface is never an `--admin` candidate.
 
 Merge trap: `gh pr merge --delete-branch` fails when the worker
 worktree still holds the branch. The merge succeeds; the branch
@@ -220,7 +212,7 @@ full sequence (from the mayor checkout, not the worker worktree):
 
   git stash push -u -m "mayor-pending"
   git pull --ff-only
-  gh pr merge <num> --squash --admin --delete-branch
+  gh pr merge <num> --merge --delete-branch
   git pull --ff-only
   git stash pop
   git worktree remove "<worker-path>" --force
