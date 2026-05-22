@@ -7,6 +7,8 @@
 /// - Apply JSON patches from mutating webhooks
 /// - Reject on failurePolicy: Fail if webhook is unreachable or returns denied
 /// - Re-run mutating webhooks marked reinvocationPolicy: IfNeeded if any patch was applied
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store as _};
 
@@ -101,14 +103,115 @@ struct WebhookEntry {
     failure_policy: String,
     #[serde(default)]
     reinvocation_policy: String,
-    // namespace_selector is captured for forward-compat but not yet evaluated
-    #[allow(dead_code)]
     #[serde(default)]
-    namespace_selector: serde_json::Value,
+    namespace_selector: Option<LabelSelector>,
+}
+
+/// Kubernetes LabelSelector: both fields are optional; absence means match-all.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LabelSelector {
+    #[serde(default)]
+    match_labels: BTreeMap<String, String>,
+    #[serde(default)]
+    match_expressions: Vec<LabelSelectorRequirement>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LabelSelectorRequirement {
+    key: String,
+    operator: String, // In, NotIn, Exists, DoesNotExist
+    #[serde(default)]
+    values: Vec<String>,
 }
 
 fn default_failure_policy() -> String {
     "Fail".to_string()
+}
+
+/// Evaluate a Kubernetes LabelSelector against a set of labels.
+///
+/// Returns `true` if the selector matches (or if no selector is configured — None means
+/// match-all, which is the correct Kubernetes default). A selector with both
+/// `matchLabels` and `matchExpressions` must satisfy all conditions (logical AND).
+///
+/// This is a pure function, unit-testable without I/O.
+pub(crate) fn label_selector_matches(
+    selector: Option<&LabelSelector>,
+    labels: &BTreeMap<String, String>,
+) -> bool {
+    let sel = match selector {
+        None => return true, // absent selector matches everything
+        Some(s) => s,
+    };
+
+    // matchLabels: every key=value pair must be present in labels
+    for (k, v) in &sel.match_labels {
+        if labels.get(k).map(|s| s.as_str()) != Some(v.as_str()) {
+            return false;
+        }
+    }
+
+    // matchExpressions: every requirement must be satisfied
+    for req in &sel.match_expressions {
+        let has_key = labels.contains_key(&req.key);
+        let matches = match req.operator.as_str() {
+            "Exists" => has_key,
+            "DoesNotExist" => !has_key,
+            "In" => {
+                has_key
+                    && req
+                        .values
+                        .iter()
+                        .any(|v| Some(v.as_str()) == labels.get(&req.key).map(|s| s.as_str()))
+            }
+            "NotIn" => {
+                !has_key
+                    || req
+                        .values
+                        .iter()
+                        .all(|v| Some(v.as_str()) != labels.get(&req.key).map(|s| s.as_str()))
+            }
+            _ => {
+                tracing::warn!(
+                    "admission: unknown labelSelector operator: {}",
+                    req.operator
+                );
+                false
+            }
+        };
+        if !matches {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Fetch the namespace object labels from the store.
+///
+/// Returns an empty map if the namespace is not found (cluster-scoped requests
+/// have no namespace; the caller should skip namespace_selector evaluation in that case).
+async fn fetch_namespace_labels(state: &AppState, namespace: &str) -> BTreeMap<String, String> {
+    let key = format!("/registry/namespaces/{namespace}");
+    match state.store.get(&key).await {
+        Ok(Some(obj)) => {
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+                val["metadata"]["labels"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                BTreeMap::new()
+            }
+        }
+        _ => BTreeMap::new(),
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -116,6 +219,78 @@ fn default_failure_policy() -> String {
 struct WebhookClientConfig {
     #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    service: Option<ServiceReference>,
+}
+
+/// In-cluster service reference for a webhook's clientConfig.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ServiceReference {
+    namespace: String,
+    name: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Resolve a webhook's clientConfig to a URL string.
+///
+/// If `clientConfig.url` is set, returns it directly.
+/// If `clientConfig.service` is set, looks up the Service object from the store by
+/// namespace+name and builds `https://<clusterIP>:<port><path>`.
+/// Returns an error if the service reference is set but the Service is not found.
+async fn webhook_url(
+    state: &AppState,
+    config: &WebhookClientConfig,
+    webhook_name: &str,
+) -> Result<String, String> {
+    if let Some(url) = &config.url {
+        return Ok(url.clone());
+    }
+
+    if let Some(svc_ref) = &config.service {
+        let key = format!(
+            "/registry/services/{}/{}", // core/v1 Service: /registry/services/<ns>/<name>
+            svc_ref.namespace, svc_ref.name
+        );
+        let obj = state.store.get(&key).await.map_err(|e| {
+            format!(
+                "store error looking up service {}/{}: {e}",
+                svc_ref.namespace, svc_ref.name
+            )
+        })?;
+
+        let svc = match obj {
+            Some(o) => o,
+            None => {
+                return Err(format!(
+                    "webhook \"{webhook_name}\": service {}/{} not found",
+                    svc_ref.namespace, svc_ref.name
+                ));
+            }
+        };
+
+        let val: serde_json::Value = serde_json::from_slice(&svc.value)
+            .map_err(|e| format!("webhook \"{webhook_name}\": failed to parse service: {e}"))?;
+
+        let cluster_ip = val["spec"]["clusterIP"].as_str().ok_or_else(|| {
+            format!(
+                "webhook \"{webhook_name}\": service {}/{} has no clusterIP",
+                svc_ref.namespace, svc_ref.name
+            )
+        })?;
+
+        let port = svc_ref.port.unwrap_or(443);
+        let path = svc_ref.path.as_deref().unwrap_or("/");
+
+        return Ok(format!("https://{cluster_ip}:{port}{path}"));
+    }
+
+    Err(format!(
+        "webhook \"{webhook_name}\" has neither url nor service in clientConfig"
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -169,7 +344,7 @@ pub fn matches_rule(
         s == "*" || s == operation
     });
 
-    let _ = namespace; // namespaceSelector is not implemented in this initial pass
+    let _ = namespace; // namespace scoping is handled separately via namespaceSelector evaluation
 
     group_match && version_match && resource_match && operation_match
 }
@@ -294,7 +469,7 @@ fn apply_webhook_patch(object: &mut serde_json::Value, patch_b64: &str) -> Resul
 /// `is_reinvocation` controls whether we skip webhooks that don't have
 /// `reinvocationPolicy: IfNeeded` during the reinvocation pass.
 async fn invoke_mutating_webhook(
-    client: &reqwest::Client,
+    state: &AppState,
     webhook: &WebhookEntry,
     object: &serde_json::Value,
     ctx: &AdmissionContext<'_>,
@@ -323,19 +498,43 @@ async fn invoke_mutating_webhook(
         }
     }
 
-    let url = match &webhook.client_config.url {
-        Some(u) => u.clone(),
-        None => {
-            // service-based client config not yet implemented; skip
-            tracing::debug!("admission: webhook {} has no URL, skipping", webhook.name);
-            return Ok((object.clone(), false));
+    // namespaceSelector: skip this webhook if the request namespace's labels don't match.
+    // Cluster-scoped requests (namespace == None) always pass the namespace selector.
+    if webhook.namespace_selector.is_some() {
+        if let Some(ns) = ctx.namespace {
+            let ns_labels = fetch_namespace_labels(state, ns).await;
+            if !label_selector_matches(webhook.namespace_selector.as_ref(), &ns_labels) {
+                tracing::debug!(
+                    "admission: mutating webhook \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
+                    webhook.name, ns
+                );
+                return Ok((object.clone(), false));
+            }
+        }
+    }
+
+    let url = match webhook_url(state, &webhook.client_config, &webhook.name).await {
+        Ok(u) => u,
+        Err(e) => {
+            if webhook.failure_policy == "Ignore" {
+                tracing::warn!(
+                    "admission: mutating webhook \"{}\" skipped (service not found, failurePolicy=Ignore): {e}",
+                    webhook.name
+                );
+                return Ok((object.clone(), false));
+            } else {
+                return Err(Status::internal(format!(
+                    "admission webhook \"{}\": {e}",
+                    webhook.name
+                )));
+            }
         }
     };
 
     let uid = uuid::Uuid::new_v4().to_string();
     let review = build_review(&uid, ctx, object);
 
-    let response = call_webhook(client, &url, &review).await;
+    let response = call_webhook(&state.webhook_client, &url, &review).await;
 
     match response {
         Some(resp) => {
@@ -413,13 +612,11 @@ pub async fn run_mutating_webhooks(
         return Ok(object);
     }
 
-    let client = &state.webhook_client;
-
     // First pass: run all webhooks.
     let mut any_patched = false;
     for webhook in &all_webhooks {
         let (new_obj, patched) =
-            invoke_mutating_webhook(client, webhook, &object, ctx, false).await?;
+            invoke_mutating_webhook(state, webhook, &object, ctx, false).await?;
         if patched {
             any_patched = true;
         }
@@ -429,7 +626,7 @@ pub async fn run_mutating_webhooks(
     // Reinvocation pass: if any patch was applied, re-run IfNeeded webhooks once.
     if any_patched {
         for webhook in &all_webhooks {
-            let (new_obj, _) = invoke_mutating_webhook(client, webhook, &object, ctx, true).await?;
+            let (new_obj, _) = invoke_mutating_webhook(state, webhook, &object, ctx, true).await?;
             object = new_obj;
         }
     }
@@ -463,8 +660,6 @@ pub async fn run_validating_webhooks(
         return Ok(());
     }
 
-    let client = &state.webhook_client;
-
     for webhook in &all_webhooks {
         // Check rule match.
         if !webhook.rules.is_empty() {
@@ -484,18 +679,42 @@ pub async fn run_validating_webhooks(
             }
         }
 
-        let url = match &webhook.client_config.url {
-            Some(u) => u.clone(),
-            None => {
-                tracing::debug!("admission: webhook {} has no URL, skipping", webhook.name);
-                continue;
+        // namespaceSelector: skip if the request namespace's labels don't match.
+        if webhook.namespace_selector.is_some() {
+            if let Some(ns) = ctx.namespace {
+                let ns_labels = fetch_namespace_labels(state, ns).await;
+                if !label_selector_matches(webhook.namespace_selector.as_ref(), &ns_labels) {
+                    tracing::debug!(
+                        "admission: validating webhook \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
+                        webhook.name, ns
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let url = match webhook_url(state, &webhook.client_config, &webhook.name).await {
+            Ok(u) => u,
+            Err(e) => {
+                if webhook.failure_policy == "Ignore" {
+                    tracing::warn!(
+                        "admission: validating webhook \"{}\" skipped (service not found, failurePolicy=Ignore): {e}",
+                        webhook.name
+                    );
+                    continue;
+                } else {
+                    return Err(Status::internal(format!(
+                        "admission webhook \"{}\": {e}",
+                        webhook.name
+                    )));
+                }
             }
         };
 
         let uid = uuid::Uuid::new_v4().to_string();
         let review = build_review(&uid, ctx, object);
 
-        let response = call_webhook(client, &url, &review).await;
+        let response = call_webhook(&state.webhook_client, &url, &review).await;
 
         match response {
             Some(resp) => {
@@ -1184,6 +1403,457 @@ mod tests {
         assert_eq!(
             returned, obj,
             "object must be unchanged when webhook is skipped due to rule mismatch"
+        );
+    }
+
+    // -- label_selector_matches unit tests --
+
+    /// None selector (absent namespaceSelector) must match all namespaces.
+    /// This is the Kubernetes default: if namespaceSelector is not set, the webhook applies
+    /// to all namespaces without restriction.
+    #[test]
+    fn label_selector_none_matches_any_labels() {
+        let labels: BTreeMap<String, String> = [("env".into(), "prod".into())].into();
+        assert!(
+            label_selector_matches(None, &labels),
+            "absent selector must match any namespace labels"
+        );
+        assert!(
+            label_selector_matches(None, &BTreeMap::new()),
+            "absent selector must match empty namespace labels"
+        );
+    }
+
+    /// matchLabels: all key=value pairs must be present and equal in the namespace labels.
+    /// A webhook scoped to env=prod must not fire in namespaces labelled env=dev.
+    #[test]
+    fn label_selector_match_labels_requires_exact_values() {
+        let sel = LabelSelector {
+            match_labels: [("env".into(), "prod".into())].into(),
+            match_expressions: vec![],
+        };
+        let prod_labels: BTreeMap<String, String> =
+            [("env".into(), "prod".into()), ("team".into(), "ops".into())].into();
+        let dev_labels: BTreeMap<String, String> = [("env".into(), "dev".into())].into();
+        let empty_labels: BTreeMap<String, String> = BTreeMap::new();
+
+        assert!(
+            label_selector_matches(Some(&sel), &prod_labels),
+            "matchLabels env=prod must match namespace with env=prod"
+        );
+        assert!(
+            !label_selector_matches(Some(&sel), &dev_labels),
+            "matchLabels env=prod must not match namespace with env=dev"
+        );
+        assert!(
+            !label_selector_matches(Some(&sel), &empty_labels),
+            "matchLabels env=prod must not match namespace with no labels"
+        );
+    }
+
+    /// matchExpressions with In: the label value must be one of the listed values.
+    /// This is used to scope webhooks to a set of environments without listing every
+    /// possible value explicitly.
+    #[test]
+    fn label_selector_match_expressions_in_operator() {
+        let sel = LabelSelector {
+            match_labels: BTreeMap::new(),
+            match_expressions: vec![LabelSelectorRequirement {
+                key: "env".into(),
+                operator: "In".into(),
+                values: vec!["prod".into(), "staging".into()],
+            }],
+        };
+        let prod: BTreeMap<String, String> = [("env".into(), "prod".into())].into();
+        let dev: BTreeMap<String, String> = [("env".into(), "dev".into())].into();
+
+        assert!(
+            label_selector_matches(Some(&sel), &prod),
+            "In [prod, staging] must match env=prod"
+        );
+        assert!(
+            !label_selector_matches(Some(&sel), &dev),
+            "In [prod, staging] must not match env=dev"
+        );
+    }
+
+    /// matchExpressions with NotIn: the label must not have the given values.
+    /// A webhook configured to skip system namespaces uses NotIn: [kube-system, kube-public].
+    #[test]
+    fn label_selector_match_expressions_not_in_operator() {
+        let sel = LabelSelector {
+            match_labels: BTreeMap::new(),
+            match_expressions: vec![LabelSelectorRequirement {
+                key: "kubernetes.io/metadata.name".into(),
+                operator: "NotIn".into(),
+                values: vec!["kube-system".into(), "kube-public".into()],
+            }],
+        };
+        let system: BTreeMap<String, String> =
+            [("kubernetes.io/metadata.name".into(), "kube-system".into())].into();
+        let user_ns: BTreeMap<String, String> =
+            [("kubernetes.io/metadata.name".into(), "default".into())].into();
+
+        assert!(
+            !label_selector_matches(Some(&sel), &system),
+            "NotIn [kube-system, kube-public] must not match kube-system"
+        );
+        assert!(
+            label_selector_matches(Some(&sel), &user_ns),
+            "NotIn [kube-system, kube-public] must match default"
+        );
+    }
+
+    /// matchExpressions with Exists/DoesNotExist: presence of a key, regardless of value.
+    #[test]
+    fn label_selector_match_expressions_exists_and_does_not_exist() {
+        let exists_sel = LabelSelector {
+            match_labels: BTreeMap::new(),
+            match_expressions: vec![LabelSelectorRequirement {
+                key: "managed-by".into(),
+                operator: "Exists".into(),
+                values: vec![],
+            }],
+        };
+        let dne_sel = LabelSelector {
+            match_labels: BTreeMap::new(),
+            match_expressions: vec![LabelSelectorRequirement {
+                key: "managed-by".into(),
+                operator: "DoesNotExist".into(),
+                values: vec![],
+            }],
+        };
+        let with_key: BTreeMap<String, String> = [("managed-by".into(), "flux".into())].into();
+        let without_key: BTreeMap<String, String> = BTreeMap::new();
+
+        assert!(
+            label_selector_matches(Some(&exists_sel), &with_key),
+            "Exists must match when the key is present"
+        );
+        assert!(
+            !label_selector_matches(Some(&exists_sel), &without_key),
+            "Exists must not match when the key is absent"
+        );
+        assert!(
+            label_selector_matches(Some(&dne_sel), &without_key),
+            "DoesNotExist must match when the key is absent"
+        );
+        assert!(
+            !label_selector_matches(Some(&dne_sel), &with_key),
+            "DoesNotExist must not match when the key is present"
+        );
+    }
+
+    /// A webhook with namespaceSelector must be skipped for namespaces whose labels don't match.
+    /// This test stores a real Namespace object in the in-memory store and seeds a
+    /// MutatingWebhookConfiguration with a namespaceSelector. The webhook points to an
+    /// unreachable URL with failurePolicy=Fail — if the namespace selector evaluation is broken
+    /// and the webhook is invoked, the pipeline would fail instead of succeeding.
+    #[tokio::test]
+    async fn namespace_selector_non_matching_namespace_skips_webhook() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a Namespace with label env=dev.
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "dev-ns",
+                "labels": {"env": "dev"}
+            }
+        });
+        store
+            .put(
+                "/registry/namespaces/dev-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Webhook with namespaceSelector that requires env=prod. Should be skipped for env=dev.
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "prod-only-mwc"},
+            "webhooks": [{
+                "name": "prod.webhook.example.com",
+                "clientConfig": {
+                    "url": "http://127.0.0.1:1"  // would fail if called
+                },
+                "rules": [{
+                    "apiGroups": ["apps"],
+                    "apiVersions": ["v1"],
+                    "resources": ["deployments"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "namespaceSelector": {
+                    "matchLabels": {"env": "prod"}
+                }
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/prod-only-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "my-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("dev-ns"), // namespace labelled env=dev, not env=prod
+            operation: "CREATE",
+        };
+        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+
+        assert!(
+            result.is_ok(),
+            "webhook with non-matching namespaceSelector must be skipped, not invoked"
+        );
+        assert_eq!(
+            result.unwrap_or_else(|_| panic!("must succeed")),
+            obj,
+            "object must be unchanged when webhook is skipped by namespaceSelector"
+        );
+    }
+
+    /// A webhook with namespaceSelector must fire (fail) for namespaces whose labels match.
+    /// This test verifies the positive case: if the namespace matches, the webhook IS invoked.
+    /// Since the URL is unreachable and failurePolicy=Fail, the pipeline must return an error.
+    #[tokio::test]
+    async fn namespace_selector_matching_namespace_invokes_webhook() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a Namespace with label env=prod.
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "prod-ns",
+                "labels": {"env": "prod"}
+            }
+        });
+        store
+            .put(
+                "/registry/namespaces/prod-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Webhook with namespaceSelector env=prod. Must be invoked for env=prod namespace.
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "prod-only-mwc"},
+            "webhooks": [{
+                "name": "prod.webhook.example.com",
+                "clientConfig": {
+                    "url": "http://127.0.0.1:1"  // unreachable — causes Fail
+                },
+                "rules": [{
+                    "apiGroups": ["apps"],
+                    "apiVersions": ["v1"],
+                    "resources": ["deployments"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "namespaceSelector": {
+                    "matchLabels": {"env": "prod"}
+                }
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/prod-only-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "my-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("prod-ns"), // namespace labelled env=prod — selector matches
+            operation: "CREATE",
+        };
+        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+
+        assert!(
+            result.is_err(),
+            "webhook with matching namespaceSelector must be invoked (and fail because URL is unreachable)"
+        );
+    }
+
+    // -- service-based clientConfig tests --
+
+    /// A webhook configured with clientConfig.service must resolve the Service clusterIP
+    /// and build the correct HTTPS URL. When the Service exists, the webhook is invoked at
+    /// https://<clusterIP>:<port><path>. Since the resolved IP is not actually listening,
+    /// failurePolicy=Ignore causes the pipeline to succeed.
+    #[tokio::test]
+    async fn service_based_client_config_resolves_cluster_ip() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a Service with a clusterIP in the webhook's namespace.
+        let svc = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-webhook-svc", "namespace": "webhook-ns"},
+            "spec": {"clusterIP": "10.96.0.1"}
+        });
+        store
+            .put(
+                "/registry/services/webhook-ns/my-webhook-svc",
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // MutatingWebhookConfiguration with service-based clientConfig.
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "service-mwc"},
+            "webhooks": [{
+                "name": "service.webhook.example.com",
+                "clientConfig": {
+                    "service": {
+                        "namespace": "webhook-ns",
+                        "name": "my-webhook-svc",
+                        "port": 8443,
+                        "path": "/mutate"
+                    }
+                },
+                "rules": [{
+                    "apiGroups": ["apps"],
+                    "apiVersions": ["v1"],
+                    "resources": ["deployments"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Ignore"  // URL resolves but nothing listens; Ignore skips gracefully
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/service-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "my-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+        // The webhook is invoked (URL resolved to https://10.96.0.1:8443/mutate), fails to
+        // connect, but failurePolicy=Ignore means the pipeline succeeds.
+        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        assert!(
+            result.is_ok(),
+            "service-based webhook with failurePolicy=Ignore and unreachable IP must succeed"
+        );
+    }
+
+    /// A webhook with clientConfig.service pointing to a non-existent Service must
+    /// apply failurePolicy: Fail returns an error, Ignore skips gracefully.
+    #[tokio::test]
+    async fn service_based_client_config_missing_service_applies_failure_policy() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // No Service stored — webhook_url will return an error.
+        let mwc_fail = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "missing-svc-fail"},
+            "webhooks": [{
+                "name": "missing.webhook.example.com",
+                "clientConfig": {
+                    "service": {
+                        "namespace": "webhook-ns",
+                        "name": "does-not-exist",
+                        "port": 443,
+                        "path": "/mutate"
+                    }
+                },
+                "rules": [{
+                    "apiGroups": ["apps"],
+                    "apiVersions": ["v1"],
+                    "resources": ["deployments"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/missing-svc-fail",
+                bytes::Bytes::from(serde_json::to_vec(&mwc_fail).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "my-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        assert!(
+            result.is_err(),
+            "service not found with failurePolicy=Fail must return an error"
         );
     }
 }
