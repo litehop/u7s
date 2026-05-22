@@ -717,7 +717,7 @@ mod handler_tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::{auth::UserInfo, rbac::RbacIndex, state::AppState};
+    use crate::{auth::UserInfo, state::AppState};
 
     /// Build a minimal AppState with an empty RBAC index and no SA key.
     fn make_state() -> AppState {

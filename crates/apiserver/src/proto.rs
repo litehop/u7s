@@ -1666,7 +1666,7 @@ mod tests {
         let type_meta_start = {
             // field 1 tag byte (1 byte) + len varint (1 byte for len < 128)
             let mut p = 0;
-            let (tag, rest) = decode_varint(envelope).unwrap();
+            let (_tag, rest) = decode_varint(envelope).unwrap();
             p += envelope.len() - rest.len();
             let (_len, rest2) = decode_varint(rest).unwrap();
             p += rest.len() - rest2.len();

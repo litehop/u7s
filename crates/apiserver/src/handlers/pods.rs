@@ -1264,8 +1264,9 @@ mod status_tests {
         crate::patch::merge_patch(&mut status, &patch_status);
 
         // null in merge patch means delete
-        assert!(status.get("hostIP").map_or(true, |v| v.is_null()
-            || !status.as_object().unwrap().contains_key("hostIP")));
+        assert!(status
+            .get("hostIP")
+            .is_none_or(|v| v.is_null() || !status.as_object().unwrap().contains_key("hostIP")));
         assert_eq!(status["phase"], "Running");
     }
 

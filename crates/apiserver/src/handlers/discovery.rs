@@ -651,7 +651,8 @@ mod tests {
             },
             status: None,
         };
-        let key = format!("/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.apps");
+        let key =
+            "/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.apps".to_string();
         let bytes = bytes::Bytes::from(serde_json::to_vec(&crd).unwrap());
         state
             .store
