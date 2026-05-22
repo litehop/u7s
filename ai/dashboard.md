@@ -1,75 +1,53 @@
 # Dashboard
-2026-05-22T22:00 UTC
-Session: a2079177-fb10-4b26-8356-4640391653f9 (`I am the Mayor now` at /Users/balint.erdos/u7s)
-Open beads: 11
+2026-05-22T23:15 UTC
+Session: bb35dc0d-a124-4aa4-99c9-70752a592c8b (`I am the Mayor now` at /Users/balint.erdos/u7s)
+Open beads: 10 (mayor-knyy closed this session)
 
-## What needs the operator now
+## What the operator needs to do now
 
-**Networking discussion (pre-requisite for two beads):**
-- mayor-2d7p (portforward) and mayor-l7a9 (attach) are both deferred pending your decision on SPDY vs WebSocket. The transport audit (mayor-5ob2) confirmed upstream kubectl 1.34–1.36 uses SPDY for exec/attach/portforward — so we need a SPDY library to implement these correctly. The audit found `hyper` already in use; a SPDY crate (`async-h1`/`h2` won't help — it would be `tokio-tungstenite` + SPDY framing or the `spdylay` bindings). Worth a separate conversation.
+**One open decision — exec/attach/portforward proxy-through approach:**
 
-**No other decisions blocking dispatch.**
+mayor-2d7p (portforward) and mayor-l7a9 (attach) are unblocked on transport (WebSocket confirmed, no SPDY). One question remains before dispatch:
 
-## Dispatch-ready (no blockers, no decisions needed)
+> When kubectl exec hits our apiserver, we must forward the WebSocket session to the kubelet. Do you want:
+> - **(A) Full proxy-through now** — WebSocket inbound from kubectl, WebSocket outbound to kubelet. Correct end-to-end, ~300-400 LoC.
+> - **(B) Stub-first** — implement the inbound WebSocket upgrade (kubectl gets 101 + upgrade), but the kubelet forward returns a clean 501. Unblocks conformance tests that check upgrade negotiation. Forward wired in a follow-on bead.
 
-| ID | P | Summary |
-|----|---|---------|
-| mayor-xas3 | P2 | Admission webhook invocation — full pipeline decision resolved |
-| mayor-rvkq | P3 | CRD CEL validation — minimal inline evaluator |
-| mayor-u7ij | P3 | ResourceQuota enforcement (count-based) |
-| mayor-x9b5 | P3 | LimitRange enforcement |
-| mayor-knyy | P3 | Switch reqwest native-tls → rustls-tls + fix danger_accept_invalid_certs |
-| mayor-15hu | P3 | Deduplicate send_request/stream_watch_events into client-util |
-| mayor-2ni  | P3 | Sonobuoy conformance audit (hold lifted — needs lima VM running) |
-
-**Dependency chain:** mayor-knyy → mayor-lghq (PQC). mayor-15hu is prereq for transport abstraction trait.
-
-## Open beads
-
-| ID | P | Summary |
-|----|---|---------|
-| mayor-xas3 | P2 | Admission webhook invocation |
-| mayor-2d7p | P2 | Pod /portforward (SPDY — awaiting networking discussion) |
-| mayor-knyy | P3 | reqwest native-tls → rustls-tls + cert verification fix |
-| mayor-15hu | P3 | Deduplicate HTTP client into client-util |
-| mayor-lghq | P3 | rustls-post-quantum ML-KEM (depends mayor-knyy) |
-| mayor-rvkq | P3 | CRD CEL validation |
-| mayor-u7ij | P3 | ResourceQuota enforcement |
-| mayor-x9b5 | P3 | LimitRange enforcement |
-| mayor-pva9 | P3 | CRD conversion webhooks (depends mayor-xas3) |
-| mayor-l7a9 | P3 | Pod /attach (SPDY — awaiting networking discussion) |
-| mayor-2ni  | P3 | Sonobuoy audit |
+**Worker dispatch is broken for this session** — background workers block on Bash permissions. mayor-knyy succeeded once (unknown why); admission and client-util fail repeatedly. Worktrees exist and are clean; work can resume next session when the permission issue is resolved. See bd memory `worker-dispatch-permission-failure-root-cause` for full analysis.
 
 ## In-flight work
 
-None. All workers completed or stale. Stale worktrees to clean up:
-- `ai/worktrees/cel-rvkq` (worker/cel-rvkq — no commits, stranded)
-- `ai/worktrees/quota-u7ij` (worker/quota-u7ij — no commits, stranded)
-- `ai/worktrees/transport-audit-5ob2` (worker/transport-audit-5ob2 — audit complete, no commits to push)
+| Bead | Worktree | Status |
+|------|----------|--------|
+| mayor-xas3 P2 | ai/worktrees/admission-xas3 | Worktree clean, ready to re-dispatch next session |
+| mayor-15hu P3 | ai/worktrees/client-util-15hu | Worktree clean, ready to re-dispatch next session |
 
-## Session findings — transport & crypto audit (mayor-5ob2)
+No open PRs.
 
-Completed this session. Key results:
-- **Security gap**: `proxy.rs:168` has `danger_accept_invalid_certs(true)` on kubelet proxy — fixed by mayor-knyy
-- **OpenSSL removed**: switching reqwest to `rustls-tls` drops 5 C crates (mayor-knyy)
-- **PQC near-drop-in**: `rustls-post-quantum 0.2` swaps in as CryptoProvider after knyy lands (mayor-lghq)
-- **QUIC**: viable only for internal scheduler/kcm traffic; kubelet path blocked until we build our own kubelet
-- **Findings doc**: `ai/findings/transport-crypto-audit-2026-05-22.md` (gitignored, local only)
+## Dispatch-ready (next session)
 
-## Session findings — dispatch mechanics
-
-Resolved a persistent worker dispatch failure. Root cause: subagents launched via `Agent()` don't load `worker.md` before their first tool call — they prompt for permission. Fix: mayor pre-creates worktree + copies `settings.json` before dispatch; prompt includes "You have full permission... do not ask, just act." Both conditions required. Updated `dispatch-prompt-template.md` and three bd memories. Confirmed working on mayor-5ob2 (34 tool uses, no prompts).
+| ID | P | Summary |
+|----|---|---------|
+| mayor-xas3 | P2 | Admission webhook invocation — worktree exists |
+| mayor-15hu | P3 | Deduplicate HyperApiClient — worktree exists |
+| mayor-2d7p | P2 | Pod /portforward (pending proxy-through decision above) |
+| mayor-l7a9 | P3 | Pod /attach (same) |
+| mayor-pva9 | P3 | CRD conversion webhooks (depends mayor-xas3) |
+| mayor-lghq | P3 | rustls-post-quantum ML-KEM (depends mayor-knyy ✓ — now unblocked) |
+| mayor-rvkq | P3 | CRD CEL validation — needs scope definition |
+| mayor-u7ij | P3 | ResourceQuota — needs scope definition |
+| mayor-x9b5 | P3 | LimitRange — needs scope definition |
 
 ## Recent progress
 
-**This session:**
-- Resolved worker dispatch mechanics (multiple failed attempts → confirmed fix)
-- Completed transport & crypto audit (mayor-5ob2) → 3 follow-on beads filed
-- Updated dispatch-prompt-template.md with correct worktree pattern and mayor pre-checklist
-- Filed and discussed QUIC/HTTP3 and PQC directions with operator
-- Set up loops (currently stopped — operator winding down session)
+**This session (2026-05-22):**
+- PR #174 merged: reqwest native-tls → rustls, danger_accept_invalid_certs fixed (mayor-knyy ✓)
+- WebSocket transport decision made: WebSocket only, no SPDY, both layers (kubectl→apiserver and apiserver→kubelet)
+- Proxy-through approach decision pending (see above)
+- Diagnosed worker dispatch permission failure — root cause unknown, memorialized
+- Cleaned stale worktrees from prior session (cel-rvkq, quota-u7ij, transport-audit-5ob2)
 
-**Previous session metrics:** 5 PRs merged, 15 beads closed.
+**Unresolved infra issue:** Worker dispatch blocks on Bash for mayor-xas3 and mayor-15hu (but not mayor-knyy, once). Likely requires global `~/.claude/settings.json` to have `defaultMode: auto` or `Bash(*)` added.
 
 ## Stance
 
