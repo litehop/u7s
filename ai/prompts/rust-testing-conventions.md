@@ -104,6 +104,28 @@ Workers may add to `[dev-dependencies]` in the crate's `Cargo.toml`:
 - `axum` `MockConnectInfo` etc. if needed
 - Nothing else without checking with the mayor first.
 
+## Extracting errors without Debug
+
+`StatusError` does NOT implement `Debug`. Never use `.unwrap_err()` or
+`.expect_err()` on a `Result` whose `Ok` or `Err` variant is `impl IntoResponse`
+or `StatusError` — this compiles locally but fails under `cargo llvm-cov` (the
+CI coverage job).
+
+Use a `match` instead:
+
+```rust
+// WRONG — fails under llvm-cov:
+let err = handler(...).await.unwrap_err();
+
+// CORRECT:
+let result = handler(...).await;
+let err = match result { Err(e) => e, Ok(_) => panic!("expected error") };
+assert_eq!(err.0, StatusCode::NOT_FOUND);
+```
+
+This applies to both async handler calls and sync functions returning
+`Result<_, StatusError>`.
+
 ## Cargo fmt
 
 Always run `cargo fmt --all` before pushing. Then verify with
