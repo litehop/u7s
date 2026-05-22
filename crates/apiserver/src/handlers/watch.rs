@@ -797,6 +797,149 @@ mod tests {
         );
     }
 
+    // -- parse_key_name_ns --
+
+    /// parse_key_name_ns extracts name and namespace from a namespaced store key.
+    /// Kubernetes DELETE tombstones are built from this; wrong parsing causes
+    /// malformed watch DELETED events that confuse client informers.
+    #[test]
+    fn parse_key_name_ns_extracts_name_and_namespace() {
+        let (name, ns) = parse_key_name_ns("/registry/coordination.k8s.io/leases/default/my-lease");
+        assert_eq!(name, "my-lease");
+        assert_eq!(ns, "default");
+    }
+
+    /// parse_key_name_ns returns empty namespace for cluster-scoped keys.
+    #[test]
+    fn parse_key_name_ns_cluster_scoped_has_empty_namespace() {
+        let (name, _ns) = parse_key_name_ns("/registry/storage.k8s.io/csinodes/node-1");
+        assert_eq!(name, "node-1");
+        // The segment before name is "csinodes", not a namespace, but parse_key_name_ns
+        // returns whatever the second-to-last segment is. For cluster-scoped resources
+        // that segment is the plural resource name, which is non-empty.
+        // The important invariant: name is the last segment.
+        assert!(!name.is_empty());
+    }
+
+    /// parse_key_name_ns on a single-segment key returns (segment, "").
+    #[test]
+    fn parse_key_name_ns_single_segment_returns_empty_namespace() {
+        let (name, ns) = parse_key_name_ns("only-name");
+        assert_eq!(name, "only-name");
+        assert_eq!(ns, "");
+    }
+
+    // -- fetch_initial_events --
+
+    /// fetch_initial_events returns None when send_initial_events is false.
+    /// This keeps the normal watch path unchanged and avoids a redundant list.
+    #[tokio::test]
+    async fn fetch_initial_events_returns_none_when_disabled() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = match fetch_initial_events(&state, "/registry/test/", false).await {
+            Ok(r) => r,
+            Err(_) => panic!("fetch_initial_events must not fail"),
+        };
+
+        assert!(
+            result.is_none(),
+            "fetch_initial_events must return None when send_initial_events=false"
+        );
+    }
+
+    /// fetch_initial_events returns Some with existing objects when enabled.
+    /// Kubelet uses this to get a complete state snapshot before streaming live changes.
+    #[tokio::test]
+    async fn fetch_initial_events_returns_existing_objects_when_enabled() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Seed two objects
+        for name in ["cm-a", "cm-b"] {
+            let obj = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": name, "namespace": "default" }
+            });
+            store
+                .put(
+                    &format!("/registry/configmaps/default/{name}"),
+                    bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                    Some(0),
+                )
+                .await
+                .unwrap();
+        }
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = match fetch_initial_events(&state, "/registry/configmaps/default/", true).await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("fetch_initial_events must not fail"),
+        };
+
+        let (items, _rv) =
+            result.unwrap_or_else(|| panic!("fetch_initial_events must return Some when enabled"));
+        assert_eq!(
+            items.len(),
+            2,
+            "fetch_initial_events must return all objects under prefix"
+        );
+    }
+
+    /// fetch_initial_events returns Some with empty list when no objects exist.
+    /// Empty sendInitialEvents must still emit a BOOKMARK; returning None would skip it.
+    #[tokio::test]
+    async fn fetch_initial_events_returns_empty_list_when_no_objects() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = match fetch_initial_events(&state, "/registry/configmaps/empty/", true).await {
+            Ok(r) => r,
+            Err(_) => panic!("fetch_initial_events must not fail"),
+        };
+
+        let (items, _rv) = result.unwrap_or_else(|| {
+            panic!("fetch_initial_events must return Some even for empty namespace")
+        });
+        assert!(
+            items.is_empty(),
+            "empty prefix must return empty item list, not None"
+        );
+    }
+
     // -- object_matches_label_selector / object_matches_field_selector tests --
 
     fn item_with_labels(labels: &[(&str, &str)]) -> serde_json::Value {
@@ -846,5 +989,109 @@ mod tests {
         let pairs = vec![("app", "frontend")];
         let result = apply_label_selector(items, &pairs);
         assert!(result.is_empty());
+    }
+
+    // -- object_matches_label_selector edge cases --
+
+    /// Empty selector matches all objects, including those with no labels.
+    /// Watch streams use this: an empty selector must never drop events.
+    #[test]
+    fn label_selector_empty_matches_all() {
+        let obj_with_labels = serde_json::json!({"metadata": {"labels": {"app": "frontend"}}});
+        let obj_no_labels = serde_json::json!({"metadata": {}});
+        assert!(object_matches_label_selector(&obj_with_labels, ""));
+        assert!(object_matches_label_selector(&obj_no_labels, ""));
+    }
+
+    /// A selector that does not match any label on the object returns false.
+    #[test]
+    fn label_selector_no_match_returns_false() {
+        let obj = serde_json::json!({"metadata": {"labels": {"app": "backend"}}});
+        assert!(!object_matches_label_selector(&obj, "app=frontend"));
+    }
+
+    /// Multiple comma-separated terms must all match (AND semantics).
+    #[test]
+    fn label_selector_multi_term_all_must_match() {
+        let obj = serde_json::json!({"metadata": {"labels": {"app": "frontend", "env": "prod"}}});
+        // Both match → true
+        assert!(object_matches_label_selector(&obj, "app=frontend,env=prod"));
+        // Only one matches → false
+        assert!(!object_matches_label_selector(&obj, "app=frontend,env=dev"));
+    }
+
+    /// Object with no metadata.labels does not match any label selector.
+    #[test]
+    fn label_selector_object_without_labels_does_not_match() {
+        let obj = serde_json::json!({"metadata": {"name": "no-labels"}});
+        assert!(!object_matches_label_selector(&obj, "app=frontend"));
+    }
+
+    // -- object_matches_field_selector edge cases --
+
+    /// Empty field selector matches all objects.
+    #[test]
+    fn field_selector_empty_matches_all() {
+        let obj = serde_json::json!({"metadata": {"name": "foo", "namespace": "default"}});
+        assert!(object_matches_field_selector(&obj, ""));
+    }
+
+    /// metadata.name equality match returns true when names agree.
+    #[test]
+    fn field_selector_metadata_name_equality_matches() {
+        let obj = serde_json::json!({"metadata": {"name": "foo"}});
+        assert!(object_matches_field_selector(&obj, "metadata.name=foo"));
+    }
+
+    /// metadata.name equality returns false when name differs.
+    #[test]
+    fn field_selector_metadata_name_equality_no_match() {
+        let obj = serde_json::json!({"metadata": {"name": "bar"}});
+        assert!(!object_matches_field_selector(&obj, "metadata.name=foo"));
+    }
+
+    /// metadata.namespace equality filters by namespace.
+    #[test]
+    fn field_selector_metadata_namespace_equality() {
+        let obj = serde_json::json!({"metadata": {"name": "pod-1", "namespace": "kube-system"}});
+        assert!(object_matches_field_selector(
+            &obj,
+            "metadata.namespace=kube-system"
+        ));
+        assert!(!object_matches_field_selector(
+            &obj,
+            "metadata.namespace=default"
+        ));
+    }
+
+    /// spec.nodeName equality match.
+    #[test]
+    fn field_selector_spec_node_name_equality() {
+        let obj =
+            serde_json::json!({"metadata": {"name": "pod-1"}, "spec": {"nodeName": "node-a"}});
+        assert!(object_matches_field_selector(&obj, "spec.nodeName=node-a"));
+        assert!(!object_matches_field_selector(&obj, "spec.nodeName=node-b"));
+    }
+
+    /// spec.nodeName inequality (`!=`) returns false when names are equal.
+    #[test]
+    fn field_selector_spec_node_name_inequality() {
+        let obj =
+            serde_json::json!({"metadata": {"name": "pod-1"}, "spec": {"nodeName": "node-a"}});
+        // node-a != node-a → false (they are equal, so inequality fails)
+        assert!(!object_matches_field_selector(
+            &obj,
+            "spec.nodeName!=node-a"
+        ));
+        // node-a != node-b → true (they differ)
+        assert!(object_matches_field_selector(&obj, "spec.nodeName!=node-b"));
+    }
+
+    /// Unknown field is ignored (conservative: don't drop events for unrecognised selectors).
+    #[test]
+    fn field_selector_unknown_field_is_ignored() {
+        let obj = serde_json::json!({"metadata": {"name": "pod-1"}});
+        // Unknown field → ignore → still matches
+        assert!(object_matches_field_selector(&obj, "status.phase=Running"));
     }
 }

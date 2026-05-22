@@ -1747,6 +1747,1060 @@ mod tests {
         );
     }
 
+    /// delete_resource returns 404 when the cluster-scoped object does not exist.
+    #[tokio::test]
+    async fn delete_resource_returns_404_for_missing() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+        let result = delete_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "nonexistent".into(),
+            )),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND),
+            Ok(_) => panic!("delete of missing cluster-scoped object must return 404"),
+        }
+    }
+
+    /// delete_resource with finalizers sets deletionTimestamp (soft-delete) and
+    /// leaves the object in the store. The object must not be hard-deleted while
+    /// finalizers are still present — controllers watch for deletionTimestamp to run cleanup.
+    #[tokio::test]
+    async fn delete_resource_with_finalizers_soft_deletes() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "finalizer-node",
+                "finalizers": ["example.com/cleanup"]
+            },
+            "spec": { "drivers": [] }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/finalizer-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let del_result = delete_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "finalizer-node".into(),
+            )),
+        )
+        .await;
+        let result = match del_result {
+            Ok(r) => r.into_response(),
+            Err(_) => panic!("soft-delete must succeed"),
+        };
+
+        assert_eq!(result.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "soft-deleted object must have deletionTimestamp set"
+        );
+
+        // Object must still exist in the store (not hard-deleted)
+        assert!(
+            store.get(key).await.unwrap().is_some(),
+            "object with finalizers must remain in store after soft-delete"
+        );
+    }
+
+    /// replace_resource (PUT) on a new object with no resourceVersion creates it.
+    /// When no resourceVersion is given, this is an unconditional write (create-or-update).
+    #[tokio::test]
+    async fn replace_resource_creates_object_when_no_resource_version() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "replace-node" },
+            "spec": { "drivers": [] }
+        });
+
+        let rr_result = replace_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "replace-node".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+        )
+        .await;
+        let result = match rr_result {
+            Ok(r) => r.into_response(),
+            Err(_) => panic!("replace_resource without rv must succeed"),
+        };
+
+        assert_eq!(result.status(), axum::http::StatusCode::OK);
+    }
+
+    /// replace_resource (PUT) with matching resourceVersion updates the object.
+    #[tokio::test]
+    async fn replace_resource_updates_object_with_matching_rv() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // First PUT — no rv → creates
+        let v1 = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "rv-node" },
+            "spec": { "drivers": [] }
+        });
+        let rr1 = replace_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "rv-node".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&v1).unwrap()),
+        )
+        .await;
+        let resp1 = match rr1 {
+            Ok(r) => r.into_response(),
+            Err(_) => panic!("first replace must succeed"),
+        };
+
+        let body = to_bytes(resp1.into_body(), usize::MAX).await.unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rv = stored["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Second PUT with matching rv → update
+        let v2 = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "rv-node", "resourceVersion": rv },
+            "spec": { "drivers": [{"name": "new.csi.io", "nodeID": "rv-node"}] }
+        });
+        let result = replace_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "rv-node".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&v2).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "replace_resource with matching rv must succeed"
+        );
+    }
+
+    /// replace_resource with stale resourceVersion must return 409 Conflict.
+    /// This is the OCC guarantee: stale writers must be rejected.
+    #[tokio::test]
+    async fn replace_resource_returns_409_on_stale_rv() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        // Create the object
+        let v1 = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "stale-node" },
+            "spec": { "drivers": [] }
+        });
+        match replace_resource(
+            State(state.clone()),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "stale-node".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&v1).unwrap()),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(_) => panic!("first replace must succeed"),
+        }
+
+        // Try with a known-stale rv
+        let stale = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "stale-node", "resourceVersion": "999" },
+            "spec": { "drivers": [] }
+        });
+        let result = replace_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "stale-node".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&stale).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(err.0, axum::http::StatusCode::CONFLICT),
+            Ok(_) => panic!("stale replace must return 409 Conflict"),
+        }
+    }
+
+    /// patch_resource with JSON Patch (`application/json-patch+json`) applies the patch.
+    /// This is the fine-grained mutation path used by kubectl patch --type=json.
+    #[tokio::test]
+    async fn patch_resource_with_json_patch_applies_changes() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "patch-node", "resourceVersion": "1" },
+            "spec": { "drivers": [] }
+        });
+        store
+            .put(
+                "/registry/storage.k8s.io/csinodes/patch-node",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut jp_headers = axum::http::HeaderMap::new();
+        jp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/metadata/labels", "value": {"env": "prod"}}
+        ]);
+
+        let patch_result = patch_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "patch-node".into(),
+            )),
+            jp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        let result = match patch_result {
+            Ok(r) => r.into_response(),
+            Err(_) => panic!("json-patch on existing object must succeed"),
+        };
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["metadata"]["labels"]["env"], "prod");
+    }
+
+    /// patch_namespaced_resource with merge-patch updates the object.
+    /// This is the primary mutation path used by controller-manager for namespaced resources.
+    #[tokio::test]
+    async fn patch_namespaced_resource_merge_patch_applies_changes() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "ns-patch-lease", "namespace": "kube-node-lease", "resourceVersion": "1" },
+            "spec": { "holderIdentity": "original" }
+        });
+        store
+            .put(
+                "/registry/coordination.k8s.io/leases/kube-node-lease/ns-patch-lease",
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let patch = serde_json::json!({"spec": {"holderIdentity": "updated"}});
+
+        let mp_result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "ns-patch-lease".into(),
+            )),
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        let result = match mp_result {
+            Ok(r) => r.into_response(),
+            Err(_) => panic!("merge-patch on existing namespaced object must succeed"),
+        };
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["spec"]["holderIdentity"], "updated");
+    }
+
+    /// create_resource returns 409 Conflict when creating the same name twice.
+    /// Kubernetes rejects duplicate object creation — clients must GET first or use apply.
+    /// Uses Node (cluster-scoped, create_or_update=false) to trigger 409.
+    #[tokio::test]
+    async fn create_resource_returns_409_on_duplicate() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        // Node is registered with create_or_update=false, so duplicate create must 409.
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "dup-node" }
+        });
+        let admin = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
+
+        match create_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            admin.clone(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(_) => panic!("first create must succeed"),
+        }
+
+        let result = create_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            admin,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(err.0, axum::http::StatusCode::CONFLICT),
+            Ok(_) => panic!("duplicate create must return 409 Conflict"),
+        }
+    }
+
+    /// list_resource with labelSelector filters to matching items only.
+    /// Controllers and kubectl filter lists by label; incorrect filtering causes missing or extra items.
+    #[tokio::test]
+    async fn list_resource_with_label_selector_filters_results() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed two CSINodes with different labels
+        for (name, app) in [("node-foo", "foo"), ("node-bar", "bar")] {
+            let obj = serde_json::json!({
+                "apiVersion": "storage.k8s.io/v1",
+                "kind": "CSINode",
+                "metadata": {
+                    "name": name,
+                    "labels": { "app": app }
+                },
+                "spec": { "drivers": [] }
+            });
+            store
+                .put(
+                    &format!("/registry/storage.k8s.io/csinodes/{name}"),
+                    bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                    Some(0),
+                )
+                .await
+                .unwrap();
+        }
+
+        let list_result = list_resource(
+            State(state),
+            Path(("storage.k8s.io".into(), "v1".into(), "csinodes".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: Some("app=foo".into()),
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+        )
+        .await;
+        let resp = match list_result {
+            Ok(r) => r,
+            Err(_) => panic!("list with label selector must not fail"),
+        };
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "label selector must filter to 1 matching item"
+        );
+        assert_eq!(items[0]["metadata"]["name"], "node-foo");
+    }
+
+    /// replace_namespaced_resource with stale resourceVersion returns 409 Conflict.
+    #[tokio::test]
+    async fn replace_namespaced_resource_returns_409_on_stale_rv() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        // Create via replace (no rv)
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "stale-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "original" }
+        });
+        match replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "stale-lease".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(_) => panic!("first replace must succeed"),
+        }
+
+        // Try with a known-stale rv
+        let stale = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "stale-lease", "namespace": "kube-node-lease", "resourceVersion": "999" },
+            "spec": { "holderIdentity": "updated" }
+        });
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "stale-lease".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&stale).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(err.0, axum::http::StatusCode::CONFLICT),
+            Ok(_) => panic!("stale replace_namespaced must return 409 Conflict"),
+        }
+    }
+
+    /// delete_namespaced_resource with finalizers soft-deletes: sets deletionTimestamp,
+    /// leaves the object in the store. Finalizer-based cleanup cannot work if the object
+    /// is hard-deleted immediately.
+    #[tokio::test]
+    async fn delete_namespaced_resource_with_finalizers_soft_deletes() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "finalizer-lease",
+                "namespace": "kube-node-lease",
+                "finalizers": ["example.com/cleanup"]
+            },
+            "spec": { "holderIdentity": "finalizer-lease" }
+        });
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/finalizer-lease";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let del_ns = delete_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "finalizer-lease".into(),
+            )),
+        )
+        .await;
+        let result = match del_ns {
+            Ok(r) => r.into_response(),
+            Err(_) => panic!("soft-delete must succeed"),
+        };
+
+        assert_eq!(result.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "soft-deleted object must have deletionTimestamp"
+        );
+
+        assert!(
+            store.get(key).await.unwrap().is_some(),
+            "namespaced object with finalizers must remain in store after soft-delete"
+        );
+    }
+
+    /// do_patch: when deletionTimestamp is set and patch removes all finalizers,
+    /// the object must be hard-deleted from the store. This is the finalizer GC path:
+    /// controllers remove themselves from finalizers, and once empty, the object is gone.
+    #[tokio::test]
+    async fn patch_resource_hard_deletes_when_finalizers_removed_after_soft_delete() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed an object that is already soft-deleted (has deletionTimestamp) with one finalizer.
+        let obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "gc-node",
+                "deletionTimestamp": "2026-05-22T00:00:00Z",
+                "finalizers": ["example.com/cleanup"]
+            },
+            "spec": { "drivers": [] }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/gc-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // PATCH to clear the finalizers list.
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({"metadata": {"finalizers": []}});
+
+        let result = patch_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "gc-node".into(),
+            )),
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "patch removing finalizers from soft-deleted object must succeed"
+        );
+
+        // After GC, the object must be hard-deleted from the store.
+        assert!(
+            store.get(key).await.unwrap().is_none(),
+            "object with deletionTimestamp and empty finalizers must be hard-deleted after patch"
+        );
+    }
+
+    /// get_resource follows the CR fallback path for unregistered groups.
+    /// Custom resources not in the static registry must be served from the CR store.
+    #[tokio::test]
+    async fn get_resource_cr_fallback_returns_404_for_missing() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        // Use an unregistered group to trigger CR fallback
+        let result = get_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "widgets".into(),
+                "my-widget".into(),
+            )),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing CR must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// get_namespaced_resource follows the CR fallback path for unregistered groups.
+    #[tokio::test]
+    async fn get_namespaced_resource_cr_fallback_returns_404_for_missing() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = get_namespaced_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "default".into(),
+                "widgets".into(),
+                "missing-widget".into(),
+            )),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing namespaced CR must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// delete_resource follows the CR fallback path for unregistered groups.
+    #[tokio::test]
+    async fn delete_resource_cr_fallback_returns_404_for_missing() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = delete_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "widgets".into(),
+                "missing-widget".into(),
+            )),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("delete of missing CR must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// delete_namespaced_resource follows the CR fallback path for unregistered groups.
+    #[tokio::test]
+    async fn delete_namespaced_resource_cr_fallback_returns_404_for_missing() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = delete_namespaced_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "default".into(),
+                "widgets".into(),
+                "missing-widget".into(),
+            )),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("delete of missing namespaced CR must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// replace_resource CR fallback returns 404 when no CRD is registered.
+    /// Without a CRD, the server cannot validate or accept CRs of that type.
+    #[tokio::test]
+    async fn replace_resource_cr_fallback_returns_404_without_crd() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let widget = serde_json::json!({
+            "apiVersion": "custom.example.com/v1",
+            "kind": "Widget",
+            "metadata": { "name": "my-widget" }
+        });
+
+        let result = replace_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "widgets".into(),
+                "my-widget".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("replace_resource without CRD must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// create_resource CR fallback returns 404 when no CRD is registered.
+    #[tokio::test]
+    async fn create_resource_cr_fallback_returns_404_without_crd() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let widget = serde_json::json!({
+            "apiVersion": "custom.example.com/v1",
+            "kind": "Widget",
+            "metadata": { "name": "my-widget" }
+        });
+
+        let result = create_resource(
+            State(state),
+            Path(("custom.example.com".into(), "v1".into(), "widgets".into())),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("create_resource without CRD must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// patch_resource CR fallback for unregistered groups.
+    #[tokio::test]
+    async fn patch_resource_cr_fallback_returns_404_for_missing() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({"metadata": {"labels": {"env": "prod"}}});
+
+        let result = patch_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "widgets".into(),
+                "nonexistent".into(),
+            )),
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("patch on missing CR must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// patch_namespaced_resource CR fallback for unregistered groups.
+    #[tokio::test]
+    async fn patch_namespaced_resource_cr_fallback_returns_404_for_missing() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({"metadata": {"labels": {"env": "prod"}}});
+
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "default".into(),
+                "widgets".into(),
+                "nonexistent".into(),
+            )),
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("patch on missing namespaced CR must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// create_namespaced_resource CR fallback returns 404 when no CRD is registered.
+    #[tokio::test]
+    async fn create_namespaced_resource_cr_fallback_returns_404_without_crd() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let widget = serde_json::json!({
+            "apiVersion": "custom.example.com/v1",
+            "kind": "Widget",
+            "metadata": { "name": "ns-widget", "namespace": "default" }
+        });
+
+        let result = create_namespaced_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "default".into(),
+                "widgets".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("create_namespaced CR without CRD must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// replace_namespaced_resource CR fallback returns 404 when no CRD is registered.
+    #[tokio::test]
+    async fn replace_namespaced_resource_cr_fallback_returns_404_without_crd() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let widget = serde_json::json!({
+            "apiVersion": "custom.example.com/v1",
+            "kind": "Widget",
+            "metadata": { "name": "rns-widget", "namespace": "default" }
+        });
+
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "custom.example.com".into(),
+                "v1".into(),
+                "default".into(),
+                "widgets".into(),
+                "rns-widget".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("replace_namespaced CR without CRD must return 404"),
+        };
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
     /// strategic_merge_patch merges arrays by name key (not replaces).
     #[test]
     fn strategic_merge_patch_applied_correctly_via_handler_logic() {
