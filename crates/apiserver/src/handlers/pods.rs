@@ -1324,7 +1324,12 @@ mod patch_type_tests {
 /// a live store, so the defaulting logic lives here as a pure function.
 pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     if pod["spec"]["enableServiceLinks"].is_null() {
-        pod["spec"]["enableServiceLinks"] = serde_json::Value::Bool(true);
+        let spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
+        // PodSpec deserializes enableServiceLinks with default_true, so spec.enable_service_links
+        // is true when the field was absent.  Write it back via the typed field so a rename
+        // of enable_service_links → something_else becomes a compile error here.
+        pod["spec"]["enableServiceLinks"] =
+            serde_json::to_value(spec.enable_service_links).expect("bool is always serializable");
     }
 }
 

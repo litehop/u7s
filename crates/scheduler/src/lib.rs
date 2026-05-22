@@ -6,7 +6,7 @@ use anyhow::{bail, Context};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -323,6 +323,31 @@ pub async fn pick_node(connector: &TlsConnector, server: &str) -> anyhow::Result
     select_first_node(list)
 }
 
+/// The target of a Binding — identifies the node to bind to.
+#[derive(Serialize)]
+struct BindingTarget<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'a str,
+    kind: &'a str,
+    name: &'a str,
+}
+
+/// Full Binding object body as posted to the API server.
+#[derive(Serialize)]
+struct Binding<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'a str,
+    kind: &'a str,
+    metadata: BindingMeta<'a>,
+    target: BindingTarget<'a>,
+}
+
+#[derive(Serialize)]
+struct BindingMeta<'a> {
+    name: &'a str,
+    namespace: &'a str,
+}
+
 /// Build the binding path for a pod in a given namespace.
 ///
 /// Pure function extracted so callers can test path construction without
@@ -334,13 +359,22 @@ pub fn binding_path(namespace: &str, pod_name: &str) -> String {
 /// Build the JSON payload for a pod binding.
 ///
 /// Pure function so the payload shape can be verified in tests.
+/// Uses typed structs so field renames are compile errors, not silent bugs.
 pub fn binding_payload(namespace: &str, pod_name: &str, node_name: &str) -> Value {
-    serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Binding",
-        "metadata": { "name": pod_name, "namespace": namespace },
-        "target": { "apiVersion": "v1", "kind": "Node", "name": node_name }
-    })
+    let binding = Binding {
+        api_version: "v1",
+        kind: "Binding",
+        metadata: BindingMeta {
+            name: pod_name,
+            namespace,
+        },
+        target: BindingTarget {
+            api_version: "v1",
+            kind: "Node",
+            name: node_name,
+        },
+    };
+    serde_json::to_value(binding).expect("Binding is always serializable")
 }
 
 /// Bind a pod to a node via POST .../pods/:name/binding.

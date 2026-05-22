@@ -305,7 +305,7 @@ pub struct PodSpec {
 // ---------------------------------------------------------------------------
 
 /// The `target` field of a Binding object.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindingTarget {
     pub name: String,
 }
@@ -313,7 +313,7 @@ pub struct BindingTarget {
 /// Typed representation of the Binding subresource body POSTed by the
 /// scheduler. Using this instead of raw `binding["target"]["name"]` indexing
 /// means a typo in the field path is a compile error, not a silent None.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Binding {
     pub target: BindingTarget,
 }
