@@ -133,20 +133,20 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     let api_version = format!("{group}/{version}");
     obj["apiVersion"] = serde_json::Value::String(api_version);
     obj["kind"] = serde_json::Value::String(kind.to_string());
-    if obj["metadata"]["uid"]
-        .as_str()
+    let mut meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+    if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
+        meta.uid = Some(new_cr_uid());
+    }
+    if meta
+        .creation_timestamp
+        .as_deref()
         .map(|s| s.is_empty())
         .unwrap_or(true)
     {
-        obj["metadata"]["uid"] = serde_json::Value::String(new_cr_uid());
+        meta.creation_timestamp = Some(utc_now_rfc3339());
     }
-    if obj["metadata"]["creationTimestamp"]
-        .as_str()
-        .map(|s| s.is_empty())
-        .unwrap_or(true)
-    {
-        obj["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-    }
+    obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
 }
 
 fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
@@ -168,24 +168,29 @@ fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
 }
 
 fn resolve_cr_metadata(stored: &serde_json::Value, incoming: &mut serde_json::Value) {
-    if incoming["metadata"]["uid"]
-        .as_str()
+    let stored_meta: crate::types::ObjectMeta =
+        serde_json::from_value(stored["metadata"].clone()).unwrap_or_default();
+    let mut incoming_meta: crate::types::ObjectMeta =
+        serde_json::from_value(incoming["metadata"].take()).unwrap_or_default();
+    if incoming_meta
+        .uid
+        .as_deref()
         .map(|s| s.is_empty())
         .unwrap_or(true)
+        && stored_meta.uid.is_some()
     {
-        if let Some(uid) = stored["metadata"]["uid"].as_str() {
-            incoming["metadata"]["uid"] = serde_json::Value::String(uid.to_string());
-        }
+        incoming_meta.uid = stored_meta.uid;
     }
-    if incoming["metadata"]["creationTimestamp"]
-        .as_str()
+    if incoming_meta
+        .creation_timestamp
+        .as_deref()
         .map(|s| s.is_empty())
         .unwrap_or(true)
+        && stored_meta.creation_timestamp.is_some()
     {
-        if let Some(ts) = stored["metadata"]["creationTimestamp"].as_str() {
-            incoming["metadata"]["creationTimestamp"] = serde_json::Value::String(ts.to_string());
-        }
+        incoming_meta.creation_timestamp = stored_meta.creation_timestamp;
     }
+    incoming["metadata"] = serde_json::to_value(incoming_meta).unwrap_or_default();
 }
 
 fn new_cr_uid() -> String {
@@ -459,7 +464,10 @@ pub async fn create_cr(
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
-    obj["metadata"]["resourceVersion"] = serde_json::Value::String(rv.to_string());
+    let mut meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+    meta.resource_version = Some(rv.to_string());
+    obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
     Ok((StatusCode::CREATED, Json(obj)))
 }
 
@@ -483,7 +491,9 @@ pub async fn replace_cr(
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let obj_name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
+    let obj_meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+    let obj_name = obj_meta.name.as_deref().unwrap_or("").to_string();
     if obj_name != name {
         return Err(Status::bad_request(format!(
             "the name of the object ({obj_name}) does not match the name on the URL ({name})"
@@ -515,7 +525,9 @@ pub async fn replace_cr(
 
     validate_cr_schema(&obj, &ctx)?;
 
-    let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
+    let meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+    let expected_rv = parse_resource_version(meta.resource_version.as_deref())?;
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
@@ -524,7 +536,10 @@ pub async fn replace_cr(
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
-    obj["metadata"]["resourceVersion"] = serde_json::Value::String(rv.to_string());
+    let mut meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+    meta.resource_version = Some(rv.to_string());
+    obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
     Ok(Json(obj))
 }
 
@@ -679,7 +694,12 @@ pub async fn create_cr_namespaced(
 
     validate_cr_schema(&obj, &ctx)?;
 
-    obj["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
+    {
+        let mut meta: crate::types::ObjectMeta =
+            serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+        meta.namespace = Some(ns.clone());
+        obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
+    }
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
     let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
@@ -690,7 +710,10 @@ pub async fn create_cr_namespaced(
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
-    obj["metadata"]["resourceVersion"] = serde_json::Value::String(rv.to_string());
+    let mut meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+    meta.resource_version = Some(rv.to_string());
+    obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
     Ok((StatusCode::CREATED, Json(obj)))
 }
 
@@ -714,7 +737,9 @@ pub async fn replace_cr_namespaced(
     let mut obj: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    let obj_name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
+    let obj_meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+    let obj_name = obj_meta.name.as_deref().unwrap_or("").to_string();
     if obj_name != name {
         return Err(Status::bad_request(format!(
             "the name of the object ({obj_name}) does not match the name on the URL ({name})"
@@ -744,7 +769,9 @@ pub async fn replace_cr_namespaced(
 
     validate_cr_schema(&obj, &ctx)?;
 
-    let expected_rv = parse_resource_version(obj["metadata"]["resourceVersion"].as_str())?;
+    let meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
+    let expected_rv = parse_resource_version(meta.resource_version.as_deref())?;
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
@@ -753,7 +780,10 @@ pub async fn replace_cr_namespaced(
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
-    obj["metadata"]["resourceVersion"] = serde_json::Value::String(rv.to_string());
+    let mut meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+    meta.resource_version = Some(rv.to_string());
+    obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
     Ok(Json(obj))
 }
 
@@ -867,7 +897,10 @@ pub async fn patch_cr(
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
-    obj["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+    let mut meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+    meta.resource_version = Some(new_rv.to_string());
+    obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
     Ok(Json(obj))
 }
 
@@ -922,7 +955,10 @@ pub async fn patch_cr_namespaced(
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
-    obj["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+    let mut meta: crate::types::ObjectMeta =
+        serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+    meta.resource_version = Some(new_rv.to_string());
+    obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
     Ok(Json(obj))
 }
 
@@ -999,8 +1035,9 @@ pub async fn put_cr_status(
         }
     }
 
-    let rv_str = current["metadata"]["resourceVersion"].as_str();
-    let expected_rv = parse_resource_version(rv_str)?;
+    let current_meta: crate::types::ObjectMeta =
+        serde_json::from_value(current["metadata"].clone()).unwrap_or_default();
+    let expected_rv = parse_resource_version(current_meta.resource_version.as_deref())?;
     let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
@@ -1008,7 +1045,10 @@ pub async fn put_cr_status(
         .await
         .map_err(|e| store_err_cr(e, &name, &kind))?;
 
-    current["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+    let mut current_meta: crate::types::ObjectMeta =
+        serde_json::from_value(current["metadata"].take()).unwrap_or_default();
+    current_meta.resource_version = Some(new_rv.to_string());
+    current["metadata"] = serde_json::to_value(current_meta).unwrap_or_default();
     Ok(Json(current))
 }
 
