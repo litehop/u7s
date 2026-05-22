@@ -3,6 +3,7 @@ pub mod cr;
 pub mod crd;
 pub mod discovery;
 pub mod generic;
+pub mod json_patch;
 pub mod namespaces;
 pub mod pods;
 pub mod scale;

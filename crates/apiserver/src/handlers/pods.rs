@@ -402,44 +402,13 @@ pub async fn delete_pod(
     })))
 }
 
-/// Classify the patch Content-Type for pod PATCH requests.
-/// Mirrors detect_patch_type in generic.rs; consolidated once generic exports it.
-#[derive(Debug)]
-enum PodPatchType {
-    Merge,
-    StrategicMerge,
-    Json,
-}
-
-fn detect_pod_patch_type(headers: &HeaderMap) -> Result<PodPatchType, crate::status::StatusError> {
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if content_type.contains("application/strategic-merge-patch+json") {
-        return Ok(PodPatchType::StrategicMerge);
-    }
-    if content_type.contains("application/merge-patch+json") {
-        return Ok(PodPatchType::Merge);
-    }
-    if content_type.contains("application/json-patch+json") {
-        return Ok(PodPatchType::Json);
-    }
-    if content_type.contains("application/apply-patch+yaml") {
-        return Ok(PodPatchType::StrategicMerge);
-    }
-    Err(Status::unsupported_media_type(format!(
-        "unsupported media type '{content_type}'; use application/merge-patch+json, application/strategic-merge-patch+json, or application/json-patch+json"
-    )))
-}
-
 pub async fn patch_pod(
     State(state): State<AppState>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let patch_type = detect_pod_patch_type(&headers)?;
+    let patch_type = super::json_patch::detect_patch_type(&headers)?;
 
     let ns = parse_namespace(&raw_ns, &state).await?;
 
@@ -458,15 +427,15 @@ pub async fn patch_pod(
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
     match patch_type {
-        PodPatchType::StrategicMerge => {
+        super::json_patch::PatchType::StrategicMerge => {
             crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
                 .map_err(|e| Status::bad_request(e.to_string()))?;
         }
-        PodPatchType::Merge => {
+        super::json_patch::PatchType::Merge => {
             crate::patch::merge_patch(&mut current_obj.body, &patch);
         }
-        PodPatchType::Json => {
-            pod_apply_json_patch(&mut current_obj.body, &patch)?;
+        super::json_patch::PatchType::Json => {
+            super::json_patch::apply_json_patch(&mut current_obj.body, &patch)?;
         }
     }
 
@@ -498,252 +467,6 @@ pub async fn patch_pod(
     current_obj.set_resource_version(new_rv);
 
     Ok(Json(current_obj.body))
-}
-
-// ---------------------------------------------------------------------------
-// JSON Patch (RFC 6902) helpers for pod PATCH.
-// Duplicated from generic.rs until that module exports them as pub(crate).
-// TODO(mayor-1hc follow-up): remove once generic::apply_json_patch is pub(crate).
-// ---------------------------------------------------------------------------
-
-fn pod_apply_json_patch(
-    obj: &mut serde_json::Value,
-    patch: &serde_json::Value,
-) -> Result<(), crate::status::StatusError> {
-    let ops = patch.as_array().ok_or_else(|| {
-        Status::unprocessable_entity("JSON patch must be an array of operations".into())
-    })?;
-    for op in ops {
-        let op_str = op["op"].as_str().ok_or_else(|| {
-            Status::unprocessable_entity("each JSON patch operation must have an 'op' field".into())
-        })?;
-        let path = op["path"].as_str().ok_or_else(|| {
-            Status::unprocessable_entity(
-                "each JSON patch operation must have a 'path' field".into(),
-            )
-        })?;
-        match op_str {
-            "add" => {
-                let value = op
-                    .get("value")
-                    .ok_or_else(|| {
-                        Status::unprocessable_entity(
-                            "'add' operation requires a 'value' field".into(),
-                        )
-                    })?
-                    .clone();
-                pod_json_patch_add(obj, path, value)?;
-            }
-            "replace" => {
-                let value = op
-                    .get("value")
-                    .ok_or_else(|| {
-                        Status::unprocessable_entity(
-                            "'replace' operation requires a 'value' field".into(),
-                        )
-                    })?
-                    .clone();
-                pod_json_patch_set(obj, path, value)?;
-            }
-            "remove" => {
-                pod_json_patch_remove(obj, path)?;
-            }
-            other => {
-                return Err(Status::unprocessable_entity(format!(
-                    "unsupported JSON patch operation '{other}'; supported: add, remove, replace"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn pod_json_pointer_segments(pointer: &str) -> Vec<String> {
-    if pointer.is_empty() {
-        return vec![];
-    }
-    let stripped = pointer.strip_prefix('/').unwrap_or(pointer);
-    stripped
-        .split('/')
-        .map(|seg| seg.replace("~1", "/").replace("~0", "~"))
-        .collect()
-}
-
-fn pod_json_navigate_mut<'a>(
-    obj: &'a mut serde_json::Value,
-    segments: &[String],
-) -> Result<(&'a mut serde_json::Value, String), crate::status::StatusError> {
-    if segments.is_empty() {
-        return Err(Status::unprocessable_entity(
-            "cannot operate on root document".into(),
-        ));
-    }
-    let (parents, last) = segments.split_at(segments.len() - 1);
-    let mut cur = obj;
-    for seg in parents {
-        cur = pod_json_navigate_one(cur, seg)?;
-    }
-    Ok((cur, last[0].clone()))
-}
-
-fn pod_json_navigate_one<'a>(
-    node: &'a mut serde_json::Value,
-    seg: &str,
-) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
-    match node {
-        serde_json::Value::Object(map) => map
-            .get_mut(seg)
-            .ok_or_else(|| Status::unprocessable_entity(format!("path segment '{seg}' not found"))),
-        serde_json::Value::Array(arr) => {
-            let idx: usize = seg.parse().map_err(|_| {
-                Status::unprocessable_entity(format!(
-                    "path segment '{seg}' is not a valid array index"
-                ))
-            })?;
-            arr.get_mut(idx).ok_or_else(|| {
-                Status::unprocessable_entity(format!("array index {idx} out of bounds"))
-            })
-        }
-        _ => Err(Status::unprocessable_entity(format!(
-            "cannot traverse into non-object/array at segment '{seg}'"
-        ))),
-    }
-}
-
-fn pod_json_navigate_one_or_create<'a>(
-    node: &'a mut serde_json::Value,
-    seg: &str,
-) -> Result<&'a mut serde_json::Value, crate::status::StatusError> {
-    match node {
-        serde_json::Value::Object(map) => {
-            map.entry(seg)
-                .or_insert_with(|| serde_json::Value::Object(Default::default()));
-            Ok(map.get_mut(seg).unwrap())
-        }
-        _ => Err(Status::unprocessable_entity(format!(
-            "cannot create intermediate key '{seg}' in non-object"
-        ))),
-    }
-}
-
-fn pod_json_patch_add(
-    obj: &mut serde_json::Value,
-    pointer: &str,
-    value: serde_json::Value,
-) -> Result<(), crate::status::StatusError> {
-    let segs = pod_json_pointer_segments(pointer);
-    if segs.is_empty() {
-        *obj = value;
-        return Ok(());
-    }
-    let (parents, last) = segs.split_at(segs.len() - 1);
-    let mut cur = obj;
-    for seg in parents {
-        cur = pod_json_navigate_one_or_create(cur, seg)?;
-    }
-    let key = &last[0];
-    match cur {
-        serde_json::Value::Object(map) => {
-            map.insert(key.clone(), value);
-        }
-        serde_json::Value::Array(arr) => {
-            if key == "-" {
-                arr.push(value);
-            } else {
-                let idx: usize = key.parse().map_err(|_| {
-                    Status::unprocessable_entity(format!("invalid array index '{key}'"))
-                })?;
-                if idx <= arr.len() {
-                    arr.insert(idx, value);
-                } else {
-                    return Err(Status::unprocessable_entity(format!(
-                        "array index {idx} out of bounds (len {})",
-                        arr.len()
-                    )));
-                }
-            }
-        }
-        _ => {
-            return Err(Status::unprocessable_entity(
-                "cannot add value to non-object/array".into(),
-            ))
-        }
-    }
-    Ok(())
-}
-
-fn pod_json_patch_set(
-    obj: &mut serde_json::Value,
-    pointer: &str,
-    value: serde_json::Value,
-) -> Result<(), crate::status::StatusError> {
-    let segs = pod_json_pointer_segments(pointer);
-    if segs.is_empty() {
-        *obj = value;
-        return Ok(());
-    }
-    let (parent, key) = pod_json_navigate_mut(obj, &segs)?;
-    match parent {
-        serde_json::Value::Object(map) => {
-            map.insert(key, value);
-        }
-        serde_json::Value::Array(arr) => {
-            if key == "-" {
-                arr.push(value);
-            } else {
-                let idx: usize = key.parse().map_err(|_| {
-                    Status::unprocessable_entity(format!("invalid array index '{key}'"))
-                })?;
-                if idx <= arr.len() {
-                    arr.insert(idx, value);
-                } else {
-                    return Err(Status::unprocessable_entity(format!(
-                        "array index {idx} out of bounds (len {})",
-                        arr.len()
-                    )));
-                }
-            }
-        }
-        _ => {
-            return Err(Status::unprocessable_entity(
-                "cannot set value on non-object/array".into(),
-            ))
-        }
-    }
-    Ok(())
-}
-
-fn pod_json_patch_remove(
-    obj: &mut serde_json::Value,
-    pointer: &str,
-) -> Result<(), crate::status::StatusError> {
-    let segs = pod_json_pointer_segments(pointer);
-    let (parent, key) = pod_json_navigate_mut(obj, &segs)?;
-    match parent {
-        serde_json::Value::Object(map) => {
-            map.remove(&key).ok_or_else(|| {
-                Status::unprocessable_entity(format!("path '{pointer}' not found"))
-            })?;
-        }
-        serde_json::Value::Array(arr) => {
-            let idx: usize = key.parse().map_err(|_| {
-                Status::unprocessable_entity(format!("invalid array index '{key}'"))
-            })?;
-            if idx < arr.len() {
-                arr.remove(idx);
-            } else {
-                return Err(Status::unprocessable_entity(format!(
-                    "array index {idx} out of bounds"
-                )));
-            }
-        }
-        _ => {
-            return Err(Status::unprocessable_entity(
-                "cannot remove from non-object/array".into(),
-            ))
-        }
-    }
-    Ok(())
 }
 
 use crate::util::utc_now_rfc3339;
@@ -1473,6 +1196,7 @@ mod status_tests {
 #[cfg(test)]
 mod patch_type_tests {
     use super::*;
+    use crate::handlers::json_patch::{apply_json_patch, detect_patch_type, PatchType};
     use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue};
 
     fn headers_with_ct(ct: &str) -> HeaderMap {
@@ -1487,13 +1211,13 @@ mod patch_type_tests {
     #[test]
     fn json_patch_content_type_is_accepted() {
         let h = headers_with_ct("application/json-patch+json");
-        let result = detect_pod_patch_type(&h);
+        let result = detect_patch_type(&h);
         assert!(
             result.is_ok(),
             "application/json-patch+json must be accepted by patch_pod; \
              before mayor-erz fix it returned 415 Unsupported Media Type"
         );
-        assert!(matches!(result.ok(), Some(PodPatchType::Json)));
+        assert!(matches!(result.ok(), Some(PatchType::Json)));
     }
 
     /// strategic-merge-patch+json must be accepted.
@@ -1501,8 +1225,8 @@ mod patch_type_tests {
     fn strategic_merge_patch_content_type_is_accepted() {
         let h = headers_with_ct("application/strategic-merge-patch+json");
         assert!(matches!(
-            detect_pod_patch_type(&h).ok(),
-            Some(PodPatchType::StrategicMerge)
+            detect_patch_type(&h).ok(),
+            Some(PatchType::StrategicMerge)
         ));
     }
 
@@ -1510,10 +1234,7 @@ mod patch_type_tests {
     #[test]
     fn merge_patch_content_type_is_accepted() {
         let h = headers_with_ct("application/merge-patch+json");
-        assert!(matches!(
-            detect_pod_patch_type(&h).ok(),
-            Some(PodPatchType::Merge)
-        ));
+        assert!(matches!(detect_patch_type(&h).ok(), Some(PatchType::Merge)));
     }
 
     /// apply-patch+yaml is treated as strategic-merge-patch (SSA approximation).
@@ -1521,8 +1242,8 @@ mod patch_type_tests {
     fn apply_patch_yaml_is_accepted_as_strategic_merge() {
         let h = headers_with_ct("application/apply-patch+yaml");
         assert!(matches!(
-            detect_pod_patch_type(&h).ok(),
-            Some(PodPatchType::StrategicMerge)
+            detect_patch_type(&h).ok(),
+            Some(PatchType::StrategicMerge)
         ));
     }
 
@@ -1531,7 +1252,7 @@ mod patch_type_tests {
     fn unknown_content_type_returns_415() {
         let h = headers_with_ct("application/octet-stream");
         // Must error, not succeed.
-        let result = detect_pod_patch_type(&h);
+        let result = detect_patch_type(&h);
         assert!(result.is_err(), "unknown content-type must be rejected");
         // Verify it produces a 415 response.
         let resp: axum::response::Response = match result {
@@ -1544,10 +1265,10 @@ mod patch_type_tests {
         );
     }
 
-    /// pod_apply_json_patch: replace operation updates a field in the pod object.
+    /// apply_json_patch: replace operation updates a field in the pod object.
     /// This verifies the json-patch apply path end-to-end at the logic level.
     #[test]
-    fn pod_apply_json_patch_replace_updates_field() {
+    fn apply_json_patch_replace_updates_field() {
         let mut pod = serde_json::json!({
             "metadata": {"name": "my-pod", "namespace": "default"},
             "spec": {"nodeName": "worker-1"}
@@ -1556,7 +1277,7 @@ mod patch_type_tests {
             {"op": "replace", "path": "/spec/nodeName", "value": "worker-2"}
         ]);
         assert!(
-            pod_apply_json_patch(&mut pod, &patch).is_ok(),
+            apply_json_patch(&mut pod, &patch).is_ok(),
             "replace op must succeed"
         );
         assert_eq!(
@@ -1565,9 +1286,9 @@ mod patch_type_tests {
         );
     }
 
-    /// pod_apply_json_patch: add operation inserts a new field.
+    /// apply_json_patch: add operation inserts a new field.
     #[test]
-    fn pod_apply_json_patch_add_inserts_field() {
+    fn apply_json_patch_add_inserts_field() {
         let mut pod = serde_json::json!({
             "metadata": {"name": "my-pod"},
             "spec": {}
@@ -1576,15 +1297,15 @@ mod patch_type_tests {
             {"op": "add", "path": "/spec/nodeName", "value": "worker-3"}
         ]);
         assert!(
-            pod_apply_json_patch(&mut pod, &patch).is_ok(),
+            apply_json_patch(&mut pod, &patch).is_ok(),
             "add op must succeed"
         );
         assert_eq!(pod["spec"]["nodeName"], "worker-3");
     }
 
-    /// pod_apply_json_patch: remove operation deletes a field.
+    /// apply_json_patch: remove operation deletes a field.
     #[test]
-    fn pod_apply_json_patch_remove_deletes_field() {
+    fn apply_json_patch_remove_deletes_field() {
         let mut pod = serde_json::json!({
             "metadata": {"name": "my-pod", "labels": {"app": "test"}}
         });
@@ -1592,7 +1313,7 @@ mod patch_type_tests {
             {"op": "remove", "path": "/metadata/labels/app"}
         ]);
         assert!(
-            pod_apply_json_patch(&mut pod, &patch).is_ok(),
+            apply_json_patch(&mut pod, &patch).is_ok(),
             "remove op must succeed"
         );
         assert!(
@@ -1732,6 +1453,10 @@ pub async fn bind_pod(
 #[cfg(test)]
 mod pure_logic_tests {
     use super::*;
+    use crate::handlers::json_patch::{
+        apply_json_patch, json_navigate_one, json_navigate_one_or_create, json_patch_add,
+        json_patch_navigate_mut, json_patch_remove, json_patch_set, json_pointer_segments,
+    };
     use u7s_store::StoreError;
 
     // -----------------------------------------------------------------------
@@ -1790,44 +1515,44 @@ mod pure_logic_tests {
     }
 
     // -----------------------------------------------------------------------
-    // pod_json_pointer_segments
+    // json_pointer_segments
     // -----------------------------------------------------------------------
 
     /// Empty pointer yields empty segments — root document path.
     #[test]
     fn pointer_segments_empty_string() {
-        assert!(pod_json_pointer_segments("").is_empty());
+        assert!(json_pointer_segments("").is_empty());
     }
 
     /// "/a/b/c" splits into ["a", "b", "c"].
     #[test]
     fn pointer_segments_three_parts() {
-        assert_eq!(pod_json_pointer_segments("/a/b/c"), vec!["a", "b", "c"]);
+        assert_eq!(json_pointer_segments("/a/b/c"), vec!["a", "b", "c"]);
     }
 
     /// RFC 6901 escape sequences: ~1 -> "/" and ~0 -> "~".
     #[test]
     fn pointer_segments_rfc6901_escapes() {
-        let segs = pod_json_pointer_segments("/a~1b/c~0d");
+        let segs = json_pointer_segments("/a~1b/c~0d");
         assert_eq!(segs, vec!["a/b", "c~d"]);
     }
 
     /// A pointer without a leading slash is used as-is (strip_prefix returns None).
     #[test]
     fn pointer_segments_no_leading_slash() {
-        let segs = pod_json_pointer_segments("foo/bar");
+        let segs = json_pointer_segments("foo/bar");
         assert_eq!(segs, vec!["foo", "bar"]);
     }
 
     // -----------------------------------------------------------------------
-    // pod_json_navigate_mut
+    // json_patch_navigate_mut
     // -----------------------------------------------------------------------
 
     /// Empty segments must return an error ("cannot operate on root document").
     #[test]
     fn navigate_mut_empty_segments_returns_err() {
         let mut obj = serde_json::json!({"a": 1});
-        let result = pod_json_navigate_mut(&mut obj, &[]);
+        let result = json_patch_navigate_mut(&mut obj, &[]);
         assert!(result.is_err(), "empty segments must error");
         let resp: axum::response::Response = match result {
             Err(e) => e.into_response(),
@@ -1842,20 +1567,20 @@ mod pure_logic_tests {
         let mut obj = serde_json::json!({"x": 99});
         let segs = vec!["x".to_string()];
         let (parent, key) =
-            pod_json_navigate_mut(&mut obj, &segs).unwrap_or_else(|_| panic!("must succeed"));
+            json_patch_navigate_mut(&mut obj, &segs).unwrap_or_else(|_| panic!("must succeed"));
         assert_eq!(key, "x");
         assert!(parent.is_object());
     }
 
     // -----------------------------------------------------------------------
-    // pod_json_navigate_one
+    // json_navigate_one
     // -----------------------------------------------------------------------
 
     /// Traversing into an object with a known key succeeds.
     #[test]
     fn navigate_one_object_known_key() {
         let mut obj = serde_json::json!({"spec": {"nodeName": "worker-1"}});
-        let result = pod_json_navigate_one(&mut obj, "spec");
+        let result = json_navigate_one(&mut obj, "spec");
         assert!(result.is_ok());
     }
 
@@ -1863,7 +1588,7 @@ mod pure_logic_tests {
     #[test]
     fn navigate_one_object_missing_key_returns_422() {
         let mut obj = serde_json::json!({"spec": {}});
-        let result = pod_json_navigate_one(&mut obj, "status");
+        let result = json_navigate_one(&mut obj, "status");
         assert!(result.is_err());
         let resp: axum::response::Response = match result {
             Err(e) => e.into_response(),
@@ -1876,7 +1601,7 @@ mod pure_logic_tests {
     #[test]
     fn navigate_one_array_valid_index() {
         let mut obj = serde_json::json!([10, 20, 30]);
-        let result = pod_json_navigate_one(&mut obj, "1");
+        let result = json_navigate_one(&mut obj, "1");
         assert!(result.is_ok());
         let val = result.unwrap_or_else(|_| panic!("must succeed"));
         assert_eq!(*val, serde_json::json!(20));
@@ -1886,7 +1611,7 @@ mod pure_logic_tests {
     #[test]
     fn navigate_one_array_oob_returns_422() {
         let mut obj = serde_json::json!([10]);
-        let result = pod_json_navigate_one(&mut obj, "5");
+        let result = json_navigate_one(&mut obj, "5");
         assert!(result.is_err());
     }
 
@@ -1894,7 +1619,7 @@ mod pure_logic_tests {
     #[test]
     fn navigate_one_array_non_numeric_index_returns_422() {
         let mut obj = serde_json::json!([10]);
-        let result = pod_json_navigate_one(&mut obj, "not-a-number");
+        let result = json_navigate_one(&mut obj, "not-a-number");
         assert!(result.is_err());
     }
 
@@ -1902,19 +1627,19 @@ mod pure_logic_tests {
     #[test]
     fn navigate_one_scalar_returns_422() {
         let mut obj = serde_json::json!(42);
-        let result = pod_json_navigate_one(&mut obj, "foo");
+        let result = json_navigate_one(&mut obj, "foo");
         assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------
-    // pod_json_navigate_one_or_create
+    // json_navigate_one_or_create
     // -----------------------------------------------------------------------
 
     /// Creating an intermediate key in an object succeeds.
     #[test]
     fn navigate_one_or_create_creates_missing_key() {
         let mut obj = serde_json::json!({});
-        let result = pod_json_navigate_one_or_create(&mut obj, "spec");
+        let result = json_navigate_one_or_create(&mut obj, "spec");
         assert!(result.is_ok());
         let node = result.unwrap_or_else(|_| panic!("must succeed"));
         assert!(node.is_object());
@@ -1924,7 +1649,7 @@ mod pure_logic_tests {
     #[test]
     fn navigate_one_or_create_non_object_returns_422() {
         let mut obj = serde_json::json!([1, 2, 3]);
-        let result = pod_json_navigate_one_or_create(&mut obj, "key");
+        let result = json_navigate_one_or_create(&mut obj, "key");
         assert!(result.is_err());
         let resp: axum::response::Response = match result {
             Err(e) => e.into_response(),
@@ -1934,14 +1659,14 @@ mod pure_logic_tests {
     }
 
     // -----------------------------------------------------------------------
-    // pod_json_patch_add — branches not covered by patch_type_tests
+    // json_patch_add — branches not covered by patch_type_tests
     // -----------------------------------------------------------------------
 
     /// add to root (empty pointer) replaces the whole document.
     #[test]
     fn patch_add_root_replaces_document() {
         let mut obj = serde_json::json!({"old": true});
-        pod_json_patch_add(&mut obj, "", serde_json::json!({"new": true}))
+        json_patch_add(&mut obj, "", serde_json::json!({"new": true}))
             .unwrap_or_else(|_| panic!("add to root must succeed"));
         assert_eq!(obj, serde_json::json!({"new": true}));
     }
@@ -1951,7 +1676,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_add_dash_appends_to_array() {
         let mut obj = serde_json::json!({"items": [1, 2]});
-        pod_json_patch_add(&mut obj, "/items/-", serde_json::json!(3))
+        json_patch_add(&mut obj, "/items/-", serde_json::json!(3))
             .unwrap_or_else(|_| panic!("add '-' must succeed"));
         assert_eq!(obj["items"], serde_json::json!([1, 2, 3]));
     }
@@ -1960,7 +1685,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_add_numeric_index_inserts_at_position() {
         let mut obj = serde_json::json!({"items": [1, 3]});
-        pod_json_patch_add(&mut obj, "/items/1", serde_json::json!(2))
+        json_patch_add(&mut obj, "/items/1", serde_json::json!(2))
             .unwrap_or_else(|_| panic!("add at index must succeed"));
         assert_eq!(obj["items"], serde_json::json!([1, 2, 3]));
     }
@@ -1969,7 +1694,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_add_array_oob_returns_422() {
         let mut obj = serde_json::json!({"items": [1]});
-        let result = pod_json_patch_add(&mut obj, "/items/5", serde_json::json!(99));
+        let result = json_patch_add(&mut obj, "/items/5", serde_json::json!(99));
         assert!(result.is_err());
     }
 
@@ -1977,7 +1702,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_add_invalid_array_index_returns_422() {
         let mut obj = serde_json::json!({"items": [1]});
-        let result = pod_json_patch_add(&mut obj, "/items/not-a-num", serde_json::json!(99));
+        let result = json_patch_add(&mut obj, "/items/not-a-num", serde_json::json!(99));
         assert!(result.is_err());
     }
 
@@ -1985,19 +1710,19 @@ mod pure_logic_tests {
     #[test]
     fn patch_add_to_scalar_returns_422() {
         let mut obj = serde_json::json!(42);
-        let result = pod_json_patch_add(&mut obj, "/foo", serde_json::json!(1));
+        let result = json_patch_add(&mut obj, "/foo", serde_json::json!(1));
         assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------
-    // pod_json_patch_set — branches not covered by patch_type_tests
+    // json_patch_set — branches not covered by patch_type_tests
     // -----------------------------------------------------------------------
 
     /// set (replace) on root (empty pointer) replaces the whole document.
     #[test]
     fn patch_set_root_replaces_document() {
         let mut obj = serde_json::json!({"old": true});
-        pod_json_patch_set(&mut obj, "", serde_json::json!({"new": true}))
+        json_patch_set(&mut obj, "", serde_json::json!({"new": true}))
             .unwrap_or_else(|_| panic!("set root must succeed"));
         assert_eq!(obj, serde_json::json!({"new": true}));
     }
@@ -2006,7 +1731,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_set_dash_appends_to_array() {
         let mut obj = serde_json::json!({"items": [1, 2]});
-        pod_json_patch_set(&mut obj, "/items/-", serde_json::json!(3))
+        json_patch_set(&mut obj, "/items/-", serde_json::json!(3))
             .unwrap_or_else(|_| panic!("set '-' must succeed"));
         assert_eq!(obj["items"], serde_json::json!([1, 2, 3]));
     }
@@ -2015,7 +1740,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_set_array_oob_returns_422() {
         let mut obj = serde_json::json!({"items": [1]});
-        let result = pod_json_patch_set(&mut obj, "/items/5", serde_json::json!(99));
+        let result = json_patch_set(&mut obj, "/items/5", serde_json::json!(99));
         assert!(result.is_err());
     }
 
@@ -2023,7 +1748,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_set_invalid_array_index_returns_422() {
         let mut obj = serde_json::json!({"items": [1]});
-        let result = pod_json_patch_set(&mut obj, "/items/bad", serde_json::json!(2));
+        let result = json_patch_set(&mut obj, "/items/bad", serde_json::json!(2));
         assert!(result.is_err());
     }
 
@@ -2032,19 +1757,19 @@ mod pure_logic_tests {
     fn patch_set_non_object_parent_returns_422() {
         let mut obj = serde_json::json!({"leaf": 42});
         // "leaf" is an integer; navigating into it then setting a sub-key must fail.
-        let result = pod_json_patch_set(&mut obj, "/leaf/sub", serde_json::json!(1));
+        let result = json_patch_set(&mut obj, "/leaf/sub", serde_json::json!(1));
         assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------
-    // pod_json_patch_remove — branches not covered by patch_type_tests
+    // json_patch_remove — branches not covered by patch_type_tests
     // -----------------------------------------------------------------------
 
     /// remove a key that does not exist returns 422.
     #[test]
     fn patch_remove_missing_key_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
-        let result = pod_json_patch_remove(&mut obj, "/b");
+        let result = json_patch_remove(&mut obj, "/b");
         assert!(result.is_err());
     }
 
@@ -2052,7 +1777,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_remove_array_index_succeeds() {
         let mut obj = serde_json::json!({"items": [10, 20, 30]});
-        pod_json_patch_remove(&mut obj, "/items/1")
+        json_patch_remove(&mut obj, "/items/1")
             .unwrap_or_else(|_| panic!("remove at valid index must succeed"));
         assert_eq!(obj["items"], serde_json::json!([10, 30]));
     }
@@ -2061,7 +1786,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_remove_array_oob_returns_422() {
         let mut obj = serde_json::json!({"items": [10]});
-        let result = pod_json_patch_remove(&mut obj, "/items/5");
+        let result = json_patch_remove(&mut obj, "/items/5");
         assert!(result.is_err());
     }
 
@@ -2069,7 +1794,7 @@ mod pure_logic_tests {
     #[test]
     fn patch_remove_invalid_array_index_returns_422() {
         let mut obj = serde_json::json!({"items": [10]});
-        let result = pod_json_patch_remove(&mut obj, "/items/not-num");
+        let result = json_patch_remove(&mut obj, "/items/not-num");
         assert!(result.is_err());
     }
 
@@ -2078,12 +1803,12 @@ mod pure_logic_tests {
     fn patch_remove_scalar_parent_returns_422() {
         let mut obj = serde_json::json!({"leaf": 42});
         // Navigate into "leaf" (integer) then attempt remove of a sub-key.
-        let result = pod_json_patch_remove(&mut obj, "/leaf/sub");
+        let result = json_patch_remove(&mut obj, "/leaf/sub");
         assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------
-    // pod_apply_json_patch — error paths not covered by patch_type_tests
+    // apply_json_patch — error paths not covered by patch_type_tests
     // -----------------------------------------------------------------------
 
     /// patch body must be a JSON array; a non-array returns 422.
@@ -2091,7 +1816,7 @@ mod pure_logic_tests {
     fn apply_json_patch_non_array_body_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
         let patch = serde_json::json!({"op": "replace", "path": "/a", "value": 2});
-        let result = pod_apply_json_patch(&mut obj, &patch);
+        let result = apply_json_patch(&mut obj, &patch);
         assert!(result.is_err());
         let resp: axum::response::Response = match result {
             Err(e) => e.into_response(),
@@ -2105,7 +1830,7 @@ mod pure_logic_tests {
     fn apply_json_patch_missing_op_field_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
         let patch = serde_json::json!([{"path": "/a", "value": 2}]);
-        let result = pod_apply_json_patch(&mut obj, &patch);
+        let result = apply_json_patch(&mut obj, &patch);
         assert!(result.is_err());
     }
 
@@ -2114,7 +1839,7 @@ mod pure_logic_tests {
     fn apply_json_patch_missing_path_field_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
         let patch = serde_json::json!([{"op": "replace", "value": 2}]);
-        let result = pod_apply_json_patch(&mut obj, &patch);
+        let result = apply_json_patch(&mut obj, &patch);
         assert!(result.is_err());
     }
 
@@ -2123,7 +1848,7 @@ mod pure_logic_tests {
     fn apply_json_patch_add_missing_value_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
         let patch = serde_json::json!([{"op": "add", "path": "/b"}]);
-        let result = pod_apply_json_patch(&mut obj, &patch);
+        let result = apply_json_patch(&mut obj, &patch);
         assert!(result.is_err());
     }
 
@@ -2132,7 +1857,7 @@ mod pure_logic_tests {
     fn apply_json_patch_replace_missing_value_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
         let patch = serde_json::json!([{"op": "replace", "path": "/a"}]);
-        let result = pod_apply_json_patch(&mut obj, &patch);
+        let result = apply_json_patch(&mut obj, &patch);
         assert!(result.is_err());
     }
 
@@ -2142,7 +1867,7 @@ mod pure_logic_tests {
     fn apply_json_patch_unsupported_op_returns_422() {
         let mut obj = serde_json::json!({"a": 1});
         let patch = serde_json::json!([{"op": "copy", "from": "/a", "path": "/b"}]);
-        let result = pod_apply_json_patch(&mut obj, &patch);
+        let result = apply_json_patch(&mut obj, &patch);
         assert!(result.is_err());
     }
 
@@ -2151,7 +1876,7 @@ mod pure_logic_tests {
     fn apply_json_patch_empty_array_is_noop() {
         let mut obj = serde_json::json!({"a": 1});
         let patch = serde_json::json!([]);
-        assert!(pod_apply_json_patch(&mut obj, &patch).is_ok());
+        assert!(apply_json_patch(&mut obj, &patch).is_ok());
         assert_eq!(obj["a"], 1);
     }
 
@@ -3090,7 +2815,7 @@ mod handler_tests {
 
     /// PATCH with json-patch+json and a valid remove op must succeed.
     #[tokio::test]
-    async fn patch_pod_json_patch_remove_label() {
+    async fn patch_json_patch_remove_label() {
         let (state, store) = make_state();
         seed_namespace(&store, "default").await;
 
