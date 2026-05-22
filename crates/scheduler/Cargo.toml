@@ -3,6 +3,10 @@ name    = "u7s-scheduler"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "u7s_scheduler"
+path = "src/lib.rs"
+
 [[bin]]
 name = "u7s-scheduler"
 path = "src/main.rs"
