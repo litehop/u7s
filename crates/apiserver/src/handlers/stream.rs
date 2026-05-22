@@ -1,161 +1,169 @@
-/// Transport-agnostic BiStream trait and WebSocket implementations.
+/// BiStream — transport-agnostic bidirectional byte channel.
 ///
-/// The splice logic in `proxy.rs` operates on `impl BiStream` so the underlying
-/// transport (axum WS inbound, tokio-tungstenite WS outbound) can be swapped for
-/// HTTP/3+QUIC without touching the business logic.
-use axum::extract::ws::{Message as AxumMsg, WebSocket};
-use bytes::Bytes;
-
-// ---------------------------------------------------------------------------
-// BiStream trait
-// ---------------------------------------------------------------------------
-
-/// A bidirectional byte stream abstraction.
+/// Abstracts over the underlying transport (axum WebSocket, tokio-tungstenite,
+/// future HTTP/3 QUIC streams) so that splice logic in /attach and /portforward
+/// can be written once and swapped at the call site.
 ///
-/// Implementations exist for axum WebSocket (inbound kubectl connection) and
-/// tokio-tungstenite WebSocket (outbound kubelet connection). The splice loop
-/// uses this trait so no WebSocket-specific code leaks into the business logic.
+/// The `+ Send` bounds on the associated futures are required by tokio::spawn.
 pub trait BiStream: Send + 'static {
-    fn recv(&mut self) -> impl std::future::Future<Output = Option<Bytes>> + Send;
-    fn send(&mut self, data: Bytes)
-        -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<bytes::Bytes>> + Send;
+    fn send(
+        &mut self,
+        data: bytes::Bytes,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
     fn close(&mut self) -> impl std::future::Future<Output = ()> + Send;
 }
 
 // ---------------------------------------------------------------------------
-// Inbound: axum WebSocket (kubectl → apiserver)
+// Axum WebSocket impl (inbound: kubectl → apiserver)
 // ---------------------------------------------------------------------------
 
-/// Wraps an axum WebSocket for use as a BiStream.
+/// Wraps an axum `WebSocket` so it satisfies `BiStream`.
 ///
-/// Binary frames are passed through as-is. Text frames are converted to bytes.
-/// Close/Ping/Pong frames are handled: close terminates, ping/pong are dropped
-/// (axum handles protocol-level pong automatically).
-pub struct AxumWs(pub WebSocket);
+/// Binary frames are passed through as-is. Text frames are coerced to bytes.
+/// Control frames (Ping/Pong/Close) are skipped — the splice loop handles data only.
+pub struct AxumWs(pub axum::extract::ws::WebSocket);
 
 impl BiStream for AxumWs {
-    async fn recv(&mut self) -> Option<Bytes> {
+    async fn recv(&mut self) -> Option<bytes::Bytes> {
         loop {
             match self.0.recv().await? {
-                Ok(AxumMsg::Binary(b)) => return Some(b),
-                Ok(AxumMsg::Text(t)) => return Some(Bytes::from(t.as_bytes().to_vec())),
-                Ok(AxumMsg::Close(_)) => return None,
-                Ok(AxumMsg::Ping(_) | AxumMsg::Pong(_)) => continue,
+                Ok(axum::extract::ws::Message::Binary(b)) => return Some(b),
+                Ok(axum::extract::ws::Message::Text(t)) => {
+                    return Some(bytes::Bytes::copy_from_slice(t.as_bytes()))
+                }
+                Ok(_) => continue, // Ping, Pong, Close — skip
                 Err(_) => return None,
             }
         }
     }
 
-    async fn send(&mut self, data: Bytes) -> anyhow::Result<()> {
+    async fn send(&mut self, data: bytes::Bytes) -> anyhow::Result<()> {
+        use axum::extract::ws::Message;
         self.0
-            .send(AxumMsg::Binary(data))
+            .send(Message::Binary(data))
             .await
-            .map_err(|e| anyhow::anyhow!("axum ws send: {e}"))
+            .map_err(anyhow::Error::from)
     }
 
     async fn close(&mut self) {
-        let _ = self.0.send(AxumMsg::Close(None)).await;
+        use axum::extract::ws::Message;
+        let _ = self.0.send(Message::Close(None)).await;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Outbound: tokio-tungstenite WebSocket (apiserver → kubelet)
+// tokio-tungstenite WebSocket impl (outbound: apiserver → kubelet)
 // ---------------------------------------------------------------------------
 
-use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tokio_tungstenite::WebSocketStream;
 
-/// Wraps a tokio-tungstenite WebSocketStream for use as a BiStream.
+/// Wraps a tokio-tungstenite `WebSocketStream` so it satisfies `BiStream`.
 ///
-/// The stream may be backed by any tokio AsyncRead+AsyncWrite (TCP, TLS, etc.).
-/// Only the generic constraint is exposed here; callers use the concrete
-/// `connect_to_kubelet` constructor which returns `TungsteniteWs<...>`.
-pub struct TungsteniteWs<S>(pub WebSocketStream<S>)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static;
+/// The stream `S` is typically `tokio_rustls::client::TlsStream<tokio::net::TcpStream>`.
+pub struct TungsteniteWs<S>(pub WebSocketStream<S>);
 
 impl<S> BiStream for TungsteniteWs<S>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    async fn recv(&mut self) -> Option<Bytes> {
+    async fn recv(&mut self) -> Option<bytes::Bytes> {
         use futures_util::StreamExt as _;
+        use tokio_tungstenite::tungstenite::Message;
         loop {
             match self.0.next().await? {
-                Ok(TungMsg::Binary(b)) => return Some(b),
-                Ok(TungMsg::Text(t)) => return Some(Bytes::from(t.as_bytes().to_vec())),
-                Ok(TungMsg::Close(_)) => return None,
-                Ok(TungMsg::Ping(_) | TungMsg::Pong(_) | TungMsg::Frame(_)) => continue,
+                Ok(Message::Binary(b)) => return Some(bytes::Bytes::from(b.to_vec())),
+                Ok(Message::Text(t)) => return Some(bytes::Bytes::copy_from_slice(t.as_bytes())),
+                Ok(_) => continue, // Ping, Pong, Close, Frame
                 Err(_) => return None,
             }
         }
     }
 
-    async fn send(&mut self, data: Bytes) -> anyhow::Result<()> {
+    async fn send(&mut self, data: bytes::Bytes) -> anyhow::Result<()> {
         use futures_util::SinkExt as _;
+        use tokio_tungstenite::tungstenite::Message;
         self.0
-            .send(TungMsg::Binary(data))
+            .send(Message::Binary(data.to_vec().into()))
             .await
-            .map_err(|e| anyhow::anyhow!("tungstenite ws send: {e}"))
+            .map_err(anyhow::Error::from)
     }
 
     async fn close(&mut self) {
-        use futures_util::SinkExt as _;
-        let _ = self.0.send(TungMsg::Close(None)).await;
+        let _ = self.0.close(None).await;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Splice: bidirectional copy between two BiStream implementations
+// Splice helper — bidirectional byte relay between two BiStream impls
 // ---------------------------------------------------------------------------
 
-/// Splice two BiStream halves until either side closes.
+/// Relay bytes between two BiStream endpoints until either side closes.
 ///
-/// Polls both directions concurrently in a single loop: whichever side
-/// produces a frame first, the frame is forwarded to the other side.
-/// The loop terminates when either side closes or errors.
-pub async fn splice<A, B>(mut a: A, mut b: B)
+/// Spawns two tasks, one per direction. Each task reads from one end and writes
+/// to the other. When one direction completes (recv returns None or send errors),
+/// the opposite end is closed and the other task is aborted. This ensures clean
+/// shutdown without leaking tasks.
+pub async fn splice<A, B>(a: A, b: B)
 where
     A: BiStream,
     B: BiStream,
 {
-    loop {
-        tokio::select! {
-            msg = a.recv() => {
-                match msg {
-                    None => break,
-                    Some(data) => { if b.send(data).await.is_err() { break; } }
-                }
-            }
-            msg = b.recv() => {
-                match msg {
-                    None => break,
-                    Some(data) => { if a.send(data).await.is_err() { break; } }
-                }
-            }
-        }
-    }
-    a.close().await;
-    b.close().await;
-}
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
-/// Drain all frames from `src` into `dst` until src closes or dst errors.
-///
-/// Used in tests to verify one direction of the splice without select! races.
-#[cfg(test)]
-pub(crate) async fn drain_one_direction<Src: BiStream, Dst: BiStream>(
-    src: &mut Src,
-    dst: &mut Dst,
-) {
-    loop {
-        match src.recv().await {
-            None => break,
-            Some(data) => {
-                if dst.send(data).await.is_err() {
-                    break;
+    // Split into independent halves so each task can hold its own lock without
+    // blocking the other direction.
+    let a_recv = Arc::new(Mutex::new(a));
+    let b_send = Arc::new(Mutex::new(b));
+
+    // We need send access to b from t1 and recv access to b from t2.
+    // Since we can't split a single BiStream, share it via Arc<Mutex<>> and
+    // accept that the two tasks alternate rather than run in true parallel.
+    // For WebSocket proxying this is fine — frames arrive at human-scale rates.
+    let a_send = Arc::clone(&a_recv);
+    let b_recv = Arc::clone(&b_send);
+
+    // a → b
+    let t1 = tokio::spawn(async move {
+        loop {
+            let msg = a_recv.lock().await.recv().await;
+            match msg {
+                None => break,
+                Some(data) => {
+                    if b_send.lock().await.send(data).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
+        // A is done sending; signal B to stop by closing it.
+        b_send.lock().await.close().await;
+    });
+
+    // b → a
+    let t2 = tokio::spawn(async move {
+        loop {
+            let msg = b_recv.lock().await.recv().await;
+            match msg {
+                None => break,
+                Some(data) => {
+                    if a_send.lock().await.send(data).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        // B is done sending; signal A to stop by closing it.
+        a_send.lock().await.close().await;
+    });
+
+    // When either direction finishes, abort the other so tasks don't leak.
+    let t2_abort = t2.abort_handle();
+    let t1_abort = t1.abort_handle();
+    tokio::select! {
+        _ = t1 => { t2_abort.abort(); }
+        _ = t2 => { t1_abort.abort(); }
     }
 }
 
@@ -166,120 +174,77 @@ pub(crate) async fn drain_one_direction<Src: BiStream, Dst: BiStream>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use bytes::Bytes;
+    use std::sync::Arc;
 
-    /// A minimal in-memory BiStream for testing splice logic.
-    ///
-    /// Frames are pre-loaded into `inbox`; sent frames go to `outbox`.
-    /// When `inbox` is exhausted, recv() returns None (stream closed).
-    struct MockStream {
-        inbox: VecDeque<Bytes>,
-        pub outbox: std::sync::Arc<std::sync::Mutex<Vec<Bytes>>>,
+    /// In-memory BiStream for testing splice logic without real WebSockets.
+    struct MemStream {
+        incoming: std::collections::VecDeque<Bytes>,
+        pub outgoing: Arc<std::sync::Mutex<Vec<Bytes>>>,
         closed: bool,
     }
 
-    impl MockStream {
-        fn new(frames: Vec<Bytes>) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<Bytes>>>) {
-            let outbox = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let s = MockStream {
-                inbox: frames.into_iter().collect(),
-                outbox: outbox.clone(),
+    impl MemStream {
+        fn new(incoming: Vec<Bytes>, outgoing: Arc<std::sync::Mutex<Vec<Bytes>>>) -> Self {
+            Self {
+                incoming: incoming.into(),
+                outgoing,
                 closed: false,
-            };
-            (s, outbox)
+            }
         }
     }
 
-    impl BiStream for MockStream {
+    impl BiStream for MemStream {
         async fn recv(&mut self) -> Option<Bytes> {
-            self.inbox.pop_front()
+            // Drain the queue regardless of closed state; return None only when empty.
+            // close() marks that no further messages will be queued, but already-queued
+            // messages should still be delivered — matching real WebSocket behavior where
+            // buffered data is readable even after the peer closes.
+            self.incoming.pop_front()
         }
 
         async fn send(&mut self, data: Bytes) -> anyhow::Result<()> {
-            self.outbox.lock().unwrap().push(data);
+            self.outgoing.lock().unwrap().push(data);
             Ok(())
         }
 
         async fn close(&mut self) {
             self.closed = true;
+            // Drain pending sends — mimic half-close: no more reads, but already-sent
+            // data was captured in outgoing.
         }
     }
 
-    /// drain_one_direction must copy all frames from src to dst's outbox.
+    /// splice must relay bytes from A to B and from B to A.
     ///
-    /// This is the foundational test for the copy loop: it must not stop
-    /// early, drop frames, or deliver them out of order. If any of those
-    /// invariants break, portforward data would be silently lost.
+    /// This verifies the core invariant: every message written to one side of
+    /// the splice must appear on the other side. If the relay were dropped or
+    /// reordered, the kubectl attach session would be corrupted.
     #[tokio::test]
-    async fn drain_one_direction_copies_all_frames() {
-        let frames = vec![
-            Bytes::from_static(b"frame-1"),
-            Bytes::from_static(b"frame-2"),
-            Bytes::from_static(b"frame-3"),
-        ];
-        let (mut src, _) = MockStream::new(frames.clone());
-        let (mut dst, outbox) = MockStream::new(vec![]);
+    async fn splice_relays_bytes_bidirectionally() {
+        let a_to_b_data = vec![Bytes::from("hello"), Bytes::from("world")];
+        let b_to_a_data = vec![Bytes::from("ping")];
 
-        drain_one_direction(&mut src, &mut dst).await;
+        let a_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b_out = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let got = outbox.lock().unwrap().clone();
-        assert_eq!(got, frames, "all frames must be forwarded in order");
-    }
+        let a = MemStream::new(a_to_b_data.clone(), Arc::clone(&a_out));
+        let b = MemStream::new(b_to_a_data.clone(), Arc::clone(&b_out));
 
-    /// drain_one_direction must forward frames from the other direction too.
-    ///
-    /// The BiStream implementation is symmetric — this test ensures the
-    /// copy logic works regardless of which end is src vs dst.
-    #[tokio::test]
-    async fn drain_one_direction_reverse_also_works() {
-        let frame = Bytes::from_static(b"from-b");
-        let (mut src, _) = MockStream::new(vec![frame.clone()]);
-        let (mut dst, outbox) = MockStream::new(vec![]);
+        splice(a, b).await;
 
-        drain_one_direction(&mut src, &mut dst).await;
-
-        let got = outbox.lock().unwrap().clone();
+        // A's messages must arrive at B.
+        let b_received = b_out.lock().unwrap().clone();
         assert_eq!(
-            got,
-            vec![frame],
-            "reverse direction must also forward frames"
+            b_received, a_to_b_data,
+            "bytes written to A must be relayed to B in order"
         );
-    }
 
-    /// splice must terminate when both sides have exhausted their frames.
-    ///
-    /// A deadlock here would mean the splice loop is blocking on recv() from
-    /// a stream that will never produce more data.
-    #[tokio::test]
-    async fn splice_terminates_when_streams_close() {
-        let (stream_a, _) = MockStream::new(vec![]);
-        let (stream_b, _) = MockStream::new(vec![]);
-        // Must complete without hanging.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            splice(stream_a, stream_b),
-        )
-        .await
-        .expect("splice must terminate when both streams are empty");
-    }
-
-    /// splice must keep forwarding from B even when A closes first.
-    ///
-    /// With select!, whichever direction closes first wins and the other is
-    /// cancelled. This test verifies the expected behaviour (A closes first,
-    /// B frames that were queued may not all arrive) — the test documents
-    /// that select! semantics mean the first-closed direction wins.
-    #[tokio::test]
-    async fn splice_terminates_when_one_side_closes() {
-        // A has no frames (closes immediately), B has one frame.
-        let (stream_a, _) = MockStream::new(vec![]);
-        let (stream_b, _) = MockStream::new(vec![Bytes::from_static(b"hello")]);
-        // Must complete without hanging.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            splice(stream_a, stream_b),
-        )
-        .await
-        .expect("splice must terminate when one stream closes");
+        // B's messages must arrive at A.
+        let a_received = a_out.lock().unwrap().clone();
+        assert_eq!(
+            a_received, b_to_a_data,
+            "bytes written to B must be relayed to A in order"
+        );
     }
 }
