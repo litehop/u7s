@@ -474,6 +474,90 @@ jobs:
           echo "Pod reached Succeeded:"
           kubectl get pod smoke-pod -n default
 
+      - name: Deployment + ConfigMap (Running)
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          # Create a ConfigMap with some data to mount as a volume.
+          kubectl create configmap hello-config \
+            --from-literal=greeting=hello \
+            --namespace default
+
+          # Create a Deployment whose pod template mounts the ConfigMap.
+          # nodeName bypasses the scheduler (not present in this job) while still
+          # exercising the full Deployment → ReplicaSet → Pod → kubelet path,
+          # including ConfigMap volume projection.  nginx:alpine stays Running so
+          # the pod reaches Running phase (vs Succeeded for the busybox one-shot).
+          # hostNetwork+dnsPolicy:None avoids ClusterDNS errors.
+          kubectl apply --validate=false -f - <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: hello
+            namespace: default
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: hello
+            template:
+              metadata:
+                labels:
+                  app: hello
+              spec:
+                nodeName: ci-node
+                hostNetwork: true
+                dnsPolicy: None
+                dnsConfig: {}
+                containers:
+                  - name: hello
+                    image: nginx:alpine
+                    volumeMounts:
+                      - name: config-vol
+                        mountPath: /etc/config
+                volumes:
+                  - name: config-vol
+                    configMap:
+                      name: hello-config
+          EOF
+
+          # Wait up to 90s for the pod created by the Deployment to reach Running.
+          RUNNING=0
+          for i in $(seq 1 90); do
+            PHASE=$(kubectl get pod -l app=hello -n default \
+              -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+            if [ "$PHASE" = "Running" ]; then
+              RUNNING=1
+              break
+            fi
+            if [ "$PHASE" = "Failed" ]; then
+              echo "ERROR: pod entered Failed phase"
+              kubectl describe pod -l app=hello -n default
+              echo "--- kubelet log ---"
+              cat "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "$RUNNING" -eq 0 ]; then
+            PHASE=$(kubectl get pod -l app=hello -n default \
+              -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "unknown")
+            echo "ERROR: Deployment pod did not reach Running within 90s (phase: $PHASE)"
+            kubectl describe pod -l app=hello -n default || true
+            echo "--- kubelet log (last 100 lines) ---"
+            tail -100 "${{ env.SMOKE_TMPDIR }}/kubelet.log"
+            echo "--- server log (last 50 lines) ---"
+            tail -50 "${{ env.SMOKE_TMPDIR }}/server.log"
+            exit 1
+          fi
+          echo "Deployment pod reached Running:"
+          kubectl get pod -l app=hello -n default
+
+          # Clean up.
+          kubectl delete deployment hello --namespace default
+          kubectl delete configmap hello-config --namespace default
+
       - name: Stop server and kubelet
         if: always()
         run: |
