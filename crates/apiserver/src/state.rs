@@ -50,6 +50,8 @@ pub struct AppState {
     pub server_address: String,
     /// Per-client watch stream concurrency limiter.
     pub watch_limit: WatchLimitState,
+    /// HTTP client for admission webhook calls.
+    pub webhook_client: reqwest::Client,
     /// DER-encoded cluster CA certificate used to verify kubelet TLS. None in tests.
     pub cluster_ca_der: Option<Arc<Vec<u8>>>,
 }
@@ -83,6 +85,10 @@ impl AppState {
         cluster_ca_der: Option<Vec<u8>>,
     ) -> Self {
         let registry = build_registry();
+        let webhook_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("webhook HTTP client must build");
         AppState {
             store,
             resource_registry: Arc::new(registry),
@@ -92,6 +98,7 @@ impl AppState {
             token_map: Arc::new(token_map),
             server_address,
             watch_limit: WatchLimitState::new(),
+            webhook_client,
             cluster_ca_der: cluster_ca_der.map(Arc::new),
         }
     }

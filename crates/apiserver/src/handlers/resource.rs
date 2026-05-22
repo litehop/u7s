@@ -7,6 +7,8 @@ use axum::{
 use bytes::Bytes;
 use u7s_store::{ListOptions, Store, StoreError};
 
+use crate::admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext};
+
 use crate::{
     auth::UserInfo,
     keys::{group_list_prefix, group_object_key},
@@ -181,6 +183,18 @@ pub async fn create_resource(
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
 
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: None,
+        operation: "CREATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+
     let key = group_object_key(&group, &plural, None, &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
     let new_rv = match result {
@@ -250,6 +264,18 @@ pub async fn replace_resource(
     }
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
+
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: None,
+        operation: "UPDATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
     let key = group_object_key(&group, &plural, None, &name);
     let new_rv = state
@@ -451,6 +477,18 @@ pub(crate) async fn do_patch(
         }
         return Ok(Json(current.body).into_response());
     }
+
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group,
+        version,
+        resource: plural,
+        name,
+        namespace: ns,
+        operation: "UPDATE",
+    };
+    current.body = run_mutating_webhooks(state, current.body, &admission_ctx).await?;
+    run_validating_webhooks(state, &current.body, &admission_ctx).await?;
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -664,6 +702,18 @@ pub async fn create_namespaced_resource(
         serde_json::to_value(ns_meta).map_err(|e| Status::internal(e.to_string()))?;
     stamp_metadata(&mut obj);
 
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: Some(&ns),
+        operation: "CREATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
     let new_rv = match result {
@@ -729,6 +779,18 @@ pub async fn replace_namespaced_resource(
     }
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
+
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: Some(&ns),
+        operation: "UPDATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let new_rv = state

@@ -1,3 +1,4 @@
+mod admission;
 mod auth;
 mod content_type;
 mod handlers;
