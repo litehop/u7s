@@ -621,4 +621,306 @@ mod tests {
         );
         assert_eq!(json["reason"], "NotFound");
     }
+
+    // store_err_to_status must map each StoreError variant to the correct HTTP status code.
+    // This mapping is what clients rely on to distinguish 404 from 409 from 500.
+    #[test]
+    fn store_err_to_status_not_found_maps_to_404() {
+        let err = store_err_to_status(StoreError::NotFound { key: "k".into() }, "my-ns");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn store_err_to_status_already_exists_maps_to_409() {
+        let err = store_err_to_status(StoreError::AlreadyExists { key: "k".into() }, "my-ns");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["reason"], "AlreadyExists");
+    }
+
+    #[test]
+    fn store_err_to_status_revision_mismatch_maps_to_409_conflict() {
+        let err = store_err_to_status(
+            StoreError::RevisionMismatch {
+                expected: 1,
+                current: 2,
+            },
+            "my-ns",
+        );
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let json = serde_json::to_value(&err.1).unwrap();
+        // RevisionMismatch maps to Conflict reason, not AlreadyExists
+        assert_eq!(json["reason"], "Conflict");
+        assert!(
+            json["message"].as_str().unwrap().contains("my-ns"),
+            "conflict message must identify the namespace"
+        );
+    }
+
+    #[test]
+    fn store_err_to_status_other_maps_to_500() {
+        // Compacted is a catch-all "other" arm — maps to internal server error.
+        // This ensures unexpected store errors don't leak as 4xx to clients.
+        let err = store_err_to_status(
+            StoreError::Compacted {
+                requested: 1,
+                horizon: 5,
+            },
+            "any-ns",
+        );
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["reason"], "InternalError");
+    }
+
+    // list_namespaces (non-watch) must return a NamespaceList with the created namespace.
+    // This is the primary read path for `kubectl get namespaces`.
+    #[tokio::test]
+    async fn list_namespaces_returns_namespace_list() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("list-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let resp = list_namespaces(
+            State(state.clone()),
+            Query(crate::handlers::generic::CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        .expect("list must not error");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // get_namespace must return 200 with the namespace body when it exists.
+    #[tokio::test]
+    async fn get_namespace_returns_200_for_existing() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("get-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let resp = get_namespace(State(state.clone()), Path("get-ns".to_string()))
+            .await
+            .expect("get must not error");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "existing namespace must return 200"
+        );
+    }
+
+    // get_namespace must return 404 when the namespace does not exist.
+    // Clients depend on this to know a resource is absent.
+    #[tokio::test]
+    async fn get_namespace_returns_404_for_missing() {
+        let state = make_state();
+
+        let err = get_namespace(State(state.clone()), Path("no-such-ns".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    // create_namespace must reject bodies with neither name nor generateName.
+    // Without an identity, the object cannot be stored or referenced.
+    #[tokio::test]
+    async fn create_namespace_rejects_missing_name() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {}
+            })
+            .to_string(),
+        );
+
+        let err = create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    // create_namespace must reject invalid namespace names with 422.
+    // Kubernetes enforces strict DNS label rules on namespace names.
+    #[tokio::test]
+    async fn create_namespace_rejects_invalid_name() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "INVALID_NAME" }
+            })
+            .to_string(),
+        );
+
+        let err = create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // create_namespace must reject a duplicate: second create for same name returns 409.
+    // Kubernetes returns AlreadyExists (409) when a namespace already exists.
+    #[tokio::test]
+    async fn create_namespace_rejects_duplicate() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("dup-ns"),
+            )
+            .await
+            .is_ok(),
+            "first create must succeed"
+        );
+
+        let err = create_namespace(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            namespace_body("dup-ns"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.0,
+            StatusCode::CONFLICT,
+            "second create of same namespace must return 409"
+        );
+    }
+
+    // replace_namespace must reject a request where URL name != body name.
+    // Kubernetes enforces name consistency to prevent accidental overwrites.
+    #[tokio::test]
+    async fn replace_namespace_rejects_name_mismatch() {
+        let state = make_state();
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "other-ns", "resourceVersion": "1" }
+            })
+            .to_string(),
+        );
+
+        let err = replace_namespace(
+            State(state.clone()),
+            Path("different-ns".to_string()),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.0,
+            StatusCode::BAD_REQUEST,
+            "name mismatch between URL and body must return 400"
+        );
+    }
+
+    // patch_namespace must return 415 when Content-Type is not merge-patch+json.
+    // Without the right content type, the patch semantics are undefined.
+    #[tokio::test]
+    async fn patch_namespace_rejects_wrong_content_type() {
+        let state = make_state();
+
+        let patch_body = Bytes::from(serde_json::json!({}).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let err = patch_namespace(
+            State(state.clone()),
+            Path("any-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.0,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "wrong content type must return 415"
+        );
+    }
+
+    // patch_namespace must return 404 when the namespace does not exist.
+    #[tokio::test]
+    async fn patch_namespace_returns_404_for_missing() {
+        let state = make_state();
+
+        let patch_body = Bytes::from(serde_json::json!({}).to_string());
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let err = patch_namespace(
+            State(state.clone()),
+            Path("no-such-ns".to_string()),
+            headers,
+            patch_body,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.0,
+            StatusCode::NOT_FOUND,
+            "patch on non-existent namespace must return 404"
+        );
+    }
+
+    // delete_namespace must return 404 when the namespace does not exist.
+    #[tokio::test]
+    async fn delete_namespace_returns_404_for_missing() {
+        let state = make_state();
+
+        let err = delete_namespace(State(state.clone()), Path("ghost-ns".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.0,
+            StatusCode::NOT_FOUND,
+            "deleting non-existent namespace must return 404"
+        );
+    }
 }
