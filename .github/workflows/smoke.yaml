@@ -305,6 +305,8 @@ jobs:
             --kubeconfig "$TMPDIR/kubeconfig" \
             --sa-key "$TMPDIR/sa.key" \
             --sa-pub "$TMPDIR/sa.pub" \
+            --ca-key "$TMPDIR/ca.key" \
+            --ca-cert "$TMPDIR/ca.crt" \
             --token-auth-file "$TMPDIR/token-auth.csv" \
             --advertise-address https://127.0.0.1:6443 \
             >"$TMPDIR/server.log" 2>&1 &
@@ -314,7 +316,11 @@ jobs:
             sleep 1
           done
           nc -z 127.0.0.1 6443 2>/dev/null || { echo "Server did not start"; cat "$TMPDIR/server.log"; exit 1; }
+          # Save the cert-based kubeconfig for kube-controller-manager before overwriting it.
+          cp "$TMPDIR/kubeconfig" "$TMPDIR/kubeconfig-cert"
           CA_DATA=$(grep "certificate-authority-data" "$TMPDIR/kubeconfig" | awk '{print $2}')
+          # Write CA cert as PEM for kcm. The kubeconfig field is base64(PEM), so decode once.
+          printf '%s' "$CA_DATA" | base64 -d > "$TMPDIR/ca.pem"
           echo "SMOKE_TOKEN=$SMOKE_TOKEN" >> "$GITHUB_ENV"
           printf '%s\n' \
             'apiVersion: v1' \
@@ -335,6 +341,34 @@ jobs:
             '  user:' \
             "    token: $SMOKE_TOKEN" \
             > "$TMPDIR/kubeconfig"
+
+      - name: Download and start kube-controller-manager
+        run: |
+          TMPDIR="${{ env.SMOKE_TMPDIR }}"
+          K8S_VERSION="${{ matrix.k8s }}"
+          KCM_BIN="$TMPDIR/kube-controller-manager"
+          curl -fsSL \
+            "https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/amd64/kube-controller-manager" \
+            -o "$KCM_BIN"
+          chmod +x "$KCM_BIN"
+          "$KCM_BIN" \
+            --kubeconfig="$TMPDIR/kubeconfig-cert" \
+            --cluster-signing-cert-file="$TMPDIR/ca.pem" \
+            --cluster-signing-key-file="$TMPDIR/ca.key" \
+            --service-account-private-key-file="$TMPDIR/sa.key" \
+            --root-ca-file="$TMPDIR/ca.pem" \
+            --controllers=csrapproving,csrsigning,garbagecollector \
+            --use-service-account-credentials=false \
+            --leader-elect=false \
+            --bind-address=127.0.0.1 \
+            >"$TMPDIR/kcm.log" 2>&1 &
+          echo "KCM_PID=$!" >> "$GITHUB_ENV"
+          # Wait up to 15s for kcm to be alive.
+          for i in $(seq 1 15); do
+            kill -0 "$KCM_PID" 2>/dev/null && break
+            sleep 1
+          done
+          kill -0 "$KCM_PID" 2>/dev/null || { echo "kcm failed to start"; cat "$TMPDIR/kcm.log"; exit 1; }
 
       - name: Start kubelet
         run: |
@@ -451,9 +485,10 @@ jobs:
           echo "Pod reached Succeeded:"
           kubectl get pod smoke-pod -n default
 
-      - name: Stop server and kubelet
+      - name: Stop server, kcm, and kubelet
         if: always()
         run: |
+          [ -n "$KCM_PID" ] && kill "$KCM_PID" 2>/dev/null || true
           [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
           [ -n "$KUBELET_PID" ] && sudo kill "$KUBELET_PID" 2>/dev/null || true
 
@@ -465,3 +500,4 @@ jobs:
           path: |
             ${{ env.SMOKE_TMPDIR }}/server.log
             ${{ env.SMOKE_TMPDIR }}/kubelet.log
+            ${{ env.SMOKE_TMPDIR }}/kcm.log
