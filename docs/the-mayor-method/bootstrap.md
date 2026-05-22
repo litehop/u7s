@@ -109,7 +109,7 @@ Patterns to apply by default:
   3 solo dispatches. The binding rule is hot-zone parallelism, not
   strict "same surface".
 
-Read the sibling documents in this directory, in this order:
+Read the sibling documents in this directory (docs/the-mayor-method), in this order:
 1. `dispatch-prompt-template.md` — the canonical worker-prompt shapes
    (solo / cluster / audit / cluster-reviewer / CI-fix) and the
    worktree-boundary block to paste verbatim into every editing
