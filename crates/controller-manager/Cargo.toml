@@ -3,6 +3,10 @@ name    = "u7s-controller-manager"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "u7s_controller_manager"
+path = "src/lib.rs"
+
 [[bin]]
 name = "u7s-controller-manager"
 path = "src/main.rs"
