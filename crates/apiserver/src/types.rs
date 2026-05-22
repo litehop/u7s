@@ -70,6 +70,9 @@ static NODES_SHORT_NAMES: &[&str] = &["no"];
 static SERVICES_SHORT_NAMES: &[&str] = &["svc"];
 static SERVICE_ACCOUNTS_SHORT_NAMES: &[&str] = &["sa"];
 static CONFIG_MAPS_SHORT_NAMES: &[&str] = &["cm"];
+static PVC_SHORT_NAMES: &[&str] = &["pvc"];
+static PV_SHORT_NAMES: &[&str] = &["pv"];
+static RC_SHORT_NAMES: &[&str] = &["rc"];
 
 static V1_RESOURCES: &[ApiResource] = &[
     ApiResource {
@@ -79,6 +82,14 @@ static V1_RESOURCES: &[ApiResource] = &[
         kind: "ConfigMap",
         verbs: CORE_VERBS,
         short_names: Some(CONFIG_MAPS_SHORT_NAMES),
+    },
+    ApiResource {
+        name: "endpoints",
+        singular_name: "endpoints",
+        namespaced: true,
+        kind: "Endpoints",
+        verbs: CORE_VERBS,
+        short_names: None,
     },
     ApiResource {
         name: "events",
@@ -105,12 +116,36 @@ static V1_RESOURCES: &[ApiResource] = &[
         short_names: Some(NODES_SHORT_NAMES),
     },
     ApiResource {
+        name: "persistentvolumeclaims",
+        singular_name: "persistentvolumeclaim",
+        namespaced: true,
+        kind: "PersistentVolumeClaim",
+        verbs: CORE_VERBS,
+        short_names: Some(PVC_SHORT_NAMES),
+    },
+    ApiResource {
+        name: "persistentvolumes",
+        singular_name: "persistentvolume",
+        namespaced: false,
+        kind: "PersistentVolume",
+        verbs: CORE_VERBS,
+        short_names: Some(PV_SHORT_NAMES),
+    },
+    ApiResource {
         name: "pods",
         singular_name: "pod",
         namespaced: true,
         kind: "Pod",
         verbs: CORE_VERBS,
         short_names: Some(PODS_SHORT_NAMES),
+    },
+    ApiResource {
+        name: "replicationcontrollers",
+        singular_name: "replicationcontroller",
+        namespaced: true,
+        kind: "ReplicationController",
+        verbs: CORE_VERBS,
+        short_names: Some(RC_SHORT_NAMES),
     },
     ApiResource {
         name: "secrets",
@@ -569,6 +604,23 @@ mod tests {
         assert!(names.contains(&"serviceaccounts"));
         assert!(names.contains(&"configmaps"));
         assert!(names.contains(&"events"));
+        // core v1 resources required for network and storage functionality
+        assert!(
+            names.contains(&"endpoints"),
+            "endpoints must be in /api/v1 — kube-proxy and service routing depend on it"
+        );
+        assert!(
+            names.contains(&"persistentvolumes"),
+            "persistentvolumes must be in /api/v1 — cluster-scoped storage lifecycle requires it"
+        );
+        assert!(
+            names.contains(&"persistentvolumeclaims"),
+            "persistentvolumeclaims must be in /api/v1 — workloads request storage through PVCs"
+        );
+        assert!(
+            names.contains(&"replicationcontrollers"),
+            "replicationcontrollers must be in /api/v1 — legacy but required for API conformance"
+        );
     }
 
     // ApiResourceList::v1 must serialize with the correct camelCase field names
