@@ -314,8 +314,10 @@ pub(crate) fn check_crb_escalation(
     if user.groups.iter().any(|g| g == "system:masters") {
         return Ok(());
     }
-    let role_ref_name = body["roleRef"]["name"].as_str().unwrap_or("");
-    let role_rules = state.rbac_index.cluster_role_rules(role_ref_name);
+    let role_ref_name = serde_json::from_value::<crate::rbac::RbacBinding>(body.clone())
+        .map(|b| b.role_ref.name)
+        .unwrap_or_default();
+    let role_rules = state.rbac_index.cluster_role_rules(&role_ref_name);
     // An empty rule set (role not found) means the user cannot hold all rules
     // of a non-existent role — deny unless role_rules is truly empty from an
     // existing role. We check: if role_ref_name is non-empty and rules are
