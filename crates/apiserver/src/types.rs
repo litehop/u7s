@@ -316,6 +316,8 @@ pub struct BindingTarget {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Binding {
     pub target: BindingTarget,
+}
+
 // NamespaceStatus — typed status for Namespace objects
 // ---------------------------------------------------------------------------
 
