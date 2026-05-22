@@ -1,7 +1,9 @@
+pub mod approval;
 pub mod authorization;
 pub mod core;
 pub mod cr;
 pub mod crd;
+pub mod csr;
 pub mod discovery;
 pub mod generic;
 pub mod json_patch;
