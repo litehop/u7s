@@ -2807,10 +2807,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "serde_json",
+ "tokio",
  "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]
