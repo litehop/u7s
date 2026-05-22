@@ -304,3 +304,473 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Handler-level tests — exercise create_token end-to-end with an in-memory
+// store so every error path in the handler is reachable from tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod handler_tests {
+    use std::sync::Arc;
+
+    use axum::{
+        extract::{Path, State},
+        response::IntoResponse,
+    };
+    use bytes::Bytes;
+    use u7s_store::{SqliteStore, Store};
+
+    use super::*;
+    use crate::state::AppState;
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Build AppState without an SA signing key (covers the "key unavailable" path).
+    fn make_state_no_key() -> (AppState, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        (state, store)
+    }
+
+    /// Build AppState with a freshly generated RSA signing key.
+    fn make_state_with_key() -> (AppState, Arc<SqliteStore>) {
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        let mut rng = rsa::rand_core::OsRng;
+        let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen");
+        let priv_pem = rsa_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("priv pem")
+            .as_bytes()
+            .to_vec();
+        let pub_pem = rsa_key
+            .to_public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("pub pem")
+            .into_bytes();
+        let enc_key =
+            jsonwebtoken::EncodingKey::from_rsa_pem(&priv_pem).expect("encoding key from pem");
+        let dec_key =
+            jsonwebtoken::DecodingKey::from_rsa_pem(&pub_pem).expect("decoding key from pem");
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            Some(enc_key),
+            Some(dec_key),
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        (state, store)
+    }
+
+    async fn seed_namespace(store: &Arc<SqliteStore>, ns: &str) {
+        let key = format!("/registry/namespaces/{ns}");
+        let val = serde_json::json!({"kind": "Namespace", "metadata": {"name": ns}});
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .expect("seed namespace");
+    }
+
+    async fn seed_serviceaccount(store: &Arc<SqliteStore>, ns: &str, name: &str, uid: &str) {
+        let key = format!("/registry/serviceaccounts/{ns}/{name}");
+        let val = serde_json::json!({
+            "kind": "ServiceAccount",
+            "metadata": {"name": name, "namespace": ns, "uid": uid}
+        });
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .expect("seed serviceaccount");
+    }
+
+    /// Collect the response body bytes from an `impl IntoResponse`.
+    async fn collect_body(r: impl IntoResponse) -> serde_json::Value {
+        let resp = r.into_response();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body collect");
+        serde_json::from_slice(&b).expect("response must be valid JSON")
+    }
+
+    /// base64url-decode a JWT claims section (middle dot-separated part) and parse as JSON.
+    fn decode_jwt_claims(token: &str) -> serde_json::Value {
+        use base64::Engine;
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have three dot-separated parts");
+        let claims_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .expect("claims must be valid base64url");
+        serde_json::from_slice(&claims_json).expect("claims must be valid JSON")
+    }
+
+    // -----------------------------------------------------------------------
+    // create_token — error paths
+    // -----------------------------------------------------------------------
+
+    /// An invalid namespace name (e.g. containing uppercase) must return 400 BadRequest.
+    /// create_token calls Namespace::parse which rejects names that violate DNS label rules.
+    /// Without this gate, invalid namespace names could be used to probe the store.
+    #[tokio::test]
+    async fn create_token_invalid_namespace_returns_400() {
+        let (state, _store) = make_state_no_key();
+        let result = create_token(
+            State(state),
+            Path(("INVALID_NS".to_owned(), "my-sa".to_owned())),
+            Bytes::new(),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("invalid namespace must be rejected"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid namespace must yield 400 BadRequest"
+        );
+    }
+
+    /// A valid namespace that does not exist in the store must return 404 NotFound.
+    /// The namespace existence check prevents token issuance for non-existent namespaces,
+    /// which would allow callers to mint tokens scoped to phantom namespaces.
+    #[tokio::test]
+    async fn create_token_missing_namespace_returns_404() {
+        let (state, _store) = make_state_no_key();
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::new(),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing namespace must be rejected"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::NOT_FOUND,
+            "missing namespace must yield 404 NotFound"
+        );
+        assert!(
+            err.1.message.contains("Namespace"),
+            "error message must name the missing resource kind"
+        );
+    }
+
+    /// A valid namespace that exists but whose ServiceAccount does not must return 404.
+    /// Token minting for a non-existent ServiceAccount is forbidden — the SA must exist
+    /// in the cluster for the token to be meaningful.
+    #[tokio::test]
+    async fn create_token_missing_serviceaccount_returns_404() {
+        let (state, store) = make_state_no_key();
+        seed_namespace(&store, "default").await;
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "ghost-sa".to_owned())),
+            Bytes::new(),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing SA must be rejected"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::NOT_FOUND,
+            "missing ServiceAccount must yield 404 NotFound"
+        );
+        assert!(
+            err.1.message.contains("ServiceAccount"),
+            "error message must name the missing kind"
+        );
+    }
+
+    /// When no SA signing key is configured, create_token must return 500 InternalServerError.
+    /// Without this gate a nil-key panic could crash the process; this path ensures a clean
+    /// error response instead.
+    #[tokio::test]
+    async fn create_token_no_signing_key_returns_500() {
+        let (state, store) = make_state_no_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-1").await;
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::new(),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing signing key must return an error"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "missing signing key must yield 500 InternalServerError"
+        );
+        assert!(
+            err.1.message.contains("signing key"),
+            "error message must mention the missing signing key"
+        );
+    }
+
+    /// A malformed JSON request body must return 400 BadRequest.
+    /// The handler parses the body only when it is non-empty; an invalid JSON body
+    /// must be rejected before any token minting occurs.
+    #[tokio::test]
+    async fn create_token_malformed_json_body_returns_400() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-2").await;
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from_static(b"{not valid json"),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("malformed JSON must be rejected"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "malformed JSON body must yield 400 BadRequest"
+        );
+        assert!(
+            err.1.message.contains("invalid JSON"),
+            "error message must mention invalid JSON"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // create_token — happy paths
+    // -----------------------------------------------------------------------
+
+    /// An empty body must succeed: create_token must use the default audience and 3600s TTL.
+    /// kubectl omits the request body in some versions; the handler must treat an absent body
+    /// identically to the Kubernetes-defaults body.
+    #[tokio::test]
+    async fn create_token_empty_body_uses_defaults_and_returns_201() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-3").await;
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::new(),
+        )
+        .await;
+        let resp = match result {
+            Ok(r) => r.into_response(),
+            Err(e) => panic!("empty-body token request must succeed: status={}", e.0),
+        };
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "successful token request must return 201 Created"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body collect");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let token = body["status"]["token"]
+            .as_str()
+            .expect("response must contain status.token");
+        assert!(!token.is_empty(), "minted token must not be empty");
+
+        let exp_ts = body["status"]["expirationTimestamp"]
+            .as_str()
+            .expect("response must contain status.expirationTimestamp");
+        assert!(!exp_ts.is_empty(), "expirationTimestamp must not be empty");
+
+        assert_eq!(
+            body["kind"], "TokenRequest",
+            "response kind must be TokenRequest"
+        );
+        assert_eq!(
+            body["apiVersion"], "authentication.k8s.io/v1",
+            "response apiVersion must be authentication.k8s.io/v1"
+        );
+    }
+
+    /// A body with an explicit audience list must mint a token with those audiences.
+    /// kubelet and admission webhooks supply explicit audiences; the token's `aud` claim
+    /// must match exactly so validators can enforce audience-based access control.
+    #[tokio::test]
+    async fn create_token_explicit_audience_appears_in_token() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-4").await;
+
+        let req_body = serde_json::json!({
+            "spec": {
+                "expirationSeconds": 7200,
+                "audiences": ["https://my-app.example.com"]
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "explicit-audience token request must succeed: status={}",
+                e.0
+            ),
+        };
+
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("token must be present");
+        let claims = decode_jwt_claims(token);
+
+        assert_eq!(
+            claims["aud"][0], "https://my-app.example.com",
+            "explicit audience must appear in JWT aud claim"
+        );
+    }
+
+    /// A body with an empty audiences list must fall back to the default kubernetes audience.
+    /// The Kubernetes TokenRequest spec says an empty audiences list means the default audience;
+    /// omitting this fallback would produce tokens that no standard validator accepts.
+    #[tokio::test]
+    async fn create_token_empty_audiences_filled_with_default() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-5").await;
+
+        let req_body = serde_json::json!({
+            "spec": {
+                "audiences": []
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!("empty-audiences token request must succeed: status={}", e.0),
+        };
+
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("token must be present");
+        let claims = decode_jwt_claims(token);
+
+        assert_eq!(
+            claims["aud"][0], "https://kubernetes.default.svc",
+            "empty audiences must default to https://kubernetes.default.svc"
+        );
+    }
+
+    /// The SA UID from the store must be embedded in the minted token's kubernetes.io claim.
+    /// Without the UID, token recipients cannot distinguish tokens minted for different SA
+    /// objects that share the same name across successive create/delete cycles.
+    #[tokio::test]
+    async fn create_token_sa_uid_embedded_in_jwt_claims() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "kube-system").await;
+        seed_serviceaccount(&store, "kube-system", "coredns", "uid-coredns-42").await;
+
+        let result = create_token(
+            State(state),
+            Path(("kube-system".to_owned(), "coredns".to_owned())),
+            Bytes::new(),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "token request for kube-system/coredns must succeed: status={}",
+                e.0
+            ),
+        };
+
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("token must be present");
+        let claims = decode_jwt_claims(token);
+
+        assert_eq!(
+            claims["kubernetes.io"]["serviceaccount"]["uid"], "uid-coredns-42",
+            "SA UID from store must appear in JWT kubernetes.io.serviceaccount.uid"
+        );
+        assert_eq!(
+            claims["kubernetes.io"]["namespace"], "kube-system",
+            "namespace must appear in JWT kubernetes.io.namespace"
+        );
+        assert_eq!(
+            claims["sub"], "system:serviceaccount:kube-system:coredns",
+            "sub claim must be the canonical service account subject"
+        );
+    }
+
+    /// A very short expiration (below 600s) must be clamped to 600s by the handler.
+    /// This prevents tokens with zero or near-zero TTLs from being minted, which would
+    /// be rejected by validators and could cause tight kubelet refresh loops.
+    #[tokio::test]
+    async fn create_token_short_expiration_clamped_to_600() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-6").await;
+
+        let req_body = serde_json::json!({
+            "spec": {
+                "expirationSeconds": 1
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "short-expiration token request must succeed (after clamping): status={}",
+                e.0
+            ),
+        };
+
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("token must be present");
+        let claims = decode_jwt_claims(token);
+
+        let iat = claims["iat"].as_u64().expect("iat must be present");
+        let exp = claims["exp"].as_u64().expect("exp must be present");
+        assert!(
+            exp - iat >= 600,
+            "expiration must be clamped to at least 600s, got exp-iat={}",
+            exp - iat
+        );
+    }
+}
