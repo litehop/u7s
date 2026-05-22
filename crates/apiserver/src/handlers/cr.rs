@@ -23,7 +23,6 @@ const CRD_LIST_PREFIX: &str = "/registry/apiextensions.k8s.io/customresourcedefi
 /// Information extracted from a CRD needed to serve a CR request.
 pub struct CrContext {
     pub kind: String,
-    pub list_kind: String,
     pub namespaced: bool,
     /// True when at least one served version declares `subresources: {status: {}}`.
     /// Controls whether the main PUT/PATCH endpoint strips `.status` and whether
@@ -78,11 +77,6 @@ pub async fn find_crd(
             .and_then(|s| s.get("openAPIV3Schema"))
             .cloned();
         let namespaced = crd.spec.scope == "Namespaced";
-        let list_kind = if crd.spec.names.list_kind.is_empty() {
-            format!("{}List", crd.spec.names.kind)
-        } else {
-            crd.spec.names.list_kind.clone()
-        };
         // A version has a status subresource when `subresources.status` is present
         // and non-null in the CRD spec. Check all versions; if any declares it, the
         // resource has a status subresource (all served versions must agree in practice).
@@ -95,7 +89,6 @@ pub async fn find_crd(
         });
         return Ok(CrContext {
             kind: crd.spec.names.kind.clone(),
-            list_kind,
             namespaced,
             has_status_subresource,
             schema,
@@ -203,6 +196,9 @@ fn store_err_cr(err: u7s_store::StoreError, name: &str, kind: &str) -> crate::st
     match err {
         u7s_store::StoreError::NotFound { .. } => Status::not_found(name, kind),
         u7s_store::StoreError::AlreadyExists { .. } => Status::already_exists(name, kind),
+        u7s_store::StoreError::RevisionMismatch { expected, current } => Status::conflict(format!(
+            "{kind} \"{name}\" cannot be updated: resource version mismatch (expected {expected}, current {current})"
+        )),
         other => Status::internal(other.to_string()),
     }
 }
@@ -386,13 +382,14 @@ pub async fn list_cr(
         items.push(v);
     }
 
-    let api_version = format!("{group}/{version}");
-    let body = serde_json::json!({
-        "apiVersion": api_version,
-        "kind": ctx.list_kind,
-        "metadata": { "resourceVersion": resp.revision.to_string() },
-        "items": items,
-    });
+    let body = super::generic::build_list_response(
+        &ctx.kind,
+        &group,
+        &version,
+        resp.revision,
+        items,
+        None,
+    );
     Ok(Json(body).into_response())
 }
 
@@ -615,13 +612,14 @@ pub async fn list_cr_namespaced(
         items.push(v);
     }
 
-    let api_version = format!("{group}/{version}");
-    let body = serde_json::json!({
-        "apiVersion": api_version,
-        "kind": ctx.list_kind,
-        "metadata": { "resourceVersion": resp.revision.to_string() },
-        "items": items,
-    });
+    let body = super::generic::build_list_response(
+        &ctx.kind,
+        &group,
+        &version,
+        resp.revision,
+        items,
+        None,
+    );
     Ok(Json(body).into_response())
 }
 
@@ -3644,6 +3642,145 @@ mod tests {
         assert!(
             err.contains("number"),
             "type error must mention 'number' (got: {err})"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression: RevisionMismatch must return 409, not 500 (mayor-5yfc)
+    // ---------------------------------------------------------------------------
+
+    // store_err_cr must map StoreError::RevisionMismatch to 409 Conflict.
+    // Before the fix this arm fell through to the `other` branch and returned 500,
+    // which misleads clients into thinking the server is broken rather than indicating
+    // that they need to re-fetch and retry with the current resourceVersion.
+    #[tokio::test]
+    async fn replace_cr_with_wrong_resource_version_returns_409() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "rv-widget".to_string();
+
+        // Create the CR — this assigns resourceVersion 1 (or similar).
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Attempt replace with resourceVersion: "999" — a non-zero value that won't match.
+        // The store will reject this with StoreError::RevisionMismatch, which must
+        // produce HTTP 409 (Conflict), not 500 (Internal Server Error).
+        // (resourceVersion "0" would produce AlreadyExists, not RevisionMismatch.)
+        let update_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": &name, "resourceVersion": "999" },
+                "spec": { "color": "green" }
+            })
+            .to_string(),
+        );
+
+        let result = replace_cr(
+            State(state.clone()),
+            Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+            axum::http::HeaderMap::new(),
+            update_body,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err for wrong resourceVersion"),
+        };
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 409,
+            "revision mismatch must return 409 Conflict, not 500 (got: {json})"
+        );
+        assert_eq!(
+            json["reason"], "Conflict",
+            "reason must be Conflict (got: {json})"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression: empty-group list response must not produce "/v1alpha1" apiVersion (mayor-q04t)
+    // ---------------------------------------------------------------------------
+
+    // build_list_response must produce apiVersion="v1alpha1" (not "/v1alpha1") when group="".
+    // A leading slash in apiVersion is malformed and breaks kubectl and client-go parsing.
+    // The old inlined `format!("{group}/{version}")` did not check for empty group; delegating
+    // to build_list_response fixes this because that function has the guard:
+    //   if group.is_empty() { version } else { format!("{}/{}", group, version) }
+    #[test]
+    fn build_list_response_empty_group_omits_slash() {
+        let body = super::super::generic::build_list_response(
+            "Foo",
+            "", // empty group
+            "v1alpha1",
+            42,
+            vec![],
+            None,
+        );
+        let api_version = body["apiVersion"].as_str().unwrap_or("");
+        assert_eq!(
+            api_version, "v1alpha1",
+            "empty group must produce apiVersion=\"v1alpha1\", not \"/v1alpha1\" (got: {api_version:?})"
+        );
+        assert_eq!(
+            body["kind"].as_str().unwrap_or(""),
+            "FooList",
+            "kind must be <Kind>List"
+        );
+    }
+
+    // Verify that list_cr routes through build_list_response by checking that a normal
+    // (non-empty group) list response has the correct apiVersion format.
+    // This is an integration smoke test for the code path — the unit test above verifies
+    // the empty-group behavior directly.
+    #[tokio::test]
+    async fn list_cr_response_has_correct_api_version() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let resp = match list_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            no_watch_query(),
+            "test-user".to_string(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("list must succeed"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let api_version = body["apiVersion"].as_str().unwrap_or("");
+        assert_eq!(
+            api_version, "example.io/v1",
+            "non-empty group must produce apiVersion=\"group/version\" (got: {api_version:?})"
         );
     }
 }
