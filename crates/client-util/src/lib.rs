@@ -171,7 +171,7 @@ mod tests {
             .distinguished_name
             .push(rcgen::DnType::CommonName, "test-ca");
         let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign CA");
-        let ca_pem = format!("{}", pem_encode_str("CERTIFICATE", ca_cert.der()));
+        let ca_pem = pem_encode_str("CERTIFICATE", ca_cert.der()).to_string();
         let ca_issuer = Issuer::new(ca_params, ca_key);
 
         // Leaf (client) cert

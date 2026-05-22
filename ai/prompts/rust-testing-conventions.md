@@ -108,3 +108,12 @@ Workers may add to `[dev-dependencies]` in the crate's `Cargo.toml`:
 
 Always run `cargo fmt --all` before pushing. Then verify with
 `cargo fmt --all -- --check`. A fmt failure in CI means a re-dispatch round-trip.
+
+## Worker quality gate checklist
+
+Before every push, run in this order:
+1. `cargo fmt --all -- --check`
+2. `cargo test --workspace --quiet` (or `-p <crate>` for the touched crate)
+3. `cargo clippy --workspace --tests -- -D warnings`
+
+These match exactly what CI and the pre-push hook enforce.
