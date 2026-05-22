@@ -91,6 +91,10 @@ pub fn extract_yaml_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 pub fn build_tls_connector(creds: &ClientCreds) -> anyhow::Result<TlsConnector> {
     use rustls::ClientConfig;
 
+    // Install the ML-KEM-768 hybrid post-quantum crypto provider.
+    // `.ok()` makes this idempotent: a second call (e.g. in tests) is a no-op.
+    rustls_post_quantum::provider().install_default().ok();
+
     let mut root_store = rustls::RootCertStore::empty();
     root_store
         .add(creds.ca_cert.clone())
@@ -552,6 +556,29 @@ mod tests {
     // ---------------------------------------------------------------------------
     // build_tls_connector — happy path
     // ---------------------------------------------------------------------------
+
+    /// build_tls_connector must succeed with the PQC provider active.
+    ///
+    /// This test verifies that rustls_post_quantum::provider() is compatible with
+    /// the rustls version in use. If the provider installation fails silently or
+    /// ClientConfig::builder() rejects it, this test will catch the breakage before
+    /// a runtime crash in scheduler or controller-manager at startup.
+    #[test]
+    fn build_tls_connector_succeeds_with_pqc_provider() {
+        rustls_post_quantum::provider().install_default().ok();
+
+        let (ca_pem, cert_pem, key_pem) = make_test_certs();
+        let yaml = make_kubeconfig_yaml("https://127.0.0.1:6443", &ca_pem, &cert_pem, &key_pem);
+        let path = write_temp_file(&yaml, "connector-pqc");
+        let creds = parse_kubeconfig(path.to_str().unwrap()).expect("parse must succeed");
+        let result = build_tls_connector(&creds);
+        assert!(
+            result.is_ok(),
+            "build_tls_connector must succeed with PQC provider active; got: {:?}",
+            result.err()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// build_tls_connector must succeed when given valid DER certs and a valid key.
     /// The TlsConnector is what controller-manager and scheduler use to open mTLS
