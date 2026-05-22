@@ -1533,7 +1533,7 @@ mod patch_type_tests {
         let result = detect_pod_patch_type(&h);
         assert!(result.is_err(), "unknown content-type must be rejected");
         // Verify it produces a 415 response.
-        let resp: axum::response::Response = result.unwrap_err().into_response();
+        let resp: axum::response::Response = match result { Err(e) => e.into_response(), Ok(_) => panic!("expected error") };
         assert_eq!(
             resp.status(),
             axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
@@ -1825,7 +1825,7 @@ mod pure_logic_tests {
         let mut obj = serde_json::json!({"a": 1});
         let result = pod_json_navigate_mut(&mut obj, &[]);
         assert!(result.is_err(), "empty segments must error");
-        let resp: axum::response::Response = result.unwrap_err().into_response();
+        let resp: axum::response::Response = match result { Err(e) => e.into_response(), Ok(_) => panic!("expected error") };
         assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -1858,7 +1858,7 @@ mod pure_logic_tests {
         let mut obj = serde_json::json!({"spec": {}});
         let result = pod_json_navigate_one(&mut obj, "status");
         assert!(result.is_err());
-        let resp: axum::response::Response = result.unwrap_err().into_response();
+        let resp: axum::response::Response = match result { Err(e) => e.into_response(), Ok(_) => panic!("expected error") };
         assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -1916,7 +1916,7 @@ mod pure_logic_tests {
         let mut obj = serde_json::json!([1, 2, 3]);
         let result = pod_json_navigate_one_or_create(&mut obj, "key");
         assert!(result.is_err());
-        let resp: axum::response::Response = result.unwrap_err().into_response();
+        let resp: axum::response::Response = match result { Err(e) => e.into_response(), Ok(_) => panic!("expected error") };
         assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -2080,7 +2080,7 @@ mod pure_logic_tests {
         let patch = serde_json::json!({"op": "replace", "path": "/a", "value": 2});
         let result = pod_apply_json_patch(&mut obj, &patch);
         assert!(result.is_err());
-        let resp: axum::response::Response = result.unwrap_err().into_response();
+        let resp: axum::response::Response = match result { Err(e) => e.into_response(), Ok(_) => panic!("expected error") };
         assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -2164,7 +2164,7 @@ mod pure_logic_tests {
         let binding = serde_json::json!({"target": {"name": ""}});
         let result = extract_binding_node_name(&binding);
         assert!(result.is_err());
-        let resp: axum::response::Response = result.unwrap_err().into_response();
+        let resp: axum::response::Response = match result { Err(e) => e.into_response(), Ok(_) => panic!("expected error") };
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -2174,7 +2174,7 @@ mod pure_logic_tests {
         let binding = serde_json::json!({"target": {}});
         let result = extract_binding_node_name(&binding);
         assert!(result.is_err());
-        let resp: axum::response::Response = result.unwrap_err().into_response();
+        let resp: axum::response::Response = match result { Err(e) => e.into_response(), Ok(_) => panic!("expected error") };
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
