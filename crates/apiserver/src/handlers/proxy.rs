@@ -163,10 +163,16 @@ pub async fn pod_log(
     }
 
     // 6. Proxy via reqwest.
-    //    KNOWN GAP (pre-alpha): kubelet uses a self-signed certificate. We accept
-    //    invalid certs here. In production this should verify against the cluster CA.
+    //    Verify the kubelet's TLS certificate against the cluster CA. The CA DER bytes
+    //    are stored in AppState and loaded from disk at startup (stable across restarts).
+    let ca_der = state.cluster_ca_der.as_deref().ok_or_else(|| {
+        Status::internal("cluster CA not available — cannot verify kubelet TLS".to_owned())
+    })?;
+    let ca_cert = reqwest::Certificate::from_der(ca_der)
+        .map_err(|e| Status::internal(format!("invalid cluster CA certificate: {e}")))?;
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .use_rustls_tls()
+        .add_root_certificate(ca_cert)
         .build()
         .map_err(|e| Status::internal(format!("failed to build HTTP client: {e}")))?;
 
@@ -337,6 +343,67 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "/log on an unscheduled pod must return 400 (not 500) — \
              there is no kubelet to proxy to until spec.nodeName is set"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_log: 500 when cluster CA is absent (prevents skipping cert verification)
+    // -----------------------------------------------------------------------
+
+    /// /log must return 500 when cluster_ca_der is None.
+    ///
+    /// This guards against accidentally disabling TLS certificate verification on
+    /// the kubelet proxy: if the CA is not in AppState, the handler fails loudly
+    /// rather than silently accepting any certificate (the old danger_accept_invalid_certs
+    /// behaviour). The 500 is surfaced before any kubelet connection is attempted.
+    #[tokio::test]
+    async fn pod_log_missing_ca_returns_500_for_scheduled_pod() {
+        let state = make_state(); // cluster_ca_der is None
+
+        // Seed a pod that IS scheduled so execution reaches the reqwest client build.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "scheduled-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        let key = crate::keys::object_key("pods", "default", "scheduled-pod");
+        state
+            .store
+            .put(&key, bytes::Bytes::from(pod.to_string()), Some(0))
+            .await
+            .expect("seed pod must not fail");
+
+        // Seed a node so the node lookup succeeds and reaches the CA check.
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {
+                "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]
+            }
+        });
+        let node_key = crate::keys::cluster_object_key("nodes", "node-1");
+        state
+            .store
+            .put(&node_key, bytes::Bytes::from(node.to_string()), Some(0))
+            .await
+            .expect("seed node must not fail");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/scheduled-pod/log")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "/log must return 500 when cluster CA is absent — \
+             the old danger_accept_invalid_certs(true) must not be silently used"
         );
     }
 

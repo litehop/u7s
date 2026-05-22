@@ -50,15 +50,37 @@ pub struct AppState {
     pub server_address: String,
     /// Per-client watch stream concurrency limiter.
     pub watch_limit: WatchLimitState,
+    /// DER-encoded cluster CA certificate used to verify kubelet TLS. None in tests.
+    pub cluster_ca_der: Option<Arc<Vec<u8>>>,
 }
 
 impl AppState {
+    /// Convenience constructor for tests: cluster_ca_der defaults to None.
+    #[cfg(test)]
     pub fn new(
         store: Arc<SqliteStore>,
         sa_key: Option<jsonwebtoken::EncodingKey>,
         sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
         token_map: HashMap<String, UserInfo>,
         server_address: String,
+    ) -> Self {
+        Self::new_with_ca(
+            store,
+            sa_key,
+            sa_decoding_key,
+            token_map,
+            server_address,
+            None,
+        )
+    }
+
+    pub fn new_with_ca(
+        store: Arc<SqliteStore>,
+        sa_key: Option<jsonwebtoken::EncodingKey>,
+        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+        token_map: HashMap<String, UserInfo>,
+        server_address: String,
+        cluster_ca_der: Option<Vec<u8>>,
     ) -> Self {
         let registry = build_registry();
         AppState {
@@ -70,6 +92,7 @@ impl AppState {
             token_map: Arc::new(token_map),
             server_address,
             watch_limit: WatchLimitState::new(),
+            cluster_ca_der: cluster_ca_der.map(Arc::new),
         }
     }
 

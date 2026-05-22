@@ -153,12 +153,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("advertised server address: {server_address}");
 
     // 9. Build app state (shared with the auth layer).
-    let state = AppState::new(
+    let state = AppState::new_with_ca(
         Arc::clone(&store),
         sa_encoding_key,
         sa_decoding_key,
         token_map,
         server_address,
+        Some(tls_material.ca_cert_der.clone()),
     );
 
     // 9a. Populate RBAC index from persisted objects before serving.
