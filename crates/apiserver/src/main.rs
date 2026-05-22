@@ -239,44 +239,43 @@ fn build_router(state: AppState) -> Router {
         // Core group (group="", apiVersion=v1) — cluster-scoped resources (e.g. nodes)
         .route(
             "/api/v1/{resource}",
-            get(handlers::generic::core_list_resource)
-                .post(handlers::generic::core_create_resource),
+            get(handlers::core::core_list_resource).post(handlers::core::core_create_resource),
         )
         // Core group — cluster-scoped named resource
         .route(
             "/api/v1/{resource}/{name}",
-            get(handlers::generic::core_get_resource)
-                .put(handlers::generic::core_replace_resource)
-                .delete(handlers::generic::core_delete_resource)
-                .patch(handlers::generic::core_patch_resource),
+            get(handlers::core::core_get_resource)
+                .put(handlers::core::core_replace_resource)
+                .delete(handlers::core::core_delete_resource)
+                .patch(handlers::core::core_patch_resource),
         )
         // Core group — cluster-scoped status subresource
         .route(
             "/api/v1/{resource}/{name}/status",
-            get(handlers::generic::core_get_resource_status)
-                .put(handlers::generic::core_put_resource_status)
-                .patch(handlers::generic::core_patch_resource_status),
+            get(handlers::core::core_get_resource_status)
+                .put(handlers::core::core_put_resource_status)
+                .patch(handlers::core::core_patch_resource_status),
         )
         // Core group — namespaced resources collection (e.g. services, configmaps)
         .route(
             "/api/v1/namespaces/{ns}/{resource}",
-            get(handlers::generic::core_list_namespaced_resource)
-                .post(handlers::generic::core_create_namespaced_resource),
+            get(handlers::core::core_list_namespaced_resource)
+                .post(handlers::core::core_create_namespaced_resource),
         )
         // Core group — namespaced named resource
         .route(
             "/api/v1/namespaces/{ns}/{resource}/{name}",
-            get(handlers::generic::core_get_namespaced_resource)
-                .put(handlers::generic::core_replace_namespaced_resource)
-                .delete(handlers::generic::core_delete_namespaced_resource)
-                .patch(handlers::generic::core_patch_namespaced_resource),
+            get(handlers::core::core_get_namespaced_resource)
+                .put(handlers::core::core_replace_namespaced_resource)
+                .delete(handlers::core::core_delete_namespaced_resource)
+                .patch(handlers::core::core_patch_namespaced_resource),
         )
         // Core group — namespaced status subresource
         .route(
             "/api/v1/namespaces/{ns}/{resource}/{name}/status",
-            get(handlers::generic::core_get_namespaced_resource_status)
-                .put(handlers::generic::core_put_namespaced_resource_status)
-                .patch(handlers::generic::core_patch_namespaced_resource_status),
+            get(handlers::core::core_get_namespaced_resource_status)
+                .put(handlers::core::core_put_namespaced_resource_status)
+                .patch(handlers::core::core_patch_namespaced_resource_status),
         )
         // CRDs — cluster-scoped, specific paths before generic catch-all
         .route(
