@@ -698,3 +698,508 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Handler-level tests — drive the actual Axum handlers end-to-end
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod handler_tests {
+    use std::sync::Arc;
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use bytes::Bytes;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::{auth::UserInfo, rbac::RbacIndex, state::AppState};
+
+    /// Build a minimal AppState with an empty RBAC index and no SA key.
+    fn make_state() -> AppState {
+        let store =
+            Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory sqlite store"));
+        AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    /// Build an AppState whose RBAC index has a ClusterRole + ClusterRoleBinding
+    /// granting `username` the supplied `rules`.
+    fn make_state_with_binding(role_rules: serde_json::Value, username: &str) -> AppState {
+        let state = make_state();
+        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/test-role";
+        state
+            .rbac_index
+            .apply_object(role_key, &serde_json::json!({ "rules": role_rules }));
+        let bind_key = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/test-binding";
+        state.rbac_index.apply_object(
+            bind_key,
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": username }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "test-role"
+                }
+            }),
+        );
+        state
+    }
+
+    fn user(username: &str, groups: &[&str]) -> UserInfo {
+        UserInfo {
+            username: username.to_owned(),
+            uid: String::new(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+        }
+    }
+
+    fn json_req(
+        method: &str,
+        uri: &str,
+        body: serde_json::Value,
+        user_info: UserInfo,
+    ) -> Request<Body> {
+        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(bytes))
+            .unwrap();
+        req.extensions_mut().insert(user_info);
+        req
+    }
+
+    // -----------------------------------------------------------------------
+    // self_subject_access_review
+    // -----------------------------------------------------------------------
+
+    /// The handler must return 201 CREATED and allowed=true when the calling
+    /// user has a matching RBAC binding. This is the primary SSAR use-case:
+    /// clients checking their own permissions (e.g. `kubectl auth can-i`).
+    #[tokio::test]
+    async fn ssar_returns_201_allowed_when_user_has_permission() {
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+            "alice",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "resourceAttributes": {
+                    "namespace": "default",
+                    "verb": "get",
+                    "group": "",
+                    "resource": "pods"
+                }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+            body,
+            user("alice", &[]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "SSAR must respond 201 CREATED"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["allowed"], true,
+            "alice must be allowed to get pods"
+        );
+        assert_eq!(val["kind"], "SelfSubjectAccessReview");
+        assert_eq!(val["apiVersion"], "authorization.k8s.io/v1");
+    }
+
+    /// When resource_attributes is absent the handler must respond allowed=false.
+    /// This is the only safe default: if we cannot determine what to check, deny.
+    #[tokio::test]
+    async fn ssar_returns_201_denied_when_no_resource_attributes() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": {} });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+            body,
+            user("nobody", &[]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["allowed"], false,
+            "absent resourceAttributes must result in allowed=false"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // self_subject_rules_review
+    // -----------------------------------------------------------------------
+
+    /// SSRR must return 201 CREATED and list the rules applicable to the
+    /// calling user. This lets clients enumerate what they are permitted to do
+    /// (e.g. ArgoCD permission discovery, `kubectl auth can-i --list`).
+    #[tokio::test]
+    async fn ssrr_returns_201_with_user_rules() {
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "apiGroups": ["apps"],
+                "resources": ["deployments"],
+                "verbs": ["list", "get"]
+            }]),
+            "alice",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+                post(self_subject_rules_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "namespace": "default" } });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+            body,
+            user("alice", &[]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["kind"], "SelfSubjectRulesReview");
+        assert_eq!(val["apiVersion"], "authorization.k8s.io/v1");
+        let rules = val["status"]["resourceRules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1, "alice must see exactly her one bound rule");
+        assert!(
+            rules[0]["verbs"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("list")),
+            "list verb must appear in rules"
+        );
+    }
+
+    /// SSRR for a user with no bindings must return an empty resourceRules array.
+    /// Returning rules the user doesn't have would be an authorization information leak.
+    #[tokio::test]
+    async fn ssrr_returns_empty_rules_for_unbound_user() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+                post(self_subject_rules_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "namespace": "default" } });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+            body,
+            user("unbound-user", &[]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let rules = val["status"]["resourceRules"].as_array().unwrap();
+        assert!(rules.is_empty(), "unbound user must see no resource rules");
+        assert_eq!(
+            val["status"]["incomplete"], false,
+            "incomplete must be false when enumeration completed normally"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // subject_access_review
+    // -----------------------------------------------------------------------
+
+    /// SAR must return 403 Forbidden when the caller is not in system:masters
+    /// and has no `create subjectaccessreviews` permission. Allowing any
+    /// authenticated user to call SAR would let them probe other users'
+    /// permissions — a serious authorization information leak.
+    #[tokio::test]
+    async fn sar_returns_403_for_unprivileged_caller() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                post(subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "user": "alice",
+                "groups": [],
+                "resourceAttributes": {
+                    "namespace": "default",
+                    "verb": "get",
+                    "group": "",
+                    "resource": "secrets"
+                }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            body,
+            user("unprivileged", &[]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "unprivileged caller must get 403, not a result"
+        );
+    }
+
+    /// A caller in system:masters must be able to use SAR — they can probe any
+    /// subject's permissions. The handler must return 201 CREATED with the
+    /// result of the RBAC check for the target user.
+    #[tokio::test]
+    async fn sar_returns_201_for_system_masters_caller() {
+        // Seed a binding for the target user (alice can get pods).
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+            "alice",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                post(subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "user": "alice",
+                "groups": [],
+                "resourceAttributes": {
+                    "namespace": "default",
+                    "verb": "get",
+                    "group": "",
+                    "resource": "pods"
+                }
+            }
+        });
+        // Caller is in system:masters — must be permitted to call SAR.
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            body,
+            user("admin", &["system:masters"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "system:masters caller must get 201 CREATED"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["kind"], "SubjectAccessReview");
+        assert_eq!(
+            val["status"]["allowed"], true,
+            "alice must be reported as allowed to get pods"
+        );
+    }
+
+    /// SAR must return allowed=false (not 403) when the caller is privileged
+    /// but the target subject has no matching permission. The 403 path is only
+    /// for unprivileged callers — the target check is separate.
+    #[tokio::test]
+    async fn sar_returns_201_denied_when_no_resource_attributes() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+                post(subject_access_review),
+            )
+            .with_state(state);
+
+        // No resourceAttributes: result must be allowed=false.
+        let body = serde_json::json!({
+            "spec": {
+                "user": "nobody",
+                "groups": []
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/subjectaccessreviews",
+            body,
+            user("admin", &["system:masters"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["allowed"], false,
+            "absent resourceAttributes must produce allowed=false, not an error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // token_review
+    // -----------------------------------------------------------------------
+
+    /// TokenReview with a recognized static token must respond 201 CREATED with
+    /// authenticated=true and the correct user identity. This is the primary
+    /// use-case for --token-auth-file (e.g. kubelets authenticating with a
+    /// bootstrap token).
+    #[tokio::test]
+    async fn token_review_returns_authenticated_for_known_token() {
+        let store =
+            Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory sqlite store"));
+        let mut token_map = std::collections::HashMap::new();
+        token_map.insert(
+            "my-static-token".to_owned(),
+            UserInfo {
+                username: "kubelet-node1".to_owned(),
+                uid: "7".to_owned(),
+                groups: vec!["system:nodes".to_owned()],
+            },
+        );
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            token_map,
+            "https://localhost:6443".into(),
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authentication.k8s.io/v1/tokenreviews",
+                post(token_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "token": "my-static-token" } });
+        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+            .header("content-type", "application/json")
+            .body(Body::from(bytes))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["kind"], "TokenReview");
+        assert_eq!(val["apiVersion"], "authentication.k8s.io/v1");
+        assert_eq!(
+            val["status"]["authenticated"], true,
+            "known token must be authenticated"
+        );
+        assert_eq!(
+            val["status"]["user"]["username"], "kubelet-node1",
+            "username must match the token map entry"
+        );
+    }
+
+    /// TokenReview with an unknown token must respond 201 CREATED with
+    /// authenticated=false and no user field. The handler must NOT return an
+    /// error status — the spec says to respond with authenticated=false.
+    #[tokio::test]
+    async fn token_review_returns_unauthenticated_for_unknown_token() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/apis/authentication.k8s.io/v1/tokenreviews",
+                post(token_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "token": "completely-unknown-token" } });
+        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+            .header("content-type", "application/json")
+            .body(Body::from(bytes))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["status"]["authenticated"], false,
+            "unknown token must not authenticate"
+        );
+        // user field must be absent when not authenticated (skip_serializing_if)
+        assert!(
+            val["status"]["user"].is_null(),
+            "user field must be absent when not authenticated"
+        );
+    }
+}
