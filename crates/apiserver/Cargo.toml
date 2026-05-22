@@ -35,4 +35,4 @@ rsa             = "0.9"
 x509-cert = "0.2"
 uuid        = { version = "1", features = ["v4"] }
 subtle      = "2"
-reqwest     = { version = "0.12", features = ["stream", "native-tls"], default-features = false }
+reqwest     = { version = "0.13", features = ["stream", "native-tls"], default-features = false }
