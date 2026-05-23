@@ -1432,10 +1432,8 @@ mod escalation_tests {
     /// Privilege flows through RBAC data — not hardcoded logic.
     #[tokio::test]
     async fn create_clusterrolebinding_allowed_for_system_masters_via_rbac() {
-        use super::super::resource::create_resource;
         let state = make_state();
         let group = "rbac.authorization.k8s.io";
-        let version = "v1";
 
         // Seed cluster-admin ClusterRole.
         let admin_role = serde_json::json!({
