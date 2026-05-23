@@ -2,11 +2,12 @@
 # Full conformance run orchestrator.
 #
 # Runs all numbered steps in order:
-#   01-build.sh           — build u7s-apiserver
-#   02-start-apiserver.sh — start apiserver (or reuse running instance)
-#   03-start-lima.sh      — provision lima VM and join kubelet
-#   04-start-kcm.sh       — start kube-controller-manager inside lima VM
-#   05-run-sonobuoy.sh    — run sonobuoy and print results
+#   01-build.sh            — build u7s-apiserver
+#   02-start-apiserver.sh  — start apiserver (or reuse running instance)
+#   03-start-lima.sh       — provision lima VM and join kubelet
+#   04-start-kcm.sh        — start kube-controller-manager inside lima VM
+#   05-start-scheduler.sh  — start u7s-scheduler inside lima VM
+#   06-run-sonobuoy.sh     — run sonobuoy and print results
 #
 # Usage:
 #   scripts/conformance/run-all.sh [--focus <regex>]
@@ -35,11 +36,11 @@ banner() {
 }
 
 # Step 01: Build
-banner "Step 1/5: Build"
+banner "Step 1/6: Build"
 bash "$DIR/01-build.sh"
 
 # Step 02: Start apiserver — source so KUBECONFIG export propagates.
-banner "Step 2/5: Start apiserver"
+banner "Step 2/6: Start apiserver"
 # shellcheck source=02-start-apiserver.sh
 source "$DIR/02-start-apiserver.sh"
 
@@ -51,16 +52,20 @@ fi
 echo "Using KUBECONFIG=$KUBECONFIG"
 
 # Step 03: Start lima VM and join kubelet.
-banner "Step 3/5: Start lima VM"
+banner "Step 3/6: Start lima VM"
 bash "$DIR/03-start-lima.sh"
 
 # Step 04: Start kcm inside VM.
-banner "Step 4/5: Start kube-controller-manager"
+banner "Step 4/6: Start kube-controller-manager"
 bash "$DIR/04-start-kcm.sh"
 
-# Step 05: Run sonobuoy.
-banner "Step 5/5: Run sonobuoy"
+# Step 05: Start scheduler inside VM.
+banner "Step 5/6: Start u7s-scheduler"
+bash "$DIR/05-start-scheduler.sh"
+
+# Step 06: Run sonobuoy.
+banner "Step 6/6: Run sonobuoy"
 export SONOBUOY_FOCUS="$FOCUS"
-bash "$DIR/05-run-sonobuoy.sh"
+bash "$DIR/06-run-sonobuoy.sh"
 
 banner "Done"

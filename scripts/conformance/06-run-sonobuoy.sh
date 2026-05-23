@@ -18,7 +18,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-echo "=== [05] Run sonobuoy ==="
+echo "=== [06] Run sonobuoy ==="
 
 ARGS=()
 if [ -n "$FOCUS" ]; then
