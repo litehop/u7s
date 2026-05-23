@@ -621,6 +621,16 @@ where
             method_to_verb(req.method())
         };
 
+        // Detect non-resource URL requests: paths not rooted in /api or /apis
+        // (i.e. parse_path returned an empty resource) are non-resource requests.
+        // Examples: GET /version, GET /openapi/v2.
+        let non_resource_url: Option<&str> =
+            if parsed.resource.is_empty() && !path.starts_with("/api") {
+                Some(&path)
+            } else {
+                None
+            };
+
         let allowed = self.rbac_index.is_allowed(&AuthzRequest {
             username: &user.username,
             groups: &user.groups,
@@ -630,6 +640,7 @@ where
             subresource: &parsed.subresource,
             namespace: parsed.namespace.as_deref(),
             name: parsed.name.as_deref(),
+            non_resource_url,
         });
 
         if !allowed {

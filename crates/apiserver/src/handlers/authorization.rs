@@ -74,6 +74,7 @@ pub async fn self_subject_access_review(
             subresource: &attrs.subresource,
             namespace: ns,
             name,
+            non_resource_url: None,
         })
     } else {
         false
@@ -208,6 +209,7 @@ pub async fn subject_access_review(
             subresource: "",
             namespace: None,
             name: None,
+            non_resource_url: None,
         });
 
     if !caller_allowed {
@@ -247,6 +249,7 @@ pub async fn subject_access_review(
             subresource: &attrs.subresource,
             namespace: ns,
             name,
+            non_resource_url: None,
         })
     } else {
         false
@@ -453,6 +456,7 @@ mod tests {
             subresource: "",
             namespace: Some("default"),
             name: None,
+            non_resource_url: None,
         }));
 
         // denied: alice cannot delete pods
@@ -465,6 +469,7 @@ mod tests {
             subresource: "",
             namespace: Some("default"),
             name: None,
+            non_resource_url: None,
         }));
     }
 
@@ -497,6 +502,7 @@ mod tests {
                 subresource: "",
                 namespace: None,
                 name: None,
+                non_resource_url: None,
             }),
             "argocd-bot must be allowed to list deployments per its binding"
         );
@@ -510,6 +516,7 @@ mod tests {
                 subresource: "",
                 namespace: None,
                 name: None,
+                non_resource_url: None,
             }),
             "a different user must not inherit argocd-bot's permissions"
         );
@@ -547,6 +554,7 @@ mod tests {
                 subresource: "",
                 namespace: Some("kube-system"),
                 name: None,
+                non_resource_url: None,
             }),
             "system:masters must be allowed when the cluster-admin binding is present"
         );
@@ -611,6 +619,7 @@ mod tests {
                 subresource: "",
                 namespace: None,
                 name: None,
+                non_resource_url: None,
             })
     }
 
