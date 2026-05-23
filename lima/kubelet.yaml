@@ -96,24 +96,10 @@ provision:
 
       # Write kubelet args — kubeconfig placed at /etc/kubelet-kubeconfig by lima-start.sh
       mkdir -p /etc/systemd/system/kubelet.service.d
-      cat > /etc/kubelet-config.yaml <<'KUBECFG'
-apiVersion: kubelet.config.k8s.io/v1beta1
-kind: KubeletConfiguration
-containerRuntimeEndpoint: unix:///var/run/crio/crio.sock
-registerNode: true
-failSwapOn: false
-resolvConf: ""
-staticPodPath: /tmp/kubelet-pods
-KUBECFG
-      cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<'UNIT'
-[Service]
-ExecStart=
-ExecStart=/usr/bin/kubelet \
-  --config=/etc/kubelet-config.yaml \
-  --kubeconfig=/etc/kubelet-kubeconfig \
-  --hostname-override=lima-node \
-  --v=2
-UNIT
+      printf 'apiVersion: kubelet.config.k8s.io/v1beta1\nkind: KubeletConfiguration\ncontainerRuntimeEndpoint: unix:///var/run/crio/crio.sock\nregisterNode: true\nfailSwapOn: false\nresolvConf: ""\nstaticPodPath: /tmp/kubelet-pods\n' \
+        > /etc/kubelet-config.yaml
+      printf '[Service]\nExecStart=\nExecStart=/usr/bin/kubelet \\\n  --config=/etc/kubelet-config.yaml \\\n  --kubeconfig=/etc/kubelet-kubeconfig \\\n  --hostname-override=lima-node \\\n  --v=2\n' \
+        > /etc/systemd/system/kubelet.service.d/u7s.conf
       systemctl daemon-reload
 
 probes:

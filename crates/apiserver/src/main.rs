@@ -642,7 +642,7 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
     // kubelet injects 10.96.0.10 (kube-dns Service) into every pod's /etc/resolv.conf;
     // without a running CoreDNS pod behind that Service, DNS lookups fail inside pods.
     let key = keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": {
@@ -670,6 +670,7 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
             }
         }
     });
+    crate::handlers::defaults::apply_defaults("apps", "deployments", &mut body);
     match store
         .put(&key, Bytes::from(body.to_string()), Some(0))
         .await
