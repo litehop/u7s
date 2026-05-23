@@ -187,7 +187,14 @@ fn authenticate(
                 // constant time so an attacker cannot distinguish valid prefixes
                 // from invalid ones.
                 if let Some(info) = ct_token_lookup(token_map, token) {
-                    return AuthnResult::Identified(info.clone());
+                    let mut user = info.clone();
+                    // Real Kubernetes always adds system:authenticated to every
+                    // successfully identified user so that ClusterRoleBindings on
+                    // that group (e.g. system:basic-user) apply universally.
+                    if !user.groups.contains(&"system:authenticated".to_owned()) {
+                        user.groups.push("system:authenticated".to_owned());
+                    }
+                    return AuthnResult::Identified(user);
                 }
                 // 2. If a SA decoding key is available, attempt JWT verification.
                 if let Some(key) = sa_decoding_key {
@@ -251,6 +258,9 @@ pub fn extract_client_cert_identity(der: &[u8]) -> Option<UserInfo> {
     }
 
     let username = username?;
+    // Real Kubernetes always adds system:authenticated to every successfully
+    // identified user so that ClusterRoleBindings on that group apply universally.
+    groups.push("system:authenticated".to_owned());
     tracing::debug!("x509 auth: username={username} groups={groups:?}");
     Some(UserInfo {
         username,
@@ -291,9 +301,17 @@ pub fn authenticate_token(
     sa_decoding_key: Option<&DecodingKey>,
 ) -> Option<UserInfo> {
     if let Some(info) = ct_token_lookup(token_map, token) {
-        return Some(info.clone());
+        let mut user = info.clone();
+        // Real Kubernetes always adds system:authenticated to every
+        // successfully identified user so that ClusterRoleBindings on
+        // that group (e.g. system:basic-user) apply universally.
+        if !user.groups.contains(&"system:authenticated".to_owned()) {
+            user.groups.push("system:authenticated".to_owned());
+        }
+        return Some(user);
     }
     if let Some(key) = sa_decoding_key {
+        // try_verify_sa_jwt already appends system:authenticated.
         if let Some(user) = try_verify_sa_jwt(token, key) {
             return Some(user);
         }
@@ -321,6 +339,10 @@ fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
                 if parts.len() == 4 {
                     g.push(format!("system:serviceaccounts:{}", parts[2]));
                 }
+                // Real Kubernetes always adds system:authenticated to every
+                // successfully identified user so that ClusterRoleBindings on
+                // that group (e.g. system:basic-user) apply universally.
+                g.push("system:authenticated".to_owned());
                 g
             };
             Some(UserInfo {
@@ -599,6 +621,16 @@ where
             method_to_verb(req.method())
         };
 
+        // Detect non-resource URL requests: paths not rooted in /api or /apis
+        // (i.e. parse_path returned an empty resource) are non-resource requests.
+        // Examples: GET /version, GET /openapi/v2.
+        let non_resource_url: Option<&str> =
+            if parsed.resource.is_empty() && !path.starts_with("/api") {
+                Some(&path)
+            } else {
+                None
+            };
+
         let allowed = self.rbac_index.is_allowed(&AuthzRequest {
             username: &user.username,
             groups: &user.groups,
@@ -608,6 +640,7 @@ where
             subresource: &parsed.subresource,
             namespace: parsed.namespace.as_deref(),
             name: parsed.name.as_deref(),
+            non_resource_url,
         });
 
         if !allowed {
@@ -1047,10 +1080,16 @@ mod tests {
     fn test_x509_cert_cn_becomes_username() {
         // The CN field of the subject must become the username.
         // This is the core Kubernetes x509 auth mapping.
+        // Even without O fields, system:authenticated must be present so that
+        // ClusterRoleBindings on that group (e.g. system:basic-user) apply.
         let der = make_cert_der("alice", &[]);
         let user = extract_client_cert_identity(&der).expect("must parse cert");
         assert_eq!(user.username, "alice");
-        assert!(user.groups.is_empty());
+        assert_eq!(
+            user.groups,
+            vec!["system:authenticated"],
+            "cert auth with no O fields must still add system:authenticated"
+        );
     }
 
     #[test]
@@ -1067,13 +1106,19 @@ mod tests {
     }
 
     #[test]
-    fn test_x509_cert_no_org_means_empty_groups() {
-        // A cert with no O fields must produce an empty groups list.
+    fn test_x509_cert_no_org_means_only_system_authenticated() {
+        // A cert with no O fields must produce only system:authenticated in groups.
         // The parser must not panic or return an error for a valid cert.
+        // system:authenticated is always added so ClusterRoleBindings on that
+        // group (e.g. system:basic-user) apply to all authenticated users.
         let der = make_cert_der("alice", &[]);
         let user = extract_client_cert_identity(&der).expect("must parse cert");
         assert_eq!(user.username, "alice");
-        assert!(user.groups.is_empty());
+        assert_eq!(
+            user.groups,
+            vec!["system:authenticated"],
+            "cert auth with no O fields must still add system:authenticated"
+        );
     }
 
     #[test]
@@ -1112,6 +1157,97 @@ mod tests {
         match authenticate(&req, &map, None, Some(&cert)) {
             AuthnResult::Identified(u) => assert_eq!(u.username, "bob"),
             AuthnResult::BadToken => panic!("static token must resolve"),
+        }
+    }
+
+    // --- system:authenticated group presence ---
+    // Argo CD and other tools bind ClusterRoles to the system:authenticated group
+    // (e.g. system:basic-user grants SelfSubjectAccessReview).  Without this group
+    // those bindings are invisible to every authenticated user, causing permission
+    // discovery failures on startup.
+
+    #[test]
+    fn test_sa_jwt_includes_system_authenticated() {
+        // SA JWTs must carry system:authenticated so that ClusterRoleBindings
+        // targeting that group (like system:basic-user) apply to service accounts.
+        let (enc, dec) = test_rsa_keypair();
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:my-sa", 3600);
+        let req = make_req(
+            Method::GET,
+            "/api/v1/pods",
+            Some(&format!("Bearer {token}")),
+        );
+        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
+            AuthnResult::Identified(u) => {
+                assert!(
+                    u.groups.contains(&"system:authenticated".to_owned()),
+                    "SA JWT auth must add system:authenticated to groups; \
+                     Argo CD's system:basic-user binding depends on this group"
+                );
+            }
+            AuthnResult::BadToken => panic!("valid SA JWT must not be rejected"),
+        }
+    }
+
+    #[test]
+    fn test_x509_cert_includes_system_authenticated() {
+        // x509 client cert auth must add system:authenticated so that
+        // ClusterRoleBindings targeting that group apply to cert-authed users.
+        let der = make_cert_der("alice", &["engineering"]);
+        let user = extract_client_cert_identity(&der).expect("must parse cert");
+        assert!(
+            user.groups.contains(&"system:authenticated".to_owned()),
+            "x509 auth must add system:authenticated to groups; \
+             Argo CD's system:basic-user binding depends on this group"
+        );
+        // Original O-field groups must still be present.
+        assert!(user.groups.contains(&"engineering".to_owned()));
+    }
+
+    #[test]
+    fn test_static_token_includes_system_authenticated() {
+        // Static bearer token auth must add system:authenticated so that
+        // ClusterRoleBindings targeting that group apply to token-authed users.
+        let mut map = HashMap::new();
+        map.insert(
+            "secret-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "42".to_owned(),
+                groups: vec!["devs".to_owned()],
+            },
+        );
+        let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
+        match authenticate(&req, &map, None, None) {
+            AuthnResult::Identified(u) => {
+                assert!(
+                    u.groups.contains(&"system:authenticated".to_owned()),
+                    "static token auth must add system:authenticated to groups; \
+                     Argo CD's system:basic-user binding depends on this group"
+                );
+                // Original groups must still be present.
+                assert!(u.groups.contains(&"devs".to_owned()));
+            }
+            AuthnResult::BadToken => panic!("valid static token must not be rejected"),
+        }
+    }
+
+    #[test]
+    fn test_anonymous_does_not_get_system_authenticated() {
+        // Anonymous users must NOT receive system:authenticated — they are
+        // unauthenticated and must only get system:unauthenticated.
+        let map = HashMap::new();
+        let req = make_req(Method::GET, "/api/v1/pods", None);
+        match authenticate(&req, &map, None, None) {
+            AuthnResult::Identified(u) => {
+                assert_eq!(u.username, "system:anonymous");
+                assert!(
+                    !u.groups.contains(&"system:authenticated".to_owned()),
+                    "anonymous user must not receive system:authenticated"
+                );
+                assert!(u.groups.contains(&"system:unauthenticated".to_owned()));
+            }
+            AuthnResult::BadToken => panic!("expected anonymous"),
         }
     }
 }

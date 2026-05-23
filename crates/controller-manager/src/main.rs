@@ -15,8 +15,9 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 use u7s_client_util::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use u7s_controller_manager::{
-    build_sa_token_secret, namespace_controller, parse_sa_added_event, secrets_path,
-    token_request_path,
+    build_sa_token_secret, cluster_role_patch_path, cluster_roles_watch_path,
+    compute_aggregated_rules, namespace_controller, parse_cluster_role_event, parse_sa_added_event,
+    secrets_path, token_request_path, ClusterRoleSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,6 +102,117 @@ async fn provision_sa(
     Ok(())
 }
 
+async fn http_patch_json(
+    client: &HyperApiClient,
+    path: &str,
+    payload: &Value,
+) -> anyhow::Result<(hyper::StatusCode, String)> {
+    client
+        .request(Method::PATCH, path, Some(serde_json::to_string(payload)?))
+        .await
+}
+
+// ---------------------------------------------------------------------------
+// ClusterRole aggregation controller
+// ---------------------------------------------------------------------------
+
+/// Watch all ClusterRoles and recompute aggregated roles whenever any role changes.
+///
+/// Aggregated ClusterRoles (those with spec.aggregationRule) collect rules from
+/// sub-roles selected by label. This mirrors the built-in Kubernetes
+/// clusterrole-aggregation-controller and is required for Argo CD's aggregated
+/// ClusterRoles (admin, edit, view) to function.
+async fn run_clusterrole_aggregation_controller(
+    server: String,
+    connector: tokio_rustls::TlsConnector,
+    bearer_token: Option<String>,
+) {
+    loop {
+        info!("starting ClusterRole aggregation watch");
+        let path = cluster_roles_watch_path();
+
+        let client = HyperApiClient {
+            server: server.clone(),
+            connector: connector.clone(),
+            bearer: bearer_token.clone(),
+        };
+
+        // Maintain a local map of all known ClusterRoles so we can recompute
+        // aggregated roles on every change without a full re-list.
+        let roles: std::sync::Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, ClusterRoleSnapshot>>,
+        > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        let result = client
+            .watch_stream(path, |event| {
+                let Some((event_type, snapshot)) = parse_cluster_role_event(&event) else {
+                    return;
+                };
+
+                let roles = std::sync::Arc::clone(&roles);
+                let client_clone = HyperApiClient {
+                    server: server.clone(),
+                    connector: connector.clone(),
+                    bearer: bearer_token.clone(),
+                };
+
+                tokio::spawn(async move {
+                    let mut map = roles.lock().await;
+
+                    // Update in-memory map.
+                    match event_type.as_str() {
+                        "ADDED" | "MODIFIED" => {
+                            map.insert(snapshot.name.clone(), snapshot);
+                        }
+                        "DELETED" => {
+                            map.remove(&snapshot.name);
+                        }
+                        _ => return,
+                    }
+
+                    // After any change, recompute all aggregated roles.
+                    let all_roles: Vec<ClusterRoleSnapshot> = map.values().cloned().collect();
+                    let aggregated: Vec<&ClusterRoleSnapshot> = all_roles
+                        .iter()
+                        .filter(|r| !r.selectors.is_empty())
+                        .collect();
+
+                    for agg_role in aggregated {
+                        let merged_rules = compute_aggregated_rules(agg_role, &all_roles);
+                        let patch = serde_json::json!({
+                            "rules": merged_rules
+                        });
+                        let patch_path = cluster_role_patch_path(&agg_role.name);
+                        match http_patch_json(&client_clone, &patch_path, &patch).await {
+                            Ok((status, _)) if status.is_success() => {
+                                info!(
+                                    "aggregated ClusterRole {}: merged {} rule(s)",
+                                    agg_role.name,
+                                    merged_rules.len()
+                                );
+                            }
+                            Ok((status, body)) => {
+                                warn!(
+                                    "patch ClusterRole {} failed ({status}): {body}",
+                                    agg_role.name
+                                );
+                            }
+                            Err(e) => {
+                                error!("patch ClusterRole {}: {e}", agg_role.name);
+                            }
+                        }
+                    }
+                });
+            })
+            .await;
+
+        if let Err(e) = result {
+            error!("ClusterRole aggregation watch error: {e} — reconnecting in 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -130,6 +242,13 @@ async fn main() -> anyhow::Result<()> {
     info!("connecting to API server at {server}");
 
     let connector = build_tls_connector(&creds)?;
+
+    // Spawn the ClusterRole aggregation controller as a background task.
+    tokio::spawn(run_clusterrole_aggregation_controller(
+        server.clone(),
+        connector.clone(),
+        bearer_token.clone(),
+    ));
 
     // Spawn the namespace lifecycle controller in the background.
     {
