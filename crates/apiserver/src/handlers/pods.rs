@@ -1351,33 +1351,55 @@ mod patch_type_tests {
     }
 }
 
-/// Apply pod creation defaults: set spec.enableServiceLinks=true if absent.
+/// Apply pod creation defaults: set spec.enableServiceLinks=true if absent,
+/// and stamp defaultMode=420 on configMap/secret/projected volumes if absent.
 ///
 /// Extracted for testability — the full create_pod handler is async and needs
 /// a live store, so the defaulting logic lives here as a pure function.
 pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
+    // Deserialize spec into typed form once; all typed-field accesses are compile-checked.
+    let mut spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
+
+    // enableServiceLinks: PodSpec deserializes this with default_true, so
+    // spec.enable_service_links is true when the field was absent. Write it
+    // back only when absent in the raw JSON, preserving an explicit false.
     if pod["spec"]["enableServiceLinks"].is_null() {
-        let spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
-        // PodSpec deserializes enableServiceLinks with default_true, so spec.enable_service_links
-        // is true when the field was absent.  Write it back via the typed field so a rename
-        // of enable_service_links → something_else becomes a compile error here.
         pod["spec"]["enableServiceLinks"] =
             serde_json::to_value(spec.enable_service_links).expect("bool is always serializable");
     }
 
-    // Default defaultMode for volume sources that require it.
+    // defaultMode for volume sources that require it.
     // The kubelet refuses to mount ConfigMap/Secret volumes whose defaultMode is absent:
     //   "no defaultMode used, not even the default value for it"
     // Real kube-apiserver defaults these to 0644 (420 decimal).
-    if let Some(volumes) = pod["spec"]["volumes"].as_array_mut() {
-        for vol in volumes {
-            for key in &["configMap", "secret", "projected"] {
-                if !vol[key].is_null() && vol[key]["defaultMode"].is_null() {
-                    vol[key]["defaultMode"] = serde_json::Value::Number(420.into());
+    //
+    // We deserialize each volume into a typed Volume, stamp the missing defaultMode
+    // on the typed field, then write the whole volumes array back. This ensures the
+    // rename of defaultMode → somethingElse is a compile error rather than a silent
+    // bug, and that untyped volume fields (emptyDir, hostPath, etc.) survive via `rest`.
+    if let Some(ref mut volumes) = spec.volumes {
+        let mut changed = false;
+        for vol in volumes.iter_mut() {
+            for proj in [
+                vol.config_map.as_mut(),
+                vol.secret.as_mut(),
+                vol.projected.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if proj.default_mode.is_none() {
+                    proj.default_mode = Some(420);
+                    changed = true;
                 }
             }
         }
+        if changed {
+            pod["spec"]["volumes"] =
+                serde_json::to_value(&*volumes).expect("Volume is always serializable");
+        }
     }
+    // If spec.volumes is None, there is nothing to default.
 }
 
 #[cfg(test)]
