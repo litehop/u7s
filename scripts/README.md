@@ -97,6 +97,42 @@ scripts/sonobuoy-run.sh --focus "ConfigMap"
 
 **Prerequisites:** u7s running, lima-node registered (`scripts/lima-start.sh` first).
 
+## scripts/conformance/ — Automated sonobuoy conformance orchestration
+
+Numbered scripts that run the full conformance sequence end-to-end. Each step
+can be run individually or via the top-level `run-all.sh` orchestrator.
+
+```bash
+# Full run (all 5 steps):
+scripts/conformance/run-all.sh
+
+# Narrow to a specific test area:
+scripts/conformance/run-all.sh --focus "ConfigMap"
+
+# Or run steps individually:
+scripts/conformance/01-build.sh
+scripts/conformance/02-start-apiserver.sh   # starts apiserver backgrounded; logs to ./temp/u7s/apiserver.log
+export KUBECONFIG=./temp/u7s/kubeconfig
+scripts/conformance/03-start-lima.sh
+scripts/conformance/04-start-kcm.sh
+scripts/conformance/05-run-sonobuoy.sh [--focus <regex>]
+```
+
+| Script | What it does |
+|---|---|
+| `01-build.sh` | `cargo build --release -p u7s-apiserver` |
+| `02-start-apiserver.sh` | Starts apiserver backgrounded; warns and reuses if port 6443 already in use |
+| `03-start-lima.sh` | Thin wrapper around `scripts/lima-start.sh` |
+| `04-start-kcm.sh` | Runs `scripts/kcm-start.sh` inside the lima VM via `nohup` (backgrounded) |
+| `05-run-sonobuoy.sh` | Thin wrapper around `scripts/sonobuoy-run.sh`; passes through `--focus` |
+| `run-all.sh` | Top-level orchestrator: sources step 02 so KUBECONFIG propagates, runs all steps |
+
+**KUBECONFIG propagation:** `run-all.sh` sources `02-start-apiserver.sh` so the
+`KUBECONFIG` export is visible to subsequent steps. When running steps individually,
+export it manually after step 02.
+
+---
+
 ## assert-worktree-boundary.sh — Worktree boundary guard (PreToolUse hook)
 
 Blocks Edit/Write calls targeting files outside the current git worktree root. Registered as a `PreToolUse` hook in `.claude/settings.json` — not intended for direct invocation.
