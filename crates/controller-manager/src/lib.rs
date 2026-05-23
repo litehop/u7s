@@ -5,6 +5,8 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+pub mod namespace_controller;
+
 // ---------------------------------------------------------------------------
 // Secret construction
 // ---------------------------------------------------------------------------

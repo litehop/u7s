@@ -430,7 +430,8 @@ async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
                 "name": name,
                 "uid": uid,
                 "creationTimestamp": "2024-01-01T00:00:00Z",
-                "labels": { "kubernetes.io/metadata.name": name }
+                "labels": { "kubernetes.io/metadata.name": name },
+                "finalizers": ["kubernetes"]
             },
             "status": { "phase": "Active" }
         });
