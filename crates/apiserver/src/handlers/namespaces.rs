@@ -56,13 +56,19 @@ pub async fn list_namespaces(
     let prefix = cluster_list_prefix("namespaces");
 
     if query.watch == Some(true) {
+        let initial = super::watch::fetch_initial_events(
+            &state,
+            &prefix,
+            query.send_initial_events == Some(true),
+        )
+        .await?;
         return super::watch::watch_generic(
             state,
             prefix,
             "v1".to_string(),
             "Namespace".to_string(),
             query.resource_version.unwrap_or(0),
-            None,
+            initial,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
@@ -691,6 +697,96 @@ mod tests {
         assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["reason"], "InternalError");
+    }
+
+    // Regression test for the kcm-smoke-stack bug: when a client requests
+    // ?watch=true&sendInitialEvents=true on /api/v1/namespaces, the server must
+    // emit the initial-events-end BOOKMARK (k8s.io/initial-events-end=true).
+    //
+    // Without this BOOKMARK, the GC's metadata SharedInformerFactory (which watches
+    // ALL resource types including namespaces) never reports "all synced", blocking
+    // the GC's dependency graph builder. With an incomplete dependency graph the GC
+    // cannot verify owner references and may garbage-collect newly created ReplicaSets,
+    // causing the kcm deployment controller smoke test to fail.
+    //
+    // The bug was: list_namespaces passed None for initial_items to watch_generic.
+    // watch_generic only emits the BOOKMARK when initial_items is Some(_).
+    #[tokio::test]
+    async fn list_namespaces_watch_with_send_initial_events_emits_bookmark() {
+        use tokio::time::{timeout, Duration};
+
+        let state = make_state();
+
+        // Seed a namespace so the initial list is non-empty, making the ADDED + BOOKMARK
+        // sequence unambiguous.
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("bookmark-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let query = crate::handlers::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: Some(true),
+            allow_watch_bookmarks: Some(true),
+        };
+
+        let resp = match list_namespaces(
+            State(state),
+            Query(query),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("watch must not error"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Read whatever arrives within a short window; the BOOKMARK must be in the initial burst.
+        let body = resp.into_body();
+        let result = timeout(
+            Duration::from_millis(300),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await;
+        let bytes = match result {
+            Ok(Ok(b)) => b,
+            _ => bytes::Bytes::new(),
+        };
+        let text = std::str::from_utf8(&bytes).unwrap_or("");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+
+        let has_initial_events_end_bookmark = lines.iter().any(|v| {
+            v["type"] == "BOOKMARK"
+                && v["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"] == "true"
+        });
+        assert!(
+            has_initial_events_end_bookmark,
+            "list_namespaces with sendInitialEvents=true must emit a BOOKMARK with \
+             k8s.io/initial-events-end=true; without it the GC metadata informer factory \
+             never completes cache sync and blocks the GC dependency graph builder. \
+             Got lines: {:?}",
+            lines
+        );
     }
 
     // list_namespaces (non-watch) must return a NamespaceList with the created namespace.

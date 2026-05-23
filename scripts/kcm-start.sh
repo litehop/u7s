@@ -87,4 +87,5 @@ exec "$KCM_BINARY" \
   --controllers=csrapproving,csrsigning,garbagecollector,deployment,replicaset \
   --use-service-account-credentials=false \
   --leader-elect=false \
-  --bind-address=127.0.0.1
+  --bind-address=127.0.0.1 \
+  --kube-api-content-type=application/json

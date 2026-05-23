@@ -282,9 +282,20 @@ pub(crate) async fn watch_generic(
         }
     }
 
+    // When sendInitialEvents is active, the list snapshot was taken at list_rv.
+    // The ring buffer replay must start from list_rv (not from_revision) so that
+    // any write that raced between the list and the watch subscribe is replayed
+    // as a synthetic ADDED in the initial phase — before the BOOKMARK — not after
+    // it. Emitting an event after the BOOKMARK would violate the Kubernetes watch
+    // protocol invariant: everything before BOOKMARK is "initial state".
+    let watch_from_rv = match &initial_items {
+        Some((_, list_rv)) => *list_rv,
+        None => from_revision,
+    };
+
     let event_stream = state
         .store
-        .watch(&prefix, from_revision)
+        .watch(&prefix, watch_from_rv)
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
