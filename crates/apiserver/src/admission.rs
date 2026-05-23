@@ -1795,6 +1795,50 @@ mod tests {
         );
     }
 
+    // -- apply_webhook_patch error branches (mayor-l3rh) --
+
+    /// apply_webhook_patch must return Err when the patch string is not valid base64.
+    /// Webhooks that accidentally base64-encode garbage must be rejected immediately
+    /// rather than silently applying no patch or panicking.
+    #[test]
+    fn apply_webhook_patch_rejects_invalid_base64() {
+        let mut obj = serde_json::json!({"metadata": {"name": "test"}});
+        // "!!!" is not valid standard base64 — the decoder must return an error.
+        let result = apply_webhook_patch(&mut obj, "!!!");
+        assert!(
+            result.is_err(),
+            "apply_webhook_patch must return Err for invalid base64 input"
+        );
+        // The error must have been produced before patching, so the object is unchanged.
+        assert_eq!(
+            obj["metadata"]["name"], "test",
+            "object must be unchanged when base64 decode fails"
+        );
+    }
+
+    /// apply_webhook_patch must return Err when the base64 decodes to non-JSON bytes.
+    /// A webhook that returns binary data or a string that isn't a JSON patch array
+    /// must be detected and rejected before any mutation occurs.
+    #[test]
+    fn apply_webhook_patch_rejects_non_json_content() {
+        let mut obj = serde_json::json!({"metadata": {"name": "test"}});
+        // base64 of "not-json-at-all"
+        let not_json_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"not-json-at-all",
+        );
+        let result = apply_webhook_patch(&mut obj, &not_json_b64);
+        assert!(
+            result.is_err(),
+            "apply_webhook_patch must return Err when base64 decodes to non-JSON"
+        );
+        // The object must be unchanged — no partial mutation.
+        assert_eq!(
+            obj["metadata"]["name"], "test",
+            "object must be unchanged when JSON parse fails"
+        );
+    }
+
     /// A webhook with clientConfig.service pointing to a non-existent Service must
     /// apply failurePolicy: Fail returns an error, Ignore skips gracefully.
     #[tokio::test]
