@@ -5,7 +5,7 @@
 #   - 50 concurrent GET requests cycling for 30 seconds
 #   - 20 concurrent mutating (POST ConfigMap) requests cycling for 30 seconds
 #
-# Fails if RSS delta exceeds 20 MB (20480 kB) from baseline.
+# Fails if combined RSS delta (apiserver + scheduler) exceeds 20 MB (20480 kB) from baseline.
 # Works on macOS and Linux.
 
 set -euo pipefail
@@ -13,6 +13,7 @@ set -euo pipefail
 DELTA_THRESHOLD_KB=20480   # 20 MB
 LOAD_DURATION_SECS=30
 SERVER_PID=""
+SCHEDULER_PID=""
 LOAD_PIDS=()
 
 TMPDIR="$(mktemp -d /tmp/u7s-bench-load-XXXXXX)"
@@ -21,6 +22,10 @@ cleanup() {
     for pid in "${LOAD_PIDS[@]:-}"; do
         kill "$pid" 2>/dev/null || true
     done
+    # Kill scheduler.
+    if [ -n "$SCHEDULER_PID" ]; then
+        kill "$SCHEDULER_PID" 2>/dev/null || true
+    fi
     # Kill server.
     if [ -n "$SERVER_PID" ]; then
         kill "$SERVER_PID" 2>/dev/null || true
@@ -33,8 +38,9 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # 1. Build
 # ---------------------------------------------------------------------------
-echo "==> Building release binary..."
+echo "==> Building release binaries..."
 cargo build --release -p u7s-apiserver
+cargo build --release -p u7s-scheduler
 
 # ---------------------------------------------------------------------------
 # 2. Start server
@@ -63,21 +69,38 @@ if ! nc -z 127.0.0.1 6443 2>/dev/null; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# 3. Start scheduler
+# ---------------------------------------------------------------------------
+echo "==> Starting scheduler (logs -> $TMPDIR/scheduler.log)..."
+./target/release/u7s-scheduler \
+    --kubeconfig "$TMPDIR/kubeconfig" \
+    >"$TMPDIR/scheduler.log" 2>&1 &
+SCHEDULER_PID=$!
+
 echo "==> Waiting 3s for memory to stabilize..."
 sleep 3
 
 # ---------------------------------------------------------------------------
-# 3. Baseline RSS
+# 4. Baseline RSS
 # ---------------------------------------------------------------------------
-BASELINE_KB=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
-if [ -z "$BASELINE_KB" ]; then
-    echo "ERROR: could not sample baseline RSS for PID $SERVER_PID"
+SERVER_BASELINE_KB=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+SCHEDULER_BASELINE_KB=$(ps -o rss= -p "$SCHEDULER_PID" | tr -d ' ')
+if [ -z "$SERVER_BASELINE_KB" ]; then
+    echo "ERROR: could not sample baseline RSS for server PID $SERVER_PID"
     exit 1
 fi
-echo "Baseline RSS: ${BASELINE_KB} kB"
+if [ -z "$SCHEDULER_BASELINE_KB" ]; then
+    echo "ERROR: could not sample baseline RSS for scheduler PID $SCHEDULER_PID"
+    exit 1
+fi
+BASELINE_KB=$(( SERVER_BASELINE_KB + SCHEDULER_BASELINE_KB ))
+echo "Baseline RSS (apiserver): ${SERVER_BASELINE_KB} kB"
+echo "Baseline RSS (scheduler): ${SCHEDULER_BASELINE_KB} kB"
+echo "Baseline RSS (combined) : ${BASELINE_KB} kB"
 
 # ---------------------------------------------------------------------------
-# 4. Saturate with load
+# 5. Saturate with load
 # ---------------------------------------------------------------------------
 BASE_URL="https://127.0.0.1:6443"
 CURL_OPTS="-k -s -o /dev/null -w '%{http_code}' --max-time 5"
@@ -145,25 +168,35 @@ done
 LOAD_PIDS=()
 
 # ---------------------------------------------------------------------------
-# 5. Sample peak RSS
+# 6. Sample peak RSS
 # ---------------------------------------------------------------------------
-PEAK_KB=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
-if [ -z "$PEAK_KB" ]; then
-    echo "ERROR: could not sample post-load RSS for PID $SERVER_PID"
+SERVER_PEAK_KB=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+SCHEDULER_PEAK_KB=$(ps -o rss= -p "$SCHEDULER_PID" | tr -d ' ')
+if [ -z "$SERVER_PEAK_KB" ]; then
+    echo "ERROR: could not sample post-load RSS for server PID $SERVER_PID"
+    exit 1
+fi
+if [ -z "$SCHEDULER_PEAK_KB" ]; then
+    echo "ERROR: could not sample post-load RSS for scheduler PID $SCHEDULER_PID"
     exit 1
 fi
 
+PEAK_KB=$(( SERVER_PEAK_KB + SCHEDULER_PEAK_KB ))
 DELTA_KB=$(( PEAK_KB - BASELINE_KB ))
 
-echo "Baseline RSS : ${BASELINE_KB} kB"
-echo "Peak RSS     : ${PEAK_KB} kB"
-echo "Delta RSS    : ${DELTA_KB} kB (threshold: ${DELTA_THRESHOLD_KB} kB)"
+echo "Baseline RSS (apiserver): ${SERVER_BASELINE_KB} kB"
+echo "Baseline RSS (scheduler): ${SCHEDULER_BASELINE_KB} kB"
+echo "Baseline RSS (combined) : ${BASELINE_KB} kB"
+echo "Peak RSS (apiserver)    : ${SERVER_PEAK_KB} kB"
+echo "Peak RSS (scheduler)    : ${SCHEDULER_PEAK_KB} kB"
+echo "Peak RSS (combined)     : ${PEAK_KB} kB"
+echo "Delta RSS               : ${DELTA_KB} kB (threshold: ${DELTA_THRESHOLD_KB} kB)"
 
 # Disarm verbose exit trap — normal path, suppress log dump.
-trap 'for pid in "${LOAD_PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done; if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi' EXIT
+trap 'for pid in "${LOAD_PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done; if [ -n "$SCHEDULER_PID" ]; then kill "$SCHEDULER_PID" 2>/dev/null || true; fi; if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi' EXIT
 
 # ---------------------------------------------------------------------------
-# 6. Verdict
+# 7. Verdict
 # ---------------------------------------------------------------------------
 if [ "$DELTA_KB" -le "$DELTA_THRESHOLD_KB" ]; then
     echo "PASS: RSS delta ${DELTA_KB} kB is within the 20 MB threshold"
@@ -172,5 +205,7 @@ else
     echo "FAIL: RSS delta ${DELTA_KB} kB exceeds the 20 MB threshold (${DELTA_THRESHOLD_KB} kB)"
     echo "Server log:"
     cat "$TMPDIR/server.log" || true
+    echo "Scheduler log:"
+    cat "$TMPDIR/scheduler.log" || true
     exit 1
 fi
