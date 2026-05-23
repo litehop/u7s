@@ -1,38 +1,33 @@
 # Dashboard
-2026-05-23 09:15 UTC
-Session: new session — mayor restarted, 4 workers dispatched
-Open beads: 8 (2×P1, 4×P2, 2×P3)
+2026-05-23 10:15 UTC
+Session: new session — mayor restarted
+Open beads: 2 (2×P3)
 
 ## What needs the operator now
 
-Nothing blocking — 4 workers are in flight. Waiting for CI.
+**Decision: sonobuoy run (`mayor-2ni`)**
+Ready to run a sonobuoy non-disruptive conformance pass? Needs: u7s running on Mac host + lima VM. Operator must kick this off manually (or say yes and mayor dispatches the audit worker). CNCF certification path confirmed: sonobuoy results are what matters (not APISnoop).
 
-## Workers in flight
-
-| Worker | Worktree | Beads | Surface |
-|--------|----------|-------|---------|
-| A | `ai/worktrees/rbac-cluster` | mayor-5u0r (P1), mayor-9sil (P2) | rbac.rs, new aggregation controller |
-| B | `ai/worktrees/auth-hcen` | mayor-hcen (P1) | auth.rs, seed_rbac |
-| C | `ai/worktrees/kcm-ns-cluster` | mayor-rlou (P2), mayor-hfmg (P2) | kcm controllers, namespace handler |
-| D | `ai/worktrees/ssa-oydz` | mayor-oydz (P2) | json_patch.rs / apply-patch |
+**Nothing else blocking.** `mayor-h2fk` (RSS bench) will be dispatched automatically once you confirm it's safe — see below.
 
 ## Forward-looking focus
 
-After workers return and CI goes green:
-1. Merge PRs (all-green required — missing checks = merge conflict, investigate)
-2. Dispatch P3 beads once P1/P2 land:
-   - `mayor-2ni` — sonobuoy audit (needs live cluster)
-   - `mayor-h2fk` — RSS bench with Deployment loop (wait for kcm smoke to be stable)
+- **`mayor-h2fk`** — RSS bench with Deployment reconciliation loop. Safe to dispatch now: PR #203 (namespace controller + kcm expansion) just merged. Will dispatch this session.
+- **`mayor-2ni`** — sonobuoy audit. Operator-time task; mayor can dispatch the audit worker once operator confirms the local cluster is up.
+- After those two: backlog is empty. File new beads or wait for sonobuoy results to drive next wave.
 
 ## In-flight / open PRs
 
-None yet — workers still running.
+None — all clean.
 
 ## Recent progress
 
-- Cleaned up 6 stale worktrees (all empty, from prior session)
-- Dispatched 4-worker wave covering 6 of 8 open beads
-- Stance confirmed: pre-alpha/greenfield, correctness first, merge on green CI
+This session (2026-05-23):
+- **5 PRs merged**: #200 (system:authenticated), #201 (SSA managedFields), #202 (RBAC aggregation + nonResourceURLs), #203 (namespace lifecycle + kcm controllers), bead sync commit
+- **6 beads closed**: mayor-hcen, mayor-oydz, mayor-5u0r, mayor-9sil, mayor-rlou, mayor-hfmg
+- **Pre-push hook wired**: `core.hooksPath = .githooks` + `chmod +x` — enforces fmt+test+clippy on every push
+- **APISnoop research**: not needed for CNCF cert (sonobuoy is the gate); APISnoop deferred/dropped
+- 313 beads closed total, 2 remain
 
 ## Stance
-Pre-alpha/greenfield: break freely, no backward compat, correctness first, performance-critical (RSS/latency hard targets), kubectl-compatible API surface, minimal crate deps. Mayor merges on green CI automatically (missing checks = merge conflict to investigate). Flags security/API/architecture PRs for operator review first.
+Pre-alpha/greenfield: break freely, no backward compat, correctness first, performance-critical (RSS/latency hard targets), kubectl-compatible API surface, minimal crate deps. Mayor merges on green CI (missing checks = merge conflict to investigate). Flags security/API/architecture PRs for operator review first.
