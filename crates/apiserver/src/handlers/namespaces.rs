@@ -15,7 +15,7 @@ use crate::{
     proto,
     state::AppState,
     status::Status,
-    types::{NamespaceStatus, Object, ObjectMeta},
+    types::{NamespacePhase, NamespaceStatus, Object, ObjectMeta},
     util::{extract_body, parse_resource_version},
 };
 
@@ -174,7 +174,8 @@ pub async fn create_namespace(
     }
     if obj.body["status"].is_null() || obj.body.get("status").is_none() {
         obj.body["status"] = serde_json::to_value(NamespaceStatus {
-            phase: "Active".to_owned(),
+            phase: Some(NamespacePhase::Active),
+            rest: serde_json::Value::Object(Default::default()),
         })
         .expect("NamespaceStatus serializes");
     }
@@ -371,7 +372,8 @@ pub async fn delete_namespace(
     if let Some(mut soft) = apply_delete_policy(&mut obj) {
         // Soft-delete: set phase=Terminating, persist, return the namespace object.
         soft["status"] = serde_json::to_value(NamespaceStatus {
-            phase: "Terminating".to_owned(),
+            phase: Some(NamespacePhase::Terminating),
+            rest: serde_json::Value::Object(Default::default()),
         })
         .expect("NamespaceStatus serializes");
         obj.body = soft;
