@@ -429,9 +429,28 @@ pub struct Binding {
 // NamespaceStatus — typed status for Namespace objects
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The two valid phases for a Namespace. Using an enum makes exhaustive matching
+/// explicit — the apiserver pattern-matches on "Terminating" to gate operations,
+/// so a typo in a string literal would be a silent logic error.
+///
+/// Kubernetes wire format uses PascalCase ("Active", "Terminating") so no
+/// rename_all is needed — the variant names are already the correct wire names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum NamespacePhase {
+    Active,
+    Terminating,
+}
+
+/// Typed status for a Namespace object. Only `phase` is pattern-matched by
+/// apiserver logic; all other status fields survive round-trips via `rest`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct NamespaceStatus {
-    pub phase: String,
+    pub phase: Option<NamespacePhase>,
+    /// All other status fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -531,33 +550,74 @@ impl Object {
 mod namespace_status_tests {
     use super::*;
 
-    /// NamespaceStatus must serialize to {"phase":"<value>"} so that a Namespace stored
+    /// NamespacePhase::Active must serialize to the string "Active".
+    /// kubectl displays the phase string directly; a wrong serialization would
+    /// show garbage in `kubectl get ns` output.
+    #[test]
+    fn namespace_phase_active_serializes_correctly() {
+        let v = serde_json::to_value(&NamespacePhase::Active).unwrap();
+        assert_eq!(v, "Active");
+    }
+
+    /// NamespacePhase::Terminating must serialize to the string "Terminating".
+    /// The apiserver pattern-matches this value to gate namespace deletion;
+    /// a wrong string would silently allow operations on a terminating namespace.
+    #[test]
+    fn namespace_phase_terminating_serializes_correctly() {
+        let v = serde_json::to_value(&NamespacePhase::Terminating).unwrap();
+        assert_eq!(v, "Terminating");
+    }
+
+    /// NamespaceStatus must serialize to {"phase":"Active"} so that a Namespace stored
     /// with typed construction matches what clients (kubectl) expect to read back.
     /// A field rename regression would silently produce wrong JSON without this test.
     #[test]
     fn namespace_status_serializes_to_phase_key() {
         let s = NamespaceStatus {
-            phase: "Active".to_owned(),
+            phase: Some(NamespacePhase::Active),
+            rest: serde_json::Value::Object(Default::default()),
         };
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["phase"], "Active");
-        // Must not emit any extra or renamed keys
-        assert_eq!(
-            v.as_object().unwrap().len(),
-            1,
-            "NamespaceStatus must only emit 'phase'"
-        );
     }
 
     /// NamespaceStatus must round-trip through JSON so stored values can be read back.
     #[test]
     fn namespace_status_round_trips() {
         let original = NamespaceStatus {
-            phase: "Terminating".to_owned(),
+            phase: Some(NamespacePhase::Terminating),
+            rest: serde_json::Value::Object(Default::default()),
         };
         let v = serde_json::to_value(&original).unwrap();
         let restored: NamespaceStatus = serde_json::from_value(v).unwrap();
-        assert_eq!(restored.phase, "Terminating");
+        assert_eq!(restored.phase, Some(NamespacePhase::Terminating));
+    }
+
+    /// NamespaceStatus with unknown status fields must preserve them on round-trip.
+    /// Kubernetes controllers may write arbitrary extra fields into status; dropping
+    /// them on a read-modify-write cycle would silently corrupt the stored object.
+    #[test]
+    fn namespace_status_round_trips_with_unknown_fields() {
+        let json = serde_json::json!({
+            "phase": "Active",
+            "conditions": [{"type": "NamespaceDeletionContentFailure", "status": "False"}],
+            "unknownFutureField": "preserved"
+        });
+        let status: NamespaceStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status.phase, Some(NamespacePhase::Active));
+
+        // Re-serialize and verify all fields survive
+        let out = serde_json::to_value(&status).unwrap();
+        assert_eq!(out["phase"], "Active");
+        assert_eq!(
+            out["conditions"][0]["type"],
+            "NamespaceDeletionContentFailure"
+        );
+        assert_eq!(
+            out["unknownFutureField"], "preserved",
+            "unknown status fields must survive round-trip via rest — \
+             losing them corrupts objects that other controllers wrote"
+        );
     }
 }
 
