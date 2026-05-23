@@ -4445,7 +4445,8 @@ mod tests {
         let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
         let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
 
-        let result = call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
         assert!(
             result.is_err(),
             "call_conversion_webhook must return Err when result.status=Failure"
@@ -4485,7 +4486,8 @@ mod tests {
         let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
         let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
 
-        let result = call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
         assert!(
             result.is_err(),
             "call_conversion_webhook must return Err when convertedObjects is empty"
@@ -4502,7 +4504,8 @@ mod tests {
         let client_config = serde_json::json!({ "url": "http://127.0.0.1:1/convert" });
         let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
 
-        let result = call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
         assert!(
             result.is_err(),
             "call_conversion_webhook must return Err when HTTP call fails (bad URL)"
@@ -4533,7 +4536,8 @@ mod tests {
         let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
         let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
 
-        let result = call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
         assert!(
             result.is_err(),
             "call_conversion_webhook must return Err when response is not valid JSON"

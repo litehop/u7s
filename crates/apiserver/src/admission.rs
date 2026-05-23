@@ -2077,7 +2077,10 @@ mod tests {
         };
 
         let result = run_mutating_webhooks(&state, obj, &ctx).await;
-        assert!(result.is_ok(), "pipeline must succeed when no patch applied");
+        assert!(
+            result.is_ok(),
+            "pipeline must succeed when no patch applied"
+        );
 
         let count = call_count.load(Ordering::SeqCst);
         assert_eq!(
