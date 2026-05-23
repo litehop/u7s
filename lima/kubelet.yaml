@@ -50,6 +50,21 @@ provision:
       # and will fail with "unknown version specified" on every sandbox create.
       # The 10-crio.conf shipped by the cri-o package already sets the correct path.
       mkdir -p /etc/crio/crio.conf.d
+
+      # Enable the CNI 1.0.0 conflist bridge config.
+      # The cri-o package ships two CNI configs:
+      #   10-crio-bridge.conf         — old 0.4.0 single-plugin format (fails with crun 1.26+)
+      #   10-crio-bridge.conflist     — new 1.0.0 conflist format (correct)
+      # Disable the old one and enable the new one.
+      CNI_DIR=/etc/cni/net.d
+      if [ -f "$CNI_DIR/10-crio-bridge.conf" ]; then
+        mv "$CNI_DIR/10-crio-bridge.conf" "$CNI_DIR/10-crio-bridge.conf.disabled" || true
+      fi
+      if [ -f "$CNI_DIR/10-crio-bridge.conflist.disabled" ]; then
+        mv "$CNI_DIR/10-crio-bridge.conflist.disabled" "$CNI_DIR/10-crio-bridge.conflist" || true
+      fi
+      # If conflist already exists and is correct, nothing to do.
+
       systemctl enable --now crio
 
       # Install kubelet 1.36 from pkgs.k8s.io
