@@ -23,7 +23,7 @@ use crate::{
     keys::group_object_key,
     state::AppState,
     status::Status,
-    types::Object,
+    types::{CertificateSigningRequestStatus, Object},
     util::{content_type, extract_body, parse_resource_version},
 };
 use u7s_store::Store as _;
@@ -101,8 +101,15 @@ pub async fn patch_approval(
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    // Save the certificate field before patching so we can restore it afterward.
-    let certificate_before = current.body["status"]["certificate"].clone();
+    // Deserialize current status to extract the certificate field before patching.
+    let status_before: CertificateSigningRequestStatus =
+        serde_json::from_value(current.body["status"].clone()).unwrap_or_else(|_| {
+            CertificateSigningRequestStatus {
+                certificate: None,
+                conditions: None,
+                rest: serde_json::Value::Object(Default::default()),
+            }
+        });
 
     match patch_type {
         PatchType::Json => {
@@ -110,20 +117,29 @@ pub async fn patch_approval(
             apply_json_patch(&mut current.body, &patch)?;
         }
         PatchType::Merge | PatchType::StrategicMerge => {
-            // Only merge the conditions portion of status.
-            if let Some(conditions) = patch.get("status").and_then(|s| s.get("conditions")) {
-                current.body["status"]["conditions"] = conditions.clone();
+            // Deserialize the patch status to get typed conditions.
+            let patch_status: Option<CertificateSigningRequestStatus> = patch
+                .get("status")
+                .and_then(|s| serde_json::from_value(s.clone()).ok());
+            if let Some(ps) = patch_status {
+                if let Some(conditions) = ps.conditions {
+                    current.body["status"]["conditions"] =
+                        serde_json::to_value(conditions).unwrap_or(serde_json::Value::Null);
+                }
             }
         }
     }
 
     // Restore protected fields — spec and status.certificate must never change via /approval.
-    if !certificate_before.is_null() {
-        current.body["status"]["certificate"] = certificate_before;
-    } else {
-        // Make sure it wasn't introduced by the patch.
-        if let Some(s) = current.body["status"].as_object_mut() {
-            s.remove("certificate");
+    match &status_before.certificate {
+        Some(cert) => {
+            current.body["status"]["certificate"] = serde_json::Value::String(cert.clone());
+        }
+        None => {
+            // Make sure it wasn't introduced by the patch.
+            if let Some(s) = current.body["status"].as_object_mut() {
+                s.remove("certificate");
+            }
         }
     }
 
@@ -146,10 +162,15 @@ pub async fn patch_approval(
 ///
 /// INVARIANT: `status.certificate` in `current` is never touched.
 pub(crate) fn merge_approval_conditions(current: &mut Object, incoming: &Object) {
-    // Replace conditions list; leave everything else in status (including certificate) alone.
-    let new_conditions = &incoming.body["status"]["conditions"];
-    if !new_conditions.is_null() {
-        current.body["status"]["conditions"] = new_conditions.clone();
+    // Deserialize the incoming status to get typed conditions.
+    let incoming_status: Option<CertificateSigningRequestStatus> =
+        serde_json::from_value(incoming.body["status"].clone()).ok();
+
+    if let Some(status) = incoming_status {
+        if let Some(conditions) = status.conditions {
+            current.body["status"]["conditions"] =
+                serde_json::to_value(conditions).unwrap_or(serde_json::Value::Null);
+        }
     }
     // Explicitly do NOT copy status.certificate from incoming.
 }
