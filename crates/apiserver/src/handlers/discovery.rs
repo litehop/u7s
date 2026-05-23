@@ -206,6 +206,7 @@ pub async fn api_group_resources(
                     "singularName": crd.spec.names.singular,
                     "namespaced": crd.spec.scope == "Namespaced",
                     "kind": crd.spec.names.kind,
+                    "shortNames": crd.spec.names.short_names,
                     "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
                 })
             })
@@ -269,6 +270,7 @@ fn apps_v1_resources() -> serde_json::Value {
                 "singularName": "daemonset",
                 "namespaced": true,
                 "kind": "DaemonSet",
+                "shortNames": ["ds"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
@@ -276,6 +278,7 @@ fn apps_v1_resources() -> serde_json::Value {
                 "singularName": "deployment",
                 "namespaced": true,
                 "kind": "Deployment",
+                "shortNames": ["deploy"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
@@ -292,6 +295,7 @@ fn apps_v1_resources() -> serde_json::Value {
                 "singularName": "replicaset",
                 "namespaced": true,
                 "kind": "ReplicaSet",
+                "shortNames": ["rs"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
@@ -308,6 +312,7 @@ fn apps_v1_resources() -> serde_json::Value {
                 "singularName": "statefulset",
                 "namespaced": true,
                 "kind": "StatefulSet",
+                "shortNames": ["sts"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
@@ -485,6 +490,7 @@ fn networking_v1_resources() -> serde_json::Value {
                 "singularName": "ingress",
                 "namespaced": true,
                 "kind": "Ingress",
+                "shortNames": ["ing"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
@@ -492,6 +498,7 @@ fn networking_v1_resources() -> serde_json::Value {
                 "singularName": "networkpolicy",
                 "namespaced": true,
                 "kind": "NetworkPolicy",
+                "shortNames": ["netpol"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -559,6 +566,7 @@ fn policy_v1_resources() -> serde_json::Value {
                 "singularName": "poddisruptionbudget",
                 "namespaced": true,
                 "kind": "PodDisruptionBudget",
+                "shortNames": ["pdb"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -668,6 +676,7 @@ fn storage_v1_resources() -> serde_json::Value {
                 "singularName": "storageclass",
                 "namespaced": false,
                 "kind": "StorageClass",
+                "shortNames": ["sc"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
@@ -1243,6 +1252,98 @@ mod tests {
         assert!(
             names.contains(&"networkpolicies"),
             "networkpolicies must be in networking.k8s.io/v1; got: {names:?}"
+        );
+    }
+
+    // apps/v1 discovery must surface shortNames for replicasets and deployments so that
+    // `kubectl get rs` and `kubectl get deploy` resolve without "server doesn't have a resource type".
+    #[tokio::test]
+    async fn apps_v1_resources_have_short_names() {
+        let state = make_state();
+        let resp =
+            api_group_resources(State(state), Path(("apps".to_string(), "v1".to_string()))).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+
+        let rs = resources
+            .iter()
+            .find(|r| r["name"] == "replicasets")
+            .expect("replicasets must be in apps/v1");
+        assert_eq!(
+            rs["shortNames"][0], "rs",
+            "replicasets must have shortName 'rs' so kubectl get rs works"
+        );
+
+        let deploy = resources
+            .iter()
+            .find(|r| r["name"] == "deployments")
+            .expect("deployments must be in apps/v1");
+        assert_eq!(
+            deploy["shortNames"][0], "deploy",
+            "deployments must have shortName 'deploy' so kubectl get deploy works"
+        );
+    }
+
+    // A CRD whose spec.names.shortNames is non-empty must surface those short names in the
+    // group-version discovery response so that `kubectl get <shortname>` resolves for CRDs.
+    #[tokio::test]
+    async fn crd_short_names_forwarded_in_group_version_discovery() {
+        let state = make_state();
+
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "widgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "widgets",
+                        "singular": "widget",
+                        "kind": "Widget",
+                        "shortNames": ["wdg"]
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": true }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create must succeed"
+        );
+
+        let resp = api_group_resources(
+            State(state),
+            Path(("example.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let widget = resources
+            .iter()
+            .find(|r| r["name"] == "widgets")
+            .expect("widgets resource must appear in example.io/v1 discovery");
+        assert_eq!(
+            widget["shortNames"][0], "wdg",
+            "CRD shortNames must be forwarded into the APIResourceList entry"
         );
     }
 }
