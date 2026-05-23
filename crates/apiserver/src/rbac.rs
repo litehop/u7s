@@ -18,6 +18,8 @@ pub struct PolicyRule {
 pub struct Subject {
     pub kind: String,
     pub name: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -278,7 +280,15 @@ fn subject_matches(binding: &RbacBinding, username: &str, groups: &[String]) -> 
     binding.subjects.iter().any(|s| match s.kind.as_str() {
         "User" => s.name == username,
         "Group" => groups.iter().any(|g| g == &s.name),
-        "ServiceAccount" => s.name == username,
+        "ServiceAccount" => {
+            // Kubernetes encodes ServiceAccount usernames as
+            // "system:serviceaccount:<namespace>:<name>".
+            // Match against both the encoded form (for RBAC) and the raw name
+            // (for bindings created without a namespace field).
+            let ns = s.namespace.as_deref().unwrap_or("");
+            let encoded = format!("system:serviceaccount:{ns}:{}", s.name);
+            username == encoded || username == s.name
+        }
         _ => false,
     })
 }
@@ -1105,6 +1115,107 @@ mod tests {
         assert!(
             user_holds_all_rules("admin-user", &groups, &admin_rules, &idx),
             "system:masters members must pass the escalation check via their cluster-admin binding"
+        );
+    }
+
+    // --- ServiceAccount subject matching (mayor-41y9) ---
+
+    fn make_cluster_binding_sa(
+        name: &str,
+        role_name: &str,
+        sa_ns: &str,
+        sa_name: &str,
+    ) -> (String, serde_json::Value) {
+        let key = format!("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{name}");
+        let val = json!({
+            "subjects": [{ "kind": "ServiceAccount", "namespace": sa_ns, "name": sa_name }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": role_name
+            }
+        });
+        (key, val)
+    }
+
+    #[test]
+    fn serviceaccount_subject_matches_encoded_username() {
+        // Kubernetes encodes ServiceAccount subjects as "system:serviceaccount:<ns>:<name>".
+        // A ClusterRoleBinding with kind=ServiceAccount, namespace=default, name=my-sa
+        // must grant access to a request whose username is "system:serviceaccount:default:my-sa".
+        // Without this, kubelet and controller-manager SA tokens are denied by RBAC even
+        // when a binding explicitly covers them.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        let (bind_key, bind_val) =
+            make_cluster_binding_sa("my-sa-binding", "pod-reader", "default", "my-sa");
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // Encoded username must be allowed — this is what kube-apiserver sends.
+        let r = req(
+            "system:serviceaccount:default:my-sa",
+            &groups,
+            "get",
+            "pods",
+            "",
+            Some("default"),
+            None,
+        );
+        assert!(
+            idx.is_allowed(&r),
+            "system:serviceaccount:default:my-sa must be allowed via ServiceAccount subject binding; \
+             without this, SA tokens are denied despite an explicit binding"
+        );
+    }
+
+    #[test]
+    fn serviceaccount_subject_does_not_match_different_sa_in_same_namespace() {
+        // A binding for my-sa must NOT grant access to other-sa in the same namespace.
+        // Without this check, any SA in the namespace could escalate by sharing a binding.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        let (bind_key, bind_val) =
+            make_cluster_binding_sa("my-sa-binding", "pod-reader", "default", "my-sa");
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // A different SA in the same namespace must be denied.
+        let r = req(
+            "system:serviceaccount:default:other-sa",
+            &groups,
+            "get",
+            "pods",
+            "",
+            Some("default"),
+            None,
+        );
+        assert!(
+            !idx.is_allowed(&r),
+            "system:serviceaccount:default:other-sa must be denied — \
+             only my-sa is bound, not other-sa"
         );
     }
 
