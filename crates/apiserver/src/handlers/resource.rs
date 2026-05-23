@@ -2903,6 +2903,150 @@ mod tests {
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
+    // -- resource.rs CRUD handler error mappings (mayor-96nx) --
+
+    /// patch_resource with an unsupported content-type (e.g. application/json) must
+    /// return 415 Unsupported Media Type. Clients that accidentally use the wrong
+    /// content type header would otherwise get a cryptic error — 415 correctly
+    /// signals that the content-type is the problem, not the request body.
+    #[tokio::test]
+    async fn patch_resource_with_bad_content_type_returns_415() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        // application/json is not a supported patch content-type for patch_resource.
+        // Valid types: merge-patch+json, strategic-merge-patch+json, json-patch+json,
+        //              apply-patch+yaml. application/json alone must return 415.
+        let mut bad_headers = axum::http::HeaderMap::new();
+        bad_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let patch = serde_json::json!({"metadata": {"labels": {"env": "prod"}}});
+
+        let result = patch_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "any-node".into(),
+            )),
+            bad_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "application/json content-type must return 415 for patch_resource"
+            ),
+            Ok(_) => panic!("patch_resource with application/json must return 415"),
+        }
+    }
+
+    /// patch_namespaced_resource with an unsupported content-type must return 415.
+    /// Same invariant as the cluster-scoped case: content-type validation fires before
+    /// any store access, so the error is fast and the reason is unambiguous.
+    #[tokio::test]
+    async fn patch_namespaced_resource_with_bad_content_type_returns_415() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let mut bad_headers = axum::http::HeaderMap::new();
+        bad_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let patch = serde_json::json!({"metadata": {"labels": {"env": "prod"}}});
+
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "any-lease".into(),
+            )),
+            bad_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "application/json content-type must return 415 for patch_namespaced_resource"
+            ),
+            Ok(_) => panic!("patch_namespaced_resource with application/json must return 415"),
+        }
+    }
+
+    /// create_namespaced_resource returns 409 Conflict when creating the same
+    /// namespaced object twice. Duplicate creation with the same name and namespace
+    /// must be rejected to prevent silent data corruption.
+    #[tokio::test]
+    async fn create_namespaced_resource_returns_409_on_duplicate() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "dup-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "dup-lease" }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&lease).unwrap());
+
+        match create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            json_headers(),
+            body.clone(),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(_) => panic!("first create must succeed"),
+        }
+
+        let result = create_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            json_headers(),
+            body,
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::CONFLICT,
+                "duplicate namespaced create must return 409 Conflict"
+            ),
+            Ok(_) => panic!("duplicate create_namespaced_resource must return 409"),
+        }
+    }
+
     /// strategic_merge_patch merges arrays by name key (not replaces).
     #[test]
     fn strategic_merge_patch_applied_correctly_via_handler_logic() {

@@ -86,6 +86,12 @@ pub(crate) async fn call_conversion_webhook(
         .cloned()
         .unwrap_or_default();
 
+    if converted.is_empty() {
+        return Err(Status::internal(
+            "conversion webhook returned no converted objects".into(),
+        ));
+    }
+
     Ok(converted)
 }
 
@@ -4374,6 +4380,167 @@ mod tests {
             cfg["url"].as_str(),
             Some("https://converter.example.com/convert"),
             "clientConfig URL must be extracted correctly"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // call_conversion_webhook error paths (mayor-q402)
+    // ---------------------------------------------------------------------------
+
+    /// Start an axum router on a random local TCP port and return the base URL.
+    /// The server runs until the returned JoinHandle is dropped/aborted.
+    async fn start_mock_conversion_server(
+        router: axum::Router,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock server must not fail");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn make_state_for_conversion() -> AppState {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    /// call_conversion_webhook must return Err when the response includes
+    /// result.status="Failure". Conversion webhooks that reject the request
+    /// (e.g. unsupported conversion direction) must propagate as errors so
+    /// the apiserver rejects the client request rather than returning corrupt data.
+    #[tokio::test]
+    async fn call_conversion_webhook_returns_err_on_failure_status() {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/convert",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "ConversionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "result": {
+                            "status": "Failure",
+                            "message": "unsupported conversion direction"
+                        }
+                    }
+                }))
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when result.status=Failure"
+        );
+        let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
+        assert!(
+            err_msg.contains("unsupported conversion direction"),
+            "error must include the webhook's failure message"
+        );
+    }
+
+    /// call_conversion_webhook must return Err when the webhook returns an empty
+    /// convertedObjects array. Receiving 0 objects for N input objects is semantically
+    /// invalid — the caller has no objects to serve and cannot proceed.
+    #[tokio::test]
+    async fn call_conversion_webhook_returns_err_when_converted_objects_empty() {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/convert",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "ConversionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "result": { "status": "Success" },
+                        "convertedObjects": []  // empty — must be rejected
+                    }
+                }))
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when convertedObjects is empty"
+        );
+    }
+
+    /// call_conversion_webhook must return Err when the HTTP call fails (bad URL).
+    /// Network errors must be propagated as errors — callers must not silently
+    /// succeed with the unconverted objects.
+    #[tokio::test]
+    async fn call_conversion_webhook_returns_err_on_http_failure() {
+        let state = make_state_for_conversion();
+        // Port 1 is never open — connection will be refused immediately.
+        let client_config = serde_json::json!({ "url": "http://127.0.0.1:1/convert" });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when HTTP call fails (bad URL)"
+        );
+    }
+
+    /// call_conversion_webhook must return Err when the response is not valid JSON.
+    /// A webhook returning malformed bytes (e.g. a 500 HTML error page) must not
+    /// panic or silently succeed — it must be detected and rejected.
+    #[tokio::test]
+    async fn call_conversion_webhook_returns_err_on_malformed_json_response() {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/convert",
+            post(|| async {
+                // Return plain text, not JSON — simulates an upstream error page.
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error (not JSON)",
+                )
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when response is not valid JSON"
         );
     }
 
