@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -379,6 +380,63 @@ pub struct Binding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceStatus {
     pub phase: String,
+}
+
+// ---------------------------------------------------------------------------
+// CertificateSigningRequest typed fields
+// ---------------------------------------------------------------------------
+
+/// Typed `spec` for a CertificateSigningRequest.
+///
+/// Only the fields the apiserver dereferences are typed; everything else is
+/// captured in `rest` so callers never lose unknown fields on round-trip.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CertificateSigningRequestSpec {
+    /// Base64-encoded PEM CSR bytes (PKCS#10 DER).
+    pub request: String,
+    /// Identifies which signer controller should handle this CSR.
+    pub signer_name: String,
+    /// Remaining fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed `status` for a CertificateSigningRequest.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CertificateSigningRequestStatus {
+    /// Base64-encoded signed certificate, written by the signer controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+    /// Approval/denial/failure conditions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<CsrCondition>>,
+    /// Remaining fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// A single condition entry in `status.conditions` of a CSR.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CsrCondition {
+    /// "Approved", "Denied", or "Failed".
+    #[serde(rename = "type")]
+    pub condition_type: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update_time: Option<String>,
+    /// Remaining fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -862,6 +920,149 @@ mod binding_tests {
         assert!(
             result.is_err(),
             "Binding with empty target must fail deserialization — name is required"
+        );
+    }
+}
+
+#[cfg(test)]
+mod csr_types_tests {
+    use super::*;
+
+    /// A minimal CSR JSON fixture exercising all typed fields and extra unknown fields.
+    ///
+    /// This test verifies the parse-at-boundary contract: typed fields are accessible
+    /// with compiler-checked names, and unknown fields are preserved in `rest` so a
+    /// round-trip through serde does not silently drop fields the apiserver does not
+    /// yet type.
+    #[test]
+    fn csr_spec_round_trips_all_typed_fields() {
+        let json = serde_json::json!({
+            "request": "dGVzdA==",
+            "signerName": "kubernetes.io/kube-apiserver-client",
+            "usages": ["client auth"],
+            "expirationSeconds": 86400
+        });
+
+        let spec: CertificateSigningRequestSpec = serde_json::from_value(json.clone()).unwrap();
+
+        // Typed fields are accessible without map indexing.
+        assert_eq!(
+            spec.request, "dGVzdA==",
+            "request must deserialize to typed field — map lookup has no compile-time safety"
+        );
+        assert_eq!(spec.signer_name, "kubernetes.io/kube-apiserver-client",
+            "signerName must deserialize to signer_name — wrong camelCase mapping silently routes to wrong signer");
+
+        // Unknown fields must survive in rest — no data loss on round-trip.
+        let round_tripped = serde_json::to_value(&spec).unwrap();
+        assert_eq!(round_tripped["request"], "dGVzdA==");
+        assert_eq!(
+            round_tripped["signerName"],
+            "kubernetes.io/kube-apiserver-client"
+        );
+        assert_eq!(
+            round_tripped["usages"][0], "client auth",
+            "usages must be preserved in rest — losing unknown fields corrupts the stored object"
+        );
+        assert_eq!(
+            round_tripped["expirationSeconds"], 86400,
+            "expirationSeconds must be preserved in rest"
+        );
+    }
+
+    /// CertificateSigningRequestStatus must deserialize certificate and conditions,
+    /// and preserve unknown fields.
+    ///
+    /// The signer writes status.certificate; the approver writes status.conditions.
+    /// Both fields must be accessible via typed structs, and a round-trip must not
+    /// drop other status fields (e.g. observedGeneration).
+    #[test]
+    fn csr_status_round_trips_all_typed_fields() {
+        let json = serde_json::json!({
+            "certificate": "Q0VSVF9EQVRB",
+            "conditions": [
+                {
+                    "type": "Approved",
+                    "status": "True",
+                    "reason": "KubectlApprove",
+                    "message": "approved by test",
+                    "lastUpdateTime": "2024-01-01T00:00:00Z",
+                    "extraField": "preserved"
+                }
+            ],
+            "observedGeneration": 1
+        });
+
+        let status: CertificateSigningRequestStatus = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(status.certificate.as_deref(), Some("Q0VSVF9EQVRB"),
+            "certificate must deserialize to typed Option<String> — map lookup returns Value::Null on absent, not None");
+        let conds = status.conditions.as_ref().expect("conditions must be Some");
+        assert_eq!(conds.len(), 1);
+        assert_eq!(
+            conds[0].condition_type, "Approved",
+            "condition_type must map from 'type' — wrong rename silently hides approval state"
+        );
+        assert_eq!(conds[0].status, "True");
+        assert_eq!(conds[0].reason.as_deref(), Some("KubectlApprove"));
+        assert_eq!(conds[0].message.as_deref(), Some("approved by test"));
+        assert_eq!(
+            conds[0].last_update_time.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+
+        // Round-trip: all fields must survive serialization.
+        let round_tripped = serde_json::to_value(&status).unwrap();
+        assert_eq!(round_tripped["certificate"], "Q0VSVF9EQVRB");
+        assert_eq!(round_tripped["conditions"][0]["type"], "Approved");
+        assert_eq!(
+            round_tripped["conditions"][0]["extraField"], "preserved",
+            "extra fields in a condition must survive round-trip via rest"
+        );
+        assert_eq!(
+            round_tripped["observedGeneration"], 1,
+            "status.observedGeneration must survive via rest — losing it corrupts status history"
+        );
+    }
+
+    /// CertificateSigningRequestStatus with no certificate must deserialize as None.
+    ///
+    /// A pending CSR has no certificate yet. None must not be confused with an
+    /// empty string — a signer that checks for empty string would wrongly think
+    /// a cert was issued.
+    #[test]
+    fn csr_status_certificate_absent_is_none() {
+        let json = serde_json::json!({
+            "conditions": []
+        });
+        let status: CertificateSigningRequestStatus = serde_json::from_value(json).unwrap();
+        assert!(
+            status.certificate.is_none(),
+            "absent certificate must be None — only the signer may set it; None != empty string"
+        );
+    }
+
+    /// CsrCondition 'type' field must serialize as 'type', not 'conditionType'.
+    ///
+    /// The wire name is 'type' (a reserved word in Rust). The rename annotation must
+    /// be present; without it the field would serialize as 'condition_type', breaking
+    /// kubectl certificate approve.
+    #[test]
+    fn csr_condition_type_serializes_as_wire_name_type() {
+        let cond = CsrCondition {
+            condition_type: "Denied".to_owned(),
+            status: "True".to_owned(),
+            reason: None,
+            message: None,
+            last_update_time: None,
+            rest: serde_json::Value::Object(Default::default()),
+        };
+        let v = serde_json::to_value(&cond).unwrap();
+        assert_eq!(v["type"], "Denied",
+            "CsrCondition must serialize condition_type as 'type' — wrong key breaks kubectl certificate deny");
+        assert!(
+            v.get("conditionType").is_none(),
+            "'conditionType' must not appear — only 'type' is understood by kubectl"
         );
     }
 }

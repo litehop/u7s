@@ -38,7 +38,7 @@ use crate::{
     keys::{group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
-    types::Object,
+    types::{CertificateSigningRequestSpec, Object},
     util::{content_type, extract_body},
 };
 
@@ -53,18 +53,23 @@ const KIND: &str = "CertificateSigningRequest";
 pub(crate) fn validate_csr_spec(
     body: &serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
-    // spec.request: required, must be non-empty base64, decoded bytes must be valid DER PKCS#10.
-    let request_b64 = body["spec"]["request"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            Status::unprocessable_entity(
-                "spec.request is required and must be a non-empty base64-encoded string".into(),
-            )
+    // Deserialize spec into a typed struct so field access is compiler-checked.
+    let spec: CertificateSigningRequestSpec = serde_json::from_value(body["spec"].clone())
+        .map_err(|e| {
+            Status::unprocessable_entity(format!(
+                "spec.request is required and must be a non-empty base64-encoded string: {e}"
+            ))
         })?;
 
+    // spec.request: required, must be non-empty base64, decoded bytes must be valid DER PKCS#10.
+    if spec.request.is_empty() {
+        return Err(Status::unprocessable_entity(
+            "spec.request is required and must be a non-empty base64-encoded string".into(),
+        ));
+    }
+
     let der_bytes = base64::engine::general_purpose::STANDARD
-        .decode(request_b64)
+        .decode(&spec.request)
         .map_err(|e| {
             Status::unprocessable_entity(format!("spec.request is not valid base64: {e}"))
         })?;
@@ -76,15 +81,11 @@ pub(crate) fn validate_csr_spec(
     })?;
 
     // spec.signerName: required, non-empty.
-    let signer_name = body["spec"]["signerName"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            Status::unprocessable_entity(
-                "spec.signerName is required and must be a non-empty string".into(),
-            )
-        })?;
-    let _ = signer_name; // used for validation only
+    if spec.signer_name.is_empty() {
+        return Err(Status::unprocessable_entity(
+            "spec.signerName is required and must be a non-empty string".into(),
+        ));
+    }
 
     Ok(())
 }
