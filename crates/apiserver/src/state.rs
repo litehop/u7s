@@ -9,7 +9,11 @@ use crate::types::{ResourceKey, ResourceMeta};
 
 /// Maximum number of concurrent watch streams allowed per authenticated user.
 /// A client that already has this many open watches gets HTTP 429 on the next attempt.
-pub const MAX_WATCHES_PER_CLIENT: usize = 10;
+///
+/// The kube-controller-manager's garbage collector opens one watch per registered
+/// resource type (50+ watches for all core + apps/v1 + extension resources). The
+/// limit must be high enough for the GC to establish all its watches simultaneously.
+pub const MAX_WATCHES_PER_CLIENT: usize = 64;
 
 /// Per-client watch stream concurrency limiter.
 ///
