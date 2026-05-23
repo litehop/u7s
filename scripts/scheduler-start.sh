@@ -37,7 +37,6 @@ pkill -f u7s-scheduler 2>/dev/null || true
 echo "Starting u7s-scheduler (logs: $LOG) ..."
 nohup "$BINARY" \
   --kubeconfig "$WORKDIR/kubeconfig" \
-  --leader-elect=false \
   > "$LOG" 2>&1 &
 SCHEDULER_PID=$!
 disown "$SCHEDULER_PID"
