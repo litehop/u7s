@@ -380,9 +380,9 @@ fn validate_cr_schema(
     let idx = compiler
         .compile("schema.json", &mut schemas)
         .map_err(|e| Status::internal(e.to_string()))?;
-    schemas.validate(obj, idx).map_err(|e| {
-        Status::unprocessable_entity(format!("CR schema validation failed: {e}"))
-    })
+    schemas
+        .validate(obj, idx)
+        .map_err(|e| Status::unprocessable_entity(format!("CR schema validation failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2692,7 +2692,10 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// Helper: call validate_cr_schema with an inline schema value.
-    fn check_schema(obj: &serde_json::Value, schema: serde_json::Value) -> Result<(), crate::status::StatusError> {
+    fn check_schema(
+        obj: &serde_json::Value,
+        schema: serde_json::Value,
+    ) -> Result<(), crate::status::StatusError> {
         let ctx = CrContext {
             kind: "Test".into(),
             namespaced: false,
