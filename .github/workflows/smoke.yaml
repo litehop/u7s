@@ -45,14 +45,16 @@ jobs:
         run: chmod +x target/release/u7s-apiserver
 
       - name: Install kubectl ${{ matrix.k8s }}
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
         run: |
-          MINOR=$(echo "${{ matrix.k8s }}" | cut -d. -f1-2)
+          MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
           curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/Release.key" \
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
           echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/kubernetes.list
           sudo apt-get update -qq
-          sudo apt-get install -y --allow-downgrades "kubectl=${{ matrix.k8s }}-*"
+          sudo apt-get install -y --allow-downgrades "kubectl=$K8S_VERSION-*"
           sudo apt-mark hold kubectl
 
       - name: Start apiserver
@@ -258,8 +260,10 @@ jobs:
         run: chmod +x target/release/u7s-apiserver
 
       - name: Install cri-o and crun
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
         run: |
-          MINOR=$(echo "${{ matrix.k8s }}" | cut -d. -f1-2)
+          MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
           sudo apt-get update -qq
           sudo apt-get install -y apt-transport-https ca-certificates curl gpg
           curl -fsSL "https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${MINOR}/deb/Release.key" \
@@ -301,14 +305,16 @@ jobs:
           sudo systemctl enable --now crio
 
       - name: Install kubelet and kubectl ${{ matrix.k8s }}
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
         run: |
-          MINOR=$(echo "${{ matrix.k8s }}" | cut -d. -f1-2)
+          MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
           curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/Release.key" \
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
           echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/kubernetes.list
           sudo apt-get update -qq
-          sudo apt-get install -y --allow-downgrades "kubelet=${{ matrix.k8s }}-*" "kubectl=${{ matrix.k8s }}-*"
+          sudo apt-get install -y --allow-downgrades "kubelet=$K8S_VERSION-*" "kubectl=$K8S_VERSION-*"
           sudo apt-mark hold kubelet kubectl
           sudo systemctl disable --now kubelet
           # Install containernetworking-plugins after kubelet; use dpkg force-overwrite
@@ -510,14 +516,16 @@ jobs:
         run: chmod +x target/release/u7s-apiserver
 
       - name: Install kubectl ${{ matrix.k8s }}
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
         run: |
-          MINOR=$(echo "${{ matrix.k8s }}" | cut -d. -f1-2)
+          MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
           curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/Release.key" \
             | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
           echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/ /" \
             | sudo tee /etc/apt/sources.list.d/kubernetes.list
           sudo apt-get update -qq
-          sudo apt-get install -y --allow-downgrades "kubectl=${{ matrix.k8s }}-*"
+          sudo apt-get install -y --allow-downgrades "kubectl=$K8S_VERSION-*"
           sudo apt-mark hold kubectl
 
       - name: Start apiserver
@@ -569,9 +577,10 @@ jobs:
             > "$TMPDIR/kubeconfig"
 
       - name: Download kube-controller-manager
+        env:
+          K8S_VERSION: ${{ matrix.k8s }}
         run: |
           TMPDIR="${{ env.SMOKE_TMPDIR }}"
-          K8S_VERSION="${{ matrix.k8s }}"
           curl -fsSL "https://dl.k8s.io/release/v${K8S_VERSION}/bin/linux/amd64/kube-controller-manager" \
             -o "$TMPDIR/kube-controller-manager"
           chmod +x "$TMPDIR/kube-controller-manager"
