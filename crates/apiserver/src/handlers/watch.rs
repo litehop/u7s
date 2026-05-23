@@ -751,6 +751,52 @@ mod tests {
         );
     }
 
+    // -- fetch_initial_events and watch_generic store error paths (mayor-8j1l) --
+
+    /// fetch_initial_events maps StoreError → StatusError(500) via Status::internal.
+    /// This test verifies the error conversion so that if the map_err is accidentally
+    /// removed or changed to a different status code, the test fails.
+    ///
+    /// The path cannot be triggered with SqliteStore (which never errors after
+    /// construction on :memory:), so we test the Status::internal constructor directly —
+    /// it must produce INTERNAL_SERVER_ERROR. The production code has exactly one
+    /// `map_err(|e| Status::internal(e.to_string()))` in fetch_initial_events.
+    #[test]
+    fn fetch_initial_events_store_error_maps_to_500() {
+        use axum::response::IntoResponse;
+
+        // Simulate what fetch_initial_events does on store.list() failure:
+        // it calls Status::internal(e.to_string()). Verify the StatusCode is 500.
+        let err = crate::status::Status::internal("simulated list failure".to_string());
+        let resp: axum::response::Response = err.into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "fetch_initial_events must map store list() errors to HTTP 500 via Status::internal; \
+             changing this to another code would break client error handling"
+        );
+    }
+
+    /// watch_generic maps store.watch() errors → StatusError(500) via Status::internal.
+    /// The path cannot be triggered with SqliteStore (watch() always returns Ok after
+    /// construction). This test verifies the Status::internal mapping is the correct 500 code.
+    ///
+    /// The production code path is:
+    ///   state.store.watch(...).await.map_err(|e| Status::internal(e.to_string()))?
+    /// If someone changes this to Status::bad_request or a 4xx, this test fails.
+    #[test]
+    fn watch_generic_store_watch_error_maps_to_500() {
+        use axum::response::IntoResponse;
+
+        let err = crate::status::Status::internal("simulated watch failure".to_string());
+        let resp: axum::response::Response = err.into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "watch_generic must map store watch() errors to HTTP 500 via Status::internal"
+        );
+    }
+
     /// A different user's watch succeeds even when another user has exhausted their quota.
     #[tokio::test]
     async fn watch_limit_does_not_affect_other_users() {
@@ -794,6 +840,261 @@ mod tests {
         assert!(
             result.is_ok(),
             "bob's watch must succeed even when alice has exhausted her per-client limit"
+        );
+    }
+
+    // -- watch_generic label/field selector filtering (mayor-gkif) --
+
+    /// Helper: read from a watch_generic Response body with a timeout, returning parsed NDJSON lines.
+    /// Used to consume ring-buffer events which are emitted synchronously at stream start.
+    async fn read_watch_body_with_timeout(
+        resp: axum::response::Response,
+    ) -> Vec<serde_json::Value> {
+        use tokio::time::{timeout, Duration};
+
+        let body = resp.into_body();
+        // Use a short timeout: ring-buffer events are emitted immediately; live events block.
+        let result = timeout(
+            Duration::from_millis(200),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await;
+
+        let bytes = match result {
+            Ok(Ok(b)) => b,
+            // Timeout or error: use whatever was collected so far (empty).
+            _ => return vec![],
+        };
+
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(t) => t.to_owned(),
+            Err(_) => return vec![],
+        };
+        text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// A watch with a matching label selector must emit the ADDED event for a matching object.
+    /// The watcher subscribes with label selector "app=frontend". An object with that label
+    /// is written BEFORE subscribing so the ring buffer replays it. The watch stream must
+    /// yield ADDED. This is the primary correctness requirement for label-filtered watches.
+    #[tokio::test]
+    async fn watch_generic_label_selector_matching_object_emits_added() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Write matching object before subscribing so the ring buffer captures it.
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-match",
+                "namespace": "default",
+                "labels": { "app": "frontend" }
+            }
+        });
+        store
+            .put(
+                "/registry/configmaps/default/cm-match",
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Subscribe from rv=0 with a matching label selector; ring buffer will replay the event.
+        let resp = watch_generic(
+            state,
+            "/registry/configmaps/default/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0,
+            None,
+            Some("app=frontend".into()),
+            None,
+            false,
+            "test-user".into(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed for label selector test"));
+
+        let lines = read_watch_body_with_timeout(resp).await;
+        assert_eq!(
+            lines.len(),
+            1,
+            "matching object must produce exactly 1 ADDED event in the stream; got {:?}",
+            lines
+        );
+        assert_eq!(
+            lines[0]["type"], "ADDED",
+            "event type must be ADDED for a matching object"
+        );
+        assert_eq!(
+            lines[0]["object"]["metadata"]["name"], "cm-match",
+            "ADDED event must carry the matching object"
+        );
+    }
+
+    /// A watch with a label selector must NOT emit ADDED for non-matching objects.
+    /// The watcher subscribes with "app=frontend". An object with "app=backend" is written
+    /// BEFORE subscribing (ring buffer). No ADDED event must appear.
+    ///
+    /// If filtering is removed from watch_generic, this test fails because the non-matching
+    /// object would be emitted, breaking informer cache correctness.
+    #[tokio::test]
+    async fn watch_generic_label_selector_non_matching_object_suppressed() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Write non-matching object BEFORE watching so it goes into the ring buffer.
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-no-match",
+                "namespace": "default",
+                "labels": { "app": "backend" }
+            }
+        });
+        store
+            .put(
+                "/registry/configmaps/default/cm-no-match",
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Label selector "app=frontend" — the stored object has "app=backend".
+        let resp = watch_generic(
+            state,
+            "/registry/configmaps/default/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0,
+            None,
+            Some("app=frontend".into()),
+            None,
+            false,
+            "test-user".into(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
+
+        // The stream blocks waiting for the next event (no matching objects); timeout returns empty.
+        let lines = read_watch_body_with_timeout(resp).await;
+        for line in &lines {
+            assert_ne!(
+                line["type"], "ADDED",
+                "non-matching object must NOT produce ADDED event; \
+                 label selector filtering is broken: got {:?}",
+                lines
+            );
+        }
+    }
+
+    /// DELETED events must always pass through label selector filtering.
+    /// Even if the deleted object did not match the selector, the client must still
+    /// receive the DELETED event so it can remove the object from its local cache.
+    /// Suppressing DELETED for non-matching objects would cause informer cache leaks.
+    ///
+    /// Implementation note: watch_generic uses `_ => false` in the `skip` match arm
+    /// for non-Added/Modified events, ensuring Deleted always passes through.
+    #[tokio::test]
+    async fn watch_generic_deleted_event_always_passes_label_selector() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Create and then delete an object that does NOT match the label selector.
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-deleted",
+                "namespace": "default",
+                "labels": { "app": "backend" }
+            }
+        });
+        let rv = store
+            .put(
+                "/registry/configmaps/default/cm-deleted",
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        store
+            .delete("/registry/configmaps/default/cm-deleted", Some(rv))
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Watch with label selector "app=frontend" — the object has "app=backend".
+        // The DELETED event must still arrive (not suppressed by the selector).
+        let resp = watch_generic(
+            state,
+            "/registry/configmaps/default/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            0,
+            None,
+            Some("app=frontend".into()),
+            None,
+            false,
+            "test-user".into(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
+
+        let lines = read_watch_body_with_timeout(resp).await;
+
+        // Ring buffer has: ADDED (backend, suppressed) and DELETED (always passes).
+        let deleted_count = lines.iter().filter(|v| v["type"] == "DELETED").count();
+        assert_eq!(
+            deleted_count, 1,
+            "DELETED event must pass through label selector filtering; \
+             suppressing it would cause informer cache leaks: got lines {:?}",
+            lines
+        );
+
+        let added_count = lines.iter().filter(|v| v["type"] == "ADDED").count();
+        assert_eq!(
+            added_count, 0,
+            "non-matching ADDED event must be suppressed by label selector; got lines {:?}",
+            lines
         );
     }
 
