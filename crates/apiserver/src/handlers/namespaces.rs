@@ -1274,9 +1274,8 @@ mod tests {
         );
 
         // Remove the finalizer via merge-patch — this must trigger a hard-delete.
-        let patch_body = Bytes::from(
-            serde_json::json!({ "metadata": { "finalizers": [] } }).to_string(),
-        );
+        let patch_body =
+            Bytes::from(serde_json::json!({ "metadata": { "finalizers": [] } }).to_string());
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::CONTENT_TYPE,
@@ -1341,7 +1340,10 @@ mod tests {
         // Fetch the stored state so we have the right resourceVersion.
         let stored = state
             .store
-            .get(&crate::keys::cluster_object_key("namespaces", "put-drain-ns"))
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "put-drain-ns",
+            ))
             .await
             .expect("store get must not error")
             .expect("must exist");
@@ -1368,7 +1370,10 @@ mod tests {
         // The namespace must be gone.
         let after = state
             .store
-            .get(&crate::keys::cluster_object_key("namespaces", "put-drain-ns"))
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "put-drain-ns",
+            ))
             .await
             .expect("store get must not error");
         assert!(
