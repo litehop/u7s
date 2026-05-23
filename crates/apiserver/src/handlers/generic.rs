@@ -32,6 +32,18 @@ pub struct CollectionQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Accept header helpers
+// ---------------------------------------------------------------------------
+
+/// Detect whether the Accept header requests PartialObjectMetadata.
+/// The kcm metadatainformer sends Accept headers like:
+///   application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,
+///   application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
+pub(crate) fn wants_partial_object_metadata(accept: &str) -> bool {
+    accept.contains("as=PartialObjectMetadata")
+}
+
+// ---------------------------------------------------------------------------
 // Path parameter validation
 // ---------------------------------------------------------------------------
 
@@ -1606,6 +1618,41 @@ mod escalation_tests {
         assert!(
             result.is_ok(),
             "system:masters with cluster-admin binding must pass escalation check"
+        );
+    }
+
+    // -- wants_partial_object_metadata --
+
+    use super::wants_partial_object_metadata;
+
+    /// kcm's metadatainformer sends Accept headers containing "as=PartialObjectMetadata".
+    /// wants_partial_object_metadata must return true for these so that watch_generic
+    /// produces BOOKMARK events with apiVersion=meta.k8s.io/v1, kind=PartialObjectMetadata.
+    /// Without this, GC cannot complete its initial sync because client-go's reflector
+    /// does not recognise the initial-events-end BOOKMARK.
+    #[test]
+    fn wants_pom_detects_metadatainformer_accept_header() {
+        // Full kcm Accept header (protobuf variant)
+        let accept = "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json";
+        assert!(
+            wants_partial_object_metadata(accept),
+            "kcm metadatainformer Accept header must be detected as PartialObjectMetadata"
+        );
+    }
+
+    #[test]
+    fn wants_pom_returns_false_for_plain_json() {
+        assert!(
+            !wants_partial_object_metadata("application/json"),
+            "plain application/json must not be detected as PartialObjectMetadata"
+        );
+    }
+
+    #[test]
+    fn wants_pom_returns_false_for_empty() {
+        assert!(
+            !wants_partial_object_metadata(""),
+            "empty Accept must not be detected as PartialObjectMetadata"
         );
     }
 }

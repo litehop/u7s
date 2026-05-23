@@ -201,11 +201,25 @@ fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::Stat
 pub async fn list_crds(
     State(state): State<AppState>,
     Query(query): Query<super::generic::CollectionQuery>,
+    headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let prefix = list_prefix();
 
     if query.watch == Some(true) {
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let pom = super::generic::wants_partial_object_metadata(accept);
+        let (watch_api_version, watch_kind) = if pom {
+            (
+                "meta.k8s.io/v1".to_string(),
+                "PartialObjectMetadata".to_string(),
+            )
+        } else {
+            (API_VERSION.to_string(), KIND.to_string())
+        };
         let initial_items = super::watch::fetch_initial_events(
             &state,
             &prefix,
@@ -215,15 +229,15 @@ pub async fn list_crds(
         return super::watch::watch_generic(
             state,
             prefix,
-            API_VERSION.to_string(),
-            KIND.to_string(),
+            watch_api_version,
+            watch_kind,
             query.resource_version.unwrap_or(0),
             initial_items,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             user.username,
-            false,
+            pom,
         )
         .await;
     }
@@ -675,6 +689,7 @@ mod tests {
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
             }),
+            HeaderMap::new(),
             Extension(UserInfo {
                 username: "test-user".into(),
                 uid: String::new(),
@@ -779,6 +794,7 @@ mod tests {
         let resp = match list_crds(
             State(state),
             query,
+            HeaderMap::new(),
             Extension(UserInfo {
                 username: "test-user".into(),
                 uid: String::new(),
@@ -895,6 +911,97 @@ mod tests {
         assert!(validate_crd_group("example.com").is_ok());
         assert!(validate_crd_group("argoproj.io").is_ok());
         assert!(validate_crd_group("gateway.networking.x-k8s.io").is_ok());
+    }
+
+    /// Regression: when kcm's metadatainformer opens a watch on CRDs with an Accept header
+    /// requesting PartialObjectMetadata and sendInitialEvents=true, the initial-events-end
+    /// BOOKMARK must have apiVersion=meta.k8s.io/v1 and kind=PartialObjectMetadata.
+    ///
+    /// Without the fix, list_crds ignored the Accept header and called watch_generic with
+    /// as_partial_object_metadata=false, producing a BOOKMARK with
+    /// apiVersion=apiextensions.k8s.io/v1, kind=CustomResourceDefinition — which client-go's
+    /// reflector does not recognise, so GC never completes cache sync and the deployment
+    /// controller never reconciles.
+    #[tokio::test]
+    async fn list_crds_pom_watch_bookmark_has_meta_k8s_io_api_version() {
+        use tokio::time::{timeout, Duration};
+
+        let state = make_state();
+
+        // Seed one CRD so the initial-events stream is non-empty.
+        let body = minimal_crd_bytes("applications.argoproj.io");
+        create_crd(State(state.clone()), HeaderMap::new(), body)
+            .await
+            .unwrap_or_else(|_| panic!("create must succeed"));
+
+        let mut pom_headers = HeaderMap::new();
+        pom_headers.insert(
+            axum::http::header::ACCEPT,
+            "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json"
+                .parse()
+                .unwrap(),
+        );
+
+        let query = Query(crate::handlers::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: Some(true),
+            allow_watch_bookmarks: Some(true),
+        });
+
+        let resp = list_crds(
+            State(state),
+            query,
+            pom_headers,
+            Extension(UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("list_crds with POM Accept must succeed"));
+
+        // Read the watch stream with a short timeout (initial-events BOOKMARK is emitted immediately).
+        let body = resp.into_body();
+        let bytes = timeout(
+            Duration::from_millis(500),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .unwrap_or_else(|_| Ok(bytes::Bytes::new()))
+        .unwrap_or_default();
+        let text = std::str::from_utf8(&bytes).unwrap_or("");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+
+        let bookmark = lines.iter().find(|v| {
+            v["type"] == "BOOKMARK"
+                && v["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"] == "true"
+        });
+        assert!(
+            bookmark.is_some(),
+            "list_crds with POM Accept and sendInitialEvents=true must emit initial-events-end BOOKMARK; \
+             without it GC never completes cache sync. Lines: {:?}",
+            lines
+        );
+
+        let bm = bookmark.unwrap();
+        assert_eq!(
+            bm["object"]["apiVersion"], "meta.k8s.io/v1",
+            "BOOKMARK for POM watch must have apiVersion=meta.k8s.io/v1, not apiextensions.k8s.io/v1; \
+             client-go reflector uses apiVersion to identify the BOOKMARK type"
+        );
+        assert_eq!(
+            bm["object"]["kind"], "PartialObjectMetadata",
+            "BOOKMARK for POM watch must have kind=PartialObjectMetadata, not CustomResourceDefinition"
+        );
     }
 }
 

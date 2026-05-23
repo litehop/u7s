@@ -54,10 +54,23 @@ pub async fn list_resource(
     let prefix = group_list_prefix(&group, &plural, None);
 
     if query.watch == Some(true) {
-        let api_version = if group.is_empty() {
-            version.clone()
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let pom = super::generic::wants_partial_object_metadata(accept);
+        let (watch_api_version, watch_kind) = if pom {
+            (
+                "meta.k8s.io/v1".to_string(),
+                "PartialObjectMetadata".to_string(),
+            )
         } else {
-            format!("{}/{}", group, version)
+            let api_version = if group.is_empty() {
+                version.clone()
+            } else {
+                format!("{}/{}", group, version)
+            };
+            (api_version, meta.kind.clone())
         };
         let from_rv = query.resource_version.unwrap_or(0);
         let initial =
@@ -65,15 +78,15 @@ pub async fn list_resource(
         return watch_generic(
             state,
             prefix,
-            api_version,
-            meta.kind.clone(),
+            watch_api_version,
+            watch_kind,
             from_rv,
             initial,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             user.username,
-            false,
+            pom,
         )
         .await;
     }
@@ -570,10 +583,23 @@ pub async fn list_namespaced_resource(
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
 
     if query.watch == Some(true) {
-        let api_version = if group.is_empty() {
-            version.clone()
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let pom = super::generic::wants_partial_object_metadata(accept);
+        let (watch_api_version, watch_kind) = if pom {
+            (
+                "meta.k8s.io/v1".to_string(),
+                "PartialObjectMetadata".to_string(),
+            )
         } else {
-            format!("{}/{}", group, version)
+            let api_version = if group.is_empty() {
+                version.clone()
+            } else {
+                format!("{}/{}", group, version)
+            };
+            (api_version, meta.kind.clone())
         };
         let from_rv = query.resource_version.unwrap_or(0);
         let initial =
@@ -581,15 +607,15 @@ pub async fn list_namespaced_resource(
         return watch_generic(
             state,
             prefix,
-            api_version,
-            meta.kind.clone(),
+            watch_api_version,
+            watch_kind,
             from_rv,
             initial,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             user.username,
-            false,
+            pom,
         )
         .await;
     }
