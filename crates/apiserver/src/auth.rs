@@ -166,7 +166,8 @@ fn authenticate(
         None => {
             // No Authorization header — try x509 client cert before anonymous fallback.
             if let Some(cert) = peer_cert {
-                if let Some(user) = try_verify_client_cert(&cert.0) {
+                // chain already verified by rustls WebPkiClientVerifier
+                if let Some(user) = extract_client_cert_identity(&cert.0) {
                     return AuthnResult::Identified(user);
                 }
             }
@@ -210,7 +211,7 @@ fn authenticate(
 /// Returns `None` if the certificate cannot be parsed or has no CN field.
 /// The certificate is assumed to already be verified (rustls checked the
 /// signature and chain during TLS handshake).
-pub fn try_verify_client_cert(der: &[u8]) -> Option<UserInfo> {
+pub fn extract_client_cert_identity(der: &[u8]) -> Option<UserInfo> {
     use x509_cert::der::Decode as _;
     use x509_cert::Certificate;
 
@@ -1047,7 +1048,7 @@ mod tests {
         // The CN field of the subject must become the username.
         // This is the core Kubernetes x509 auth mapping.
         let der = make_cert_der("alice", &[]);
-        let user = try_verify_client_cert(&der).expect("must parse cert");
+        let user = extract_client_cert_identity(&der).expect("must parse cert");
         assert_eq!(user.username, "alice");
         assert!(user.groups.is_empty());
     }
@@ -1057,7 +1058,7 @@ mod tests {
         // The O fields of the subject must become the groups list.
         // system:masters in O grants cluster-admin equivalent via RBAC.
         let der = make_cert_der("admin", &["system:masters"]);
-        let user = try_verify_client_cert(&der).expect("must parse cert");
+        let user = extract_client_cert_identity(&der).expect("must parse cert");
         assert_eq!(user.username, "admin");
         assert!(
             user.groups.contains(&"system:masters".to_owned()),
@@ -1070,7 +1071,7 @@ mod tests {
         // A cert with no O fields must produce an empty groups list.
         // The parser must not panic or return an error for a valid cert.
         let der = make_cert_der("alice", &[]);
-        let user = try_verify_client_cert(&der).expect("must parse cert");
+        let user = extract_client_cert_identity(&der).expect("must parse cert");
         assert_eq!(user.username, "alice");
         assert!(user.groups.is_empty());
     }
