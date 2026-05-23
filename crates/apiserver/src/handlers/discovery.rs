@@ -691,6 +691,28 @@ fn storage_v1_resources() -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
+// OpenAPI stub endpoints
+// ---------------------------------------------------------------------------
+
+/// Minimal Swagger 2.0 stub — stops 404s for clients like Argo CD that call
+/// /openapi/v2 on startup. No field schemas are defined yet.
+pub async fn openapi_v2() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "swagger": "2.0",
+        "info": {"title": "u7s", "version": "v1"},
+        "paths": {}
+    }))
+}
+
+/// Minimal OpenAPI v3 discovery stub — kubectl 1.28+ calls /openapi/v3 first.
+/// An empty "paths" map is valid and tells kubectl to fall back to /openapi/v2.
+pub async fn openapi_v3() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "paths": {}
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1287,6 +1309,33 @@ mod tests {
         assert_eq!(
             deploy["shortNames"][0], "deploy",
             "deployments must have shortName 'deploy' so kubectl get deploy works"
+        );
+    }
+
+    // /openapi/v2 must return a Swagger 2.0 document — Argo CD and other tools call this
+    // on startup and hard-fail if the endpoint is missing or returns malformed JSON.
+    #[tokio::test]
+    async fn openapi_v2_returns_swagger_2_0() {
+        let Json(val) = openapi_v2().await;
+        assert_eq!(
+            val.get("swagger").and_then(|v| v.as_str()),
+            Some("2.0"),
+            "/openapi/v2 must contain \"swagger\": \"2.0\""
+        );
+        assert!(
+            val.get("paths").is_some(),
+            "/openapi/v2 must contain a \"paths\" key"
+        );
+    }
+
+    // /openapi/v3 must return an object with a "paths" key — kubectl 1.28+ calls this
+    // first; an empty paths map causes it to fall back to /openapi/v2 gracefully.
+    #[tokio::test]
+    async fn openapi_v3_returns_paths_key() {
+        let Json(val) = openapi_v3().await;
+        assert!(
+            val.get("paths").is_some(),
+            "/openapi/v3 must contain a \"paths\" key so kubectl can fall back to /openapi/v2"
         );
     }
 
