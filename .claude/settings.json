@@ -48,7 +48,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r '.command // \"\"' 2>/dev/null || echo ''); case \"$cmd\" in *\"git push\"*) cargo test --workspace --quiet && cargo clippy --workspace --quiet -- -D warnings && cargo fmt --check ;; esac"
+            "command": "cmd=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r '.command // \"\"' 2>/dev/null || echo ''); case \"$cmd\" in *\"git push\"*|*\"gh pr create\"*|*\"gh pr edit\"*) cargo fmt --all -- --check && cargo test --workspace --quiet && cargo clippy --workspace --tests --quiet -- -D warnings ;; esac"
           }
         ]
       }

@@ -171,12 +171,22 @@ You may `cd` into the worktree after these pass — but not as your first comman
 
 1. `bd update <BEAD_ID> --claim` then `bd update <BEAD_ID> --status=in_progress`.
 2. Implement.
-3. Run quality gates: `<exact commands>`.
+3. **Quality gate — mandatory, run in this exact order, paste the output into your return:**
+   ```bash
+   cargo fmt --all
+   cargo fmt --all -- --check
+   cargo test --workspace --quiet
+   cargo clippy --workspace --tests --quiet -- -D warnings
+   ```
+   Do not proceed to step 4 if any command fails. Fix the failure first.
+   Note: `gh pr create` and `git push` are both intercepted by a pre-tool hook
+   that re-runs fmt+test+clippy and will block if they fail. Running them here
+   first means you see the failure with context, not as a cryptic hook rejection.
 4. Push branch + `gh pr create` with title `<scope>(<artefact>): <summary> (<BEAD_ID>)`.
 
 ## Return
 
-Under <N> words: PR URL + per-step summary + test deltas.
+Under <N> words: PR URL + per-step summary + test deltas (how many tests before/after).
 
 <COMMON CONSTRAINTS>
 ```
@@ -410,6 +420,38 @@ suggested. Worker should test their hypothesis before applying the fix.
 
 ---
 
+## Lima VM protocol (inject into any bead that touches scripts/conformance/ or scripts/*-start.sh)
+
+Workers have access to the lima-node MCP server (`mcp__lima-node__*`) and
+`limactl shell lima-node <cmd>` via Bash. **There is no excuse for guessing.**
+The protocol is: observe first, write code second.
+
+```
+## Lima debugging protocol — MANDATORY for this bead
+
+You have two ways to run commands inside the lima VM:
+- `limactl shell lima-node <cmd>` via Bash
+- `mcp__lima-node__run_shell_command` (preferred for multi-step exploration)
+
+**Do not write or commit any code that you have not first verified works
+in the VM.** The sequence is:
+
+1. Read the existing scripts to understand the current state.
+2. Run the relevant commands INSIDE the VM to observe actual behaviour:
+   - Check what binaries/tools are present
+   - Check logs of running processes
+   - Run the command you intend to script, manually, and observe the output
+3. Only after you have observed correct behaviour in the VM, encode it in a script.
+4. Run the new script (or `bash -n` it if the VM is not available) and check output.
+5. If a script fails at runtime, read the log (`limactl shell lima-node cat /tmp/....log`)
+   and iterate. Do not commit a guess and push to CI to find out if it works.
+
+Paste the key VM command outputs into your return so the mayor can verify
+you actually ran them and did not synthesise the output.
+```
+
+---
+
 ## What goes WRONG without these patterns
 
 - **Agents add back-compat shims by default.** Pre-alpha posture must be
@@ -426,10 +468,25 @@ suggested. Worker should test their hypothesis before applying the fix.
   prompt.
 - **Agents re-discover known issues.** Naming recent landings + prior
   findings docs prevents this.
+- **Workers use `gh pr create` to bypass the pre-push hook.** The PreToolUse
+  hook now intercepts `gh pr create` and `gh pr edit` the same way it intercepts
+  `git push` — running fmt+test+clippy before either is allowed. But the dispatch
+  prompt must also mandate running quality gates explicitly before pushing, so
+  workers see failures with context rather than as a hook rejection.
+- **Workers guess at VM behaviour instead of observing it.** `mcp__lima-node__*`
+  and `limactl shell` are both available. For any bead touching `scripts/conformance/`
+  or `scripts/*-start.sh`, inject the Lima VM protocol block verbatim.
 - **Generic prompts produce generic work.** Always include file:line
   citations + concrete fix sketches.
 - **Findings docs leak into PRs.** `ai/findings/` is gitignored; never
   commit one.
+- **Mayor force-merges through a failing check with `--admin`.** NEVER use
+  `--admin`. If a check fails: read the log first. If it is a transient GitHub
+  infra flake (e.g. `fatal: could not read Username`, checkout auth failure,
+  runner timeout unrelated to the diff), rerun the specific job with
+  `gh run rerun <run-id> --failed` and wait for green. Only merge when ALL
+  checks are green. `--admin` bypasses branch protection and is not appropriate
+  even for obvious infra flakes.
 - **Branch-delete-on-merge fails.** See Mayor Merge Protocol in
   [`bootstrap.md`](./bootstrap.md) (the PR merge `/loop` block).
 
