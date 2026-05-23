@@ -422,33 +422,43 @@ suggested. Worker should test their hypothesis before applying the fix.
 
 ## Lima VM protocol (inject into any bead that touches scripts/conformance/ or scripts/*-start.sh)
 
-Workers have access to the lima-node MCP server (`mcp__lima-node__*`) and
-`limactl shell lima-node <cmd>` via Bash. **There is no excuse for guessing.**
-The protocol is: observe first, write code second.
+Workers have direct access to the lima VM at all times via the lima-node MCP
+server (`mcp__lima-node__*`). This is not optional tooling — it is the primary
+development interface for VM work. `bash -n` syntax checks are not a substitute
+for running code.
 
 ```
 ## Lima debugging protocol — MANDATORY for this bead
 
-You have two ways to run commands inside the lima VM:
-- `limactl shell lima-node <cmd>` via Bash
-- `mcp__lima-node__run_shell_command` (preferred for multi-step exploration)
+You have the lima-node MCP server available: use `mcp__lima-node__run_shell_command`
+to run commands directly inside the lima VM. You also have `limactl shell lima-node
+<cmd>` via Bash. Both are in your allowlist. The VM is always available — there
+is no scenario where you cannot test in it.
 
-**Do not write or commit any code that you have not first verified works
-in the VM.** The sequence is:
+**The rule: do not commit any script you have not executed successfully in the VM.**
+`bash -n` is a syntax check only — it does not prove the script works. The sequence:
 
 1. Read the existing scripts to understand the current state.
-2. Run the relevant commands INSIDE the VM to observe actual behaviour:
-   - Check what binaries/tools are present
-   - Check logs of running processes
-   - Run the command you intend to script, manually, and observe the output
-3. Only after you have observed correct behaviour in the VM, encode it in a script.
-4. Run the new script (or `bash -n` it if the VM is not available) and check output.
-5. If a script fails at runtime, read the log (`limactl shell lima-node cat /tmp/....log`)
-   and iterate. Do not commit a guess and push to CI to find out if it works.
+2. Run the exact commands your script will run, manually, inside the VM via
+   `mcp__lima-node__run_shell_command`. Observe real output.
+3. If the command fails, debug it in the VM until it succeeds. Read logs:
+   `mcp__lima-node__run_shell_command ["cat", "/tmp/....log"]`
+4. Only after step 2 produces correct output, encode it in a script.
+5. Run the script itself inside the VM and verify it exits 0.
+6. Then and only then: commit and push.
 
-Paste the key VM command outputs into your return so the mayor can verify
-you actually ran them and did not synthesise the output.
+**Your return MUST include the raw output of at least one
+`mcp__lima-node__run_shell_command` call that proves the script ran correctly.**
+A return without VM output will be rejected — the mayor will ask you to go back
+and actually test it.
 ```
+
+### Mayor enforcement at return-review time
+
+When a worker returns from a VM-touching bead, check its return message for
+`mcp__lima-node__run_shell_command` output. If absent: do not merge. Send the
+worker back with: "Your return contains no VM execution evidence. Run the script
+in the lima VM via mcp__lima-node__run_shell_command and show the output."
 
 ---
 
