@@ -965,6 +965,7 @@ mod tests {
             subresource: "",
             namespace: Some("default"),
             name: None,
+            non_resource_url: None,
         };
         assert!(
             state.rbac_index.is_allowed(&pod_read),
@@ -981,6 +982,7 @@ mod tests {
             subresource: "",
             namespace: Some("kube-node-lease"),
             name: None,
+            non_resource_url: None,
         };
         assert!(
             state.rbac_index.is_allowed(&lease_create),
@@ -998,6 +1000,7 @@ mod tests {
             subresource: "",
             namespace: Some("default"),
             name: None,
+            non_resource_url: None,
         };
         assert!(
             !state.rbac_index.is_allowed(&pod_read_other),

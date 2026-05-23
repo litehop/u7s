@@ -12,6 +12,8 @@ pub struct PolicyRule {
     pub verbs: Vec<String>,
     #[serde(rename = "resourceNames", default)]
     pub resource_names: Vec<String>,
+    #[serde(rename = "nonResourceURLs", default)]
+    pub non_resource_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -52,6 +54,11 @@ pub struct AuthzRequest<'a> {
     pub subresource: &'a str,
     pub namespace: Option<&'a str>,
     pub name: Option<&'a str>,
+    /// Set to the raw HTTP path for non-resource URL requests (e.g. "/version",
+    /// "/healthz"). When `Some`, the RBAC check uses `nonResourceURLs` matching
+    /// instead of the resource/apiGroup path. When `None`, normal resource-based
+    /// matching applies.
+    pub non_resource_url: Option<&'a str>,
 }
 
 pub struct RbacIndex {
@@ -176,6 +183,39 @@ impl RbacIndex {
     pub fn is_allowed(&self, req: &AuthzRequest<'_>) -> bool {
         let inner = self.inner.read().unwrap();
 
+        // Non-resource URL requests (e.g. GET /version, GET /healthz) use a
+        // separate matching path: only nonResourceURLs rules apply, not
+        // resource-based rules.
+        if let Some(url) = req.non_resource_url {
+            for (_, binding) in &inner.cluster_bindings {
+                if !subject_matches(binding, req.username, req.groups) {
+                    continue;
+                }
+                let rules = resolve_cluster_role_rules(&inner, &binding.role_ref);
+                if rules_allow_non_resource(rules, req.verb, url) {
+                    return true;
+                }
+            }
+            // Namespace bindings are also checked — they can reference ClusterRoles
+            // that include nonResourceURLs rules.
+            if let Some(req_ns) = req.namespace {
+                for (_, binding) in &inner.namespace_bindings {
+                    let binding_ns = binding.namespace.as_deref().unwrap_or("");
+                    if binding_ns != req_ns {
+                        continue;
+                    }
+                    if !subject_matches(binding, req.username, req.groups) {
+                        continue;
+                    }
+                    let rules = resolve_role_rules(&inner, &binding.role_ref, req_ns);
+                    if rules_allow_non_resource(rules, req.verb, url) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         // Check cluster bindings first (namespace-agnostic).
         for (_, binding) in &inner.cluster_bindings {
             if !subject_matches(binding, req.username, req.groups) {
@@ -245,6 +285,7 @@ pub fn user_holds_all_rules(
                         subresource: "",
                         namespace: None,
                         name: None,
+                        non_resource_url: None,
                     };
                     if !rbac.is_allowed(&req) {
                         return false;
@@ -330,6 +371,42 @@ fn resolve_role_rules<'a>(
 
 fn rules_allow(rules: &[PolicyRule], req: &AuthzRequest<'_>) -> bool {
     rules.iter().any(|rule| rule_covers(rule, req))
+}
+
+/// Check whether any rule in `rules` permits `verb` on the non-resource `url`.
+///
+/// A rule participates in non-resource matching only when it has at least one
+/// entry in `nonResourceURLs`. Rules with empty `nonResourceURLs` are
+/// resource-only rules and do not match non-resource requests.
+fn rules_allow_non_resource(rules: &[PolicyRule], verb: &str, url: &str) -> bool {
+    rules.iter().any(|rule| {
+        if rule.non_resource_urls.is_empty() {
+            return false;
+        }
+        // Verb must match.
+        if !rule.verbs.iter().any(|v| v == "*" || v == verb) {
+            return false;
+        }
+        rule.non_resource_urls
+            .iter()
+            .any(|pattern| non_resource_url_matches(pattern, url))
+    })
+}
+
+/// Match a single non-resource URL pattern against a concrete URL.
+///
+/// Matching rules (same as Kubernetes):
+/// - `"*"` matches any URL.
+/// - `"/apis/*"` matches any URL with the prefix `"/apis/"` (trailing wildcard).
+/// - `"/version"` matches only the exact URL `"/version"`.
+fn non_resource_url_matches(pattern: &str, url: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return url.starts_with(prefix);
+    }
+    pattern == url
 }
 
 fn rule_covers(rule: &PolicyRule, req: &AuthzRequest<'_>) -> bool {
@@ -462,6 +539,7 @@ mod tests {
             subresource,
             namespace,
             name,
+            non_resource_url: None,
         }
     }
 
@@ -1369,6 +1447,194 @@ mod tests {
         assert!(
             !idx.is_allowed(&r),
             "roleRef with wrong apiGroup must not grant access — accepting any apiGroup would be a privilege escalation"
+        );
+    }
+
+    // --- nonResourceURLs matching (mayor-9sil) ---
+
+    fn non_resource_req<'a>(
+        username: &'a str,
+        groups: &'a [String],
+        verb: &'a str,
+        url: &'a str,
+    ) -> AuthzRequest<'a> {
+        AuthzRequest {
+            username,
+            groups,
+            verb,
+            api_group: "",
+            resource: "",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: Some(url),
+        }
+    }
+
+    #[test]
+    fn non_resource_url_exact_match_allows() {
+        // A rule with nonResourceURLs: ["/version"] must allow GET /version.
+        // Argo CD requests GET /version to detect the server version; without this
+        // the request is denied and Argo CD marks the cluster as unavailable.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "version-reader",
+            json!([{
+                "verbs": ["get"],
+                "nonResourceURLs": ["/version"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "alice-version",
+            "version-reader",
+            json!([{ "kind": "User", "name": "alice" }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+        let r = non_resource_req("alice", &groups, "get", "/version");
+        assert!(
+            idx.is_allowed(&r),
+            "nonResourceURLs: [\"/version\"] must allow GET /version — \
+             Argo CD uses this to detect server version"
+        );
+    }
+
+    #[test]
+    fn non_resource_url_wildcard_star_matches_any_url() {
+        // A rule with nonResourceURLs: ["*"] must allow any non-resource path.
+        // The cluster-admin ClusterRole uses "*" to grant unrestricted access,
+        // including non-resource URLs. Without wildcard support the cluster-admin
+        // would silently deny GET /version and similar requests.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "super-admin",
+            json!([{
+                "verbs": ["*"],
+                "nonResourceURLs": ["*"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "admin-binding",
+            "super-admin",
+            json!([{ "kind": "User", "name": "admin" }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+        for url in &["/version", "/healthz", "/openapi/v2", "/metrics"] {
+            let r = non_resource_req("admin", &groups, "get", url);
+            assert!(
+                idx.is_allowed(&r),
+                "nonResourceURLs: [\"*\"] must allow any URL; denied for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_resource_url_prefix_wildcard_matches_prefix() {
+        // A rule with nonResourceURLs: ["/apis/*"] must allow any path under /apis/.
+        // Kubernetes uses prefix wildcards so roles can grant access to entire
+        // API families without enumerating every path.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "apis-browser",
+            json!([{
+                "verbs": ["get"],
+                "nonResourceURLs": ["/apis/*"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "bob-apis",
+            "apis-browser",
+            json!([{ "kind": "User", "name": "bob" }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // Any path under /apis/ must be allowed.
+        let r = non_resource_req("bob", &groups, "get", "/apis/apps/v1");
+        assert!(idx.is_allowed(&r), "/apis/* must match /apis/apps/v1");
+
+        // A path NOT under /apis/ must be denied.
+        let r2 = non_resource_req("bob", &groups, "get", "/version");
+        assert!(
+            !idx.is_allowed(&r2),
+            "/apis/* must NOT match /version — prefix wildcard must not be a global wildcard"
+        );
+    }
+
+    #[test]
+    fn non_resource_url_denied_without_matching_rule() {
+        // A user with only resource-based rules must be denied non-resource URL requests.
+        // Without explicit nonResourceURLs rules, paths like /version must be denied —
+        // resource rules do not bleed into non-resource URL checks.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "pod-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "carol-pods",
+            "pod-reader",
+            json!([{ "kind": "User", "name": "carol" }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+        let r = non_resource_req("carol", &groups, "get", "/version");
+        assert!(
+            !idx.is_allowed(&r),
+            "resource-only rules must not grant access to non-resource URLs — \
+             otherwise any pod-reader could access /version, /metrics, etc."
+        );
+    }
+
+    #[test]
+    fn non_resource_url_verb_mismatch_denies() {
+        // Even with a matching nonResourceURL, the verb must also match.
+        // A rule granting GET /version must NOT allow POST /version.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_cluster_role(
+            "version-getter",
+            json!([{
+                "verbs": ["get"],
+                "nonResourceURLs": ["/version"]
+            }]),
+        );
+        let (bind_key, bind_val) = make_cluster_binding(
+            "dave-version",
+            "version-getter",
+            json!([{ "kind": "User", "name": "dave" }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // GET must be allowed.
+        let r_get = non_resource_req("dave", &groups, "get", "/version");
+        assert!(idx.is_allowed(&r_get), "GET /version must be allowed");
+
+        // POST must be denied — verb is not in the rule.
+        let r_post = non_resource_req("dave", &groups, "post", "/version");
+        assert!(
+            !idx.is_allowed(&r_post),
+            "POST /version must be denied — verb mismatch must not be ignored"
         );
     }
 }
