@@ -27,10 +27,15 @@
 #   CRI-O issues:
 #     limactl shell lima-node sudo journalctl -u crio --no-pager -n 30
 #   Container sandbox failures ("unknown version specified"):
-#     This means system crun is being used instead of CRI-O's bundled one.
-#     Fix: limactl shell lima-node sudo rm /etc/crio/crio.conf.d/10-crun.conf
-#          limactl shell lima-node sudo systemctl restart crio
-#     (lima/kubelet.yaml provision now prevents this — delete+reprovision fixes it permanently)
+#     Two possible causes:
+#     1. System crun used instead of CRI-O's bundled one (10-crun.conf drop-in):
+#        Fix: limactl shell lima-node sudo rm /etc/crio/crio.conf.d/10-crun.conf
+#             limactl shell lima-node sudo systemctl restart crio
+#     2. Wrong CNI config format (10-crio-bridge.conf 0.4.0 instead of 1.0.0 conflist):
+#        Fix: limactl shell lima-node sudo mv /etc/cni/net.d/10-crio-bridge.conf /etc/cni/net.d/10-crio-bridge.conf.disabled
+#             limactl shell lima-node sudo mv /etc/cni/net.d/10-crio-bridge.conflist.disabled /etc/cni/net.d/10-crio-bridge.conflist
+#             limactl shell lima-node sudo systemctl restart crio
+#     (lima/kubelet.yaml provision now prevents both — delete+reprovision fixes them permanently)
 set -euo pipefail
 
 VM_NAME="lima-node"
