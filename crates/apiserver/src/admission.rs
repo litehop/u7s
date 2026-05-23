@@ -1839,6 +1839,254 @@ mod tests {
         );
     }
 
+    // -- reinvocation pass tests (mayor-6jk5) --
+
+    /// Start an axum router on a random local TCP port and return the base URL and handle.
+    async fn start_mock_webhook_server(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock webhook server must not fail");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// Reinvocation pass: when webhook A patches the object in pass 1, the
+    /// reinvocation pass runs. Webhook B (reinvocationPolicy: IfNeeded) must fire
+    /// in pass 2. A webhook WITHOUT IfNeeded must NOT be called in pass 2.
+    ///
+    /// This matters because reinvocation is the mechanism allowing sidecar-injecting
+    /// webhooks to see final object state after other webhooks have run. If the pass-2
+    /// skip logic is broken, IfNeeded webhooks silently fail to re-run, allowing the
+    /// sidecar injector to miss injecting into mutated pods.
+    #[tokio::test]
+    async fn reinvocation_pass_fires_if_needed_and_skips_non_if_needed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+
+        // Counter: how many times webhook A is called.
+        let webhook_a_count = StdArc::new(AtomicUsize::new(0));
+        let webhook_a_count_clone = webhook_a_count.clone();
+
+        // Counter: how many times webhook B is called.
+        let webhook_b_count = StdArc::new(AtomicUsize::new(0));
+        let webhook_b_count_clone = webhook_b_count.clone();
+
+        // Webhook A: patches the object in pass 1 (no IfNeeded).
+        // It applies a label patch to trigger any_patched=true.
+        let router_a = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = webhook_a_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let patch = serde_json::json!([
+                        {"op": "add", "path": "/metadata/labels", "value": {"injected": "true"}}
+                    ]);
+                    let patch_b64 = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        serde_json::to_string(&patch).unwrap(),
+                    );
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {
+                            "uid": "uid-a",
+                            "allowed": true,
+                            "patch": patch_b64,
+                            "patchType": "JSONPatch"
+                        }
+                    }))
+                }
+            }),
+        );
+
+        // Webhook B: just allows (reinvocationPolicy: IfNeeded, no patch).
+        let router_b = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = webhook_b_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {
+                            "uid": "uid-b",
+                            "allowed": true
+                        }
+                    }))
+                }
+            }),
+        );
+
+        let (url_a, _handle_a) = start_mock_webhook_server(router_a).await;
+        let (url_b, _handle_b) = start_mock_webhook_server(router_b).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Single MutatingWebhookConfiguration with two webhooks:
+        // - webhook-a: no reinvocationPolicy (defaults to Never)
+        // - webhook-b: reinvocationPolicy: IfNeeded
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "reinvoke-test"},
+            "webhooks": [
+                {
+                    "name": "webhook-a.example.com",
+                    "clientConfig": { "url": format!("{url_a}/webhook") },
+                    "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                    "failurePolicy": "Fail"
+                    // reinvocationPolicy defaults to "" (Never)
+                },
+                {
+                    "name": "webhook-b.example.com",
+                    "clientConfig": { "url": format!("{url_b}/webhook") },
+                    "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                    "failurePolicy": "Fail",
+                    "reinvocationPolicy": "IfNeeded"
+                }
+            ]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/reinvoke-test",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "my-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+
+        let result = run_mutating_webhooks(&state, obj, &ctx).await;
+        assert!(result.is_ok(), "mutating webhook pipeline must succeed");
+
+        // Pass 1: both A and B fire once.
+        // Pass 2 (reinvocation): webhook A has no reinvocationPolicy → must NOT fire again.
+        //                       webhook B has IfNeeded → MUST fire again.
+        let a_count = webhook_a_count.load(Ordering::SeqCst);
+        let b_count = webhook_b_count.load(Ordering::SeqCst);
+
+        assert_eq!(
+            a_count, 1,
+            "webhook-a (no IfNeeded) must be called exactly once; \
+             calling it in pass 2 would allow duplicate mutations"
+        );
+        assert_eq!(
+            b_count, 2,
+            "webhook-b (IfNeeded) must be called in both pass 1 and pass 2; \
+             skipping pass 2 would prevent sidecar injectors from seeing final object state"
+        );
+
+        // The patch from webhook-a must be present in the returned object.
+        let returned = result.unwrap_or_else(|_| panic!("pipeline must succeed"));
+        assert_eq!(
+            returned["metadata"]["labels"]["injected"], "true",
+            "patch from webhook-a pass 1 must be applied to the returned object"
+        );
+    }
+
+    /// When no webhook patches the object (any_patched=false), the reinvocation
+    /// pass must NOT run. Webhooks must not be called more than once when there
+    /// was nothing to reinvoke for.
+    #[tokio::test]
+    async fn reinvocation_pass_skipped_when_no_patch_applied() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // A webhook with IfNeeded that only allows (no patch) — must not trigger reinvocation.
+        let router = Router::new().route(
+            "/webhook",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": "uid-c", "allowed": true}
+                    }))
+                }
+            }),
+        );
+
+        let (url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "no-patch-mwc"},
+            "webhooks": [{
+                "name": "no-patch.webhook.example.com",
+                "clientConfig": { "url": format!("{url}/webhook") },
+                "rules": [{"apiGroups": ["apps"], "apiVersions": ["v1"], "resources": ["deployments"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail",
+                "reinvocationPolicy": "IfNeeded"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/no-patch-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "no-patch-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "no-patch-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+
+        let result = run_mutating_webhooks(&state, obj, &ctx).await;
+        assert!(result.is_ok(), "pipeline must succeed when no patch applied");
+
+        let count = call_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "webhook with IfNeeded must only be called once when no patch was applied in pass 1; \
+             triggering pass 2 without any_patched=true wastes latency and causes duplicate calls"
+        );
+    }
+
     /// A webhook with clientConfig.service pointing to a non-existent Service must
     /// apply failurePolicy: Fail returns an error, Ignore skips gracefully.
     #[tokio::test]
