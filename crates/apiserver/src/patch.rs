@@ -80,7 +80,7 @@ fn strategic_merge_patch_at(
                     let entry = target_obj
                         .entry(key)
                         .or_insert(serde_json::Value::Array(vec![]));
-                    strategic_merge_array(entry, value, merge_key)?;
+                    strategic_merge_array(entry, value, merge_key, &child_path)?;
                 }
                 MergeKeyKind::Replace | MergeKeyKind::Unknown => {
                     // Last-write-wins: check for $patch:replace directive in elements.
@@ -116,6 +116,7 @@ fn strategic_merge_array(
     target: &mut serde_json::Value,
     patch: &serde_json::Value,
     merge_key: &str,
+    path: &str,
 ) -> Result<(), PatchError> {
     let patch_arr = match patch.as_array() {
         Some(a) => a,
@@ -175,8 +176,9 @@ fn strategic_merge_array(
                 match found {
                     Some(target_elem) => {
                         // Deep-merge the patch element into the target element.
-                        // We treat both as objects (they must be if they have a merge key).
-                        strategic_merge_patch_at(target_elem, patch_elem, "")?;
+                        // Pass `path` (the array's own path) so nested lists like env,
+                        // volumeMounts, ports resolve their merge keys correctly.
+                        strategic_merge_patch_at(target_elem, patch_elem, path)?;
                     }
                     None => {
                         target_arr.push(patch_elem.clone());
@@ -207,9 +209,23 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         | "spec.imagePullSecrets"
         | "spec.template.spec.containers"
         | "spec.template.spec.initContainers"
-        | "spec.template.spec.volumes" => MergeKeyKind::Key("name"),
+        | "spec.template.spec.volumes"
+        | "spec.template.spec.imagePullSecrets" => MergeKeyKind::Key("name"),
 
         "spec.hostAliases" => MergeKeyKind::Key("ip"),
+
+        // Nested list fields inside container objects.
+        // These paths are relative to the container object (e.g. spec.containers.env).
+        path if path.ends_with(".env")
+            || path.ends_with(".initContainers.env")
+            || path.ends_with(".ephemeralContainers.env") =>
+        {
+            MergeKeyKind::Key("name")
+        }
+
+        path if path.ends_with(".volumeMounts") => MergeKeyKind::Key("mountPath"),
+
+        path if path.ends_with(".ports") => MergeKeyKind::Key("containerPort"),
 
         "rules" | "subjects" => MergeKeyKind::Replace,
 
