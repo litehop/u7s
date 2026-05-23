@@ -492,6 +492,169 @@ mod tests {
         );
     }
 
+    // --- Regression tests for nested list SMP merge (mayor-4c81) ---
+    // These tests must FAIL if the path-threading fix is reverted (i.e. if
+    // strategic_merge_array is called with "" instead of the array's path).
+
+    #[test]
+    fn test_smp_nested_env_survives_partial_patch() {
+        // Two containers, each with two env vars.  Patching one env var in one
+        // container must leave the untouched env var and the untouched container
+        // intact.  Without the path fix, env falls through to last-write-wins
+        // and the unpatched var is silently dropped.
+        let mut target = json!({
+            "spec": {
+                "containers": [
+                    {
+                        "name": "app",
+                        "env": [
+                            {"name": "FOO", "value": "foo1"},
+                            {"name": "BAR", "value": "bar1"}
+                        ]
+                    },
+                    {
+                        "name": "sidecar",
+                        "env": [
+                            {"name": "X", "value": "x1"},
+                            {"name": "Y", "value": "y1"}
+                        ]
+                    }
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "containers": [
+                    {
+                        "name": "app",
+                        "env": [
+                            {"name": "FOO", "value": "foo2"}
+                        ]
+                    }
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 2, "both containers must survive");
+
+        // app container: FOO updated, BAR must still be present
+        let app = containers.iter().find(|c| c["name"] == "app").unwrap();
+        let env = app["env"].as_array().unwrap();
+        assert_eq!(env.len(), 2, "app must still have two env vars");
+        let foo = env.iter().find(|e| e["name"] == "FOO").unwrap();
+        assert_eq!(foo["value"], "foo2", "FOO must be updated");
+        let bar = env.iter().find(|e| e["name"] == "BAR");
+        assert!(bar.is_some(), "BAR must survive the partial env patch");
+
+        // sidecar container must be completely untouched
+        let sidecar = containers.iter().find(|c| c["name"] == "sidecar").unwrap();
+        let sidecar_env = sidecar["env"].as_array().unwrap();
+        assert_eq!(sidecar_env.len(), 2, "sidecar env must be untouched");
+    }
+
+    #[test]
+    fn test_smp_nested_volume_mounts_survives_partial_patch() {
+        // One container with two volumeMounts.  Patching a field on one (matched
+        // by mountPath, the volumeMounts merge key) must leave the other
+        // volumeMount intact.  Without the path fix, volumeMounts falls through
+        // to last-write-wins and the unpatched mount is silently dropped.
+        let mut target = json!({
+            "spec": {
+                "containers": [
+                    {
+                        "name": "app",
+                        "volumeMounts": [
+                            {"mountPath": "/etc/config", "name": "config", "readOnly": false},
+                            {"mountPath": "/var/data",   "name": "data",   "readOnly": false}
+                        ]
+                    }
+                ]
+            }
+        });
+        // Patch adds readOnly: true to /etc/config only; /var/data must survive.
+        let patch = json!({
+            "spec": {
+                "containers": [
+                    {
+                        "name": "app",
+                        "volumeMounts": [
+                            {"mountPath": "/etc/config", "name": "config", "readOnly": true}
+                        ]
+                    }
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["containers"].as_array().unwrap();
+        let app = containers.iter().find(|c| c["name"] == "app").unwrap();
+        let mounts = app["volumeMounts"].as_array().unwrap();
+        assert_eq!(mounts.len(), 2, "both volumeMounts must survive");
+        let config = mounts
+            .iter()
+            .find(|m| m["mountPath"] == "/etc/config")
+            .unwrap();
+        assert_eq!(
+            config["readOnly"], true,
+            "readOnly must be updated on the patched mount"
+        );
+        assert!(
+            mounts.iter().any(|m| m["mountPath"] == "/var/data"),
+            "data volumeMount must survive the partial patch"
+        );
+    }
+
+    #[test]
+    fn test_smp_nested_ports_survives_partial_patch() {
+        // One container with two ports.  Patching one containerPort must leave
+        // the other port intact.
+        let mut target = json!({
+            "spec": {
+                "containers": [
+                    {
+                        "name": "app",
+                        "ports": [
+                            {"containerPort": 8080, "protocol": "TCP"},
+                            {"containerPort": 9090, "protocol": "TCP"}
+                        ]
+                    }
+                ]
+            }
+        });
+        let patch = json!({
+            "spec": {
+                "containers": [
+                    {
+                        "name": "app",
+                        "ports": [
+                            {"containerPort": 8080, "protocol": "UDP"}
+                        ]
+                    }
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let containers = target["spec"]["containers"].as_array().unwrap();
+        let app = containers.iter().find(|c| c["name"] == "app").unwrap();
+        let ports = app["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 2, "both ports must survive");
+        let port8080 = ports.iter().find(|p| p["containerPort"] == 8080).unwrap();
+        assert_eq!(
+            port8080["protocol"], "UDP",
+            "port 8080 protocol must be updated"
+        );
+        assert!(
+            ports.iter().any(|p| p["containerPort"] == 9090),
+            "port 9090 must survive the partial patch"
+        );
+    }
+
     #[test]
     fn test_smp_patch_delete_with_empty_merge_key_value() {
         // $patch:delete where the merge key is present but set to "" (empty string).
