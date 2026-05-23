@@ -309,6 +309,14 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     // Clients without a cert fall through to other auth mechanisms (tokens, anonymous).
     let mut root_store = RootCertStore::empty();
     root_store.add(CertificateDer::from(ca_cert_der.clone()))?;
+    if root_store.is_empty() {
+        // If no CA cert was loaded, rustls will reject all client certs silently.
+        // This would disable x509 authentication entirely. Fail at startup rather than
+        // silently accepting anonymous-only connections.
+        return Err(anyhow::anyhow!(
+            "TLS trust store is empty: cluster CA cert must be present to enable mTLS client authentication"
+        ));
+    }
     let client_verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
         .allow_unauthenticated()
         .build()
