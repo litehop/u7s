@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
+    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     state::AppState,
     status::Status,
@@ -272,6 +273,23 @@ pub async fn create_crd(
 
     stamp_server_fields(&mut crd);
 
+    // Admission webhook pipeline (mutating then validating).
+    {
+        let admission_ctx = AdmissionContext {
+            group: "apiextensions.k8s.io",
+            version: "v1",
+            resource: "customresourcedefinitions",
+            name: &name,
+            namespace: None,
+            operation: "CREATE",
+        };
+        let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
+        let mutated = run_mutating_webhooks(&state, obj_val, &admission_ctx).await?;
+        run_validating_webhooks(&state, &mutated, &admission_ctx).await?;
+        crd = serde_json::from_value(mutated)
+            .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+    }
+
     let key = store_key(&name);
     let rv = state
         .store
@@ -357,6 +375,23 @@ pub async fn replace_crd(
     } else {
         crd.metadata.resource_version.parse::<u64>().ok()
     };
+
+    // Admission webhook pipeline (mutating then validating).
+    {
+        let admission_ctx = AdmissionContext {
+            group: "apiextensions.k8s.io",
+            version: "v1",
+            resource: "customresourcedefinitions",
+            name: &name,
+            namespace: None,
+            operation: "UPDATE",
+        };
+        let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
+        let mutated = run_mutating_webhooks(&state, obj_val, &admission_ctx).await?;
+        run_validating_webhooks(&state, &mutated, &admission_ctx).await?;
+        crd = serde_json::from_value(mutated)
+            .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+    }
 
     let rv = state
         .store
@@ -853,5 +888,188 @@ mod tests {
         assert!(validate_crd_group("example.com").is_ok());
         assert!(validate_crd_group("argoproj.io").is_ok());
         assert!(validate_crd_group("gateway.networking.x-k8s.io").is_ok());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admission regression tests — prove create_crd / replace_crd invoke the
+// admission webhook pipeline (mayor-8sn9).
+//
+// Without the fix, these handlers bypassed admission entirely.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admission_tests {
+    use std::sync::Arc;
+
+    use axum::{routing::post, Router};
+    use bytes::Bytes;
+    use tokio::net::TcpListener;
+    use u7s_store::{SqliteStore, Store};
+
+    use super::*;
+    use crate::state::AppState;
+
+    fn make_state(store: Arc<SqliteStore>) -> AppState {
+        AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    async fn start_mock_webhook(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock webhook server must not fail");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn crd_body(name: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": {"name": name},
+                "spec": {
+                    "group": "example.com",
+                    "names": {
+                        "plural": "foos",
+                        "singular": "foo",
+                        "kind": "Foo",
+                        "listKind": "FooList"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [{"name": "v1", "served": true, "storage": true}]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    fn deny_router() -> Router {
+        Router::new().route(
+            "/webhook",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": false,
+                        "status": {"code": 403, "message": "denied by test webhook"}
+                    }
+                }))
+            }),
+        )
+    }
+
+    /// create_crd must invoke the validating admission pipeline.
+    /// A validating webhook that denies must cause create_crd to return an error,
+    /// and the CRD must NOT be stored. Before the fix, admission was bypassed.
+    #[tokio::test]
+    async fn create_crd_invokes_validating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        let (url, _handle) = start_mock_webhook(deny_router()).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating-crd"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": ["apiextensions.k8s.io"], "apiVersions": ["v1"], "resources": ["customresourcedefinitions"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-crd",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = create_crd(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            crd_body("foos.example.com"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "create_crd must be rejected when validating webhook denies — \
+             without the fix, admission was bypassed and the CRD was silently stored"
+        );
+
+        let stored = store.get(&store_key("foos.example.com")).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "denied CRD must not be stored in the backing store"
+        );
+    }
+
+    /// replace_crd must invoke the validating admission pipeline.
+    /// A validating webhook that denies must cause replace_crd to return an error.
+    #[tokio::test]
+    async fn replace_crd_invokes_validating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        // First create the CRD (no webhook registered yet).
+        let create_result = create_crd(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            crd_body("foos.example.com"),
+        )
+        .await;
+        assert!(create_result.is_ok(), "initial create must succeed");
+
+        let (url, _handle) = start_mock_webhook(deny_router()).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating-crd-update"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": ["apiextensions.k8s.io"], "apiVersions": ["v1"], "resources": ["customresourcedefinitions"], "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-crd-update",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = replace_crd(
+            axum::extract::State(state),
+            axum::extract::Path("foos.example.com".to_string()),
+            HeaderMap::new(),
+            crd_body("foos.example.com"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "replace_crd must be rejected when validating webhook denies — \
+             without the fix, admission was bypassed and the CRD was silently updated"
+        );
     }
 }
