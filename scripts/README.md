@@ -150,3 +150,29 @@ bash scripts/bench-rss-load.sh
 ```
 
 **Threshold:** 20 MB RSS delta. Guards against memory leaks under concurrent load.
+
+---
+
+## Troubleshooting
+
+### `openssl s_client` prints "certificate signature failure" — false alarm
+
+**Symptom:** Running `openssl s_client -connect 127.0.0.1:6443` (or `host.lima.internal:6443`) from inside the Lima VM prints an error like:
+
+```
+verify error:num=1:X509_V_ERR_UNSPECIFIED:unspecified certificate verification error
+...
+certificate signature failure
+```
+
+**This is a false alarm.** The certificate and server are fine.
+
+**Root cause:** Ubuntu 22.04 ships OpenSSL 3.0.x, which does not support the `X25519MLKEM768` post-quantum key-exchange extension used by u7s's `rustls-post-quantum` TLS stack. OpenSSL 3.0.x cannot complete the handshake and misreports this as a certificate error.
+
+**Verification:** Go clients (kubelet, kcm, kubectl) use a modern TLS implementation and connect successfully. Use these instead:
+
+```bash
+# Correct diagnostic — if this works, the server and cert are fine:
+kubectl get namespaces
+curl --cacert ./temp/u7s/ca.crt https://127.0.0.1:6443/api
+```
