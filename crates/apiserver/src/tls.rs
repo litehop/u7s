@@ -214,6 +214,8 @@ pub struct TlsMaterial {
     pub ca_cert_der: Vec<u8>,
     /// DER-encoded admin client certificate (written into kubeconfig).
     pub admin_cert_der: Vec<u8>,
+    /// PEM-encoded admin client certificate (concatenate with admin_key_pem for reqwest::Identity).
+    pub admin_cert_pem: Vec<u8>,
     /// PEM-encoded admin private key (written into kubeconfig).
     pub admin_key_pem: Vec<u8>,
     /// Configured rustls ServerConfig for the axum server.
@@ -325,9 +327,12 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(server_cert_chain, server_key_der)?;
 
+    let admin_cert_der = admin_cert.der().to_vec();
+    let admin_cert_pem = pem_encode("CERTIFICATE", &admin_cert_der);
     Ok(TlsMaterial {
         ca_cert_der,
-        admin_cert_der: admin_cert.der().to_vec(),
+        admin_cert_der,
+        admin_cert_pem,
         admin_key_pem: admin_key.serialize_pem().into_bytes(),
         server_config: Arc::new(server_config),
     })

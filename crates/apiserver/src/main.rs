@@ -156,6 +156,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("advertised server address: {server_address}");
 
     // 9. Build app state (shared with the auth layer).
+    // Combine admin cert PEM + admin key PEM for the webhook mTLS client identity.
+    // The webhook client will present this certificate when connecting to admission
+    // webhook servers, so they can verify they are talking to the apiserver.
+    let mut webhook_identity_pem = tls_material.admin_cert_pem.clone();
+    webhook_identity_pem.extend_from_slice(&tls_material.admin_key_pem);
     let state = AppState::new_with_ca(
         Arc::clone(&store),
         sa_encoding_key,
@@ -163,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         token_map,
         server_address,
         Some(tls_material.ca_cert_der.clone()),
+        Some(webhook_identity_pem),
     );
 
     // 9a. Populate RBAC index from persisted objects before serving.
