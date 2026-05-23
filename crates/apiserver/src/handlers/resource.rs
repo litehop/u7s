@@ -222,6 +222,7 @@ pub async fn create_resource(
 
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
+    super::defaults::apply_defaults(&group, &plural, &mut obj.body);
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -304,6 +305,8 @@ pub async fn replace_resource(
     }
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
+
+    super::defaults::apply_defaults(&group, &plural, &mut obj.body);
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -435,6 +438,7 @@ pub(crate) async fn do_patch(
         obj.body["metadata"] =
             serde_json::to_value(obj_meta).map_err(|e| Status::internal(e.to_string()))?;
         stamp_metadata(&mut obj);
+        super::defaults::apply_defaults(group, plural, &mut obj.body);
         let new_rv = match state.store.put(key, obj.to_bytes(), Some(0)).await {
             Ok(rv) => rv,
             Err(StoreError::AlreadyExists { .. }) => {
@@ -451,6 +455,7 @@ pub(crate) async fn do_patch(
                     .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
                 crate::patch::strategic_merge_patch(&mut current.body, &patch)
                     .map_err(|e| Status::bad_request(e.to_string()))?;
+                super::defaults::apply_defaults(group, plural, &mut current.body);
                 let expected_rv = parse_resource_version(current.resource_version())?;
                 let rv = state
                     .store
@@ -491,6 +496,7 @@ pub(crate) async fn do_patch(
             apply_json_patch(&mut current.body, &patch)?;
         }
     }
+    super::defaults::apply_defaults(group, plural, &mut current.body);
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
     let current_meta: ObjectMeta =
@@ -772,6 +778,7 @@ pub async fn create_namespaced_resource(
     obj.body["metadata"] =
         serde_json::to_value(ns_meta).map_err(|e| Status::internal(e.to_string()))?;
     stamp_metadata(&mut obj);
+    super::defaults::apply_defaults(&group, &plural, &mut obj.body);
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -856,6 +863,8 @@ pub async fn replace_namespaced_resource(
     }
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
+
+    super::defaults::apply_defaults(&group, &plural, &mut obj.body);
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
