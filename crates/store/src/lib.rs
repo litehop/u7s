@@ -1545,14 +1545,18 @@ mod tests {
             .expect("create");
 
         // Both streams must independently receive an ADDED event for the same revision.
-        let ev_a = next_event(&mut stream_a).await.expect("stream A must get event");
+        let ev_a = next_event(&mut stream_a)
+            .await
+            .expect("stream A must get event");
         assert!(
             matches!(&ev_a, WatchEvent::Added(obj) if obj.key == key && obj.revision == rv),
             "watcher A must receive ADDED for the written object, got {:?}",
             ev_a
         );
 
-        let ev_b = next_event(&mut stream_b).await.expect("stream B must get event");
+        let ev_b = next_event(&mut stream_b)
+            .await
+            .expect("stream B must get event");
         assert!(
             matches!(&ev_b, WatchEvent::Added(obj) if obj.key == key && obj.revision == rv),
             "watcher B must receive ADDED independently — fan-out failed, got {:?}",

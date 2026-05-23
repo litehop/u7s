@@ -1211,7 +1211,9 @@ mod tests {
         idx.apply_object(&cr_key, &cr_val);
 
         // Create a RoleBinding in "staging" that refs the ClusterRole (not a Role).
-        let rb_key = "/apis/rbac.authorization.k8s.io/v1/namespaces/staging/rolebindings/bob-pod-reader".to_owned();
+        let rb_key =
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/staging/rolebindings/bob-pod-reader"
+                .to_owned();
         let rb_val = json!({
             "subjects": [{ "kind": "User", "name": "bob" }],
             "roleRef": {

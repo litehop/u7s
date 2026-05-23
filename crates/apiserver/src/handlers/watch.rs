@@ -847,7 +847,9 @@ mod tests {
 
     /// Helper: read from a watch_generic Response body with a timeout, returning parsed NDJSON lines.
     /// Used to consume ring-buffer events which are emitted synchronously at stream start.
-    async fn read_watch_body_with_timeout(resp: axum::response::Response) -> Vec<serde_json::Value> {
+    async fn read_watch_body_with_timeout(
+        resp: axum::response::Response,
+    ) -> Vec<serde_json::Value> {
         use tokio::time::{timeout, Duration};
 
         let body = resp.into_body();
@@ -1080,25 +1082,17 @@ mod tests {
         let lines = read_watch_body_with_timeout(resp).await;
 
         // Ring buffer has: ADDED (backend, suppressed) and DELETED (always passes).
-        let deleted_count = lines
-            .iter()
-            .filter(|v| v["type"] == "DELETED")
-            .count();
+        let deleted_count = lines.iter().filter(|v| v["type"] == "DELETED").count();
         assert_eq!(
-            deleted_count,
-            1,
+            deleted_count, 1,
             "DELETED event must pass through label selector filtering; \
              suppressing it would cause informer cache leaks: got lines {:?}",
             lines
         );
 
-        let added_count = lines
-            .iter()
-            .filter(|v| v["type"] == "ADDED")
-            .count();
+        let added_count = lines.iter().filter(|v| v["type"] == "ADDED").count();
         assert_eq!(
-            added_count,
-            0,
+            added_count, 0,
             "non-matching ADDED event must be suppressed by label selector; got lines {:?}",
             lines
         );
