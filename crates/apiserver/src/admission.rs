@@ -1866,7 +1866,6 @@ mod tests {
     async fn reinvocation_pass_fires_if_needed_and_skips_non_if_needed() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc as StdArc;
-        use tokio::net::TcpListener;
 
         // Counter: how many times webhook A is called.
         let webhook_a_count = StdArc::new(AtomicUsize::new(0));
