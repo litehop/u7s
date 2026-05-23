@@ -251,6 +251,7 @@ async fn watch_pods(
         field_selector,
         allow_watch_bookmarks,
         username,
+        false,
     )
     .await
 }
@@ -516,7 +517,7 @@ mod watch_tests {
             serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx","resourceVersion":"5"}}),
         );
         let bytes =
-            crate::handlers::watch::encode_watch_event(&WatchEvent::Added(obj), "v1", "Pod")
+            crate::handlers::watch::encode_watch_event(&WatchEvent::Added(obj), "v1", "Pod", false)
                 .expect("should encode");
         let line = std::str::from_utf8(&bytes).unwrap();
         assert!(line.ends_with('\n'), "NDJSON must end with newline");
@@ -534,9 +535,13 @@ mod watch_tests {
             7,
             serde_json::json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"nginx","resourceVersion":"7"}}),
         );
-        let bytes =
-            crate::handlers::watch::encode_watch_event(&WatchEvent::Modified(obj), "v1", "Pod")
-                .expect("should encode");
+        let bytes = crate::handlers::watch::encode_watch_event(
+            &WatchEvent::Modified(obj),
+            "v1",
+            "Pod",
+            false,
+        )
+        .expect("should encode");
         let parsed: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
         assert_eq!(parsed["type"], "MODIFIED");
@@ -553,6 +558,7 @@ mod watch_tests {
             },
             "v1",
             "Pod",
+            false,
         )
         .expect("should encode");
         let parsed: serde_json::Value =
@@ -570,6 +576,7 @@ mod watch_tests {
             &WatchEvent::Bookmark { revision: 42 },
             "v1",
             "Pod",
+            false,
         )
         .expect("should encode");
         let parsed: serde_json::Value =
@@ -589,6 +596,7 @@ mod watch_tests {
             },
             "v1",
             "Pod",
+            false,
         );
         assert!(result.is_none(), "Compacted must signal close via None");
     }

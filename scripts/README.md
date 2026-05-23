@@ -2,6 +2,56 @@
 
 Development, testing, and CI tooling for u7s. Requires a working Rust toolchain, `curl`, and (for lima scripts) `limactl`.
 
+## Local kubelet workflow
+
+Full end-to-end: u7s on the Mac host, kubelet inside a lima VM.
+
+```bash
+# 1. Build
+cargo build --release -p u7s-apiserver
+
+# 2. Start apiserver (state persists in ./temp/u7s/ across restarts)
+scripts/u7s-start.sh
+# → prints: export KUBECONFIG=./temp/u7s/kubeconfig
+
+# 3. In a second terminal — join the kubelet
+export KUBECONFIG=./temp/u7s/kubeconfig
+scripts/lima-start.sh
+# → waits for lima-node to appear in kubectl get nodes
+
+# 4. Verify
+kubectl get nodes
+kubectl get pods -A
+```
+
+**Re-joining after a server restart:** Just re-run `scripts/lima-start.sh` — it rewrites the kubeconfig in the VM and restarts kubelet. The CA is stable across restarts so no re-provisioning is needed.
+
+**Full reset** (rotates CA — kubelet must re-join):
+```bash
+scripts/u7s-start.sh --reset
+export KUBECONFIG=./temp/u7s/kubeconfig
+scripts/lima-start.sh
+```
+
+**VM re-provisioning** (slow, ~5 min — only needed once or if VM is broken):
+```bash
+limactl delete lima-node
+scripts/lima-start.sh   # provisions fresh VM then joins
+```
+
+---
+
+## u7s-start.sh — Start the apiserver for local development
+
+Builds are handled by the caller (`cargo build --release`). This script only starts the server, waits for the port to open, and prints the `KUBECONFIG` export line.
+
+State lives in `./temp/u7s/` (gitignored). The CA and SA keys persist across restarts so kubelets stay joined without re-provisioning.
+
+```bash
+scripts/u7s-start.sh           # start (errors if port 6443 already in use)
+scripts/u7s-start.sh --reset   # wipe state and start fresh
+```
+
 ## lima-start.sh — Start lima-node and join it to u7s
 
 Starts the lima VM (`lima-node`), copies the kubeconfig into it (rewriting `127.0.0.1` → `host.lima.internal`), starts kubelet inside the VM, and polls until the node appears in `kubectl get nodes`.

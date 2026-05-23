@@ -8,13 +8,10 @@
 #   - kubectl runs on the Mac against 127.0.0.1:6443
 #
 # Quick start:
-#   1. cargo run --release -p u7s-apiserver -- \
-#        --db /tmp/u7s.db \
-#        --kubeconfig /tmp/u7s-kubeconfig \
-#        --sa-key /tmp/u7s-sa.key --sa-pub /tmp/u7s-sa.pub \
-#        --advertise-address https://127.0.0.1:6443
+#   1. cargo build --release -p u7s-apiserver
+#      scripts/u7s-start.sh       # starts server, prints export KUBECONFIG=...
 #
-#   2. export KUBECONFIG=/tmp/u7s-kubeconfig
+#   2. export KUBECONFIG=./temp/u7s/kubeconfig
 #      scripts/lima-start.sh
 #
 #   3. kubectl get nodes        # lima-node should appear within ~30s
@@ -60,8 +57,9 @@ find_kubeconfig() {
     return
   fi
   echo "error: KUBECONFIG not set or file not found." >&2
-  echo "Start u7s and set KUBECONFIG to the path it printed:" >&2
-  echo "  export KUBECONFIG=/tmp/u7s-kubeconfig" >&2
+  echo "Start u7s first, then export the path it prints:" >&2
+  echo "  scripts/u7s-start.sh" >&2
+  echo "  export KUBECONFIG=./temp/u7s/kubeconfig" >&2
   exit 1
 }
 
