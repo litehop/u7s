@@ -347,13 +347,65 @@ fn default_true() -> bool {
 /// Typed representation of the fields in a Pod's `spec` that are read by
 /// handlers. Parsing at the handler boundary catches typos the compiler
 /// cannot see in raw `["nodeName"]` indexing.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PodSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_name: Option<String>,
     #[serde(default = "default_true")]
     pub enable_service_links: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volumes: Option<Vec<Volume>>,
+}
+
+/// Typed representation of a Pod volume entry (fields accessed by handlers).
+/// The `rest` field captures all other volume-type fields (emptyDir, hostPath,
+/// etc.) opaquely so they survive a round-trip without loss.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Volume {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_map: Option<VolumeProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<VolumeProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected: Option<VolumeProjection>,
+    /// All other fields in this volume entry (e.g. emptyDir, hostPath).
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed representation of the subset of configMap/secret/projected volume
+/// source fields that the apiserver reads (defaultMode stamping).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_mode: Option<i32>,
+    /// All other fields in this volume source.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
+/// Typed representation of the Pod `status` fields read by handlers.
+/// `phase` and `conditions` are the only fields the apiserver logic
+/// dereferences; everything else passes through opaquely via `rest`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PodStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Pod conditions stay opaque — the apiserver does not pattern-match
+    /// on individual condition fields, only on the array as a whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<serde_json::Value>>,
+    /// All other status fields.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -872,9 +924,139 @@ mod pod_spec_tests {
         let spec = PodSpec {
             node_name: None,
             enable_service_links: true,
+            volumes: None,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert!(v.get("nodeName").is_none());
+    }
+}
+
+#[cfg(test)]
+mod pod_typed_fields_tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Round-trip: a full Pod JSON fixture is deserialized into typed structs
+    // and re-serialized. No fields must be dropped (the `rest` flatten must
+    // capture everything the typed fields don't claim).
+    // -----------------------------------------------------------------------
+
+    /// Volume must deserialize configMap.defaultMode and preserve untyped fields.
+    ///
+    /// The apiserver defaults defaultMode on create; if the typed struct drops
+    /// other configMap fields (e.g. `name`, `items`) on round-trip, the pod's
+    /// volume spec is silently corrupted.
+    #[test]
+    fn volume_config_map_round_trips_without_dropping_fields() {
+        let json = serde_json::json!({
+            "name": "my-cfg",
+            "configMap": {
+                "name": "app-config",
+                "defaultMode": 420,
+                "items": [{"key": "app.conf", "path": "app.conf"}]
+            }
+        });
+        let vol: Volume = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(vol.name, "my-cfg");
+        let cm = vol.config_map.as_ref().unwrap();
+        assert_eq!(cm.default_mode, Some(420));
+        // Re-serialize and verify nothing was dropped
+        let out = serde_json::to_value(&vol).unwrap();
+        assert_eq!(out["configMap"]["name"], "app-config");
+        assert_eq!(out["configMap"]["defaultMode"], 420);
+        assert_eq!(out["configMap"]["items"][0]["key"], "app.conf");
+    }
+
+    /// Volume must deserialize secret.defaultMode and preserve untyped fields.
+    #[test]
+    fn volume_secret_round_trips_without_dropping_fields() {
+        let json = serde_json::json!({
+            "name": "my-sec",
+            "secret": {
+                "secretName": "app-secret",
+                "defaultMode": 256
+            }
+        });
+        let vol: Volume = serde_json::from_value(json).unwrap();
+        let sec = vol.secret.as_ref().unwrap();
+        assert_eq!(sec.default_mode, Some(256));
+        let out = serde_json::to_value(&vol).unwrap();
+        assert_eq!(out["secret"]["secretName"], "app-secret");
+        assert_eq!(out["secret"]["defaultMode"], 256);
+    }
+
+    /// Volume with an untyped source (emptyDir) must round-trip through `rest`.
+    ///
+    /// Volumes that are not configMap/secret/projected must not be silently
+    /// dropped. The `rest` field on Volume must capture them.
+    #[test]
+    fn volume_untyped_source_survives_round_trip() {
+        let json = serde_json::json!({
+            "name": "scratch",
+            "emptyDir": {"medium": "Memory", "sizeLimit": "128Mi"}
+        });
+        let vol: Volume = serde_json::from_value(json).unwrap();
+        assert_eq!(vol.name, "scratch");
+        assert!(vol.config_map.is_none());
+        assert!(vol.secret.is_none());
+        let out = serde_json::to_value(&vol).unwrap();
+        assert_eq!(out["emptyDir"]["medium"], "Memory");
+        assert_eq!(out["emptyDir"]["sizeLimit"], "128Mi");
+    }
+
+    /// PodStatus must deserialize `phase` and `conditions` and preserve other fields.
+    ///
+    /// Handlers read `phase` to check lifecycle; `conditions` is used in status
+    /// merge. If the typed struct drops `hostIP` or `podIP`, kubelet updates are
+    /// silently discarded.
+    #[test]
+    fn pod_status_round_trips_without_dropping_fields() {
+        let json = serde_json::json!({
+            "phase": "Running",
+            "conditions": [
+                {"type": "Ready", "status": "True"}
+            ],
+            "hostIP": "10.0.0.1",
+            "podIP": "172.16.0.5"
+        });
+        let status: PodStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(status.phase.as_deref(), Some("Running"));
+        let conds = status.conditions.as_ref().unwrap();
+        assert_eq!(conds.len(), 1);
+        assert_eq!(conds[0]["type"], "Ready");
+        let out = serde_json::to_value(&status).unwrap();
+        // Typed fields present
+        assert_eq!(out["phase"], "Running");
+        // Untyped fields must survive (rest flatten)
+        assert_eq!(out["hostIP"], "10.0.0.1");
+        assert_eq!(out["podIP"], "172.16.0.5");
+    }
+
+    /// PodSpec with volumes round-trips: volumes survive deserialization and
+    /// re-serialization intact.
+    #[test]
+    fn pod_spec_with_volumes_round_trips() {
+        let json = serde_json::json!({
+            "nodeName": "worker-1",
+            "enableServiceLinks": true,
+            "volumes": [
+                {"name": "cfg", "configMap": {"name": "my-cm", "defaultMode": 420}},
+                {"name": "scratch", "emptyDir": {}}
+            ],
+            "containers": [{"name": "app", "image": "nginx"}]
+        });
+        let spec: PodSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.node_name.as_deref(), Some("worker-1"));
+        let vols = spec.volumes.as_ref().unwrap();
+        assert_eq!(vols.len(), 2);
+        assert_eq!(vols[0].name, "cfg");
+        assert_eq!(vols[0].config_map.as_ref().unwrap().default_mode, Some(420));
+        assert_eq!(vols[1].name, "scratch");
+        // containers must survive in rest (untyped field)
+        let out = serde_json::to_value(&spec).unwrap();
+        assert_eq!(out["nodeName"], "worker-1");
+        assert_eq!(out["volumes"][0]["name"], "cfg");
+        assert_eq!(out["volumes"][1]["emptyDir"], serde_json::json!({}));
     }
 }
 
