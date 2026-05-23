@@ -1776,6 +1776,28 @@ mod tests {
             "metadata": {"name": "cluster-admin"},
             "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
         });
+        // Pre-seed the rbac_index so system:masters can create ClusterRoleBindings
+        // via RBAC (no hardcoded bypass exists).
+        let masters_crb_seed = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "system-masters-cluster-admin"},
+            "subjects": [{"kind": "Group", "name": "system:masters"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin",
+            &cr,
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system-masters-cluster-admin",
+            &masters_crb_seed,
+        );
+
         let admin_user = Extension(crate::auth::UserInfo {
             username: "admin".into(),
             uid: String::new(),

@@ -313,10 +313,6 @@ pub(crate) fn check_crb_escalation(
     if group != RBAC_GROUP || plural != CLUSTER_ROLE_BINDINGS {
         return Ok(());
     }
-    // system:masters unconditionally bypasses the escalation check.
-    if user.groups.iter().any(|g| g == "system:masters") {
-        return Ok(());
-    }
     let role_ref_name = serde_json::from_value::<crate::rbac::RbacBinding>(body.clone())
         .map(|b| b.role_ref.name)
         .unwrap_or_default();
@@ -1298,6 +1294,28 @@ mod escalation_tests {
             "metadata": {"name": "cluster-admin"},
             "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
         });
+        // Pre-seed the rbac_index so system:masters can create ClusterRoleBindings
+        // via RBAC (no hardcoded bypass exists anymore).
+        let masters_crb_seed = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "system-masters-cluster-admin"},
+            "subjects": [{"kind": "Group", "name": "system:masters"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin",
+            &admin_role,
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system-masters-cluster-admin",
+            &masters_crb_seed,
+        );
+
         let admin_user = axum::Extension(crate::auth::UserInfo {
             username: "admin".into(),
             uid: String::new(),
@@ -1409,7 +1427,102 @@ mod escalation_tests {
         }
     }
 
-    /// A system:masters user must be exempt from the escalation check.
+    /// A system:masters user passes the escalation check when the seeded
+    /// cluster-admin ClusterRoleBinding grants system:masters full access.
+    /// Privilege flows through RBAC data — not hardcoded logic.
+    #[tokio::test]
+    async fn create_clusterrolebinding_allowed_for_system_masters_via_rbac() {
+        use super::super::resource::create_resource;
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+
+        // Seed cluster-admin ClusterRole.
+        let admin_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "cluster-admin"},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        // Seed system:masters → cluster-admin ClusterRoleBinding.
+        // Without this binding the escalation check must deny, because system:masters
+        // privilege must flow through RBAC data, not hardcoded bypasses.
+        let masters_crb = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "system-masters-cluster-admin"},
+            "subjects": [{"kind": "Group", "name": "system:masters"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        // We seed via check_crb_escalation directly (bypassing the handler) to avoid
+        // a chicken-and-egg problem.  The function being tested is check_crb_escalation;
+        // we seed the index directly so we can call it in isolation.
+        let admin_role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin";
+        let masters_crb_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system-masters-cluster-admin";
+        state.rbac_index.apply_object(admin_role_key, &admin_role);
+        state.rbac_index.apply_object(masters_crb_key, &masters_crb);
+
+        let admin_user = crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        };
+        let crb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "admin-binding"},
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        let result = super::check_crb_escalation(
+            "clusterrolebindings",
+            group,
+            &admin_user,
+            &crb_body,
+            &state,
+        );
+        assert!(
+            result.is_ok(),
+            "system:masters with cluster-admin binding must pass escalation check via RBAC"
+        );
+
+        // Regression: system:masters with NO binding must be denied.
+        // This ensures system:masters privilege cannot bypass RBAC by relying on
+        // hardcoded group membership — it must be backed by a ClusterRoleBinding.
+        let no_binding_state = make_state();
+        // Seed only the ClusterRole — no ClusterRoleBinding for system:masters.
+        no_binding_state
+            .rbac_index
+            .apply_object(admin_role_key, &admin_role);
+        let denied = super::check_crb_escalation(
+            "clusterrolebindings",
+            group,
+            &admin_user,
+            &crb_body,
+            &no_binding_state,
+        );
+        assert!(
+            denied.is_err(),
+            "system:masters with no binding must be denied — privilege must flow through RBAC data"
+        );
+        assert_eq!(
+            denied.unwrap_err().0,
+            StatusCode::FORBIDDEN,
+            "denial must be 403 Forbidden"
+        );
+    }
+
+    // Keep the full integration test using create_resource to exercise the
+    // handler path with the seeded binding.
     #[tokio::test]
     async fn create_clusterrolebinding_allowed_for_system_masters() {
         use super::super::resource::create_resource;
@@ -1417,12 +1530,38 @@ mod escalation_tests {
         let group = "rbac.authorization.k8s.io";
         let version = "v1";
 
+        // Seed the cluster-admin ClusterRole via the handler so the store and
+        // rbac_index are both updated.
         let admin_role = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "ClusterRole",
             "metadata": {"name": "cluster-admin"},
             "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
         });
+        // We seed as a bootstrap admin who already has the binding in the index
+        // (seeded directly) to avoid a chicken-and-egg.
+        let masters_crb = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "system-masters-cluster-admin"},
+            "subjects": [{"kind": "Group", "name": "system:masters"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        // Pre-seed the rbac_index with both objects so the admin_user can create
+        // via create_resource without triggering a 403.
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin",
+            &admin_role,
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system-masters-cluster-admin",
+            &masters_crb,
+        );
+
         let admin_user = axum::Extension(crate::auth::UserInfo {
             username: "admin".into(),
             uid: String::new(),
@@ -1468,7 +1607,7 @@ mod escalation_tests {
 
         assert!(
             result.is_ok(),
-            "system:masters must always pass the escalation check"
+            "system:masters with cluster-admin binding must pass escalation check"
         );
     }
 }
