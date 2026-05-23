@@ -1,25 +1,31 @@
 # Dashboard
-2026-05-23T16:00 UTC (session active)
+2026-05-23 (session closed)
 Resume: open Claude Code in /Users/balint.erdos/u7s and say "I am the Mayor now"
 Open beads: 1 (1×P3)
 
 ## What needs the operator now
 
-Nothing blocking. Only open bead is deferred:
+Nothing urgent. One deferred bead:
+- `mayor-6w76` (P3) — Pod proto decoder. Defer until decode failure observed.
 
-- `mayor-6w76` (P3) — Pod proto decoder. Deferred until decode failure observed in the wild.
+Good candidate for next session: checkpoint review of recent commits (PRs #206–#213) — spawn independent reviewers for correctness, coverage, performance hotspots; cluster resulting beads.
 
 ## In-flight / open PRs
 
-None. All worktrees removed, no open PRs.
+None. All loops cancelled. Worktrees clean.
 
 ## Recent progress (this session)
 
-- **PR #213 merged**: boon replaces hand-rolled CRD validator (mayor-rlfe). Full enum/pattern/min/max enforcement. 125 lines deleted, ~20 added, 2 new regression tests.
-- **mayor-rlfe closed**
-- **Decision doc written**: `docs/decisions/boon-for-crd-schema-validation.md` — benchmark numbers, Viotti et al. VLDB reference, rationale
-- **Worktree hygiene**: `crd-boon-rlfe`, `schema-bench` removed; remote orphans pruned
-- **PRs #206–#213 all merged this session**: conformance scripts, OpenAPI stubs, SMP fixes (×2), CSR/Pod/Namespace typed fields, boon validation
+- **PR #206**: `scripts/conformance/` — numbered orchestration scripts for sonobuoy
+- **PR #207**: `/openapi/v2` and `/openapi/v3` stub endpoints
+- **PR #208**: SMP nested list merge fix — path-reset bug + 3 regression tests (mayor-p4br, mayor-4c81)
+- **PR #209**: CSR typed fields — `CertificateSigningRequestSpec/Status/CsrCondition`, 6 map lookups replaced (mayor-h7rl)
+- **PR #210**: Pod typed fields — `PodSpec/PodStatus/Volume/VolumeProjection`, 3 map lookups replaced (mayor-51an)
+- **PR #211**: SMP Service ports merge key — `spec.ports` → `port` key (mayor-pt54)
+- **PR #212**: Namespace status.phase typed enum — `NamespacePhase/NamespaceStatus` (mayor-veja)
+- **PR #213**: boon replaces hand-rolled CRD validator — full enum/pattern/min/max enforcement (mayor-rlfe)
+- **Decision doc**: `docs/decisions/boon-for-crd-schema-validation.md` — benchmark + Viotti et al. VLDB rationale
+- **Typed fields policy established**: type what apiserver reasons about; Value for pass-through; schemars derives on all new structs; k8s-openapi as dev-dep only
 
 ## Stance
 
