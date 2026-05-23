@@ -90,18 +90,15 @@ mod tests {
             "spec.progressDeadlineSeconds must default to 600"
         );
         assert_eq!(
-            obj["spec"]["strategy"]["type"],
-            "RollingUpdate",
+            obj["spec"]["strategy"]["type"], "RollingUpdate",
             "spec.strategy.type must default to RollingUpdate"
         );
         assert_eq!(
-            obj["spec"]["strategy"]["rollingUpdate"]["maxSurge"],
-            "25%",
+            obj["spec"]["strategy"]["rollingUpdate"]["maxSurge"], "25%",
             "spec.strategy.rollingUpdate.maxSurge must default to 25%"
         );
         assert_eq!(
-            obj["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"],
-            "25%",
+            obj["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"], "25%",
             "spec.strategy.rollingUpdate.maxUnavailable must default to 25%"
         );
     }
@@ -129,8 +126,7 @@ mod tests {
             "spec.replicas must not be overwritten when already set"
         );
         assert_eq!(
-            obj["spec"]["strategy"]["type"],
-            "Recreate",
+            obj["spec"]["strategy"]["type"], "Recreate",
             "spec.strategy.type must not be overwritten when already set"
         );
         // Recreate strategy: rollingUpdate sub-object must not be injected
