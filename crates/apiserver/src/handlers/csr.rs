@@ -27,9 +27,13 @@ use u7s_store::{ListOptions, Store as _};
 
 use crate::{
     auth::UserInfo,
-    handlers::generic::{
-        apply_label_selector, build_list_response, decode_continue, lookup, parse_field_selector,
-        parse_label_selector, resolve_name, stamp_metadata, validate_name, CollectionQuery,
+    handlers::{
+        generic::{
+            apply_label_selector, build_list_response, decode_continue, lookup,
+            parse_field_selector, parse_label_selector, resolve_name, stamp_metadata,
+            validate_name, CollectionQuery,
+        },
+        watch::{fetch_initial_events, watch_generic},
     },
     keys::{group_list_prefix, group_object_key},
     state::AppState,
@@ -94,12 +98,31 @@ pub(crate) fn validate_csr_spec(
 pub async fn list_csr(
     State(state): State<AppState>,
     Query(query): Query<CollectionQuery>,
-    Extension(_user): Extension<UserInfo>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     // Lookup is infallible for the built-in CSR resource type.
     let meta = lookup(&state, GROUP, VERSION, PLURAL)?;
     let kind = meta.kind.clone();
     let prefix = group_list_prefix(GROUP, PLURAL, None);
+
+    if query.watch == Some(true) {
+        let from_rv = query.resource_version.unwrap_or(0);
+        let initial =
+            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
+        return watch_generic(
+            state,
+            prefix,
+            format!("{GROUP}/{VERSION}"),
+            kind,
+            from_rv,
+            initial,
+            query.label_selector,
+            query.field_selector,
+            query.allow_watch_bookmarks == Some(true),
+            user.username,
+        )
+        .await;
+    }
 
     let field_selector = query
         .field_selector
