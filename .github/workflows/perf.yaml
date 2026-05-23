@@ -168,9 +168,9 @@ jobs:
           KUBECONFIG: ${{ env.BENCH_TMPDIR }}/kubeconfig
         run: |
           TMPDIR="${{ env.BENCH_TMPDIR }}"
-          kubectl create namespace default --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace default --dry-run=client -o yaml | kubectl apply --validate=false -f -
           kubectl create configmap bench-config --from-literal=key=value --namespace default \
-            --dry-run=client -o yaml | kubectl apply -f -
+            --dry-run=client -o yaml | kubectl apply --validate=false -f -
           for i in $(seq 1 50); do
             kubectl apply --validate=false -f - <<EOF
           apiVersion: apps/v1
