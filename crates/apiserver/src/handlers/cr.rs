@@ -361,128 +361,28 @@ fn store_err_cr(err: u7s_store::StoreError, name: &str, kind: &str) -> crate::st
 // openAPIV3Schema validation
 // ---------------------------------------------------------------------------
 
-/// Validate `value` against a minimal subset of openAPIV3Schema.
-///
-/// Supported keywords:
-/// - `type`: "object", "string", "integer", "boolean", "number", "array"
-/// - `properties`: recursive sub-schema per key (only when type is "object")
-/// - `required`: list of required property names
-/// - `additionalProperties: false`: reject keys not listed in `properties`
-///
-/// Unknown keywords are silently ignored (permissive on unsupported features).
-/// Returns `Ok(())` when valid, `Err(message)` describing the first violation.
-pub fn validate_against_schema(
-    value: &serde_json::Value,
-    schema: &serde_json::Value,
-    path: &str,
-) -> Result<(), String> {
-    // Validate `type` constraint.
-    if let Some(expected_type) = schema.get("type").and_then(|t| t.as_str()) {
-        let actual_ok = match expected_type {
-            "object" => value.is_object(),
-            "string" => value.is_string(),
-            "integer" => value.is_i64() || value.is_u64(),
-            "number" => value.is_number(),
-            "boolean" => value.is_boolean(),
-            "array" => value.is_array(),
-            // Unknown type keywords → permissive
-            _ => true,
-        };
-        if !actual_ok {
-            let actual_type = json_type_name(value);
-            return Err(format!(
-                "{path}: expected type {expected_type}, got {actual_type}"
-            ));
-        }
-    }
-
-    // Only validate properties/required/additionalProperties for objects.
-    if let Some(obj) = value.as_object() {
-        let properties = schema.get("properties").and_then(|p| p.as_object());
-
-        // Validate `required` constraint.
-        if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
-            for req in required {
-                if let Some(key) = req.as_str() {
-                    if !obj.contains_key(key) {
-                        let field_path = if path.is_empty() {
-                            key.to_string()
-                        } else {
-                            format!("{path}.{key}")
-                        };
-                        return Err(format!("{field_path}: required field missing"));
-                    }
-                }
-            }
-        }
-
-        // Validate `additionalProperties: false`.
-        let additional_props = schema.get("additionalProperties");
-        let rejects_additional = matches!(additional_props, Some(serde_json::Value::Bool(false)));
-        if rejects_additional {
-            if let Some(props) = &properties {
-                for key in obj.keys() {
-                    if !props.contains_key(key.as_str()) {
-                        let field_path = if path.is_empty() {
-                            key.to_string()
-                        } else {
-                            format!("{path}.{key}")
-                        };
-                        return Err(format!(
-                            "{field_path}: unknown field (additionalProperties is false)"
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Recursively validate each declared property that is present in the object.
-        if let Some(props) = &properties {
-            for (key, sub_schema) in props.iter() {
-                if let Some(val) = obj.get(key.as_str()) {
-                    let child_path = if path.is_empty() {
-                        key.to_string()
-                    } else {
-                        format!("{path}.{key}")
-                    };
-                    validate_against_schema(val, sub_schema, &child_path)?;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn json_type_name(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(n) => {
-            if n.is_f64() {
-                "number"
-            } else {
-                "integer"
-            }
-        }
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
 /// Validate `obj` against the CRD schema in `ctx`, if a schema is present.
+/// Uses boon for full openAPIV3Schema keyword coverage (enum, pattern, minimum,
+/// maximum, format, items, oneOf, allOf, etc.).
 /// Returns `Err(StatusError)` with HTTP 422 if validation fails.
 fn validate_cr_schema(
     obj: &serde_json::Value,
     ctx: &CrContext,
 ) -> Result<(), crate::status::StatusError> {
-    if let Some(schema) = &ctx.schema {
-        validate_against_schema(obj, schema, "").map_err(|msg| {
-            Status::unprocessable_entity(format!("CR instance schema validation failed: {msg}"))
-        })?;
-    }
-    Ok(())
+    let Some(schema) = &ctx.schema else {
+        return Ok(());
+    };
+    let mut schemas = boon::Schemas::new();
+    let mut compiler = boon::Compiler::new();
+    compiler
+        .add_resource("schema.json", schema.clone())
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let idx = compiler
+        .compile("schema.json", &mut schemas)
+        .map_err(|e| Status::internal(e.to_string()))?;
+    schemas
+        .validate(obj, idx)
+        .map_err(|e| Status::unprocessable_entity(format!("CR schema validation failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2788,10 +2688,26 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // openAPIV3Schema validation tests
+    // openAPIV3Schema validation tests (boon-based)
     // ---------------------------------------------------------------------------
 
-    // validate_against_schema: type:object with valid object passes.
+    /// Helper: call validate_cr_schema with an inline schema value.
+    fn check_schema(
+        obj: &serde_json::Value,
+        schema: serde_json::Value,
+    ) -> Result<(), crate::status::StatusError> {
+        let ctx = CrContext {
+            kind: "Test".into(),
+            namespaced: false,
+            has_status_subresource: false,
+            schema: Some(schema),
+            storage_version: "v1".into(),
+            conversion_webhook_client_config: None,
+        };
+        validate_cr_schema(obj, &ctx)
+    }
+
+    // type:object with valid object passes.
     // This is the happy path — a properly typed CR body must not be rejected.
     #[test]
     fn schema_valid_object_passes() {
@@ -2803,12 +2719,12 @@ mod tests {
         });
         let value = serde_json::json!({ "spec": {} });
         assert!(
-            validate_against_schema(&value, &schema, "").is_ok(),
+            check_schema(&value, schema).is_ok(),
             "valid object must pass schema validation"
         );
     }
 
-    // validate_against_schema: type:object with spec as string fails.
+    // type:object with spec as string fails.
     // Ensures the type constraint is actually enforced — wrong types must be caught.
     #[test]
     fn schema_wrong_type_for_property_fails() {
@@ -2819,18 +2735,15 @@ mod tests {
             }
         });
         let value = serde_json::json!({ "spec": "not-an-object" });
-        let err = validate_against_schema(&value, &schema, "").unwrap_err();
+        let err = check_schema(&value, schema).unwrap_err();
+        let msg = &err.1.message;
         assert!(
-            err.contains("spec"),
-            "error must name the offending field (got: {err})"
-        );
-        assert!(
-            err.contains("object"),
-            "error must mention expected type (got: {err})"
+            msg.contains("spec"),
+            "error must name the offending field (got: {msg})"
         );
     }
 
-    // validate_against_schema: required field missing causes an error.
+    // required field missing causes an error.
     // Controllers rely on required fields being present — silent acceptance would
     // allow incomplete CRs that break the controller's assumptions.
     #[test]
@@ -2843,18 +2756,15 @@ mod tests {
             }
         });
         let value = serde_json::json!({ "metadata": { "name": "foo" } });
-        let err = validate_against_schema(&value, &schema, "").unwrap_err();
+        let err = check_schema(&value, schema).unwrap_err();
+        let msg = &err.1.message;
         assert!(
-            err.contains("spec"),
-            "error must mention the missing required field (got: {err})"
-        );
-        assert!(
-            err.contains("required"),
-            "error must say the field is required (got: {err})"
+            msg.contains("spec"),
+            "error must mention the missing required field (got: {msg})"
         );
     }
 
-    // validate_against_schema: additionalProperties:false rejects unknown keys.
+    // additionalProperties:false rejects unknown keys.
     // Strict schemas should prevent typos in field names from being silently stored.
     #[test]
     fn schema_additional_properties_false_rejects_unknown_key() {
@@ -2866,46 +2776,79 @@ mod tests {
             "additionalProperties": false
         });
         let value = serde_json::json!({ "spec": {}, "unknownField": "oops" });
-        let err = validate_against_schema(&value, &schema, "").unwrap_err();
         assert!(
-            err.contains("unknownField"),
-            "error must name the unexpected field (got: {err})"
+            check_schema(&value, schema).is_err(),
+            "additional property must be rejected"
         );
     }
 
-    // validate_against_schema: unknown keywords are ignored (permissive).
-    // openAPIV3Schema has many optional keywords; we must not reject schemas
-    // that use keywords we haven't implemented.
+    // Unknown extension keywords must not cause a compile error (permissive).
+    // openAPIV3Schema CRDs use x-kubernetes-* extensions; boon must not reject them.
     #[test]
-    fn schema_unknown_keywords_are_ignored() {
+    fn schema_unknown_extension_keywords_do_not_fail_compile() {
         let schema = serde_json::json!({
             "type": "object",
             "x-kubernetes-preserve-unknown-fields": true,
-            "description": "some doc",
-            "default": {}
+            "description": "some doc"
         });
         let value = serde_json::json!({ "anything": "here" });
         assert!(
-            validate_against_schema(&value, &schema, "").is_ok(),
-            "unknown keywords must not cause validation failure"
+            check_schema(&value, schema).is_ok(),
+            "schema with extension keywords must not cause compile or validation error"
         );
     }
 
-    // validate_against_schema: scalar types are correctly checked.
+    // scalar types are correctly checked.
     // These are the leaf types that CRD schemas declare for individual fields.
     #[test]
     fn schema_scalar_type_checks() {
         let string_schema = serde_json::json!({ "type": "string" });
-        assert!(validate_against_schema(&serde_json::json!("hello"), &string_schema, "f").is_ok());
-        assert!(validate_against_schema(&serde_json::json!(42), &string_schema, "f").is_err());
+        assert!(check_schema(&serde_json::json!("hello"), string_schema.clone()).is_ok());
+        assert!(check_schema(&serde_json::json!(42), string_schema).is_err());
 
         let int_schema = serde_json::json!({ "type": "integer" });
-        assert!(validate_against_schema(&serde_json::json!(7), &int_schema, "f").is_ok());
-        assert!(validate_against_schema(&serde_json::json!("7"), &int_schema, "f").is_err());
+        assert!(check_schema(&serde_json::json!(7), int_schema.clone()).is_ok());
+        assert!(check_schema(&serde_json::json!("7"), int_schema).is_err());
 
         let bool_schema = serde_json::json!({ "type": "boolean" });
-        assert!(validate_against_schema(&serde_json::json!(true), &bool_schema, "f").is_ok());
-        assert!(validate_against_schema(&serde_json::json!(1), &bool_schema, "f").is_err());
+        assert!(check_schema(&serde_json::json!(true), bool_schema.clone()).is_ok());
+        assert!(check_schema(&serde_json::json!(1), bool_schema).is_err());
+    }
+
+    // enum violation: value not in the allowed set must be rejected.
+    // The old hand-rolled validator silently accepted enum violations — this test
+    // ensures boon enforces enum correctly.
+    #[test]
+    fn schema_enum_violation_fails() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "enum": ["Issuer", "ClusterIssuer"] }
+            }
+        });
+        let value = serde_json::json!({ "kind": "BadValue" });
+        assert!(
+            check_schema(&value, schema).is_err(),
+            "enum violation must be rejected by boon"
+        );
+    }
+
+    // pattern violation: string not matching regex must be rejected.
+    // The old hand-rolled validator silently accepted pattern violations — this test
+    // ensures boon enforces pattern correctly.
+    #[test]
+    fn schema_pattern_violation_fails() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "duration": { "type": "string", "pattern": "^[0-9]+(h|m|s)$" }
+            }
+        });
+        let value = serde_json::json!({ "duration": "90days" });
+        assert!(
+            check_schema(&value, schema).is_err(),
+            "pattern violation must be rejected by boon"
+        );
     }
 
     // CRD with schema: valid CR body accepted by create_cr_namespaced.
@@ -3968,54 +3911,49 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Additional validate_against_schema branch coverage
+    // Additional boon schema validation coverage
     // ---------------------------------------------------------------------------
 
-    // validate_against_schema must report the correct type name for null.
-    // json_type_name(Null) → "null"; type:string with null value must fail with "null" in the message.
+    // type:string with null value must fail.
+    // Ensures boon catches null values where a string is expected.
     #[test]
-    fn schema_null_value_type_error_mentions_null() {
+    fn schema_null_value_type_error() {
         let schema = serde_json::json!({ "type": "string" });
-        let err = validate_against_schema(&serde_json::Value::Null, &schema, "f").unwrap_err();
         assert!(
-            err.contains("null"),
-            "type error for null must mention 'null' (got: {err})"
+            check_schema(&serde_json::Value::Null, schema).is_err(),
+            "type:string must reject null"
         );
     }
 
-    // validate_against_schema must report the correct type name for an array.
-    // json_type_name(Array) → "array"; type:string with array value must fail with "array" in message.
+    // type:string with array value must fail.
+    // Ensures boon catches array values where a string is expected.
     #[test]
-    fn schema_array_value_type_error_mentions_array() {
+    fn schema_array_value_type_error() {
         let schema = serde_json::json!({ "type": "string" });
-        let err = validate_against_schema(&serde_json::json!([1, 2, 3]), &schema, "f").unwrap_err();
         assert!(
-            err.contains("array"),
-            "type error for array must mention 'array' (got: {err})"
+            check_schema(&serde_json::json!([1, 2, 3]), schema).is_err(),
+            "type:string must reject an array"
         );
     }
 
-    // validate_against_schema: type:number accepts floats.
-    // json_type_name for a float is "number", and the type constraint "number" accepts it.
+    // type:number accepts floats.
+    // The type constraint "number" must accept floating-point values.
     #[test]
     fn schema_number_type_accepts_float() {
         let schema = serde_json::json!({ "type": "number" });
         assert!(
-            validate_against_schema(&serde_json::json!(1.5), &schema, "f").is_ok(),
+            check_schema(&serde_json::json!(1.5), schema).is_ok(),
             "type:number must accept a float value"
         );
     }
 
-    // validate_against_schema: type:number rejects a string.
-    // The error message must include "number" as the expected type.
+    // type:number rejects a string.
     #[test]
     fn schema_number_type_rejects_string() {
         let schema = serde_json::json!({ "type": "number" });
-        let err =
-            validate_against_schema(&serde_json::json!("not-a-number"), &schema, "f").unwrap_err();
         assert!(
-            err.contains("number"),
-            "type error must mention 'number' (got: {err})"
+            check_schema(&serde_json::json!("not-a-number"), schema).is_err(),
+            "type:number must reject a string"
         );
     }
 
