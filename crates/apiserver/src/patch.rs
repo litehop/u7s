@@ -225,6 +225,10 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
 
         path if path.ends_with(".volumeMounts") => MergeKeyKind::Key("mountPath"),
 
+        // Service spec.ports uses "port" (integer) as the merge key, not "containerPort".
+        // This exact match must come before the suffix match below.
+        "spec.ports" => MergeKeyKind::Key("port"),
+
         path if path.ends_with(".ports") => MergeKeyKind::Key("containerPort"),
 
         "rules" | "subjects" => MergeKeyKind::Replace,
@@ -688,6 +692,48 @@ mod tests {
             containers[0]["name"].as_str().unwrap(),
             "real",
             "element with non-empty merge key must be untouched"
+        );
+    }
+
+    #[test]
+    fn test_smp_service_ports_merge_key_is_port_not_container_port() {
+        // Service spec.ports uses "port" as the merge key, not "containerPort".
+        // Patching targetPort on port 80 must leave port 443 unchanged.
+        // Without the explicit "spec.ports" → "port" entry the suffix-match arm
+        // maps spec.ports to "containerPort", which finds no match (Service ports
+        // have no containerPort field) and appends instead of merging — corrupting
+        // the port list.
+        let mut target = serde_json::json!({
+            "spec": {
+                "ports": [
+                    {"port": 80,  "protocol": "TCP", "targetPort": 8080},
+                    {"port": 443, "protocol": "TCP", "targetPort": 8443}
+                ]
+            }
+        });
+        let patch = serde_json::json!({
+            "spec": {
+                "ports": [
+                    {"port": 80, "protocol": "TCP", "targetPort": 9090}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let ports = target["spec"]["ports"].as_array().unwrap();
+        assert_eq!(ports.len(), 2, "port 443 must survive the partial patch");
+        let port80 = ports.iter().find(|p| p["port"] == 80).unwrap();
+        assert_eq!(
+            port80["targetPort"], 9090,
+            "targetPort for port 80 must be updated"
+        );
+        let port443 = ports.iter().find(|p| p["port"] == 443);
+        assert!(port443.is_some(), "port 443 must not be dropped");
+        assert_eq!(
+            port443.unwrap()["targetPort"],
+            8443,
+            "port 443 targetPort must be unchanged"
         );
     }
 }
