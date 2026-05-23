@@ -156,12 +156,25 @@ jobs:
           done
           kill -0 "$KCM_PID" 2>/dev/null || { echo "kcm failed to start"; cat "$TMPDIR/kcm.log"; exit 1; }
 
+      - name: Start u7s-scheduler
+        run: |
+          TMPDIR="${{ env.BENCH_TMPDIR }}"
+          cargo build --release -p u7s-scheduler
+          ./target/release/u7s-scheduler \
+            --kubeconfig "$TMPDIR/kubeconfig-cert" \
+            >"$TMPDIR/scheduler.log" 2>&1 &
+          echo "SCHEDULER_PID=$!" >> "$GITHUB_ENV"
+
       - name: Sample baseline RSS
         run: |
           sleep 5
-          RSS_BASELINE=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+          SERVER_RSS=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+          SCHEDULER_RSS=$(ps -o rss= -p "$SCHEDULER_PID" | tr -d ' ')
+          RSS_BASELINE=$(( SERVER_RSS + SCHEDULER_RSS ))
           echo "RSS_BASELINE=$RSS_BASELINE" >> "$GITHUB_ENV"
-          echo "Baseline RSS: ${RSS_BASELINE} kB"
+          echo "Baseline RSS (apiserver): ${SERVER_RSS} kB"
+          echo "Baseline RSS (scheduler): ${SCHEDULER_RSS} kB"
+          echo "Baseline RSS (combined) : ${RSS_BASELINE} kB"
 
       - name: Deployment reconciliation workload (50 cycles)
         env:
@@ -213,11 +226,15 @@ jobs:
 
       - name: Sample peak RSS and check threshold
         run: |
-          RSS_PEAK=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+          SERVER_RSS=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+          SCHEDULER_RSS=$(ps -o rss= -p "$SCHEDULER_PID" | tr -d ' ')
+          RSS_PEAK=$(( SERVER_RSS + SCHEDULER_RSS ))
           DELTA=$(( RSS_PEAK - RSS_BASELINE ))
-          echo "Baseline RSS: ${RSS_BASELINE} kB"
-          echo "Peak RSS:     ${RSS_PEAK} kB"
-          echo "Delta:        ${DELTA} kB"
+          echo "Baseline RSS (combined): ${RSS_BASELINE} kB"
+          echo "Peak RSS (apiserver)   : ${SERVER_RSS} kB"
+          echo "Peak RSS (scheduler)   : ${SCHEDULER_RSS} kB"
+          echo "Peak RSS (combined)    : ${RSS_PEAK} kB"
+          echo "Delta                  : ${DELTA} kB"
           if [ "$DELTA" -gt 10240 ]; then
             echo "FAIL: RSS delta ${DELTA} kB exceeds 10240 kB (10 MB)"
             exit 1
@@ -227,6 +244,7 @@ jobs:
       - name: Stop apiserver and kcm
         if: always()
         run: |
+          [ -n "$SCHEDULER_PID" ] && kill "$SCHEDULER_PID" 2>/dev/null || true
           [ -n "$KCM_PID" ] && kill "$KCM_PID" 2>/dev/null || true
           [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
 
@@ -238,3 +256,4 @@ jobs:
           path: |
             ${{ env.BENCH_TMPDIR }}/server.log
             ${{ env.BENCH_TMPDIR }}/kcm.log
+            ${{ env.BENCH_TMPDIR }}/scheduler.log

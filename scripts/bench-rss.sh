@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# bench-rss.sh — Measure idle RSS of u7s-apiserver.
+# bench-rss.sh — Measure idle RSS of u7s-apiserver + u7s-scheduler.
 #
-# Exits 0 if RSS <= 65536 kB (64 MB), exits 1 otherwise.
+# Exits 0 if combined RSS <= 65536 kB (64 MB), exits 1 otherwise.
 # Works on macOS and Linux.
 
 set -euo pipefail
 
 THRESHOLD_KB=65536  # 64 MB
 SERVER_PID=""
+SCHEDULER_PID=""
 
 TMPDIR="$(mktemp -d /tmp/u7s-bench-XXXXXX)"
-trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi; echo "Server log:"; cat "$TMPDIR/server.log" 2>/dev/null || true' EXIT
+trap 'if [ -n "$SCHEDULER_PID" ]; then kill "$SCHEDULER_PID" 2>/dev/null || true; fi; if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi; echo "Server log:"; cat "$TMPDIR/server.log" 2>/dev/null || true' EXIT
 
-echo "==> Building release binary..."
+echo "==> Building release binaries..."
 cargo build --release -p u7s-apiserver
+cargo build --release -p u7s-scheduler
 
 echo "==> Starting apiserver (logs -> $TMPDIR/server.log)..."
 BENCH_TOKEN="bench-token"
@@ -39,27 +41,44 @@ if ! nc -z 127.0.0.1 6443 2>/dev/null; then
     exit 1
 fi
 
+echo "==> Starting scheduler (logs -> $TMPDIR/scheduler.log)..."
+./target/release/u7s-scheduler \
+    --kubeconfig "$TMPDIR/kubeconfig" \
+    >"$TMPDIR/scheduler.log" 2>&1 &
+SCHEDULER_PID=$!
+
 echo "==> Waiting 3s for memory to stabilize..."
 sleep 3
 
-RSS_KB=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+SERVER_RSS_KB=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
+SCHEDULER_RSS_KB=$(ps -o rss= -p "$SCHEDULER_PID" | tr -d ' ')
 
-if [ -z "$RSS_KB" ]; then
-    echo "ERROR: could not sample RSS for PID $SERVER_PID"
+if [ -z "$SERVER_RSS_KB" ]; then
+    echo "ERROR: could not sample RSS for server PID $SERVER_PID"
+    exit 1
+fi
+if [ -z "$SCHEDULER_RSS_KB" ]; then
+    echo "ERROR: could not sample RSS for scheduler PID $SCHEDULER_PID"
     exit 1
 fi
 
-echo "RSS: ${RSS_KB} kB (threshold: ${THRESHOLD_KB} kB)"
+COMBINED_RSS_KB=$(( SERVER_RSS_KB + SCHEDULER_RSS_KB ))
+
+echo "Apiserver RSS : ${SERVER_RSS_KB} kB"
+echo "Scheduler RSS : ${SCHEDULER_RSS_KB} kB"
+echo "Combined RSS  : ${COMBINED_RSS_KB} kB (threshold: ${THRESHOLD_KB} kB)"
 
 # Disarm the EXIT trap — normal exit, suppress log dump
-trap 'if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi' EXIT
+trap 'if [ -n "$SCHEDULER_PID" ]; then kill "$SCHEDULER_PID" 2>/dev/null || true; fi; if [ -n "$SERVER_PID" ]; then kill "$SERVER_PID" 2>/dev/null || true; fi' EXIT
 
-if [ "$RSS_KB" -le "$THRESHOLD_KB" ]; then
-    echo "PASS: RSS ${RSS_KB} kB is within the 64 MB threshold"
+if [ "$COMBINED_RSS_KB" -le "$THRESHOLD_KB" ]; then
+    echo "PASS: combined RSS ${COMBINED_RSS_KB} kB is within the 64 MB threshold"
     exit 0
 else
-    echo "FAIL: RSS ${RSS_KB} kB exceeds the 64 MB threshold (${THRESHOLD_KB} kB)"
+    echo "FAIL: combined RSS ${COMBINED_RSS_KB} kB exceeds the 64 MB threshold (${THRESHOLD_KB} kB)"
     echo "Server log:"
     cat "$TMPDIR/server.log" || true
+    echo "Scheduler log:"
+    cat "$TMPDIR/scheduler.log" || true
     exit 1
 fi
