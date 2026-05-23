@@ -1447,4 +1447,103 @@ mod tests {
         // Unknown field → ignore → still matches
         assert!(object_matches_field_selector(&obj, "status.phase=Running"));
     }
+
+    // -- sendInitialEvents regression: initial-events-end BOOKMARK via watch_generic (mayor-w9tz) --
+
+    /// Regression: when fetch_initial_events returns Some(items, rv) and is passed to
+    /// watch_generic, the stream must emit the initial-events-end BOOKMARK before any
+    /// live events. This verifies the fix for mayor-w9tz: CR watch paths (cr.rs, crd.rs)
+    /// previously passed None for initial_items, causing GC to block forever waiting for
+    /// the BOOKMARK and never completing cache sync.
+    #[tokio::test]
+    async fn watch_generic_with_initial_items_emits_initial_events_end_bookmark() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Seed one object so initial_items is non-empty.
+        let obj = serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "GatewayClass",
+            "metadata": { "name": "my-gc" }
+        });
+        store
+            .put(
+                "/registry/gateway.networking.k8s.io/v1/gatewayclasses/my-gc",
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Simulate what list_cr does: call fetch_initial_events then pass result to watch_generic.
+        let initial_items = match fetch_initial_events(
+            &state,
+            "/registry/gateway.networking.k8s.io/v1/gatewayclasses/",
+            true, // send_initial_events = true
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("fetch_initial_events must not fail"),
+        };
+
+        assert!(
+            initial_items.is_some(),
+            "fetch_initial_events must return Some when send_initial_events=true"
+        );
+
+        let resp = match watch_generic(
+            state,
+            "/registry/gateway.networking.k8s.io/v1/gatewayclasses/".into(),
+            "gateway.networking.k8s.io/v1".into(),
+            "GatewayClass".into(),
+            0,
+            initial_items,
+            None,
+            None,
+            true, // allow_watch_bookmarks
+            "test-user".into(),
+            false,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("watch_generic must succeed"),
+        };
+
+        let lines = read_watch_body_with_timeout(resp).await;
+
+        // The stream must contain at least: ADDED (for seeded object) + BOOKMARK with
+        // k8s.io/initial-events-end=true. If initial_items is None (the bug), no BOOKMARK
+        // is emitted and GC blocks forever waiting for it.
+        let bookmark = lines.iter().find(|v| {
+            v["type"] == "BOOKMARK"
+                && v["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"] == "true"
+        });
+        assert!(
+            bookmark.is_some(),
+            "watch_generic must emit initial-events-end BOOKMARK when initial_items is Some; \
+             without it GC (metadatainformer) blocks cache sync forever (mayor-w9tz). \
+             Got lines: {:?}",
+            lines
+        );
+
+        let added_count = lines.iter().filter(|v| v["type"] == "ADDED").count();
+        assert!(
+            added_count >= 1,
+            "watch_generic must emit at least one ADDED event for the seeded object before the BOOKMARK; got {:?}",
+            lines
+        );
+    }
 }
