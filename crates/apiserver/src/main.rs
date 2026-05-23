@@ -525,6 +525,43 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("seed ClusterRoleBinding system:masters: {e}"))?;
     tracing::info!("seeded ClusterRoleBinding: system:masters");
 
+    // ClusterRole: system:basic-user — grants every authenticated user the
+    // ability to create SelfSubjectAccessReviews and SelfSubjectRulesReviews.
+    // Argo CD calls these endpoints on startup to discover its own permissions;
+    // without this role those requests are denied with 403.
+    let bu_role_key = keys::group_object_key(GROUP, "clusterroles", None, "system:basic-user");
+    let bu_role_body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": { "name": "system:basic-user", "uid": "00000000-0000-0000-0000-000000000014", "creationTimestamp": "2024-01-01T00:00:00Z" },
+        "rules": [
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["selfsubjectaccessreviews","selfsubjectrulesreviews"], "verbs": ["create"] }
+        ]
+    });
+    store
+        .put(&bu_role_key, Bytes::from(bu_role_body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed ClusterRole system:basic-user: {e}"))?;
+    tracing::info!("seeded ClusterRole: system:basic-user");
+
+    // ClusterRoleBinding: system:basic-user — binds system:authenticated group
+    // to the system:basic-user ClusterRole.  This is the standard Kubernetes
+    // bootstrap binding that Argo CD relies on for permission discovery.
+    let bu_bind_key =
+        keys::group_object_key(GROUP, "clusterrolebindings", None, "system:basic-user");
+    let bu_bind_body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:basic-user", "uid": "00000000-0000-0000-0000-000000000015", "creationTimestamp": "2024-01-01T00:00:00Z" },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:authenticated" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:basic-user" }
+    });
+    store
+        .put(&bu_bind_key, Bytes::from(bu_bind_body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed ClusterRoleBinding system:basic-user: {e}"))?;
+    tracing::info!("seeded ClusterRoleBinding: system:basic-user");
+
     Ok(())
 }
 
@@ -929,6 +966,88 @@ mod tests {
         let store = make_store();
         seed_rbac(&store).await.expect("first seed must not fail");
         seed_rbac(&store).await.expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn seed_rbac_creates_basic_user_role_and_authenticated_binding() {
+        // Argo CD calls SelfSubjectAccessReview on startup to discover its own permissions.
+        // This requires:
+        //   1. ClusterRole system:basic-user granting create on selfsubjectaccessreviews.
+        //   2. ClusterRoleBinding system:basic-user binding system:authenticated → that role.
+        // Without these, every authenticated user gets 403 on discovery, breaking Argo CD startup.
+        const GROUP: &str = "rbac.authorization.k8s.io";
+
+        let store = make_store();
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        // ClusterRole system:basic-user must exist with the right rules.
+        let bu_role_key = keys::group_object_key(GROUP, "clusterroles", None, "system:basic-user");
+        let bu_role_obj = store.get(&bu_role_key).await.expect("get must not fail");
+        assert!(
+            bu_role_obj.is_some(),
+            "ClusterRole system:basic-user must exist after seeding"
+        );
+        let bu_role: serde_json::Value =
+            serde_json::from_slice(&bu_role_obj.unwrap().value).expect("valid json");
+        assert_eq!(bu_role["kind"].as_str(), Some("ClusterRole"));
+        assert_eq!(
+            bu_role["metadata"]["name"].as_str(),
+            Some("system:basic-user")
+        );
+        let rules = bu_role["rules"].as_array().expect("rules must be an array");
+        let resources: Vec<String> = rules
+            .iter()
+            .flat_map(|r| {
+                r["resources"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert!(
+            resources.iter().any(|r| r == "selfsubjectaccessreviews"),
+            "system:basic-user must grant selfsubjectaccessreviews"
+        );
+        assert!(
+            resources.iter().any(|r| r == "selfsubjectrulesreviews"),
+            "system:basic-user must grant selfsubjectrulesreviews"
+        );
+
+        // ClusterRoleBinding system:basic-user must bind system:authenticated group.
+        let bu_bind_key =
+            keys::group_object_key(GROUP, "clusterrolebindings", None, "system:basic-user");
+        let bu_bind_obj = store.get(&bu_bind_key).await.expect("get must not fail");
+        assert!(
+            bu_bind_obj.is_some(),
+            "ClusterRoleBinding system:basic-user must exist after seeding"
+        );
+        let bu_bind: serde_json::Value =
+            serde_json::from_slice(&bu_bind_obj.unwrap().value).expect("valid json");
+        assert_eq!(bu_bind["kind"].as_str(), Some("ClusterRoleBinding"));
+        assert_eq!(
+            bu_bind["metadata"]["name"].as_str(),
+            Some("system:basic-user")
+        );
+        let subjects = bu_bind["subjects"]
+            .as_array()
+            .expect("subjects must be an array");
+        assert_eq!(subjects.len(), 1, "must have exactly one subject");
+        assert_eq!(subjects[0]["kind"].as_str(), Some("Group"));
+        assert_eq!(
+            subjects[0]["name"].as_str(),
+            Some("system:authenticated"),
+            "binding must target system:authenticated so all authed users get basic-user permissions"
+        );
+        assert_eq!(
+            bu_bind["roleRef"]["name"].as_str(),
+            Some("system:basic-user"),
+            "ClusterRoleBinding must reference system:basic-user role"
+        );
+        assert_eq!(bu_bind["roleRef"]["kind"].as_str(), Some("ClusterRole"));
     }
 
     #[tokio::test]
