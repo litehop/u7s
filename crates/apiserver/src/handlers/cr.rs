@@ -551,13 +551,19 @@ pub async fn list_cr(
         } else {
             (format!("{group}/{version}"), ctx.kind.clone())
         };
+        let initial_items = super::watch::fetch_initial_events(
+            &state,
+            &prefix,
+            query.send_initial_events == Some(true),
+        )
+        .await?;
         return super::watch::watch_generic(
             state,
             prefix,
             watch_api_version,
             watch_kind,
             query.resource_version.unwrap_or(0),
-            None,
+            initial_items,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
@@ -865,13 +871,19 @@ pub async fn list_cr_namespaced(
         } else {
             (format!("{group}/{version}"), ctx.kind.clone())
         };
+        let initial_items = super::watch::fetch_initial_events(
+            &state,
+            &prefix,
+            query.send_initial_events == Some(true),
+        )
+        .await?;
         return super::watch::watch_generic(
             state,
             prefix,
             watch_api_version,
             watch_kind,
             query.resource_version.unwrap_or(0),
-            None,
+            initial_items,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),

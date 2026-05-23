@@ -206,13 +206,19 @@ pub async fn list_crds(
     let prefix = list_prefix();
 
     if query.watch == Some(true) {
+        let initial_items = super::watch::fetch_initial_events(
+            &state,
+            &prefix,
+            query.send_initial_events == Some(true),
+        )
+        .await?;
         return super::watch::watch_generic(
             state,
             prefix,
             API_VERSION.to_string(),
             KIND.to_string(),
             query.resource_version.unwrap_or(0),
-            None,
+            initial_items,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
