@@ -1138,6 +1138,118 @@ mod tests {
         (key, val)
     }
 
+    // --- enumerate_rules namespace binding path + RoleBinding→ClusterRole (mayor-qftq) ---
+
+    #[test]
+    fn enumerate_rules_rolebinding_appears_in_bound_namespace_only() {
+        // enumerate_rules must include rules from a namespace-scoped RoleBinding only
+        // when called with the matching namespace. Returning rules in the wrong namespace
+        // would allow cross-namespace privilege escalation.
+        let idx = RbacIndex::new();
+
+        let (role_key, role_val) = make_role(
+            "ns-a",
+            "ns-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["configmaps"],
+                "verbs": ["get", "list"]
+            }]),
+        );
+        idx.apply_object(&role_key, &role_val);
+
+        let (bind_key, bind_val) = make_role_binding(
+            "ns-a",
+            "alice-ns-reader",
+            "ns-reader",
+            json!([{ "kind": "User", "name": "alice" }]),
+        );
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![];
+
+        // Rules must appear when called with the bound namespace.
+        let rules_in_ns_a = idx.enumerate_rules("alice", &groups, "ns-a");
+        assert!(
+            !rules_in_ns_a.is_empty(),
+            "enumerate_rules must include rules for alice in namespace 'ns-a' where she is bound"
+        );
+        let verbs_in_ns_a: Vec<&str> = rules_in_ns_a
+            .iter()
+            .flat_map(|r| r.verbs.iter().map(|v| v.as_str()))
+            .collect();
+        assert!(
+            verbs_in_ns_a.contains(&"get"),
+            "rules in ns-a must include the 'get' verb from the bound Role"
+        );
+
+        // Rules must NOT appear for a different namespace.
+        let rules_in_ns_b = idx.enumerate_rules("alice", &groups, "ns-b");
+        assert!(
+            rules_in_ns_b.is_empty(),
+            "enumerate_rules must NOT include rules for alice in namespace 'ns-b' — \
+             RoleBinding in 'ns-a' must not leak to 'ns-b'"
+        );
+    }
+
+    #[test]
+    fn enumerate_rules_rolebinding_to_clusterrole_returns_clusterrole_rules() {
+        // A RoleBinding whose roleRef.kind=ClusterRole must resolve the ClusterRole's rules
+        // and return them scoped to the binding's namespace. This allows granting
+        // cluster-wide role definitions in a specific namespace without creating a Role copy.
+        let idx = RbacIndex::new();
+
+        // Seed a ClusterRole (not a namespaced Role).
+        let (cr_key, cr_val) = make_cluster_role(
+            "global-pod-reader",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get", "list", "watch"]
+            }]),
+        );
+        idx.apply_object(&cr_key, &cr_val);
+
+        // Create a RoleBinding in "staging" that refs the ClusterRole (not a Role).
+        let rb_key = "/apis/rbac.authorization.k8s.io/v1/namespaces/staging/rolebindings/bob-pod-reader".to_owned();
+        let rb_val = json!({
+            "subjects": [{ "kind": "User", "name": "bob" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "global-pod-reader"
+            },
+            "namespace": "staging"
+        });
+        idx.apply_object(&rb_key, &rb_val);
+
+        let groups: Vec<String> = vec![];
+
+        // enumerate_rules in "staging" must return the ClusterRole's rules.
+        let rules = idx.enumerate_rules("bob", &groups, "staging");
+        assert!(
+            !rules.is_empty(),
+            "RoleBinding pointing to a ClusterRole must resolve and return the ClusterRole's rules \
+             in the bound namespace; empty rules means the ClusterRole ref was not followed"
+        );
+        let verbs: Vec<&str> = rules
+            .iter()
+            .flat_map(|r| r.verbs.iter().map(|v| v.as_str()))
+            .collect();
+        assert!(
+            verbs.contains(&"watch"),
+            "ClusterRole rules must include 'watch' verb; got {:?}",
+            verbs
+        );
+
+        // Must NOT appear in a different namespace — RoleBinding is namespace-scoped.
+        let rules_other = idx.enumerate_rules("bob", &groups, "production");
+        assert!(
+            rules_other.is_empty(),
+            "RoleBinding in 'staging' pointing to ClusterRole must not grant rules in 'production'"
+        );
+    }
+
     #[test]
     fn serviceaccount_subject_matches_encoded_username() {
         // Kubernetes encodes ServiceAccount subjects as "system:serviceaccount:<ns>:<name>".
