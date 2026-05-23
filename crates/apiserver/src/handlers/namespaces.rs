@@ -8,6 +8,7 @@ use bytes::Bytes;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
+    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     keys::{cluster_list_prefix, cluster_object_key},
     proto,
@@ -179,6 +180,18 @@ pub async fn create_namespace(
                 serde_json::Value::String(uuid::Uuid::new_v4().to_string());
         }
     }
+
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "namespaces",
+        name: &name,
+        namespace: None,
+        operation: "CREATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
     let key = cluster_object_key("namespaces", &name);
     let new_rv = state
@@ -953,6 +966,211 @@ mod tests {
             err.0,
             StatusCode::NOT_FOUND,
             "deleting non-existent namespace must return 404"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admission regression tests — prove create_namespace invokes the
+// admission webhook pipeline (mayor-8sn9).
+//
+// Without the fix, create_namespace bypassed admission entirely; admission-based
+// controls on namespaces were non-functional.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admission_tests {
+    use std::sync::Arc;
+
+    use axum::{routing::post, Router};
+    use bytes::Bytes;
+    use tokio::net::TcpListener;
+    use u7s_store::{SqliteStore, Store};
+
+    use super::*;
+
+    fn make_state(store: Arc<SqliteStore>) -> crate::state::AppState {
+        crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    async fn start_mock_webhook(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock webhook server must not fail");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// create_namespace must invoke the mutating admission pipeline.
+    /// A mutating webhook that adds a label must have that label in the stored
+    /// namespace. Without the fix, the webhook was never called.
+    #[tokio::test]
+    async fn create_namespace_invokes_mutating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        let patch_label_router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/metadata/labels", "value": {"admitted": "yes"}}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        );
+
+        let (url, _handle) = start_mock_webhook(patch_label_router).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "test-mutating-ns"},
+            "webhooks": [{
+                "name": "test.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["namespaces"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/test-mutating-ns",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ns_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "test-ns"}
+            })
+            .to_string(),
+        );
+
+        let result = create_namespace(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            ns_body,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "create_namespace must succeed when webhook allows"
+        );
+
+        let stored = store
+            .get(&crate::keys::cluster_object_key("namespaces", "test-ns"))
+            .await
+            .unwrap()
+            .expect("namespace must be stored");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["labels"]["admitted"], "yes",
+            "mutating webhook label must be present in stored namespace — \
+             without the fix, create_namespace bypassed admission and the label was never injected"
+        );
+    }
+
+    /// create_namespace must invoke the validating admission pipeline.
+    /// A validating webhook that denies must cause create_namespace to return an error,
+    /// and the namespace must NOT be stored.
+    #[tokio::test]
+    async fn create_namespace_invokes_validating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        let deny_router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": false,
+                        "status": {"code": 403, "message": "denied by test webhook"}
+                    }
+                }))
+            }),
+        );
+
+        let (url, _handle) = start_mock_webhook(deny_router).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating-ns"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["namespaces"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating-ns",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ns_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "denied-ns"}
+            })
+            .to_string(),
+        );
+
+        let result = create_namespace(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            ns_body,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "create_namespace must be rejected when validating webhook denies — \
+             without the fix, admission was bypassed and the namespace was silently stored"
+        );
+
+        let stored = store
+            .get(&crate::keys::cluster_object_key("namespaces", "denied-ns"))
+            .await
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "denied namespace must not be stored in the backing store"
         );
     }
 }

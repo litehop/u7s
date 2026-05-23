@@ -7,6 +7,9 @@ use axum::{
 use bytes::Bytes;
 use u7s_store::{ListOptions, Store, StoreError};
 
+use crate::admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext};
+use crate::{limit_range, quota};
+
 use crate::{
     auth::UserInfo,
     keys::{group_list_prefix, group_object_key},
@@ -181,6 +184,18 @@ pub async fn create_resource(
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
 
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: None,
+        operation: "CREATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+
     let key = group_object_key(&group, &plural, None, &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
     let new_rv = match result {
@@ -250,6 +265,18 @@ pub async fn replace_resource(
     }
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
+
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: None,
+        operation: "UPDATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
     let key = group_object_key(&group, &plural, None, &name);
     let new_rv = state
@@ -451,6 +478,18 @@ pub(crate) async fn do_patch(
         }
         return Ok(Json(current.body).into_response());
     }
+
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group,
+        version,
+        resource: plural,
+        name,
+        namespace: ns,
+        operation: "UPDATE",
+    };
+    current.body = run_mutating_webhooks(state, current.body, &admission_ctx).await?;
+    run_validating_webhooks(state, &current.body, &admission_ctx).await?;
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -664,6 +703,24 @@ pub async fn create_namespaced_resource(
         serde_json::to_value(ns_meta).map_err(|e| Status::internal(e.to_string()))?;
     stamp_metadata(&mut obj);
 
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: Some(&ns),
+        operation: "CREATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+
+    // LimitRange: inject defaults then validate min/max bounds (pods only).
+    obj.body = limit_range::apply_limit_ranges(&state, obj.body, &ns, &plural).await?;
+
+    // ResourceQuota: ensure object count does not exceed hard limits.
+    quota::check_resource_quota(&state, &ns, &group, &plural).await?;
+
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
     let new_rv = match result {
@@ -729,6 +786,18 @@ pub async fn replace_namespaced_resource(
     }
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
+
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: Some(&ns),
+        operation: "UPDATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let new_rv = state
@@ -1707,6 +1776,28 @@ mod tests {
             "metadata": {"name": "cluster-admin"},
             "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
         });
+        // Pre-seed the rbac_index so system:masters can create ClusterRoleBindings
+        // via RBAC (no hardcoded bypass exists).
+        let masters_crb_seed = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "system-masters-cluster-admin"},
+            "subjects": [{"kind": "Group", "name": "system:masters"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin",
+            &cr,
+        );
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system-masters-cluster-admin",
+            &masters_crb_seed,
+        );
+
         let admin_user = Extension(crate::auth::UserInfo {
             username: "admin".into(),
             uid: String::new(),
@@ -2810,6 +2901,150 @@ mod tests {
             Ok(_) => panic!("replace_namespaced CR without CRD must return 404"),
         };
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    // -- resource.rs CRUD handler error mappings (mayor-96nx) --
+
+    /// patch_resource with an unsupported content-type (e.g. application/json) must
+    /// return 415 Unsupported Media Type. Clients that accidentally use the wrong
+    /// content type header would otherwise get a cryptic error — 415 correctly
+    /// signals that the content-type is the problem, not the request body.
+    #[tokio::test]
+    async fn patch_resource_with_bad_content_type_returns_415() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        // application/json is not a supported patch content-type for patch_resource.
+        // Valid types: merge-patch+json, strategic-merge-patch+json, json-patch+json,
+        //              apply-patch+yaml. application/json alone must return 415.
+        let mut bad_headers = axum::http::HeaderMap::new();
+        bad_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let patch = serde_json::json!({"metadata": {"labels": {"env": "prod"}}});
+
+        let result = patch_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "any-node".into(),
+            )),
+            bad_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "application/json content-type must return 415 for patch_resource"
+            ),
+            Ok(_) => panic!("patch_resource with application/json must return 415"),
+        }
+    }
+
+    /// patch_namespaced_resource with an unsupported content-type must return 415.
+    /// Same invariant as the cluster-scoped case: content-type validation fires before
+    /// any store access, so the error is fast and the reason is unambiguous.
+    #[tokio::test]
+    async fn patch_namespaced_resource_with_bad_content_type_returns_415() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let mut bad_headers = axum::http::HeaderMap::new();
+        bad_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let patch = serde_json::json!({"metadata": {"labels": {"env": "prod"}}});
+
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "any-lease".into(),
+            )),
+            bad_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "application/json content-type must return 415 for patch_namespaced_resource"
+            ),
+            Ok(_) => panic!("patch_namespaced_resource with application/json must return 415"),
+        }
+    }
+
+    /// create_namespaced_resource returns 409 Conflict when creating the same
+    /// namespaced object twice. Duplicate creation with the same name and namespace
+    /// must be rejected to prevent silent data corruption.
+    #[tokio::test]
+    async fn create_namespaced_resource_returns_409_on_duplicate() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "dup-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "dup-lease" }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&lease).unwrap());
+
+        match create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            json_headers(),
+            body.clone(),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(_) => panic!("first create must succeed"),
+        }
+
+        let result = create_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            json_headers(),
+            body,
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::CONFLICT,
+                "duplicate namespaced create must return 409 Conflict"
+            ),
+            Ok(_) => panic!("duplicate create_namespaced_resource must return 409"),
+        }
     }
 
     /// strategic_merge_patch merges arrays by name key (not replaces).

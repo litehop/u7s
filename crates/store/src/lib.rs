@@ -1512,4 +1512,117 @@ mod tests {
             "error variant must be StoreError::Serialization"
         );
     }
+
+    // --- Watch fan-out and conditional delete tests (mayor-1lj2) ---
+
+    #[tokio::test]
+    async fn watch_fan_out_two_concurrent_watchers_both_receive_added() {
+        // Two concurrent watchers on the same prefix must BOTH receive the ADDED event
+        // when an object is written. Fan-out via the broadcast channel means each subscriber
+        // gets its own copy. If the implementation is a single-consumer channel, the second
+        // watcher silently misses events — a correctness bug for multi-controller deployments.
+        use futures_core::Stream;
+        use std::pin::Pin;
+
+        let store = Arc::new(make_store());
+        let key = "/registry/pods/default/fan-out-pod";
+
+        // Subscribe both watchers BEFORE writing, so the event goes into the broadcast channel.
+        let stream_a = store
+            .watch("/registry/pods/default/", 0)
+            .await
+            .expect("watch A");
+        let stream_b = store
+            .watch("/registry/pods/default/", 0)
+            .await
+            .expect("watch B");
+        let mut stream_a: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream_a);
+        let mut stream_b: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream_b);
+
+        let rv = store
+            .put(key, pod_json("fan-out-pod"), Some(0))
+            .await
+            .expect("create");
+
+        // Both streams must independently receive an ADDED event for the same revision.
+        let ev_a = next_event(&mut stream_a)
+            .await
+            .expect("stream A must get event");
+        assert!(
+            matches!(&ev_a, WatchEvent::Added(obj) if obj.key == key && obj.revision == rv),
+            "watcher A must receive ADDED for the written object, got {:?}",
+            ev_a
+        );
+
+        let ev_b = next_event(&mut stream_b)
+            .await
+            .expect("stream B must get event");
+        assert!(
+            matches!(&ev_b, WatchEvent::Added(obj) if obj.key == key && obj.revision == rv),
+            "watcher B must receive ADDED independently — fan-out failed, got {:?}",
+            ev_b
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_stale_rv_returns_revision_mismatch() {
+        // delete(key, Some(stale_rv)) must return RevisionMismatch when the stored
+        // revision has advanced past stale_rv. Without this check, any concurrent
+        // controller could delete a newer version of an object, losing mutations.
+        let store = make_store();
+        let key = "/registry/pods/default/cond-del-pod";
+
+        let rv1 = store
+            .put(key, pod_json("cond-del-pod"), Some(0))
+            .await
+            .expect("create");
+
+        // Advance the revision by updating the object so rv1 is now stale.
+        let rv2 = store
+            .put(key, pod_json("cond-del-pod"), Some(rv1))
+            .await
+            .expect("update");
+        assert!(rv2 > rv1, "revision must advance after update");
+
+        // Attempt to delete with the stale rv1 — must be rejected.
+        let err = store
+            .delete(key, Some(rv1))
+            .await
+            .expect_err("delete with stale rv must fail");
+        assert!(
+            matches!(
+                err,
+                StoreError::RevisionMismatch {
+                    expected,
+                    current
+                } if expected == rv1 && current == rv2
+            ),
+            "expected RevisionMismatch {{expected: {rv1}, current: {rv2}}}, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_correct_rv_succeeds() {
+        // delete(key, Some(rv)) with the current revision must succeed and remove the object.
+        // This verifies the happy path of optimistic concurrency for delete.
+        let store = make_store();
+        let key = "/registry/pods/default/cond-del-ok-pod";
+
+        let rv = store
+            .put(key, pod_json("cond-del-ok-pod"), Some(0))
+            .await
+            .expect("create");
+
+        store
+            .delete(key, Some(rv))
+            .await
+            .expect("delete with correct rv must succeed");
+
+        // Object must be gone.
+        let result = store.get(key).await.expect("get after delete");
+        assert!(
+            result.is_none(),
+            "object must be absent after conditional delete"
+        );
+    }
 }

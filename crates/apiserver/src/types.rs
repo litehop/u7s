@@ -68,11 +68,15 @@ static CORE_VERBS: &[&str] = &[
 static PODS_SHORT_NAMES: &[&str] = &["po"];
 static NODES_SHORT_NAMES: &[&str] = &["no"];
 static SERVICES_SHORT_NAMES: &[&str] = &["svc"];
+static ENDPOINTS_SHORT_NAMES: &[&str] = &["ep"];
+static NAMESPACES_SHORT_NAMES: &[&str] = &["ns"];
 static SERVICE_ACCOUNTS_SHORT_NAMES: &[&str] = &["sa"];
 static CONFIG_MAPS_SHORT_NAMES: &[&str] = &["cm"];
 static PVC_SHORT_NAMES: &[&str] = &["pvc"];
 static PV_SHORT_NAMES: &[&str] = &["pv"];
 static RC_SHORT_NAMES: &[&str] = &["rc"];
+static RESOURCE_QUOTAS_SHORT_NAMES: &[&str] = &["quota"];
+static LIMIT_RANGES_SHORT_NAMES: &[&str] = &["limits"];
 
 static V1_RESOURCES: &[ApiResource] = &[
     ApiResource {
@@ -89,7 +93,7 @@ static V1_RESOURCES: &[ApiResource] = &[
         namespaced: true,
         kind: "Endpoints",
         verbs: CORE_VERBS,
-        short_names: None,
+        short_names: Some(ENDPOINTS_SHORT_NAMES),
     },
     ApiResource {
         name: "events",
@@ -100,12 +104,20 @@ static V1_RESOURCES: &[ApiResource] = &[
         short_names: None,
     },
     ApiResource {
+        name: "limitranges",
+        singular_name: "limitrange",
+        namespaced: true,
+        kind: "LimitRange",
+        verbs: CORE_VERBS,
+        short_names: Some(LIMIT_RANGES_SHORT_NAMES),
+    },
+    ApiResource {
         name: "namespaces",
         singular_name: "namespace",
         namespaced: false,
         kind: "Namespace",
         verbs: CORE_VERBS,
-        short_names: None,
+        short_names: Some(NAMESPACES_SHORT_NAMES),
     },
     ApiResource {
         name: "nodes",
@@ -146,6 +158,14 @@ static V1_RESOURCES: &[ApiResource] = &[
         kind: "ReplicationController",
         verbs: CORE_VERBS,
         short_names: Some(RC_SHORT_NAMES),
+    },
+    ApiResource {
+        name: "resourcequotas",
+        singular_name: "resourcequota",
+        namespaced: true,
+        kind: "ResourceQuota",
+        verbs: CORE_VERBS,
+        short_names: Some(RESOURCE_QUOTAS_SHORT_NAMES),
     },
     ApiResource {
         name: "secrets",

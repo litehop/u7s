@@ -17,6 +17,131 @@ use crate::{
 const CRD_LIST_PREFIX: &str = "/registry/apiextensions.k8s.io/customresourcedefinitions/";
 
 // ---------------------------------------------------------------------------
+// CRD conversion webhook
+// ---------------------------------------------------------------------------
+
+/// Call the CRD conversion webhook with a set of objects and a desired API version.
+///
+/// The ConversionReview protocol (apiextensions.k8s.io/v1):
+///   request.objects      — the stored objects to convert
+///   request.desiredAPIVersion — the target version (e.g. "example.com/v2")
+///   response.convertedObjects — the converted objects returned by the webhook
+///
+/// Returns the converted objects on success, or an error if the webhook fails or
+/// the response is malformed.
+pub(crate) async fn call_conversion_webhook(
+    state: &AppState,
+    client_config: &serde_json::Value,
+    objects: Vec<serde_json::Value>,
+    desired_api_version: &str,
+) -> Result<Vec<serde_json::Value>, crate::status::StatusError> {
+    // Resolve the URL from the clientConfig (same logic as admission webhook).
+    let url = resolve_conversion_webhook_url(state, client_config).await?;
+
+    let uid = uuid::Uuid::new_v4().to_string();
+    let review = serde_json::json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "ConversionReview",
+        "request": {
+            "uid": uid,
+            "desiredAPIVersion": desired_api_version,
+            "objects": objects
+        }
+    });
+
+    let body = serde_json::to_vec(&review).map_err(|e| Status::internal(e.to_string()))?;
+    let resp = state
+        .webhook_client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| Status::internal(format!("conversion webhook call failed: {e}")))?;
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| Status::internal(format!("conversion webhook response read error: {e}")))?;
+
+    let resp_val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        Status::internal(format!("conversion webhook response JSON parse error: {e}"))
+    })?;
+
+    // Check result status.
+    let result_status = resp_val["response"]["result"]["status"]
+        .as_str()
+        .unwrap_or("Failure");
+    if result_status != "Success" {
+        let msg = resp_val["response"]["result"]["message"]
+            .as_str()
+            .unwrap_or("conversion webhook returned failure");
+        return Err(Status::internal(format!(
+            "conversion webhook failed: {msg}"
+        )));
+    }
+
+    let converted = resp_val["response"]["convertedObjects"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    if converted.is_empty() {
+        return Err(Status::internal(
+            "conversion webhook returned no converted objects".into(),
+        ));
+    }
+
+    Ok(converted)
+}
+
+/// Resolve the conversion webhook URL from a clientConfig object.
+///
+/// Supports both `url` (direct URL) and `service` (in-cluster service reference).
+async fn resolve_conversion_webhook_url(
+    state: &AppState,
+    client_config: &serde_json::Value,
+) -> Result<String, crate::status::StatusError> {
+    if let Some(url) = client_config["url"].as_str() {
+        return Ok(url.to_string());
+    }
+
+    if let Some(svc) = client_config.get("service").filter(|s| !s.is_null()) {
+        let ns = svc["namespace"].as_str().unwrap_or("default");
+        let name = svc["name"]
+            .as_str()
+            .ok_or_else(|| Status::internal("conversion webhook service has no name".into()))?;
+        let port = svc["port"].as_u64().unwrap_or(443);
+        let path = svc["path"].as_str().unwrap_or("/");
+
+        let key = format!("/registry/services/{ns}/{name}");
+        let obj = state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| {
+                Status::internal(format!("conversion webhook service {ns}/{name} not found"))
+            })?;
+
+        let val: serde_json::Value =
+            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+
+        let cluster_ip = val["spec"]["clusterIP"].as_str().ok_or_else(|| {
+            Status::internal(format!(
+                "conversion webhook service {ns}/{name} has no clusterIP"
+            ))
+        })?;
+
+        return Ok(format!("https://{cluster_ip}:{port}{path}"));
+    }
+
+    Err(Status::internal(
+        "conversion webhook clientConfig has neither url nor service".into(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // CRD lookup
 // ---------------------------------------------------------------------------
 
@@ -31,6 +156,12 @@ pub struct CrContext {
     /// The `openAPIV3Schema` from the matched version's schema field, if present.
     /// Used for server-side CR body validation on CREATE and UPDATE.
     pub schema: Option<serde_json::Value>,
+    /// The storage version name (the CRD version with `storage: true`).
+    /// Objects are stored in the store under this version's key.
+    pub storage_version: String,
+    /// Conversion configuration from the CRD spec. Present only when
+    /// `spec.conversion.strategy == "Webhook"`.
+    pub conversion_webhook_client_config: Option<serde_json::Value>,
 }
 
 /// Find the CRD whose spec.group == group and spec.names.plural == plural.
@@ -87,11 +218,29 @@ pub async fn find_crd(
                 .map(|st| !st.is_null())
                 .unwrap_or(false)
         });
+        // Find the storage version (exactly one version should have storage: true).
+        let storage_version = crd
+            .spec
+            .versions
+            .iter()
+            .find(|v| v.storage)
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| version.to_string());
+        // Extract conversion webhook clientConfig if strategy is Webhook.
+        let conversion_webhook_client_config = crd
+            .spec
+            .conversion
+            .as_ref()
+            .filter(|c| c["strategy"].as_str() == Some("Webhook"))
+            .and_then(|c| c["webhook"]["clientConfig"].as_object())
+            .map(|cfg| serde_json::Value::Object(cfg.clone()));
         return Ok(CrContext {
             kind: crd.spec.names.kind.clone(),
             namespaced,
             has_status_subresource,
             schema,
+            storage_version,
+            conversion_webhook_client_config,
         });
     }
 
@@ -355,7 +504,18 @@ pub async fn list_cr(
         ));
     }
 
-    let prefix = cr_list_prefix(&group, &version, &plural, None);
+    // When version != storage_version, list from the storage version's key prefix.
+    // Watch streams are not converted (watch conversion is out of scope).
+    let (list_version, needs_conversion) = if version != ctx.storage_version {
+        (
+            ctx.storage_version.as_str(),
+            ctx.conversion_webhook_client_config.is_some(),
+        )
+    } else {
+        (version.as_str(), false)
+    };
+
+    let prefix = cr_list_prefix(&group, list_version, &plural, None);
 
     if query.watch == Some(true) {
         let api_version = format!("{group}/{version}");
@@ -380,11 +540,18 @@ pub async fn list_cr(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    let mut items = Vec::with_capacity(resp.items.len());
+    let mut items: Vec<serde_json::Value> = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
         let v: serde_json::Value =
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(v);
+    }
+
+    // Convert all items if needed. Batch the conversion in a single webhook call.
+    if needs_conversion && !items.is_empty() {
+        let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
+        let desired_api_version = format!("{group}/{version}");
+        items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
     }
 
     let body = super::generic::build_list_response(
@@ -408,13 +575,44 @@ pub async fn get_cr(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &version, &plural, None, &name);
+    // When version != storage_version, fall back to the storage version key.
+    // If a conversion webhook is configured, call it; otherwise return as-is.
+    let (fetch_version, needs_conversion) = if version != ctx.storage_version {
+        (
+            ctx.storage_version.as_str(),
+            ctx.conversion_webhook_client_config.is_some(),
+        )
+    } else {
+        (version.as_str(), false)
+    };
+
+    let key = cr_store_key(&group, fetch_version, &plural, None, &name);
     let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+
+    if needs_conversion {
+        let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
+        let obj: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        let desired_api_version = format!("{group}/{version}");
+        let mut converted =
+            call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
+        let converted_obj = converted
+            .pop()
+            .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
+        let bytes =
+            serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response());
+    }
 
     Ok((
         StatusCode::OK,
@@ -595,7 +793,16 @@ pub async fn list_cr_namespaced(
         ));
     }
 
-    let prefix = cr_list_prefix(&group, &version, &plural, Some(&ns));
+    let (list_version, needs_conversion) = if version != ctx.storage_version {
+        (
+            ctx.storage_version.as_str(),
+            ctx.conversion_webhook_client_config.is_some(),
+        )
+    } else {
+        (version.as_str(), false)
+    };
+
+    let prefix = cr_list_prefix(&group, list_version, &plural, Some(&ns));
 
     if query.watch == Some(true) {
         let api_version = format!("{group}/{version}");
@@ -620,11 +827,17 @@ pub async fn list_cr_namespaced(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    let mut items = Vec::with_capacity(resp.items.len());
+    let mut items: Vec<serde_json::Value> = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
         let v: serde_json::Value =
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(v);
+    }
+
+    if needs_conversion && !items.is_empty() {
+        let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
+        let desired_api_version = format!("{group}/{version}");
+        items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
     }
 
     let body = super::generic::build_list_response(
@@ -648,13 +861,42 @@ pub async fn get_cr_namespaced(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
+    let (fetch_version, needs_conversion) = if version != ctx.storage_version {
+        (
+            ctx.storage_version.as_str(),
+            ctx.conversion_webhook_client_config.is_some(),
+        )
+    } else {
+        (version.as_str(), false)
+    };
+
+    let key = cr_store_key(&group, fetch_version, &plural, Some(&ns), &name);
     let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+
+    if needs_conversion {
+        let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
+        let obj: serde_json::Value =
+            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+        let desired_api_version = format!("{group}/{version}");
+        let mut converted =
+            call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
+        let converted_obj = converted
+            .pop()
+            .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
+        let bytes =
+            serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
+        return Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response());
+    }
 
     Ok((
         StatusCode::OK,
@@ -3890,6 +4132,457 @@ mod tests {
         assert_eq!(
             api_version, "example.io/v1",
             "non-empty group must produce apiVersion=\"group/version\" (got: {api_version:?})"
+        );
+    }
+
+    // -- CRD conversion webhook tests --
+
+    /// When a CRD has only one version with storage:true and no conversion config,
+    /// get_cr must return the stored object as-is even if the URL version differs.
+    /// This is the no-conversion baseline: stored version == requested version.
+    #[tokio::test]
+    async fn get_cr_same_version_no_conversion() {
+        let state = make_state();
+
+        // Single-version CRD (v1 is both storage and requested).
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "widgets", "singular": "widget", "kind": "Widget"},
+                "scope": "Cluster",
+                "versions": [{"name": "v1", "served": true, "storage": true}]
+            }
+        });
+        state
+            .store
+            .put(
+                "/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.com",
+                bytes::Bytes::from(serde_json::to_vec(&crd).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Store a widget under v1.
+        let widget = serde_json::json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "my-widget"},
+            "spec": {"color": "blue"}
+        });
+        state
+            .store
+            .put(
+                "/registry/cr/example.com/v1/widgets/my-widget",
+                bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // GET the widget at v1 — same as storage version, no conversion needed.
+        let resp = match get_cr(
+            State(state),
+            Path((
+                "example.com".into(),
+                "v1".into(),
+                "widgets".into(),
+                "my-widget".into(),
+            )),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["spec"]["color"], "blue",
+            "stored object must be returned unchanged"
+        );
+    }
+
+    /// When a CRD has two versions (v1alpha1 as storage, v1 as served) and no conversion
+    /// webhook is configured, GET for v1 must fall back to the v1alpha1 stored object
+    /// and return it as-is. This is the no-webhook-conversion case.
+    #[tokio::test]
+    async fn get_cr_different_version_no_webhook_returns_stored_object() {
+        let state = make_state();
+
+        // CRD with v1alpha1 (storage) and v1 (served), no conversion webhook.
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "widgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "widgets", "singular": "widget", "kind": "Widget"},
+                "scope": "Cluster",
+                "versions": [
+                    {"name": "v1alpha1", "served": true, "storage": true},
+                    {"name": "v1", "served": true, "storage": false}
+                ]
+            }
+        });
+        state
+            .store
+            .put(
+                "/registry/apiextensions.k8s.io/customresourcedefinitions/widgets.example.com",
+                bytes::Bytes::from(serde_json::to_vec(&crd).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Store widget under v1alpha1 (the storage version).
+        let widget = serde_json::json!({
+            "apiVersion": "example.com/v1alpha1",
+            "kind": "Widget",
+            "metadata": {"name": "my-widget"},
+            "spec": {"color": "blue"}
+        });
+        state
+            .store
+            .put(
+                "/registry/cr/example.com/v1alpha1/widgets/my-widget",
+                bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // GET at v1 — no conversion webhook, falls through to stored v1alpha1 object.
+        // The stored object is returned as-is (no conversion attempted without webhook).
+        let resp = match get_cr(
+            State(state),
+            Path((
+                "example.com".into(),
+                "v1".into(),
+                "widgets".into(),
+                "my-widget".into(),
+            )),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("get must succeed when no conversion is needed"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Without a conversion webhook, the v1alpha1 stored data is returned unchanged.
+        assert_eq!(
+            body["spec"]["color"], "blue",
+            "stored v1alpha1 object must be returned when no webhook is configured"
+        );
+    }
+
+    /// find_crd extracts the storage version correctly from the CRD spec.
+    /// If the storage version is wrong, conversion fallback uses the wrong key and
+    /// returns 404 or a wrong object instead of calling the webhook.
+    #[tokio::test]
+    async fn find_crd_extracts_storage_version() {
+        let state = make_state();
+
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "gadgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "gadgets", "singular": "gadget", "kind": "Gadget"},
+                "scope": "Cluster",
+                "versions": [
+                    {"name": "v1alpha1", "served": true, "storage": true},
+                    {"name": "v1", "served": true, "storage": false}
+                ]
+            }
+        });
+        state
+            .store
+            .put(
+                "/registry/apiextensions.k8s.io/customresourcedefinitions/gadgets.example.com",
+                bytes::Bytes::from(serde_json::to_vec(&crd).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ctx = match find_crd(&state, "example.com", "v1", "gadgets").await {
+            Ok(c) => c,
+            Err(_) => panic!("find_crd must succeed for a matching CRD"),
+        };
+        assert_eq!(
+            ctx.storage_version, "v1alpha1",
+            "find_crd must extract the version marked storage:true as storage_version"
+        );
+    }
+
+    /// find_crd extracts conversion webhook clientConfig when strategy is Webhook.
+    /// If this is wrong, the conversion webhook call is skipped or uses the wrong endpoint.
+    #[tokio::test]
+    async fn find_crd_extracts_conversion_webhook_config() {
+        let state = make_state();
+
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "gadgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "gadgets", "singular": "gadget", "kind": "Gadget"},
+                "scope": "Cluster",
+                "versions": [
+                    {"name": "v1alpha1", "served": true, "storage": true},
+                    {"name": "v1", "served": true, "storage": false}
+                ],
+                "conversion": {
+                    "strategy": "Webhook",
+                    "webhook": {
+                        "clientConfig": {
+                            "url": "https://converter.example.com/convert"
+                        }
+                    }
+                }
+            }
+        });
+        state
+            .store
+            .put(
+                "/registry/apiextensions.k8s.io/customresourcedefinitions/gadgets.example.com",
+                bytes::Bytes::from(serde_json::to_vec(&crd).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ctx = match find_crd(&state, "example.com", "v1", "gadgets").await {
+            Ok(c) => c,
+            Err(_) => panic!("find_crd must succeed for a matching CRD"),
+        };
+        assert!(
+            ctx.conversion_webhook_client_config.is_some(),
+            "find_crd must extract conversion webhook clientConfig when strategy=Webhook"
+        );
+        let cfg = ctx.conversion_webhook_client_config.unwrap();
+        assert_eq!(
+            cfg["url"].as_str(),
+            Some("https://converter.example.com/convert"),
+            "clientConfig URL must be extracted correctly"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // call_conversion_webhook error paths (mayor-q402)
+    // ---------------------------------------------------------------------------
+
+    /// Start an axum router on a random local TCP port and return the base URL.
+    /// The server runs until the returned JoinHandle is dropped/aborted.
+    async fn start_mock_conversion_server(
+        router: axum::Router,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock server must not fail");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn make_state_for_conversion() -> AppState {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    /// call_conversion_webhook must return Err when the response includes
+    /// result.status="Failure". Conversion webhooks that reject the request
+    /// (e.g. unsupported conversion direction) must propagate as errors so
+    /// the apiserver rejects the client request rather than returning corrupt data.
+    #[tokio::test]
+    async fn call_conversion_webhook_returns_err_on_failure_status() {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/convert",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "ConversionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "result": {
+                            "status": "Failure",
+                            "message": "unsupported conversion direction"
+                        }
+                    }
+                }))
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when result.status=Failure"
+        );
+        let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
+        assert!(
+            err_msg.contains("unsupported conversion direction"),
+            "error must include the webhook's failure message"
+        );
+    }
+
+    /// call_conversion_webhook must return Err when the webhook returns an empty
+    /// convertedObjects array. Receiving 0 objects for N input objects is semantically
+    /// invalid — the caller has no objects to serve and cannot proceed.
+    #[tokio::test]
+    async fn call_conversion_webhook_returns_err_when_converted_objects_empty() {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/convert",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "apiextensions.k8s.io/v1",
+                    "kind": "ConversionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "result": { "status": "Success" },
+                        "convertedObjects": []  // empty — must be rejected
+                    }
+                }))
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when convertedObjects is empty"
+        );
+    }
+
+    /// call_conversion_webhook must return Err when the HTTP call fails (bad URL).
+    /// Network errors must be propagated as errors — callers must not silently
+    /// succeed with the unconverted objects.
+    #[tokio::test]
+    async fn call_conversion_webhook_returns_err_on_http_failure() {
+        let state = make_state_for_conversion();
+        // Port 1 is never open — connection will be refused immediately.
+        let client_config = serde_json::json!({ "url": "http://127.0.0.1:1/convert" });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when HTTP call fails (bad URL)"
+        );
+    }
+
+    /// call_conversion_webhook must return Err when the response is not valid JSON.
+    /// A webhook returning malformed bytes (e.g. a 500 HTML error page) must not
+    /// panic or silently succeed — it must be detected and rejected.
+    #[tokio::test]
+    async fn call_conversion_webhook_returns_err_on_malformed_json_response() {
+        use axum::routing::post;
+        use axum::Router;
+
+        let router = Router::new().route(
+            "/convert",
+            post(|| async {
+                // Return plain text, not JSON — simulates an upstream error page.
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error (not JSON)",
+                )
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when response is not valid JSON"
+        );
+    }
+
+    /// find_crd must NOT extract conversion config when strategy is None (no conversion).
+    #[tokio::test]
+    async fn find_crd_no_conversion_config_when_strategy_is_none() {
+        let state = make_state();
+
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "gadgets.example.com"},
+            "spec": {
+                "group": "example.com",
+                "names": {"plural": "gadgets", "singular": "gadget", "kind": "Gadget"},
+                "scope": "Cluster",
+                "versions": [
+                    {"name": "v1alpha1", "served": true, "storage": true},
+                    {"name": "v1", "served": true, "storage": false}
+                ],
+                "conversion": {
+                    "strategy": "None"
+                }
+            }
+        });
+        state
+            .store
+            .put(
+                "/registry/apiextensions.k8s.io/customresourcedefinitions/gadgets.example.com",
+                bytes::Bytes::from(serde_json::to_vec(&crd).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ctx = match find_crd(&state, "example.com", "v1", "gadgets").await {
+            Ok(c) => c,
+            Err(_) => panic!("find_crd must succeed for a matching CRD"),
+        };
+        assert!(
+            ctx.conversion_webhook_client_config.is_none(),
+            "find_crd must not extract conversion config when strategy is not Webhook"
         );
     }
 }

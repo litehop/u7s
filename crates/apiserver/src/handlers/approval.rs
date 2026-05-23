@@ -38,7 +38,7 @@ const KIND: &str = "CertificateSigningRequest";
 /// Never modifies `spec` or `status.certificate`.
 pub async fn put_approval(
     State(state): State<AppState>,
-    Path((_group, _version, _plural, name)): Path<(String, String, String, String)>,
+    Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -80,7 +80,7 @@ pub async fn put_approval(
 /// changed. spec and status.certificate are never modified.
 pub async fn patch_approval(
     State(state): State<AppState>,
-    Path((_group, _version, _plural, name)): Path<(String, String, String, String)>,
+    Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -239,12 +239,7 @@ mod tests {
 
         let result = put_approval(
             axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "certificates.k8s.io".into(),
-                "v1".into(),
-                "certificatesigningrequests".into(),
-                name.into(),
-            )),
+            axum::extract::Path(name.to_owned()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -299,12 +294,7 @@ mod tests {
 
         let result = put_approval(
             axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "certificates.k8s.io".into(),
-                "v1".into(),
-                "certificatesigningrequests".into(),
-                name.into(),
-            )),
+            axum::extract::Path(name.to_owned()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -346,12 +336,7 @@ mod tests {
 
         let result = put_approval(
             axum::extract::State(state),
-            axum::extract::Path((
-                "certificates.k8s.io".into(),
-                "v1".into(),
-                "certificatesigningrequests".into(),
-                name.into(),
-            )),
+            axum::extract::Path(name.to_owned()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -382,12 +367,7 @@ mod tests {
 
         let result = put_approval(
             axum::extract::State(state),
-            axum::extract::Path((
-                "certificates.k8s.io".into(),
-                "v1".into(),
-                "certificatesigningrequests".into(),
-                "nonexistent".into(),
-            )),
+            axum::extract::Path("nonexistent".to_owned()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )

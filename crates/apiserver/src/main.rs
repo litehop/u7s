@@ -1,10 +1,13 @@
+mod admission;
 mod auth;
 mod content_type;
 mod handlers;
 mod inflight;
 mod keys;
+mod limit_range;
 mod patch;
 mod proto;
+mod quota;
 mod rbac;
 mod state;
 mod status;
@@ -153,6 +156,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("advertised server address: {server_address}");
 
     // 9. Build app state (shared with the auth layer).
+    // Combine admin cert PEM + admin key PEM for the webhook mTLS client identity.
+    // The webhook client will present this certificate when connecting to admission
+    // webhook servers, so they can verify they are talking to the apiserver.
+    let mut webhook_identity_pem = tls_material.admin_cert_pem.clone();
+    webhook_identity_pem.extend_from_slice(&tls_material.admin_key_pem);
     let state = AppState::new_with_ca(
         Arc::clone(&store),
         sa_encoding_key,
@@ -160,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         token_map,
         server_address,
         Some(tls_material.ca_cert_der.clone()),
+        Some(webhook_identity_pem),
     );
 
     // 9a. Populate RBAC index from persisted objects before serving.
@@ -338,14 +347,14 @@ fn build_router(state: AppState) -> Router {
         // Must be registered before the generic cluster-scoped catch-all.
         .route(
             "/apis/certificates.k8s.io/v1/certificatesigningrequests",
-            get(handlers::resource::list_resource).post(handlers::csr::create_csr),
+            get(handlers::csr::list_csr).post(handlers::csr::create_csr),
         )
         // CSR /approval subresource — PUT and PATCH only merge status.conditions;
         // spec and status.certificate are never touched. Must be before the named
         // resource catch-all so axum doesn't interpret "approval" as a resource name.
         .route(
             "/apis/certificates.k8s.io/v1/certificatesigningrequests/{name}/approval",
-            get(handlers::resource::get_resource)
+            get(handlers::csr::get_csr)
                 .put(handlers::approval::put_approval)
                 .patch(handlers::approval::patch_approval),
         )
@@ -1739,11 +1748,6 @@ mod tests {
         });
         let create_result = handlers::csr::create_csr(
             axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "certificates.k8s.io".into(),
-                "v1".into(),
-                "certificatesigningrequests".into(),
-            )),
             axum::Extension(user),
             json_headers.clone(),
             bytes::Bytes::from(create_body.to_string()),
@@ -1815,12 +1819,7 @@ mod tests {
         });
         let approval_result = handlers::approval::put_approval(
             axum::extract::State(state.clone()),
-            axum::extract::Path((
-                "certificates.k8s.io".into(),
-                "v1".into(),
-                "certificatesigningrequests".into(),
-                "lifecycle-csr".into(),
-            )),
+            axum::extract::Path("lifecycle-csr".to_owned()),
             json_headers.clone(),
             bytes::Bytes::from(approval_body.to_string()),
         )

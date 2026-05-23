@@ -1,38 +1,67 @@
 #!/usr/bin/env bash
-# Start the lima kubelet VM and join it to u7s running on the Mac host.
+# Local E2E setup: u7s on Mac host + kubelet inside lima VM.
 #
-# Prerequisites:
-#   brew install lima
-#   u7s must already be running — start it manually first:
-#     cargo run --release -p u7s-apiserver -- --db /tmp/u7s.db ...
+# Architecture:
+#   - u7s runs natively on the Mac (fast cargo rebuild loop)
+#   - kubelet + CRI-O run inside the lima VM (Linux kernel required)
+#   - kubelet reaches u7s via host.lima.internal:6443
+#   - kubectl runs on the Mac against 127.0.0.1:6443
 #
-# The script extracts the CA from u7s's kubeconfig, copies it into the VM,
-# and starts kubelet. kubectl get nodes should show lima-node within ~90s.
+# Quick start:
+#   1. cargo run --release -p u7s-apiserver -- \
+#        --db /tmp/u7s.db \
+#        --kubeconfig /tmp/u7s-kubeconfig \
+#        --sa-key /tmp/u7s-sa.key --sa-pub /tmp/u7s-sa.pub \
+#        --advertise-address https://127.0.0.1:6443
+#
+#   2. export KUBECONFIG=/tmp/u7s-kubeconfig
+#      scripts/lima-start.sh
+#
+#   3. kubectl get nodes        # lima-node should appear within ~30s
+#      kubectl get pods -A
+#
+# Re-running after u7s restart:
+#   Just re-run this script — it rewrites the kubeconfig in the VM and
+#   restarts kubelet, so the new TLS cert is picked up automatically.
+#
+# Troubleshooting:
+#   kubelet not registering:
+#     limactl shell lima-node sudo journalctl -u kubelet --no-pager -n 50
+#   CRI-O issues:
+#     limactl shell lima-node sudo journalctl -u crio --no-pager -n 30
+#   Container sandbox failures ("unknown version specified"):
+#     This means system crun is being used instead of CRI-O's bundled one.
+#     Fix: limactl shell lima-node sudo rm /etc/crio/crio.conf.d/10-crun.conf
+#          limactl shell lima-node sudo systemctl restart crio
+#     (lima/kubelet.yaml provision now prevents this — delete+reprovision fixes it permanently)
 set -euo pipefail
 
 VM_NAME="lima-node"
 LIMA_YAML="$(dirname "$0")/../lima/kubelet.yaml"
 
 check_deps() {
-  if ! command -v limactl &>/dev/null; then
-    echo "error: limactl not found — install with: brew install lima" >&2
-    exit 1
-  fi
-  if ! command -v kubectl &>/dev/null; then
-    echo "error: kubectl not found — run: aqua install" >&2
-    exit 1
-  fi
+  local missing=0
+  for cmd in limactl kubectl; do
+    if ! command -v "$cmd" &>/dev/null; then
+      echo "error: $cmd not found" >&2
+      case "$cmd" in
+        limactl) echo "  install: brew install lima" >&2 ;;
+        kubectl)  echo "  install: aqua install" >&2 ;;
+      esac
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ]
 }
 
 find_kubeconfig() {
-  # u7s prints: kubeconfig written to <path>
-  # Try common locations the operator might use.
   if [ -n "${KUBECONFIG:-}" ] && [ -f "$KUBECONFIG" ]; then
     echo "$KUBECONFIG"
     return
   fi
-  echo "error: KUBECONFIG env var not set or file not found." >&2
-  echo "Start u7s and export KUBECONFIG to the path it printed." >&2
+  echo "error: KUBECONFIG not set or file not found." >&2
+  echo "Start u7s and set KUBECONFIG to the path it printed:" >&2
+  echo "  export KUBECONFIG=/tmp/u7s-kubeconfig" >&2
   exit 1
 }
 
@@ -40,34 +69,45 @@ check_deps
 
 KUBECONFIG_PATH=$(find_kubeconfig)
 
-# Verify u7s is reachable
+# Verify u7s is reachable before touching the VM.
 if ! kubectl --kubeconfig="$KUBECONFIG_PATH" get namespaces &>/dev/null; then
   echo "error: cannot reach u7s at the server in $KUBECONFIG_PATH" >&2
-  echo "Make sure u7s is running on the host." >&2
+  echo "Make sure u7s is running on the host first." >&2
   exit 1
 fi
+echo "u7s is reachable."
 
-echo "u7s is reachable. Starting lima VM '$VM_NAME'..."
+# Start or resume the lima VM.
+if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${VM_NAME}$"; then
+  STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${VM_NAME} / {print \$2}")
+  if [ "$STATUS" != "Running" ]; then
+    echo "Starting stopped VM '$VM_NAME'..."
+    limactl start "$VM_NAME"
+  else
+    echo "VM '$VM_NAME' already running."
+  fi
+else
+  echo "Provisioning VM '$VM_NAME' (first run, takes ~5 min)..."
+  limactl start --name="$VM_NAME" "$LIMA_YAML"
+fi
 
-limactl start --name="$VM_NAME" "$LIMA_YAML" || true
-
-echo "Copying kubeconfig into VM (u7s address will be rewritten to host.lima.internal)..."
-
-# Rewrite the server address from 127.0.0.1 to host.lima.internal for in-VM use
+# Rewrite server address from 127.0.0.1 to host.lima.internal for in-VM use.
+echo "Copying kubeconfig into VM..."
 REWRITTEN=$(mktemp)
 sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "$KUBECONFIG_PATH" > "$REWRITTEN"
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/kubelet-kubeconfig"
 rm "$REWRITTEN"
-
 limactl shell "$VM_NAME" sudo cp /tmp/kubelet-kubeconfig /etc/kubelet-kubeconfig
 limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
 
+# Restart kubelet so it picks up the new kubeconfig/cert.
 echo "Starting kubelet inside VM..."
-limactl shell "$VM_NAME" sudo systemctl start kubelet
+limactl shell "$VM_NAME" sudo systemctl restart kubelet
 
-echo "Waiting for lima-node to register with u7s (up to 90s)..."
+# Wait for the node to appear.
+echo "Waiting for lima-node to register (up to 60s)..."
 FOUND=0
-for i in $(seq 1 90); do
+for i in $(seq 1 60); do
   if kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes 2>/dev/null | grep -q "lima-node"; then
     FOUND=1
     break
@@ -76,11 +116,17 @@ for i in $(seq 1 90); do
 done
 
 if [ "$FOUND" -eq 0 ]; then
-  echo "ERROR: lima-node did not appear within 90s." >&2
-  echo "--- kubelet log ---" >&2
-  limactl shell "$VM_NAME" sudo journalctl -u kubelet --no-pager -n 50 >&2
+  echo "ERROR: lima-node did not appear within 60s." >&2
+  echo "--- kubelet log (last 30 lines) ---" >&2
+  limactl shell "$VM_NAME" sudo journalctl -u kubelet --no-pager -n 30 >&2
   exit 1
 fi
 
+echo ""
 echo "Success! Node registered:"
 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
+echo ""
+echo "Run kubectl commands with:"
+echo "  export KUBECONFIG=$KUBECONFIG_PATH"
+echo "  kubectl get nodes"
+echo "  kubectl run test --image=busybox:1.36 --restart=Never --overrides='{\"spec\":{\"nodeName\":\"lima-node\",\"hostNetwork\":true,\"dnsPolicy\":\"None\",\"dnsConfig\":{}}}' -- sh -c 'echo hello'"

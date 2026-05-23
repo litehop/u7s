@@ -13,9 +13,9 @@
 //! Returns 422 Unprocessable Entity on any violation.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use base64::Engine as _;
@@ -23,12 +23,15 @@ use bytes::Bytes;
 use x509_cert::der::Decode as _;
 use x509_cert::request::CertReq;
 
-use u7s_store::Store as _;
+use u7s_store::{ListOptions, Store as _};
 
 use crate::{
     auth::UserInfo,
-    handlers::generic::{resolve_name, stamp_metadata},
-    keys::group_object_key,
+    handlers::generic::{
+        apply_label_selector, build_list_response, decode_continue, lookup, parse_field_selector,
+        parse_label_selector, resolve_name, stamp_metadata, validate_name, CollectionQuery,
+    },
+    keys::{group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
     types::Object,
@@ -82,22 +85,109 @@ pub(crate) fn validate_csr_spec(
     Ok(())
 }
 
+/// GET /apis/certificates.k8s.io/v1/certificatesigningrequests
+///
+/// List all CertificateSigningRequests. The route is a hardcoded literal (no
+/// path captures), so we hardcode group/version/plural instead of extracting
+/// them — the generic list_resource handler requires Path<(String,String,String)>
+/// which panics when axum finds 0 capture groups.
+pub async fn list_csr(
+    State(state): State<AppState>,
+    Query(query): Query<CollectionQuery>,
+    Extension(_user): Extension<UserInfo>,
+) -> Result<Response, crate::status::StatusError> {
+    // Lookup is infallible for the built-in CSR resource type.
+    let meta = lookup(&state, GROUP, VERSION, PLURAL)?;
+    let kind = meta.kind.clone();
+    let prefix = group_list_prefix(GROUP, PLURAL, None);
+
+    let field_selector = query
+        .field_selector
+        .as_deref()
+        .map(parse_field_selector)
+        .transpose()?;
+    let continue_key = query
+        .continue_token
+        .as_deref()
+        .map(decode_continue)
+        .transpose()?;
+
+    let resp = state
+        .store
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector,
+                limit: query.limit,
+                continue_key,
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut items = Vec::with_capacity(resp.items.len());
+    for obj in &resp.items {
+        let v: serde_json::Value =
+            serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+        items.push(v);
+    }
+
+    let items = if let Some(ref sel) = query.label_selector {
+        let pairs = parse_label_selector(sel)?;
+        apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
+
+    let body = build_list_response(
+        &kind,
+        GROUP,
+        VERSION,
+        resp.revision,
+        items,
+        resp.continue_key,
+    );
+    Ok(Json(body).into_response())
+}
+
+/// GET /apis/certificates.k8s.io/v1/certificatesigningrequests/{name}
+/// (also used for the /approval subresource GET)
+///
+/// The approval route `/apis/certificates.k8s.io/v1/certificatesigningrequests/{name}/approval`
+/// has only `{name}` as a capture group. The generic get_resource handler expects
+/// Path<(String,String,String,String)> and would panic. This handler extracts only
+/// the name and hardcodes the rest.
+pub async fn get_csr(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, crate::status::StatusError> {
+    validate_name("name", &name)?;
+    let key = group_object_key(GROUP, PLURAL, None, &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, KIND))?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        stored.value,
+    )
+        .into_response())
+}
+
 /// POST /apis/certificates.k8s.io/v1/certificatesigningrequests
 ///
 /// Validates spec.request (base64 + DER PKCS#10) and spec.signerName before
 /// storing. Returns 422 on validation failure, 201 on success.
 pub async fn create_csr(
     State(state): State<AppState>,
-    Path((group, version, plural)): Path<(String, String, String)>,
     Extension(_user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    // Guard: this handler is only for the CSR resource.
-    if group != GROUP || version != VERSION || plural != PLURAL {
-        return Err(Status::not_found(&plural, KIND));
-    }
-
     let body = extract_body(&body, content_type(&headers));
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
@@ -266,5 +356,75 @@ mod tests {
                 err.0
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // list_csr regression test
+    //
+    // Before the fix, GET /apis/certificates.k8s.io/v1/certificatesigningrequests
+    // was wired to list_resource which extracts Path<(String,String,String)>.
+    // The route is a hardcoded literal with 0 capture groups — axum panicked with
+    // "Wrong number of path arguments for Path. Expected 3 but got 0".
+    //
+    // This test verifies that the route returns 200 (not a 500/panic).
+    // It will fail if the route is re-wired to a handler that extracts Path params
+    // from a literal route.
+    // -----------------------------------------------------------------------
+
+    /// GET /apis/certificates.k8s.io/v1/certificatesigningrequests returns 200.
+    ///
+    /// The kcm controller calls this on startup. Before the fix it panicked
+    /// because the hardcoded literal route had no path captures but the handler
+    /// expected three. An empty list is a valid response.
+    #[tokio::test]
+    async fn list_csr_returns_200_not_panic() {
+        use std::sync::Arc;
+
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+            routing::get,
+            Extension, Router,
+        };
+        use tower::ServiceExt as _;
+        use u7s_store::SqliteStore;
+
+        use crate::{auth::UserInfo, state::AppState};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/certificates.k8s.io/v1/certificatesigningrequests",
+                get(list_csr),
+            )
+            .layer(Extension(UserInfo {
+                username: "test".into(),
+                uid: "".into(),
+                groups: vec![],
+            }))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/apis/certificates.k8s.io/v1/certificatesigningrequests")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET CSR list must return 200 — a 500 indicates the route panicked due to \
+             wrong path param count (regression: literal route wired to handler expecting \
+             Path captures)"
+        );
     }
 }
