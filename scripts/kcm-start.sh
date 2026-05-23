@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Start kube-controller-manager for local development.
 #
-# Downloads the kcm binary if not already cached in ./temp/u7s/kcm/.
+# Downloads the kcm binary if not already cached in ~/.cache/u7s/kcm/
+# (override with KCM_CACHE_DIR env var).
 # Uses the cert-based kubeconfig at ./temp/u7s/kubeconfig (kcm requires
 # x509 client cert auth — the token-based kubeconfig will NOT work).
 #
@@ -18,7 +19,9 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 WORKDIR="$REPO/temp/u7s"
-CACHE_DIR="$WORKDIR/kcm"
+# The repo may be mounted read-only (e.g. inside Lima VM). Use a writable
+# user-local cache dir for the downloaded binary.
+CACHE_DIR="${KCM_CACHE_DIR:-${HOME}/.cache/u7s/kcm}"
 
 # Determine default k8s version from installed kubectl; fallback to 1.34.8.
 DEFAULT_VERSION="1.34.8"
@@ -77,13 +80,30 @@ if [ ! -f "$KCM_BINARY" ]; then
   echo "Cached at $KCM_BINARY"
 fi
 
+# ca.crt is written by u7s in DER format; KCM requires PEM. Convert on the fly.
+# Also, when running inside a Lima VM the apiserver is on the host, reachable
+# via host.lima.internal rather than 127.0.0.1 — rewrite the kubeconfig.
+TMPDIR_KCM="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_KCM"' EXIT
+
+openssl x509 -inform DER -in "$WORKDIR/ca.crt" -out "$TMPDIR_KCM/ca.pem"
+CA_CERT="$TMPDIR_KCM/ca.pem"
+
+KUBECONFIG_FILE="$WORKDIR/kubeconfig"
+if grep -q "127.0.0.1" "$KUBECONFIG_FILE" && \
+   grep -q "host.lima.internal" /etc/hosts 2>/dev/null; then
+  sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' \
+    "$KUBECONFIG_FILE" > "$TMPDIR_KCM/kubeconfig"
+  KUBECONFIG_FILE="$TMPDIR_KCM/kubeconfig"
+fi
+
 echo "Starting kube-controller-manager v${K8S_VERSION} ..."
 exec "$KCM_BINARY" \
-  --kubeconfig="$WORKDIR/kubeconfig" \
-  --cluster-signing-cert-file="$WORKDIR/ca.crt" \
+  --kubeconfig="$KUBECONFIG_FILE" \
+  --cluster-signing-cert-file="$CA_CERT" \
   --cluster-signing-key-file="$WORKDIR/ca.key" \
   --service-account-private-key-file="$WORKDIR/sa.key" \
-  --root-ca-file="$WORKDIR/ca.crt" \
+  --root-ca-file="$CA_CERT" \
   --controllers=csrapproving,csrsigning,garbagecollector,deployment,replicaset \
   --use-service-account-credentials=false \
   --leader-elect=false \

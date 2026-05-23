@@ -25,4 +25,4 @@ if [ -n "$FOCUS" ]; then
   ARGS+=(--focus "$FOCUS")
 fi
 
-exec "$REPO/scripts/sonobuoy-run.sh" "${ARGS[@]}"
+exec "$REPO/scripts/sonobuoy-run.sh" "${ARGS[@]+"${ARGS[@]}"}"
