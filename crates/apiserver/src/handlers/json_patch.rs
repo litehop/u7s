@@ -1,6 +1,58 @@
 use axum::http::HeaderMap;
+use serde::Deserialize;
 
 use crate::{status::Status, util::content_type};
+
+/// Query parameters accepted by PATCH endpoints.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct PatchQuery {
+    #[serde(rename = "fieldManager")]
+    pub field_manager: Option<String>,
+}
+
+/// Strip `managedFields` from an SSA apply body before merging.
+///
+/// Kubernetes clients (including Argo CD) include a `managedFields` key in the
+/// apply body to indicate their previous ownership. We don't track field
+/// ownership, so we discard it before the merge to avoid persisting stale data.
+pub(crate) fn strip_managed_fields(patch: &mut serde_json::Value) {
+    if let Some(map) = patch.as_object_mut() {
+        if let Some(meta) = map.get_mut("metadata") {
+            if let Some(meta_map) = meta.as_object_mut() {
+                meta_map.remove("managedFields");
+            }
+        }
+    }
+}
+
+/// Inject a synthetic `managedFields` entry into a response object.
+///
+/// Argo CD's client library reads `managedFields` from apply responses to
+/// determine field ownership. Without it, Argo CD treats every resource as
+/// OutOfSync and loops forever. We echo back a single entry for the applying
+/// manager; we do not implement full SSA field-level tracking.
+pub(crate) fn inject_managed_fields(
+    obj: &mut serde_json::Value,
+    manager: &str,
+    api_version: &str,
+    now: &str,
+) {
+    if let Some(map) = obj.as_object_mut() {
+        if let Some(meta) = map.get_mut("metadata") {
+            if let Some(meta_map) = meta.as_object_mut() {
+                meta_map.insert(
+                    "managedFields".to_string(),
+                    serde_json::json!([{
+                        "manager": manager,
+                        "operation": "Apply",
+                        "apiVersion": api_version,
+                        "time": now
+                    }]),
+                );
+            }
+        }
+    }
+}
 
 /// Patch Content-Type variants understood by all patch endpoints.
 #[derive(Debug)]
@@ -287,4 +339,62 @@ pub(crate) fn json_patch_remove(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// strip_managed_fields removes the managedFields key from metadata.
+    /// This matters because Argo CD sends managedFields in apply bodies to signal
+    /// previous ownership — we must not persist it or it corrupts the stored object.
+    #[test]
+    fn strip_managed_fields_removes_managed_fields_from_metadata() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "test",
+                "managedFields": [{"manager": "argocd", "operation": "Apply"}]
+            }
+        });
+
+        strip_managed_fields(&mut obj);
+
+        assert!(
+            obj["metadata"]["managedFields"].is_null(),
+            "managedFields must be removed from metadata after strip"
+        );
+        // Other metadata fields must survive the strip.
+        assert_eq!(obj["metadata"]["name"], "test");
+    }
+
+    /// strip_managed_fields is a no-op when managedFields is absent.
+    #[test]
+    fn strip_managed_fields_is_noop_when_absent() {
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "clean" }
+        });
+        strip_managed_fields(&mut obj);
+        assert_eq!(obj["metadata"]["name"], "clean");
+    }
+
+    /// inject_managed_fields inserts a synthetic SSA entry with the expected shape.
+    /// Argo CD reads manager, operation, apiVersion, and time from this entry.
+    #[test]
+    fn inject_managed_fields_inserts_synthetic_ssa_entry() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "metadata": { "name": "my-deploy" }
+        });
+
+        inject_managed_fields(&mut obj, "argocd", "apps/v1", "2026-05-23T00:00:00Z");
+
+        let mf = &obj["metadata"]["managedFields"];
+        assert!(mf.is_array(), "managedFields must be an array");
+        assert_eq!(mf[0]["manager"], "argocd");
+        assert_eq!(mf[0]["operation"], "Apply");
+        assert_eq!(mf[0]["apiVersion"], "apps/v1");
+        assert_eq!(mf[0]["time"], "2026-05-23T00:00:00Z");
+    }
 }
