@@ -20,6 +20,7 @@ use super::generic::{
     apply_label_selector, build_list_response, decode_continue, parse_field_selector,
     parse_label_selector, CollectionQuery,
 };
+use super::json_patch::PatchQuery;
 use super::resource::{
     create_namespaced_resource, create_resource, delete_namespaced_resource, delete_resource,
     get_namespaced_resource, get_resource, list_namespaced_resource, list_resource,
@@ -163,12 +164,14 @@ pub async fn core_delete_resource(
 pub async fn core_patch_resource(
     State(state): State<AppState>,
     Path((plural, name)): Path<(String, String)>,
+    Query(patch_query): Query<PatchQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     patch_resource(
         State(state),
         Path(("".into(), "v1".into(), plural, name)),
+        Query(patch_query),
         headers,
         body,
     )
@@ -284,12 +287,14 @@ pub async fn core_delete_namespaced_resource(
 pub async fn core_patch_namespaced_resource(
     State(state): State<AppState>,
     Path((ns, plural, name)): Path<(String, String, String)>,
+    Query(patch_query): Query<PatchQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     patch_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
+        Query(patch_query),
         headers,
         body,
     )

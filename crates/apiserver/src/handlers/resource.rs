@@ -24,7 +24,10 @@ use super::generic::{
     decode_continue, lookup, parse_field_selector, parse_label_selector, resolve_name,
     stamp_metadata, store_err, validate_name, CollectionQuery, RBAC_GROUP,
 };
-use super::json_patch::{apply_json_patch, detect_patch_type, PatchType};
+use super::json_patch::{
+    apply_json_patch, detect_patch_type, inject_managed_fields, strip_managed_fields, PatchQuery,
+    PatchType,
+};
 use super::watch::{fetch_initial_events, watch_generic};
 
 // ---------------------------------------------------------------------------
@@ -405,6 +408,8 @@ pub async fn delete_resource(
 ///
 /// `ns` is `None` for cluster-scoped resources and `Some(namespace)` for namespaced ones.
 /// The caller supplies the pre-computed `key` and resolved `meta`.
+/// `field_manager` is the value of the `?fieldManager=` query param; used only for SSA to
+/// populate the synthetic `managedFields` echo in the response.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn do_patch(
     state: &AppState,
@@ -416,6 +421,7 @@ pub(crate) async fn do_patch(
     ns: Option<&str>,
     name: &str,
     is_ssa: bool,
+    field_manager: Option<&str>,
     patch_type: PatchType,
     body: Bytes,
 ) -> Result<Response, crate::status::StatusError> {
@@ -429,6 +435,8 @@ pub(crate) async fn do_patch(
     if is_ssa && stored_opt.is_none() {
         let mut obj = Object::from_bytes(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+        // Strip any managedFields the client sent — we don't track field ownership.
+        strip_managed_fields(&mut obj.body);
         let mut obj_meta: ObjectMeta =
             serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
         obj_meta.name = Some(name.to_string());
@@ -451,11 +459,20 @@ pub(crate) async fn do_patch(
                     .ok_or_else(|| Status::not_found(name, &meta.kind))?;
                 let mut current = Object::from_bytes(&stored.value)
                     .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-                let patch: serde_json::Value = serde_json::from_slice(&body)
+                let mut patch: serde_json::Value = serde_json::from_slice(&body)
                     .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+                strip_managed_fields(&mut patch);
                 crate::patch::strategic_merge_patch(&mut current.body, &patch)
                     .map_err(|e| Status::bad_request(e.to_string()))?;
                 super::defaults::apply_defaults(group, plural, &mut current.body);
+                if let Some(fm) = field_manager {
+                    let api_ver = current.body["apiVersion"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let now = crate::util::utc_now_rfc3339();
+                    inject_managed_fields(&mut current.body, fm, &api_ver, &now);
+                }
                 let expected_rv = parse_resource_version(current.resource_version())?;
                 let rv = state
                     .store
@@ -468,6 +485,11 @@ pub(crate) async fn do_patch(
             Err(e) => return Err(store_err(e, name, &meta.kind)),
         };
         obj.set_resource_version(new_rv);
+        if let Some(fm) = field_manager {
+            let api_ver = obj.body["apiVersion"].as_str().unwrap_or("").to_string();
+            let now = crate::util::utc_now_rfc3339();
+            inject_managed_fields(&mut obj.body, fm, &api_ver, &now);
+        }
         return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
     }
 
@@ -478,6 +500,11 @@ pub(crate) async fn do_patch(
 
     let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    // Strip managedFields the client sent in the apply body — we don't track field ownership.
+    if is_ssa {
+        strip_managed_fields(&mut patch);
+    }
 
     // Strip status from the patch on the main endpoint for resources with a status subresource.
     if meta.has_status_subresource {
@@ -551,12 +578,24 @@ pub(crate) async fn do_patch(
         };
         state.rbac_index.apply_object(&rbac_key, &current.body);
     }
+    // SSA: echo synthetic managedFields so clients (e.g. Argo CD) can track field ownership.
+    if is_ssa {
+        if let Some(fm) = field_manager {
+            let api_ver = current.body["apiVersion"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let now = crate::util::utc_now_rfc3339();
+            inject_managed_fields(&mut current.body, fm, &api_ver, &now);
+        }
+    }
     Ok(Json(current.body).into_response())
 }
 
 pub async fn patch_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Query(patch_query): Query<PatchQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -579,7 +618,18 @@ pub async fn patch_resource(
 
     let key = group_object_key(&group, &plural, None, &name);
     do_patch(
-        &state, &key, &meta, &group, &version, &plural, None, &name, is_ssa, patch_type, body,
+        &state,
+        &key,
+        &meta,
+        &group,
+        &version,
+        &plural,
+        None,
+        &name,
+        is_ssa,
+        patch_query.field_manager.as_deref(),
+        patch_type,
+        body,
     )
     .await
 }
@@ -963,6 +1013,7 @@ pub async fn delete_namespaced_resource(
 pub async fn patch_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    Query(patch_query): Query<PatchQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -995,6 +1046,7 @@ pub async fn patch_namespaced_resource(
         Some(&ns),
         &name,
         is_ssa,
+        patch_query.field_manager.as_deref(),
         patch_type,
         body,
     )
@@ -1374,6 +1426,7 @@ mod tests {
                 "csinodes".to_string(),
                 "nonexistent-node".to_string(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             smp_headers,
             patch_bytes,
         )
@@ -1423,6 +1476,7 @@ mod tests {
                 "csinodes".to_string(),
                 "lima-node".to_string(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             ssa_headers,
             patch_bytes,
         )
@@ -1481,6 +1535,7 @@ mod tests {
                 "leases".to_string(),
                 "lima-node".to_string(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             ssa_headers,
             patch_bytes,
         )
@@ -1547,6 +1602,7 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             ssa_headers,
             patch_bytes,
         )
@@ -1555,6 +1611,159 @@ mod tests {
         assert!(
             patch_result.is_ok(),
             "PATCH with application/apply-patch+yaml must succeed"
+        );
+    }
+
+    /// apply-patch+yaml with ?fieldManager=argocd must return managedFields in the response.
+    ///
+    /// Argo CD reads managedFields from apply responses to determine field ownership.
+    /// Without this, Argo CD reports every resource as OutOfSync and loops forever.
+    /// This test covers both creation (object absent) and update (object exists) paths.
+    #[tokio::test]
+    async fn apply_patch_yaml_returns_managed_fields_for_field_manager() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "argocd-lease",
+                "namespace": "kube-node-lease",
+                // Client sends managedFields in the body — we must strip it before storing.
+                "managedFields": [{"manager": "old-manager", "operation": "Apply"}]
+            },
+            "spec": { "holderIdentity": "argocd", "leaseDurationSeconds": 15 }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        // --- Creation path (object absent) ---
+        let create_result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "argocd-lease".to_string(),
+            )),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("argocd".to_string()),
+            }),
+            ssa_headers.clone(),
+            patch_bytes.clone(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("apply-patch+yaml creation must succeed"))
+        .into_response();
+
+        assert_eq!(create_result.status(), axum::http::StatusCode::CREATED);
+        let body_bytes = to_bytes(create_result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Response must contain managedFields echoing the field manager.
+        let mf = &v["metadata"]["managedFields"];
+        assert!(mf.is_array(), "managedFields must be an array");
+        let entry = &mf[0];
+        assert_eq!(
+            entry["manager"], "argocd",
+            "managedFields[0].manager must be the ?fieldManager value"
+        );
+        assert_eq!(
+            entry["operation"], "Apply",
+            "managedFields[0].operation must be 'Apply'"
+        );
+        assert_eq!(
+            entry["apiVersion"], "coordination.k8s.io/v1",
+            "managedFields[0].apiVersion must match the object apiVersion"
+        );
+        assert!(
+            entry["time"].is_string(),
+            "managedFields[0].time must be a string timestamp"
+        );
+
+        // The client-supplied managedFields from the request body must NOT appear in the store.
+        // We only store the synthetic entry; we never persist the client's old ownership data.
+        let stored = store
+            .get("/registry/coordination.k8s.io/leases/kube-node-lease/argocd-lease")
+            .await
+            .unwrap()
+            .expect("object must exist");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        // The stored managedFields should not contain "old-manager" from the request body.
+        if let Some(stored_mf) = stored_v["metadata"]["managedFields"].as_array() {
+            for entry in stored_mf {
+                assert_ne!(
+                    entry["manager"], "old-manager",
+                    "client-supplied managedFields must not be persisted in the store"
+                );
+            }
+        }
+
+        // --- Update path (object exists) ---
+        let update_patch = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "argocd-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "argocd", "leaseDurationSeconds": 20 }
+        });
+        let update_bytes = bytes::Bytes::from(serde_json::to_vec(&update_patch).unwrap());
+
+        let update_result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "argocd-lease".to_string(),
+            )),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("argocd".to_string()),
+            }),
+            ssa_headers,
+            update_bytes,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("apply-patch+yaml update must succeed"))
+        .into_response();
+
+        let update_body = to_bytes(update_result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let uv: serde_json::Value = serde_json::from_slice(&update_body).unwrap();
+
+        let umf = &uv["metadata"]["managedFields"];
+        assert!(
+            umf.is_array(),
+            "managedFields must be present in update response"
+        );
+        assert_eq!(
+            umf[0]["manager"], "argocd",
+            "update response managedFields[0].manager must be 'argocd'"
+        );
+        assert_eq!(
+            umf[0]["operation"], "Apply",
+            "update response managedFields[0].operation must be 'Apply'"
         );
     }
 
@@ -2268,6 +2477,7 @@ mod tests {
                 "csinodes".into(),
                 "patch-node".into(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             jp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2333,6 +2543,7 @@ mod tests {
                 "leases".into(),
                 "ns-patch-lease".into(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             mp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2656,6 +2867,7 @@ mod tests {
                 "csinodes".into(),
                 "gc-node".into(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             mp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2871,6 +3083,7 @@ mod tests {
                 "widgets".into(),
                 "nonexistent".into(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             mp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -2906,6 +3119,7 @@ mod tests {
                 "widgets".into(),
                 "nonexistent".into(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             mp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3016,6 +3230,7 @@ mod tests {
                 "csinodes".into(),
                 "any-node".into(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             bad_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3057,6 +3272,7 @@ mod tests {
                 "leases".into(),
                 "any-lease".into(),
             )),
+            axum::extract::Query(PatchQuery::default()),
             bad_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
