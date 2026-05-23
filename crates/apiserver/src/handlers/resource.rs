@@ -31,6 +31,14 @@ use super::watch::{fetch_initial_events, watch_generic};
 // Cluster-scoped handlers  (group/version/resource)
 // ---------------------------------------------------------------------------
 
+/// Detect whether the Accept header requests PartialObjectMetadata.
+/// The kcm metadatainformer (GC) sends headers like:
+///   application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,
+///   application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
+fn wants_partial_object_metadata(accept: &str) -> bool {
+    accept.contains("as=PartialObjectMetadata")
+}
+
 pub async fn list_resource(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
@@ -53,11 +61,25 @@ pub async fn list_resource(
     };
     let prefix = group_list_prefix(&group, &plural, None);
 
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let pom = wants_partial_object_metadata(accept);
+
     if query.watch == Some(true) {
-        let api_version = if group.is_empty() {
-            version.clone()
+        let (watch_api_version, watch_kind) = if pom {
+            (
+                "meta.k8s.io/v1".to_string(),
+                "PartialObjectMetadata".to_string(),
+            )
         } else {
-            format!("{}/{}", group, version)
+            let av = if group.is_empty() {
+                version.clone()
+            } else {
+                format!("{}/{}", group, version)
+            };
+            (av, meta.kind.clone())
         };
         let from_rv = query.resource_version.unwrap_or(0);
         let initial =
@@ -65,15 +87,15 @@ pub async fn list_resource(
         return watch_generic(
             state,
             prefix,
-            api_version,
-            meta.kind.clone(),
+            watch_api_version,
+            watch_kind,
             from_rv,
             initial,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             user.username,
-            false,
+            pom,
         )
         .await;
     }
@@ -114,6 +136,20 @@ pub async fn list_resource(
     } else {
         items
     };
+
+    if pom {
+        let pom_items: Vec<serde_json::Value> = items
+            .iter()
+            .map(super::watch::to_partial_object_metadata)
+            .collect();
+        let body = serde_json::json!({
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "PartialObjectMetadataList",
+            "metadata": { "resourceVersion": resp.revision.to_string() },
+            "items": pom_items
+        });
+        return Ok(Json(body).into_response());
+    }
 
     let body = build_list_response(
         &meta.kind,
@@ -569,11 +605,25 @@ pub async fn list_namespaced_resource(
     };
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
 
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let pom = wants_partial_object_metadata(accept);
+
     if query.watch == Some(true) {
-        let api_version = if group.is_empty() {
-            version.clone()
+        let (watch_api_version, watch_kind) = if pom {
+            (
+                "meta.k8s.io/v1".to_string(),
+                "PartialObjectMetadata".to_string(),
+            )
         } else {
-            format!("{}/{}", group, version)
+            let av = if group.is_empty() {
+                version.clone()
+            } else {
+                format!("{}/{}", group, version)
+            };
+            (av, meta.kind.clone())
         };
         let from_rv = query.resource_version.unwrap_or(0);
         let initial =
@@ -581,15 +631,15 @@ pub async fn list_namespaced_resource(
         return watch_generic(
             state,
             prefix,
-            api_version,
-            meta.kind.clone(),
+            watch_api_version,
+            watch_kind,
             from_rv,
             initial,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             user.username,
-            false,
+            pom,
         )
         .await;
     }
@@ -630,6 +680,20 @@ pub async fn list_namespaced_resource(
     } else {
         items
     };
+
+    if pom {
+        let pom_items: Vec<serde_json::Value> = items
+            .iter()
+            .map(super::watch::to_partial_object_metadata)
+            .collect();
+        let body = serde_json::json!({
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "PartialObjectMetadataList",
+            "metadata": { "resourceVersion": resp.revision.to_string() },
+            "items": pom_items
+        });
+        return Ok(Json(body).into_response());
+    }
 
     let body = build_list_response(
         &meta.kind,
@@ -3072,5 +3136,279 @@ mod tests {
         crate::patch::strategic_merge_patch(&mut body, &patch).unwrap();
         let containers = body["spec"]["containers"].as_array().unwrap();
         assert_eq!(containers.len(), 2, "SMP must merge containers by name");
+    }
+
+    // -- PartialObjectMetadata (POM) watch support for built-in resources (mayor-by0r) --
+    //
+    // The kube-controller-manager's garbage collector uses metadatainformer, which opens
+    // watches on ALL resource types with Accept: ...as=PartialObjectMetadata... .
+    // list_namespaced_resource and list_resource must detect this header and:
+    //   1. Wrap ADDED/MODIFIED events as PartialObjectMetadata objects.
+    //   2. Use apiVersion="meta.k8s.io/v1" and kind="PartialObjectMetadata" in all events.
+    //   3. Send the initial-events-end BOOKMARK with the correct apiVersion/kind.
+    // Without this fix the GC's informer receives events with the wrong apiVersion/kind
+    // (e.g. "apps/v1"/"Deployment"), causing it to reject the BOOKMARK and never complete
+    // cache sync — which blocks the GC from running and can prevent Deployment→RS creation.
+
+    fn pom_accept_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,\
+                 application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json",
+            ),
+        );
+        h
+    }
+
+    /// Regression: list_namespaced_resource with POM Accept must return PartialObjectMetadataList.
+    /// The GC does a list before opening a watch. If the list returns a DeploymentList instead of
+    /// PartialObjectMetadataList, the GC cannot parse the response and will fail to populate its
+    /// dependency graph.
+    #[tokio::test]
+    async fn list_namespaced_resource_with_pom_accept_returns_partial_object_metadata_list() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "my-deploy",
+                "namespace": "default",
+                "ownerReferences": []
+            },
+            "spec": { "replicas": 1 }
+        });
+        store
+            .put(
+                "/registry/apps/deployments/default/my-deploy",
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let resp = list_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
+            pom_accept_headers(),
+            axum::Extension(crate::auth::UserInfo {
+                username: "test".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("list with POM Accept must succeed"));
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["apiVersion"], "meta.k8s.io/v1",
+            "POM list must return apiVersion=meta.k8s.io/v1, not apps/v1; \
+             GC cannot parse the dependency graph from a DeploymentList"
+        );
+        assert_eq!(
+            v["kind"], "PartialObjectMetadataList",
+            "POM list must return kind=PartialObjectMetadataList, not DeploymentList"
+        );
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "must return 1 item");
+        assert_eq!(
+            items[0]["apiVersion"], "meta.k8s.io/v1",
+            "each POM item must have apiVersion=meta.k8s.io/v1"
+        );
+        assert_eq!(
+            items[0]["kind"], "PartialObjectMetadata",
+            "each POM item must have kind=PartialObjectMetadata"
+        );
+        // spec must be stripped (only metadata is preserved in PartialObjectMetadata)
+        assert!(
+            items[0]["spec"].is_null() || items[0].get("spec").is_none(),
+            "POM items must not include spec — only metadata is preserved"
+        );
+    }
+
+    /// Regression: list_namespaced_resource with POM Accept + sendInitialEvents=true must send
+    /// the initial-events-end BOOKMARK with apiVersion=meta.k8s.io/v1 and
+    /// kind=PartialObjectMetadata. Without this fix, the GC's informer receives a BOOKMARK
+    /// with apiVersion=apps/v1 and kind=Deployment, which it rejects, causing the informer to
+    /// never complete cache sync and eventually log "event bookmark expired".
+    #[tokio::test]
+    async fn list_namespaced_resource_with_pom_accept_watch_emits_pom_bookmark() {
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Seed a Deployment so sendInitialEvents emits at least one ADDED event.
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "gc-deploy", "namespace": "default" },
+            "spec": { "replicas": 1 }
+        });
+        store
+            .put(
+                "/registry/apps/deployments/default/gc-deploy",
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let resp = list_namespaced_resource(
+            State(state),
+            Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+            )),
+            Query(CollectionQuery {
+                watch: Some(true),
+                resource_version: Some(0),
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: Some(true),
+                allow_watch_bookmarks: Some(true),
+            }),
+            pom_accept_headers(),
+            axum::Extension(crate::auth::UserInfo {
+                username: "gc-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch with POM Accept must succeed"));
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // Read the stream with a short timeout — initial events are emitted synchronously.
+        use tokio::time::{timeout, Duration};
+        let body = resp.into_body();
+        let bytes = timeout(
+            Duration::from_millis(300),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .unwrap_or(Ok(bytes::Bytes::new()))
+        .unwrap_or_default();
+
+        let text = std::str::from_utf8(&bytes).unwrap_or("");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+
+        // The ADDED event must carry PartialObjectMetadata, not Deployment.
+        let added = lines.iter().find(|v| v["type"] == "ADDED");
+        assert!(
+            added.is_some(),
+            "watch with sendInitialEvents must emit at least one ADDED event for the seeded Deployment"
+        );
+        let added = added.unwrap();
+        assert_eq!(
+            added["object"]["apiVersion"], "meta.k8s.io/v1",
+            "ADDED event must carry apiVersion=meta.k8s.io/v1 when POM is requested; \
+             GC informer rejects ADDED events with wrong apiVersion"
+        );
+        assert_eq!(
+            added["object"]["kind"], "PartialObjectMetadata",
+            "ADDED event must carry kind=PartialObjectMetadata when POM is requested"
+        );
+
+        // The initial-events-end BOOKMARK must carry PartialObjectMetadata apiVersion/kind.
+        // This is the key fix: without it the GC informer never completes cache sync.
+        let bookmark = lines.iter().find(|v| {
+            v["type"] == "BOOKMARK"
+                && v["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"] == "true"
+        });
+        assert!(
+            bookmark.is_some(),
+            "watch with POM Accept + sendInitialEvents must emit initial-events-end BOOKMARK; \
+             without it GC's metadatainformer blocks forever and logs 'event bookmark expired'. \
+             Got lines: {:?}",
+            lines
+        );
+        let bookmark = bookmark.unwrap();
+        assert_eq!(
+            bookmark["object"]["apiVersion"], "meta.k8s.io/v1",
+            "initial-events-end BOOKMARK must carry apiVersion=meta.k8s.io/v1, not apps/v1; \
+             GC informer validates the apiVersion in the BOOKMARK and rejects mismatches"
+        );
+        assert_eq!(
+            bookmark["object"]["kind"], "PartialObjectMetadata",
+            "initial-events-end BOOKMARK must carry kind=PartialObjectMetadata, not Deployment"
+        );
+    }
+
+    /// wants_partial_object_metadata detects the GC's Accept header correctly.
+    /// This is the predicate that gates POM mode — if it returns false for the GC's header,
+    /// the GC gets wrong apiVersion/kind in all events and can never sync.
+    #[test]
+    fn wants_partial_object_metadata_detects_gc_accept_header() {
+        // Real header sent by kube-controller-manager's metadatainformer.
+        let gc_accept = "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;\
+                         g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;\
+                         g=meta.k8s.io;v=v1,application/json";
+        assert!(
+            wants_partial_object_metadata(gc_accept),
+            "GC's Accept header must be detected as POM; if not, GC informers get wrong \
+             apiVersion/kind and can never sync (mayor-by0r)"
+        );
+
+        // Non-POM accept must return false.
+        assert!(
+            !wants_partial_object_metadata("application/json"),
+            "plain JSON Accept must not be detected as POM"
+        );
+        assert!(
+            !wants_partial_object_metadata(""),
+            "empty Accept must not be detected as POM"
+        );
     }
 }
