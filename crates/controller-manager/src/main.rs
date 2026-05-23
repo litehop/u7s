@@ -15,7 +15,8 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 use u7s_client_util::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use u7s_controller_manager::{
-    build_sa_token_secret, parse_sa_added_event, secrets_path, token_request_path,
+    build_sa_token_secret, namespace_controller, parse_sa_added_event, secrets_path,
+    token_request_path,
 };
 
 // ---------------------------------------------------------------------------
@@ -130,6 +131,64 @@ async fn main() -> anyhow::Result<()> {
 
     let connector = build_tls_connector(&creds)?;
 
+    // Spawn the namespace lifecycle controller in the background.
+    {
+        let server_ns = server.clone();
+        let connector_ns = connector.clone();
+        let bearer_ns = bearer_token.clone();
+        tokio::spawn(async move {
+            loop {
+                info!("starting Namespace watch (lifecycle controller)");
+                let client = HyperApiClient {
+                    server: server_ns.clone(),
+                    connector: connector_ns.clone(),
+                    bearer: bearer_ns.clone(),
+                };
+                let path = "/api/v1/namespaces?watch=true";
+                let result = client
+                    .watch_stream(path, |event| {
+                        let action = namespace_controller::parse_ns_event(&event);
+                        match action {
+                            namespace_controller::NsAction::AddFinalizer(name) => {
+                                info!("namespace {name}: adding 'kubernetes' finalizer");
+                                let client_clone = HyperApiClient {
+                                    server: server_ns.clone(),
+                                    connector: connector_ns.clone(),
+                                    bearer: bearer_ns.clone(),
+                                };
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        add_kubernetes_finalizer(&client_clone, &name).await
+                                    {
+                                        error!("add_kubernetes_finalizer {name}: {e}");
+                                    }
+                                });
+                            }
+                            namespace_controller::NsAction::Drain(name) => {
+                                info!("namespace {name}: Terminating — draining resources");
+                                let client_clone = HyperApiClient {
+                                    server: server_ns.clone(),
+                                    connector: connector_ns.clone(),
+                                    bearer: bearer_ns.clone(),
+                                };
+                                tokio::spawn(async move {
+                                    if let Err(e) = drain_namespace(&client_clone, &name).await {
+                                        error!("drain_namespace {name}: {e}");
+                                    }
+                                });
+                            }
+                            namespace_controller::NsAction::None => {}
+                        }
+                    })
+                    .await;
+                if let Err(e) = result {
+                    error!("namespace watch error: {e} — reconnecting in 5s");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+
     loop {
         info!("starting ServiceAccount watch");
         let path = "/api/v1/serviceaccounts?watch=true";
@@ -165,4 +224,148 @@ async fn main() -> anyhow::Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Namespace lifecycle helpers
+// ---------------------------------------------------------------------------
+
+/// Fetch the current namespace object. Returns None when the namespace is already gone.
+async fn get_namespace(
+    client: &HyperApiClient,
+    name: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    use anyhow::Context;
+    let path = namespace_controller::namespace_patch_path(name);
+    let (status, body) = client
+        .request(Method::GET, &path, None)
+        .await
+        .with_context(|| format!("GET namespace {name}"))?;
+    if status.as_u16() == 404 {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        anyhow::bail!("GET namespace {name} failed ({status}): {body}");
+    }
+    let ns: serde_json::Value =
+        serde_json::from_str(&body).with_context(|| format!("parse namespace {name}"))?;
+    Ok(Some(ns))
+}
+
+/// Replace the namespace object via PUT.
+async fn replace_namespace(
+    client: &HyperApiClient,
+    name: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let path = namespace_controller::namespace_patch_path(name);
+    let (status, resp) = client
+        .request(Method::PUT, &path, Some(serde_json::to_string(body)?))
+        .await
+        .with_context(|| format!("PUT namespace {name}"))?;
+    if status.is_success() || status.as_u16() == 404 {
+        Ok(())
+    } else {
+        anyhow::bail!("PUT namespace {name} failed ({status}): {resp}");
+    }
+}
+
+/// Add the "kubernetes" finalizer to a namespace via GET + PUT.
+async fn add_kubernetes_finalizer(client: &HyperApiClient, name: &str) -> anyhow::Result<()> {
+    let Some(mut ns) = get_namespace(client, name).await? else {
+        info!("namespace {name}: already deleted, skipping finalizer add");
+        return Ok(());
+    };
+
+    // Build the new finalizers list, adding "kubernetes" if not already present.
+    let existing: Vec<String> = ns["metadata"]["finalizers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+        .collect();
+
+    if existing.iter().any(|f| f == "kubernetes") {
+        // Already present — idempotent.
+        return Ok(());
+    }
+
+    let mut new_finalizers = existing;
+    new_finalizers.push("kubernetes".to_owned());
+    ns["metadata"]["finalizers"] = serde_json::to_value(&new_finalizers)?;
+
+    replace_namespace(client, name, &ns).await?;
+    info!("namespace {name}: 'kubernetes' finalizer added");
+    Ok(())
+}
+
+/// Drain all core namespaced resources from a Terminating namespace,
+/// then remove the "kubernetes" finalizer via GET + PUT to trigger hard-delete.
+async fn drain_namespace(client: &HyperApiClient, namespace: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    for resource in namespace_controller::CORE_DRAIN_RESOURCES {
+        let list_path = namespace_controller::namespaced_resource_list_path(namespace, resource);
+        let (status, body) = client
+            .request(Method::GET, &list_path, None)
+            .await
+            .with_context(|| format!("list {resource} in {namespace}"))?;
+
+        if !status.is_success() {
+            // 404 means resource type doesn't exist in this namespace — skip.
+            if status.as_u16() == 404 {
+                continue;
+            }
+            warn!("list {resource} in {namespace}: HTTP {status} — skipping");
+            continue;
+        }
+
+        let list: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("parse {resource} list in {namespace}"))?;
+        let items = list["items"].as_array().cloned().unwrap_or_default();
+
+        for item in items {
+            let item_name = item["metadata"]["name"].as_str().unwrap_or("").to_owned();
+            if item_name.is_empty() {
+                continue;
+            }
+            let del_path = namespace_controller::namespaced_resource_delete_path(
+                namespace, resource, &item_name,
+            );
+            let (del_status, _) = client
+                .request(Method::DELETE, &del_path, None)
+                .await
+                .with_context(|| format!("delete {resource}/{item_name} in {namespace}"))?;
+            if del_status.is_success() || del_status.as_u16() == 404 {
+                info!("namespace {namespace}: deleted {resource}/{item_name}");
+            } else {
+                warn!("namespace {namespace}: delete {resource}/{item_name} returned {del_status}");
+            }
+        }
+    }
+
+    // Remove the "kubernetes" finalizer via GET + PUT.
+    let Some(mut ns) = get_namespace(client, namespace).await? else {
+        // Already gone — nothing to do.
+        info!("namespace {namespace}: already deleted");
+        return Ok(());
+    };
+
+    let new_finalizers: Vec<String> = ns["metadata"]["finalizers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+        .filter(|f| f != "kubernetes")
+        .collect();
+
+    ns["metadata"]["finalizers"] = serde_json::to_value(&new_finalizers)?;
+    // Also clear null so merge-patch semantics work: set to empty array.
+
+    replace_namespace(client, namespace, &ns).await?;
+    info!("namespace {namespace}: 'kubernetes' finalizer removed, hard-delete triggered");
+    Ok(())
 }
