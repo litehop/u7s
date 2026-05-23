@@ -9,6 +9,7 @@ use serde::Deserialize;
 use u7s_store::{ListOptions, Store, StoreError};
 
 use crate::{
+    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     keys::{cluster_object_key, list_prefix, object_key},
     state::AppState,
@@ -277,6 +278,18 @@ pub async fn create_pod(
 
     apply_pod_create_defaults(&mut obj.body);
 
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "pods",
+        name: &name,
+        namespace: Some(ns.as_str()),
+        operation: "CREATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state
         .store
@@ -334,6 +347,18 @@ pub async fn replace_pod(
     }
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
+
+    // Admission webhook pipeline (mutating then validating).
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "pods",
+        name: &name,
+        namespace: Some(ns.as_str()),
+        operation: "UPDATE",
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state
@@ -2853,5 +2878,344 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Admission regression tests — prove create_pod / replace_pod invoke the
+// admission webhook pipeline (mayor-8sn9).
+//
+// Without the fix both handlers skipped admission entirely; admission-based
+// controls (OPA Gatekeeper, Kyverno) on pods were non-functional.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admission_tests {
+    use std::sync::Arc;
+
+    use axum::{routing::post, Router};
+    use bytes::Bytes;
+    use tokio::net::TcpListener;
+    use u7s_store::{SqliteStore, Store};
+
+    use super::*;
+    use crate::state::AppState;
+
+    fn make_state(store: Arc<SqliteStore>) -> AppState {
+        AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    async fn seed_namespace(store: &Arc<SqliteStore>, ns: &str) {
+        let key = format!("/registry/namespaces/{ns}");
+        let val = serde_json::json!({"kind": "Namespace", "metadata": {"name": ns}});
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .expect("seed namespace");
+    }
+
+    async fn start_mock_webhook(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock webhook server must not fail");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    fn patch_label_router() -> Router {
+        Router::new().route(
+            "/webhook",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/metadata/labels", "value": {"admitted": "yes"}}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        )
+    }
+
+    fn deny_router() -> Router {
+        Router::new().route(
+            "/webhook",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": false,
+                        "status": {"code": 403, "message": "denied by test webhook"}
+                    }
+                }))
+            }),
+        )
+    }
+
+    /// create_pod must invoke the mutating admission pipeline.
+    /// A mutating webhook that adds a label must have that label present in the
+    /// stored pod — without this fix, the webhook was never called and the pod was
+    /// stored without the label.
+    #[tokio::test]
+    async fn create_pod_invokes_mutating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        seed_namespace(&store, "default").await;
+
+        let (url, _handle) = start_mock_webhook(patch_label_router()).await;
+
+        // Register a MutatingWebhookConfiguration targeting pods CREATE.
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "test-mutating"},
+            "webhooks": [{
+                "name": "test.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/test-mutating",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "test-pod", "namespace": "default"},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            })
+            .to_string(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let result = create_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(),)),
+            headers,
+            pod_body,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "create_pod must succeed when webhook allows"
+        );
+
+        // The stored pod must have the label injected by the webhook.
+        let stored = store
+            .get("/registry/pods/default/test-pod")
+            .await
+            .unwrap()
+            .expect("pod must be stored");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["labels"]["admitted"], "yes",
+            "mutating webhook label must be present in stored pod — \
+             without the fix, create_pod bypassed admission and the label was never injected"
+        );
+    }
+
+    /// create_pod must invoke the validating admission pipeline.
+    /// A validating webhook that denies must cause create_pod to return an error,
+    /// and the pod must NOT be stored. Before the fix, denial was silently ignored.
+    #[tokio::test]
+    async fn create_pod_invokes_validating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        seed_namespace(&store, "default").await;
+
+        let (url, _handle) = start_mock_webhook(deny_router()).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test-validating"},
+            "webhooks": [{
+                "name": "deny.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/test-validating",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "denied-pod", "namespace": "default"},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            })
+            .to_string(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let result = create_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(),)),
+            headers,
+            pod_body,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "create_pod must be rejected when validating webhook denies — \
+             without the fix, admission was bypassed and the pod was silently stored"
+        );
+
+        // Pod must NOT be in the store.
+        let stored = store
+            .get("/registry/pods/default/denied-pod")
+            .await
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "denied pod must not be stored in the backing store"
+        );
+    }
+
+    /// replace_pod must invoke the mutating admission pipeline.
+    /// A webhook that adds a label on UPDATE must mutate the stored pod.
+    #[tokio::test]
+    async fn replace_pod_invokes_mutating_admission() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        seed_namespace(&store, "default").await;
+
+        // Seed an existing pod.
+        let pod_key = "/registry/pods/default/my-pod";
+        let existing = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        store
+            .put(
+                pod_key,
+                Bytes::from(serde_json::to_vec(&existing).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let stored_rv = store.get(pod_key).await.unwrap().unwrap().revision;
+
+        let (url, _handle) = start_mock_webhook(patch_label_router()).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "test-mutating-update"},
+            "webhooks": [{
+                "name": "test.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/test-mutating-update",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "my-pod",
+                    "namespace": "default",
+                    "resourceVersion": stored_rv.to_string()
+                },
+                "spec": {"containers": [{"name": "app", "image": "nginx:latest"}]}
+            })
+            .to_string(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let result = replace_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(), "my-pod".to_string())),
+            headers,
+            pod_body,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "replace_pod must succeed when webhook allows"
+        );
+
+        let stored = store
+            .get(pod_key)
+            .await
+            .unwrap()
+            .expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["labels"]["admitted"], "yes",
+            "mutating webhook label must be present after replace_pod — \
+             without the fix, replace_pod bypassed admission and the label was never injected"
+        );
     }
 }
