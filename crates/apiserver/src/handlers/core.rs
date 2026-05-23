@@ -35,6 +35,7 @@ pub async fn core_list_resource(
     State(state): State<AppState>,
     Path(plural): Path<String>,
     Query(query): Query<CollectionQuery>,
+    headers: axum::http::HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Pods are namespaced; the registry has no cluster-scoped "pods" entry.
@@ -57,6 +58,7 @@ pub async fn core_list_resource(
                 query.field_selector,
                 query.allow_watch_bookmarks == Some(true),
                 user.username,
+                false,
             )
             .await
             .map(IntoResponse::into_response);
@@ -103,6 +105,7 @@ pub async fn core_list_resource(
         State(state),
         Path(("".into(), "v1".into(), plural)),
         Query(query),
+        headers,
         Extension(user),
     )
     .await
@@ -213,12 +216,14 @@ pub async fn core_list_namespaced_resource(
     State(state): State<AppState>,
     Path((ns, plural)): Path<(String, String)>,
     Query(query): Query<CollectionQuery>,
+    headers: axum::http::HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     list_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural)),
         Query(query),
+        headers,
         Extension(user),
     )
     .await

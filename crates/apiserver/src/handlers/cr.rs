@@ -489,9 +489,28 @@ fn validate_cr_schema(
 // Cluster-scoped CR handlers
 // ---------------------------------------------------------------------------
 
+/// Detect whether the Accept header requests PartialObjectMetadata or PartialObjectMetadataList.
+/// The kcm metadatainformer sends Accept headers like:
+///   application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,
+///   application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
+fn wants_partial_object_metadata(accept: &str) -> bool {
+    accept.contains("as=PartialObjectMetadata")
+}
+
+/// Strip spec/status from a full CR object, returning a PartialObjectMetadata-shaped value.
+/// The GC only needs metadata (ownerReferences, finalizers, etc.) — spec/status are omitted.
+fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": obj.get("metadata").cloned().unwrap_or_default()
+    })
+}
+
 pub async fn list_cr(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
+    headers: axum::http::HeaderMap,
     query: super::generic::CollectionQuery,
     username: String,
 ) -> Result<Response, crate::status::StatusError> {
@@ -517,19 +536,33 @@ pub async fn list_cr(
 
     let prefix = cr_list_prefix(&group, list_version, &plural, None);
 
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let pom = wants_partial_object_metadata(accept);
+
     if query.watch == Some(true) {
-        let api_version = format!("{group}/{version}");
+        let (watch_api_version, watch_kind) = if pom {
+            (
+                "meta.k8s.io/v1".to_string(),
+                "PartialObjectMetadata".to_string(),
+            )
+        } else {
+            (format!("{group}/{version}"), ctx.kind.clone())
+        };
         return super::watch::watch_generic(
             state,
             prefix,
-            api_version,
-            ctx.kind,
+            watch_api_version,
+            watch_kind,
             query.resource_version.unwrap_or(0),
             None,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             username,
+            pom,
         )
         .await;
     }
@@ -552,6 +585,18 @@ pub async fn list_cr(
         let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
         let desired_api_version = format!("{group}/{version}");
         items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
+    }
+
+    if pom {
+        let pom_items: Vec<serde_json::Value> =
+            items.iter().map(to_partial_object_metadata).collect();
+        let body = serde_json::json!({
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "PartialObjectMetadataList",
+            "metadata": { "resourceVersion": resp.revision.to_string() },
+            "items": pom_items
+        });
+        return Ok(Json(body).into_response());
     }
 
     let body = super::generic::build_list_response(
@@ -781,6 +826,7 @@ pub async fn delete_cr(
 pub async fn list_cr_namespaced(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    headers: axum::http::HeaderMap,
     query: super::generic::CollectionQuery,
     username: String,
 ) -> Result<Response, crate::status::StatusError> {
@@ -804,19 +850,33 @@ pub async fn list_cr_namespaced(
 
     let prefix = cr_list_prefix(&group, list_version, &plural, Some(&ns));
 
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let pom = wants_partial_object_metadata(accept);
+
     if query.watch == Some(true) {
-        let api_version = format!("{group}/{version}");
+        let (watch_api_version, watch_kind) = if pom {
+            (
+                "meta.k8s.io/v1".to_string(),
+                "PartialObjectMetadata".to_string(),
+            )
+        } else {
+            (format!("{group}/{version}"), ctx.kind.clone())
+        };
         return super::watch::watch_generic(
             state,
             prefix,
-            api_version,
-            ctx.kind,
+            watch_api_version,
+            watch_kind,
             query.resource_version.unwrap_or(0),
             None,
             query.label_selector,
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             username,
+            pom,
         )
         .await;
     }
@@ -838,6 +898,18 @@ pub async fn list_cr_namespaced(
         let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
         let desired_api_version = format!("{group}/{version}");
         items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
+    }
+
+    if pom {
+        let pom_items: Vec<serde_json::Value> =
+            items.iter().map(to_partial_object_metadata).collect();
+        let body = serde_json::json!({
+            "apiVersion": "meta.k8s.io/v1",
+            "kind": "PartialObjectMetadataList",
+            "metadata": { "resourceVersion": resp.revision.to_string() },
+            "items": pom_items
+        });
+        return Ok(Json(body).into_response());
     }
 
     let body = super::generic::build_list_response(
@@ -1530,6 +1602,7 @@ mod tests {
                     "default".to_string(),
                     "things".to_string(),
                 )),
+                axum::http::HeaderMap::new(),
                 no_watch_query(),
                 "test-user".to_string(),
             )
@@ -1558,6 +1631,7 @@ mod tests {
                     "default".to_string(),
                     "widgets".to_string(),
                 )),
+                axum::http::HeaderMap::new(),
                 no_watch_query(),
                 "test-user".to_string(),
             )
@@ -1583,6 +1657,7 @@ mod tests {
                     "v1alpha1".to_string(),
                     "applications".to_string(),
                 )),
+                axum::http::HeaderMap::new(),
                 no_watch_query(),
                 "test-user".to_string(),
             )
@@ -1725,6 +1800,7 @@ mod tests {
         let resp = match list_cr_namespaced(
             State(state.clone()),
             Path((group, version, ns, plural)),
+            axum::http::HeaderMap::new(),
             no_watch_query(),
             "test-user".to_string(),
         )
@@ -2027,6 +2103,7 @@ mod tests {
                 "v1".to_string(),
                 "widgets".to_string(),
             )),
+            axum::http::HeaderMap::new(),
             watch_query(),
             "test-user".to_string(),
         )
@@ -2063,6 +2140,7 @@ mod tests {
                 "argocd".to_string(),
                 "applications".to_string(),
             )),
+            axum::http::HeaderMap::new(),
             watch_query(),
             "test-user".to_string(),
         )
@@ -3818,6 +3896,7 @@ mod tests {
                 "v1".to_string(),
                 "widgets".to_string(),
             )),
+            axum::http::HeaderMap::new(),
             no_watch_query(),
             "test-user".to_string(),
         )
@@ -3863,6 +3942,7 @@ mod tests {
                 "v1".to_string(),
                 "widgets".to_string(),
             )),
+            axum::http::HeaderMap::new(),
             no_watch_query(),
             "test-user".to_string(),
         )
@@ -4112,6 +4192,7 @@ mod tests {
                 "v1".to_string(),
                 "widgets".to_string(),
             )),
+            axum::http::HeaderMap::new(),
             no_watch_query(),
             "test-user".to_string(),
         )
@@ -4583,6 +4664,260 @@ mod tests {
         assert!(
             ctx.conversion_webhook_client_config.is_none(),
             "find_crd must not extract conversion config when strategy is not Webhook"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // PartialObjectMetadata media type negotiation (mayor-ve5z)
+    // ---------------------------------------------------------------------------
+
+    /// wants_partial_object_metadata must detect the kcm metadatainformer Accept header.
+    /// The GC sends: application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,
+    ///               application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json
+    /// Without this detection the reflector gets full CR objects it can't decode as PartialObjectMetadata,
+    /// causing it to restart without ever receiving the initial-events-end BOOKMARK.
+    #[test]
+    fn wants_pom_detects_partial_object_metadata_accept_header() {
+        // Real kcm metadatainformer Accept header.
+        let accept = "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json";
+        assert!(
+            wants_partial_object_metadata(accept),
+            "must detect as=PartialObjectMetadata in kcm metadatainformer Accept header"
+        );
+    }
+
+    #[test]
+    fn wants_pom_detects_partial_object_metadata_list() {
+        let accept = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1";
+        assert!(
+            wants_partial_object_metadata(accept),
+            "must detect as=PartialObjectMetadataList"
+        );
+    }
+
+    #[test]
+    fn wants_pom_returns_false_for_plain_json() {
+        assert!(
+            !wants_partial_object_metadata("application/json"),
+            "plain application/json must NOT trigger POM transformation"
+        );
+    }
+
+    /// to_partial_object_metadata must strip spec/status and set the correct apiVersion/kind.
+    /// The GC needs metadata (ownerReferences, finalizers) but not spec/status — sending full
+    /// objects causes the reflector to fail decoding and never receive the initial-events-end BOOKMARK.
+    #[test]
+    fn to_pom_strips_spec_and_sets_correct_kind() {
+        let full_cr = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": { "name": "w1", "uid": "abc", "ownerReferences": [] },
+            "spec": { "color": "blue" },
+            "status": { "ready": true }
+        });
+        let pom = to_partial_object_metadata(&full_cr);
+        assert_eq!(pom["apiVersion"], "meta.k8s.io/v1");
+        assert_eq!(pom["kind"], "PartialObjectMetadata");
+        assert_eq!(pom["metadata"]["name"], "w1");
+        assert_eq!(pom["metadata"]["uid"], "abc");
+        // spec and status must be absent — GC does not need them.
+        assert!(
+            pom.get("spec").is_none() || pom["spec"].is_null(),
+            "spec must be absent in POM"
+        );
+        assert!(
+            pom.get("status").is_none() || pom["status"].is_null(),
+            "status must be absent in POM"
+        );
+    }
+
+    /// LIST with as=PartialObjectMetadataList Accept header must return PartialObjectMetadataList
+    /// with each item as PartialObjectMetadata (no spec). This is the critical path for the kcm
+    /// garbage collector — it lists resources using this media type.
+    #[tokio::test]
+    async fn list_cr_with_pom_accept_returns_partial_object_metadata_list() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        // Create a widget with spec so we can verify spec is stripped.
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                widget_body("pom-widget"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let mut accept_headers = axum::http::HeaderMap::new();
+        accept_headers.insert(
+            axum::http::header::ACCEPT,
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+                .parse()
+                .unwrap(),
+        );
+
+        let resp = match list_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            accept_headers,
+            no_watch_query(),
+            "test-user".to_string(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("list with POM accept must succeed"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            body["kind"], "PartialObjectMetadataList",
+            "kind must be PartialObjectMetadataList when Accept requests POM"
+        );
+        assert_eq!(
+            body["apiVersion"], "meta.k8s.io/v1",
+            "apiVersion must be meta.k8s.io/v1 for POM list"
+        );
+
+        let items = body["items"].as_array().expect("items must be an array");
+        assert_eq!(items.len(), 1, "must have exactly one item");
+        assert_eq!(
+            items[0]["kind"], "PartialObjectMetadata",
+            "each item kind must be PartialObjectMetadata"
+        );
+        assert_eq!(
+            items[0]["apiVersion"], "meta.k8s.io/v1",
+            "each item apiVersion must be meta.k8s.io/v1"
+        );
+        assert_eq!(
+            items[0]["metadata"]["name"], "pom-widget",
+            "item metadata.name must be preserved"
+        );
+        assert!(
+            items[0].get("spec").is_none() || items[0]["spec"].is_null(),
+            "spec must be absent in PartialObjectMetadata item — GC does not need it \
+             and its presence causes the reflector to fail decoding"
+        );
+    }
+
+    /// WATCH with as=PartialObjectMetadata Accept header must emit ADDED events shaped as
+    /// PartialObjectMetadata. Without this, the kcm reflector fails to decode the objects
+    /// and the metadatainformer never syncs, blocking all GC-dependent controllers.
+    #[tokio::test]
+    async fn list_cr_watch_with_pom_accept_emits_partial_object_metadata_events() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        // Write a widget BEFORE subscribing so the ring buffer replays it.
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                widget_body("watch-pom-widget"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Accept header as sent by kcm metadatainformer.
+        let mut accept_headers = axum::http::HeaderMap::new();
+        accept_headers.insert(
+            axum::http::header::ACCEPT,
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json"
+                .parse()
+                .unwrap(),
+        );
+
+        let resp = match list_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            accept_headers,
+            watch_query(),
+            "test-user".to_string(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("watch with POM accept must succeed"),
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("transfer-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("chunked"),
+            "watch response must use chunked encoding"
+        );
+
+        // Drop the test's AppState clone so the broadcast sender (tx) inside SqliteStore
+        // is released. The watch stream's receiver then gets Err(Closed) after draining
+        // the ring buffer, and the stream terminates cleanly — allowing to_bytes to return.
+        drop(state);
+
+        // Read all events. The ring buffer replays the pre-existing widget as ADDED,
+        // then the stream closes because tx was dropped above.
+        let body = resp.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("watch stream must drain cleanly after store is dropped");
+
+        let text = std::str::from_utf8(&bytes).unwrap_or("");
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+
+        // The ring buffer must replay the ADDED event for the pre-existing widget.
+        let added: Vec<_> = events.iter().filter(|e| e["type"] == "ADDED").collect();
+        assert!(
+            !added.is_empty(),
+            "POM watch must emit at least one ADDED event from ring buffer; \
+             without it the GC metadatainformer cache never syncs"
+        );
+        assert_eq!(
+            added[0]["object"]["kind"], "PartialObjectMetadata",
+            "ADDED event object kind must be PartialObjectMetadata, not the full CR kind — \
+             full objects cause the kcm reflector to fail decoding and restart"
+        );
+        assert_eq!(
+            added[0]["object"]["apiVersion"], "meta.k8s.io/v1",
+            "ADDED event object apiVersion must be meta.k8s.io/v1"
+        );
+        assert_eq!(
+            added[0]["object"]["metadata"]["name"], "watch-pom-widget",
+            "ADDED event metadata.name must match"
+        );
+        assert!(
+            added[0]["object"].get("spec").is_none() || added[0]["object"]["spec"].is_null(),
+            "spec must be absent in POM ADDED event — the kcm scheme does not know Gateway, Widget etc."
         );
     }
 }

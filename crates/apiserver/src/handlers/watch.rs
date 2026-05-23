@@ -4,15 +4,31 @@ use u7s_store::{ListOptions, Store, WatchEvent};
 
 use crate::{state::AppState, status::Status};
 
+/// Transform a full CR JSON object into a PartialObjectMetadata object.
+/// The GC only needs metadata (ownerReferences, finalizers, etc.) — spec/status are omitted.
+pub(crate) fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "PartialObjectMetadata",
+        "metadata": obj.get("metadata").cloned().unwrap_or_default()
+    })
+}
+
 /// Serialise a single watch event to NDJSON bytes (including trailing newline).
 /// Returns None on Compacted — the caller should close the stream.
 /// Returns None on corrupt object bytes (invalid UTF-8) — the event is skipped,
 /// a warning is logged, and the stream continues. Emitting null would send invalid
 /// data to Kubernetes clients that may panic or behave incorrectly.
+///
+/// When `as_partial_object_metadata` is true, ADDED and MODIFIED event objects are
+/// wrapped as PartialObjectMetadata (apiVersion: meta.k8s.io/v1, kind: PartialObjectMetadata,
+/// only metadata preserved). BOOKMARK and DELETED use the caller-supplied api_version/kind
+/// which should also be set to "meta.k8s.io/v1"/"PartialObjectMetadata" by the caller.
 pub(crate) fn encode_watch_event(
     event: &WatchEvent,
     api_version: &str,
     kind: &str,
+    as_partial_object_metadata: bool,
 ) -> Option<Bytes> {
     let line = match event {
         WatchEvent::Added(obj) => {
@@ -23,7 +39,17 @@ pub(crate) fn encode_watch_event(
                     return None;
                 }
             };
-            format!("{{\"type\":\"ADDED\",\"object\":{object_json}}}\n")
+            if as_partial_object_metadata {
+                let full: serde_json::Value =
+                    serde_json::from_str(object_json).unwrap_or(serde_json::Value::Null);
+                let pom = to_partial_object_metadata(&full);
+                format!(
+                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
+                    serde_json::to_string(&pom).unwrap_or_default()
+                )
+            } else {
+                format!("{{\"type\":\"ADDED\",\"object\":{object_json}}}\n")
+            }
         }
         WatchEvent::Modified(obj) => {
             let object_json = match std::str::from_utf8(&obj.value) {
@@ -33,7 +59,17 @@ pub(crate) fn encode_watch_event(
                     return None;
                 }
             };
-            format!("{{\"type\":\"MODIFIED\",\"object\":{object_json}}}\n")
+            if as_partial_object_metadata {
+                let full: serde_json::Value =
+                    serde_json::from_str(object_json).unwrap_or(serde_json::Value::Null);
+                let pom = to_partial_object_metadata(&full);
+                format!(
+                    "{{\"type\":\"MODIFIED\",\"object\":{}}}\n",
+                    serde_json::to_string(&pom).unwrap_or_default()
+                )
+            } else {
+                format!("{{\"type\":\"MODIFIED\",\"object\":{object_json}}}\n")
+            }
         }
         WatchEvent::Deleted { key, revision } => {
             // Reconstruct a minimal tombstone object from the store key.
@@ -217,6 +253,10 @@ pub(crate) async fn watch_generic(
     field_selector: Option<String>,
     allow_watch_bookmarks: bool,
     username: String,
+    // When true, wrap each ADDED/MODIFIED object as PartialObjectMetadata and use
+    // "meta.k8s.io/v1"/"PartialObjectMetadata" for BOOKMARK and DELETED events.
+    // The caller must also pass api_version="meta.k8s.io/v1" and kind="PartialObjectMetadata".
+    as_partial_object_metadata: bool,
 ) -> Result<Response, crate::status::StatusError> {
     // Enforce per-client watch concurrency limit. Try to acquire a permit from
     // this user's semaphore. If the semaphore is exhausted (client already has
@@ -266,9 +306,14 @@ pub(crate) async fn watch_generic(
         if let Some((items, list_rv)) = initial_items {
             last_rv = last_rv.max(list_rv);
             for item in items {
+                let emit = if as_partial_object_metadata {
+                    to_partial_object_metadata(&item)
+                } else {
+                    item
+                };
                 let line = format!(
                     "{{\"type\":\"ADDED\",\"object\":{}}}\n",
-                    serde_json::to_string(&item).unwrap_or_default()
+                    serde_json::to_string(&emit).unwrap_or_default()
                 );
                 yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
             }
@@ -336,7 +381,7 @@ pub(crate) async fn watch_generic(
                             };
 
                             if !skip {
-                                if let Some(chunk) = encode_watch_event(&event, &api_version, &kind) {
+                                if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
                                     yield Ok::<Bytes, axum::BoxError>(chunk);
                                 }
                             }
@@ -409,7 +454,7 @@ mod tests {
             revision: 42,
         });
 
-        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap", false)
             .expect("ADDED event must produce a chunk");
 
         let line = std::str::from_utf8(&chunk).unwrap().trim_end();
@@ -451,7 +496,7 @@ mod tests {
             revision: 99,
         });
 
-        let chunk = encode_watch_event(&event, "v1", "ConfigMap")
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap", false)
             .expect("MODIFIED event must produce a chunk");
 
         let decoded: serde_json::Value =
@@ -486,7 +531,7 @@ mod tests {
             revision: 7,
         });
 
-        let chunk = encode_watch_event(&event, "v1", "ConfigMap").unwrap();
+        let chunk = encode_watch_event(&event, "v1", "ConfigMap", false).unwrap();
         let decoded: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end()).unwrap();
 
@@ -519,7 +564,7 @@ mod tests {
             revision: 1,
         });
 
-        let result = encode_watch_event(&event, "v1", "ConfigMap");
+        let result = encode_watch_event(&event, "v1", "ConfigMap", false);
 
         assert!(
             result.is_none(),
@@ -538,7 +583,7 @@ mod tests {
             revision: 2,
         });
 
-        let result = encode_watch_event(&event, "v1", "ConfigMap");
+        let result = encode_watch_event(&event, "v1", "ConfigMap", false);
 
         assert!(
             result.is_none(),
@@ -616,6 +661,7 @@ mod tests {
             None,
             false,
             "test-user".into(),
+            false,
         )
         .await;
 
@@ -663,6 +709,7 @@ mod tests {
             None,
             false,
             "test-user".into(),
+            false,
         )
         .await;
 
@@ -735,6 +782,7 @@ mod tests {
             None,
             false,
             "alice".into(),
+            false,
         )
         .await;
 
@@ -834,6 +882,7 @@ mod tests {
             None,
             false,
             "bob".into(),
+            false,
         )
         .await;
 
@@ -926,6 +975,7 @@ mod tests {
             None,
             false,
             "test-user".into(),
+            false,
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed for label selector test"));
@@ -1000,6 +1050,7 @@ mod tests {
             None,
             false,
             "test-user".into(),
+            false,
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed"));
@@ -1075,6 +1126,7 @@ mod tests {
             None,
             false,
             "test-user".into(),
+            false,
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed"));

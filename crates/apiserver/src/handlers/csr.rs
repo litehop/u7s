@@ -120,6 +120,7 @@ pub async fn list_csr(
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             user.username,
+            false,
         )
         .await;
     }

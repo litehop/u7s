@@ -35,6 +35,7 @@ pub async fn list_resource(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
+    headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -43,6 +44,7 @@ pub async fn list_resource(
             return super::cr::list_cr(
                 State(state),
                 Path((group, version, plural)),
+                headers,
                 query,
                 user.username,
             )
@@ -71,6 +73,7 @@ pub async fn list_resource(
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             user.username,
+            false,
         )
         .await;
     }
@@ -547,6 +550,7 @@ pub async fn list_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
+    headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
@@ -556,6 +560,7 @@ pub async fn list_namespaced_resource(
             return super::cr::list_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural)),
+                headers,
                 query,
                 user.username,
             )
@@ -584,6 +589,7 @@ pub async fn list_namespaced_resource(
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             user.username,
+            false,
         )
         .await;
     }
@@ -1253,6 +1259,7 @@ mod tests {
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
             }),
+            axum::http::HeaderMap::new(),
             Extension(crate::auth::UserInfo {
                 username: "test-user".into(),
                 uid: String::new(),
@@ -1595,6 +1602,7 @@ mod tests {
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
             }),
+            axum::http::HeaderMap::new(),
             axum::Extension(crate::auth::UserInfo {
                 username: "test".into(),
                 uid: String::new(),
@@ -2367,6 +2375,7 @@ mod tests {
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
             }),
+            axum::http::HeaderMap::new(),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),

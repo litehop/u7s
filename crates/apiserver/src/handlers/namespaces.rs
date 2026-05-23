@@ -67,6 +67,7 @@ pub async fn list_namespaces(
             query.field_selector,
             query.allow_watch_bookmarks == Some(true),
             user.username,
+            false,
         )
         .await;
     }
