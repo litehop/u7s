@@ -427,8 +427,8 @@ mod tests {
         // This exercises the production code path: watch_stream calls
         // drain_watch_buffer per frame, and drain_watch_buffer must consume all
         // complete lines even when multiple arrive in one network frame.
-        let mut buf =
-            "{\"type\":\"ADDED\",\"object\":{}}\n{\"type\":\"MODIFIED\",\"object\":{}}\n".to_owned();
+        let mut buf = "{\"type\":\"ADDED\",\"object\":{}}\n{\"type\":\"MODIFIED\",\"object\":{}}\n"
+            .to_owned();
         let mut events: Vec<Value> = Vec::new();
         drain_watch_buffer(&mut buf, &mut |v| events.push(v));
         assert_eq!(
