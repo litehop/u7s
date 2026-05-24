@@ -1209,6 +1209,90 @@ mod tests {
     // node_address: pure logic tests
     // -----------------------------------------------------------------------
 
+    /// resolve_attach_target must return 404 when the pod references a node that is not in store.
+    ///
+    /// The pod's spec.nodeName points to a node that was deleted (or never registered).
+    /// Returning 404 is preferable to 500: it tells the caller the resource is gone
+    /// rather than suggesting an internal error.
+    #[tokio::test]
+    async fn pod_attach_node_not_found_returns_404() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "missing-node",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+        // Do NOT seed the node — it is deliberately absent.
+
+        let query = AttachQuery {
+            container: None,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            tty: None,
+        };
+        match resolve_attach_target(&state, "default", "mypod", &query).await {
+            Ok(_) => panic!("expected error when node is absent from store"),
+            Err(e) => assert_eq!(
+                e.0,
+                StatusCode::NOT_FOUND,
+                "resolve_attach_target must return 404 when the referenced node is not in store"
+            ),
+        };
+    }
+
+    /// validate_portforward must return 404 when the pod references a node that is not in store.
+    ///
+    /// The pod's spec.nodeName points to a node that was deleted (or never registered).
+    /// Returning 404 informs the caller the node is gone rather than producing a 500.
+    #[tokio::test]
+    async fn portforward_validation_node_not_found_returns_404() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "missing-node",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+        // Do NOT seed the node — it is deliberately absent.
+
+        let err = validate_portforward(&state, "default", "mypod", Some("8080"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            404,
+            "validate_portforward must return 404 when the referenced node is not in store"
+        );
+    }
+
     /// node_address prefers InternalIP over Hostname.
     ///
     /// The InternalIP is the routable address inside the cluster. Using Hostname
