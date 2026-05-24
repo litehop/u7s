@@ -1412,8 +1412,7 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
                     for var in env {
                         let field_ref = &mut var["valueFrom"]["fieldRef"];
                         if field_ref.is_object()
-                            && (field_ref["apiVersion"].is_null()
-                                || field_ref["apiVersion"] == "")
+                            && (field_ref["apiVersion"].is_null() || field_ref["apiVersion"] == "")
                         {
                             field_ref["apiVersion"] = serde_json::json!("v1");
                         }
