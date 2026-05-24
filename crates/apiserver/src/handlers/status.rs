@@ -1214,4 +1214,170 @@ mod tests {
         assert_eq!(v["spec"]["gatewayClassName"], "nginx");
         assert_eq!(v["spec"]["listeners"][0]["port"], 80);
     }
+
+    /// put_namespaced_resource_status uses the CR fallback key when the group is not
+    /// in the static resource registry. This allows CRD-backed controllers (e.g. cert-manager)
+    /// to update status on their custom resources via the same /status route as built-in types.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_uses_cr_fallback_key_for_unknown_group() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        // Store a CR under the CR fallback key path.
+        // "certificates.cert-manager.io" is not in the static registry, so the handler
+        // must fall back to /registry/cr/<group>/<version>/<plural>/<ns>/<name>.
+        let cert = serde_json::json!({
+            "apiVersion": "cert-manager.io/v1",
+            "kind": "Certificate",
+            "metadata": { "name": "my-cert", "namespace": "default" },
+            "spec": { "secretName": "my-tls" }
+        });
+        let cr_key = "/registry/cr/cert-manager.io/v1/certificates/default/my-cert";
+        store
+            .put(
+                cr_key,
+                bytes::Bytes::from(serde_json::to_vec(&cert).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let put_body = serde_json::json!({
+            "apiVersion": "cert-manager.io/v1",
+            "kind": "Certificate",
+            "metadata": { "name": "my-cert", "namespace": "default" },
+            "status": { "conditions": [{"type": "Ready", "status": "True"}] }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "cert-manager.io".into(),
+                "v1".into(),
+                "default".into(),
+                "certificates".into(),
+                "my-cert".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "put_namespaced_resource_status must succeed via CR fallback key for unknown group"
+        );
+
+        let stored = store.get(cr_key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["conditions"][0]["type"], "Ready",
+            "status must be updated via CR fallback key"
+        );
+        // spec must be unchanged — status subresource isolation applies to CRs too
+        assert_eq!(
+            v["spec"]["secretName"], "my-tls",
+            "spec must not be modified"
+        );
+    }
+
+    /// patch_namespaced_resource_status uses the CR fallback key when the group is not
+    /// in the static resource registry. Controllers that manage custom resources must be
+    /// able to patch status via the same /status route used for built-in resources.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_uses_cr_fallback_key_for_unknown_group() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let cert = serde_json::json!({
+            "apiVersion": "cert-manager.io/v1",
+            "kind": "Certificate",
+            "metadata": { "name": "patch-cert", "namespace": "default" },
+            "spec": { "secretName": "patch-tls" },
+            "status": {}
+        });
+        let cr_key = "/registry/cr/cert-manager.io/v1/certificates/default/patch-cert";
+        store
+            .put(
+                cr_key,
+                bytes::Bytes::from(serde_json::to_vec(&cert).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch =
+            serde_json::json!({"status": {"conditions": [{"type": "Issued", "status": "True"}]}});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "cert-manager.io".into(),
+                "v1".into(),
+                "default".into(),
+                "certificates".into(),
+                "patch-cert".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "patch_namespaced_resource_status must succeed via CR fallback key for unknown group"
+        );
+
+        let stored = store.get(cr_key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["conditions"][0]["type"], "Issued",
+            "status must be patched via CR fallback key"
+        );
+        assert_eq!(
+            v["spec"]["secretName"], "patch-tls",
+            "spec must not be modified by status patch"
+        );
+    }
+
+    /// put_resource_status returns 400 when the name parameter is empty.
+    /// validate_name runs before any store access, so an empty name is rejected
+    /// before touching the database — this prevents path-traversal store key attacks.
+    #[tokio::test]
+    async fn put_resource_status_rejects_empty_name() {
+        let state = make_state();
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "" },
+            "status": { "ready": true }
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "".into(), // empty name
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 400 for empty name"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "empty name must return 400, not reach the store"
+        );
+    }
 }
