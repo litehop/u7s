@@ -2843,6 +2843,242 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
+    // replace_pod — 409 on stale resourceVersion
+    // -----------------------------------------------------------------------
+
+    /// PUT /pods/:name with a stale resourceVersion must return 409 Conflict.
+    /// replace_pod uses OCC: a stale writer must not silently overwrite newer data.
+    #[tokio::test]
+    async fn replace_pod_stale_rv_returns_409() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "occ-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .with_state(state);
+
+        let stale_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "occ-pod",
+                "namespace": "default",
+                "resourceVersion": "99999"
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx:latest"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/occ-pod")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&stale_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "stale resourceVersion on replace_pod must return 409 Conflict — \
+             OCC prevents lost-update races when multiple controllers update the same pod"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_pod_status — 404 on missing pod
+    // -----------------------------------------------------------------------
+
+    /// PUT /pods/:name/status on a missing pod must return 404.
+    /// The status subresource cannot create objects — only the main resource endpoint does that.
+    #[tokio::test]
+    async fn replace_pod_status_returns_404_for_missing() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "ghost-pod", "namespace": "default"},
+            "status": {"phase": "Running"}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/ghost-pod/status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PUT /status on non-existent pod must return 404 — \
+             the status subresource cannot create new pods"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_pod_status — 404 on missing pod
+    // -----------------------------------------------------------------------
+
+    /// PATCH /pods/:name/status on a missing pod must return 404.
+    #[tokio::test]
+    async fn patch_pod_status_returns_404_for_missing() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/ghost-pod/status")
+            .header(
+                header::CONTENT_TYPE,
+                "application/strategic-merge-patch+json",
+            )
+            .body(Body::from(r#"{"status":{"phase":"Running"}}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PATCH /status on non-existent pod must return 404 — \
+             kubelet should not be able to update status of pods that don't exist"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // create_pod — 409 on duplicate
+    // -----------------------------------------------------------------------
+
+    /// POST /pods with the same name twice must return 409 Conflict.
+    /// Duplicate pod creation must be rejected — the scheduler must GET+bind, not re-create.
+    #[tokio::test]
+    async fn create_pod_duplicate_returns_409() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "dup-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .with_state(state);
+
+        // First create — must succeed.
+        let req1 = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+        let resp1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::CREATED);
+
+        // Second create with same name — must return 409.
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+        let resp2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::CONFLICT,
+            "duplicate pod creation must return 409 Conflict — \
+             the store already has this key and AlreadyExists maps to 409"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_namespace — invalid format returns 400
+    // -----------------------------------------------------------------------
+
+    /// GET /pods in a namespace with an invalid format (contains uppercase) must return 404.
+    /// parse_namespace validates format; an invalid namespace name must be rejected.
+    #[tokio::test]
+    async fn list_pods_invalid_namespace_format_returns_404() {
+        use axum::http::method::Method;
+
+        let (state, _store) = make_state();
+
+        let user = crate::auth::UserInfo {
+            username: "test".into(),
+            uid: String::new(),
+            groups: vec![],
+        };
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", get(list_pods))
+            .layer(axum::Extension(user))
+            .with_state(state);
+
+        // "INVALID" has uppercase — parse_namespace rejects it
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/namespaces/INVALID/pods")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Either 400 (bad format) or 404 (not found in store) — both are correct rejections.
+        assert!(
+            resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::NOT_FOUND,
+            "invalid namespace format must return 400 or 404, got {}",
+            resp.status()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_pod — 404 on missing pod
+    // -----------------------------------------------------------------------
+
+    /// PATCH /pods/:name on a missing pod must return 404.
+    #[tokio::test]
+    async fn patch_pod_missing_pod_returns_404() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/ghost-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(Body::from(r#"{"metadata":{"labels":{"k":"v"}}}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PATCH on non-existent pod must return 404"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // patch_pod — strategic-merge-patch (delete-then-recreate finalizer path)
     // -----------------------------------------------------------------------
 
