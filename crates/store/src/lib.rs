@@ -703,6 +703,7 @@ impl Store for SqliteStore {
         };
 
         let prefix_owned = prefix.to_string();
+        let compaction_horizon_arc = Arc::clone(&self.compaction_horizon);
 
         let stream = async_stream::stream! {
             // Yield compacted event if from_revision is before the horizon.
@@ -731,9 +732,10 @@ impl Store for SqliteStore {
                         }
                         yield internal_to_watch(&event);
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // We lost n messages; yield compacted to signal the gap.
-                        let current_horizon = n; // approximate
+                    Err(broadcast::error::RecvError::Lagged(_n)) => {
+                        // We lost messages; yield compacted to signal the gap.
+                        // Use the store's compaction horizon — not _n (that's a dropped-message count, not a revision).
+                        let current_horizon = compaction_horizon_arc.load(Ordering::Relaxed);
                         yield WatchEvent::Compacted { requested: from_revision, horizon: current_horizon };
                         return;
                     }
@@ -1075,6 +1077,91 @@ mod tests {
             ),
             "expected Compacted, got {:?}",
             event
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_lagged_emits_compaction_horizon_not_message_count() {
+        // RecvError::Lagged(n) gives n = count of dropped messages, NOT a revision number.
+        // The Compacted event horizon field must be the store's compaction horizon (a revision),
+        // not the dropped-message count. If a consumer retries from horizon=3 (dropped count)
+        // when the real horizon is 50_000, it gets 410 Gone or replays compacted history.
+        //
+        // This test will FAIL if the fix is reverted to `let current_horizon = n`.
+        use tokio::sync::broadcast;
+
+        // Build a store with a tiny broadcast capacity so lag is easy to trigger.
+        let write_conn = {
+            use rusqlite::Connection;
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, revision INTEGER NOT NULL) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
+                 CREATE INDEX IF NOT EXISTS idx_pods_nodename ON objects (json_extract(value, '$.spec.nodeName')) WHERE key LIKE '/registry/pods/%';",
+            ).unwrap();
+            conn
+        };
+        let write_conn = Arc::new(tokio::sync::Mutex::new(write_conn));
+        let read_conn = Arc::clone(&write_conn);
+
+        // Use broadcast capacity = 4 so writing 6 events lags a slow subscriber.
+        let (tx, _) = broadcast::channel::<Arc<InternalEvent>>(4);
+        let ring = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
+            RING_CAPACITY + 1,
+        )));
+        let compaction_horizon = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let store = SqliteStore {
+            write_conn,
+            read_conn,
+            tx,
+            ring,
+            compaction_horizon,
+        };
+
+        // Set a known compaction horizon — this is what the Compacted event must report.
+        let known_horizon: u64 = 50_000;
+        store.set_compaction_horizon_for_test(known_horizon);
+
+        // Subscribe a watcher BEFORE writing, so it lags when we flood the channel.
+        let stream = store.watch("/registry/pods/", 0).await.expect("watch");
+        let mut stream: Pin<Box<dyn futures_core::Stream<Item = WatchEvent> + Send>> =
+            Box::pin(stream);
+
+        // Write enough events to overflow the broadcast channel (capacity=4) without consuming.
+        // We write 6 objects: 6 > 4, so the slow subscriber lags by 2 messages.
+        for i in 0..6u64 {
+            let key = format!("/registry/pods/default/pod-{i}");
+            store
+                .put(&key, pod_json(&format!("pod-{i}")), Some(0))
+                .await
+                .expect("put");
+        }
+
+        // Drain replayed ring-buffer events (up to 6), then expect a Compacted event
+        // from the broadcast lag. We allow up to 10 events to find it.
+        let mut compacted_event = None;
+        for _ in 0..10 {
+            match next_event(&mut stream).await {
+                Some(WatchEvent::Compacted { requested, horizon }) => {
+                    compacted_event = Some((requested, horizon));
+                    break;
+                }
+                Some(_) => continue, // replayed ring-buffer event; keep going
+                None => break,       // timeout — stream ended
+            }
+        }
+
+        let (_, horizon) = compacted_event
+            .expect("watch stream must emit a Compacted event when the broadcast channel lags");
+
+        // The horizon must be the store's compaction horizon (known_horizon = 50_000),
+        // not the dropped-message count (which would be 2 — far smaller).
+        assert_eq!(
+            horizon, known_horizon,
+            "Compacted horizon must be the store's compaction horizon ({known_horizon}), \
+             not the dropped-message count (got {horizon})"
         );
     }
 
