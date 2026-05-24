@@ -1180,6 +1180,26 @@ mod tests {
     }
 
     #[test]
+    fn extract_client_cert_identity_documents_no_chain_verification() {
+        // extract_client_cert_identity ONLY extracts CN/O from DER bytes.
+        // It does NOT verify the certificate chain — that is TLS's job
+        // (rustls WebPkiClientVerifier validates chain before the cert reaches
+        // this function). A self-signed cert not rooted in any cluster CA
+        // must still return Some(UserInfo) from this function.
+        //
+        // This test encodes the contract: callers must not rely on this
+        // function for trust decisions. Chain validation happens at the TLS layer.
+        let der = make_cert_der("self-signed-user", &["some-org"]);
+        // make_cert_der already generates a cert signed by a local ephemeral CA,
+        // not by any cluster CA — it is "untrusted" from the cluster's perspective.
+        let user = extract_client_cert_identity(&der)
+            .expect("extract_client_cert_identity must succeed on any parseable DER, \
+                     regardless of signing chain — chain validation is TLS's responsibility");
+        assert_eq!(user.username, "self-signed-user");
+        assert!(user.groups.contains(&"some-org".to_owned()));
+    }
+
+    #[test]
     fn test_x509_cert_injected_into_authn_no_header() {
         // When no Authorization header is present but a PeerCertificate is
         // available, the caller must be identified via x509 — not as anonymous.
