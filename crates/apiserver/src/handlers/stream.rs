@@ -247,4 +247,145 @@ mod tests {
             "bytes written to B must be relayed to A in order"
         );
     }
+
+    /// splice must terminate promptly when the A side produces no messages.
+    ///
+    /// If splice ignored an immediately-closed endpoint and blocked forever, the
+    /// portforward connection would hang rather than finishing cleanly. This guards
+    /// against that regression.
+    #[tokio::test]
+    async fn splice_terminates_when_a_closes_immediately() {
+        let a_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // A has no queued messages — recv returns None immediately.
+        let a = MemStream::new(vec![], Arc::clone(&a_out));
+        let b = MemStream::new(vec![Bytes::from("ignored")], Arc::clone(&b_out));
+
+        // Must complete; would hang if splice failed to detect the closed side.
+        tokio::time::timeout(std::time::Duration::from_secs(1), splice(a, b))
+            .await
+            .expect("splice must finish when one side closes immediately");
+    }
+
+    /// splice must terminate promptly when the B side produces no messages.
+    ///
+    /// Symmetric counterpart to the A-closes test — guards both directions.
+    #[tokio::test]
+    async fn splice_terminates_when_b_closes_immediately() {
+        let a_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let a = MemStream::new(vec![Bytes::from("ignored")], Arc::clone(&a_out));
+        // B has no queued messages — recv returns None immediately.
+        let b = MemStream::new(vec![], Arc::clone(&b_out));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), splice(a, b))
+            .await
+            .expect("splice must finish when B closes immediately");
+    }
+
+    /// A MemStream that always returns Err from send, simulating a broken connection.
+    struct FailingSendStream {
+        incoming: std::collections::VecDeque<Bytes>,
+        closed: bool,
+    }
+
+    impl FailingSendStream {
+        fn new(incoming: Vec<Bytes>) -> Self {
+            Self {
+                incoming: incoming.into(),
+                closed: false,
+            }
+        }
+    }
+
+    impl BiStream for FailingSendStream {
+        async fn recv(&mut self) -> Option<Bytes> {
+            self.incoming.pop_front()
+        }
+
+        async fn send(&mut self, _data: Bytes) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("send failed: connection broken"))
+        }
+
+        async fn close(&mut self) {
+            self.closed = true;
+        }
+    }
+
+    /// splice must stop relaying when a send call returns an error.
+    ///
+    /// If splice continued looping after a failed send it would produce an infinite
+    /// error storm. The correct behavior is to abort both directions and return.
+    #[tokio::test]
+    async fn splice_terminates_on_send_error() {
+        let a_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // A sends one message; B.send() always fails.
+        let a = MemStream::new(vec![Bytes::from("trigger")], Arc::clone(&a_out));
+        let b = FailingSendStream::new(vec![]);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), splice(a, b))
+            .await
+            .expect("splice must finish when send errors — not loop forever");
+    }
+
+    /// BiStream::recv on MemStream returns queued messages in FIFO order, then None.
+    ///
+    /// This documents the MemStream contract so that tests relying on ordering
+    /// (e.g. splice_relays_bytes_bidirectionally) remain meaningful if MemStream
+    /// is ever modified.
+    #[tokio::test]
+    async fn mem_stream_recv_is_fifo_then_none() {
+        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut s = MemStream::new(
+            vec![Bytes::from("first"), Bytes::from("second")],
+            Arc::clone(&out),
+        );
+
+        assert_eq!(s.recv().await, Some(Bytes::from("first")));
+        assert_eq!(s.recv().await, Some(Bytes::from("second")));
+        assert_eq!(
+            s.recv().await,
+            None,
+            "recv must return None once the queue is drained"
+        );
+    }
+
+    /// BiStream::close on MemStream sets the closed flag.
+    ///
+    /// The splice loop calls close() on the opposite endpoint when one direction
+    /// finishes. If close() were a no-op that silently dropped the signal, the
+    /// other side would never know to stop — leaking tasks or hanging sessions.
+    #[tokio::test]
+    async fn mem_stream_close_sets_closed_flag() {
+        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut s = MemStream::new(vec![], Arc::clone(&out));
+
+        assert!(!s.closed, "stream must start open");
+        s.close().await;
+        assert!(s.closed, "close() must mark the stream as closed");
+    }
+
+    /// BiStream::send on MemStream appends to the shared outgoing buffer.
+    ///
+    /// Verifies the send path of the mock so that tests which check b_out / a_out
+    /// contents are trustworthy — a broken send() would make the relay tests
+    /// vacuously pass.
+    #[tokio::test]
+    async fn mem_stream_send_appends_to_outgoing() {
+        let out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut s = MemStream::new(vec![], Arc::clone(&out));
+
+        s.send(Bytes::from("a")).await.unwrap();
+        s.send(Bytes::from("b")).await.unwrap();
+
+        let captured = out.lock().unwrap().clone();
+        assert_eq!(
+            captured,
+            vec![Bytes::from("a"), Bytes::from("b")],
+            "send() must append messages to the outgoing buffer in order"
+        );
+    }
 }
