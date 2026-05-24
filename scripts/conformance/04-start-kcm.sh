@@ -19,8 +19,9 @@ if ! command -v limactl &>/dev/null; then
 fi
 
 # Kill any stale kube-controller-manager from a previous run before starting fresh.
+# Anchor with ^ so pkill doesn't match its own bash -c argument string.
 limactl shell "$VM_NAME" bash -c \
-  "pkill -f kube-controller-manager 2>/dev/null || true"
+  "pkill -f '^kube-controller-manager' 2>/dev/null || true"
 
 # The repo is mounted read-only inside lima at the same path as on the host.
 # Use the host REPO path — lima mounts match host paths.
