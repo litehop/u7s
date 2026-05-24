@@ -7,7 +7,7 @@ use hyper::{Method, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_rustls::TlsConnector;
-use tracing::{info, warn};
+use tracing::info;
 use u7s_client_util::HyperApiClient;
 
 // ---------------------------------------------------------------------------
@@ -245,6 +245,19 @@ pub fn binding_payload(namespace: &str, pod_name: &str, node_name: &str) -> Valu
     serde_json::to_value(binding).expect("Binding is always serializable")
 }
 
+/// Check a bind response status code and body, returning Err on non-2xx.
+///
+/// Extracted as a pure function so the error-returning logic can be unit-tested
+/// without network access. A non-2xx response must surface as Err so the caller
+/// can log and retry; silently returning Ok on 409 Conflict (duplicate bind) or
+/// 404 (pod gone) masks real scheduling failures.
+pub fn check_bind_response(status: u16, body: &str) -> anyhow::Result<()> {
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    bail!("bind failed with HTTP {status}: {body}")
+}
+
 /// Bind a pod to a node via POST .../pods/:name/binding.
 pub async fn bind_pod(
     connector: &TlsConnector,
@@ -257,11 +270,8 @@ pub async fn bind_pod(
     let payload = binding_payload(namespace, pod_name, node_name);
 
     let (status, body) = http_post_json(connector, server, &path, &payload).await?;
-    if status.is_success() {
-        info!("bound pod {namespace}/{pod_name} → node {node_name}");
-    } else {
-        warn!("binding {namespace}/{pod_name} failed ({status}): {body}");
-    }
+    check_bind_response(status.as_u16(), &body)?;
+    info!("bound pod {namespace}/{pod_name} → node {node_name}");
     Ok(())
 }
 
@@ -273,6 +283,67 @@ pub async fn bind_pod(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // check_bind_response tests — the error-returning logic for bind_pod.
+    // Before this fix, bind_pod returned Ok(()) on any status code, including
+    // 409 Conflict (duplicate bind) and 404 (pod already gone). Callers then
+    // logged nothing and assumed success, silently masking scheduling failures.
+
+    #[test]
+    fn bind_pod_returns_err_on_non_2xx() {
+        // 409 Conflict is what the API server returns when a pod is already bound.
+        // bind_pod must surface this as Err so the caller can log and skip.
+        // Reverting to Ok(()) on non-2xx would make this test fail.
+        let result = check_bind_response(409, "AlreadyExists");
+        assert!(
+            result.is_err(),
+            "409 Conflict must return Err, not Ok — duplicate binds must be surfaced"
+        );
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("409"),
+            "error must include the status code; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_bind_response_ok_on_2xx() {
+        // 201 Created is the success response for a new binding.
+        assert!(
+            check_bind_response(201, "").is_ok(),
+            "201 Created must return Ok"
+        );
+        assert!(
+            check_bind_response(200, "ok").is_ok(),
+            "200 OK must return Ok"
+        );
+    }
+
+    #[test]
+    fn check_bind_response_err_includes_body() {
+        // The error message must include the response body so operators can diagnose
+        // failures without needing API server logs.
+        let result = check_bind_response(422, "validation error: bad spec");
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("validation error"),
+            "error message must include response body; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_bind_response_err_on_404() {
+        // 404 means the pod was deleted before binding completed — must surface as Err.
+        let result = check_bind_response(404, "not found");
+        assert!(result.is_err(), "404 must return Err");
+    }
+
+    #[test]
+    fn check_bind_response_err_on_500() {
+        // 500 Internal Server Error must not be silently swallowed.
+        let result = check_bind_response(500, "internal error");
+        assert!(result.is_err(), "500 must return Err");
+    }
 
     // drain_watch_buffer is re-exported from client-util where it is called by
     // watch_stream (and therefore stream_watch_events). This test confirms that
