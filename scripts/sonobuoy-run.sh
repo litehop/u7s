@@ -36,6 +36,10 @@ trap 'rm -f "$REWRITTEN"' EXIT
 sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "$KUBECONFIG" > "$REWRITTEN"
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
 
+echo "Cleaning up any previous sonobuoy run..."
+limactl shell "$VM_NAME" sudo sonobuoy delete --all --wait \
+  --kubeconfig /tmp/sonobuoy-kubeconfig 2>/dev/null || true
+
 SONOBUOY_ARGS="run --mode=non-disruptive-conformance --wait --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
 if [ -n "$FOCUS" ]; then
   SONOBUOY_ARGS="$SONOBUOY_ARGS --e2e-focus=$FOCUS"
