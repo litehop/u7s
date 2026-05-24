@@ -860,4 +860,118 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
     }
+
+    /// advertise_host with an empty host segment (e.g. scheme-only "https://") must
+    /// return None rather than Some(""), which would produce an invalid SAN.
+    #[test]
+    fn advertise_host_empty_host_returns_none() {
+        // A bare scheme with no host produces an empty host segment after stripping the
+        // scheme. Returning Some("") would silently insert an empty-string SAN into the
+        // server certificate, which is invalid and would cause cert parsing errors.
+        assert_eq!(
+            advertise_host(Some("https://")),
+            None,
+            "empty host segment must return None, not Some(\"\")"
+        );
+    }
+
+    /// advertise_host must strip a bare port suffix even when no scheme is present.
+    /// Operators may supply just "host:6443" without a scheme prefix.
+    #[test]
+    fn advertise_host_no_scheme_strips_port() {
+        assert_eq!(
+            advertise_host(Some("myhost:6443")),
+            Some("myhost".into()),
+            "advertise_host must strip the port even when no scheme is present"
+        );
+    }
+
+    /// write_kubeconfig must produce a file containing `apiVersion: v1` so that
+    /// kubectl recognises it as a valid kubeconfig document.
+    #[test]
+    fn write_kubeconfig_file_contains_apiversion() {
+        let dir = test_temp_dir("kubeconfig-content");
+        let kubeconfig_path = dir.join("kubeconfig");
+        let args = Args {
+            db: "./state.db".into(),
+            listen: "0.0.0.0:6443".into(),
+            kubeconfig: kubeconfig_path.to_string_lossy().into_owned(),
+            token_auth_file: None,
+            sa_key: "./sa.key".into(),
+            sa_pub: "./sa.pub".into(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            advertise_address: None,
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+        write_kubeconfig(&kubeconfig_path.to_string_lossy(), &tls, &args)
+            .expect("write_kubeconfig must succeed");
+
+        let contents =
+            std::fs::read_to_string(&kubeconfig_path).expect("kubeconfig file must be readable");
+        assert!(
+            contents.contains("apiVersion: v1"),
+            "kubeconfig must contain 'apiVersion: v1' for kubectl compatibility; got: {contents}"
+        );
+        assert!(
+            contents.contains("kind: Config"),
+            "kubeconfig must contain 'kind: Config'; got: {contents}"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// generate_tls must write ca.key and ca.crt to disk on first run.
+    /// These files are required for CA stability across restarts — if they are not
+    /// written, every restart generates a new CA, breaking kubelets that trusted the
+    /// previous CA certificate.
+    #[test]
+    fn generate_tls_writes_ca_files_to_disk() {
+        let dir = test_temp_dir("gen-tls-files");
+        let ca_key_path = dir.join("ca.key");
+        let ca_cert_path = dir.join("ca.crt");
+        let args = Args {
+            db: "./state.db".into(),
+            listen: "0.0.0.0:6443".into(),
+            kubeconfig: "./kubeconfig".into(),
+            token_auth_file: None,
+            sa_key: "./sa.key".into(),
+            sa_pub: "./sa.pub".into(),
+            ca_key: ca_key_path.to_string_lossy().into_owned(),
+            ca_cert: ca_cert_path.to_string_lossy().into_owned(),
+            advertise_address: None,
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+
+        assert!(
+            ca_key_path.exists(),
+            "generate_tls must write ca.key so the CA is stable across restarts"
+        );
+        assert!(
+            ca_cert_path.exists(),
+            "generate_tls must write ca.crt so the CA is stable across restarts"
+        );
+        // The returned ca_cert_der must match the DER bytes on disk.
+        let cert_on_disk = std::fs::read(&ca_cert_path).expect("ca.crt must be readable");
+        assert_eq!(
+            tls.ca_cert_der, cert_on_disk,
+            "ca_cert_der in TlsMaterial must match the bytes written to ca.crt"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// write_private_key must write the exact bytes provided and make the file
+    /// readable (i.e. the content round-trips correctly).
+    #[test]
+    fn write_private_key_content_roundtrips() {
+        let dir = test_temp_dir("key-roundtrip");
+        let key_path = dir.join("test.key");
+        let expected = b"-----BEGIN EC PRIVATE KEY-----\nfakekey\n-----END EC PRIVATE KEY-----\n";
+        write_private_key(&key_path, expected).expect("write_private_key must succeed");
+        let actual = std::fs::read(&key_path).expect("file must be readable after write");
+        assert_eq!(
+            actual, expected,
+            "write_private_key must write the exact bytes provided"
+        );
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
 }
