@@ -331,12 +331,20 @@ fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
             let sub = data.claims.sub;
             tracing::debug!("SA JWT verified: sub={sub}");
             // sub format: system:serviceaccount:{ns}:{name}
+            // Validate before use: a malformed sub silently omits the
+            // namespace-scoped group, causing RBAC policies on
+            // system:serviceaccounts:{ns} to silently fail.
+            let parts: Vec<&str> = sub.splitn(4, ':').collect();
+            if parts.len() != 4 || parts[0] != "system" || parts[1] != "serviceaccount" {
+                tracing::warn!(
+                    "SA JWT rejected: sub does not match \
+                     system:serviceaccount:{{ns}}:{{name}} format: sub={sub}"
+                );
+                return None;
+            }
             let groups = {
                 let mut g = vec!["system:serviceaccounts".to_owned()];
-                let parts: Vec<&str> = sub.splitn(4, ':').collect();
-                if parts.len() == 4 {
-                    g.push(format!("system:serviceaccounts:{}", parts[2]));
-                }
+                g.push(format!("system:serviceaccounts:{}", parts[2]));
                 // Real Kubernetes always adds system:authenticated to every
                 // successfully identified user so that ClusterRoleBindings on
                 // that group (e.g. system:basic-user) apply universally.
@@ -1079,6 +1087,25 @@ mod tests {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("JWT from wrong key must not succeed"),
         }
+    }
+
+    #[test]
+    fn sa_jwt_with_malformed_sub_is_rejected() {
+        // A JWT whose sub is missing the name segment (only 3 colon-separated
+        // parts) must be rejected entirely. Before this fix, the missing segment
+        // caused the namespace-scoped group (system:serviceaccounts:{ns}) to be
+        // silently omitted, making RBAC policies on that group silently fail.
+        // Rejecting the token is the correct response: a well-formed SA JWT must
+        // always have sub = system:serviceaccount:{ns}:{name}.
+        let (enc, dec) = test_rsa_keypair();
+        // Only three parts — missing the service account name.
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:only-three", 3600);
+        let result = try_verify_sa_jwt(&token, &dec);
+        assert!(
+            result.is_none(),
+            "JWT with malformed sub (missing name segment) must be rejected, \
+             not silently accepted with incomplete groups"
+        );
     }
 
     #[test]
