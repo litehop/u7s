@@ -1309,6 +1309,58 @@ mod tests {
         );
     }
 
+    // replace_namespace with stale resourceVersion must return 409 Conflict.
+    // OCC prevents concurrent updates from clobbering each other.
+    // A stale PUT must be rejected rather than silently overwriting newer data.
+    #[tokio::test]
+    async fn replace_namespace_stale_resource_version_returns_409() {
+        let state = make_state();
+
+        // Create the namespace first.
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("occ-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Try to replace with a known-stale resourceVersion.
+        let stale_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "occ-ns",
+                    "resourceVersion": "99999"
+                }
+            })
+            .to_string(),
+        );
+
+        let result = replace_namespace(
+            State(state.clone()),
+            Path("occ-ns".to_string()),
+            axum::http::HeaderMap::new(),
+            stale_body,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("stale replace must fail"),
+        };
+        assert_eq!(
+            err.0,
+            StatusCode::CONFLICT,
+            "stale resourceVersion on replace_namespace must return 409 Conflict — \
+             OCC is the guard against lost-update races in concurrent namespace updates"
+        );
+    }
+
     // replace_namespace must trigger hard-delete when deletionTimestamp is set and
     // finalizers become empty after the PUT.
     //
