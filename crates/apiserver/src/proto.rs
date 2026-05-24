@@ -639,6 +639,54 @@ pub fn decode_event_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
+/// Decoded fields from a protobuf-encoded TokenRequest.
+pub struct TokenRequestFields {
+    pub audiences: Vec<String>,
+    pub expiration_seconds: Option<u64>,
+}
+
+/// Decode the inner raw bytes of a protobuf-encoded TokenRequest.
+///
+/// Wire layout (k8s.io/api/authentication/v1/generated.proto):
+///   field 1 (ObjectMeta, wire 2): ignored
+///   field 2 (TokenRequestSpec, wire 2): spec
+///     field 1 (repeated string): audiences
+///     field 2 (int64, wire 0): expirationSeconds
+///
+/// Returns `None` if the bytes are not a recognisable protobuf message (malformed input).
+pub fn decode_token_request(raw: &[u8]) -> Option<TokenRequestFields> {
+    let mut audiences = Vec::new();
+    let mut expiration_seconds: Option<u64> = None;
+
+    scan_length_delimited_fields(raw, |field, data| {
+        if field == 2 {
+            // spec: TokenRequestSpec
+            scan_mixed_fields(data, |f, wt, d| match (f, wt) {
+                (1, 2) => {
+                    // audiences: repeated string
+                    if let Ok(s) = std::str::from_utf8(d) {
+                        audiences.push(s.to_owned());
+                    }
+                }
+                (2, 0) => {
+                    // expirationSeconds: int64 varint
+                    // scan_mixed_fields passes the consumed raw bytes for wire type 0;
+                    // decode_varint reads the value from those bytes.
+                    if let Some((v, _)) = decode_varint(d) {
+                        expiration_seconds = Some(v);
+                    }
+                }
+                _ => {}
+            });
+        }
+    })?;
+
+    Some(TokenRequestFields {
+        audiences,
+        expiration_seconds,
+    })
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -1992,5 +2040,47 @@ mod tests {
 
         assert_eq!(result["kind"], "Event");
         assert_eq!(result["metadata"]["name"], "myevent");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_token_request
+    // ---------------------------------------------------------------------------
+
+    /// decode_token_request must decode the exact inner raw bytes captured from a real
+    /// `kubectl create token sonobuoy-serviceaccount -n sonobuoy --audience=https://kubernetes.default.svc.cluster.local`
+    /// invocation (72 bytes, after stripping the outer k8s envelope).
+    ///
+    /// This is the primary regression guard for mayor-hy77: kubectl 1.31+ sends a native
+    /// protobuf TokenRequest body that the handler was previously trying to parse as JSON,
+    /// producing "invalid JSON: expected value at line 1 column 1".
+    #[test]
+    fn decode_token_request_from_kubectl_capture() {
+        // Raw bytes of the inner TokenRequest proto from a real kubectl invocation:
+        //   field 1 (ObjectMeta): 0a 10 ... (len=16, mostly empty fields)
+        //   field 2 (spec):       12 2e ... (len=46)
+        //     field 1 (audience): 0a 2c https://kubernetes.default.svc.cluster.local (len=44)
+        //   field 3+: trailing empty fields
+        let raw: &[u8] = &[
+            0x0a, 0x10, 0x0a, 0x00, 0x12, 0x00, 0x1a, 0x00, 0x22, 0x00, 0x2a, 0x00, 0x32, 0x00,
+            0x38, 0x00, 0x42, 0x00, 0x12, 0x2e, 0x0a, 0x2c, 0x68, 0x74, 0x74, 0x70, 0x73, 0x3a,
+            0x2f, 0x2f, 0x6b, 0x75, 0x62, 0x65, 0x72, 0x6e, 0x65, 0x74, 0x65, 0x73, 0x2e, 0x64,
+            0x65, 0x66, 0x61, 0x75, 0x6c, 0x74, 0x2e, 0x73, 0x76, 0x63, 0x2e, 0x63, 0x6c, 0x75,
+            0x73, 0x74, 0x65, 0x72, 0x2e, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x1a, 0x04, 0x0a, 0x00,
+            0x12, 0x00, 0x1a, 0x00, 0x22, 0x00,
+        ];
+
+        let fields = decode_token_request(raw).expect("must decode kubectl TokenRequest capture");
+
+        assert_eq!(
+            fields.audiences,
+            vec!["https://kubernetes.default.svc.cluster.local"],
+            "audience must be extracted from the real kubectl proto capture"
+        );
+        // kubectl did not set expirationSeconds in this capture; expect None or Some(0).
+        assert!(
+            fields.expiration_seconds.is_none() || fields.expiration_seconds == Some(0),
+            "expiration_seconds must be None or 0 when kubectl omits it; got {:?}",
+            fields.expiration_seconds
+        );
     }
 }
