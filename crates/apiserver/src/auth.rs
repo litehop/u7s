@@ -126,14 +126,12 @@ fn ct_token_lookup<'a>(
     let mut found: Option<&'a UserInfo> = None;
     for (stored_token, info) in map.iter() {
         let stored_bytes = stored_token.as_bytes();
-        // ConstantTimeEq returns Choice (1u8 for equal, 0u8 for not equal).
-        // Length mismatch: pad both sides to the same length conceptually —
         // subtle::ConstantTimeEq on slices of different lengths always returns
-        // 0 (not equal) without short-circuiting, so we can call it directly.
-        // We use a manual length check first (which leaks whether lengths match,
-        // but not token content) then the constant-time byte compare.
-        if stored_bytes.len() == candidate_bytes.len() && stored_bytes.ct_eq(candidate_bytes).into()
-        {
+        // 0 (not equal) without leaking which byte differed or whether the
+        // lengths matched. A manual length pre-check would leak whether the
+        // candidate length matches any stored token — a timing side-channel.
+        // Call ct_eq directly: it is safe and correct for unequal-length slices.
+        if stored_bytes.ct_eq(candidate_bytes).into() {
             found = Some(info);
             // Do NOT break: continue iterating so the loop takes the same time
             // regardless of which token matched or whether any matched.
@@ -333,12 +331,20 @@ fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
             let sub = data.claims.sub;
             tracing::debug!("SA JWT verified: sub={sub}");
             // sub format: system:serviceaccount:{ns}:{name}
+            // Validate before use: a malformed sub silently omits the
+            // namespace-scoped group, causing RBAC policies on
+            // system:serviceaccounts:{ns} to silently fail.
+            let parts: Vec<&str> = sub.splitn(4, ':').collect();
+            if parts.len() != 4 || parts[0] != "system" || parts[1] != "serviceaccount" {
+                tracing::warn!(
+                    "SA JWT rejected: sub does not match \
+                     system:serviceaccount:{{ns}}:{{name}} format: sub={sub}"
+                );
+                return None;
+            }
             let groups = {
                 let mut g = vec!["system:serviceaccounts".to_owned()];
-                let parts: Vec<&str> = sub.splitn(4, ':').collect();
-                if parts.len() == 4 {
-                    g.push(format!("system:serviceaccounts:{}", parts[2]));
-                }
+                g.push(format!("system:serviceaccounts:{}", parts[2]));
                 // Real Kubernetes always adds system:authenticated to every
                 // successfully identified user so that ClusterRoleBindings on
                 // that group (e.g. system:basic-user) apply universally.
@@ -793,6 +799,39 @@ mod tests {
         assert!(ct_token_lookup(&map, "any-token").is_none());
     }
 
+    #[test]
+    fn ct_token_lookup_different_lengths_no_match() {
+        // A candidate of a different length than a stored token must NOT match.
+        // This verifies that removing the manual length pre-check did not break
+        // correctness: subtle::ct_eq handles unequal-length slices safely.
+        // (The manual len check was removed because it leaked timing info about
+        // whether the candidate length matched any stored token.)
+        let mut map = HashMap::new();
+        map.insert(
+            "tok-sixteen-chrs".to_owned(), // exactly 16 chars
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+            },
+        );
+        // Shorter candidate — must not match.
+        assert!(
+            ct_token_lookup(&map, "tok-sixteen-ch").is_none(),
+            "shorter candidate must not match stored token"
+        );
+        // Longer candidate — must not match.
+        assert!(
+            ct_token_lookup(&map, "tok-sixteen-chrsX").is_none(),
+            "longer candidate must not match stored token"
+        );
+        // Exact match — must succeed.
+        assert!(
+            ct_token_lookup(&map, "tok-sixteen-chrs").is_some(),
+            "exact candidate must match stored token"
+        );
+    }
+
     // --- parse_path() ---
 
     #[test]
@@ -1051,6 +1090,25 @@ mod tests {
     }
 
     #[test]
+    fn sa_jwt_with_malformed_sub_is_rejected() {
+        // A JWT whose sub is missing the name segment (only 3 colon-separated
+        // parts) must be rejected entirely. Before this fix, the missing segment
+        // caused the namespace-scoped group (system:serviceaccounts:{ns}) to be
+        // silently omitted, making RBAC policies on that group silently fail.
+        // Rejecting the token is the correct response: a well-formed SA JWT must
+        // always have sub = system:serviceaccount:{ns}:{name}.
+        let (enc, dec) = test_rsa_keypair();
+        // Only three parts — missing the service account name.
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:only-three", 3600);
+        let result = try_verify_sa_jwt(&token, &dec);
+        assert!(
+            result.is_none(),
+            "JWT with malformed sub (missing name segment) must be rejected, \
+             not silently accepted with incomplete groups"
+        );
+    }
+
+    #[test]
     fn test_authn_static_token_takes_priority_over_jwt() {
         // If a token happens to be in the static map, it must use static auth,
         // not fall through to JWT parsing (which would fail on a non-JWT string).
@@ -1119,6 +1177,27 @@ mod tests {
             vec!["system:authenticated"],
             "cert auth with no O fields must still add system:authenticated"
         );
+    }
+
+    #[test]
+    fn extract_client_cert_identity_documents_no_chain_verification() {
+        // extract_client_cert_identity ONLY extracts CN/O from DER bytes.
+        // It does NOT verify the certificate chain — that is TLS's job
+        // (rustls WebPkiClientVerifier validates chain before the cert reaches
+        // this function). A self-signed cert not rooted in any cluster CA
+        // must still return Some(UserInfo) from this function.
+        //
+        // This test encodes the contract: callers must not rely on this
+        // function for trust decisions. Chain validation happens at the TLS layer.
+        let der = make_cert_der("self-signed-user", &["some-org"]);
+        // make_cert_der already generates a cert signed by a local ephemeral CA,
+        // not by any cluster CA — it is "untrusted" from the cluster's perspective.
+        let user = extract_client_cert_identity(&der).expect(
+            "extract_client_cert_identity must succeed on any parseable DER, \
+                     regardless of signing chain — chain validation is TLS's responsibility",
+        );
+        assert_eq!(user.username, "self-signed-user");
+        assert!(user.groups.contains(&"some-org".to_owned()));
     }
 
     #[test]
