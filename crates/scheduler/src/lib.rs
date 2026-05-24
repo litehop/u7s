@@ -770,4 +770,91 @@ mod tests {
         let result = select_first_node(list);
         assert!(result.is_err(), "expected error for empty node list");
     }
+
+    // ---------------------------------------------------------------------------
+    // Additional coverage (mayor-in2l): branches not exercised by earlier tests.
+    // ---------------------------------------------------------------------------
+
+    // needs_scheduling with a BOOKMARKED event type — exercises the non-ADDED/MODIFIED
+    // branch with a type other than DELETED. Watch streams emit BOOKMARK events
+    // periodically; they must be ignored like DELETED.
+    #[test]
+    fn needs_scheduling_returns_none_for_bookmark_event() {
+        let event = json!({
+            "type": "BOOKMARK",
+            "object": {
+                "metadata": { "name": "some-pod", "namespace": "default" },
+                "spec": {}
+            }
+        });
+        assert!(
+            needs_scheduling(&event).is_none(),
+            "BOOKMARK events must not trigger scheduling"
+        );
+    }
+
+    // needs_scheduling fallback: when the event JSON cannot be deserialized into
+    // WatchEvent<PodObject>, the function uses a default WatchEvent with an empty
+    // event_type. This covers the unwrap_or_else branch — a non-object value like
+    // a JSON number triggers the fallback.
+    #[test]
+    fn needs_scheduling_returns_none_for_non_object_event() {
+        // A JSON number is not a WatchEvent — deserialization fails, fallback to
+        // empty event_type, which does not match ADDED or MODIFIED.
+        let event = json!(42);
+        assert!(
+            needs_scheduling(&event).is_none(),
+            "non-object JSON must not trigger scheduling"
+        );
+    }
+
+    // needs_scheduling with an explicitly null node_name field: None from the struct
+    // means unscheduled. This is distinct from absent (already covered) and from
+    // empty string "".
+    #[test]
+    fn needs_scheduling_returns_some_when_node_name_is_null() {
+        // spec.nodeName: null is a valid unscheduled state in Kubernetes.
+        // The scheduler must treat it the same as absent or "".
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "null-node-pod", "namespace": "default" },
+                "spec": { "nodeName": null }
+            }
+        });
+        let result = needs_scheduling(&event);
+        assert!(
+            result.is_some(),
+            "null nodeName must be treated as unscheduled"
+        );
+        let (ns, name) = result.unwrap();
+        assert_eq!(ns, "default");
+        assert_eq!(name, "null-node-pod");
+    }
+
+    // binding_path with special characters — ensures the path template doesn't
+    // introduce double slashes or truncate long names.
+    #[test]
+    fn binding_path_does_not_double_slash() {
+        let path = binding_path("default", "my-pod");
+        assert!(
+            !path.contains("//"),
+            "binding path must not contain double slashes: {path}"
+        );
+    }
+
+    // NodeList with a single item — the common production case (one worker node).
+    // select_first_node must return that node's name, not an error.
+    #[test]
+    fn select_first_node_returns_name_for_single_item_list() {
+        let list = NodeList {
+            items: vec![NodeItem {
+                metadata: NodeMetadata {
+                    name: "worker-0".to_owned(),
+                },
+            }],
+        };
+        let name = select_first_node(list).expect("single-item list must return Ok");
+        assert_eq!(name, "worker-0");
+    }
 }
