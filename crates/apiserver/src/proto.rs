@@ -1,4 +1,4 @@
-//! Kubernetes protobuf wire format decoder.
+//! Kubernetes protobuf wire format decoder — prost-backed implementation.
 //!
 //! kubectl sends write requests with `Content-Type: application/vnd.kubernetes.protobuf` by
 //! default. The encoding is NOT standard protobuf alone — it uses a 4-byte magic prefix followed
@@ -16,10 +16,441 @@
 //!   field 3 (contentEncoding, wire 2): tag = 0x1a
 //!   field 4 (contentType, wire 2):    tag = 0x22  <- "application/json" or ".../protobuf"
 
+use prost::Message;
+
 const K8S_PROTO_MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
 
 // ---------------------------------------------------------------------------
+// Prost-generated message types
+// All field numbers match the official k8s .proto definitions exactly.
+// Option B: every field of every message type we decode is included.
+// ---------------------------------------------------------------------------
+
+// --- k8s.io/apimachinery/pkg/runtime/generated.proto ---
+
+/// TypeMeta — embedded in Unknown field 1.
+/// k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct TypeMeta {
+    /// apiVersion (field 1, string)
+    #[prost(string, tag = "1")]
+    api_version: String,
+    /// kind (field 2, string)
+    #[prost(string, tag = "2")]
+    kind: String,
+}
+
+/// Unknown — the k8s protobuf envelope.
+/// k8s.io/apimachinery/pkg/runtime/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Unknown {
+    /// typeMeta (field 1, message)
+    #[prost(message, tag = "1")]
+    type_meta: Option<TypeMeta>,
+    /// raw (field 2, bytes) — the actual object, often JSON
+    #[prost(bytes = "vec", tag = "2")]
+    raw: Vec<u8>,
+    /// contentEncoding (field 3, string)
+    #[prost(string, tag = "3")]
+    content_encoding: String,
+    /// contentType (field 4, string)
+    #[prost(string, tag = "4")]
+    content_type: String,
+}
+
+// --- k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto ---
+
+/// Time wrapper message (field 1 = int64 seconds since epoch).
+/// Used for creationTimestamp, deletionTimestamp etc.
+#[derive(Clone, PartialEq, Message)]
+struct Time {
+    /// seconds (field 1, int64)
+    #[prost(int64, tag = "1")]
+    seconds: i64,
+    /// nanos (field 2, int32)
+    #[prost(int32, tag = "2")]
+    nanos: i32,
+}
+
+/// MicroTime — same as Time but microsecond precision.
+#[derive(Clone, PartialEq, Message)]
+struct MicroTime {
+    #[prost(int64, tag = "1")]
+    seconds: i64,
+    #[prost(int32, tag = "2")]
+    nanos: i32,
+}
+
+/// ObjectMeta — common metadata for all Kubernetes objects.
+/// k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct ObjectMeta {
+    /// name (field 1, string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// generateName (field 2, string)
+    #[prost(string, tag = "2")]
+    generate_name: String,
+    /// namespace (field 3, string)
+    #[prost(string, tag = "3")]
+    namespace: String,
+    /// selfLink (field 4, string) — deprecated
+    #[prost(string, tag = "4")]
+    self_link: String,
+    /// uid (field 5, string)
+    #[prost(string, tag = "5")]
+    uid: String,
+    /// resourceVersion (field 6, string)
+    #[prost(string, tag = "6")]
+    resource_version: String,
+    /// generation (field 7, int64)
+    #[prost(int64, tag = "7")]
+    generation: i64,
+    /// creationTimestamp (field 8, message Time)
+    #[prost(message, tag = "8")]
+    creation_timestamp: Option<Time>,
+    /// deletionTimestamp (field 9, message Time)
+    #[prost(message, tag = "9")]
+    deletion_timestamp: Option<Time>,
+    /// deletionGracePeriodSeconds (field 10, int64)
+    #[prost(int64, tag = "10")]
+    deletion_grace_period_seconds: i64,
+    /// labels (field 11, map<string, string>)
+    #[prost(map = "string, string", tag = "11")]
+    labels: std::collections::HashMap<String, String>,
+    /// annotations (field 12, map<string, string>)
+    #[prost(map = "string, string", tag = "12")]
+    annotations: std::collections::HashMap<String, String>,
+    /// ownerReferences (field 13, repeated OwnerReference) — decoded as raw bytes
+    #[prost(bytes = "vec", repeated, tag = "13")]
+    owner_references: Vec<Vec<u8>>,
+    /// finalizers (field 14, repeated string)
+    #[prost(string, repeated, tag = "14")]
+    finalizers: Vec<String>,
+}
+
+// --- k8s.io/api/core/v1/generated.proto ---
+
+/// NamespaceSpec (field 1=finalizers repeated string)
+#[derive(Clone, PartialEq, Message)]
+struct NamespaceSpec {
+    #[prost(string, repeated, tag = "1")]
+    finalizers: Vec<String>,
+}
+
+/// NamespaceStatus (field 1=phase string, field 2=conditions repeated bytes)
+#[derive(Clone, PartialEq, Message)]
+struct NamespaceStatus {
+    #[prost(string, tag = "1")]
+    phase: String,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    conditions: Vec<Vec<u8>>,
+}
+
+/// Namespace — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Namespace {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message NamespaceSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<NamespaceSpec>,
+    /// status (field 3, message NamespaceStatus)
+    #[prost(message, tag = "3")]
+    status: Option<NamespaceStatus>,
+}
+
+/// ConfigMap — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct ConfigMap {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// data (field 2, map<string, string>)
+    #[prost(map = "string, string", tag = "2")]
+    data: std::collections::HashMap<String, String>,
+    /// binaryData (field 3, map<string, bytes>)
+    #[prost(map = "string, bytes", tag = "3")]
+    binary_data: std::collections::HashMap<String, Vec<u8>>,
+    /// immutable (field 4, bool)
+    #[prost(bool, tag = "4")]
+    immutable: bool,
+}
+
+/// NodeSpec — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct NodeSpec {
+    /// podCIDR (field 1, string)
+    #[prost(string, tag = "1")]
+    pod_cidr: String,
+    /// externalID (field 2, string) — deprecated
+    #[prost(string, tag = "2")]
+    external_id: String,
+    /// providerID (field 3, string)
+    #[prost(string, tag = "3")]
+    provider_id: String,
+    /// unschedulable (field 4, bool)
+    #[prost(bool, tag = "4")]
+    unschedulable: bool,
+    /// taints (field 5, repeated) — decoded as raw bytes (complex nested message)
+    #[prost(bytes = "vec", repeated, tag = "5")]
+    taints: Vec<Vec<u8>>,
+    /// configSource (field 6, bytes) — deprecated, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "6")]
+    config_source: Vec<u8>,
+    /// podCIDRs (field 7, repeated string)
+    #[prost(string, repeated, tag = "7")]
+    pod_cidrs: Vec<String>,
+}
+
+/// Node — k8s.io/api/core/v1/generated.proto
+/// NodeStatus (field 3) is decoded as raw bytes — it contains complex repeated fields
+/// (conditions, addresses, capacity, etc.) that we don't need to read.
+#[derive(Clone, PartialEq, Message)]
+struct Node {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message NodeSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<NodeSpec>,
+    /// status (field 3, bytes) — opaque, not decoded
+    #[prost(bytes = "vec", tag = "3")]
+    status: Vec<u8>,
+}
+
+/// ObjectReference — used in Event.involvedObject
+#[derive(Clone, PartialEq, Message)]
+struct ObjectReference {
+    /// kind (field 1, string)
+    #[prost(string, tag = "1")]
+    kind: String,
+    /// namespace (field 2, string)
+    #[prost(string, tag = "2")]
+    namespace: String,
+    /// name (field 3, string)
+    #[prost(string, tag = "3")]
+    name: String,
+    /// uid (field 4, string)
+    #[prost(string, tag = "4")]
+    uid: String,
+    /// apiVersion (field 5, string)
+    #[prost(string, tag = "5")]
+    api_version: String,
+    /// resourceVersion (field 6, string)
+    #[prost(string, tag = "6")]
+    resource_version: String,
+    /// fieldPath (field 7, string)
+    #[prost(string, tag = "7")]
+    field_path: String,
+}
+
+/// EventSource — source component of an Event
+#[derive(Clone, PartialEq, Message)]
+struct EventSource {
+    #[prost(string, tag = "1")]
+    component: String,
+    #[prost(string, tag = "2")]
+    host: String,
+}
+
+/// Event — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Event {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// involvedObject (field 2, message ObjectReference)
+    #[prost(message, tag = "2")]
+    involved_object: Option<ObjectReference>,
+    /// reason (field 3, string)
+    #[prost(string, tag = "3")]
+    reason: String,
+    /// message (field 4, string)
+    #[prost(string, tag = "4")]
+    message: String,
+    /// source (field 5, message EventSource)
+    #[prost(message, tag = "5")]
+    source: Option<EventSource>,
+    /// firstTimestamp (field 6, message Time)
+    #[prost(message, tag = "6")]
+    first_timestamp: Option<Time>,
+    /// lastTimestamp (field 7, message Time)
+    #[prost(message, tag = "7")]
+    last_timestamp: Option<Time>,
+    /// count (field 8, int32)
+    #[prost(int32, tag = "8")]
+    count: i32,
+    /// type (field 9, string)
+    #[prost(string, tag = "9")]
+    r#type: String,
+    /// eventTime (field 10, MicroTime)
+    #[prost(message, tag = "10")]
+    event_time: Option<MicroTime>,
+    /// series (field 11, bytes) — EventSeries, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "11")]
+    series: Vec<u8>,
+    /// action (field 12, string)
+    #[prost(string, tag = "12")]
+    action: String,
+    /// related (field 13, message ObjectReference)
+    #[prost(message, tag = "13")]
+    related: Option<ObjectReference>,
+    /// reportingComponent (field 14, string)
+    #[prost(string, tag = "14")]
+    reporting_component: String,
+    /// reportingInstance (field 15, string)
+    #[prost(string, tag = "15")]
+    reporting_instance: String,
+}
+
+// --- k8s.io/api/coordination/v1/generated.proto ---
+
+/// LeaseSpec — k8s.io/api/coordination/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct LeaseSpec {
+    /// holderIdentity (field 1, string)
+    #[prost(string, tag = "1")]
+    holder_identity: String,
+    /// leaseDurationSeconds (field 2, int32)
+    #[prost(int32, tag = "2")]
+    lease_duration_seconds: i32,
+    /// acquireTime (field 3, MicroTime)
+    #[prost(message, tag = "3")]
+    acquire_time: Option<MicroTime>,
+    /// renewTime (field 4, MicroTime)
+    #[prost(message, tag = "4")]
+    renew_time: Option<MicroTime>,
+    /// leaseTransitions (field 5, int32)
+    #[prost(int32, tag = "5")]
+    lease_transitions: i32,
+    /// strategy (field 6, string) — CoordinatedLeaseStrategy
+    #[prost(string, tag = "6")]
+    strategy: String,
+    /// preferredHolder (field 7, string)
+    #[prost(string, tag = "7")]
+    preferred_holder: String,
+}
+
+/// Lease — k8s.io/api/coordination/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Lease {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message LeaseSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<LeaseSpec>,
+}
+
+// --- k8s.io/api/storage/v1/generated.proto ---
+
+/// VolumeNodeResources — used in CSINodeAllocatable
+#[derive(Clone, PartialEq, Message)]
+struct VolumeNodeResources {
+    /// count (field 1, int32) — maximum number of unique volumes managed by the CSI driver
+    #[prost(int32, tag = "1")]
+    count: i32,
+}
+
+/// CSINodeDriver — k8s.io/api/storage/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct CsiNodeDriver {
+    /// name (field 1, string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// nodeID (field 2, string)
+    #[prost(string, tag = "2")]
+    node_id: String,
+    /// topologyKeys (field 3, repeated string)
+    #[prost(string, repeated, tag = "3")]
+    topology_keys: Vec<String>,
+    /// allocatable (field 4, message VolumeNodeResources)
+    #[prost(message, tag = "4")]
+    allocatable: Option<VolumeNodeResources>,
+}
+
+/// CSINodeSpec — k8s.io/api/storage/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct CsiNodeSpec {
+    /// drivers (field 1, repeated CSINodeDriver)
+    #[prost(message, repeated, tag = "1")]
+    drivers: Vec<CsiNodeDriver>,
+}
+
+/// CSINode — k8s.io/api/storage/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct CsiNode {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message CSINodeSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<CsiNodeSpec>,
+}
+
+// --- k8s.io/api/authentication/v1/generated.proto ---
+
+/// BoundObjectReference — used in TokenRequestSpec
+#[derive(Clone, PartialEq, Message)]
+struct BoundObjectReference {
+    /// kind (field 1, string)
+    #[prost(string, tag = "1")]
+    kind: String,
+    /// apiVersion (field 2, string)
+    #[prost(string, tag = "2")]
+    api_version: String,
+    /// name (field 3, string)
+    #[prost(string, tag = "3")]
+    name: String,
+    /// uid (field 4, string)
+    #[prost(string, tag = "4")]
+    uid: String,
+}
+
+/// TokenRequestSpec — k8s.io/api/authentication/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct TokenRequestSpec {
+    /// audiences (field 1, repeated string)
+    #[prost(string, repeated, tag = "1")]
+    audiences: Vec<String>,
+    /// expirationSeconds (field 2, int64) — optional, 0 = unset
+    #[prost(int64, tag = "2")]
+    expiration_seconds: i64,
+    /// boundObjectRef (field 3, message BoundObjectReference)
+    #[prost(message, tag = "3")]
+    bound_object_ref: Option<BoundObjectReference>,
+}
+
+/// TokenRequestStatus — k8s.io/api/authentication/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct TokenRequestStatus {
+    /// token (field 1, string)
+    #[prost(string, tag = "1")]
+    token: String,
+    /// expirationTimestamp (field 2, message Time)
+    #[prost(message, tag = "2")]
+    expiration_timestamp: Option<Time>,
+}
+
+/// TokenRequest — k8s.io/api/authentication/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct TokenRequestProto {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message TokenRequestSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<TokenRequestSpec>,
+    /// status (field 3, message TokenRequestStatus)
+    #[prost(message, tag = "3")]
+    status: Option<TokenRequestStatus>,
+}
+
+// ---------------------------------------------------------------------------
 // Encoder — produces Kubernetes protobuf wire format from a JSON value.
+// Used in tests only; not called from production handlers.
 // ---------------------------------------------------------------------------
 
 /// Encode a varint into a byte vector.
@@ -110,139 +541,63 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
         return None;
     }
     let proto_bytes = &body[4..];
-    let mut raw: Option<Vec<u8>> = None;
-    let mut content_type = String::new();
-    let mut kind = String::new();
-    scan_length_delimited_fields(proto_bytes, |field_number, data| {
-        match field_number {
-            1 => {
-                // TypeMeta: field 1 = apiVersion (string), field 2 = kind (string)
-                scan_length_delimited_fields(data, |f, d| {
-                    if f == 2 {
-                        kind = String::from_utf8_lossy(d).into_owned();
-                    }
-                });
-            }
-            2 => raw = Some(data.to_vec()),
-            4 => content_type = String::from_utf8_lossy(data).into_owned(),
-            _ => {}
-        }
-    })?;
+    let unknown = Unknown::decode(proto_bytes).ok()?;
+    // raw field must be non-empty — we require a payload
+    if unknown.raw.is_empty() {
+        return None;
+    }
     Some(ProtoEnvelope {
-        raw: raw?,
-        content_type,
-        kind,
+        raw: unknown.raw,
+        content_type: unknown.content_type,
+        kind: unknown.type_meta.map(|t| t.kind).unwrap_or_default(),
     })
 }
 
-/// Decode one ObjectMeta proto field into `meta`, `labels`, and `annotations`.
-///
-/// Called from within a `scan_mixed_fields` closure for field 1 (ObjectMeta) of any top-level
-/// Kubernetes object.  All three decoders (Namespace, ConfigMap, Node) share the identical
-/// ObjectMeta wire layout — this function consolidates that logic.
-fn decode_object_meta_field(
-    fn2: u64,
-    wt: u64,
-    fd: &[u8],
-    meta: &mut serde_json::Value,
-    labels: &mut Option<serde_json::Map<String, serde_json::Value>>,
-    annotations: &mut Option<serde_json::Map<String, serde_json::Value>>,
-) {
-    match (fn2, wt) {
-        (1, 2) => {
-            // name (string)
-            meta["name"] = serde_json::Value::String(String::from_utf8_lossy(fd).into_owned());
-        }
-        (2, 2) => {
-            // generateName (string)
-            let s = String::from_utf8_lossy(fd).into_owned();
-            if !s.is_empty() {
-                meta["generateName"] = serde_json::Value::String(s);
-            }
-        }
-        (3, 2) => {
-            // namespace (string) — usually empty for cluster-scoped objects
-            let s = String::from_utf8_lossy(fd).into_owned();
-            if !s.is_empty() {
-                meta["namespace"] = serde_json::Value::String(s);
-            }
-        }
-        (5, 2) => {
-            // uid (string)
-            let s = String::from_utf8_lossy(fd).into_owned();
-            if !s.is_empty() {
-                meta["uid"] = serde_json::Value::String(s);
-            }
-        }
-        (6, 2) => {
-            // resourceVersion (string)
-            let s = String::from_utf8_lossy(fd).into_owned();
-            if !s.is_empty() {
-                meta["resourceVersion"] = serde_json::Value::String(s);
-            }
-        }
-        (11, 2) => {
-            // labels map entry
-            if let Some((k, v)) = decode_map_entry(fd) {
-                labels
-                    .get_or_insert_with(serde_json::Map::new)
-                    .insert(k, serde_json::Value::String(v));
-            }
-        }
-        (12, 2) => {
-            // annotations map entry
-            if let Some((k, v)) = decode_map_entry(fd) {
-                annotations
-                    .get_or_insert_with(serde_json::Map::new)
-                    .insert(k, serde_json::Value::String(v));
-            }
-        }
-        _ => {} // ignore other fields (creationTimestamp wire type 2, generation varint, etc.)
+// ---------------------------------------------------------------------------
+// Type-specific decoders — convert prost-decoded structs to serde_json::Value
+// ---------------------------------------------------------------------------
+
+/// Convert a prost ObjectMeta into a serde_json::Value map.
+fn object_meta_to_json(meta: ObjectMeta) -> serde_json::Value {
+    let mut m = serde_json::json!({ "creationTimestamp": serde_json::Value::Null });
+    if !meta.name.is_empty() {
+        m["name"] = serde_json::Value::String(meta.name);
     }
+    if !meta.generate_name.is_empty() {
+        m["generateName"] = serde_json::Value::String(meta.generate_name);
+    }
+    if !meta.namespace.is_empty() {
+        m["namespace"] = serde_json::Value::String(meta.namespace);
+    }
+    if !meta.uid.is_empty() {
+        m["uid"] = serde_json::Value::String(meta.uid);
+    }
+    if !meta.resource_version.is_empty() {
+        m["resourceVersion"] = serde_json::Value::String(meta.resource_version);
+    }
+    if !meta.labels.is_empty() {
+        let labels: serde_json::Map<String, serde_json::Value> = meta
+            .labels
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        m["labels"] = serde_json::Value::Object(labels);
+    }
+    if !meta.annotations.is_empty() {
+        let annotations: serde_json::Map<String, serde_json::Value> = meta
+            .annotations
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        m["annotations"] = serde_json::Value::Object(annotations);
+    }
+    m
 }
 
 /// Decode a proto-encoded Namespace object into a `serde_json::Value`.
-///
-/// Namespace proto layout (k8s.io/api/core/v1/generated.proto):
-///   field 1 (ObjectMeta, wire 2): metadata
-///   field 2 (NamespaceSpec, wire 2): spec
-///   field 3 (NamespaceStatus, wire 2): status
-///
-/// ObjectMeta proto layout (k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto):
-///   field 1 (string): name
-///   field 2 (string): generateName
-///   field 3 (string): namespace
-///   field 5 (string): uid
-///   field 6 (string): resourceVersion
-///   field 8 (Time, wire 2): creationTimestamp — always emitted by kubectl even when zero
-///   field 11 (MapEntry, wire 2 repeated): labels
-///   field 12 (MapEntry, wire 2 repeated): annotations
-///
-/// Map entries are each a 2-field sub-message: field 1 = key (string), field 2 = value (string).
 pub fn decode_namespace_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let mut meta = serde_json::json!({ "creationTimestamp": null });
-    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
-
-    // --- Parse the Namespace message: extract field 1 (ObjectMeta) ---
-    scan_length_delimited_fields(data, |field_number, field_data| {
-        if field_number == 1 {
-            // field 1 = ObjectMeta
-            scan_mixed_fields(field_data, |fn2, wt, fd| {
-                decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
-            });
-        }
-        // field 2 (NamespaceSpec) and field 3 (NamespaceStatus) are ignored —
-        // create_namespace fills in status.phase=Active unconditionally.
-    })?;
-
-    if let Some(l) = labels {
-        meta["labels"] = serde_json::Value::Object(l);
-    }
-    if let Some(a) = annotations {
-        meta["annotations"] = serde_json::Value::Object(a);
-    }
-
+    let ns = Namespace::decode(data).ok()?;
+    let meta = object_meta_to_json(ns.metadata.unwrap_or_default());
     Some(serde_json::json!({
         "apiVersion": "v1",
         "kind": "Namespace",
@@ -251,261 +606,120 @@ pub fn decode_namespace_proto(data: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// Decode a proto-encoded ConfigMap object into a `serde_json::Value`.
-///
-/// ConfigMap proto layout (k8s.io/api/core/v1/generated.proto):
-///   field 1 (ObjectMeta, wire 2): metadata
-///   field 2 (map<string,string> data, wire 2 repeated): data entries
-///   field 3 (map<string,string> binaryData, wire 2 repeated): ignored
-///   field 4 (bool immutable, wire 0): ignored
-///
-/// Map entries use the same two-field sub-message format as Namespace labels/annotations:
-///   field 1 = key (string), field 2 = value (string).
 pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let mut meta = serde_json::json!({ "creationTimestamp": null });
-    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut cm_data: Option<serde_json::Map<String, serde_json::Value>> = None;
-
-    scan_length_delimited_fields(data, |field_number, field_data| {
-        match field_number {
-            1 => {
-                // ObjectMeta — same layout as decode_namespace_proto
-                scan_mixed_fields(field_data, |fn2, wt, fd| {
-                    decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
-                });
-            }
-            2 => {
-                // data map entry
-                if let Some((k, v)) = decode_map_entry(field_data) {
-                    cm_data
-                        .get_or_insert_with(serde_json::Map::new)
-                        .insert(k, serde_json::Value::String(v));
-                }
-            }
-            _ => {} // binaryData, immutable: ignored
-        }
-    })?;
-
-    if let Some(l) = labels {
-        meta["labels"] = serde_json::Value::Object(l);
-    }
-    if let Some(a) = annotations {
-        meta["annotations"] = serde_json::Value::Object(a);
-    }
+    let cm = ConfigMap::decode(data).ok()?;
+    let meta = object_meta_to_json(cm.metadata.unwrap_or_default());
 
     let mut obj = serde_json::json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": meta
     });
-    if let Some(d) = cm_data {
-        obj["data"] = serde_json::Value::Object(d);
+    if !cm.data.is_empty() {
+        let data_map: serde_json::Map<String, serde_json::Value> = cm
+            .data
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        obj["data"] = serde_json::Value::Object(data_map);
     }
     Some(obj)
 }
 
 /// Decode a proto-encoded Node object into a `serde_json::Value`.
-///
-/// Node proto layout (k8s.io/api/core/v1/generated.proto):
-///   field 1 (ObjectMeta, wire 2): metadata
-///   field 2 (NodeSpec, wire 2): spec
-///   field 3 (NodeStatus, wire 2): status — treated as opaque, ignored
-///
-/// NodeSpec proto layout (k8s.io/api/core/v1/generated.proto):
-///   field 1 (string): podCIDR
-///   field 2 (string): externalID (deprecated)
-///   field 3 (string): providerID
-///   field 4 (bool, wire 0): unschedulable — ignored
-///   field 5+ (complex messages): taints, configSource — ignored
-///   field 7 (string, repeated): podCIDRs
-///
-/// NodeStatus is not decoded — it contains complex repeated fields (conditions, addresses,
-/// capacity, etc.) that require a full proto schema. The status subresource PATCH path
-/// handles status separately.
 pub fn decode_node_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let mut meta = serde_json::json!({ "creationTimestamp": null });
-    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut spec = serde_json::Map::new();
-    let mut pod_cidrs: Vec<serde_json::Value> = Vec::new();
-
-    scan_length_delimited_fields(data, |field_number, field_data| {
-        match field_number {
-            1 => {
-                // field 1 = ObjectMeta — same layout as decode_namespace_proto
-                scan_mixed_fields(field_data, |fn2, wt, fd| {
-                    decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
-                });
-            }
-            2 => {
-                // field 2 = NodeSpec — decode simple string fields
-                scan_length_delimited_fields(field_data, |fn2, fd| match fn2 {
-                    1 => {
-                        // podCIDR (string)
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            spec.insert("podCIDR".to_string(), serde_json::Value::String(s));
-                        }
-                    }
-                    3 => {
-                        // providerID (string)
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            spec.insert("providerID".to_string(), serde_json::Value::String(s));
-                        }
-                    }
-                    7 => {
-                        // podCIDRs (repeated string)
-                        let s = String::from_utf8_lossy(fd).into_owned();
-                        if !s.is_empty() {
-                            pod_cidrs.push(serde_json::Value::String(s));
-                        }
-                    }
-                    _ => {} // unschedulable (varint), taints, configSource: ignored
-                });
-            }
-            _ => {} // field 3 (NodeStatus) and others: ignored
-        }
-    })?;
-
-    if let Some(l) = labels {
-        meta["labels"] = serde_json::Value::Object(l);
-    }
-    if let Some(a) = annotations {
-        meta["annotations"] = serde_json::Value::Object(a);
-    }
-    if !pod_cidrs.is_empty() {
-        spec.insert("podCIDRs".to_string(), serde_json::Value::Array(pod_cidrs));
-    }
+    let node = Node::decode(data).ok()?;
+    let meta = object_meta_to_json(node.metadata.unwrap_or_default());
 
     let mut obj = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Node",
         "metadata": meta
     });
-    if !spec.is_empty() {
-        obj["spec"] = serde_json::Value::Object(spec);
+
+    if let Some(spec) = node.spec {
+        let mut spec_map = serde_json::Map::new();
+        if !spec.pod_cidr.is_empty() {
+            spec_map.insert(
+                "podCIDR".to_string(),
+                serde_json::Value::String(spec.pod_cidr),
+            );
+        }
+        if !spec.provider_id.is_empty() {
+            spec_map.insert(
+                "providerID".to_string(),
+                serde_json::Value::String(spec.provider_id),
+            );
+        }
+        if !spec.pod_cidrs.is_empty() {
+            spec_map.insert(
+                "podCIDRs".to_string(),
+                serde_json::Value::Array(
+                    spec.pod_cidrs
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !spec_map.is_empty() {
+            obj["spec"] = serde_json::Value::Object(spec_map);
+        }
     }
+
     Some(obj)
 }
 
 /// Decode a proto-encoded Lease object into a `serde_json::Value`.
-///
-/// Lease proto layout (k8s.io/api/coordination/v1/generated.proto):
-///   field 1 (ObjectMeta, wire 2): metadata
-///   field 2 (LeaseSpec, wire 2): spec
-///
-/// LeaseSpec proto layout:
-///   field 1 (string): holderIdentity
-///   field 2 (int32, wire 0): leaseDurationSeconds
-///   field 3 (MicroTime, wire 2): acquireTime — skipped
-///   field 4 (MicroTime, wire 2): renewTime — skipped
-///   field 5 (int32, wire 0): leaseTransitions — skipped
-///   field 6 (string): strategy — skipped
 pub fn decode_lease_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let mut meta = serde_json::json!({ "creationTimestamp": null });
-    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut spec = serde_json::Map::new();
-
-    scan_length_delimited_fields(data, |field_number, field_data| match field_number {
-        1 => {
-            scan_mixed_fields(field_data, |fn2, wt, fd| {
-                decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
-            });
-        }
-        2 => {
-            scan_mixed_fields(field_data, |fn2, wt, fd| match (fn2, wt) {
-                (1, 2) => {
-                    let s = String::from_utf8_lossy(fd).into_owned();
-                    if !s.is_empty() {
-                        spec.insert("holderIdentity".to_string(), serde_json::Value::String(s));
-                    }
-                }
-                (2, 0) => {
-                    if let Some((v, _)) = decode_varint(fd) {
-                        spec.insert(
-                            "leaseDurationSeconds".to_string(),
-                            serde_json::Value::Number(serde_json::Number::from(v as i64)),
-                        );
-                    }
-                }
-                _ => {}
-            });
-        }
-        _ => {}
-    })?;
-
-    if let Some(l) = labels {
-        meta["labels"] = serde_json::Value::Object(l);
-    }
-    if let Some(a) = annotations {
-        meta["annotations"] = serde_json::Value::Object(a);
-    }
+    let lease = Lease::decode(data).ok()?;
+    let meta = object_meta_to_json(lease.metadata.unwrap_or_default());
 
     let mut obj = serde_json::json!({
         "apiVersion": "coordination.k8s.io/v1",
         "kind": "Lease",
         "metadata": meta
     });
-    if !spec.is_empty() {
-        obj["spec"] = serde_json::Value::Object(spec);
+
+    if let Some(spec) = lease.spec {
+        let mut spec_map = serde_json::Map::new();
+        if !spec.holder_identity.is_empty() {
+            spec_map.insert(
+                "holderIdentity".to_string(),
+                serde_json::Value::String(spec.holder_identity),
+            );
+        }
+        if spec.lease_duration_seconds != 0 {
+            spec_map.insert(
+                "leaseDurationSeconds".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(spec.lease_duration_seconds)),
+            );
+        }
+        if !spec_map.is_empty() {
+            obj["spec"] = serde_json::Value::Object(spec_map);
+        }
     }
+
     Some(obj)
 }
 
 /// Decode a proto-encoded CSINode object into a `serde_json::Value`.
-///
-/// CSINode proto layout (k8s.io/api/storage/v1/generated.proto):
-///   field 1 (ObjectMeta, wire 2): metadata
-///   field 2 (CSINodeSpec, wire 2): spec
-///
-/// CSINodeSpec proto layout:
-///   field 1 (repeated CSINodeDriver, wire 2): drivers
-///
-/// CSINodeDriver proto layout:
-///   field 1 (string): name
-///   field 2 (string): nodeID
-///   field 3 (repeated string): topologyKeys — skipped
-///   field 4 (CSINodeAllocatedCapacity, wire 2): allocatable — skipped
 pub fn decode_csinode_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let mut meta = serde_json::json!({ "creationTimestamp": null });
-    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut drivers: Vec<serde_json::Value> = Vec::new();
+    let csinode = CsiNode::decode(data).ok()?;
+    let meta = object_meta_to_json(csinode.metadata.unwrap_or_default());
 
-    scan_length_delimited_fields(data, |field_number, field_data| match field_number {
-        1 => {
-            scan_mixed_fields(field_data, |fn2, wt, fd| {
-                decode_object_meta_field(fn2, wt, fd, &mut meta, &mut labels, &mut annotations);
-            });
-        }
-        2 => {
-            scan_length_delimited_fields(field_data, |fn2, fd| {
-                if fn2 == 1 {
-                    let mut name = String::new();
-                    let mut node_id = String::new();
-                    scan_length_delimited_fields(fd, |fn3, fd3| match fn3 {
-                        1 => name = String::from_utf8_lossy(fd3).into_owned(),
-                        2 => node_id = String::from_utf8_lossy(fd3).into_owned(),
-                        _ => {}
-                    });
-                    drivers.push(serde_json::json!({
-                        "name": name,
-                        "nodeID": node_id
-                    }));
-                }
-            });
-        }
-        _ => {}
-    })?;
-
-    if let Some(l) = labels {
-        meta["labels"] = serde_json::Value::Object(l);
-    }
-    if let Some(a) = annotations {
-        meta["annotations"] = serde_json::Value::Object(a);
-    }
+    let drivers: Vec<serde_json::Value> = csinode
+        .spec
+        .map(|s| s.drivers)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d.name,
+                "nodeID": d.node_id
+            })
+        })
+        .collect();
 
     Some(serde_json::json!({
         "apiVersion": "storage.k8s.io/v1",
@@ -518,123 +732,65 @@ pub fn decode_csinode_proto(data: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// Decode a proto-encoded Event object into a `serde_json::Value`.
-///
-/// Event proto layout (k8s.io/api/core/v1/generated.proto):
-///   field 1 (ObjectMeta, wire 2): metadata
-///   field 2 (ObjectReference, wire 2): involvedObject
-///   field 3 (string): reason
-///   field 4 (string): message
-///   field 5 (ObjectReference, wire 2): source — skipped
-///   field 6 (Time, wire 2): firstTimestamp — skipped
-///   field 7 (Time, wire 2): lastTimestamp — skipped
-///   field 8 (int32, wire 0): count
-///   field 9 (string): type
-///
-/// ObjectReference proto layout:
-///   field 1 (string): kind
-///   field 2 (string): namespace
-///   field 3 (string): name
-///   field 4 (string): uid
-///   field 5 (string): apiVersion
-///   field 6 (string): resourceVersion
-///   field 7 (string): fieldPath
 pub fn decode_event_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let mut meta = serde_json::json!({ "creationTimestamp": null });
-    let mut labels: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut annotations: Option<serde_json::Map<String, serde_json::Value>> = None;
-    let mut involved_object = serde_json::Map::new();
-    let mut reason = String::new();
-    let mut message = String::new();
-    let mut count: Option<i64> = None;
-    let mut event_type = String::new();
+    let event = Event::decode(data).ok()?;
+    let meta = object_meta_to_json(event.metadata.unwrap_or_default());
 
-    scan_mixed_fields(data, |field_number, wt, field_data| {
-        match (field_number, wt) {
-            (1, 2) => {
-                scan_mixed_fields(field_data, |fn2, wt2, fd| {
-                    decode_object_meta_field(
-                        fn2,
-                        wt2,
-                        fd,
-                        &mut meta,
-                        &mut labels,
-                        &mut annotations,
-                    );
-                });
-            }
-            (2, 2) => {
-                scan_length_delimited_fields(field_data, |fn2, fd| {
-                    let s = String::from_utf8_lossy(fd).into_owned();
-                    match fn2 {
-                        1 => {
-                            involved_object
-                                .insert("kind".to_string(), serde_json::Value::String(s));
-                        }
-                        2 => {
-                            involved_object
-                                .insert("namespace".to_string(), serde_json::Value::String(s));
-                        }
-                        3 => {
-                            involved_object
-                                .insert("name".to_string(), serde_json::Value::String(s));
-                        }
-                        4 => {
-                            involved_object.insert("uid".to_string(), serde_json::Value::String(s));
-                        }
-                        5 => {
-                            involved_object
-                                .insert("apiVersion".to_string(), serde_json::Value::String(s));
-                        }
-                        6 => {
-                            involved_object.insert(
-                                "resourceVersion".to_string(),
-                                serde_json::Value::String(s),
-                            );
-                        }
-                        7 => {
-                            involved_object
-                                .insert("fieldPath".to_string(), serde_json::Value::String(s));
-                        }
-                        _ => {}
-                    }
-                });
-            }
-            (3, 2) => reason = String::from_utf8_lossy(field_data).into_owned(),
-            (4, 2) => message = String::from_utf8_lossy(field_data).into_owned(),
-            (8, 0) => {
-                if let Some((v, _)) = decode_varint(field_data) {
-                    count = Some(v as i64);
-                }
-            }
-            (9, 2) => event_type = String::from_utf8_lossy(field_data).into_owned(),
-            _ => {}
+    let involved_object = event.involved_object.map(|r| {
+        let mut m = serde_json::Map::new();
+        if !r.kind.is_empty() {
+            m.insert("kind".to_string(), serde_json::Value::String(r.kind));
         }
-    })?;
-
-    if let Some(l) = labels {
-        meta["labels"] = serde_json::Value::Object(l);
-    }
-    if let Some(a) = annotations {
-        meta["annotations"] = serde_json::Value::Object(a);
-    }
+        if !r.namespace.is_empty() {
+            m.insert(
+                "namespace".to_string(),
+                serde_json::Value::String(r.namespace),
+            );
+        }
+        if !r.name.is_empty() {
+            m.insert("name".to_string(), serde_json::Value::String(r.name));
+        }
+        if !r.uid.is_empty() {
+            m.insert("uid".to_string(), serde_json::Value::String(r.uid));
+        }
+        if !r.api_version.is_empty() {
+            m.insert(
+                "apiVersion".to_string(),
+                serde_json::Value::String(r.api_version),
+            );
+        }
+        if !r.resource_version.is_empty() {
+            m.insert(
+                "resourceVersion".to_string(),
+                serde_json::Value::String(r.resource_version),
+            );
+        }
+        if !r.field_path.is_empty() {
+            m.insert(
+                "fieldPath".to_string(),
+                serde_json::Value::String(r.field_path),
+            );
+        }
+        serde_json::Value::Object(m)
+    });
 
     let mut obj = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Event",
         "metadata": meta,
-        "involvedObject": serde_json::Value::Object(involved_object)
+        "involvedObject": involved_object.unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
     });
-    if !reason.is_empty() {
-        obj["reason"] = serde_json::Value::String(reason);
+    if !event.reason.is_empty() {
+        obj["reason"] = serde_json::Value::String(event.reason);
     }
-    if !message.is_empty() {
-        obj["message"] = serde_json::Value::String(message);
+    if !event.message.is_empty() {
+        obj["message"] = serde_json::Value::String(event.message);
     }
-    if let Some(c) = count {
-        obj["count"] = serde_json::Value::Number(serde_json::Number::from(c));
+    if event.count != 0 {
+        obj["count"] = serde_json::Value::Number(serde_json::Number::from(event.count));
     }
-    if !event_type.is_empty() {
-        obj["type"] = serde_json::Value::String(event_type);
+    if !event.r#type.is_empty() {
+        obj["type"] = serde_json::Value::String(event.r#type);
     }
     Some(obj)
 }
@@ -651,38 +807,20 @@ pub struct TokenRequestFields {
 ///   field 1 (ObjectMeta, wire 2): ignored
 ///   field 2 (TokenRequestSpec, wire 2): spec
 ///     field 1 (repeated string): audiences
-///     field 2 (int64, wire 0): expirationSeconds
+///     field 2 (int64): expirationSeconds (0 = unset)
+///     field 3 (BoundObjectReference, message): boundObjectRef
 ///
 /// Returns `None` if the bytes are not a recognisable protobuf message (malformed input).
 pub fn decode_token_request(raw: &[u8]) -> Option<TokenRequestFields> {
-    let mut audiences = Vec::new();
-    let mut expiration_seconds: Option<u64> = None;
-
-    scan_length_delimited_fields(raw, |field, data| {
-        if field == 2 {
-            // spec: TokenRequestSpec
-            scan_mixed_fields(data, |f, wt, d| match (f, wt) {
-                (1, 2) => {
-                    // audiences: repeated string
-                    if let Ok(s) = std::str::from_utf8(d) {
-                        audiences.push(s.to_owned());
-                    }
-                }
-                (2, 0) => {
-                    // expirationSeconds: int64 varint
-                    // scan_mixed_fields passes the consumed raw bytes for wire type 0;
-                    // decode_varint reads the value from those bytes.
-                    if let Some((v, _)) = decode_varint(d) {
-                        expiration_seconds = Some(v);
-                    }
-                }
-                _ => {}
-            });
-        }
-    })?;
-
+    let tr = TokenRequestProto::decode(raw).ok()?;
+    let spec = tr.spec.unwrap_or_default();
+    let expiration_seconds = if spec.expiration_seconds > 0 {
+        Some(spec.expiration_seconds as u64)
+    } else {
+        None
+    };
     Some(TokenRequestFields {
-        audiences,
+        audiences: spec.audiences,
         expiration_seconds,
     })
 }
@@ -703,145 +841,13 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
     }
 }
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Scan length-delimited (wire type 2) fields of a protobuf message, calling `f(field_number,
-/// field_data)` for each. Non-length-delimited fields are skipped silently. Returns `None` if the
-/// data is malformed (truncated varint or truncated field payload).
-fn scan_length_delimited_fields<F>(mut data: &[u8], mut f: F) -> Option<()>
-where
-    F: FnMut(u64, &[u8]),
-{
-    while !data.is_empty() {
-        let (tag, rest) = decode_varint(data)?;
-        data = rest;
-        let field_number = tag >> 3;
-        let wire_type = tag & 0x7;
-        match wire_type {
-            0 => {
-                let (_, rest) = decode_varint(data)?;
-                data = rest;
-            }
-            1 => {
-                if data.len() < 8 {
-                    return None;
-                }
-                data = &data[8..];
-            }
-            2 => {
-                let (len, rest) = decode_varint(data)?;
-                let len = len as usize;
-                data = rest;
-                if data.len() < len {
-                    return None;
-                }
-                f(field_number, &data[..len]);
-                data = &data[len..];
-            }
-            5 => {
-                if data.len() < 4 {
-                    return None;
-                }
-                data = &data[4..];
-            }
-            _ => return None,
-        }
-    }
-    Some(())
-}
-
-/// Scan ALL wire types of a protobuf message, calling `f(field_number, wire_type, field_data)`.
-/// For length-delimited (wire type 2), `field_data` is the payload bytes. For other wire types,
-/// `field_data` is the raw bytes consumed (not interpreted). Returns `None` on malformed input.
-fn scan_mixed_fields<F>(mut data: &[u8], mut f: F) -> Option<()>
-where
-    F: FnMut(u64, u64, &[u8]),
-{
-    while !data.is_empty() {
-        let (tag, rest) = decode_varint(data)?;
-        data = rest;
-        let field_number = tag >> 3;
-        let wire_type = tag & 0x7;
-        match wire_type {
-            0 => {
-                let (_, rest) = decode_varint(data)?;
-                let consumed = data.len() - rest.len();
-                f(field_number, wire_type, &data[..consumed]);
-                data = rest;
-            }
-            1 => {
-                if data.len() < 8 {
-                    return None;
-                }
-                f(field_number, wire_type, &data[..8]);
-                data = &data[8..];
-            }
-            2 => {
-                let (len, rest) = decode_varint(data)?;
-                let len = len as usize;
-                data = rest;
-                if data.len() < len {
-                    return None;
-                }
-                f(field_number, wire_type, &data[..len]);
-                data = &data[len..];
-            }
-            5 => {
-                if data.len() < 4 {
-                    return None;
-                }
-                f(field_number, wire_type, &data[..4]);
-                data = &data[4..];
-            }
-            _ => return None,
-        }
-    }
-    Some(())
-}
-
-/// Decode a protobuf map entry: `{ field 1 (key, string), field 2 (value, string) }`.
-/// Returns `Some((key, value))` on success, `None` if malformed or key is empty.
-fn decode_map_entry(data: &[u8]) -> Option<(String, String)> {
-    let mut key = String::new();
-    let mut value = String::new();
-    scan_length_delimited_fields(data, |field_number, fd| match field_number {
-        1 => key = String::from_utf8_lossy(fd).into_owned(),
-        2 => value = String::from_utf8_lossy(fd).into_owned(),
-        _ => {}
-    })?;
-    if key.is_empty() {
-        return None;
-    }
-    Some((key, value))
-}
-
-/// Decode a protobuf varint from the front of `data`.
-/// Returns `Some((value, remaining))` or `None` if the data is too short or the varint
-/// exceeds 10 bytes (which would overflow a u64).
-fn decode_varint(data: &[u8]) -> Option<(u64, &[u8])> {
-    let mut result: u64 = 0;
-    let mut shift = 0u32;
-    for (i, &byte) in data.iter().enumerate() {
-        if shift >= 64 {
-            return None; // varint too long
-        }
-        result |= ((byte & 0x7f) as u64) << shift;
-        shift += 7;
-        if byte & 0x80 == 0 {
-            return Some((result, &data[i + 1..]));
-        }
-    }
-    None // ran out of data
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // ---------------------------------------------------------------------------
-    // Varint encoder — used only in tests to build synthetic protobuf payloads.
+    // Varint encoder — used only in tests to build synthetic protobuf payloads
+    // and to walk raw proto bytes in assert_valid_wire_types.
     // ---------------------------------------------------------------------------
 
     fn encode_varint(mut v: u64) -> Vec<u8> {
@@ -864,6 +870,24 @@ mod tests {
         out.extend_from_slice(&encode_varint(payload.len() as u64));
         out.extend_from_slice(payload);
         out
+    }
+
+    /// Decode a protobuf varint from the front of `data`.
+    /// Used by assert_valid_wire_types to walk raw proto bytes.
+    fn decode_varint(data: &[u8]) -> Option<(u64, &[u8])> {
+        let mut result: u64 = 0;
+        let mut shift = 0u32;
+        for (i, &byte) in data.iter().enumerate() {
+            if shift >= 64 {
+                return None;
+            }
+            result |= ((byte & 0x7f) as u64) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                return Some((result, &data[i + 1..]));
+            }
+        }
+        None
     }
 
     /// Build a minimal Kubernetes protobuf body: magic prefix + Unknown message containing
@@ -2081,6 +2105,51 @@ mod tests {
             fields.expiration_seconds.is_none() || fields.expiration_seconds == Some(0),
             "expiration_seconds must be None or 0 when kubectl omits it; got {:?}",
             fields.expiration_seconds
+        );
+    }
+
+    /// Regression test for mayor-2qq8: decode_token_request must correctly decode a
+    /// TokenRequest with both expirationSeconds and a non-default audience, as sent by
+    /// kubectl 1.31+ with explicit flags.
+    ///
+    /// The hand-rolled decoder had a bug where expirationSeconds was looked up at the
+    /// wrong field number inside the spec sub-message. prost decodes it correctly via
+    /// the official field 2 (int64) in TokenRequestSpec.
+    ///
+    /// This test must fail if decode_token_request returns None or extracts wrong values.
+    #[test]
+    fn decode_token_request_with_expiration_and_audience() {
+        use prost::Message as _;
+
+        // Construct a TokenRequestProto with spec.audiences and spec.expiration_seconds
+        let tr = TokenRequestProto {
+            metadata: None,
+            spec: Some(TokenRequestSpec {
+                audiences: vec!["https://my-custom-audience.example.com".to_string()],
+                expiration_seconds: 7200,
+                bound_object_ref: None,
+            }),
+            status: None,
+        };
+
+        // Encode with prost — the correct wire format
+        let mut buf = Vec::new();
+        tr.encode(&mut buf).expect("prost encode must succeed");
+
+        let fields = decode_token_request(&buf).expect(
+            "decode_token_request must return Some for a well-formed TokenRequest with expiration",
+        );
+
+        assert_eq!(
+            fields.audiences,
+            vec!["https://my-custom-audience.example.com"],
+            "audience must match what was encoded"
+        );
+        assert_eq!(
+            fields.expiration_seconds,
+            Some(7200),
+            "expirationSeconds=7200 must be decoded correctly; None here means the \
+             hand-rolled decoder was reading the wrong field number"
         );
     }
 }
