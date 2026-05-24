@@ -58,27 +58,11 @@ pub async fn http_post_json(
 // Watch streaming — reads newline-delimited JSON from a watch endpoint
 // ---------------------------------------------------------------------------
 
-/// Drain all complete newline-terminated JSON lines from `buf`, calling
-/// `handler` for each successfully parsed value.
-///
-/// Lines that fail to parse are logged and skipped. Incomplete lines (no
-/// trailing `\n`) are left in `buf` for the next call.
-///
-/// Pure function extracted so the line-parsing logic can be unit-tested
-/// without a network connection.
-pub fn drain_watch_buffer(buf: &mut String, handler: &mut impl FnMut(Value)) {
-    while let Some(nl) = buf.find('\n') {
-        let line = buf[..nl].trim().to_owned();
-        *buf = buf[nl + 1..].to_owned();
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Value>(&line) {
-            Ok(v) => handler(v),
-            Err(e) => warn!("failed to parse watch event: {e}: {line}"),
-        }
-    }
-}
+// Re-export drain_watch_buffer from client-util so that:
+// 1. The canonical implementation lives alongside watch_stream (which calls it).
+// 2. Scheduler-level unit tests exercise the same function used in production,
+//    not a separate copy.
+pub use u7s_client_util::drain_watch_buffer;
 
 pub async fn stream_watch_events(
     connector: &TlsConnector,
@@ -289,6 +273,31 @@ pub async fn bind_pod(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // drain_watch_buffer is re-exported from client-util where it is called by
+    // watch_stream (and therefore stream_watch_events). This test confirms that
+    // the function used in production handles multi-line chunks correctly.
+    // If drain_watch_buffer were decoupled from watch_stream again (reverted to
+    // an inline copy), this re-export would break at compile time.
+    #[test]
+    fn drain_watch_buffer_multi_line_chunk_parses_all_events() {
+        // Simulate receiving two complete JSON watch events in a single chunk.
+        // This exercises the production code path: watch_stream calls
+        // drain_watch_buffer per frame, and drain_watch_buffer must consume all
+        // complete lines even when multiple arrive in one network frame.
+        let mut buf =
+            "{\"type\":\"ADDED\",\"object\":{}}\n{\"type\":\"MODIFIED\",\"object\":{}}\n".to_owned();
+        let mut events: Vec<Value> = Vec::new();
+        drain_watch_buffer(&mut buf, &mut |v| events.push(v));
+        assert_eq!(
+            events.len(),
+            2,
+            "both lines must be parsed from a single chunk"
+        );
+        assert_eq!(events[0]["type"], "ADDED");
+        assert_eq!(events[1]["type"], "MODIFIED");
+        assert!(buf.is_empty(), "all complete lines must be consumed");
+    }
 
     // WatchEvent deserialization — verifies that the typed envelope correctly
     // maps "type" → event_type and "object" → object. A rename or missing field
