@@ -154,6 +154,20 @@ pub fn needs_scheduling(event: &Value) -> Option<(String, String)> {
     Some((namespace, pod_name.to_owned()))
 }
 
+/// Return `true` if a spawn for `key` ("namespace/name") should proceed.
+///
+/// `key` must be absent from `in_flight` — the set of pod keys currently being
+/// scheduled. The caller is responsible for inserting the key before spawning and
+/// removing it when the task completes (success or error).
+///
+/// Pure function so the dedup decision can be unit-tested without a runtime.
+/// The guard prevents two rapid ADDED/MODIFIED events for the same pod from
+/// spawning two concurrent bind_pod tasks; the second bind would receive a 409
+/// Conflict, which (after bead 2) is now a logged Err rather than silent Ok.
+pub fn should_schedule(in_flight: &std::collections::HashSet<String>, key: &str) -> bool {
+    !in_flight.contains(key)
+}
+
 #[derive(Deserialize)]
 pub struct NodeList {
     pub items: Vec<NodeItem>,
@@ -343,6 +357,63 @@ mod tests {
         // 500 Internal Server Error must not be silently swallowed.
         let result = check_bind_response(500, "internal error");
         assert!(result.is_err(), "500 must return Err");
+    }
+
+    // should_schedule tests — the dedup guard for concurrent bind_pod spawns.
+    // Without this guard, two rapid ADDED/MODIFIED events for the same pod
+    // would spawn two concurrent bind_pod calls; the second returns 409 Conflict
+    // (now surfaced as Err after bead 2). The HashSet prevents the duplicate spawn.
+
+    #[test]
+    fn should_schedule_returns_true_for_key_not_in_flight() {
+        // An empty in-flight set means no bind is running — schedule is allowed.
+        // Removing the HashSet guard entirely would make this always return true,
+        // which is correct here; the failure mode is in the next test.
+        let in_flight = std::collections::HashSet::new();
+        assert!(
+            should_schedule(&in_flight, "default/my-pod"),
+            "must return true when pod is not in-flight"
+        );
+    }
+
+    #[test]
+    fn should_schedule_returns_false_when_key_already_in_flight() {
+        // A pod key present in in_flight means a bind task is already running.
+        // should_schedule must return false to prevent a duplicate spawn.
+        // This test fails if the HashSet guard is removed (always returns true).
+        let mut in_flight = std::collections::HashSet::new();
+        in_flight.insert("default/my-pod".to_owned());
+        assert!(
+            !should_schedule(&in_flight, "default/my-pod"),
+            "must return false when pod is already in-flight"
+        );
+    }
+
+    #[test]
+    fn should_schedule_is_key_specific() {
+        // Only the matching key must be blocked; other pods must still be schedulable.
+        let mut in_flight = std::collections::HashSet::new();
+        in_flight.insert("default/pod-a".to_owned());
+        assert!(
+            should_schedule(&in_flight, "default/pod-b"),
+            "pod-b must be schedulable even when pod-a is in-flight"
+        );
+        assert!(
+            !should_schedule(&in_flight, "default/pod-a"),
+            "pod-a must not be schedulable when it is in-flight"
+        );
+    }
+
+    #[test]
+    fn should_schedule_key_uses_namespace_slash_name_format() {
+        // The key format is "namespace/name". A key "default/pod" must not match
+        // "kube-system/pod" — different namespace, different key.
+        let mut in_flight = std::collections::HashSet::new();
+        in_flight.insert("default/coredns".to_owned());
+        assert!(
+            should_schedule(&in_flight, "kube-system/coredns"),
+            "same pod name in different namespace must be treated as a distinct key"
+        );
     }
 
     // drain_watch_buffer is re-exported from client-util where it is called by
