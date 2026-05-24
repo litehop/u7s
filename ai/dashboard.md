@@ -1,46 +1,39 @@
 # Dashboard
-2026-05-24 03:30 UTC
-Session: f317c180-6e09-4912-b648-3b889a2d42d0
-Open beads: 1 (mayor-6w76, P3 perpetually deferred)
+2026-05-24 05:00 UTC
+Session: f317c180-6e09-4912-b648-3b889a2d42d0 (CLOSED)
+Open beads: 2 (1×P2 stale in-progress, 1×P3 deferred)
 
 ## What needs the operator now
 
-**Coverage sprint complete.** All 3 coverage beads merged (PRs #223–#225).
-Workspace tests: 912 (up from ~856 at session start).
+**sonobuoy-run.sh has an uncommitted fix** — `--skip-preflight=dnscheck` added to
+`scripts/sonobuoy-run.sh`. Include in next commit before running sonobuoy.
 
-**Recommended next action:** Run sonobuoy for Phase 3 exit criterion 2:
+**Decision on mayor-4na6 (P2, IN_PROGRESS since 2026-05-22):**
+Generify AppState over `S: Store`. The OCC tests it was meant to unlock were delivered
+without it (PRs #221–#222). Close as superseded, or dispatch for future testability?
+
+**Run sonobuoy** (Phase 3 exit criterion 2):
 ```
 scripts/conformance/run-all.sh --reset
 ```
-This is the last blocker before the conformance sprint can begin.
 
 ## Forward-looking
 
-**Phase 3 exit criterion 2:** Sonobuoy non-disruptive-conformance run produces a results report.
-After that: file 10–30 new beads from sonobuoy triage → conformance sprint begins.
+After sonobuoy: triage HIGH failures → file beads → conformance sprint (Phase 3 → Phase 4).
+`mayor-6w76` (P3) — proto decoder, activate only on observed decode failure.
 
-**Only remaining open bead:**
-- `mayor-6w76` (P3, deferred) — Pod proto decoder; activate only if decode failure observed in the wild
+## Recent progress
 
-## Session progress (full session)
+**Session f317c180: 9 PRs merged (#217–#225), ~21 beads closed, 912 workspace tests (+56 from ~856).**
 
-**PRs merged: 9 total (#217–#225). Beads closed: ~21. Beads filed: ~15.**
-
-| PR | Bead(s) | Summary |
-|----|---------|---------|
-| #217 | reset+scheduler | reset.sh + --reset flag; 04-start-kcm.sh bash prefix fix |
-| #218 | 3 security | CT token, JWT sub, cert identity |
-| #219 | mayor-utgk | store Lagged emits compaction_horizon not message-count |
-| #220 | 4 scheduler beads | double-bind dedup, bind_pod Err on non-2xx, drain_watch_buffer to client-util, +14 tests |
-| #221 | mayor-pw9f, mayor-flxm | cr.rs: 13 tests; status.rs: 4 tests |
-| #222 | 5 coverage beads | handlers: 28 new tests across resource/namespaces/pods/approval/csr |
-| #223 | mayor-mjdu | stream.rs: 6 tests (splice, BiStream, MemStream) |
-| #224 | mayor-h1gp | tls.rs: 5 tests (advertise_host edges, write_kubeconfig, generate_tls, write_private_key) |
-| #225 | mayor-6j1j | proxy.rs: 2 tests (node-not-found 404 for attach + portforward) |
-
-**Workspace tests: ~856 → 912 (+56)**
-
-**Docs committed:** extended-context README, project-context (decisions settled), roadmap (Phase 3 stack complete). Won't be stash-clobbered again.
+| Area | What landed |
+|------|-------------|
+| Conformance stack | reset.sh, --reset flag, 04-start-kcm.sh bash fix, sonobuoy dns preflight fix |
+| Security | CT token constant-time comparison, JWT sub guard, cert identity rename + 3 tests |
+| Store | Lagged emits compaction_horizon correctly (not message count) |
+| Scheduler | Double-bind dedup, bind_pod Err on non-2xx, drain_watch_buffer → client-util, +14 tests |
+| Handler coverage | cr, status, resource, namespaces, pods, approval, csr (+42 tests, PRs #221–#222) |
+| Final coverage | stream.rs splice/BiStream, tls.rs edge cases, proxy.rs node-not-found (+13 tests, PRs #223–#225) |
 
 ## Stance
 Pre-alpha/greenfield — break freely, no backward compat, correctness first,
