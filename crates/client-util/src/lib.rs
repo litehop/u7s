@@ -277,23 +277,37 @@ impl HyperApiClient {
                     let frame: hyper::body::Frame<bytes::Bytes> = frame;
                     if let Ok(data) = frame.into_data() {
                         buf.push_str(&String::from_utf8_lossy(&data));
-                        while let Some(nl) = buf.find('\n') {
-                            let line = buf[..nl].trim().to_owned();
-                            buf = buf[nl + 1..].to_owned();
-                            if line.is_empty() {
-                                continue;
-                            }
-                            match serde_json::from_str::<Value>(&line) {
-                                Ok(v) => on_event(v),
-                                Err(e) => warn!("failed to parse watch event: {e}: {line}"),
-                            }
-                        }
+                        drain_watch_buffer(&mut buf, &mut on_event);
                     }
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+/// Drain all complete newline-terminated JSON lines from `buf`, calling
+/// `handler` for each successfully parsed value.
+///
+/// Lines that fail to parse are logged and skipped. Incomplete lines (no
+/// trailing `\n`) are left in `buf` for the next call.
+///
+/// This function is the canonical implementation used by `HyperApiClient::watch_stream`.
+/// It is also re-exported from `u7s-scheduler` so that scheduler-level code can
+/// reference the same function — ensuring unit tests for the parsing logic cover
+/// the actual production code path.
+pub fn drain_watch_buffer(buf: &mut String, handler: &mut impl FnMut(Value)) {
+    while let Some(nl) = buf.find('\n') {
+        let line = buf[..nl].trim().to_owned();
+        *buf = buf[nl + 1..].to_owned();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(&line) {
+            Ok(v) => handler(v),
+            Err(e) => warn!("failed to parse watch event: {e}: {line}"),
+        }
     }
 }
 

@@ -7,7 +7,7 @@ use hyper::{Method, StatusCode, Uri};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_rustls::TlsConnector;
-use tracing::{info, warn};
+use tracing::info;
 use u7s_client_util::HyperApiClient;
 
 // ---------------------------------------------------------------------------
@@ -58,27 +58,11 @@ pub async fn http_post_json(
 // Watch streaming — reads newline-delimited JSON from a watch endpoint
 // ---------------------------------------------------------------------------
 
-/// Drain all complete newline-terminated JSON lines from `buf`, calling
-/// `handler` for each successfully parsed value.
-///
-/// Lines that fail to parse are logged and skipped. Incomplete lines (no
-/// trailing `\n`) are left in `buf` for the next call.
-///
-/// Pure function extracted so the line-parsing logic can be unit-tested
-/// without a network connection.
-pub fn drain_watch_buffer(buf: &mut String, handler: &mut impl FnMut(Value)) {
-    while let Some(nl) = buf.find('\n') {
-        let line = buf[..nl].trim().to_owned();
-        *buf = buf[nl + 1..].to_owned();
-        if line.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<Value>(&line) {
-            Ok(v) => handler(v),
-            Err(e) => warn!("failed to parse watch event: {e}: {line}"),
-        }
-    }
-}
+// Re-export drain_watch_buffer from client-util so that:
+// 1. The canonical implementation lives alongside watch_stream (which calls it).
+// 2. Scheduler-level unit tests exercise the same function used in production,
+//    not a separate copy.
+pub use u7s_client_util::drain_watch_buffer;
 
 pub async fn stream_watch_events(
     connector: &TlsConnector,
@@ -168,6 +152,20 @@ pub fn needs_scheduling(event: &Value) -> Option<(String, String)> {
         .namespace
         .unwrap_or_else(|| "default".to_owned());
     Some((namespace, pod_name.to_owned()))
+}
+
+/// Return `true` if a spawn for `key` ("namespace/name") should proceed.
+///
+/// `key` must be absent from `in_flight` — the set of pod keys currently being
+/// scheduled. The caller is responsible for inserting the key before spawning and
+/// removing it when the task completes (success or error).
+///
+/// Pure function so the dedup decision can be unit-tested without a runtime.
+/// The guard prevents two rapid ADDED/MODIFIED events for the same pod from
+/// spawning two concurrent bind_pod tasks; the second bind would receive a 409
+/// Conflict, which (after bead 2) is now a logged Err rather than silent Ok.
+pub fn should_schedule(in_flight: &std::collections::HashSet<String>, key: &str) -> bool {
+    !in_flight.contains(key)
 }
 
 #[derive(Deserialize)]
@@ -261,6 +259,19 @@ pub fn binding_payload(namespace: &str, pod_name: &str, node_name: &str) -> Valu
     serde_json::to_value(binding).expect("Binding is always serializable")
 }
 
+/// Check a bind response status code and body, returning Err on non-2xx.
+///
+/// Extracted as a pure function so the error-returning logic can be unit-tested
+/// without network access. A non-2xx response must surface as Err so the caller
+/// can log and retry; silently returning Ok on 409 Conflict (duplicate bind) or
+/// 404 (pod gone) masks real scheduling failures.
+pub fn check_bind_response(status: u16, body: &str) -> anyhow::Result<()> {
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    bail!("bind failed with HTTP {status}: {body}")
+}
+
 /// Bind a pod to a node via POST .../pods/:name/binding.
 pub async fn bind_pod(
     connector: &TlsConnector,
@@ -273,11 +284,8 @@ pub async fn bind_pod(
     let payload = binding_payload(namespace, pod_name, node_name);
 
     let (status, body) = http_post_json(connector, server, &path, &payload).await?;
-    if status.is_success() {
-        info!("bound pod {namespace}/{pod_name} → node {node_name}");
-    } else {
-        warn!("binding {namespace}/{pod_name} failed ({status}): {body}");
-    }
+    check_bind_response(status.as_u16(), &body)?;
+    info!("bound pod {namespace}/{pod_name} → node {node_name}");
     Ok(())
 }
 
@@ -289,6 +297,149 @@ pub async fn bind_pod(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // check_bind_response tests — the error-returning logic for bind_pod.
+    // Before this fix, bind_pod returned Ok(()) on any status code, including
+    // 409 Conflict (duplicate bind) and 404 (pod already gone). Callers then
+    // logged nothing and assumed success, silently masking scheduling failures.
+
+    #[test]
+    fn bind_pod_returns_err_on_non_2xx() {
+        // 409 Conflict is what the API server returns when a pod is already bound.
+        // bind_pod must surface this as Err so the caller can log and skip.
+        // Reverting to Ok(()) on non-2xx would make this test fail.
+        let result = check_bind_response(409, "AlreadyExists");
+        assert!(
+            result.is_err(),
+            "409 Conflict must return Err, not Ok — duplicate binds must be surfaced"
+        );
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("409"),
+            "error must include the status code; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_bind_response_ok_on_2xx() {
+        // 201 Created is the success response for a new binding.
+        assert!(
+            check_bind_response(201, "").is_ok(),
+            "201 Created must return Ok"
+        );
+        assert!(
+            check_bind_response(200, "ok").is_ok(),
+            "200 OK must return Ok"
+        );
+    }
+
+    #[test]
+    fn check_bind_response_err_includes_body() {
+        // The error message must include the response body so operators can diagnose
+        // failures without needing API server logs.
+        let result = check_bind_response(422, "validation error: bad spec");
+        let msg = format!("{:#}", result.err().unwrap());
+        assert!(
+            msg.contains("validation error"),
+            "error message must include response body; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_bind_response_err_on_404() {
+        // 404 means the pod was deleted before binding completed — must surface as Err.
+        let result = check_bind_response(404, "not found");
+        assert!(result.is_err(), "404 must return Err");
+    }
+
+    #[test]
+    fn check_bind_response_err_on_500() {
+        // 500 Internal Server Error must not be silently swallowed.
+        let result = check_bind_response(500, "internal error");
+        assert!(result.is_err(), "500 must return Err");
+    }
+
+    // should_schedule tests — the dedup guard for concurrent bind_pod spawns.
+    // Without this guard, two rapid ADDED/MODIFIED events for the same pod
+    // would spawn two concurrent bind_pod calls; the second returns 409 Conflict
+    // (now surfaced as Err after bead 2). The HashSet prevents the duplicate spawn.
+
+    #[test]
+    fn should_schedule_returns_true_for_key_not_in_flight() {
+        // An empty in-flight set means no bind is running — schedule is allowed.
+        // Removing the HashSet guard entirely would make this always return true,
+        // which is correct here; the failure mode is in the next test.
+        let in_flight = std::collections::HashSet::new();
+        assert!(
+            should_schedule(&in_flight, "default/my-pod"),
+            "must return true when pod is not in-flight"
+        );
+    }
+
+    #[test]
+    fn should_schedule_returns_false_when_key_already_in_flight() {
+        // A pod key present in in_flight means a bind task is already running.
+        // should_schedule must return false to prevent a duplicate spawn.
+        // This test fails if the HashSet guard is removed (always returns true).
+        let mut in_flight = std::collections::HashSet::new();
+        in_flight.insert("default/my-pod".to_owned());
+        assert!(
+            !should_schedule(&in_flight, "default/my-pod"),
+            "must return false when pod is already in-flight"
+        );
+    }
+
+    #[test]
+    fn should_schedule_is_key_specific() {
+        // Only the matching key must be blocked; other pods must still be schedulable.
+        let mut in_flight = std::collections::HashSet::new();
+        in_flight.insert("default/pod-a".to_owned());
+        assert!(
+            should_schedule(&in_flight, "default/pod-b"),
+            "pod-b must be schedulable even when pod-a is in-flight"
+        );
+        assert!(
+            !should_schedule(&in_flight, "default/pod-a"),
+            "pod-a must not be schedulable when it is in-flight"
+        );
+    }
+
+    #[test]
+    fn should_schedule_key_uses_namespace_slash_name_format() {
+        // The key format is "namespace/name". A key "default/pod" must not match
+        // "kube-system/pod" — different namespace, different key.
+        let mut in_flight = std::collections::HashSet::new();
+        in_flight.insert("default/coredns".to_owned());
+        assert!(
+            should_schedule(&in_flight, "kube-system/coredns"),
+            "same pod name in different namespace must be treated as a distinct key"
+        );
+    }
+
+    // drain_watch_buffer is re-exported from client-util where it is called by
+    // watch_stream (and therefore stream_watch_events). This test confirms that
+    // the function used in production handles multi-line chunks correctly.
+    // If drain_watch_buffer were decoupled from watch_stream again (reverted to
+    // an inline copy), this re-export would break at compile time.
+    #[test]
+    fn drain_watch_buffer_multi_line_chunk_parses_all_events() {
+        // Simulate receiving two complete JSON watch events in a single chunk.
+        // This exercises the production code path: watch_stream calls
+        // drain_watch_buffer per frame, and drain_watch_buffer must consume all
+        // complete lines even when multiple arrive in one network frame.
+        let mut buf = "{\"type\":\"ADDED\",\"object\":{}}\n{\"type\":\"MODIFIED\",\"object\":{}}\n"
+            .to_owned();
+        let mut events: Vec<Value> = Vec::new();
+        drain_watch_buffer(&mut buf, &mut |v| events.push(v));
+        assert_eq!(
+            events.len(),
+            2,
+            "both lines must be parsed from a single chunk"
+        );
+        assert_eq!(events[0]["type"], "ADDED");
+        assert_eq!(events[1]["type"], "MODIFIED");
+        assert!(buf.is_empty(), "all complete lines must be consumed");
+    }
 
     // WatchEvent deserialization — verifies that the typed envelope correctly
     // maps "type" → event_type and "object" → object. A rename or missing field
@@ -618,5 +769,92 @@ mod tests {
         let list = NodeList { items: vec![] };
         let result = select_first_node(list);
         assert!(result.is_err(), "expected error for empty node list");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Additional coverage (mayor-in2l): branches not exercised by earlier tests.
+    // ---------------------------------------------------------------------------
+
+    // needs_scheduling with a BOOKMARKED event type — exercises the non-ADDED/MODIFIED
+    // branch with a type other than DELETED. Watch streams emit BOOKMARK events
+    // periodically; they must be ignored like DELETED.
+    #[test]
+    fn needs_scheduling_returns_none_for_bookmark_event() {
+        let event = json!({
+            "type": "BOOKMARK",
+            "object": {
+                "metadata": { "name": "some-pod", "namespace": "default" },
+                "spec": {}
+            }
+        });
+        assert!(
+            needs_scheduling(&event).is_none(),
+            "BOOKMARK events must not trigger scheduling"
+        );
+    }
+
+    // needs_scheduling fallback: when the event JSON cannot be deserialized into
+    // WatchEvent<PodObject>, the function uses a default WatchEvent with an empty
+    // event_type. This covers the unwrap_or_else branch — a non-object value like
+    // a JSON number triggers the fallback.
+    #[test]
+    fn needs_scheduling_returns_none_for_non_object_event() {
+        // A JSON number is not a WatchEvent — deserialization fails, fallback to
+        // empty event_type, which does not match ADDED or MODIFIED.
+        let event = json!(42);
+        assert!(
+            needs_scheduling(&event).is_none(),
+            "non-object JSON must not trigger scheduling"
+        );
+    }
+
+    // needs_scheduling with an explicitly null node_name field: None from the struct
+    // means unscheduled. This is distinct from absent (already covered) and from
+    // empty string "".
+    #[test]
+    fn needs_scheduling_returns_some_when_node_name_is_null() {
+        // spec.nodeName: null is a valid unscheduled state in Kubernetes.
+        // The scheduler must treat it the same as absent or "".
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "null-node-pod", "namespace": "default" },
+                "spec": { "nodeName": null }
+            }
+        });
+        let result = needs_scheduling(&event);
+        assert!(
+            result.is_some(),
+            "null nodeName must be treated as unscheduled"
+        );
+        let (ns, name) = result.unwrap();
+        assert_eq!(ns, "default");
+        assert_eq!(name, "null-node-pod");
+    }
+
+    // binding_path with special characters — ensures the path template doesn't
+    // introduce double slashes or truncate long names.
+    #[test]
+    fn binding_path_does_not_double_slash() {
+        let path = binding_path("default", "my-pod");
+        assert!(
+            !path.contains("//"),
+            "binding path must not contain double slashes: {path}"
+        );
+    }
+
+    // NodeList with a single item — the common production case (one worker node).
+    // select_first_node must return that node's name, not an error.
+    #[test]
+    fn select_first_node_returns_name_for_single_item_list() {
+        let list = NodeList {
+            items: vec![NodeItem {
+                metadata: NodeMetadata {
+                    name: "worker-0".to_owned(),
+                },
+            }],
+        };
+        let name = select_first_node(list).expect("single-item list must return Ok");
+        assert_eq!(name, "worker-0");
     }
 }
