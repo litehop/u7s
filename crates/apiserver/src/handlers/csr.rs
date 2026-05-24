@@ -396,6 +396,337 @@ mod tests {
     // from a literal route.
     // -----------------------------------------------------------------------
 
+    fn make_state() -> AppState {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    async fn seed_csr_for_get(state: &AppState, name: &str) {
+        let b64 = valid_csr_b64();
+        let csr = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": name, "resourceVersion": "1"},
+            "spec": {
+                "request": b64,
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            },
+            "status": {"conditions": []}
+        });
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        state
+            .store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&csr).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed CSR");
+    }
+
+    /// get_csr returns 200 when the CSR exists.
+    /// kcm reads back CSRs after approval to check the certificate field.
+    #[tokio::test]
+    async fn get_csr_returns_200_for_existing() {
+        let state = make_state();
+        seed_csr_for_get(&state, "existing-csr").await;
+
+        let result = get_csr(
+            axum::extract::State(state),
+            axum::extract::Path("existing-csr".to_string()),
+        )
+        .await;
+
+        let resp = result.unwrap_or_else(|_| panic!("get_csr on existing CSR must succeed"));
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "get_csr must return 200 for an existing CSR"
+        );
+    }
+
+    /// get_csr returns 404 when the CSR does not exist.
+    /// kcm must distinguish a missing CSR from a server error.
+    #[tokio::test]
+    async fn get_csr_returns_404_for_missing() {
+        let state = make_state();
+
+        let result = get_csr(
+            axum::extract::State(state),
+            axum::extract::Path("no-such-csr".to_string()),
+        )
+        .await;
+
+        let err = result.expect_err("get_csr on missing CSR must return error");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::NOT_FOUND,
+            "get_csr on non-existent CSR must return 404"
+        );
+    }
+
+    /// create_csr with a valid CSR body must return 201 and store the object.
+    /// This is the primary happy path: a client submits a node cert request.
+    #[tokio::test]
+    async fn create_csr_valid_body_returns_201() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let b64 = valid_csr_b64();
+
+        let csr_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "valid-csr"},
+            "spec": {
+                "request": b64,
+                "signerName": "kubernetes.io/kube-apiserver-client",
+                "usages": ["client auth"]
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let result = create_csr(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+        )
+        .await
+        .map(IntoResponse::into_response);
+
+        let resp = result.unwrap_or_else(|_| panic!("create_csr with valid body must succeed"));
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "create_csr must return 201 on success"
+        );
+
+        let key = "/registry/certificates.k8s.io/certificatesigningrequests/valid-csr";
+        assert!(
+            state.store.get(key).await.unwrap().is_some(),
+            "created CSR must be persisted in the store"
+        );
+    }
+
+    /// create_csr with duplicate name must return 409 Conflict.
+    /// OCC: the store returns AlreadyExists which maps to 409.
+    #[tokio::test]
+    async fn create_csr_duplicate_returns_409() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let b64 = valid_csr_b64();
+
+        let csr_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "dup-csr"},
+            "spec": {
+                "request": b64,
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        // First create — must succeed.
+        create_csr(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+            headers.clone(),
+            bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+        )
+        .await
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|_| panic!("first create must succeed"));
+
+        // Second create with same name — must return 409.
+        let result = create_csr(
+            axum::extract::State(state),
+            axum::Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+        )
+        .await
+        .map(IntoResponse::into_response);
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::CONFLICT,
+                "duplicate CSR create must return 409 Conflict"
+            ),
+            Ok(resp) => panic!("duplicate create must return 409, got {}", resp.status()),
+        }
+    }
+
+    /// create_csr strips the status field from the stored object.
+    /// spec is immutable after create; status is written by the signer via /status.
+    /// A client that sends status in the body must not have it persisted.
+    #[tokio::test]
+    async fn create_csr_strips_status_from_stored_body() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let b64 = valid_csr_b64();
+
+        let csr_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "no-status-csr"},
+            "spec": {
+                "request": b64,
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            },
+            "status": {
+                "certificate": "SHOULD_BE_STRIPPED",
+                "conditions": [{"type": "Approved"}]
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        create_csr(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+        )
+        .await
+        .map(IntoResponse::into_response)
+        .unwrap_or_else(|_| panic!("create must succeed"));
+
+        let key = "/registry/certificates.k8s.io/certificatesigningrequests/no-status-csr";
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert!(
+            v.get("status").is_none() || v["status"].is_null(),
+            "create_csr must strip the status field from stored body — \
+             clients must not pre-set status; that is the signer's exclusive right. \
+             Got: {:?}",
+            v.get("status")
+        );
+    }
+
+    /// list_csr with label selector must filter results.
+    /// This covers the label_selector branch in list_csr (non-watch path).
+    #[tokio::test]
+    async fn list_csr_with_label_selector_filters_results() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let b64 = valid_csr_b64();
+
+        // Seed two CSRs with different labels.
+        for (name, env) in [("csr-foo", "foo"), ("csr-bar", "bar")] {
+            let csr = serde_json::json!({
+                "apiVersion": "certificates.k8s.io/v1",
+                "kind": "CertificateSigningRequest",
+                "metadata": {
+                    "name": name,
+                    "labels": {"env": env}
+                },
+                "spec": {
+                    "request": b64,
+                    "signerName": "kubernetes.io/kube-apiserver-client"
+                }
+            });
+            let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+            store
+                .put(
+                    &key,
+                    bytes::Bytes::from(serde_json::to_vec(&csr).unwrap()),
+                    Some(0),
+                )
+                .await
+                .unwrap();
+        }
+
+        let user = crate::auth::UserInfo {
+            username: "test".into(),
+            uid: String::new(),
+            groups: vec![],
+        };
+
+        let result = list_csr(
+            axum::extract::State(state),
+            axum::extract::Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: Some("env=foo".into()),
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
+            axum::Extension(user),
+        )
+        .await;
+
+        let resp = result.unwrap_or_else(|_| panic!("list_csr with label selector must succeed"));
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "label selector env=foo must filter to 1 matching CSR"
+        );
+        assert_eq!(items[0]["metadata"]["name"], "csr-foo");
+    }
+
     /// GET /apis/certificates.k8s.io/v1/certificatesigningrequests returns 200.
     ///
     /// The kcm controller calls this on startup. Before the fix it panicked

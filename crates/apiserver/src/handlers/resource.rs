@@ -3611,6 +3611,298 @@ mod tests {
         );
     }
 
+    /// create_resource with invalid JSON body must return 400 Bad Request.
+    /// Clients that send malformed bodies (e.g. truncated JSON) must get a clear
+    /// rejection rather than a 500 or silent data corruption.
+    #[tokio::test]
+    async fn create_resource_invalid_json_returns_400() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = create_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from("not valid json"),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid JSON body must return 400"
+            ),
+            Ok(_) => panic!("invalid JSON must be rejected with 400"),
+        }
+    }
+
+    /// replace_namespaced_resource rejects a body whose name doesn't match the URL name.
+    /// Prevents accidental cross-object overwrites via PUT.
+    #[tokio::test]
+    async fn replace_namespaced_resource_name_mismatch_returns_400() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "other-lease", "namespace": "kube-node-lease" },
+            "spec": {}
+        });
+
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "url-name".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "name mismatch between URL and body must return 400"
+            ),
+            Ok(_) => panic!("name mismatch must be rejected with 400"),
+        }
+    }
+
+    /// replace_resource rejects a body whose name doesn't match the URL name.
+    #[tokio::test]
+    async fn replace_resource_name_mismatch_returns_400() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "actual-name" },
+            "spec": { "drivers": [] }
+        });
+
+        let result = replace_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "url-name".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "name mismatch must return 400"
+            ),
+            Ok(_) => panic!("name mismatch must be rejected with 400"),
+        }
+    }
+
+    /// create_namespaced_resource with invalid JSON body must return 400.
+    #[tokio::test]
+    async fn create_namespaced_resource_invalid_json_returns_400() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = create_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from("not json at all"),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid JSON in create_namespaced_resource must return 400"
+            ),
+            Ok(_) => panic!("invalid JSON body must return 400"),
+        }
+    }
+
+    /// get_resource with an invalid name (contains '..') must return 400.
+    /// Name validation guards against path traversal and invalid etcd keys.
+    #[tokio::test]
+    async fn get_resource_invalid_name_returns_400() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = get_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "..".into(),
+            )),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("invalid name must return error"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "double-dot name must be rejected with 400 — guards against path traversal"
+        );
+    }
+
+    /// delete_resource with invalid name must return 400 (validate_name check).
+    #[tokio::test]
+    async fn delete_resource_invalid_name_returns_400() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = delete_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "..".into(),
+            )),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("invalid name must return error"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid name must return 400 from delete_resource"
+        );
+    }
+
+    /// replace_resource with invalid body JSON must return 400.
+    #[tokio::test]
+    async fn replace_resource_invalid_json_returns_400() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = replace_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "test-node".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from("invalid json"),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid JSON in replace_resource must return 400"
+            ),
+            Ok(_) => panic!("invalid JSON must return 400"),
+        }
+    }
+
+    /// replace_namespaced_resource with invalid JSON body must return 400.
+    #[tokio::test]
+    async fn replace_namespaced_resource_invalid_json_returns_400() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = replace_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "my-lease".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from("not json"),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid JSON in replace_namespaced_resource must return 400"
+            ),
+            Ok(_) => panic!("invalid JSON body must return 400"),
+        }
+    }
+
+    /// rbac_cluster_key and rbac_namespaced_key produce the expected paths.
+    /// These keys index ClusterRoles/ClusterRoleBindings for RBAC rule lookup.
+    /// A wrong key format causes RBAC evaluation to fail silently.
+    #[test]
+    fn rbac_key_format_is_correct() {
+        let ck = rbac_cluster_key("rbac.authorization.k8s.io", "v1", "clusterroles", "admin");
+        assert_eq!(
+            ck, "/apis/rbac.authorization.k8s.io/v1/clusterroles/admin",
+            "cluster key format must match the RBAC index expected path"
+        );
+
+        let nk = rbac_namespaced_key(
+            "rbac.authorization.k8s.io",
+            "v1",
+            "kube-system",
+            "rolebindings",
+            "view",
+        );
+        assert_eq!(
+            nk, "/apis/rbac.authorization.k8s.io/v1/namespaces/kube-system/rolebindings/view",
+            "namespaced key format must match the RBAC index expected path"
+        );
+    }
+
     /// wants_partial_object_metadata detects the GC's Accept header correctly.
     /// This is the predicate that gates POM mode — if it returns false for the GC's header,
     /// the GC gets wrong apiVersion/kind in all events and can never sync.

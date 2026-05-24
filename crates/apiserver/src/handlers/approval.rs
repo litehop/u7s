@@ -400,6 +400,267 @@ mod tests {
         }
     }
 
+    /// PATCH /approval with merge-patch+json must update status.conditions.
+    ///
+    /// kubectl certificate approve sends a strategic-merge-patch or merge-patch.
+    /// The handler must accept it and apply only the conditions — never spec or certificate.
+    #[tokio::test]
+    async fn patch_approval_merge_patch_updates_conditions() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "patch-merge-csr";
+        seed_csr(&store, name, None).await;
+
+        let patch_body = json!({
+            "status": {
+                "conditions": [{
+                    "type": "Approved",
+                    "status": "True",
+                    "reason": "ManualApproval",
+                    "message": "approved via patch"
+                }]
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PATCH /approval with merge-patch must succeed"
+        );
+
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let conds = v["status"]["conditions"].as_array().unwrap();
+        assert_eq!(
+            conds[0]["type"], "Approved",
+            "merge-patch on /approval must write Approved condition"
+        );
+        assert!(
+            v["status"]["certificate"].is_null() || v["status"].get("certificate").is_none(),
+            "patch_approval must not write certificate field — that belongs to the signer"
+        );
+    }
+
+    /// PATCH /approval with json-patch+json must apply the patch (JSON Patch path).
+    ///
+    /// This covers the PatchType::Json branch, which addresses the full document
+    /// then restores protected fields. The net effect must be correct conditions.
+    #[tokio::test]
+    async fn patch_approval_json_patch_updates_conditions() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "patch-json-csr";
+        seed_csr(&store, name, None).await;
+
+        // Add a condition via JSON Patch
+        let patch_body = json!([
+            {
+                "op": "add",
+                "path": "/status/conditions/-",
+                "value": {
+                    "type": "Denied",
+                    "status": "True",
+                    "reason": "SecurityPolicy",
+                    "message": "denied via json-patch"
+                }
+            }
+        ]);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PATCH /approval with json-patch must succeed"
+        );
+
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let conds = v["status"]["conditions"].as_array().unwrap();
+        assert!(
+            conds.iter().any(|c| c["type"] == "Denied"),
+            "json-patch on /approval must add the Denied condition"
+        );
+    }
+
+    /// PATCH /approval on a missing CSR must return 404.
+    ///
+    /// There is nothing to patch if the CSR doesn't exist.
+    #[tokio::test]
+    async fn patch_approval_missing_csr_returns_404() {
+        let state = make_state();
+
+        let patch_body = json!({"status": {"conditions": []}});
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state),
+            axum::extract::Path("nonexistent-csr".to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::NOT_FOUND,
+                "PATCH /approval on missing CSR must return 404"
+            ),
+            Ok(_) => panic!("PATCH /approval on missing CSR must return 404"),
+        }
+    }
+
+    /// PATCH /approval with wrong content-type must return 415.
+    ///
+    /// patch_approval delegates content-type detection to detect_patch_type,
+    /// which rejects unknown types with 415 Unsupported Media Type.
+    #[tokio::test]
+    async fn patch_approval_wrong_content_type_returns_415() {
+        let state = make_state();
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state),
+            axum::extract::Path("any-csr".to_owned()),
+            headers,
+            bytes::Bytes::from(r#"{"status":{}}"#),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "PATCH /approval with application/json must return 415 — \
+                 only merge-patch, strategic-merge-patch, and json-patch are valid"
+            ),
+            Ok(_) => panic!("wrong content-type must return 415"),
+        }
+    }
+
+    /// PATCH /approval with strategic-merge-patch must update conditions.
+    ///
+    /// Same semantics as merge-patch: only the status.conditions from the patch body
+    /// are applied. spec and status.certificate must not be modified.
+    #[tokio::test]
+    async fn patch_approval_strategic_merge_patch_updates_conditions() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "smp-csr";
+        seed_csr(&store, name, Some("EXISTING_CERT")).await;
+
+        let patch_body = json!({
+            "status": {
+                "conditions": [{
+                    "type": "Approved",
+                    "status": "True",
+                    "reason": "SMP",
+                    "message": "approved via smp"
+                }]
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PATCH /approval with strategic-merge-patch must succeed"
+        );
+
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        let conds = v["status"]["conditions"].as_array().unwrap();
+        assert_eq!(
+            conds[0]["type"], "Approved",
+            "strategic-merge-patch on /approval must write Approved condition"
+        );
+
+        // status.certificate was present before patch — it must be preserved.
+        assert_eq!(
+            v["status"]["certificate"], "EXISTING_CERT",
+            "patch_approval must not erase a pre-existing status.certificate — \
+             the signer already issued a cert; patching approval conditions must not invalidate it"
+        );
+    }
+
     /// merge_approval_conditions must preserve status.certificate when present.
     ///
     /// The signer writes status.certificate. If a subsequent /approval PUT is made,
