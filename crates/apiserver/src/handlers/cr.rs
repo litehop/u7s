@@ -4870,4 +4870,304 @@ mod tests {
             "spec must be absent in POM ADDED event — the kcm scheme does not know Gateway, Widget etc."
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // store_err_cr unit tests — all four branches must map to the right status code
+    // ---------------------------------------------------------------------------
+
+    /// store_err_cr must map NotFound to 404. This is the error users see when a
+    /// CR they try to GET or DELETE does not exist — returning 500 would mislead them.
+    #[test]
+    fn store_err_cr_not_found_returns_404() {
+        let err = store_err_cr(
+            u7s_store::StoreError::NotFound {
+                key: "/registry/cr/example.io/v1/widgets/my-widget".into(),
+            },
+            "my-widget",
+            "Widget",
+        );
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 404);
+        assert_eq!(json["reason"], "NotFound");
+    }
+
+    /// store_err_cr must map AlreadyExists to 409. This is the error users see when
+    /// they try to create a CR that already exists — 409 Conflict is the correct code.
+    #[test]
+    fn store_err_cr_already_exists_returns_409() {
+        let err = store_err_cr(
+            u7s_store::StoreError::AlreadyExists {
+                key: "/registry/cr/example.io/v1/widgets/my-widget".into(),
+            },
+            "my-widget",
+            "Widget",
+        );
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 409);
+        assert_eq!(json["reason"], "AlreadyExists");
+    }
+
+    /// store_err_cr must map RevisionMismatch to 409 Conflict with a message that
+    /// explains the resource-version mismatch. This is the OCC guard — clients that
+    /// send a stale resourceVersion receive a clear conflict error, not a silent failure.
+    #[test]
+    fn store_err_cr_revision_mismatch_returns_409() {
+        let err = store_err_cr(
+            u7s_store::StoreError::RevisionMismatch {
+                expected: 42,
+                current: 99,
+            },
+            "my-widget",
+            "Widget",
+        );
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 409);
+        // Message must mention the version numbers so the client knows what happened.
+        let msg = json["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("42") && msg.contains("99"),
+            "conflict message must contain expected (42) and current (99) revisions, got: {msg}"
+        );
+    }
+
+    /// store_err_cr maps RevisionMismatch to 409 with a message explaining the OCC conflict.
+    /// The message must contain both expected and current revision numbers so the client
+    /// can understand what version it should use for the retry.
+    #[test]
+    fn store_err_cr_revision_mismatch_message_contains_revisions() {
+        let err = store_err_cr(
+            u7s_store::StoreError::RevisionMismatch {
+                expected: 1,
+                current: 5,
+            },
+            "my-widget",
+            "Widget",
+        );
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+        let json = serde_json::to_value(&err.1).unwrap();
+        let msg = json["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("1") && msg.contains("5"),
+            "conflict message must contain expected (1) and current (5) revision numbers, got: {msg}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // cr_store_key and cr_list_prefix unit tests
+    // ---------------------------------------------------------------------------
+
+    /// cr_store_key must use the namespace segment for namespaced resources and
+    /// omit it for cluster-scoped resources. The key structure is relied upon by
+    /// list (prefix scan), get, put, and delete — a wrong key silently stores or
+    /// retrieves data under an unexpected path.
+    #[test]
+    fn cr_store_key_namespaced_includes_namespace() {
+        let key = cr_store_key("example.io", "v1", "widgets", Some("default"), "my-widget");
+        assert_eq!(
+            key,
+            "/registry/cr/example.io/v1/widgets/default/my-widget",
+            "namespaced key must include the namespace segment"
+        );
+    }
+
+    #[test]
+    fn cr_store_key_cluster_scoped_omits_namespace() {
+        let key = cr_store_key("example.io", "v1", "widgets", None, "my-widget");
+        assert_eq!(
+            key,
+            "/registry/cr/example.io/v1/widgets/my-widget",
+            "cluster-scoped key must omit the namespace segment"
+        );
+    }
+
+    /// cr_list_prefix must produce a prefix that correctly scopes the list scan.
+    /// A prefix that is too broad (e.g. missing trailing slash) could scan across
+    /// all namespaces or all resource types.
+    #[test]
+    fn cr_list_prefix_namespaced_ends_with_namespace_slash() {
+        let prefix = cr_list_prefix("example.io", "v1", "widgets", Some("default"));
+        assert_eq!(
+            prefix,
+            "/registry/cr/example.io/v1/widgets/default/",
+            "namespaced prefix must end with namespace and slash"
+        );
+    }
+
+    #[test]
+    fn cr_list_prefix_cluster_scoped_ends_with_plural_slash() {
+        let prefix = cr_list_prefix("example.io", "v1", "widgets", None);
+        assert_eq!(
+            prefix,
+            "/registry/cr/example.io/v1/widgets/",
+            "cluster-scoped prefix must end with plural and slash"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // resolve_conversion_webhook_url — service-based and error paths
+    // ---------------------------------------------------------------------------
+
+    /// resolve_conversion_webhook_url must return an error when clientConfig has
+    /// neither a url nor a service field. Without a reachable endpoint the conversion
+    /// cannot proceed, and silently returning an empty URL would call a bogus address.
+    #[tokio::test]
+    async fn resolve_webhook_url_empty_config_returns_err() {
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({});
+        let result = resolve_conversion_webhook_url(&state, &client_config).await;
+        assert!(
+            result.is_err(),
+            "clientConfig with neither url nor service must return Err"
+        );
+        let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
+        assert!(
+            err_msg.contains("neither url nor service"),
+            "error must mention missing url/service, got: {err_msg}"
+        );
+    }
+
+    /// resolve_conversion_webhook_url must return an error when the service field
+    /// is present but the service object does not exist in the store.
+    /// The error must surface as an internal error so the apiserver rejects the
+    /// request rather than attempting to connect to an unknown endpoint.
+    #[tokio::test]
+    async fn resolve_webhook_url_service_not_found_returns_err() {
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({
+            "service": {
+                "namespace": "kube-system",
+                "name": "webhook-svc",
+                "port": 443,
+                "path": "/convert"
+            }
+        });
+        let result = resolve_conversion_webhook_url(&state, &client_config).await;
+        assert!(
+            result.is_err(),
+            "service not in store must return Err"
+        );
+        let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
+        assert!(
+            err_msg.contains("not found"),
+            "error must mention service not found, got: {err_msg}"
+        );
+    }
+
+    /// resolve_conversion_webhook_url must return an error when the service exists
+    /// in the store but has no spec.clusterIP — without a clusterIP the URL cannot
+    /// be built and the webhook call must not proceed.
+    #[tokio::test]
+    async fn resolve_webhook_url_service_missing_cluster_ip_returns_err() {
+        let state = make_state_for_conversion();
+
+        // Seed a service object with no clusterIP.
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "webhook-svc", "namespace": "kube-system" },
+            "spec": { "ports": [{"port": 443}] }
+            // no clusterIP field
+        });
+        state
+            .store
+            .put(
+                "/registry/services/kube-system/webhook-svc",
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let client_config = serde_json::json!({
+            "service": {
+                "namespace": "kube-system",
+                "name": "webhook-svc",
+                "port": 443,
+                "path": "/convert"
+            }
+        });
+        let result = resolve_conversion_webhook_url(&state, &client_config).await;
+        assert!(
+            result.is_err(),
+            "service without clusterIP must return Err"
+        );
+        let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
+        assert!(
+            err_msg.contains("clusterIP"),
+            "error must mention missing clusterIP, got: {err_msg}"
+        );
+    }
+
+    /// resolve_conversion_webhook_url must build the correct https URL from a
+    /// service reference. This is the primary in-cluster webhook path: the
+    /// conversion webhook is deployed as a Service with a known clusterIP.
+    #[tokio::test]
+    async fn resolve_webhook_url_service_path_returns_correct_url() {
+        let state = make_state_for_conversion();
+
+        // Seed a service object with a clusterIP.
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "webhook-svc", "namespace": "kube-system" },
+            "spec": { "clusterIP": "10.96.0.50", "ports": [{"port": 9443}] }
+        });
+        state
+            .store
+            .put(
+                "/registry/services/kube-system/webhook-svc",
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let client_config = serde_json::json!({
+            "service": {
+                "namespace": "kube-system",
+                "name": "webhook-svc",
+                "port": 9443,
+                "path": "/convert"
+            }
+        });
+        let result = resolve_conversion_webhook_url(&state, &client_config).await;
+        assert!(
+            result.is_ok(),
+            "service with clusterIP must resolve successfully"
+        );
+        let url = match result {
+            Ok(u) => u,
+            Err(_) => panic!("expected Ok but got Err"),
+        };
+        assert_eq!(
+            url, "https://10.96.0.50:9443/convert",
+            "URL must use clusterIP and port from service, got: {url}"
+        );
+    }
+
+    /// resolve_conversion_webhook_url must return an error when the service field is
+    /// present but has no name. A nameless service reference cannot be looked up.
+    #[tokio::test]
+    async fn resolve_webhook_url_service_missing_name_returns_err() {
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({
+            "service": {
+                "namespace": "kube-system"
+                // no "name" field
+            }
+        });
+        let result = resolve_conversion_webhook_url(&state, &client_config).await;
+        assert!(
+            result.is_err(),
+            "service without name must return Err"
+        );
+        let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
+        assert!(
+            err_msg.contains("no name"),
+            "error must mention missing service name, got: {err_msg}"
+        );
+    }
 }
