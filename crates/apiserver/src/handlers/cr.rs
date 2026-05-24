@@ -4967,8 +4967,7 @@ mod tests {
     fn cr_store_key_namespaced_includes_namespace() {
         let key = cr_store_key("example.io", "v1", "widgets", Some("default"), "my-widget");
         assert_eq!(
-            key,
-            "/registry/cr/example.io/v1/widgets/default/my-widget",
+            key, "/registry/cr/example.io/v1/widgets/default/my-widget",
             "namespaced key must include the namespace segment"
         );
     }
@@ -4977,8 +4976,7 @@ mod tests {
     fn cr_store_key_cluster_scoped_omits_namespace() {
         let key = cr_store_key("example.io", "v1", "widgets", None, "my-widget");
         assert_eq!(
-            key,
-            "/registry/cr/example.io/v1/widgets/my-widget",
+            key, "/registry/cr/example.io/v1/widgets/my-widget",
             "cluster-scoped key must omit the namespace segment"
         );
     }
@@ -4990,8 +4988,7 @@ mod tests {
     fn cr_list_prefix_namespaced_ends_with_namespace_slash() {
         let prefix = cr_list_prefix("example.io", "v1", "widgets", Some("default"));
         assert_eq!(
-            prefix,
-            "/registry/cr/example.io/v1/widgets/default/",
+            prefix, "/registry/cr/example.io/v1/widgets/default/",
             "namespaced prefix must end with namespace and slash"
         );
     }
@@ -5000,8 +4997,7 @@ mod tests {
     fn cr_list_prefix_cluster_scoped_ends_with_plural_slash() {
         let prefix = cr_list_prefix("example.io", "v1", "widgets", None);
         assert_eq!(
-            prefix,
-            "/registry/cr/example.io/v1/widgets/",
+            prefix, "/registry/cr/example.io/v1/widgets/",
             "cluster-scoped prefix must end with plural and slash"
         );
     }
@@ -5045,10 +5041,7 @@ mod tests {
             }
         });
         let result = resolve_conversion_webhook_url(&state, &client_config).await;
-        assert!(
-            result.is_err(),
-            "service not in store must return Err"
-        );
+        assert!(result.is_err(), "service not in store must return Err");
         let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
         assert!(
             err_msg.contains("not found"),
@@ -5090,10 +5083,7 @@ mod tests {
             }
         });
         let result = resolve_conversion_webhook_url(&state, &client_config).await;
-        assert!(
-            result.is_err(),
-            "service without clusterIP must return Err"
-        );
+        assert!(result.is_err(), "service without clusterIP must return Err");
         let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
         assert!(
             err_msg.contains("clusterIP"),
@@ -5160,10 +5150,7 @@ mod tests {
             }
         });
         let result = resolve_conversion_webhook_url(&state, &client_config).await;
-        assert!(
-            result.is_err(),
-            "service without name must return Err"
-        );
+        assert!(result.is_err(), "service without name must return Err");
         let err_msg = serde_json::to_string(&result.unwrap_err().1).unwrap();
         assert!(
             err_msg.contains("no name"),
