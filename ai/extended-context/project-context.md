@@ -33,21 +33,19 @@ A Kubernetes-compatible control plane implementation in Rust, targeting severely
 - RBAC: ServiceAccount, Role, ClusterRole, RoleBinding, ClusterRoleBinding
 - CRD + custom resource support (Argo CD ships its own CRDs: Application, AppProject, etc.)
 
-## Key open decisions (need operator input before spec is written)
+## Design decisions (all settled)
 
-- **State store:** SQLite vs LMDB. Operator noted "need to think more." Both are embedded; SQLite is simpler (SQL queries, tooling), LMDB is faster and has zero-copy reads but a lower-level API.
-- **Container runtime:** Not decided. Options: containerd, CRI-O, direct runc/crun.
-- **Scheduler design:** Operator wants to understand the domain better before committing to custom vs upstream kube-scheduler.
+- **API server:** Implemented from scratch in Rust (axum). No upstream binary wrapping.
+- **State store:** SQLite WAL (rusqlite bundled). See `docs/decisions/sqlite-over-lmdb.md`.
+- **Container runtime:** CRI-O + crun. See `docs/decisions/crio-over-containerd.md`.
+- **Scheduler:** External kube-scheduler binary for Phase 3 conformance; custom bin-spread scheduler planned for Phase 4+.
+- **Networking:** CNI plugin model (no built-in overlay). WebSocket-only exec/attach/portforward (no SPDY).
+- **CRD validation:** boon crate (full openAPIV3Schema). See `docs/decisions/boon-for-crd-schema-validation.md`.
 
-## Design decisions already made
+## Current phase
 
-- **API server:** Implement the Kubernetes REST API from scratch in Rust. No wrapping of upstream kube-apiserver binary.
-- **Networking:** CNI plugin model (no built-in overlay).
-
-## Session goals
-
-- Write specifications and implementation prompts (`/ai/prompts/`)
-- Architecture overview first, then drill into individual components
+Phase 3 — Conformance. Stack complete as of 2026-05-24. Ready for first sonobuoy run.
+See `roadmap.md` for full detail.
 
 ## Worker preamble addendum (append to project-stance.md preamble)
 

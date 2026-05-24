@@ -84,11 +84,10 @@ point where Argo CD can be installed and operated.
 - SA projected volume auto-injection — **DEFERRED** (see below)
 - Phase 3 audit: 5 HIGH + 9 MED conformance gaps; most resolved
 
-### Active blocker: no scheduler in conformance stack
-`scripts/conformance/` runs: apiserver → lima VM + kubelet → kcm → sonobuoy.
-No kube-scheduler step. Sonobuoy creates Pods without nodeName; they stay Pending.
-**Fix: add `05-start-scheduler.sh` (download + run kube-scheduler binary inside lima),
-renumber sonobuoy to `06-run-sonobuoy.sh`.**
+### Conformance stack: COMPLETE (as of 2026-05-24)
+`scripts/conformance/run-all.sh` runs: build → apiserver → lima VM + kubelet → kcm →
+kube-scheduler (on Mac host) → sonobuoy. `reset.sh` + `--reset` flag added for clean
+restarts. **Stack is feature-complete and ready to run.**
 
 ### Phase 3 deferred items (explicit triggers — do not let these rot)
 
@@ -101,7 +100,7 @@ renumber sonobuoy to `06-run-sonobuoy.sh`.**
 | — (DEFERRED) | SA projected volume auto-injection into every pod | pod fails to mount implicit token |
 
 ### Phase 3 exit criteria
-1. `scripts/conformance/run-all.sh` completes without a scheduler-less Pending failure
+1. ✓ `scripts/conformance/run-all.sh` completes without a scheduler-less Pending failure
 2. Sonobuoy non-disruptive-conformance run produces a results report
 3. All HIGH-severity sonobuoy failures have filed beads (or are fixed)
 
