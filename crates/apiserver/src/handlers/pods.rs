@@ -278,6 +278,7 @@ pub async fn create_pod(
     crate::handlers::generic::stamp_metadata(&mut obj);
 
     apply_pod_create_defaults(&mut obj.body);
+    inject_sa_token_volume(&mut obj.body, &name);
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -1412,12 +1413,109 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
                     for var in env {
                         let field_ref = &mut var["valueFrom"]["fieldRef"];
                         if field_ref.is_object()
-                            && (field_ref["apiVersion"].is_null()
-                                || field_ref["apiVersion"] == "")
+                            && (field_ref["apiVersion"].is_null() || field_ref["apiVersion"] == "")
                         {
                             field_ref["apiVersion"] = serde_json::json!("v1");
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Inject the projected service-account token volume into a pod, mirroring
+/// what the real Kubernetes ServiceAccount admission plugin does.
+///
+/// Skips injection when:
+/// - `spec.serviceAccountName` is absent or empty
+/// - `spec.automountServiceAccountToken` is explicitly `false`
+/// - any existing volume name already starts with `kube-api-access-` (idempotency)
+///
+/// The volume name suffix is derived deterministically from the pod name so
+/// the function is pure (no I/O, no randomness) and therefore unit-testable.
+pub fn inject_sa_token_volume(pod: &mut serde_json::Value, pod_name: &str) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Skip if serviceAccountName absent or empty.
+    let sa_name = pod["spec"]["serviceAccountName"].as_str().unwrap_or("");
+    if sa_name.is_empty() {
+        return;
+    }
+
+    // Skip if automountServiceAccountToken is explicitly false.
+    if pod["spec"]["automountServiceAccountToken"] == serde_json::Value::Bool(false) {
+        return;
+    }
+
+    // Idempotency: skip if a kube-api-access-* volume already exists.
+    if let Some(volumes) = pod["spec"]["volumes"].as_array() {
+        if volumes.iter().any(|v| {
+            v["name"]
+                .as_str()
+                .map(|n| n.starts_with("kube-api-access-"))
+                .unwrap_or(false)
+        }) {
+            return;
+        }
+    }
+
+    // Deterministic 5-char suffix from pod name hash.
+    let mut h = DefaultHasher::new();
+    pod_name.hash(&mut h);
+    let suffix_num = h.finish();
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let suffix: String = (0..5)
+        .map(|i| {
+            let idx = ((suffix_num >> (i * 6)) as usize) % ALPHABET.len();
+            ALPHABET[idx] as char
+        })
+        .collect();
+    let vol_name = format!("kube-api-access-{suffix}");
+
+    // Append projected volume.
+    let new_vol = serde_json::json!({
+        "name": vol_name,
+        "projected": {
+            "defaultMode": 420,
+            "sources": [
+                {"serviceAccountToken": {"expirationSeconds": 3607, "path": "token"}},
+                {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
+                {"downwardAPI": {"items": [{"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.namespace"}, "path": "namespace"}]}}
+            ]
+        }
+    });
+    match pod["spec"]["volumes"].as_array_mut() {
+        Some(vols) => vols.push(new_vol),
+        None => pod["spec"]["volumes"] = serde_json::json!([new_vol]),
+    }
+
+    // Append volumeMount to each container in containers and initContainers,
+    // skipping any that already mount the SA path.
+    const SA_MOUNT_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+    let new_mount = serde_json::json!({
+        "mountPath": SA_MOUNT_PATH,
+        "name": vol_name,
+        "readOnly": true
+    });
+    for containers_key in &["containers", "initContainers"] {
+        if let Some(containers) = pod["spec"][containers_key].as_array_mut() {
+            for container in containers.iter_mut() {
+                let already_mounted = container["volumeMounts"]
+                    .as_array()
+                    .map(|mounts| {
+                        mounts
+                            .iter()
+                            .any(|m| m["mountPath"].as_str() == Some(SA_MOUNT_PATH))
+                    })
+                    .unwrap_or(false);
+                if already_mounted {
+                    continue;
+                }
+                match container["volumeMounts"].as_array_mut() {
+                    Some(mounts) => mounts.push(new_mount.clone()),
+                    None => container["volumeMounts"] = serde_json::json!([new_mount.clone()]),
                 }
             }
         }
@@ -1593,6 +1691,194 @@ mod create_defaults_tests {
         assert_eq!(
             pod["spec"]["initContainers"][0]["env"][0]["valueFrom"]["fieldRef"]["apiVersion"],
             serde_json::json!("v1"),
+        );
+    }
+
+    // --- inject_sa_token_volume tests ---
+
+    /// SA token projected volume must be injected when serviceAccountName is set.
+    ///
+    /// rest.InClusterConfig() reads /var/run/secrets/kubernetes.io/serviceaccount/token;
+    /// without this injection sonobuoy fails with "no configuration has been provided".
+    #[test]
+    fn sa_token_volume_injected_when_sa_name_set() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "serviceAccountName": "default",
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        inject_sa_token_volume(&mut pod, "my-pod");
+        let volumes = pod["spec"]["volumes"]
+            .as_array()
+            .expect("volumes must be set");
+        assert!(
+            volumes.iter().any(|v| v["name"]
+                .as_str()
+                .map(|n| n.starts_with("kube-api-access-"))
+                .unwrap_or(false)),
+            "a kube-api-access-* volume must be injected so in-cluster token is available"
+        );
+        let mounts = pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts must be set");
+        assert!(
+            mounts.iter().any(|m| m["mountPath"].as_str()
+                == Some("/var/run/secrets/kubernetes.io/serviceaccount")),
+            "volumeMount at SA path must be added to container"
+        );
+    }
+
+    /// SA token volume must NOT be injected when automountServiceAccountToken is false.
+    ///
+    /// Pods that explicitly opt out must not receive the mount; injecting anyway
+    /// would violate the user's security intent and differ from real kube behavior.
+    #[test]
+    fn sa_token_volume_not_injected_when_automount_false() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "serviceAccountName": "default",
+                "automountServiceAccountToken": false,
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        inject_sa_token_volume(&mut pod, "my-pod");
+        assert!(
+            pod["spec"]["volumes"].is_null(),
+            "no volume must be injected when automountServiceAccountToken=false"
+        );
+    }
+
+    /// SA token volume must NOT be injected when serviceAccountName is absent.
+    ///
+    /// Pods with no SA name have no identity to bind a token to.
+    #[test]
+    fn sa_token_volume_not_injected_when_sa_name_absent() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        inject_sa_token_volume(&mut pod, "my-pod");
+        assert!(
+            pod["spec"]["volumes"].is_null(),
+            "no volume must be injected when serviceAccountName is absent"
+        );
+    }
+
+    /// SA token volume must NOT be injected when serviceAccountName is empty string.
+    #[test]
+    fn sa_token_volume_not_injected_when_sa_name_empty() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "serviceAccountName": "",
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        inject_sa_token_volume(&mut pod, "my-pod");
+        assert!(
+            pod["spec"]["volumes"].is_null(),
+            "no volume must be injected when serviceAccountName is empty"
+        );
+    }
+
+    /// inject_sa_token_volume must be idempotent: a second call must not add a
+    /// duplicate volume when a kube-api-access-* volume already exists.
+    ///
+    /// This prevents volume-name collisions on repeated admission passes.
+    #[test]
+    fn sa_token_volume_idempotent_when_kube_api_access_volume_exists() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "serviceAccountName": "default",
+                "volumes": [{"name": "kube-api-access-abcde", "projected": {"defaultMode": 420, "sources": []}}],
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        inject_sa_token_volume(&mut pod, "my-pod");
+        let count = pod["spec"]["volumes"]
+            .as_array()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "duplicate kube-api-access-* volume must not be added when one already exists"
+        );
+    }
+
+    /// VolumeMounts must be added to both containers and initContainers.
+    ///
+    /// initContainers run before main containers and also need in-cluster config
+    /// (e.g. sonobuoy's init step pulls a kubeconfig).
+    #[test]
+    fn sa_token_volume_mounts_added_to_containers_and_init_containers() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "serviceAccountName": "default",
+                "containers": [{"name": "main", "image": "busybox"}],
+                "initContainers": [{"name": "init", "image": "busybox"}]
+            }
+        });
+        inject_sa_token_volume(&mut pod, "my-pod");
+        let main_mount = pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .and_then(|m| {
+                m.iter().find(|e| {
+                    e["mountPath"].as_str() == Some("/var/run/secrets/kubernetes.io/serviceaccount")
+                })
+            });
+        assert!(
+            main_mount.is_some(),
+            "main container must receive the SA volumeMount"
+        );
+        let init_mount = pod["spec"]["initContainers"][0]["volumeMounts"]
+            .as_array()
+            .and_then(|m| {
+                m.iter().find(|e| {
+                    e["mountPath"].as_str() == Some("/var/run/secrets/kubernetes.io/serviceaccount")
+                })
+            });
+        assert!(
+            init_mount.is_some(),
+            "initContainer must receive the SA volumeMount"
+        );
+    }
+
+    /// A container that already mounts the SA path must not receive a duplicate mount.
+    ///
+    /// Kubelet rejects pods with duplicate mount paths; idempotency here prevents
+    /// that failure when a pod already has an explicit SA mount.
+    #[test]
+    fn sa_token_volume_mount_skipped_when_container_has_existing_sa_mount() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "serviceAccountName": "default",
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox",
+                    "volumeMounts": [{
+                        "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                        "name": "my-existing-sa",
+                        "readOnly": true
+                    }]
+                }]
+            }
+        });
+        inject_sa_token_volume(&mut pod, "my-pod");
+        let mount_count = pod["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .map(|m| {
+                m.iter()
+                    .filter(|e| {
+                        e["mountPath"].as_str()
+                            == Some("/var/run/secrets/kubernetes.io/serviceaccount")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            mount_count, 1,
+            "duplicate SA mount must not be added when container already has one"
         );
     }
 }
