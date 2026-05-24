@@ -16,6 +16,7 @@ use u7s_store::Store;
 
 use crate::{
     keys::{cluster_object_key, object_key},
+    proto::{decode_k8s_proto_envelope, decode_token_request},
     state::AppState,
     status::Status,
     types::ObjectMeta,
@@ -107,21 +108,32 @@ pub async fn create_token(
         .as_ref()
         .ok_or_else(|| Status::internal("SA signing key not available".into()))?;
 
-    // 4. Parse request body — accept empty body (kubectl omits it in some versions).
+    // 4. Parse request body.
+    //    kubectl 1.31+ sends Content-Type: application/vnd.kubernetes.protobuf for subresource
+    //    POSTs. The k8s proto envelope's inner raw bytes are a native protobuf TokenRequest,
+    //    not JSON. Detect the envelope and decode via the proto path; fall back to JSON otherwise.
     let mut spec = if body.is_empty() {
         TokenRequestSpec {
             expiration_seconds: default_expiration(),
             audiences: vec!["https://kubernetes.default.svc".to_owned()],
         }
+    } else if let Some(env) = decode_k8s_proto_envelope(&body) {
+        // Proto path: inner raw is a protobuf-encoded TokenRequest.
+        let fields = decode_token_request(&env.raw)
+            .ok_or_else(|| Status::bad_request("invalid protobuf TokenRequest".into()))?;
+        TokenRequestSpec {
+            expiration_seconds: fields.expiration_seconds.unwrap_or_else(default_expiration),
+            audiences: fields.audiences,
+        }
     } else {
+        // JSON path: body is plain JSON (older kubectl, direct API calls).
         let req: TokenRequest = serde_json::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
-        let mut spec = req.spec;
-        if spec.audiences.is_empty() {
-            spec.audiences = vec!["https://kubernetes.default.svc".to_owned()];
-        }
-        spec
+        req.spec
     };
+    if spec.audiences.is_empty() {
+        spec.audiences = vec!["https://kubernetes.default.svc".to_owned()];
+    }
 
     // Clamp expiration to Kubernetes-specified range: [600, 172800] (10 min to 48 h).
     spec.expiration_seconds = spec.expiration_seconds.clamp(600, 172_800);
@@ -733,6 +745,78 @@ mod handler_tests {
         assert_eq!(
             claims["sub"], "system:serviceaccount:kube-system:coredns",
             "sub claim must be the canonical service account subject"
+        );
+    }
+
+    /// A protobuf-encoded TokenRequest body (as sent by kubectl 1.31+) must be decoded
+    /// and produce a JWT whose `aud` claim matches the audience in the proto body.
+    ///
+    /// This is the primary regression test for mayor-hy77: kubectl 1.31+ always sends
+    /// Content-Type: application/vnd.kubernetes.protobuf for subresource POSTs, and the
+    /// handler was previously failing with "invalid JSON: expected value at line 1 column 1".
+    ///
+    /// The proto body is constructed by hand (no prost/protobuf dep) matching the wire format:
+    ///   k8s magic (4 bytes)
+    ///   Unknown envelope field 2 (raw bytes):
+    ///     TokenRequest field 2 (spec):
+    ///       field 1 (audiences): one string entry
+    #[tokio::test]
+    async fn create_token_proto_body_succeeds() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-proto-test").await;
+
+        // Build a minimal protobuf-encoded TokenRequest by hand.
+        // Audience string to encode:
+        let audience = b"https://kubernetes.default.svc.cluster.local";
+
+        // TokenRequestSpec field 1 (audience, wire type 2):
+        //   tag = (1 << 3) | 2 = 0x0a
+        let mut spec_bytes = Vec::new();
+        spec_bytes.push(0x0a); // field 1, wire type 2
+        spec_bytes.push(audience.len() as u8); // length varint (fits in 1 byte)
+        spec_bytes.extend_from_slice(audience);
+
+        // TokenRequest field 2 (spec, wire type 2):
+        //   tag = (2 << 3) | 2 = 0x12
+        let mut token_request_bytes = Vec::new();
+        token_request_bytes.push(0x12); // field 2, wire type 2
+        token_request_bytes.push(spec_bytes.len() as u8);
+        token_request_bytes.extend_from_slice(&spec_bytes);
+
+        // k8s Unknown envelope field 2 (raw, wire type 2):
+        //   tag = (2 << 3) | 2 = 0x12
+        let mut envelope_bytes = Vec::new();
+        envelope_bytes.push(0x12); // field 2, wire type 2
+        envelope_bytes.push(token_request_bytes.len() as u8);
+        envelope_bytes.extend_from_slice(&token_request_bytes);
+
+        // Full body: k8s magic + envelope.
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00]; // k8s proto magic
+        body.extend_from_slice(&envelope_bytes);
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(body),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "proto-body token request must succeed: status={} message={}",
+                e.0, e.1.message
+            ),
+        };
+
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("token must be present in response");
+        let claims = decode_jwt_claims(token);
+
+        assert_eq!(
+            claims["aud"][0], "https://kubernetes.default.svc.cluster.local",
+            "audience from protobuf body must appear in JWT aud claim"
         );
     }
 
