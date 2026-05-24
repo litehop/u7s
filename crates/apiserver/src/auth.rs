@@ -126,14 +126,12 @@ fn ct_token_lookup<'a>(
     let mut found: Option<&'a UserInfo> = None;
     for (stored_token, info) in map.iter() {
         let stored_bytes = stored_token.as_bytes();
-        // ConstantTimeEq returns Choice (1u8 for equal, 0u8 for not equal).
-        // Length mismatch: pad both sides to the same length conceptually —
         // subtle::ConstantTimeEq on slices of different lengths always returns
-        // 0 (not equal) without short-circuiting, so we can call it directly.
-        // We use a manual length check first (which leaks whether lengths match,
-        // but not token content) then the constant-time byte compare.
-        if stored_bytes.len() == candidate_bytes.len() && stored_bytes.ct_eq(candidate_bytes).into()
-        {
+        // 0 (not equal) without leaking which byte differed or whether the
+        // lengths matched. A manual length pre-check would leak whether the
+        // candidate length matches any stored token — a timing side-channel.
+        // Call ct_eq directly: it is safe and correct for unequal-length slices.
+        if stored_bytes.ct_eq(candidate_bytes).into() {
             found = Some(info);
             // Do NOT break: continue iterating so the loop takes the same time
             // regardless of which token matched or whether any matched.
@@ -791,6 +789,39 @@ mod tests {
         // Empty map must not panic or return a result.
         let map = HashMap::new();
         assert!(ct_token_lookup(&map, "any-token").is_none());
+    }
+
+    #[test]
+    fn ct_token_lookup_different_lengths_no_match() {
+        // A candidate of a different length than a stored token must NOT match.
+        // This verifies that removing the manual length pre-check did not break
+        // correctness: subtle::ct_eq handles unequal-length slices safely.
+        // (The manual len check was removed because it leaked timing info about
+        // whether the candidate length matched any stored token.)
+        let mut map = HashMap::new();
+        map.insert(
+            "tok-sixteen-chrs".to_owned(), // exactly 16 chars
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec![],
+            },
+        );
+        // Shorter candidate — must not match.
+        assert!(
+            ct_token_lookup(&map, "tok-sixteen-ch").is_none(),
+            "shorter candidate must not match stored token"
+        );
+        // Longer candidate — must not match.
+        assert!(
+            ct_token_lookup(&map, "tok-sixteen-chrsX").is_none(),
+            "longer candidate must not match stored token"
+        );
+        // Exact match — must succeed.
+        assert!(
+            ct_token_lookup(&map, "tok-sixteen-chrs").is_some(),
+            "exact candidate must match stored token"
+        );
     }
 
     // --- parse_path() ---
