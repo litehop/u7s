@@ -10,8 +10,10 @@
 #   06-run-sonobuoy.sh     — run sonobuoy and print results
 #
 # Usage:
-#   scripts/conformance/run-all.sh [--focus <regex>]
+#   scripts/conformance/run-all.sh [--reset] [--focus <regex>]
 #
+#   --reset   Run reset.sh before building — kills host processes, deletes the
+#             lima-node VM, and wipes temp/u7s/ for a fully clean run.
 #   --focus   Passed through to sonobuoy to narrow test selection.
 #             Also settable via SONOBUOY_FOCUS env var.
 set -euo pipefail
@@ -20,9 +22,11 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$REPO/scripts/conformance"
 WORKDIR="$REPO/temp/u7s"
 FOCUS="${SONOBUOY_FOCUS:-}"
+RESET=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --reset) RESET=1; shift ;;
     --focus) FOCUS="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -34,6 +38,11 @@ banner() {
   echo " $*"
   echo "============================================================"
 }
+
+if [ "$RESET" -eq 1 ]; then
+  banner "Reset: tearing down stale state"
+  bash "$DIR/reset.sh"
+fi
 
 # Step 01: Build
 banner "Step 1/6: Build"
