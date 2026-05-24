@@ -1192,9 +1192,10 @@ mod tests {
         let der = make_cert_der("self-signed-user", &["some-org"]);
         // make_cert_der already generates a cert signed by a local ephemeral CA,
         // not by any cluster CA — it is "untrusted" from the cluster's perspective.
-        let user = extract_client_cert_identity(&der)
-            .expect("extract_client_cert_identity must succeed on any parseable DER, \
-                     regardless of signing chain — chain validation is TLS's responsibility");
+        let user = extract_client_cert_identity(&der).expect(
+            "extract_client_cert_identity must succeed on any parseable DER, \
+                     regardless of signing chain — chain validation is TLS's responsibility",
+        );
         assert_eq!(user.username, "self-signed-user");
         assert!(user.groups.contains(&"some-org".to_owned()));
     }
