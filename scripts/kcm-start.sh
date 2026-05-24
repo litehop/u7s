@@ -104,7 +104,7 @@ exec "$KCM_BINARY" \
   --cluster-signing-key-file="$WORKDIR/ca.key" \
   --service-account-private-key-file="$WORKDIR/sa.key" \
   --root-ca-file="$CA_CERT" \
-  --controllers=csrapproving,csrsigning,garbagecollector,deployment,replicaset \
+  --controllers=csrapproving,csrsigning,garbagecollector,deployment,replicaset,root-ca-cert-publisher \
   --use-service-account-credentials=false \
   --leader-elect=false \
   --bind-address=127.0.0.1 \
