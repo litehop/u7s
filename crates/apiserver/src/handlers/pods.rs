@@ -1400,6 +1400,28 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
         }
     }
     // If spec.volumes is None, there is nothing to default.
+
+    // Default fieldRef.apiVersion to "v1" for all containers (including initContainers).
+    // The kubelet calls ConvertDownwardAPIFieldLabel(apiVersion, ...) which errors with
+    // "unsupported pod version: <empty>" when apiVersion is absent.
+    // Real kube-apiserver stamps this field before storing the object.
+    for containers_key in &["containers", "initContainers"] {
+        if let Some(containers) = pod["spec"][containers_key].as_array_mut() {
+            for container in containers {
+                if let Some(env) = container["env"].as_array_mut() {
+                    for var in env {
+                        let field_ref = &mut var["valueFrom"]["fieldRef"];
+                        if field_ref.is_object()
+                            && (field_ref["apiVersion"].is_null()
+                                || field_ref["apiVersion"] == "")
+                        {
+                            field_ref["apiVersion"] = serde_json::json!("v1");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1500,6 +1522,77 @@ mod create_defaults_tests {
             pod["spec"]["volumes"][0]["secret"]["defaultMode"],
             serde_json::Value::Number(420.into()),
             "secret volume defaultMode must be set to 0644 (420) when absent"
+        );
+    }
+
+    /// fieldRef.apiVersion must be defaulted to "v1" when absent.
+    ///
+    /// The kubelet calls ConvertDownwardAPIFieldLabel(apiVersion, label, value) which
+    /// returns "unsupported pod version: <value>" when apiVersion is empty or missing.
+    /// Real kube-apiserver stamps "v1" on fieldRef before storing the object.
+    /// Without the fix, sonobuoy pods fail with CreateContainerConfigError.
+    #[test]
+    fn field_ref_api_version_defaults_to_v1_when_absent() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "sonobuoy:latest",
+                    "env": [{
+                        "name": "SONOBUOY_ADVERTISE_IP",
+                        "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}
+                    }]
+                }]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["containers"][0]["env"][0]["valueFrom"]["fieldRef"]["apiVersion"],
+            serde_json::json!("v1"),
+            "fieldRef.apiVersion must be defaulted to v1; absent value causes \
+             CreateContainerConfigError in kubelet"
+        );
+    }
+
+    #[test]
+    fn field_ref_api_version_preserved_when_explicit() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "sonobuoy:latest",
+                    "env": [{
+                        "name": "MY_VAR",
+                        "valueFrom": {"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.name"}}
+                    }]
+                }]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["containers"][0]["env"][0]["valueFrom"]["fieldRef"]["apiVersion"],
+            serde_json::json!("v1"),
+        );
+    }
+
+    #[test]
+    fn field_ref_api_version_defaulted_in_init_containers() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "initContainers": [{
+                    "name": "init",
+                    "image": "busybox",
+                    "env": [{
+                        "name": "NODE_NAME",
+                        "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}
+                    }]
+                }]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["initContainers"][0]["env"][0]["valueFrom"]["fieldRef"]["apiVersion"],
+            serde_json::json!("v1"),
         );
     }
 }
