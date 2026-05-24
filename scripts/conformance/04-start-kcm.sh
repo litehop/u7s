@@ -25,7 +25,7 @@ limactl shell "$VM_NAME" bash -c \
 # The repo is mounted read-only inside lima at the same path as on the host.
 # Use the host REPO path — lima mounts match host paths.
 limactl shell "$VM_NAME" bash -c \
-  "nohup \"$REPO/scripts/kcm-start.sh\" > $KCM_LOG 2>&1 &"
+  "nohup bash \"$REPO/scripts/kcm-start.sh\" > $KCM_LOG 2>&1 &"
 
 echo "kube-controller-manager started inside $VM_NAME (log: $KCM_LOG inside VM)"
 echo "To tail: limactl shell $VM_NAME tail -f $KCM_LOG"
