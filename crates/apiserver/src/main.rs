@@ -81,6 +81,12 @@ struct Args {
     /// Defaults to the listen address, substituting 0.0.0.0 with 127.0.0.1.
     #[arg(long)]
     advertise_address: Option<String>,
+
+    /// CIDR range from which clusterIPs are auto-allocated for Services.
+    /// Must be a valid IPv4 CIDR with prefix length <= 30 (e.g. "10.96.0.0/12").
+    /// Matches kubeadm's default. Set to empty string to disable auto-allocation.
+    #[arg(long, default_value = "10.96.0.0/12")]
+    service_cluster_ip_range: String,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -155,7 +161,31 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!("advertised server address: {server_address}");
 
-    // 9. Build app state (shared with the auth layer).
+    // 9. Build service IP allocator from the configured CIDR.
+    let service_ip_allocator = if args.service_cluster_ip_range.is_empty() {
+        tracing::info!(
+            "service clusterIP auto-allocation disabled (empty --service-cluster-ip-range)"
+        );
+        None
+    } else {
+        match state::ServiceIpAllocator::from_cidr(&args.service_cluster_ip_range) {
+            Ok(alloc) => {
+                tracing::info!(
+                    "service clusterIP auto-allocation enabled: {}",
+                    args.service_cluster_ip_range
+                );
+                Some(alloc)
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "invalid --service-cluster-ip-range '{}': {e}",
+                    args.service_cluster_ip_range
+                ));
+            }
+        }
+    };
+
+    // 10. Build app state (shared with the auth layer).
     // Combine admin cert PEM + admin key PEM for the webhook mTLS client identity.
     // The webhook client will present this certificate when connecting to admission
     // webhook servers, so they can verify they are talking to the apiserver.
@@ -169,12 +199,16 @@ async fn main() -> anyhow::Result<()> {
         server_address,
         Some(tls_material.ca_cert_der.clone()),
         Some(webhook_identity_pem),
+        service_ip_allocator,
     );
 
-    // 9a. Populate RBAC index from persisted objects before serving.
+    // 10a. Populate RBAC index from persisted objects before serving.
     state.init().await;
 
-    // 10. Build axum router and attach tower layers.
+    // 10b. Seed service IP hint from already-allocated sentinels in the store.
+    state.init_service_ip_hint().await;
+
+    // 11. Build axum router and attach tower layers.
     //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
     //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
     //     auth processing — this prevents OOM via large unauthenticated request bodies.
@@ -189,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(InflightLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
 
-    // 11. Bind TLS listener and serve.
+    // 12. Bind TLS listener and serve.
     let listener = TcpListener::bind(&args.listen).await?;
     serve_tls(listener, app, tls_material.server_config).await?;
     Ok(())
@@ -2185,6 +2219,150 @@ mod tests {
         assert!(
             stored.is_none(),
             "RoleBinding 'sonobuoy/sonobuoy' must be deleted from store after collection DELETE"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Service clusterIP auto-allocation integration tests
+    // ---------------------------------------------------------------------------
+
+    fn make_state_with_cidr(cidr: &str) -> state::AppState {
+        use state::ServiceIpAllocator;
+        use std::sync::Arc;
+        let store = Arc::new(make_store());
+        let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
+        state::AppState::new_with_ca(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+            None,
+            None,
+            Some(alloc),
+        )
+    }
+
+    /// POST a Service with no clusterIP → GET it back → clusterIP is in the configured CIDR.
+    ///
+    /// This is the primary correctness test: the apiserver must auto-assign an IP
+    /// so that KCM's endpoints-controller can populate Endpoints and kube-proxy can
+    /// program iptables rules. Without a clusterIP, Service traffic is unroutable.
+    #[tokio::test]
+    async fn service_create_auto_assigns_cluster_ip_from_cidr() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request};
+        use std::net::Ipv4Addr;
+        use tower_service::Service as _;
+
+        // /29: .0 network, .1 reserved, .2-.6 usable, .7 broadcast
+        let state = make_state_with_cidr("10.0.0.0/29");
+        let mut router = build_router(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "my-svc", "namespace": "default" },
+            "spec": {
+                "selector": { "app": "my-app" },
+                "ports": [{ "port": 80, "targetPort": 8080 }]
+            }
+        });
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/namespaces/default/services")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request must build");
+
+        let resp = router.call(req).await.expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "Service POST must return 201 Created"
+        );
+
+        let body_bytes = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("collect body");
+        let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let cluster_ip = val["spec"]["clusterIP"].as_str().unwrap_or("");
+        assert!(
+            !cluster_ip.is_empty(),
+            "spec.clusterIP must be auto-assigned — without it Service traffic is unroutable"
+        );
+        assert_ne!(
+            cluster_ip, "None",
+            "clusterIP must not be 'None' for a regular Service"
+        );
+
+        // Verify it falls within the configured CIDR (10.0.0.0/29).
+        let ip: Ipv4Addr = cluster_ip
+            .parse()
+            .expect("clusterIP must be a valid IPv4 address");
+        let base = u32::from("10.0.0.0".parse::<Ipv4Addr>().unwrap());
+        let ip_u32 = u32::from(ip);
+        assert!(
+            ip_u32 >= base && ip_u32 < base + 8,
+            "clusterIP {cluster_ip} must be within 10.0.0.0/29"
+        );
+    }
+
+    /// POST two Services with no clusterIP → they get different IPs.
+    ///
+    /// Duplicate clusterIPs would cause all traffic for one service to be
+    /// mis-routed to the other. The UNIQUE constraint + CAS must prevent this.
+    #[tokio::test]
+    async fn two_services_get_different_cluster_ips() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request};
+        use tower_service::Service as _;
+
+        // /29: 6 usable IPs — enough for two services.
+        let state = make_state_with_cidr("10.0.0.0/29");
+        let mut router = build_router(state);
+
+        let make_svc_req = |name: &str| {
+            let body = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": { "name": name, "namespace": "default" },
+                "spec": { "ports": [{ "port": 80 }] }
+            });
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/namespaces/default/services")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("request must build")
+        };
+
+        let resp1 = router
+            .call(make_svc_req("svc-a"))
+            .await
+            .expect("router call must not error");
+        assert_eq!(resp1.status(), axum::http::StatusCode::CREATED);
+        let b1 = to_bytes(resp1.into_body(), 4096).await.unwrap();
+        let v1: serde_json::Value = serde_json::from_slice(&b1).unwrap();
+        let ip1 = v1["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
+
+        let resp2 = router
+            .call(make_svc_req("svc-b"))
+            .await
+            .expect("router call must not error");
+        assert_eq!(resp2.status(), axum::http::StatusCode::CREATED);
+        let b2 = to_bytes(resp2.into_body(), 4096).await.unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&b2).unwrap();
+        let ip2 = v2["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
+
+        assert!(
+            !ip1.is_empty() && !ip2.is_empty(),
+            "both services must receive a clusterIP"
+        );
+        assert_ne!(
+            ip1, ip2,
+            "two services must not share a clusterIP — duplicate IPs mis-route traffic"
         );
     }
 }

@@ -955,6 +955,7 @@ mod tests {
             "https://localhost:6443".into(),
             Some(ca_der),
             None,
+            None,
         );
 
         let pod = serde_json::json!({
@@ -1154,6 +1155,7 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
             Some(ca_der),
+            None,
             None,
         );
 

@@ -833,6 +833,13 @@ pub async fn create_namespaced_resource<S: Store>(
     obj.body["metadata"] =
         serde_json::to_value(ns_meta).map_err(|e| Status::internal(e.to_string()))?;
     stamp_metadata(&mut obj);
+
+    // Auto-allocate clusterIP for Services that don't specify one.
+    // Must run before apply_defaults so the allocated IP feeds into ipFamilies/clusterIPs.
+    if group.is_empty() && plural == "services" {
+        maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body).await?;
+    }
+
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
 
     // Admission webhook pipeline (mutating then validating).
@@ -1013,6 +1020,16 @@ pub async fn delete_namespaced_resource<S: Store>(
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.remove_object(&rbac_key);
     }
+
+    // Release the clusterIP sentinel so the IP can be re-allocated.
+    if group.is_empty() && plural == "services" {
+        let cluster_ip = obj.body["spec"]["clusterIP"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        state.release_service_ip(&cluster_ip).await;
+    }
+
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
@@ -1193,6 +1210,34 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
 // ---------------------------------------------------------------------------
 // Private helpers (duplicated from generic to avoid pub exposure)
 // ---------------------------------------------------------------------------
+
+/// Allocate a clusterIP for a Service if none is already set.
+///
+/// Called on Service CREATE only (not update/patch — you never reallocate).
+/// Keeps `apply_defaults` pure (no async side effects).
+///
+/// Sets `spec.clusterIP` in `body` when allocation succeeds.
+/// If `spec.clusterIP` is already set (non-empty string), does nothing.
+async fn maybe_allocate_cluster_ip<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    name: &str,
+    body: &mut serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    // Only auto-allocate when clusterIP is absent or empty.
+    let existing = body["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    // Detect the special `default/kubernetes` Service which reserves .1.
+    let is_kubernetes_service = ns == "default" && name == "kubernetes";
+
+    if let Some(ip) = state.allocate_service_ip(is_kubernetes_service).await? {
+        body["spec"]["clusterIP"] = serde_json::Value::String(ip.to_string());
+    }
+    Ok(())
+}
 
 fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
     format!("/apis/{group}/{version}/{plural}/{name}")

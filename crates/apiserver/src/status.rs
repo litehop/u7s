@@ -17,6 +17,12 @@ pub struct Status {
 
 pub struct StatusError(pub StatusCode, pub Status);
 
+impl std::fmt::Debug for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StatusError({}: {})", self.0, self.1.message)
+    }
+}
+
 impl IntoResponse for StatusError {
     fn into_response(self) -> Response {
         (self.0, axum::Json(self.1)).into_response()
@@ -160,6 +166,20 @@ impl Status {
                 message,
                 reason: "Forbidden",
                 code: 403,
+            },
+        )
+    }
+
+    pub fn service_unavailable(message: String) -> StatusError {
+        StatusError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "ServiceUnavailable",
+                code: 503,
             },
         )
     }
