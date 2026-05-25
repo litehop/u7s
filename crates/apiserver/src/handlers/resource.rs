@@ -1054,6 +1054,99 @@ pub async fn patch_namespaced_resource(
 }
 
 // ---------------------------------------------------------------------------
+// Collection delete handlers  (DELETE on collection endpoint)
+// ---------------------------------------------------------------------------
+
+/// DELETE /apis/{group}/{version}/{resource}
+///
+/// Deletes all cluster-scoped objects of the given resource type.  Real
+/// Kubernetes supports collection delete (kubectl delete clusterrolebinding --all,
+/// sonobuoy delete --all).  Without this handler axum returns 405 because no
+/// DELETE is registered on the collection route.
+pub async fn delete_collection_resource(
+    State(state): State<AppState>,
+    Path((group, version, plural)): Path<(String, String, String)>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    // Verify the resource is known; return 404 for unknown resource types.
+    let _meta = lookup(&state, &group, &version, &plural)
+        .cloned()
+        .map_err(|_| Status::not_found(&plural, &format!("{group}/{version}/{plural}")))?;
+
+    let prefix = group_list_prefix(&group, &plural, None);
+    let resp = state
+        .store
+        .list(&prefix, u7s_store::ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    for obj in resp.items {
+        // Extract name from the stored JSON for RBAC index eviction.
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+            let name = parsed["metadata"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if group == RBAC_GROUP && !name.is_empty() {
+                let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
+                state.rbac_index.remove_object(&rbac_key);
+            }
+        }
+        // Ignore NotFound races (another writer may have deleted concurrently).
+        let _ = state.store.delete(&obj.key, None).await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "code": 200
+    }))
+    .into_response())
+}
+
+/// DELETE /apis/{group}/{version}/namespaces/{ns}/{resource}
+///
+/// Deletes all namespaced objects of the given resource type within the namespace.
+pub async fn delete_collection_namespaced_resource(
+    State(state): State<AppState>,
+    Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    let _meta = lookup(&state, &group, &version, &plural)
+        .cloned()
+        .map_err(|_| Status::not_found(&plural, &format!("{group}/{version}/{plural}")))?;
+
+    let prefix = group_list_prefix(&group, &plural, Some(&ns));
+    let resp = state
+        .store
+        .list(&prefix, u7s_store::ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    for obj in resp.items {
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+            let name = parsed["metadata"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            if group == RBAC_GROUP && !name.is_empty() {
+                let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+                state.rbac_index.remove_object(&rbac_key);
+            }
+        }
+        let _ = state.store.delete(&obj.key, None).await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "code": 200
+    }))
+    .into_response())
+}
+
+// ---------------------------------------------------------------------------
 // Private helpers (duplicated from generic to avoid pub exposure)
 // ---------------------------------------------------------------------------
 
