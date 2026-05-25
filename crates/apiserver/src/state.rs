@@ -753,7 +753,8 @@ mod tests {
         identity_pem.extend_from_slice(leaf_key.serialize_pem().as_bytes());
 
         // Must succeed: valid CA DER + valid identity PEM.
-        let _client = AppState::<SqliteStore>::build_webhook_client(Some(&ca_cert_der), Some(&identity_pem));
+        let _client =
+            AppState::<SqliteStore>::build_webhook_client(Some(&ca_cert_der), Some(&identity_pem));
     }
 
     /// Inline PEM encoder for test use — mirrors tls::pem_encode.
