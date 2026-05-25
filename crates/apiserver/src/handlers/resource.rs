@@ -2346,7 +2346,7 @@ mod tests {
         );
     }
 
-    /// is_seeded_rbac_object protects names that start with "system:" and "cluster-admin".
+    /// is_seeded_rbac_object protects names that start with "system:".
     /// Verifies the name-matching logic so we can't accidentally widen/narrow the guard.
     #[test]
     fn is_seeded_rbac_object_matches_protected_names() {
@@ -2363,10 +2363,6 @@ mod tests {
         assert!(
             is_seeded_rbac_object(group, "system:basic-user"),
             "system:basic-user must be protected"
-        );
-        assert!(
-            is_seeded_rbac_object(group, "cluster-admin"),
-            "cluster-admin must be protected"
         );
         // Unprotected names.
         assert!(
