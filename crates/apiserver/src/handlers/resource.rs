@@ -342,6 +342,13 @@ pub async fn delete_resource(
     State(state): State<AppState>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    // Guard first — before validate_name so colon-names in RBAC (e.g. system:node) don't fail
+    // the DNS-label charset check. The collection-delete path has the same guard.
+    if is_seeded_rbac_object(&group, &name) {
+        return Err(Status::forbidden(format!(
+            "cannot delete bootstrap RBAC object {name}"
+        )));
+    }
     validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -948,6 +955,13 @@ pub async fn delete_namespaced_resource(
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
+    // Guard before validate_name("name") so colon-names in RBAC don't fail the charset check.
+    // Namespaced system: objects don't exist today but blocking them prevents future surprises.
+    if is_seeded_rbac_object(&group, &name) {
+        return Err(Status::forbidden(format!(
+            "cannot delete bootstrap RBAC object {name}"
+        )));
+    }
     validate_name("name", &name)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -2378,6 +2392,46 @@ mod tests {
             !is_seeded_rbac_object("apps", "system:masters"),
             "is_seeded_rbac_object must only protect rbac.authorization.k8s.io resources"
         );
+    }
+
+    /// delete_resource must reject a named DELETE of system:node ClusterRoleBinding with 403.
+    ///
+    /// This is the bug sonobuoy triggered: a named DELETE bypassed the is_seeded_rbac_object guard
+    /// that the collection-delete path already had. Without this guard the bootstrap binding is
+    /// erased and the admin cert user loses cluster-admin access. If this guard is removed, the
+    /// test will return Ok(200) or Err(404) instead of Err(403).
+    ///
+    /// The guard fires before validate_name, so "system:node" (which contains a colon not in the
+    /// DNS-label charset) never reaches the validator — the 403 is returned first.
+    #[tokio::test]
+    async fn delete_resource_rejects_named_delete_of_bootstrap_clusterrolebinding() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+
+        let result = delete_resource(
+            State(state),
+            Path((
+                "rbac.authorization.k8s.io".into(),
+                "v1".into(),
+                "clusterrolebindings".into(),
+                "system:node".into(),
+            )),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::FORBIDDEN,
+                "named DELETE of system:node ClusterRoleBinding must return 403 Forbidden — \
+                 the guard must fire before validate_name so the colon in the name is irrelevant"
+            ),
+            Ok(_) => panic!(
+                "named DELETE of bootstrap RBAC object must be rejected — \
+                 if this fires the is_seeded_rbac_object guard was removed from delete_resource"
+            ),
+        }
     }
 
     /// delete_resource returns 404 when the cluster-scoped object does not exist.
