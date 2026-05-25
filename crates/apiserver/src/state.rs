@@ -57,6 +57,10 @@ pub struct AppState<S = SqliteStore> {
     pub webhook_client: reqwest::Client,
     /// DER-encoded cluster CA certificate used to verify kubelet TLS. None in tests.
     pub cluster_ca_der: Option<Arc<Vec<u8>>>,
+    /// PEM-encoded cluster CA certificate for injection into namespace ConfigMaps.
+    /// The kubelet needs this as `kube-root-ca.crt` in every namespace to mount
+    /// projected service-account token volumes. None in tests.
+    pub cluster_ca_pem: Option<Arc<String>>,
 }
 
 // Manual Clone so we don't impose S: Clone (Arc<S> is always Clone).
@@ -73,6 +77,7 @@ impl<S> Clone for AppState<S> {
             watch_limit: self.watch_limit.clone(),
             webhook_client: self.webhook_client.clone(),
             cluster_ca_der: self.cluster_ca_der.clone(),
+            cluster_ca_pem: self.cluster_ca_pem.clone(),
         }
     }
 }
@@ -164,6 +169,7 @@ impl<S: Store> AppState<S> {
         let registry = build_registry();
         let webhook_client =
             Self::build_webhook_client(cluster_ca_der.as_deref(), webhook_identity_pem.as_deref());
+        let cluster_ca_pem = cluster_ca_der.as_deref().map(der_to_pem).map(Arc::new);
         AppState {
             store,
             resource_registry: Arc::new(registry),
@@ -175,6 +181,7 @@ impl<S: Store> AppState<S> {
             watch_limit: WatchLimitState::new(),
             webhook_client,
             cluster_ca_der: cluster_ca_der.map(Arc::new),
+            cluster_ca_pem,
         }
     }
 
@@ -243,6 +250,23 @@ impl<S: Store> AppState<S> {
 
         tracing::info!("rbac init: index populated from store");
     }
+}
+
+/// Convert DER-encoded certificate bytes to a PEM string.
+///
+/// Used to populate `kube-root-ca.crt` ConfigMaps — the kubelet expects the
+/// cluster CA in PEM format as `ca.crt` inside a projected volume.
+pub fn der_to_pem(der: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let encoded = b64.encode(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in encoded.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap());
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
 }
 
 fn rk(group: &str, version: &str, plural: &str) -> ResourceKey {

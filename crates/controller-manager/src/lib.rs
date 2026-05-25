@@ -251,7 +251,38 @@ pub fn compute_aggregated_rules(
     merged
 }
 
-/// Path for the ClusterRoles collection.
+// ---------------------------------------------------------------------------
+// Root-CA ConfigMap construction (root-ca-cert-publisher)
+// ---------------------------------------------------------------------------
+
+/// Build the `kube-root-ca.crt` ConfigMap for a namespace.
+///
+/// The Kubernetes `root-ca-cert-publisher` controller writes this ConfigMap
+/// to every namespace so that pods can verify the API server's TLS cert via
+/// the projected SA token volume (`kube-api-access-*`).  Without it the
+/// kubelet cannot mount the projected volume and the pod stays Pending.
+///
+/// `ca_pem` must be a PEM-encoded certificate (BEGIN CERTIFICATE … END CERTIFICATE).
+pub fn build_root_ca_configmap(namespace: &str, ca_pem: &str) -> Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "kube-root-ca.crt",
+            "namespace": namespace
+        },
+        "data": {
+            "ca.crt": ca_pem
+        }
+    })
+}
+
+/// Path to the ConfigMaps collection in a namespace (for POST).
+pub fn configmaps_path(namespace: &str) -> String {
+    format!("/api/v1/namespaces/{namespace}/configmaps")
+}
+
+/// Path to the ClusterRoles collection.
 pub fn cluster_roles_watch_path() -> &'static str {
     "/apis/rbac.authorization.k8s.io/v1/clusterroles?watch=true"
 }
@@ -462,6 +493,57 @@ mod tests {
         assert_eq!(
             secrets_path("kube-system"),
             "/api/v1/namespaces/kube-system/secrets"
+        );
+    }
+
+    // --- Root-CA ConfigMap publisher ---
+
+    /// build_root_ca_configmap must produce a ConfigMap named exactly "kube-root-ca.crt".
+    /// The kubelet resolves the projected volume source by this exact name; any other name
+    /// causes MountVolume.SetUp to fail with "configmap not found" and the pod stays Pending.
+    #[test]
+    fn root_ca_configmap_has_correct_name_and_kind() {
+        let cm = build_root_ca_configmap(
+            "sonobuoy",
+            "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+        );
+        assert_eq!(cm["kind"], "ConfigMap");
+        assert_eq!(cm["metadata"]["name"], "kube-root-ca.crt");
+        assert_eq!(cm["metadata"]["namespace"], "sonobuoy");
+        assert_eq!(cm["apiVersion"], "v1");
+    }
+
+    /// build_root_ca_configmap must store the PEM under the "ca.crt" key in data.
+    /// The projected volume source references {"key": "ca.crt", "path": "ca.crt"};
+    /// a wrong key name means the file is absent inside the pod.
+    #[test]
+    fn root_ca_configmap_data_key_is_ca_crt() {
+        let pem = "-----BEGIN CERTIFICATE-----\nABCD\n-----END CERTIFICATE-----\n";
+        let cm = build_root_ca_configmap("default", pem);
+        assert_eq!(
+            cm["data"]["ca.crt"].as_str().unwrap(),
+            pem,
+            "ca.crt data key must hold the exact PEM bytes"
+        );
+        // Must be exactly one key in data — no extras.
+        assert_eq!(
+            cm["data"].as_object().unwrap().len(),
+            1,
+            "data must contain only 'ca.crt'"
+        );
+    }
+
+    /// configmaps_path must produce the correct API server path.
+    /// A wrong path returns 404 and the ConfigMap is never created.
+    #[test]
+    fn configmaps_path_format() {
+        assert_eq!(
+            configmaps_path("sonobuoy"),
+            "/api/v1/namespaces/sonobuoy/configmaps"
+        );
+        assert_eq!(
+            configmaps_path("kube-system"),
+            "/api/v1/namespaces/kube-system/configmaps"
         );
     }
 

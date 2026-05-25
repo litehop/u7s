@@ -15,9 +15,10 @@ use serde_json::Value;
 use tracing::{error, info, warn};
 use u7s_client_util::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use u7s_controller_manager::{
-    build_sa_token_secret, cluster_role_patch_path, cluster_roles_watch_path,
-    compute_aggregated_rules, namespace_controller, parse_cluster_role_event, parse_sa_added_event,
-    secrets_path, token_request_path, ClusterRoleSnapshot,
+    build_root_ca_configmap, build_sa_token_secret, cluster_role_patch_path,
+    cluster_roles_watch_path, compute_aggregated_rules, configmaps_path, namespace_controller,
+    parse_cluster_role_event, parse_sa_added_event, secrets_path, token_request_path,
+    ClusterRoleSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,12 @@ struct Args {
     /// API server address override. Takes precedence over kubeconfig server.
     #[arg(long)]
     server: Option<String>,
+
+    /// Path to the cluster CA certificate (PEM).  When set, the root-ca-cert-publisher
+    /// controller creates a "kube-root-ca.crt" ConfigMap in every namespace so that
+    /// the kubelet can mount the projected SA token volume.
+    #[arg(long)]
+    root_ca_file: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +250,13 @@ async fn main() -> anyhow::Result<()> {
 
     let connector = build_tls_connector(&creds)?;
 
+    // Load the CA PEM if provided, for the root-ca-cert-publisher controller.
+    let root_ca_pem: Option<String> = args
+        .root_ca_file
+        .as_deref()
+        .map(|p| std::fs::read_to_string(p).with_context(|| format!("reading root CA file {p}")))
+        .transpose()?;
+
     // Spawn the ClusterRole aggregation controller as a background task.
     tokio::spawn(run_clusterrole_aggregation_controller(
         server.clone(),
@@ -250,11 +264,32 @@ async fn main() -> anyhow::Result<()> {
         bearer_token.clone(),
     ));
 
+    // If the CA PEM is available, spawn a one-shot task that publishes the
+    // kube-root-ca.crt ConfigMap to all existing namespaces.  New namespaces
+    // get the ConfigMap via the AddFinalizer path in the watch loop below.
+    if let Some(ref ca_pem) = root_ca_pem {
+        let server_rc = server.clone();
+        let connector_rc = connector.clone();
+        let bearer_rc = bearer_token.clone();
+        let ca_pem_rc = ca_pem.clone();
+        tokio::spawn(async move {
+            let client = HyperApiClient {
+                server: server_rc.clone(),
+                connector: connector_rc.clone(),
+                bearer: bearer_rc.clone(),
+            };
+            if let Err(e) = publish_root_ca_to_all_namespaces(&client, &ca_pem_rc).await {
+                error!("root-ca-cert startup reconcile: {e}");
+            }
+        });
+    }
+
     // Spawn the namespace lifecycle controller in the background.
     {
         let server_ns = server.clone();
         let connector_ns = connector.clone();
         let bearer_ns = bearer_token.clone();
+        let root_ca_pem_ns = root_ca_pem.clone();
         tokio::spawn(async move {
             loop {
                 info!("starting Namespace watch (lifecycle controller)");
@@ -275,11 +310,20 @@ async fn main() -> anyhow::Result<()> {
                                     connector: connector_ns.clone(),
                                     bearer: bearer_ns.clone(),
                                 };
+                                let ca_pem = root_ca_pem_ns.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) =
                                         add_kubernetes_finalizer(&client_clone, &name).await
                                     {
                                         error!("add_kubernetes_finalizer {name}: {e}");
+                                    }
+                                    if let Some(ref pem) = ca_pem {
+                                        if let Err(e) =
+                                            publish_root_ca_configmap(&client_clone, &name, pem)
+                                                .await
+                                        {
+                                            error!("publish_root_ca_configmap {name}: {e}");
+                                        }
                                     }
                                 });
                             }
@@ -530,5 +574,68 @@ async fn drain_namespace(client: &HyperApiClient, namespace: &str) -> anyhow::Re
 
     replace_namespace(client, namespace, &ns).await?;
     info!("namespace {namespace}: 'kubernetes' finalizer removed, hard-delete triggered");
+    Ok(())
+}
+
+/// List all active namespaces and publish the `kube-root-ca.crt` ConfigMap to each.
+///
+/// Called once at startup so that pre-existing namespaces get the ConfigMap even
+/// if they have already had the "kubernetes" finalizer added (and thus the namespace
+/// watch loop emits `NsAction::None` for them on reconnect).
+async fn publish_root_ca_to_all_namespaces(
+    client: &HyperApiClient,
+    ca_pem: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let (status, body) = client
+        .request(Method::GET, "/api/v1/namespaces", None)
+        .await
+        .context("list namespaces for root-ca-cert startup reconcile")?;
+    if !status.is_success() {
+        anyhow::bail!("GET /api/v1/namespaces failed ({status}): {body}");
+    }
+    let list: serde_json::Value = serde_json::from_str(&body).context("parse namespace list")?;
+    let namespaces = list["items"].as_array().cloned().unwrap_or_default();
+    let count = namespaces.len();
+    for ns in namespaces {
+        let name = ns["metadata"]["name"].as_str().unwrap_or("").to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        if let Err(e) = publish_root_ca_configmap(client, &name, ca_pem).await {
+            error!("publish_root_ca_configmap {name}: {e}");
+        }
+    }
+    info!("root-ca-cert startup reconcile complete ({count} namespaces)");
+    Ok(())
+}
+
+/// Publish the `kube-root-ca.crt` ConfigMap to the given namespace.
+///
+/// The kubelet requires this ConfigMap to mount the projected SA token volume
+/// (`kube-api-access-*`).  Without it, any pod with a ServiceAccount token
+/// volume stays Pending indefinitely with:
+///   "configmap \"kube-root-ca.crt\" not found"
+///
+/// Idempotent: a 409 Conflict (ConfigMap already exists) is silently ignored.
+async fn publish_root_ca_configmap(
+    client: &HyperApiClient,
+    namespace: &str,
+    ca_pem: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let path = configmaps_path(namespace);
+    let cm = build_root_ca_configmap(namespace, ca_pem);
+    let (status, body) = client
+        .request(Method::POST, &path, Some(serde_json::to_string(&cm)?))
+        .await
+        .with_context(|| format!("POST kube-root-ca.crt configmap in {namespace}"))?;
+    if status.is_success() {
+        info!("namespace {namespace}: published kube-root-ca.crt ConfigMap");
+    } else if status.as_u16() == 409 {
+        // Already exists — idempotent.
+    } else {
+        anyhow::bail!("POST kube-root-ca.crt in {namespace} failed ({status}): {body}");
+    }
     Ok(())
 }
