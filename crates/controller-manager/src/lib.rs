@@ -255,6 +255,17 @@ pub fn compute_aggregated_rules(
 // Root-CA ConfigMap construction (root-ca-cert-publisher)
 // ---------------------------------------------------------------------------
 
+/// Typed `data` field for the `kube-root-ca.crt` ConfigMap.
+///
+/// Using a struct rather than a raw `json!` literal ensures that field names
+/// are checked at compile time — a typo like `"ca-crt"` would silently produce
+/// a wrong ConfigMap that the kubelet cannot use to mount projected SA token volumes.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct RootCaConfigMapData {
+    #[serde(rename = "ca.crt")]
+    pub ca_crt: String,
+}
+
 /// Build the `kube-root-ca.crt` ConfigMap for a namespace.
 ///
 /// The Kubernetes `root-ca-cert-publisher` controller writes this ConfigMap
@@ -264,6 +275,9 @@ pub fn compute_aggregated_rules(
 ///
 /// `ca_pem` must be a PEM-encoded certificate (BEGIN CERTIFICATE … END CERTIFICATE).
 pub fn build_root_ca_configmap(namespace: &str, ca_pem: &str) -> Value {
+    let data = RootCaConfigMapData {
+        ca_crt: ca_pem.to_owned(),
+    };
     serde_json::json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -271,9 +285,7 @@ pub fn build_root_ca_configmap(namespace: &str, ca_pem: &str) -> Value {
             "name": "kube-root-ca.crt",
             "namespace": namespace
         },
-        "data": {
-            "ca.crt": ca_pem
-        }
+        "data": serde_json::to_value(data).expect("RootCaConfigMapData serializes")
     })
 }
 
@@ -497,6 +509,23 @@ mod tests {
     }
 
     // --- Root-CA ConfigMap publisher ---
+
+    /// RootCaConfigMapData must serialize to {"ca.crt":"<value>"} with the dot in the key.
+    /// The kubelet resolves the projected volume entry by the key name "ca.crt" exactly;
+    /// a rename to "ca_crt" or "caCrt" would silently omit the file inside the pod.
+    #[test]
+    fn root_ca_configmap_data_serializes_ca_crt_field() {
+        let d = RootCaConfigMapData {
+            ca_crt: "pem-data".to_owned(),
+        };
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["ca.crt"], "pem-data");
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            1,
+            "RootCaConfigMapData must only emit 'ca.crt'"
+        );
+    }
 
     /// build_root_ca_configmap must produce a ConfigMap named exactly "kube-root-ca.crt".
     /// The kubelet resolves the projected volume source by this exact name; any other name

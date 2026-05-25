@@ -11,7 +11,7 @@ use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     handlers::generic::apply_delete_policy,
-    keys::{cluster_list_prefix, cluster_object_key, object_key},
+    keys::{cluster_list_prefix, cluster_object_key},
     proto,
     state::AppState,
     status::Status,
@@ -46,51 +46,6 @@ fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusErro
             "Namespace \"{name}\" cannot be updated: resource version mismatch (expected {expected}, current {current})"
         )),
         other => Status::internal(other.to_string()),
-    }
-}
-
-/// Build the `kube-root-ca.crt` ConfigMap body for a namespace.
-///
-/// Exposed for use in `main.rs` seed functions. Returns `None` when no CA PEM
-/// is available (test environments without a real TLS setup).
-pub fn build_root_ca_configmap(namespace: &str, ca_pem: &str) -> serde_json::Value {
-    serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": {
-            "name": "kube-root-ca.crt",
-            "namespace": namespace
-        },
-        "data": {
-            "ca.crt": ca_pem
-        }
-    })
-}
-
-/// Store the `kube-root-ca.crt` ConfigMap in a namespace.
-///
-/// The kubelet requires this ConfigMap to mount projected service-account token
-/// volumes — without it, every pod in the namespace stays Pending.
-/// Idempotent: AlreadyExists is silently ignored.
-async fn inject_root_ca_configmap<S: Store>(
-    store: &S,
-    namespace: &str,
-    ca_pem: &str,
-) -> Result<(), crate::status::StatusError> {
-    let body = build_root_ca_configmap(namespace, ca_pem);
-    let key = object_key("configmaps", namespace, "kube-root-ca.crt");
-    match store
-        .put(&key, Bytes::from(body.to_string()), Some(0))
-        .await
-    {
-        Ok(_) => {
-            tracing::info!("injected kube-root-ca.crt into namespace {namespace}");
-            Ok(())
-        }
-        Err(StoreError::AlreadyExists { .. }) => Ok(()),
-        Err(e) => Err(Status::internal(format!(
-            "failed to inject kube-root-ca.crt into {namespace}: {e}"
-        ))),
     }
 }
 
@@ -276,19 +231,6 @@ pub async fn create_namespace<S: Store>(
         .map_err(|e| store_err_to_status(e, &name))?;
 
     obj.set_resource_version(new_rv);
-
-    // Inject the kube-root-ca.crt ConfigMap so the kubelet can mount projected
-    // service-account token volumes in pods scheduled to this namespace.
-    // Failure is non-fatal — log and continue; the pod will stay Pending but
-    // the namespace itself was created successfully.
-    if let Some(ca_pem) = state.cluster_ca_pem.as_deref() {
-        if let Err(e) = inject_root_ca_configmap(&*state.store, &name, ca_pem).await {
-            tracing::warn!(
-                "create_namespace {name}: kube-root-ca.crt injection failed: {}",
-                e.1.message
-            );
-        }
-    }
 
     Ok((StatusCode::CREATED, Json(obj.body)))
 }
@@ -1591,76 +1533,6 @@ mod tests {
             after.is_none(),
             "namespace must be hard-deleted when all finalizers are removed via PUT while \
              deletionTimestamp is set"
-        );
-    }
-
-    // create_namespace must inject the kube-root-ca.crt ConfigMap into the namespace
-    // when AppState has a cluster CA PEM configured.
-    //
-    // Without this ConfigMap the kubelet cannot populate the kube-api-access projected
-    // volume and every pod in the namespace stays Pending indefinitely. This is the
-    // regression test for mayor-qsjq.
-    #[tokio::test]
-    async fn create_namespace_injects_kube_root_ca_configmap_when_ca_pem_set() {
-        use std::sync::Arc;
-        let fake_ca_pem =
-            "-----BEGIN CERTIFICATE-----\nZmFrZS1jYS1kYXRh\n-----END CERTIFICATE-----\n";
-        let mut state = make_state();
-        state.cluster_ca_pem = Some(Arc::new(fake_ca_pem.to_string()));
-
-        assert!(create_namespace(
-            State(state.clone()),
-            axum::http::HeaderMap::new(),
-            namespace_body("ca-inject-ns")
-        )
-        .await
-        .is_ok());
-
-        let cm_key = crate::keys::object_key("configmaps", "ca-inject-ns", "kube-root-ca.crt");
-        let stored = state
-            .store
-            .get(&cm_key)
-            .await
-            .expect("store get must not error")
-            .expect("kube-root-ca.crt must be injected (mayor-qsjq regression)");
-        let cm: serde_json::Value =
-            serde_json::from_slice(&stored.value).expect("stored ConfigMap must be valid JSON");
-        assert_eq!(cm["kind"], "ConfigMap");
-        assert_eq!(cm["metadata"]["name"], "kube-root-ca.crt");
-        assert_eq!(cm["metadata"]["namespace"], "ca-inject-ns");
-        assert_eq!(
-            cm["data"]["ca.crt"], fake_ca_pem,
-            "ca.crt data must match the configured cluster CA PEM"
-        );
-    }
-
-    // create_namespace must NOT inject kube-root-ca.crt when no CA PEM is configured
-    // (test environments and clusters without TLS).
-    #[tokio::test]
-    async fn create_namespace_skips_root_ca_injection_when_ca_pem_absent() {
-        let state = make_state();
-        assert!(
-            state.cluster_ca_pem.is_none(),
-            "make_state must not set cluster_ca_pem"
-        );
-
-        assert!(create_namespace(
-            State(state.clone()),
-            axum::http::HeaderMap::new(),
-            namespace_body("no-ca-ns")
-        )
-        .await
-        .is_ok());
-
-        let cm_key = crate::keys::object_key("configmaps", "no-ca-ns", "kube-root-ca.crt");
-        assert!(
-            state
-                .store
-                .get(&cm_key)
-                .await
-                .expect("store get must not error")
-                .is_none(),
-            "kube-root-ca.crt must not be injected when cluster_ca_pem is absent"
         );
     }
 }

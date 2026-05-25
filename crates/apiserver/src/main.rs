@@ -104,11 +104,6 @@ async fn main() -> anyhow::Result<()> {
     // 4. Generate TLS certs.
     let tls_material = generate_tls(&args)?;
 
-    // 4a. Seed kube-root-ca.crt ConfigMap in every pre-seeded namespace.
-    // Must run after generate_tls so the CA cert PEM is available.
-    let ca_pem = state::der_to_pem(&tls_material.ca_cert_der);
-    seed_root_ca_configmaps(&store, &ca_pem).await?;
-
     // 5. Write kubeconfig.
     write_kubeconfig(&args.kubeconfig, &tls_material, &args)?;
 
@@ -729,34 +724,6 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
         Err(e) => return Err(anyhow::anyhow!("seed Deployment kube-system/coredns: {e}")),
     }
 
-    Ok(())
-}
-
-/// Seed the `kube-root-ca.crt` ConfigMap in every pre-seeded namespace.
-///
-/// The kubelet requires this ConfigMap to mount projected service-account token
-/// volumes — without it, every pod in the namespace stays Pending because the
-/// kubelet cannot populate the `kube-api-access-*` projected volume.
-///
-/// This must be called after `generate_tls` so the CA PEM is available.
-/// Idempotent: AlreadyExists is silently ignored.
-async fn seed_root_ca_configmaps(store: &SqliteStore, ca_pem: &str) -> anyhow::Result<()> {
-    use bytes::Bytes;
-    use u7s_store::Store;
-
-    const NAMESPACES: &[&str] = &["default", "kube-system", "kube-node-lease", "kube-public"];
-    for ns in NAMESPACES {
-        let body = handlers::namespaces::build_root_ca_configmap(ns, ca_pem);
-        let key = keys::object_key("configmaps", ns, "kube-root-ca.crt");
-        match store
-            .put(&key, Bytes::from(body.to_string()), Some(0))
-            .await
-        {
-            Ok(_) => tracing::info!("seeded kube-root-ca.crt in namespace {ns}"),
-            Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
-            Err(e) => return Err(anyhow::anyhow!("seed kube-root-ca.crt in {ns}: {e}")),
-        }
-    }
     Ok(())
 }
 
