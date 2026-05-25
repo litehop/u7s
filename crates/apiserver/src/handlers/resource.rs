@@ -1080,6 +1080,7 @@ pub async fn patch_namespaced_resource(
 pub async fn delete_collection_resource(
     State(state): State<AppState>,
     Path((group, version, plural)): Path<(String, String, String)>,
+    Query(query): Query<CollectionQuery>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Verify the resource is known; return 404 for unknown resource types.
     let _meta = lookup(&state, &group, &version, &plural)
@@ -1093,6 +1094,12 @@ pub async fn delete_collection_resource(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
+    let label_pairs = query
+        .label_selector
+        .as_deref()
+        .map(parse_label_selector)
+        .transpose()?;
+
     for obj in resp.items {
         // Extract name from the stored JSON for RBAC index eviction and protection.
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
@@ -1100,6 +1107,13 @@ pub async fn delete_collection_resource(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            // Honor labelSelector — only delete objects matching the requested labels.
+            if let Some(ref pairs) = label_pairs {
+                let kept = apply_label_selector(vec![parsed.clone()], pairs);
+                if kept.is_empty() {
+                    continue;
+                }
+            }
             // Skip bootstrap RBAC objects — deleting them would revoke cluster-admin
             // access for the admin cert user (system:masters → cluster-admin binding).
             if is_seeded_rbac_object(&group, &name) {
@@ -1129,6 +1143,7 @@ pub async fn delete_collection_resource(
 pub async fn delete_collection_namespaced_resource(
     State(state): State<AppState>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    Query(query): Query<CollectionQuery>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
     let _meta = lookup(&state, &group, &version, &plural)
@@ -1142,12 +1157,24 @@ pub async fn delete_collection_namespaced_resource(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
+    let label_pairs = query
+        .label_selector
+        .as_deref()
+        .map(parse_label_selector)
+        .transpose()?;
+
     for obj in resp.items {
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
             let name = parsed["metadata"]["name"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            if let Some(ref pairs) = label_pairs {
+                let kept = apply_label_selector(vec![parsed], pairs);
+                if kept.is_empty() {
+                    continue;
+                }
+            }
             if group == RBAC_GROUP && !name.is_empty() {
                 let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
                 state.rbac_index.remove_object(&rbac_key);
@@ -1188,7 +1215,7 @@ fn rbac_namespaced_key(group: &str, version: &str, ns: &str, plural: &str, name:
 /// wipes the system:masters ClusterRoleBinding from both the SQLite store and
 /// the in-memory RBAC index, revoking cluster-admin access for the cert user.
 fn is_seeded_rbac_object(group: &str, name: &str) -> bool {
-    group == RBAC_GROUP && name.starts_with("system:")
+    group == RBAC_GROUP && (name.starts_with("system:") || name == "cluster-admin")
 }
 
 #[cfg(test)]
@@ -2333,10 +2360,20 @@ mod tests {
             .await
             .expect("user binding seed must succeed");
 
-        // Collection DELETE — simulates sonobuoy delete --all
+        // Collection DELETE — simulates sonobuoy delete --all (no labelSelector)
         let result = delete_collection_resource(
             State(state.clone()),
             Path((group.to_string(), version.to_string(), plural.to_string())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
         )
         .await;
         assert!(result.is_ok(), "collection delete must succeed");
@@ -4222,5 +4259,37 @@ mod tests {
             !wants_partial_object_metadata(""),
             "empty Accept must not be detected as POM"
         );
+    }
+
+    // -- is_seeded_rbac_object --
+
+    #[test]
+    fn seeded_rbac_protects_cluster_admin() {
+        assert!(
+            is_seeded_rbac_object(RBAC_GROUP, "cluster-admin"),
+            "cluster-admin must be protected — sonobuoy delete --all must not wipe it"
+        );
+    }
+
+    #[test]
+    fn seeded_rbac_protects_system_prefix() {
+        assert!(is_seeded_rbac_object(RBAC_GROUP, "system:node"));
+        assert!(is_seeded_rbac_object(RBAC_GROUP, "system:masters"));
+        assert!(is_seeded_rbac_object(RBAC_GROUP, "system:basic-user"));
+    }
+
+    #[test]
+    fn seeded_rbac_allows_user_roles() {
+        assert!(!is_seeded_rbac_object(
+            RBAC_GROUP,
+            "sonobuoy-serviceaccount-cr"
+        ));
+        assert!(!is_seeded_rbac_object(RBAC_GROUP, "my-custom-role"));
+    }
+
+    #[test]
+    fn seeded_rbac_wrong_group_is_not_protected() {
+        assert!(!is_seeded_rbac_object("apps", "cluster-admin"));
+        assert!(!is_seeded_rbac_object("", "system:node"));
     }
 }
