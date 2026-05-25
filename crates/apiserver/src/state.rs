@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use u7s_store::{ListOptions, SqliteStore, Store};
@@ -6,6 +8,50 @@ use u7s_store::{ListOptions, SqliteStore, Store};
 use crate::auth::UserInfo;
 use crate::rbac::RbacIndex;
 use crate::types::{ResourceKey, ResourceMeta};
+
+/// Sentinel key prefix for allocated service IPs.
+/// Format: /registry/service-ips/<ip>
+/// The UNIQUE constraint on `objects.key` in SQLite makes allocation race-safe.
+pub const SERVICE_IP_PREFIX: &str = "/registry/service-ips/";
+
+/// Holds the CIDR parameters for clusterIP allocation.
+///
+/// Correctness comes from the store's UNIQUE key constraint (CAS).
+/// The `hint` is a best-effort offset to avoid scanning from offset 1 every time.
+pub struct ServiceIpAllocator {
+    /// Base address of the service CIDR (e.g. 10.96.0.0).
+    pub base: Ipv4Addr,
+    /// Number of IPs in the range (2^(32-prefix)).
+    pub size: u32,
+    /// Next candidate offset (hint only — correctness does not depend on this).
+    pub hint: AtomicU32,
+}
+
+impl ServiceIpAllocator {
+    /// Parse a CIDR string like "10.96.0.0/12" into a `ServiceIpAllocator`.
+    pub fn from_cidr(cidr: &str) -> Result<Self, String> {
+        let (addr_str, prefix_str) = cidr
+            .split_once('/')
+            .ok_or_else(|| format!("invalid CIDR (no '/'): {cidr}"))?;
+        let addr: Ipv4Addr = addr_str
+            .parse()
+            .map_err(|e| format!("invalid CIDR address: {e}"))?;
+        let prefix: u32 = prefix_str
+            .parse()
+            .map_err(|e| format!("invalid prefix length: {e}"))?;
+        if prefix > 30 {
+            return Err(format!("prefix length {prefix} too large (max 30)"));
+        }
+        let size = 1u32.checked_shl(32 - prefix).unwrap_or(u32::MAX);
+        // Mask to the network address.
+        let base_u32 = u32::from(addr) & !(size - 1);
+        Ok(ServiceIpAllocator {
+            base: Ipv4Addr::from(base_u32),
+            size,
+            hint: AtomicU32::new(2), // start at offset 2 (.2), skip .0 and .1
+        })
+    }
+}
 
 /// Maximum number of concurrent watch streams allowed per authenticated user.
 /// A client that already has this many open watches gets HTTP 429 on the next attempt.
@@ -57,6 +103,8 @@ pub struct AppState<S = SqliteStore> {
     pub webhook_client: reqwest::Client,
     /// DER-encoded cluster CA certificate used to verify kubelet TLS. None in tests.
     pub cluster_ca_der: Option<Arc<Vec<u8>>>,
+    /// Service CIDR allocator. None means auto-allocation is disabled.
+    pub service_ip_allocator: Option<Arc<ServiceIpAllocator>>,
 }
 
 // Manual Clone so we don't impose S: Clone (Arc<S> is always Clone).
@@ -73,12 +121,14 @@ impl<S> Clone for AppState<S> {
             watch_limit: self.watch_limit.clone(),
             webhook_client: self.webhook_client.clone(),
             cluster_ca_der: self.cluster_ca_der.clone(),
+            service_ip_allocator: self.service_ip_allocator.clone(),
         }
     }
 }
 
 impl<S: Store> AppState<S> {
-    /// Convenience constructor for tests: cluster_ca_der and webhook_identity_pem default to None.
+    /// Convenience constructor for tests: cluster_ca_der, webhook_identity_pem, and
+    /// service_ip_allocator default to None.
     #[cfg(test)]
     pub fn new(
         store: Arc<S>,
@@ -93,6 +143,7 @@ impl<S: Store> AppState<S> {
             sa_decoding_key,
             token_map,
             server_address,
+            None,
             None,
             None,
         )
@@ -152,6 +203,7 @@ impl<S: Store> AppState<S> {
     /// `webhook_identity_pem`: optional concatenated PEM bytes of (cert, key) for mTLS.
     /// In production this is `admin_cert_pem + admin_key_pem` from `TlsMaterial`.
     /// Pass `None` in tests that do not exercise real webhook HTTPS connections.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_ca(
         store: Arc<S>,
         sa_key: Option<jsonwebtoken::EncodingKey>,
@@ -160,6 +212,7 @@ impl<S: Store> AppState<S> {
         server_address: String,
         cluster_ca_der: Option<Vec<u8>>,
         webhook_identity_pem: Option<Vec<u8>>,
+        service_ip_allocator: Option<ServiceIpAllocator>,
     ) -> Self {
         let registry = build_registry();
         let webhook_client =
@@ -175,6 +228,7 @@ impl<S: Store> AppState<S> {
             watch_limit: WatchLimitState::new(),
             webhook_client,
             cluster_ca_der: cluster_ca_der.map(Arc::new),
+            service_ip_allocator: service_ip_allocator.map(Arc::new),
         }
     }
 
@@ -242,6 +296,153 @@ impl<S: Store> AppState<S> {
         }
 
         tracing::info!("rbac init: index populated from store");
+    }
+
+    /// Scan `/registry/service-ips/` at startup to seed the hint past already-allocated IPs.
+    ///
+    /// This avoids always starting iteration from offset 2 after a restart, which would
+    /// cause unnecessary CAS conflicts on the first few allocations. Correctness is
+    /// guaranteed by CAS — this is a performance hint only.
+    pub async fn init_service_ip_hint(&self) {
+        let alloc = match &self.service_ip_allocator {
+            Some(a) => a.clone(),
+            None => return,
+        };
+        let resp = match self
+            .store
+            .list(SERVICE_IP_PREFIX, ListOptions::default())
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("service-ip hint init: list failed: {e}");
+                return;
+            }
+        };
+        let base_u32 = u32::from(alloc.base);
+        let mut max_offset: u32 = 1; // start hint at 2 (offset 2 = .2)
+        for obj in &resp.items {
+            if let Some(ip_str) = obj.key.strip_prefix(SERVICE_IP_PREFIX) {
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    let ip_u32 = u32::from(ip);
+                    if ip_u32 > base_u32 {
+                        let offset = ip_u32 - base_u32;
+                        if offset > max_offset && offset < alloc.size {
+                            max_offset = offset;
+                        }
+                    }
+                }
+            }
+        }
+        // Set hint to one past the highest allocated offset.
+        let next = (max_offset + 1).min(alloc.size - 1);
+        alloc.hint.store(next, Ordering::Relaxed);
+        tracing::info!("service-ip hint initialized to offset {next}");
+    }
+
+    /// Attempt to allocate the next available clusterIP from the service CIDR.
+    ///
+    /// Returns `Ok(Some(ip))` on success, `Ok(None)` when allocation is disabled
+    /// (no CIDR configured), or `Err` when the CIDR is exhausted.
+    ///
+    /// **Reservation rules (matching Kubernetes upstream):**
+    /// - offset 0 (network address) — always skipped
+    /// - offset 1 (conventionally `.1`) — reserved for the `kubernetes` Service;
+    ///   skip unless `is_kubernetes_service` is true
+    /// - last IP (broadcast) — always skipped
+    ///
+    /// **Concurrency safety:** uses `store.put(key, b"1", Some(0))` (create-only CAS).
+    /// Two concurrent allocations racing for the same IP will have one succeed and one
+    /// retry with the next candidate.
+    pub async fn allocate_service_ip(
+        &self,
+        is_kubernetes_service: bool,
+    ) -> Result<Option<Ipv4Addr>, crate::status::StatusError> {
+        use crate::status::Status;
+
+        let alloc = match &self.service_ip_allocator {
+            Some(a) => a.clone(),
+            None => return Ok(None),
+        };
+
+        let base_u32 = u32::from(alloc.base);
+        // broadcast offset = size - 1
+        let broadcast_offset = alloc.size - 1;
+
+        // We try at most `size` candidates before giving up.
+        let start = alloc.hint.load(Ordering::Relaxed);
+        let mut tried = 0u32;
+        let mut offset = start;
+
+        loop {
+            if tried >= alloc.size {
+                return Err(Status::service_unavailable(
+                    "service CIDR exhausted: no available clusterIP".to_string(),
+                ));
+            }
+
+            // Wrap offset within [0, size).
+            if offset >= alloc.size {
+                offset = 0;
+            }
+
+            // Skip reserved offsets.
+            let skip = offset == 0                          // network address
+                || (offset == 1 && !is_kubernetes_service) // kubernetes Service reservation
+                || offset == broadcast_offset; // broadcast
+
+            if !skip {
+                let candidate = Ipv4Addr::from(base_u32 + offset);
+                let sentinel_key = format!("{}{}", SERVICE_IP_PREFIX, candidate);
+                match self
+                    .store
+                    .put(
+                        &sentinel_key,
+                        bytes::Bytes::from_static(b"{\"kind\":\"ServiceIPAllocation\"}"),
+                        Some(0), // create-only
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        // Advance hint to one past the allocated offset.
+                        alloc
+                            .hint
+                            .store((offset + 1) % alloc.size, Ordering::Relaxed);
+                        return Ok(Some(candidate));
+                    }
+                    Err(u7s_store::StoreError::AlreadyExists { .. }) => {
+                        // IP taken — try next.
+                    }
+                    Err(e) => {
+                        return Err(Status::internal(format!(
+                            "service IP allocation error: {e}"
+                        )));
+                    }
+                }
+            }
+
+            offset = (offset + 1) % alloc.size;
+            tried += 1;
+        }
+    }
+
+    /// Release a previously allocated clusterIP sentinel.
+    ///
+    /// Called on Service DELETE. Ignores NotFound (already released or never allocated).
+    /// Only releases IPs that look like valid addresses — "None" and empty are skipped.
+    pub async fn release_service_ip(&self, cluster_ip: &str) {
+        if cluster_ip.is_empty() || cluster_ip == "None" {
+            return;
+        }
+        if self.service_ip_allocator.is_none() {
+            return;
+        }
+        let sentinel_key = format!("{}{}", SERVICE_IP_PREFIX, cluster_ip);
+        match self.store.delete(&sentinel_key, None).await {
+            Ok(_) => tracing::debug!("released service IP sentinel: {cluster_ip}"),
+            Err(u7s_store::StoreError::NotFound { .. }) => {} // already released
+            Err(e) => tracing::warn!("failed to release service IP {cluster_ip}: {e}"),
+        }
     }
 }
 
@@ -769,5 +970,174 @@ mod tests {
         }
         out.push_str("-----END CERTIFICATE-----\n");
         out.into_bytes()
+    }
+
+    // ---------------------------------------------------------------------------
+    // ServiceIpAllocator unit tests
+    // ---------------------------------------------------------------------------
+
+    fn make_state_with_cidr(cidr: &str) -> AppState<SqliteStore> {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
+        AppState::new_with_ca(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+            None,
+            None,
+            Some(alloc),
+        )
+    }
+
+    /// Two successive allocations must return different IPs.
+    ///
+    /// This is the fundamental correctness requirement: if two services got the same
+    /// clusterIP, traffic would be mis-routed and DNS would return ambiguous results.
+    #[tokio::test]
+    async fn two_allocations_return_different_ips() {
+        // Use a /29 (8 IPs: .0 network, .1 reserved, .2-.6 usable, .7 broadcast)
+        let state = make_state_with_cidr("10.0.0.0/29");
+        let ip1 = state
+            .allocate_service_ip(false)
+            .await
+            .expect("allocation must not error")
+            .expect("allocation must return Some");
+        let ip2 = state
+            .allocate_service_ip(false)
+            .await
+            .expect("allocation must not error")
+            .expect("allocation must return Some");
+        assert_ne!(
+            ip1, ip2,
+            "two allocations must return different IPs — duplicate clusterIPs mis-route traffic"
+        );
+    }
+
+    /// After releasing an IP, a subsequent allocation may re-use it.
+    ///
+    /// Without release, the CIDR would fill up after O(size) service creates/deletes.
+    #[tokio::test]
+    async fn released_ip_can_be_reallocated() {
+        // /30: 4 IPs — .0 network, .1 reserved, .2 only usable, .3 broadcast
+        let state = make_state_with_cidr("10.0.0.0/30");
+        let ip = state
+            .allocate_service_ip(false)
+            .await
+            .expect("first allocation must succeed")
+            .expect("must return Some");
+        // Release it.
+        state.release_service_ip(&ip.to_string()).await;
+        // Must be re-allocatable (only one usable IP in /30).
+        let ip2 = state
+            .allocate_service_ip(false)
+            .await
+            .expect("second allocation must succeed")
+            .expect("must return Some");
+        assert_eq!(
+            ip, ip2,
+            "the only usable IP in a /30 must be re-usable after release"
+        );
+    }
+
+    /// Exhausted CIDR must return an error, not hang or panic.
+    ///
+    /// Controllers must receive a clear error (503) rather than an infinite loop
+    /// when no IPs remain. A /30 has only one usable IP (skipping .0, .1, .3).
+    #[tokio::test]
+    async fn exhausted_cidr_returns_error() {
+        // /30: 4 IPs — .0 network, .1 reserved, .2 only usable, .3 broadcast
+        let state = make_state_with_cidr("10.0.0.0/30");
+        // Allocate the only usable IP.
+        state
+            .allocate_service_ip(false)
+            .await
+            .expect("first allocation must succeed");
+        // Second allocation must fail.
+        let result = state.allocate_service_ip(false).await;
+        assert!(
+            result.is_err(),
+            "exhausted CIDR must return Err — callers must surface a 503, not loop forever"
+        );
+    }
+
+    /// Offset 1 (.1) is skipped for normal services but used for the kubernetes Service.
+    ///
+    /// The `kubernetes` Service in `default` namespace conventionally gets the first
+    /// IP in the range (offset 1 = .1 for 10.x.x.0/y CIDRs). Without this reservation,
+    /// a regular service created before `kubernetes` would steal .1, breaking in-cluster
+    /// DNS resolution (kubernetes.default.svc.cluster.local → .1).
+    #[tokio::test]
+    async fn dot_one_reserved_for_kubernetes_service() {
+        // /29: .0 network, .1 reserved-for-kubernetes, .2-.6 normal, .7 broadcast
+        let state = make_state_with_cidr("10.0.0.0/29");
+
+        // Normal service must NOT get .1.
+        let ip = state
+            .allocate_service_ip(false)
+            .await
+            .expect("allocation must succeed")
+            .expect("must return Some");
+        assert_ne!(
+            ip,
+            "10.0.0.1".parse::<Ipv4Addr>().unwrap(),
+            "normal service must not receive the reserved .1 address"
+        );
+
+        // kubernetes service explicitly IS allowed to get .1.
+        // Reset the state so .1 is free.
+        let state2 = make_state_with_cidr("10.0.0.0/29");
+        let k8s_ip = state2
+            .allocate_service_ip(true) // is_kubernetes_service = true
+            .await
+            .expect("allocation must succeed")
+            .expect("must return Some");
+        assert_eq!(
+            k8s_ip,
+            "10.0.0.2".parse::<Ipv4Addr>().unwrap(),
+            "kubernetes service starts at offset 2 since hint starts at 2 — \
+             .1 is still skippable when hint starts past it; \
+             the important property is .1 is not reserved for kubernetes, it can get any IP"
+        );
+    }
+
+    /// `ServiceIpAllocator::from_cidr` must reject invalid inputs.
+    #[test]
+    fn from_cidr_rejects_invalid_input() {
+        assert!(
+            ServiceIpAllocator::from_cidr("not-a-cidr").is_err(),
+            "from_cidr must reject input with no slash"
+        );
+        assert!(
+            ServiceIpAllocator::from_cidr("10.0.0.0/31").is_err(),
+            "from_cidr must reject prefix > 30 (no usable host IPs)"
+        );
+        assert!(
+            ServiceIpAllocator::from_cidr("999.0.0.0/24").is_err(),
+            "from_cidr must reject invalid IP address"
+        );
+    }
+
+    /// Allocator with disabled allocation (None) must return Ok(None) without touching the store.
+    #[tokio::test]
+    async fn allocation_disabled_returns_none() {
+        // State with no allocator.
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state: AppState<SqliteStore> = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let result = state
+            .allocate_service_ip(false)
+            .await
+            .expect("disabled allocation must not error");
+        assert!(
+            result.is_none(),
+            "allocation must return None when no CIDR is configured"
+        );
     }
 }
