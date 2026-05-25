@@ -31,7 +31,7 @@ Start u7s manually (note the kubeconfig path it prints), then:
 
 ```sh
 export KUBECONFIG=/path/u7s/printed/kubeconfig
-scripts/lima-start.sh
+scripts/conformance/lima-start.sh
 ```
 
 The script starts an Ubuntu 24.04 VM with cri-o + crun + kubelet, copies the kubeconfig into the VM (rewriting the address to `host.lima.internal`), starts kubelet, and polls until `lima-node` appears in `kubectl get nodes`.
@@ -49,18 +49,18 @@ To run the Kubernetes conformance suite against u7s locally:
 
 2. Start the lima VM with kubelet registered (if not already running):
    ```sh
-   scripts/lima-start.sh
+   scripts/conformance/lima-start.sh
    ```
 
 3. Run sonobuoy (installed inside the VM):
    ```sh
-   scripts/sonobuoy-run.sh
+   scripts/conformance/06-run-sonobuoy.sh
    ```
    This runs `--mode=non-disruptive-conformance` — the single-node conformance subset, approximately 5–15 minutes.
 
 4. To iterate on a specific failure area, use `--focus` to run only matching tests:
    ```sh
-   scripts/sonobuoy-run.sh --focus "ConfigMap"
+   scripts/conformance/06-run-sonobuoy.sh --focus "ConfigMap"
    ```
 
 **Architecture:** u7s runs on the Mac host for a fast `cargo build` → restart loop. kubelet and sonobuoy run inside the lima VM (Linux, cri-o+crun) for reproducibility. sonobuoy reaches u7s via `host.lima.internal:6443`.

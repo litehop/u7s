@@ -39,7 +39,7 @@
 set -euo pipefail
 
 VM_NAME="lima-node"
-LIMA_YAML="$(dirname "$0")/../lima/kubelet.yaml"
+LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
 
 check_deps() {
   local missing=0
