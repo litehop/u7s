@@ -151,6 +151,12 @@ jobs:
             sleep 1
           done
 
+          # Remove the kubernetes finalizer before deleting — in production this is
+          # done by kube-controller-manager after draining child resources, but the
+          # kubectl smoke job does not run kcm.  Without removing the finalizer the
+          # namespace stays in Terminating indefinitely and no DELETED event fires.
+          kubectl patch namespace watch-test \
+            -p '{"metadata":{"finalizers":[]}}' --type=merge
           # Delete namespace — should trigger a DELETED event.
           kubectl delete namespace watch-test
 
