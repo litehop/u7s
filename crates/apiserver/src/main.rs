@@ -364,7 +364,9 @@ fn build_router(state: AppState) -> Router {
         // Generic cluster-scoped resources — collection
         .route(
             "/apis/{group}/{version}/{resource}",
-            get(handlers::resource::list_resource).post(handlers::resource::create_resource),
+            get(handlers::resource::list_resource)
+                .post(handlers::resource::create_resource)
+                .delete(handlers::resource::delete_collection_resource),
         )
         // Generic cluster-scoped resources — named
         .route(
@@ -378,7 +380,8 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/apis/{group}/{version}/namespaces/{ns}/{resource}",
             get(handlers::resource::list_namespaced_resource)
-                .post(handlers::resource::create_namespaced_resource),
+                .post(handlers::resource::create_namespaced_resource)
+                .delete(handlers::resource::delete_collection_namespaced_resource),
         )
         // Scale subresource — apps/v1 workloads (deployments, replicasets, statefulsets)
         // Must be registered before the generic namespaced named-resource catch-all.
@@ -2038,6 +2041,150 @@ mod tests {
         assert_eq!(
             final_conds[0]["type"], "Approved",
             "Approved condition must survive PUT /status — signer must not erase approver's decision"
+        );
+    }
+
+    /// DELETE /apis/rbac.authorization.k8s.io/v1/clusterrolebindings must return 200,
+    /// not 405 Method Not Allowed.
+    ///
+    /// Regression test for mayor-6l6m: sonobuoy delete --all sends a collection DELETE to
+    /// remove all ClusterRoleBindings it created.  Before the fix the collection route only
+    /// registered GET+POST, so axum returned 405.  The test verifies:
+    ///   1. The route exists and accepts DELETE (not 405).
+    ///   2. Items stored under the prefix are actually removed.
+    ///   3. The RBAC index is evicted so permissions are gone immediately.
+    #[tokio::test]
+    async fn delete_collection_clusterrolebindings_returns_200_not_405() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+        use u7s_store::Store;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a ClusterRoleBinding so we can verify it is actually deleted.
+        let group = "rbac.authorization.k8s.io";
+        let crb_key = keys::group_object_key(group, "clusterrolebindings", None, "sonobuoy");
+        let crb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": { "name": "sonobuoy" },
+            "subjects": [],
+            "roleRef": { "apiGroup": group, "kind": "ClusterRole", "name": "cluster-admin" }
+        });
+        store
+            .put(&crb_key, bytes::Bytes::from(crb_body.to_string()), Some(0))
+            .await
+            .expect("seed ClusterRoleBinding must succeed");
+
+        let mut router = build_router(state);
+
+        // Issue DELETE to the collection endpoint (no object name).
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings")
+            .body(axum::body::Body::empty())
+            .expect("request build must not fail");
+        let resp = router.call(req).await.expect("router must not error");
+
+        // Must not return 405 Method Not Allowed — the route must accept DELETE.
+        assert_ne!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "DELETE /apis/rbac.authorization.k8s.io/v1/clusterrolebindings must not return 405 — \
+             sonobuoy delete --all sends a collection DELETE to clean up its ClusterRoleBindings"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "collection DELETE must return 200 Success"
+        );
+
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let val: serde_json::Value = serde_json::from_slice(&body).expect("response must be JSON");
+        assert_eq!(val["kind"], "Status");
+        assert_eq!(val["status"], "Success");
+
+        // The seeded ClusterRoleBinding must be gone from the store.
+        let stored = store.get(&crb_key).await.expect("store.get must not fail");
+        assert!(
+            stored.is_none(),
+            "ClusterRoleBinding 'sonobuoy' must be deleted from store after collection DELETE"
+        );
+    }
+
+    /// DELETE /apis/rbac.authorization.k8s.io/v1/namespaces/{ns}/rolebindings must return
+    /// 200, not 405 Method Not Allowed.
+    ///
+    /// Same root cause as the cluster-scoped variant: the namespaced collection route also
+    /// lacked a DELETE handler.  sonobuoy cleans up its namespace-scoped RoleBindings the
+    /// same way it cleans cluster-scoped ones.
+    #[tokio::test]
+    async fn delete_collection_namespaced_rolebindings_returns_200_not_405() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+        use u7s_store::Store;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let group = "rbac.authorization.k8s.io";
+        let rb_key = keys::group_object_key(group, "rolebindings", Some("sonobuoy"), "sonobuoy");
+        let rb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": { "name": "sonobuoy", "namespace": "sonobuoy" },
+            "subjects": [],
+            "roleRef": { "apiGroup": group, "kind": "ClusterRole", "name": "cluster-admin" }
+        });
+        store
+            .put(&rb_key, bytes::Bytes::from(rb_body.to_string()), Some(0))
+            .await
+            .expect("seed RoleBinding must succeed");
+
+        let mut router = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/apis/rbac.authorization.k8s.io/v1/namespaces/sonobuoy/rolebindings")
+            .body(axum::body::Body::empty())
+            .expect("request build must not fail");
+        let resp = router.call(req).await.expect("router must not error");
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "DELETE on namespaced rolebindings collection must not return 405"
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["kind"], "Status");
+        assert_eq!(val["status"], "Success");
+
+        let stored = store.get(&rb_key).await.expect("store.get must not fail");
+        assert!(
+            stored.is_none(),
+            "RoleBinding 'sonobuoy/sonobuoy' must be deleted from store after collection DELETE"
         );
     }
 }
