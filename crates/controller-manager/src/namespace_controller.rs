@@ -94,7 +94,6 @@ pub fn parse_ns_event(event: &Value) -> NsAction {
 
     match watch_event.event_type.as_str() {
         "ADDED" => {
-            // Add the "kubernetes" finalizer if absent.
             let has_k8s_finalizer = watch_event
                 .object
                 .metadata
@@ -103,9 +102,23 @@ pub fn parse_ns_event(event: &Value) -> NsAction {
                 .unwrap_or(&[])
                 .iter()
                 .any(|f| f == "kubernetes");
-            if has_k8s_finalizer {
+            let deletion_ts_set = watch_event.object.metadata.deletion_timestamp.is_some();
+            let is_terminating = watch_event
+                .object
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                == Some("Terminating");
+
+            if deletion_ts_set && is_terminating && has_k8s_finalizer {
+                // Namespace is already Terminating (e.g. watch reconnected while drain was
+                // in progress and failed). Re-emit Drain so the controller retries.
+                NsAction::Drain(name)
+            } else if has_k8s_finalizer {
+                // Active namespace that already has the finalizer — nothing to do.
                 NsAction::None
             } else {
+                // Add the "kubernetes" finalizer so every namespace goes through drain.
                 NsAction::AddFinalizer(name)
             }
         }
@@ -221,12 +234,79 @@ mod tests {
         assert_eq!(parse_ns_event(&ev), NsAction::AddFinalizer("my-ns".into()));
     }
 
-    // An ADDED namespace that already has the "kubernetes" finalizer must not trigger AddFinalizer.
-    // Adding it twice would produce a duplicate in the finalizers list.
+    // An ADDED namespace that already has the "kubernetes" finalizer and is Active must not
+    // trigger any action. Adding it twice would produce a duplicate in the finalizers list.
     #[test]
-    fn added_with_finalizer_is_noop() {
+    fn added_active_with_finalizer_is_noop() {
         let ev = added_event("my-ns", &["kubernetes"]);
         assert_eq!(parse_ns_event(&ev), NsAction::None);
+    }
+
+    // An ADDED namespace with deletionTimestamp set, phase=Terminating, and the "kubernetes"
+    // finalizer must trigger Drain — not None.
+    //
+    // This covers the watch-reconnect case: when the watch stream dies while drain_namespace
+    // is in progress (or after it errors out), the server re-delivers the Terminating namespace
+    // as an ADDED event on reconnect. Without this fix the controller sees ADDED, notes that
+    // the "kubernetes" finalizer is already present, and returns None — the namespace is never
+    // drained and hangs in Terminating forever.
+    #[test]
+    fn added_terminating_with_finalizer_triggers_drain() {
+        let ev = serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "name": "stuck-ns",
+                    "finalizers": ["kubernetes"],
+                    "deletionTimestamp": "2024-01-02T00:00:00Z"
+                },
+                "status": { "phase": "Terminating" }
+            }
+        });
+        assert_eq!(
+            parse_ns_event(&ev),
+            NsAction::Drain("stuck-ns".into()),
+            "ADDED event for a Terminating namespace must trigger Drain so the controller \
+             retries after a watch reconnect; returning None here leaves the namespace stuck"
+        );
+    }
+
+    // An ADDED namespace with deletionTimestamp but phase=Active must not trigger Drain —
+    // the apiserver has not yet transitioned it to Terminating.
+    #[test]
+    fn added_deletion_ts_but_active_phase_is_noop() {
+        let ev = serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "name": "ns",
+                    "finalizers": ["kubernetes"],
+                    "deletionTimestamp": "2024-01-02T00:00:00Z"
+                },
+                "status": { "phase": "Active" }
+            }
+        });
+        assert_eq!(parse_ns_event(&ev), NsAction::None);
+    }
+
+    // An ADDED namespace with phase=Terminating but NO "kubernetes" finalizer must trigger
+    // AddFinalizer — not Drain. If it has no finalizer, the drain lifecycle hasn't started.
+    // (In practice this shouldn't happen since create_namespace stamps the finalizer, but
+    // the controller must be defensive.)
+    #[test]
+    fn added_terminating_without_finalizer_triggers_add_finalizer() {
+        let ev = serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "name": "ns",
+                    "finalizers": [],
+                    "deletionTimestamp": "2024-01-02T00:00:00Z"
+                },
+                "status": { "phase": "Terminating" }
+            }
+        });
+        assert_eq!(parse_ns_event(&ev), NsAction::AddFinalizer("ns".into()));
     }
 
     // A MODIFIED namespace in Terminating phase with the "kubernetes" finalizer must trigger Drain.
