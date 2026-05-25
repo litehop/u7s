@@ -128,6 +128,21 @@ fi
 echo ""
 echo "Success! Node registered:"
 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
+
+# Start kube-controller-manager inside the VM in the background.
+# KCM is a Linux binary — it must run inside the Lima VM on Mac.
+# It publishes kube-root-ca.crt into every namespace, which is required
+# for pods to start. Without it every pod stays Pending.
+KCM_LOG="/tmp/kcm.log"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+echo ""
+echo "Starting kube-controller-manager inside VM (log: $KCM_LOG inside VM)..."
+limactl shell "$VM_NAME" bash -c \
+  "pkill -f '^kube-controller-manager' 2>/dev/null || true"
+limactl shell "$VM_NAME" bash -c \
+  "nohup bash \"$REPO/scripts/kcm-start.sh\" > $KCM_LOG 2>&1 &"
+echo "kube-controller-manager started (tail: limactl shell $VM_NAME tail -f $KCM_LOG)"
+
 echo ""
 echo "Run kubectl commands with:"
 echo "  export KUBECONFIG=$KUBECONFIG_PATH"
