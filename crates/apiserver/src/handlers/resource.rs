@@ -42,8 +42,8 @@ fn wants_partial_object_metadata(accept: &str) -> bool {
     accept.contains("as=PartialObjectMetadata")
 }
 
-pub async fn list_resource(
-    State(state): State<AppState>,
+pub async fn list_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
     headers: HeaderMap,
@@ -165,8 +165,8 @@ pub async fn list_resource(
     Ok(Json(body).into_response())
 }
 
-pub async fn get_resource(
-    State(state): State<AppState>,
+pub async fn get_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     validate_name("name", &name)?;
@@ -193,8 +193,8 @@ pub async fn get_resource(
         .into_response())
 }
 
-pub async fn create_resource(
-    State(state): State<AppState>,
+pub async fn create_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
@@ -262,8 +262,8 @@ pub async fn create_resource(
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
 
-pub async fn replace_resource(
-    State(state): State<AppState>,
+pub async fn replace_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
@@ -338,8 +338,8 @@ pub async fn replace_resource(
     Ok(Json(obj.body).into_response())
 }
 
-pub async fn delete_resource(
-    State(state): State<AppState>,
+pub async fn delete_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Guard first — before validate_name so colon-names in RBAC (e.g. system:node) don't fail
@@ -418,8 +418,8 @@ pub async fn delete_resource(
 /// `field_manager` is the value of the `?fieldManager=` query param; used only for SSA to
 /// populate the synthetic `managedFields` echo in the response.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn do_patch(
-    state: &AppState,
+pub(crate) async fn do_patch<S: Store>(
+    state: &AppState<S>,
     key: &str,
     meta: &crate::types::ResourceMeta,
     group: &str,
@@ -599,8 +599,8 @@ pub(crate) async fn do_patch(
     Ok(Json(current.body).into_response())
 }
 
-pub async fn patch_resource(
-    State(state): State<AppState>,
+pub async fn patch_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     Query(patch_query): Query<PatchQuery>,
     headers: HeaderMap,
@@ -645,8 +645,8 @@ pub async fn patch_resource(
 // Namespaced handlers  (group/version/namespaces/:ns/resource)
 // ---------------------------------------------------------------------------
 
-pub async fn list_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn list_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
     headers: HeaderMap,
@@ -769,8 +769,8 @@ pub async fn list_namespaced_resource(
     Ok(Json(body).into_response())
 }
 
-pub async fn get_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn get_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
@@ -802,8 +802,8 @@ pub async fn get_namespaced_resource(
         .into_response())
 }
 
-pub async fn create_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn create_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -878,8 +878,8 @@ pub async fn create_namespaced_resource(
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
 
-pub async fn replace_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn replace_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -950,8 +950,8 @@ pub async fn replace_namespaced_resource(
     Ok(Json(obj.body).into_response())
 }
 
-pub async fn delete_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn delete_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
@@ -1024,8 +1024,8 @@ pub async fn delete_namespaced_resource(
     .into_response())
 }
 
-pub async fn patch_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn patch_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     Query(patch_query): Query<PatchQuery>,
     headers: HeaderMap,
@@ -1077,8 +1077,8 @@ pub async fn patch_namespaced_resource(
 /// Kubernetes supports collection delete (kubectl delete clusterrolebinding --all,
 /// sonobuoy delete --all).  Without this handler axum returns 405 because no
 /// DELETE is registered on the collection route.
-pub async fn delete_collection_resource(
-    State(state): State<AppState>,
+pub async fn delete_collection_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1140,8 +1140,8 @@ pub async fn delete_collection_resource(
 /// DELETE /apis/{group}/{version}/namespaces/{ns}/{resource}
 ///
 /// Deletes all namespaced objects of the given resource type within the namespace.
-pub async fn delete_collection_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn delete_collection_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {

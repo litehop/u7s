@@ -198,8 +198,8 @@ fn to_bytes(crd: &CustomResourceDefinition) -> Result<Bytes, crate::status::Stat
 // Handlers
 // ---------------------------------------------------------------------------
 
-pub async fn list_crds(
-    State(state): State<AppState>,
+pub async fn list_crds<S: Store>(
+    State(state): State<AppState<S>>,
     Query(query): Query<super::generic::CollectionQuery>,
     headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
@@ -264,8 +264,8 @@ pub async fn list_crds(
     Ok(Json(body).into_response())
 }
 
-pub async fn create_crd(
-    State(state): State<AppState>,
+pub async fn create_crd<S: Store>(
+    State(state): State<AppState<S>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -322,8 +322,8 @@ pub async fn create_crd(
     Ok((StatusCode::CREATED, Json(crd)))
 }
 
-pub async fn get_crd(
-    State(state): State<AppState>,
+pub async fn get_crd<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
 ) -> Result<Response, crate::status::StatusError> {
     let key = store_key(&name);
@@ -342,8 +342,8 @@ pub async fn get_crd(
         .into_response())
 }
 
-pub async fn replace_crd(
-    State(state): State<AppState>,
+pub async fn replace_crd<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -424,8 +424,8 @@ pub async fn replace_crd(
     Ok(Json(crd))
 }
 
-pub async fn delete_crd(
-    State(state): State<AppState>,
+pub async fn delete_crd<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let key = store_key(&name);

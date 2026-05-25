@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use u7s_store::{ListOptions, Store as _};
+use u7s_store::{ListOptions, Store};
 
 use crate::state::AppState;
 use crate::status::{Status, StatusError};
@@ -193,7 +193,10 @@ pub(crate) fn label_selector_matches(
 ///
 /// Returns an empty map if the namespace is not found (cluster-scoped requests
 /// have no namespace; the caller should skip namespace_selector evaluation in that case).
-async fn fetch_namespace_labels(state: &AppState, namespace: &str) -> BTreeMap<String, String> {
+async fn fetch_namespace_labels<S: Store>(
+    state: &AppState<S>,
+    namespace: &str,
+) -> BTreeMap<String, String> {
     let key = format!("/registry/namespaces/{namespace}");
     match state.store.get(&key).await {
         Ok(Some(obj)) => {
@@ -241,8 +244,8 @@ struct ServiceReference {
 /// If `clientConfig.service` is set, looks up the Service object from the store by
 /// namespace+name and builds `https://<clusterIP>:<port><path>`.
 /// Returns an error if the service reference is set but the Service is not found.
-async fn webhook_url(
-    state: &AppState,
+async fn webhook_url<S: Store>(
+    state: &AppState<S>,
     config: &WebhookClientConfig,
     webhook_name: &str,
 ) -> Result<String, String> {
@@ -368,7 +371,7 @@ pub struct AdmissionContext<'a> {
 // Store helpers: fetch webhook configurations
 // ---------------------------------------------------------------------------
 
-async fn fetch_mutating_configs(state: &AppState) -> Vec<serde_json::Value> {
+async fn fetch_mutating_configs<S: Store>(state: &AppState<S>) -> Vec<serde_json::Value> {
     let prefix = "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/";
     match state.store.list(prefix, ListOptions::default()).await {
         Ok(resp) => resp
@@ -383,7 +386,7 @@ async fn fetch_mutating_configs(state: &AppState) -> Vec<serde_json::Value> {
     }
 }
 
-async fn fetch_validating_configs(state: &AppState) -> Vec<serde_json::Value> {
+async fn fetch_validating_configs<S: Store>(state: &AppState<S>) -> Vec<serde_json::Value> {
     let prefix = "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/";
     match state.store.list(prefix, ListOptions::default()).await {
         Ok(resp) => resp
@@ -468,8 +471,8 @@ fn apply_webhook_patch(object: &mut serde_json::Value, patch_b64: &str) -> Resul
 ///
 /// `is_reinvocation` controls whether we skip webhooks that don't have
 /// `reinvocationPolicy: IfNeeded` during the reinvocation pass.
-async fn invoke_mutating_webhook(
-    state: &AppState,
+async fn invoke_mutating_webhook<S: Store>(
+    state: &AppState<S>,
     webhook: &WebhookEntry,
     object: &serde_json::Value,
     ctx: &AdmissionContext<'_>,
@@ -590,8 +593,8 @@ async fn invoke_mutating_webhook(
 ///
 /// Returns the (possibly mutated) object, or a StatusError if any Fail-policy
 /// webhook denied or was unreachable.
-pub async fn run_mutating_webhooks(
-    state: &AppState,
+pub async fn run_mutating_webhooks<S: Store>(
+    state: &AppState<S>,
     mut object: serde_json::Value,
     ctx: &AdmissionContext<'_>,
 ) -> Result<serde_json::Value, StatusError> {
@@ -639,8 +642,8 @@ pub async fn run_mutating_webhooks(
 /// Fetches all ValidatingWebhookConfiguration objects from the store, filters by
 /// rules, POSTs AdmissionReview to each matching webhook URL.
 /// Returns Ok(()) if all webhooks allow, or a StatusError if any deny or fail with Fail policy.
-pub async fn run_validating_webhooks(
-    state: &AppState,
+pub async fn run_validating_webhooks<S: Store>(
+    state: &AppState<S>,
     object: &serde_json::Value,
     ctx: &AdmissionContext<'_>,
 ) -> Result<(), StatusError> {

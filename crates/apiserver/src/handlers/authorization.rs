@@ -1,6 +1,8 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
 use serde::{Deserialize, Serialize};
 
+use u7s_store::Store;
+
 use crate::{auth::UserInfo, rbac::AuthzRequest, state::AppState};
 
 // ---------------------------------------------------------------------------
@@ -48,8 +50,8 @@ struct AccessReviewStatus {
     allowed: bool,
 }
 
-pub async fn self_subject_access_review(
-    State(state): State<AppState>,
+pub async fn self_subject_access_review<S: Store>(
+    State(state): State<AppState<S>>,
     Extension(user): Extension<UserInfo>,
     Json(body): Json<SelfSubjectAccessReviewRequest>,
 ) -> impl IntoResponse {
@@ -128,8 +130,8 @@ struct ResourceRule {
     resources: Vec<String>,
 }
 
-pub async fn self_subject_rules_review(
-    State(state): State<AppState>,
+pub async fn self_subject_rules_review<S: Store>(
+    State(state): State<AppState<S>>,
     Extension(user): Extension<UserInfo>,
     Json(body): Json<SelfSubjectRulesReviewRequest>,
 ) -> impl IntoResponse {
@@ -187,8 +189,8 @@ struct SubjectAccessReviewResponse {
     status: AccessReviewStatus,
 }
 
-pub async fn subject_access_review(
-    State(state): State<AppState>,
+pub async fn subject_access_review<S: Store>(
+    State(state): State<AppState<S>>,
     Extension(caller): Extension<UserInfo>,
     Json(body): Json<SubjectAccessReviewRequest>,
 ) -> impl IntoResponse {
@@ -301,8 +303,8 @@ struct TokenReviewUser {
     groups: Vec<String>,
 }
 
-pub async fn token_review(
-    State(state): State<AppState>,
+pub async fn token_review<S: Store>(
+    State(state): State<AppState<S>>,
     Json(body): Json<TokenReviewRequest>,
 ) -> impl IntoResponse {
     let token = body.spec.token;

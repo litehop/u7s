@@ -11,7 +11,7 @@
 /// Kubernetes spec reference:
 ///   https://kubernetes.io/docs/concepts/policy/limit-range/
 use serde_json::Value;
-use u7s_store::{ListOptions, Store as _};
+use u7s_store::{ListOptions, Store};
 
 use crate::{keys::list_prefix, state::AppState, status::Status, status::StatusError};
 
@@ -91,7 +91,7 @@ pub fn parse_quantity(s: &str) -> Option<f64> {
 // ---------------------------------------------------------------------------
 
 /// Fetch all LimitRange objects for the given namespace.
-async fn fetch_limit_ranges(state: &AppState, namespace: &str) -> Vec<Value> {
+async fn fetch_limit_ranges<S: Store>(state: &AppState<S>, namespace: &str) -> Vec<Value> {
     let prefix = list_prefix("limitranges", namespace);
     match state.store.list(&prefix, ListOptions::default()).await {
         Ok(resp) => resp
@@ -274,8 +274,8 @@ pub fn validate_container_resources(
 /// Returns the (possibly mutated) pod body, or a 403 StatusError if validation fails.
 /// This is a no-op (returns body unchanged) if the resource is not a Pod or if there
 /// are no LimitRanges in the namespace.
-pub async fn apply_limit_ranges(
-    state: &AppState,
+pub async fn apply_limit_ranges<S: Store>(
+    state: &AppState<S>,
     mut body: Value,
     namespace: &str,
     resource: &str,

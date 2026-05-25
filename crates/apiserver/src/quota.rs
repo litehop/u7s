@@ -17,7 +17,7 @@
 /// Kubernetes spec reference:
 ///   https://kubernetes.io/docs/concepts/policy/resource-quotas/
 use serde_json::Value;
-use u7s_store::{ListOptions, Store as _};
+use u7s_store::{ListOptions, Store};
 
 use crate::{keys::group_list_prefix, state::AppState, status::Status, status::StatusError};
 
@@ -61,7 +61,7 @@ fn parse_count(s: &str) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 /// Fetch all ResourceQuota objects in a namespace.
-async fn fetch_resource_quotas(state: &AppState, namespace: &str) -> Vec<Value> {
+async fn fetch_resource_quotas<S: Store>(state: &AppState<S>, namespace: &str) -> Vec<Value> {
     // ResourceQuota is a core/v1 namespaced resource.
     let prefix = group_list_prefix("", "resourcequotas", Some(namespace));
     match state.store.list(&prefix, ListOptions::default()).await {
@@ -78,7 +78,12 @@ async fn fetch_resource_quotas(state: &AppState, namespace: &str) -> Vec<Value> 
 }
 
 /// Count the current number of objects of a given resource kind in a namespace.
-async fn count_objects(state: &AppState, namespace: &str, group: &str, plural: &str) -> u64 {
+async fn count_objects<S: Store>(
+    state: &AppState<S>,
+    namespace: &str,
+    group: &str,
+    plural: &str,
+) -> u64 {
     let prefix = group_list_prefix(group, plural, Some(namespace));
     match state.store.list(&prefix, ListOptions::default()).await {
         Ok(resp) => resp.items.len() as u64,
@@ -102,8 +107,8 @@ async fn count_objects(state: &AppState, namespace: &str, group: &str, plural: &
 /// Returns Ok(()) if all quotas allow the create, or a 403 StatusError if any
 /// quota would be exceeded. Returns Ok(()) immediately for cluster-scoped
 /// resources (no namespace) and when no ResourceQuota objects exist.
-pub async fn check_resource_quota(
-    state: &AppState,
+pub async fn check_resource_quota<S: Store>(
+    state: &AppState<S>,
     namespace: &str,
     group: &str,
     resource: &str,

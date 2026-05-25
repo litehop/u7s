@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
-use u7s_store::{ListOptions, SqliteStore, Store as _};
+use u7s_store::{ListOptions, SqliteStore, Store};
 
 use crate::auth::UserInfo;
 use crate::rbac::RbacIndex;
@@ -39,9 +39,8 @@ impl WatchLimitState {
     }
 }
 
-#[derive(Clone)]
-pub struct AppState {
-    pub store: Arc<SqliteStore>,
+pub struct AppState<S = SqliteStore> {
+    pub store: Arc<S>,
     pub resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
     pub rbac_index: Arc<RbacIndex>,
     /// RSA signing key for service-account JWTs. None when SA key is unavailable.
@@ -60,11 +59,29 @@ pub struct AppState {
     pub cluster_ca_der: Option<Arc<Vec<u8>>>,
 }
 
-impl AppState {
+// Manual Clone so we don't impose S: Clone (Arc<S> is always Clone).
+impl<S> Clone for AppState<S> {
+    fn clone(&self) -> Self {
+        AppState {
+            store: self.store.clone(),
+            resource_registry: self.resource_registry.clone(),
+            rbac_index: self.rbac_index.clone(),
+            sa_key: self.sa_key.clone(),
+            sa_decoding_key: self.sa_decoding_key.clone(),
+            token_map: self.token_map.clone(),
+            server_address: self.server_address.clone(),
+            watch_limit: self.watch_limit.clone(),
+            webhook_client: self.webhook_client.clone(),
+            cluster_ca_der: self.cluster_ca_der.clone(),
+        }
+    }
+}
+
+impl<S: Store> AppState<S> {
     /// Convenience constructor for tests: cluster_ca_der and webhook_identity_pem default to None.
     #[cfg(test)]
     pub fn new(
-        store: Arc<SqliteStore>,
+        store: Arc<S>,
         sa_key: Option<jsonwebtoken::EncodingKey>,
         sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
         token_map: HashMap<String, UserInfo>,
@@ -136,7 +153,7 @@ impl AppState {
     /// In production this is `admin_cert_pem + admin_key_pem` from `TlsMaterial`.
     /// Pass `None` in tests that do not exercise real webhook HTTPS connections.
     pub fn new_with_ca(
-        store: Arc<SqliteStore>,
+        store: Arc<S>,
         sa_key: Option<jsonwebtoken::EncodingKey>,
         sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
         token_map: HashMap<String, UserInfo>,
@@ -682,7 +699,7 @@ mod tests {
         let ca_der = cert.cert.der().to_vec();
 
         // Must not panic — if CA DER is valid, client construction succeeds.
-        let _client = AppState::build_webhook_client(Some(&ca_der), None);
+        let _client = AppState::<SqliteStore>::build_webhook_client(Some(&ca_der), None);
     }
 
     /// build_webhook_client succeeds with no CA and no identity (test path).
@@ -692,7 +709,7 @@ mod tests {
     /// after the security fix is applied.
     #[test]
     fn build_webhook_client_succeeds_with_no_ca_no_identity() {
-        let _client = AppState::build_webhook_client(None, None);
+        let _client = AppState::<SqliteStore>::build_webhook_client(None, None);
     }
 
     /// build_webhook_client succeeds when given a valid PEM identity (cert + key).
@@ -736,7 +753,8 @@ mod tests {
         identity_pem.extend_from_slice(leaf_key.serialize_pem().as_bytes());
 
         // Must succeed: valid CA DER + valid identity PEM.
-        let _client = AppState::build_webhook_client(Some(&ca_cert_der), Some(&identity_pem));
+        let _client =
+            AppState::<SqliteStore>::build_webhook_client(Some(&ca_cert_der), Some(&identity_pem));
     }
 
     /// Inline PEM encoder for test use — mirrors tls::pem_encode.
