@@ -461,18 +461,28 @@ fn parse_path(path: &str) -> ParsedPath {
 
     // rest: namespaces/<ns>/<resource>[/<name>[/<sub>]]
     //   or: <resource>[/<name>[/<sub>]]
-    let (namespace, resource, name, subresource) = if rest.first().copied() == Some("namespaces") {
-        let ns = rest.get(1).copied().unwrap_or("").to_owned();
-        let resource = rest.get(2).copied().unwrap_or("").to_owned();
-        let name = rest.get(3).map(|s| s.to_string());
-        let subresource = rest.get(4).copied().unwrap_or("").to_owned();
-        (Some(ns), resource, name, subresource)
-    } else {
-        let resource = rest.first().copied().unwrap_or("").to_owned();
-        let name = rest.get(1).map(|s| s.to_string());
-        let subresource = rest.get(2).copied().unwrap_or("").to_owned();
-        (None, resource, name, subresource)
-    };
+    //
+    // Only treat as namespaced if there's a resource segment after the namespace
+    // name (rest.len() >= 3).  Without this check, /api/v1/namespaces and
+    // /api/v1/namespaces/{name} would be mis-classified as namespaced operations
+    // with resource="" instead of cluster-scoped operations on the "namespaces"
+    // resource, causing RBAC wildcard rules to never match.
+    let (namespace, resource, name, subresource) =
+        if rest.first().copied() == Some("namespaces") && rest.len() >= 3 {
+            // /namespaces/<ns>/<resource>[/<name>[/<sub>]]
+            let ns = rest.get(1).copied().unwrap_or("").to_owned();
+            let resource = rest.get(2).copied().unwrap_or("").to_owned();
+            let name = rest.get(3).map(|s| s.to_string());
+            let subresource = rest.get(4).copied().unwrap_or("").to_owned();
+            (Some(ns), resource, name, subresource)
+        } else {
+            // cluster-scoped: <resource>[/<name>[/<sub>]]
+            // Handles /namespaces, /namespaces/<name>, /nodes/<name>, etc.
+            let resource = rest.first().copied().unwrap_or("").to_owned();
+            let name = rest.get(1).map(|s| s.to_string());
+            let subresource = rest.get(2).copied().unwrap_or("").to_owned();
+            (None, resource, name, subresource)
+        };
 
     ParsedPath {
         api_group,
@@ -859,6 +869,68 @@ mod tests {
         assert_eq!(p.resource, "pods");
         assert_eq!(p.subresource, "status");
         assert_eq!(p.name.as_deref(), Some("mypod"));
+    }
+
+    // Regression tests for parse_path misclassifying namespace paths (mayor-8kmu).
+    // /api/v1/namespaces and /api/v1/namespaces/{name} are cluster-scoped
+    // operations on the "namespaces" resource, not namespaced operations.
+    // Without the rest.len() >= 3 guard, resource="" and RBAC wildcard rules
+    // (cluster-admin) never match, denying all namespace operations.
+
+    /// LIST namespaces: cluster-scoped, resource="namespaces", no namespace.
+    #[test]
+    fn test_parse_namespace_collection_is_cluster_scoped() {
+        let p = parse_path("/api/v1/namespaces");
+        assert_eq!(p.api_group, "");
+        assert_eq!(p.resource, "namespaces");
+        assert!(p.namespace.is_none(), "must be cluster-scoped");
+        assert!(p.name.is_none());
+        assert_eq!(p.subresource, "");
+    }
+
+    /// GET/DELETE a specific namespace: cluster-scoped, resource="namespaces",
+    /// name=Some("foo"), no namespace field.
+    #[test]
+    fn test_parse_namespace_named_is_cluster_scoped() {
+        let p = parse_path("/api/v1/namespaces/foo");
+        assert_eq!(p.api_group, "");
+        assert_eq!(p.resource, "namespaces");
+        assert!(p.namespace.is_none(), "must be cluster-scoped");
+        assert_eq!(p.name.as_deref(), Some("foo"));
+        assert_eq!(p.subresource, "");
+    }
+
+    /// Namespaced resource collection still works after the fix.
+    #[test]
+    fn test_parse_namespaced_resource_collection() {
+        let p = parse_path("/api/v1/namespaces/foo/pods");
+        assert_eq!(p.api_group, "");
+        assert_eq!(p.resource, "pods");
+        assert_eq!(p.namespace.as_deref(), Some("foo"));
+        assert!(p.name.is_none());
+        assert_eq!(p.subresource, "");
+    }
+
+    /// Namespaced named resource still works after the fix.
+    #[test]
+    fn test_parse_namespaced_resource_named() {
+        let p = parse_path("/api/v1/namespaces/foo/pods/bar");
+        assert_eq!(p.api_group, "");
+        assert_eq!(p.resource, "pods");
+        assert_eq!(p.namespace.as_deref(), Some("foo"));
+        assert_eq!(p.name.as_deref(), Some("bar"));
+        assert_eq!(p.subresource, "");
+    }
+
+    /// APIS group cluster-scoped resource (clusterrolebindings).
+    #[test]
+    fn test_parse_apis_cluster_scoped_resource() {
+        let p = parse_path("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings");
+        assert_eq!(p.api_group, "rbac.authorization.k8s.io");
+        assert_eq!(p.resource, "clusterrolebindings");
+        assert!(p.namespace.is_none());
+        assert!(p.name.is_none());
+        assert_eq!(p.subresource, "");
     }
 
     // --- get_verb() — collection vs named vs watch disambiguation ---
