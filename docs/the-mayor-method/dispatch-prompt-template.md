@@ -118,6 +118,16 @@ by the harness, not from the worktree.
 You are implementing bead **<BEAD_ID>** in <project description>.
 
 <include project stance obtained from operator>
+
+## Tooling rules (mandatory)
+
+- Use `jq` for JSON parsing in shell — never `python3 -c`.
+- Use the `Read` tool for file reads — never `cat`, `head`, or `tail` via Bash.
+- Use the `Edit` tool for targeted edits — never `sed` or `awk` via Bash.
+- Use the `Grep` tool for search — never shell `grep` / `find` for file I/O.
+- Bash is for runtime commands only: `git`, `cargo`, `gh`, `kubectl`, `bd`.
+- These are not preferences — violating them triggers permission prompts that
+  stall the session. Use the right tool the first time.
 ```
 
 ## Worktree path convention
@@ -420,45 +430,65 @@ suggested. Worker should test their hypothesis before applying the fix.
 
 ---
 
-## Lima VM protocol (inject into any bead that touches scripts/conformance/ or scripts/*-start.sh)
+## Lima VM protocol
 
-Workers have direct access to the lima VM at all times via the lima-node MCP
-server (`mcp__lima-node__*`). This is not optional tooling — it is the primary
-development interface for VM work. `bash -n` syntax checks are not a substitute
-for running code.
+### When to inject
+
+Inject the block below for **any** bead that touches:
+- `scripts/conformance/` or `scripts/*-start.sh` (script correctness)
+- RBAC handlers, auth middleware, collection delete, namespace drain (sonobuoy smoke path)
+- Any handler or middleware that the sonobuoy delete/run flow exercises
+
+Cargo tests alone are not sufficient for these beads. `sonobuoy delete --all`
+exercises a runtime code path (RBAC index, label selector filtering, namespace
+termination) that unit tests cannot cover. A worker that passes `cargo test` but
+skips VM verification is shipping untested code.
+
+### The block (paste verbatim into applicable dispatch prompts)
 
 ```
-## Lima debugging protocol — MANDATORY for this bead
+## Lima VM protocol — MANDATORY for this bead
 
-You have the lima-node MCP server available: use `mcp__lima-node__run_shell_command`
+You have the lima-node MCP server available. Use `mcp__lima-node__run_shell_command`
 to run commands directly inside the lima VM. You also have `limactl shell lima-node
-<cmd>` via Bash. Both are in your allowlist. The VM is always available — there
-is no scenario where you cannot test in it.
+<cmd>` via Bash. Both are in your allowlist. The VM is always available.
 
-**The rule: do not commit any script you have not executed successfully in the VM.**
-`bash -n` is a syntax check only — it does not prove the script works. The sequence:
+**Cargo tests are not sufficient.** This bead touches a runtime path that
+sonobuoy exercises. You must verify against the live server.
 
-1. Read the existing scripts to understand the current state.
-2. Run the exact commands your script will run, manually, inside the VM via
-   `mcp__lima-node__run_shell_command`. Observe real output.
-3. If the command fails, debug it in the VM until it succeeds. Read logs:
-   `mcp__lima-node__run_shell_command ["cat", "/tmp/....log"]`
-4. Only after step 2 produces correct output, encode it in a script.
-5. Run the script itself inside the VM and verify it exits 0.
-6. Then and only then: commit and push.
+Verification sequence (do not skip any step):
 
-**Your return MUST include the raw output of at least one
-`mcp__lima-node__run_shell_command` call that proves the script ran correctly.**
-A return without VM output will be rejected — the mayor will ask you to go back
-and actually test it.
+1. Build and start the server in the host terminal:
+   ```bash
+   cargo build -p u7s-apiserver --release 2>&1 | tail -5
+   # kill any running instance, then:
+   RUST_LOG=info ./target/release/u7s-apiserver &
+   sleep 2
+   ```
+2. From the VM, run the sonobuoy smoke:
+   ```
+   mcp__lima-node__run_shell_command: ["sonobuoy", "delete", "--all", "--wait",
+     "--kubeconfig", "/tmp/sonobuoy-kubeconfig"]
+   ```
+   Expected: exits 0 with no error lines. If it fails, read the server log and
+   debug in the VM until it passes.
+3. Your return MUST include the raw output of the sonobuoy delete command.
+   A return without this output will be rejected.
+
+For script-only beads (no server restart needed):
+1. Run the exact commands manually in the VM first.
+2. Then encode them in the script.
+3. Run the script in the VM and verify exit 0.
+4. Include at least one `mcp__lima-node__run_shell_command` output in your return.
 ```
 
 ### Mayor enforcement at return-review time
 
-When a worker returns from a VM-touching bead, check its return message for
-`mcp__lima-node__run_shell_command` output. If absent: do not merge. Send the
-worker back with: "Your return contains no VM execution evidence. Run the script
-in the lima VM via mcp__lima-node__run_shell_command and show the output."
+When a worker returns from a VM/sonobuoy-touching bead:
+- Check the return for sonobuoy delete output or `mcp__lima-node__run_shell_command` evidence.
+- If absent: **do not merge**. Send back: "Your return contains no VM execution
+  evidence. Run `sonobuoy delete --all --wait` in the lima VM and show the output."
+- The hook pre-checks cargo quality gates. VM verification is the mayor's gate.
 
 ---
 
@@ -483,9 +513,24 @@ in the lima VM via mcp__lima-node__run_shell_command and show the output."
   `git push` — running fmt+test+clippy before either is allowed. But the dispatch
   prompt must also mandate running quality gates explicitly before pushing, so
   workers see failures with context rather than as a hook rejection.
+- **Workers pass cargo tests but skip sonobuoy smoke verification.** Unit tests
+  cannot cover the runtime RBAC/auth/collection-delete/namespace-drain path that
+  sonobuoy exercises. For any bead touching those surfaces, inject the Lima VM
+  protocol block and enforce VM evidence at return-review time. Do not merge
+  without it.
+- **Workers use Python or shell tools instead of permitted built-ins.** `python3 -c`
+  for JSON, `cat`/`head` for file reads, `sed`/`awk` for edits — all trigger
+  permission prompts and slow the session. The common preamble tooling rules
+  prevent this if injected. Always inject the common preamble verbatim.
+- **Mayor "gets into the flow" and codes instead of dispatching.** The three-
+  condition exception test is easy to rationalize past once the mayor has already
+  read several files. The fourth condition (≤2 files read) is the circuit breaker.
+  If the mayor is debugging a runtime issue, it has already failed the test.
+  Workers have the lima-node MCP server and can debug live. Write a better brief.
 - **Workers guess at VM behaviour instead of observing it.** `mcp__lima-node__*`
-  and `limactl shell` are both available. For any bead touching `scripts/conformance/`
-  or `scripts/*-start.sh`, inject the Lima VM protocol block verbatim.
+  and `limactl shell` are both available. For any bead touching `scripts/conformance/`,
+  `scripts/*-start.sh`, or sonobuoy-exercised handlers, inject the Lima VM protocol
+  block verbatim.
 - **Generic prompts produce generic work.** Always include file:line
   citations + concrete fix sketches.
 - **Findings docs leak into PRs.** `ai/findings/` is gitignored; never
