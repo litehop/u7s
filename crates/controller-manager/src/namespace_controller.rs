@@ -68,6 +68,18 @@ pub const CORE_DRAIN_RESOURCES: &[&str] = &[
     "replicationcontrollers",
 ];
 
+/// Non-core (API-group) resource types to drain from a terminating namespace.
+/// Each tuple is (group, version, plural).
+pub const NON_CORE_DRAIN_RESOURCES: &[(&str, &str, &str)] = &[
+    ("apps", "v1", "deployments"),
+    ("apps", "v1", "replicasets"),
+    ("apps", "v1", "statefulsets"),
+    ("apps", "v1", "daemonsets"),
+    ("rbac.authorization.k8s.io", "v1", "rolebindings"),
+    ("rbac.authorization.k8s.io", "v1", "roles"),
+    ("coordination.k8s.io", "v1", "leases"),
+];
+
 /// Parse a namespace watch event into an action.
 pub fn parse_ns_event(event: &Value) -> NsAction {
     let watch_event: NsWatchEvent = match serde_json::from_value(event.clone()) {
@@ -143,6 +155,27 @@ pub fn namespaced_resource_list_path(namespace: &str, resource: &str) -> String 
 /// Path to delete a specific namespaced resource.
 pub fn namespaced_resource_delete_path(namespace: &str, resource: &str, name: &str) -> String {
     format!("/api/v1/namespaces/{namespace}/{resource}/{name}")
+}
+
+/// Path to list all objects of a non-core (API-group) resource type in a namespace.
+pub fn non_core_namespaced_resource_list_path(
+    namespace: &str,
+    group: &str,
+    version: &str,
+    plural: &str,
+) -> String {
+    format!("/apis/{group}/{version}/namespaces/{namespace}/{plural}")
+}
+
+/// Path to delete a specific non-core (API-group) namespaced resource.
+pub fn non_core_namespaced_resource_delete_path(
+    namespace: &str,
+    group: &str,
+    version: &str,
+    plural: &str,
+    name: &str,
+) -> String {
+    format!("/apis/{group}/{version}/namespaces/{namespace}/{plural}/{name}")
 }
 
 // ---------------------------------------------------------------------------
@@ -292,5 +325,51 @@ mod tests {
         assert!(CORE_DRAIN_RESOURCES.contains(&"configmaps"));
         assert!(CORE_DRAIN_RESOURCES.contains(&"secrets"));
         assert!(CORE_DRAIN_RESOURCES.contains(&"serviceaccounts"));
+    }
+
+    // Non-core URL helpers must produce the exact /apis/{group}/{version}/namespaces/{ns}/{plural}
+    // paths required by the Kubernetes API group routing. A wrong path silently skips the resource.
+    #[test]
+    fn non_core_url_helpers_correct() {
+        assert_eq!(
+            non_core_namespaced_resource_list_path("sonobuoy", "apps", "v1", "deployments"),
+            "/apis/apps/v1/namespaces/sonobuoy/deployments"
+        );
+        assert_eq!(
+            non_core_namespaced_resource_list_path(
+                "kube-system",
+                "coordination.k8s.io",
+                "v1",
+                "leases"
+            ),
+            "/apis/coordination.k8s.io/v1/namespaces/kube-system/leases"
+        );
+        assert_eq!(
+            non_core_namespaced_resource_delete_path(
+                "sonobuoy",
+                "rbac.authorization.k8s.io",
+                "v1",
+                "rolebindings",
+                "sonobuoy-serviceaccount-edit"
+            ),
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/sonobuoy/rolebindings/sonobuoy-serviceaccount-edit"
+        );
+    }
+
+    // NON_CORE_DRAIN_RESOURCES must include the resource types that sonobuoy and other
+    // controllers create. Missing any of these leaves orphaned objects that break re-runs.
+    #[test]
+    fn non_core_drain_resources_includes_required_types() {
+        let plurals: Vec<&str> = NON_CORE_DRAIN_RESOURCES
+            .iter()
+            .map(|(_, _, p)| *p)
+            .collect();
+        assert!(plurals.contains(&"deployments"), "deployments missing");
+        assert!(plurals.contains(&"replicasets"), "replicasets missing");
+        assert!(plurals.contains(&"statefulsets"), "statefulsets missing");
+        assert!(plurals.contains(&"daemonsets"), "daemonsets missing");
+        assert!(plurals.contains(&"rolebindings"), "rolebindings missing");
+        assert!(plurals.contains(&"roles"), "roles missing");
+        assert!(plurals.contains(&"leases"), "leases missing");
     }
 }

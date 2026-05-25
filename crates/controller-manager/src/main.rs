@@ -465,6 +465,50 @@ async fn drain_namespace(client: &HyperApiClient, namespace: &str) -> anyhow::Re
         }
     }
 
+    for (group, version, resource) in namespace_controller::NON_CORE_DRAIN_RESOURCES {
+        let list_path = namespace_controller::non_core_namespaced_resource_list_path(
+            namespace, group, version, resource,
+        );
+        let (status, body) = client
+            .request(Method::GET, &list_path, None)
+            .await
+            .with_context(|| format!("list {group}/{resource} in {namespace}"))?;
+
+        if !status.is_success() {
+            // 404 means resource type not registered in this server — skip silently.
+            if status.as_u16() == 404 {
+                continue;
+            }
+            warn!("list {group}/{resource} in {namespace}: HTTP {status} — skipping");
+            continue;
+        }
+
+        let list: serde_json::Value = serde_json::from_str(&body)
+            .with_context(|| format!("parse {group}/{resource} list in {namespace}"))?;
+        let items = list["items"].as_array().cloned().unwrap_or_default();
+
+        for item in items {
+            let item_name = item["metadata"]["name"].as_str().unwrap_or("").to_owned();
+            if item_name.is_empty() {
+                continue;
+            }
+            let del_path = namespace_controller::non_core_namespaced_resource_delete_path(
+                namespace, group, version, resource, &item_name,
+            );
+            let (del_status, _) = client
+                .request(Method::DELETE, &del_path, None)
+                .await
+                .with_context(|| format!("delete {group}/{resource}/{item_name} in {namespace}"))?;
+            if del_status.is_success() || del_status.as_u16() == 404 {
+                info!("namespace {namespace}: deleted {group}/{resource}/{item_name}");
+            } else {
+                warn!(
+                    "namespace {namespace}: delete {group}/{resource}/{item_name} returned {del_status}"
+                );
+            }
+        }
+    }
+
     // Remove the "kubernetes" finalizer via GET + PUT.
     let Some(mut ns) = get_namespace(client, namespace).await? else {
         // Already gone — nothing to do.
