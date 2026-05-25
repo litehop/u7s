@@ -352,6 +352,14 @@ pub async fn delete_resource(
         }
     };
 
+    // Guard: refuse named DELETE of bootstrap RBAC objects (e.g. system:node ClusterRoleBinding).
+    // The collection-delete path has the same guard; without this one a named DELETE bypasses it.
+    if is_seeded_rbac_object(&group, &name) {
+        return Err(Status::forbidden(format!(
+            "cannot delete bootstrap RBAC object {name}"
+        )));
+    }
+
     let key = group_object_key(&group, &plural, None, &name);
 
     // Fetch current to check finalizers.
@@ -960,6 +968,15 @@ pub async fn delete_namespaced_resource(
             .map(IntoResponse::into_response);
         }
     };
+
+    // Guard: refuse named DELETE of bootstrap RBAC objects — consistent with delete_resource and
+    // delete_collection_resource. Namespaced system: objects don't exist today but blocking them
+    // prevents future surprises if they are ever seeded.
+    if is_seeded_rbac_object(&group, &name) {
+        return Err(Status::forbidden(format!(
+            "cannot delete bootstrap RBAC object {name}"
+        )));
+    }
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
 
@@ -2377,6 +2394,78 @@ mod tests {
         assert!(
             !is_seeded_rbac_object("apps", "system:masters"),
             "is_seeded_rbac_object must only protect rbac.authorization.k8s.io resources"
+        );
+    }
+
+    /// delete_resource must reject a named DELETE of system:node ClusterRoleBinding with 403.
+    ///
+    /// This is the bug sonobuoy triggered: a named DELETE bypassed the is_seeded_rbac_object guard
+    /// that the collection-delete path already had. Without this guard the bootstrap binding is
+    /// erased and the admin cert user loses cluster-admin access. If this guard is removed, the
+    /// test will return Ok(200) or Err(404) instead of Err(403).
+    #[tokio::test]
+    async fn delete_resource_rejects_named_delete_of_bootstrap_clusterrolebinding() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed the binding so the guard is checked before any 404 path.
+        let crb = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": { "name": "system:node" },
+            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:node" },
+            "subjects": []
+        });
+        store
+            .put(
+                "/registry/rbac.authorization.k8s.io/clusterrolebindings/system:node",
+                bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = delete_resource(
+            State(state.clone()),
+            Path((
+                "rbac.authorization.k8s.io".into(),
+                "v1".into(),
+                "clusterrolebindings".into(),
+                "system:node".into(),
+            )),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::FORBIDDEN,
+                "named DELETE of system:node ClusterRoleBinding must return 403 Forbidden"
+            ),
+            Ok(_) => panic!(
+                "named DELETE of bootstrap RBAC object must be rejected — \
+                 if this fires the is_seeded_rbac_object guard was removed from delete_resource"
+            ),
+        }
+
+        // The binding must still be present in the store — it must not have been erased.
+        let stored = store
+            .get("/registry/rbac.authorization.k8s.io/clusterrolebindings/system:node")
+            .await
+            .expect("store.get must not fail");
+        assert!(
+            stored.is_some(),
+            "system:node ClusterRoleBinding must survive a named DELETE attempt"
         );
     }
 

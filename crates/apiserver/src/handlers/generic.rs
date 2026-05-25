@@ -69,13 +69,15 @@ pub(crate) fn validate_name(label: &str, value: &str) -> Result<(), crate::statu
             value
         )));
     }
-    // Full DNS-label charset check: lowercase alpha, digits, hyphens only.
+    // Charset check: lowercase alpha, digits, hyphens, dots, and colons.
+    // Colons are valid in Kubernetes RBAC names (e.g. "system:node", "system:masters")
+    // and do not introduce path-traversal risk — only '/' and '..' do.
     if !value
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == ':')
     {
         return Err(Status::bad_request(format!(
-            "invalid {label} '{}': must match [a-z0-9.-]+",
+            "invalid {label} '{}': must match [a-z0-9.:-]+",
             value
         )));
     }
@@ -1268,6 +1270,24 @@ mod resolve_name_tests {
         assert!(validate_name("namespace", "kube-system").is_ok());
         assert!(validate_name("name", "foo.example.com").is_ok());
         assert!(validate_name("name", "a123").is_ok());
+    }
+
+    /// Colons are valid in Kubernetes RBAC names (system:node, system:masters).
+    /// validate_name must accept them — they pose no path-traversal risk.
+    #[test]
+    fn validate_name_accepts_rbac_colon_names() {
+        assert!(
+            validate_name("name", "system:node").is_ok(),
+            "system:node must be accepted — it is a valid RBAC ClusterRole/Binding name"
+        );
+        assert!(
+            validate_name("name", "system:masters").is_ok(),
+            "system:masters must be accepted"
+        );
+        assert!(
+            validate_name("name", "system:basic-user").is_ok(),
+            "system:basic-user must be accepted"
+        );
     }
 }
 
