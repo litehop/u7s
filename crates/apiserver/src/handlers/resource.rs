@@ -1080,12 +1080,17 @@ pub async fn delete_collection_resource(
         .map_err(|e| Status::internal(e.to_string()))?;
 
     for obj in resp.items {
-        // Extract name from the stored JSON for RBAC index eviction.
+        // Extract name from the stored JSON for RBAC index eviction and protection.
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
             let name = parsed["metadata"]["name"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            // Skip bootstrap RBAC objects — deleting them would revoke cluster-admin
+            // access for the admin cert user (system:masters → cluster-admin binding).
+            if is_seeded_rbac_object(&group, &name) {
+                continue;
+            }
             if group == RBAC_GROUP && !name.is_empty() {
                 let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
                 state.rbac_index.remove_object(&rbac_key);
@@ -1156,6 +1161,20 @@ fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> Str
 
 fn rbac_namespaced_key(group: &str, version: &str, ns: &str, plural: &str, name: &str) -> String {
     format!("/apis/{group}/{version}/namespaces/{ns}/{plural}/{name}")
+}
+
+/// Returns true if the named RBAC object was seeded at startup and must not be
+/// bulk-deleted by collection DELETE (e.g. sonobuoy delete --all).
+///
+/// Any RBAC object whose name starts with "system:" is considered
+/// bootstrap-protected and survives collection deletes.
+///
+/// This matters because sonobuoy delete --all now sends DELETE to the
+/// collection endpoint (enabled in PR #230). Without protection, that request
+/// wipes the system:masters ClusterRoleBinding from both the SQLite store and
+/// the in-memory RBAC index, revoking cluster-admin access for the cert user.
+fn is_seeded_rbac_object(group: &str, name: &str) -> bool {
+    group == RBAC_GROUP && name.starts_with("system:")
 }
 
 #[cfg(test)]
@@ -2229,6 +2248,135 @@ mod tests {
         assert!(
             rules_after.is_empty(),
             "soft-deleted ClusterRoleBinding must be evicted from RBAC index immediately"
+        );
+    }
+
+    /// Regression test (mayor-3cgu): collection DELETE on RBAC resources must NOT remove
+    /// bootstrap objects (system:masters, cluster-admin, system:node, etc.).
+    ///
+    /// sonobuoy delete --all issues DELETE /apis/rbac.authorization.k8s.io/v1/clusterrolebindings
+    /// which (after PR #230) now calls delete_collection_resource.  Without protection that
+    /// handler would wipe the system:masters ClusterRoleBinding from both the SQLite store and
+    /// the in-memory RBAC index, causing the admin cert user to lose cluster-admin access
+    /// immediately — even without a server restart.
+    #[tokio::test]
+    async fn delete_collection_skips_seeded_rbac_objects() {
+        use axum::extract::{Path, State};
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store as _};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+        let plural = "clusterrolebindings";
+
+        // Seed the system:masters ClusterRoleBinding as seed_rbac() does at startup.
+        let crb_key = crate::keys::group_object_key(group, plural, None, "system:masters");
+        let crb_val = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": { "name": "system:masters" },
+            "subjects": [{ "kind": "Group", "name": "system:masters" }],
+            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "cluster-admin" }
+        });
+        store
+            .put(
+                &crb_key,
+                bytes::Bytes::from(serde_json::to_vec(&crb_val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed must succeed");
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/system:masters",
+            &crb_val,
+        );
+
+        // Also insert a non-system binding that sonobuoy might create.
+        let user_crb_key =
+            crate::keys::group_object_key(group, plural, None, "sonobuoy-clusteradmin");
+        let user_crb_val = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": { "name": "sonobuoy-clusteradmin" },
+            "subjects": [{ "kind": "ServiceAccount", "name": "sonobuoy", "namespace": "sonobuoy" }],
+            "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "cluster-admin" }
+        });
+        store
+            .put(
+                &user_crb_key,
+                bytes::Bytes::from(serde_json::to_vec(&user_crb_val).unwrap()),
+                None,
+            )
+            .await
+            .expect("user binding seed must succeed");
+
+        // Collection DELETE — simulates sonobuoy delete --all
+        let result = delete_collection_resource(
+            State(state.clone()),
+            Path((group.to_string(), version.to_string(), plural.to_string())),
+        )
+        .await;
+        assert!(result.is_ok(), "collection delete must succeed");
+
+        // system:masters must still be in the store.
+        let still_there = store.get(&crb_key).await.expect("store.get must not fail");
+        assert!(
+            still_there.is_some(),
+            "system:masters CRB must survive collection DELETE — \
+             deleting it would revoke cluster-admin access for the admin cert user"
+        );
+
+        // sonobuoy-clusteradmin must be gone.
+        let gone = store
+            .get(&user_crb_key)
+            .await
+            .expect("store.get must not fail");
+        assert!(
+            gone.is_none(),
+            "non-system CRB (sonobuoy-clusteradmin) must be deleted by collection DELETE"
+        );
+    }
+
+    /// is_seeded_rbac_object protects names that start with "system:".
+    /// Verifies the name-matching logic so we can't accidentally widen/narrow the guard.
+    #[test]
+    fn is_seeded_rbac_object_matches_protected_names() {
+        let group = "rbac.authorization.k8s.io";
+        // Protected names.
+        assert!(
+            is_seeded_rbac_object(group, "system:masters"),
+            "system:masters must be protected"
+        );
+        assert!(
+            is_seeded_rbac_object(group, "system:node"),
+            "system:node must be protected"
+        );
+        assert!(
+            is_seeded_rbac_object(group, "system:basic-user"),
+            "system:basic-user must be protected"
+        );
+        // Unprotected names.
+        assert!(
+            !is_seeded_rbac_object(group, "sonobuoy-clusteradmin"),
+            "sonobuoy bindings must not be protected"
+        );
+        assert!(
+            !is_seeded_rbac_object(group, "my-custom-role"),
+            "user-created roles must not be protected"
+        );
+        // Wrong group: must not protect even system: names.
+        assert!(
+            !is_seeded_rbac_object("apps", "system:masters"),
+            "is_seeded_rbac_object must only protect rbac.authorization.k8s.io resources"
         );
     }
 
