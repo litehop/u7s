@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use u7s_store::StoreError;
 
+use u7s_store::Store;
+
 use crate::{
     auth::UserInfo,
     rbac::user_holds_all_rules,
@@ -119,8 +121,8 @@ pub(crate) fn resolve_name(obj: &mut Object) -> Result<String, crate::status::St
     }
 }
 
-pub(crate) fn lookup<'a>(
-    state: &'a AppState,
+pub(crate) fn lookup<'a, S: Store>(
+    state: &'a AppState<S>,
     group: &str,
     version: &str,
     plural: &str,
@@ -315,12 +317,12 @@ const CLUSTER_ROLE_BINDINGS: &str = "clusterrolebindings";
 ///
 /// Returns `Ok(())` if the check passes (or is not applicable), or
 /// `Err(StatusError)` with 403 Forbidden if the check fails.
-pub(crate) fn check_crb_escalation(
+pub(crate) fn check_crb_escalation<S: Store>(
     plural: &str,
     group: &str,
     user: &UserInfo,
     body: &serde_json::Value,
-    state: &AppState,
+    state: &AppState<S>,
 ) -> Result<(), crate::status::StatusError> {
     if group != RBAC_GROUP || plural != CLUSTER_ROLE_BINDINGS {
         return Ok(());

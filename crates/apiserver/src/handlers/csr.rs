@@ -23,7 +23,7 @@ use bytes::Bytes;
 use x509_cert::der::Decode as _;
 use x509_cert::request::CertReq;
 
-use u7s_store::{ListOptions, Store as _};
+use u7s_store::{ListOptions, Store};
 
 use crate::{
     auth::UserInfo,
@@ -96,8 +96,8 @@ pub(crate) fn validate_csr_spec(
 /// path captures), so we hardcode group/version/plural instead of extracting
 /// them — the generic list_resource handler requires Path<(String,String,String)>
 /// which panics when axum finds 0 capture groups.
-pub async fn list_csr(
-    State(state): State<AppState>,
+pub async fn list_csr<S: Store>(
+    State(state): State<AppState<S>>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -182,8 +182,8 @@ pub async fn list_csr(
 /// has only `{name}` as a capture group. The generic get_resource handler expects
 /// Path<(String,String,String,String)> and would panic. This handler extracts only
 /// the name and hardcodes the rest.
-pub async fn get_csr(
-    State(state): State<AppState>,
+pub async fn get_csr<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
 ) -> Result<Response, crate::status::StatusError> {
     validate_name("name", &name)?;
@@ -207,8 +207,8 @@ pub async fn get_csr(
 ///
 /// Validates spec.request (base64 + DER PKCS#10) and spec.signerName before
 /// storing. Returns 422 on validation failure, 201 on success.
-pub async fn create_csr(
-    State(state): State<AppState>,
+pub async fn create_csr<S: Store>(
+    State(state): State<AppState<S>>,
     Extension(_user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,

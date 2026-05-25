@@ -49,8 +49,8 @@ fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusErro
     }
 }
 
-pub async fn list_namespaces(
-    State(state): State<AppState>,
+pub async fn list_namespaces<S: Store>(
+    State(state): State<AppState<S>>,
     Query(query): Query<super::generic::CollectionQuery>,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -102,8 +102,8 @@ pub async fn list_namespaces(
     Ok(Json(body).into_response())
 }
 
-pub async fn create_namespace(
-    State(state): State<AppState>,
+pub async fn create_namespace<S: Store>(
+    State(state): State<AppState<S>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -235,8 +235,8 @@ pub async fn create_namespace(
     Ok((StatusCode::CREATED, Json(obj.body)))
 }
 
-pub async fn get_namespace(
-    State(state): State<AppState>,
+pub async fn get_namespace<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
 ) -> Result<Response, crate::status::StatusError> {
     let key = cluster_object_key("namespaces", &name);
@@ -255,8 +255,8 @@ pub async fn get_namespace(
         .into_response())
 }
 
-pub async fn replace_namespace(
-    State(state): State<AppState>,
+pub async fn replace_namespace<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -309,8 +309,8 @@ pub async fn replace_namespace(
     Ok(Json(obj.body).into_response())
 }
 
-pub async fn patch_namespace(
-    State(state): State<AppState>,
+pub async fn patch_namespace<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -373,8 +373,8 @@ pub async fn patch_namespace(
     Ok(Json(current.body).into_response())
 }
 
-pub async fn delete_namespace(
-    State(state): State<AppState>,
+pub async fn delete_namespace<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let key = cluster_object_key("namespaces", &name);

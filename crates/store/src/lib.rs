@@ -159,6 +159,11 @@ pub trait Store: Send + Sync + 'static {
     ) -> impl std::future::Future<
         Output = Result<impl futures_core::Stream<Item = WatchEvent> + Send + 'static>,
     > + Send;
+
+    /// Return the current compaction horizon.
+    /// Any revision below this value has been compacted out of the ring buffer.
+    /// Returns 0 when no compaction has occurred.
+    fn compaction_horizon(&self) -> u64;
 }
 
 const RING_CAPACITY: usize = 1000;
@@ -748,6 +753,10 @@ impl Store for SqliteStore {
         };
 
         Ok(stream)
+    }
+
+    fn compaction_horizon(&self) -> u64 {
+        self.compaction_horizon.load(Ordering::Relaxed)
     }
 }
 

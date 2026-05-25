@@ -19,7 +19,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use u7s_store::Store as _;
+use u7s_store::Store;
 
 use crate::{
     handlers::stream::{splice, AxumWs, TungsteniteWs},
@@ -76,8 +76,8 @@ pub fn node_address(node: &serde_json::Value) -> Option<String> {
 // /log handler
 // ---------------------------------------------------------------------------
 
-pub async fn pod_log(
-    State(state): State<AppState>,
+pub async fn pod_log<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
     Query(query): Query<LogQuery>,
 ) -> Result<Response, crate::status::StatusError> {
@@ -231,8 +231,8 @@ pub struct AttachTarget {
 /// Extracted from `pod_attach` so the error paths (404, 400, 500) can be tested
 /// without going through the WebSocket upgrade machinery.  All I/O is either
 /// store reads (testable) or TLS config construction (deterministic).
-pub async fn resolve_attach_target(
-    state: &AppState,
+pub async fn resolve_attach_target<S: Store>(
+    state: &AppState<S>,
     raw_ns: &str,
     pod_name: &str,
     query: &AttachQuery,
@@ -333,8 +333,8 @@ pub async fn resolve_attach_target(
 /// The v5 channel protocol multiplexes stdin/stdout/stderr/resize over a single
 /// WebSocket using a 1-byte channel prefix per message. The splice passes bytes
 /// through unchanged — kubelet handles the mux.
-pub async fn pod_attach(
-    State(state): State<AppState>,
+pub async fn pod_attach<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
     Query(query): Query<AttachQuery>,
     ws: WebSocketUpgrade,
@@ -438,8 +438,8 @@ pub(crate) struct PortforwardParams {
 /// Separated from the handler so this decision logic can be unit-tested without
 /// a real HTTP connection (axum's WebSocketUpgrade extractor requires a live
 /// connection, so the upgrade itself cannot be exercised in unit tests).
-pub(crate) async fn validate_portforward(
-    state: &AppState,
+pub(crate) async fn validate_portforward<S: Store>(
+    state: &AppState<S>,
     ns: &str,
     pod_name: &str,
     ports: Option<&str>,
@@ -510,8 +510,8 @@ pub(crate) async fn validate_portforward(
 /// Upgrades the inbound connection to WebSocket (subprotocol v5.portforward.k8s.io),
 /// then opens an outbound WebSocket to the kubelet's portForward endpoint, and
 /// bidirectionally splices the two streams.
-pub async fn pod_portforward(
-    State(state): State<AppState>,
+pub async fn pod_portforward<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, pod_name)): Path<(String, String)>,
     Query(query): Query<PortforwardQuery>,
     ws: WebSocketUpgrade,

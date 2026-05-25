@@ -26,7 +26,7 @@ use crate::{
     types::{CertificateSigningRequestStatus, Object},
     util::{content_type, extract_body, parse_resource_version},
 };
-use u7s_store::Store as _;
+use u7s_store::Store;
 
 const GROUP: &str = "certificates.k8s.io";
 const PLURAL: &str = "certificatesigningrequests";
@@ -36,8 +36,8 @@ const KIND: &str = "CertificateSigningRequest";
 ///
 /// Merges `status.conditions` from the incoming body into the stored object.
 /// Never modifies `spec` or `status.certificate`.
-pub async fn put_approval(
-    State(state): State<AppState>,
+pub async fn put_approval<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
@@ -78,8 +78,8 @@ pub async fn put_approval(
 ///
 /// Applies a patch to the approval subresource. Only status.conditions may be
 /// changed. spec and status.certificate are never modified.
-pub async fn patch_approval(
-    State(state): State<AppState>,
+pub async fn patch_approval<S: Store>(
+    State(state): State<AppState<S>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,

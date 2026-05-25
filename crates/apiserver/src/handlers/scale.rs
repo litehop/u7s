@@ -5,7 +5,7 @@ use axum::{
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use u7s_store::Store as _;
+use u7s_store::Store;
 
 use crate::{keys::group_object_key, state::AppState, status::Status, types::Object};
 
@@ -105,8 +105,8 @@ pub fn extract_replicas(obj: &serde_json::Value) -> i64 {
 }
 
 /// GET /apis/apps/v1/namespaces/:ns/:resource/:name/scale
-pub async fn get_scale(
-    State(state): State<AppState>,
+pub async fn get_scale<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, resource, name)): Path<(String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     require_scale_resource(&resource)?;
@@ -135,8 +135,8 @@ pub async fn get_scale(
 ///
 /// Accepts a Scale object body; writes `spec.replicas` back into the stored
 /// workload, increments resourceVersion, returns the updated Scale.
-pub async fn put_scale(
-    State(state): State<AppState>,
+pub async fn put_scale<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, resource, name)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -183,8 +183,8 @@ pub async fn put_scale(
 ///
 /// Accepts a JSON merge-patch body targeting the Scale object.  Only
 /// `spec.replicas` is extracted and written back to the stored workload.
-pub async fn patch_scale(
-    State(state): State<AppState>,
+pub async fn patch_scale<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, resource, name)): Path<(String, String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {

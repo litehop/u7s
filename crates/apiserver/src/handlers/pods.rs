@@ -101,9 +101,9 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
 
 /// Validate a raw namespace string: format check then store lookup.
 /// Returns 400 on invalid format, 404 if namespace does not exist.
-async fn parse_namespace(
+async fn parse_namespace<S: Store>(
     raw: &str,
-    state: &AppState,
+    state: &AppState<S>,
 ) -> Result<Namespace, crate::status::StatusError> {
     let ns = Namespace::parse(raw).map_err(Status::bad_request)?;
     let key = cluster_object_key("namespaces", ns.as_str());
@@ -130,8 +130,8 @@ fn store_err_to_status(err: StoreError, name: &str) -> crate::status::StatusErro
     }
 }
 
-pub async fn list_pods(
-    State(state): State<AppState>,
+pub async fn list_pods<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<CollectionQuery>,
     Extension(user): Extension<UserInfo>,
@@ -230,8 +230,8 @@ pub async fn list_pods(
 /// The `initial_pods` list is already filtered by the caller (list_pods)
 /// before being passed here, so `watch_generic` emits them as-is.
 #[allow(clippy::too_many_arguments)]
-async fn watch_pods(
-    state: AppState,
+async fn watch_pods<S: Store>(
+    state: AppState<S>,
     prefix: String,
     _ns: Namespace,
     from_revision: u64,
@@ -256,8 +256,8 @@ async fn watch_pods(
     .await
 }
 
-pub async fn create_pod(
-    State(state): State<AppState>,
+pub async fn create_pod<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     headers: HeaderMap,
     body: Bytes,
@@ -304,8 +304,8 @@ pub async fn create_pod(
     Ok((StatusCode::CREATED, Json(obj.body)))
 }
 
-pub async fn get_pod(
-    State(state): State<AppState>,
+pub async fn get_pod<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
@@ -326,8 +326,8 @@ pub async fn get_pod(
         .into_response())
 }
 
-pub async fn replace_pod(
-    State(state): State<AppState>,
+pub async fn replace_pod<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -374,8 +374,8 @@ pub async fn replace_pod(
     Ok(Json(obj.body))
 }
 
-pub async fn delete_pod(
-    State(state): State<AppState>,
+pub async fn delete_pod<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
@@ -423,8 +423,8 @@ pub async fn delete_pod(
     })))
 }
 
-pub async fn patch_pod(
-    State(state): State<AppState>,
+pub async fn patch_pod<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -821,8 +821,8 @@ mod field_selector_tests {
 // Status subresource — GET/PUT/PATCH /api/v1/namespaces/:ns/pods/:name/status
 // ---------------------------------------------------------------------------
 
-pub async fn get_pod_status(
-    State(state): State<AppState>,
+pub async fn get_pod_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
@@ -843,8 +843,8 @@ pub async fn get_pod_status(
         .into_response())
 }
 
-pub async fn replace_pod_status(
-    State(state): State<AppState>,
+pub async fn replace_pod_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -910,8 +910,8 @@ pub fn apply_status_patch(
     result
 }
 
-pub async fn patch_pod_status(
-    State(state): State<AppState>,
+pub async fn patch_pod_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -1898,8 +1898,8 @@ pub fn extract_binding_node_name(
     Ok(parsed.target.name)
 }
 
-pub async fn bind_pod(
-    State(state): State<AppState>,
+pub async fn bind_pod<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,

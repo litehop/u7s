@@ -127,8 +127,8 @@ pub(crate) fn parse_key_name_ns(key: &str) -> (&str, &str) {
 /// startup protocol used by kubelet and controller-manager.
 ///
 /// Returns `None` when `send_initial_events` is false (caller uses normal watch).
-pub(crate) async fn fetch_initial_events(
-    state: &AppState,
+pub(crate) async fn fetch_initial_events<S: Store>(
+    state: &AppState<S>,
     prefix: &str,
     send_initial_events: bool,
 ) -> Result<Option<(Vec<serde_json::Value>, u64)>, crate::status::StatusError> {
@@ -242,8 +242,8 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
 /// watch stream concurrency limit (MAX_WATCHES_PER_CLIENT). Exceeding the limit
 /// returns HTTP 429 immediately without opening a watch stream.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn watch_generic(
-    state: AppState,
+pub(crate) async fn watch_generic<S: Store>(
+    state: AppState<S>,
     prefix: String,
     api_version: String,
     kind: String,

@@ -4,7 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use u7s_store::{ListOptions, Store as _};
+use u7s_store::{ListOptions, Store};
 
 use crate::handlers::crd::CustomResourceDefinition;
 use crate::state::AppState;
@@ -26,7 +26,7 @@ pub async fn version() -> Json<serde_json::Value> {
     }))
 }
 
-pub async fn api_versions(State(state): State<AppState>) -> Json<APIVersions> {
+pub async fn api_versions<S: Store>(State(state): State<AppState<S>>) -> Json<APIVersions> {
     Json(APIVersions::v1(state.server_address.clone()))
 }
 
@@ -56,7 +56,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("storage.k8s.io", "v1"),
 ];
 
-pub async fn api_group_list(State(state): State<AppState>) -> Json<APIGroupList> {
+pub async fn api_group_list<S: Store>(State(state): State<AppState<S>>) -> Json<APIGroupList> {
     let mut groups: Vec<APIGroup> = STATIC_GROUPS
         .iter()
         .map(|(name, version)| {
@@ -174,8 +174,8 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
     }
 }
 
-pub async fn api_group_resources(
-    State(state): State<AppState>,
+pub async fn api_group_resources<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version)): Path<(String, String)>,
 ) -> Response {
     let static_list = static_group_resources(group.as_str(), version.as_str());

@@ -32,8 +32,8 @@ use super::status::{
 };
 use super::watch::{fetch_initial_events, watch_generic};
 
-pub async fn core_list_resource(
-    State(state): State<AppState>,
+pub async fn core_list_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path(plural): Path<String>,
     Query(query): Query<CollectionQuery>,
     headers: axum::http::HeaderMap,
@@ -113,15 +113,15 @@ pub async fn core_list_resource(
     .map(IntoResponse::into_response)
 }
 
-pub async fn core_get_resource(
-    State(state): State<AppState>,
+pub async fn core_get_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     get_resource(State(state), Path(("".into(), "v1".into(), plural, name))).await
 }
 
-pub async fn core_create_resource(
-    State(state): State<AppState>,
+pub async fn core_create_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path(plural): Path<String>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
@@ -137,8 +137,8 @@ pub async fn core_create_resource(
     .await
 }
 
-pub async fn core_replace_resource(
-    State(state): State<AppState>,
+pub async fn core_replace_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
@@ -154,15 +154,15 @@ pub async fn core_replace_resource(
     .await
 }
 
-pub async fn core_delete_resource(
-    State(state): State<AppState>,
+pub async fn core_delete_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     delete_resource(State(state), Path(("".into(), "v1".into(), plural, name))).await
 }
 
-pub async fn core_patch_resource(
-    State(state): State<AppState>,
+pub async fn core_patch_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
     Query(patch_query): Query<PatchQuery>,
     headers: HeaderMap,
@@ -178,15 +178,15 @@ pub async fn core_patch_resource(
     .await
 }
 
-pub async fn core_get_resource_status(
-    State(state): State<AppState>,
+pub async fn core_get_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     get_resource_status(State(state), Path(("".into(), "v1".into(), plural, name))).await
 }
 
-pub async fn core_put_resource_status(
-    State(state): State<AppState>,
+pub async fn core_put_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -200,8 +200,8 @@ pub async fn core_put_resource_status(
     .await
 }
 
-pub async fn core_patch_resource_status(
-    State(state): State<AppState>,
+pub async fn core_patch_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -215,8 +215,8 @@ pub async fn core_patch_resource_status(
     .await
 }
 
-pub async fn core_list_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn core_list_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, plural)): Path<(String, String)>,
     Query(query): Query<CollectionQuery>,
     headers: axum::http::HeaderMap,
@@ -232,8 +232,8 @@ pub async fn core_list_namespaced_resource(
     .await
 }
 
-pub async fn core_get_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn core_get_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     get_namespaced_resource(
@@ -243,8 +243,8 @@ pub async fn core_get_namespaced_resource(
     .await
 }
 
-pub async fn core_create_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn core_create_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, plural)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -258,8 +258,8 @@ pub async fn core_create_namespaced_resource(
     .await
 }
 
-pub async fn core_replace_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn core_replace_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -273,8 +273,8 @@ pub async fn core_replace_namespaced_resource(
     .await
 }
 
-pub async fn core_delete_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn core_delete_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     delete_namespaced_resource(
@@ -284,8 +284,8 @@ pub async fn core_delete_namespaced_resource(
     .await
 }
 
-pub async fn core_patch_namespaced_resource(
-    State(state): State<AppState>,
+pub async fn core_patch_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
     Query(patch_query): Query<PatchQuery>,
     headers: HeaderMap,
@@ -301,8 +301,8 @@ pub async fn core_patch_namespaced_resource(
     .await
 }
 
-pub async fn core_get_namespaced_resource_status(
-    State(state): State<AppState>,
+pub async fn core_get_namespaced_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     get_namespaced_resource_status(
@@ -312,8 +312,8 @@ pub async fn core_get_namespaced_resource_status(
     .await
 }
 
-pub async fn core_put_namespaced_resource_status(
-    State(state): State<AppState>,
+pub async fn core_put_namespaced_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -327,8 +327,8 @@ pub async fn core_put_namespaced_resource_status(
     .await
 }
 
-pub async fn core_patch_namespaced_resource_status(
-    State(state): State<AppState>,
+pub async fn core_patch_namespaced_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,

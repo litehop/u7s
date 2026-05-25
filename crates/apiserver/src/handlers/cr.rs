@@ -29,8 +29,8 @@ const CRD_LIST_PREFIX: &str = "/registry/apiextensions.k8s.io/customresourcedefi
 ///
 /// Returns the converted objects on success, or an error if the webhook fails or
 /// the response is malformed.
-pub(crate) async fn call_conversion_webhook(
-    state: &AppState,
+pub(crate) async fn call_conversion_webhook<S: Store>(
+    state: &AppState<S>,
     client_config: &serde_json::Value,
     objects: Vec<serde_json::Value>,
     desired_api_version: &str,
@@ -98,8 +98,8 @@ pub(crate) async fn call_conversion_webhook(
 /// Resolve the conversion webhook URL from a clientConfig object.
 ///
 /// Supports both `url` (direct URL) and `service` (in-cluster service reference).
-async fn resolve_conversion_webhook_url(
-    state: &AppState,
+async fn resolve_conversion_webhook_url<S: Store>(
+    state: &AppState<S>,
     client_config: &serde_json::Value,
 ) -> Result<String, crate::status::StatusError> {
     if let Some(url) = client_config["url"].as_str() {
@@ -167,8 +167,8 @@ pub struct CrContext {
 /// Find the CRD whose spec.group == group and spec.names.plural == plural.
 /// Returns Err(404) if not found, Err(404) if the requested version is not served,
 /// and the CrContext on success.
-pub async fn find_crd(
-    state: &AppState,
+pub async fn find_crd<S: Store>(
+    state: &AppState<S>,
     group: &str,
     version: &str,
     plural: &str,
@@ -407,8 +407,8 @@ fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-pub async fn list_cr(
-    State(state): State<AppState>,
+pub async fn list_cr<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     headers: axum::http::HeaderMap,
     query: super::generic::CollectionQuery,
@@ -516,8 +516,8 @@ pub async fn list_cr(
     Ok(Json(body).into_response())
 }
 
-pub async fn get_cr(
-    State(state): State<AppState>,
+pub async fn get_cr<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
@@ -573,8 +573,8 @@ pub async fn get_cr(
         .into_response())
 }
 
-pub async fn create_cr(
-    State(state): State<AppState>,
+pub async fn create_cr<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -620,8 +620,8 @@ pub async fn create_cr(
     Ok((StatusCode::CREATED, Json(obj)))
 }
 
-pub async fn replace_cr(
-    State(state): State<AppState>,
+pub async fn replace_cr<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -692,8 +692,8 @@ pub async fn replace_cr(
     Ok(Json(obj))
 }
 
-pub async fn delete_cr(
-    State(state): State<AppState>,
+pub async fn delete_cr<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
@@ -729,8 +729,8 @@ pub async fn delete_cr(
 // Namespaced CR handlers
 // ---------------------------------------------------------------------------
 
-pub async fn list_cr_namespaced(
-    State(state): State<AppState>,
+pub async fn list_cr_namespaced<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     headers: axum::http::HeaderMap,
     query: super::generic::CollectionQuery,
@@ -835,8 +835,8 @@ pub async fn list_cr_namespaced(
     Ok(Json(body).into_response())
 }
 
-pub async fn get_cr_namespaced(
-    State(state): State<AppState>,
+pub async fn get_cr_namespaced<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
@@ -890,8 +890,8 @@ pub async fn get_cr_namespaced(
         .into_response())
 }
 
-pub async fn create_cr_namespaced(
-    State(state): State<AppState>,
+pub async fn create_cr_namespaced<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -943,8 +943,8 @@ pub async fn create_cr_namespaced(
     Ok((StatusCode::CREATED, Json(obj)))
 }
 
-pub async fn replace_cr_namespaced(
-    State(state): State<AppState>,
+pub async fn replace_cr_namespaced<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -1013,8 +1013,8 @@ pub async fn replace_cr_namespaced(
     Ok(Json(obj))
 }
 
-pub async fn delete_cr_namespaced(
-    State(state): State<AppState>,
+pub async fn delete_cr_namespaced<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
@@ -1076,8 +1076,8 @@ fn validate_patch_content_type(headers: &HeaderMap) -> Result<(), crate::status:
 // Cluster-scoped CR patch handler
 // ---------------------------------------------------------------------------
 
-pub async fn patch_cr(
-    State(state): State<AppState>,
+pub async fn patch_cr<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -1134,8 +1134,8 @@ pub async fn patch_cr(
 // Namespaced CR patch handler
 // ---------------------------------------------------------------------------
 
-pub async fn patch_cr_namespaced(
-    State(state): State<AppState>,
+pub async fn patch_cr_namespaced<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -1198,14 +1198,13 @@ pub async fn patch_cr_namespaced(
 /// `generic::put_resource_status`) and custom resources (stored under
 /// `/registry/cr/...`). Only updates the `.status` field; all other fields
 /// including `.spec` are left unchanged.
-pub async fn put_cr_status(
-    State(state): State<AppState>,
+pub async fn put_cr_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     use crate::{keys::group_object_key, types::ResourceKey, util::parse_resource_version};
-    use u7s_store::Store;
 
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -1282,8 +1281,8 @@ pub async fn put_cr_status(
 ///
 /// Returns the full object (status is embedded). For CRs this is identical to
 /// the main GET endpoint. For registry resources it delegates to get_resource.
-pub async fn get_cr_status(
-    State(state): State<AppState>,
+pub async fn get_cr_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     use crate::types::ResourceKey;

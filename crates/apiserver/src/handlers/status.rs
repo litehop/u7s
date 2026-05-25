@@ -21,16 +21,16 @@ use super::resource::{get_namespaced_resource, get_resource};
 
 // -- cluster-scoped --
 
-pub async fn get_resource_status(
-    State(state): State<AppState>,
+pub async fn get_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     // Same as get_resource; status is embedded in the object.
     get_resource(State(state), Path((group, version, plural, name))).await
 }
 
-pub async fn put_resource_status(
-    State(state): State<AppState>,
+pub async fn put_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -73,8 +73,8 @@ pub async fn put_resource_status(
     Ok(Json(current.body))
 }
 
-pub async fn patch_resource_status(
-    State(state): State<AppState>,
+pub async fn patch_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -136,16 +136,16 @@ pub async fn patch_resource_status(
 
 // -- namespaced --
 
-pub async fn get_namespaced_resource_status(
-    State(state): State<AppState>,
+pub async fn get_namespaced_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     // Same as get_namespaced_resource; status is embedded in the object.
     get_namespaced_resource(State(state), Path((group, version, ns, plural, name))).await
 }
 
-pub async fn put_namespaced_resource_status(
-    State(state): State<AppState>,
+pub async fn put_namespaced_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -206,8 +206,8 @@ pub async fn put_namespaced_resource_status(
     Ok(Json(current.body))
 }
 
-pub async fn patch_namespaced_resource_status(
-    State(state): State<AppState>,
+pub async fn patch_namespaced_resource_status<S: Store>(
+    State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -1378,6 +1378,240 @@ mod tests {
             err.0,
             axum::http::StatusCode::BAD_REQUEST,
             "empty name must return 400, not reach the store"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // MockStore — injects RevisionMismatch on the first put() after arm() is called.
+    //
+    // Using Arc<SqliteStore> for inner so we can clone the handle into the async
+    // block without borrowing self (SqliteStore is not Clone).
+    // ---------------------------------------------------------------------------
+
+    struct MockStore {
+        inner: Arc<SqliteStore>,
+        inject_next: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockStore {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(SqliteStore::new(":memory:").unwrap()),
+                inject_next: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.inject_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl u7s_store::Store for MockStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .inject_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move {
+                if inject {
+                    Err(u7s_store::StoreError::RevisionMismatch {
+                        expected: 1,
+                        current: 99,
+                    })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            // MockStore::watch is not called by the OCC tests (they only test put).
+            // Return an empty stream so MockStore compiles as a Store impl.
+            // Delegating to inner.watch() is not possible because SqliteStore::watch
+            // is async fn taking &self — the desugared future captures &self for its
+            // full lifetime, creating a borrow-across-await that the borrow checker
+            // rejects inside async move blocks.
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+    }
+
+    /// put_resource_status returns 409 Conflict when the store rejects the write
+    /// with RevisionMismatch (OCC: another writer updated the object concurrently).
+    ///
+    /// The handler must propagate RevisionMismatch as 409, not 500.  Without this
+    /// guarantee, controllers that retry on 409 would instead see 500 and stop
+    /// retrying, leaving the status field permanently stale.
+    #[tokio::test]
+    async fn put_resource_status_returns_409_on_revision_mismatch() {
+        let mock = Arc::new(MockStore::new());
+        // Seed a CSINode via the inner store (bypasses the inject flag).
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "node-occ" },
+            "spec": { "drivers": [] }
+        });
+        mock.inner
+            .put(
+                "/registry/storage.k8s.io/csinodes/node-occ",
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Arm the mock so the next put() injects RevisionMismatch.
+        mock.arm();
+
+        let state = crate::state::AppState::new(
+            mock,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "node-occ" },
+            "status": { "ready": true }
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "node-occ".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 409 but handler returned Ok"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "RevisionMismatch must produce 409 Conflict so controllers can retry"
+        );
+    }
+
+    /// put_namespaced_resource_status returns 409 Conflict when the store rejects
+    /// the write with RevisionMismatch.
+    ///
+    /// Same OCC contract as the cluster-scoped variant above, but exercising the
+    /// namespaced code path which has its own lookup and put call.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_returns_409_on_revision_mismatch() {
+        let mock = Arc::new(MockStore::new());
+        // Seed a Deployment via the inner store.
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "myapp", "namespace": "default" },
+            "spec": { "replicas": 1, "selector": {"matchLabels": {"app": "myapp"}}, "template": {} }
+        });
+        mock.inner
+            .put(
+                "/registry/apps/deployments/default/myapp",
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Arm the mock so the next put() injects RevisionMismatch.
+        mock.arm();
+
+        let state = crate::state::AppState::new(
+            mock,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "myapp", "namespace": "default" },
+            "status": { "readyReplicas": 1 }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "myapp".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 409 but handler returned Ok"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "RevisionMismatch must produce 409 Conflict so controllers can retry"
         );
     }
 }

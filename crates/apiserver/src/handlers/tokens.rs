@@ -75,8 +75,8 @@ struct SaRef {
 // Handler
 // ---------------------------------------------------------------------------
 
-pub async fn create_token(
-    State(state): State<AppState>,
+pub async fn create_token<S: Store>(
+    State(state): State<AppState<S>>,
     Path((raw_ns, sa_name)): Path<(String, String)>,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
