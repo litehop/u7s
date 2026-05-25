@@ -15,7 +15,9 @@ use crate::{
 #[derive(Deserialize)]
 pub struct CollectionQuery {
     pub watch: Option<bool>,
+    #[serde(rename = "resourceVersion")]
     pub resource_version: Option<u64>,
+    #[serde(rename = "labelSelector")]
     pub label_selector: Option<String>,
     #[serde(rename = "fieldSelector")]
     pub field_selector: Option<String>,
@@ -1654,6 +1656,84 @@ mod escalation_tests {
         assert!(
             !wants_partial_object_metadata(""),
             "empty Accept must not be detected as PartialObjectMetadata"
+        );
+    }
+}
+
+// -- CollectionQuery serde deserialization (mayor-utbu regression) --
+//
+// Kubernetes client-go sends camelCase query parameters: labelSelector, resourceVersion.
+// Without the correct #[serde(rename)] attributes, these are silently ignored, causing
+// label-filtered LIST and watch-from-revision requests to return all objects, which
+// breaks sonobuoy's delete wait loop (infinite loop after all CRBs are deleted).
+//
+// The rename attributes are validated via serde_json (rename applies to all serde formats).
+#[cfg(test)]
+mod collection_query_rename_tests {
+    use super::CollectionQuery;
+
+    /// labelSelector= query param must populate label_selector when renamed correctly.
+    ///
+    /// Without #[serde(rename = "labelSelector")], `label_selector` is always None
+    /// when clients send `?labelSelector=X` (Kubernetes standard camelCase param).
+    /// This causes LIST to return all objects regardless of label, breaking sonobuoy's
+    /// post-delete wait loop: it lists all CRBs (including protected system: ones),
+    /// tries to delete them, gets 403, and loops forever (mayor-utbu).
+    #[test]
+    fn label_selector_camel_case_field_is_deserialized() {
+        // serde #[rename] applies to all formats; JSON is the simplest to test without
+        // adding serde_urlencoded as an explicit dev-dependency.
+        let v = serde_json::json!({"labelSelector": "component=sonobuoy"});
+        let q: CollectionQuery =
+            serde_json::from_value(v).expect("labelSelector field must deserialize without error");
+        assert_eq!(
+            q.label_selector.as_deref(),
+            Some("component=sonobuoy"),
+            "labelSelector must populate label_selector; \
+             without #[serde(rename = \"labelSelector\")] the HTTP query param is silently \
+             ignored and all objects are returned regardless of label (mayor-utbu)"
+        );
+    }
+
+    /// resourceVersion= query param must populate resource_version when renamed correctly.
+    ///
+    /// Without #[serde(rename = "resourceVersion")], watches always start from rv=0
+    /// (full relist) rather than from the client's last-known revision.
+    #[test]
+    fn resource_version_camel_case_field_is_deserialized() {
+        let v = serde_json::json!({"resourceVersion": 42});
+        let q: CollectionQuery = serde_json::from_value(v)
+            .expect("resourceVersion field must deserialize without error");
+        assert_eq!(
+            q.resource_version,
+            Some(42),
+            "resourceVersion must populate resource_version; \
+             without #[serde(rename = \"resourceVersion\")] it is always None and \
+             watches always start from revision 0 (full relist)"
+        );
+    }
+
+    /// Snake_case variants must NOT match after the rename is applied.
+    ///
+    /// This is the inverse regression guard: if someone accidentally applies rename_all
+    /// or removes the per-field rename, the snake_case field names from the old (wrong)
+    /// deserialization path must no longer populate the fields.
+    #[test]
+    fn snake_case_variants_do_not_match_after_rename() {
+        // The old (wrong) field names would have been "label_selector" and "resource_version".
+        // After adding the rename attributes, ONLY the camelCase names are accepted.
+        let v = serde_json::json!({"label_selector": "app=foo", "resource_version": 5});
+        let q: CollectionQuery = serde_json::from_value(v)
+            .expect("unknown fields must be silently ignored by serde (no deny_unknown_fields)");
+        assert!(
+            q.label_selector.is_none(),
+            "snake_case 'label_selector' must NOT populate label_selector after rename; \
+             only camelCase 'labelSelector' should be accepted (this would indicate the \
+             rename was reverted or the wrong variant was used)"
+        );
+        assert!(
+            q.resource_version.is_none(),
+            "snake_case 'resource_version' must NOT populate resource_version after rename"
         );
     }
 }
