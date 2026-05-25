@@ -128,8 +128,9 @@ pub async fn list_resource<S: Store>(
 
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
-        let v: serde_json::Value =
+        let mut v: serde_json::Value =
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+        super::defaults::apply_defaults(&group, &plural, &mut v);
         items.push(v);
     }
 
@@ -185,12 +186,10 @@ pub async fn get_resource<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
 
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        stored.value,
-    )
-        .into_response())
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    super::defaults::apply_defaults(&group, &plural, &mut obj);
+    Ok(Json(obj).into_response())
 }
 
 pub async fn create_resource<S: Store>(
@@ -732,8 +731,9 @@ pub async fn list_namespaced_resource<S: Store>(
 
     let mut items = Vec::with_capacity(resp.items.len());
     for obj in &resp.items {
-        let v: serde_json::Value =
+        let mut v: serde_json::Value =
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
+        super::defaults::apply_defaults(&group, &plural, &mut v);
         items.push(v);
     }
 
@@ -794,12 +794,10 @@ pub async fn get_namespaced_resource<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
 
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        stored.value,
-    )
-        .into_response())
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    super::defaults::apply_defaults(&group, &plural, &mut obj);
+    Ok(Json(obj).into_response())
 }
 
 pub async fn create_namespaced_resource<S: Store>(
@@ -4291,5 +4289,132 @@ mod tests {
     fn seeded_rbac_wrong_group_is_not_protected() {
         assert!(!is_seeded_rbac_object("apps", "cluster-admin"));
         assert!(!is_seeded_rbac_object("", "system:node"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Service IP field defaulting — integration tests
+    // ---------------------------------------------------------------------------
+
+    /// POSTing a Service with only spec.clusterIP must cause the GET response to include
+    /// ipFamilies, ipFamilyPolicy, and clusterIPs.
+    ///
+    /// KCM's endpoints-controller crashes at IPFamilies[0] when these fields are absent.
+    /// Write-time defaulting ensures any Service stored after this fix has the fields.
+    /// Read-time defaulting in the GET handler covers pre-fix objects in the store.
+    #[tokio::test]
+    async fn service_create_and_get_has_ip_family_fields() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "my-svc", "namespace": "default" },
+            "spec": { "clusterIP": "10.96.0.1", "ports": [{ "port": 80 }] }
+        });
+
+        // Create via namespaced POST.
+        let create_result = create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Service create must succeed"))
+        .into_response();
+        assert_eq!(create_result.status(), axum::http::StatusCode::CREATED);
+
+        // GET it back.
+        let get_result = get_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "services".into(),
+                "my-svc".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Service GET must succeed"));
+
+        let body = to_bytes(get_result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["spec"]["ipFamilyPolicy"], "SingleStack",
+            "GET must return ipFamilyPolicy=SingleStack"
+        );
+        assert_eq!(
+            v["spec"]["ipFamilies"],
+            serde_json::json!(["IPv4"]),
+            "GET must return ipFamilies=[IPv4] for an IPv4 clusterIP"
+        );
+        assert_eq!(
+            v["spec"]["clusterIPs"],
+            serde_json::json!(["10.96.0.1"]),
+            "GET must return clusterIPs=[clusterIP]"
+        );
+    }
+
+    /// A headless Service (clusterIP="None") must get ipFamilies defaulted but no clusterIPs.
+    ///
+    /// "None" is a sentinel that kube uses for headless Services; it must not appear
+    /// in clusterIPs.  KCM reads IPFamilies[0] even for headless Services, so
+    /// the field must be present.
+    #[tokio::test]
+    async fn headless_service_get_has_ip_family_but_no_cluster_ips() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "headless-svc", "namespace": "default" },
+            "spec": { "clusterIP": "None" }
+        });
+
+        let _ = create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("headless Service create must succeed"))
+        .into_response();
+
+        let get_result = get_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "services".into(),
+                "headless-svc".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("headless Service GET must succeed"));
+
+        let body = to_bytes(get_result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["spec"]["ipFamilies"],
+            serde_json::json!(["IPv4"]),
+            "headless Service must have ipFamilies=[IPv4]"
+        );
+        assert!(
+            v["spec"]["clusterIPs"].is_null(),
+            "headless Service must not have clusterIPs set"
+        );
     }
 }
