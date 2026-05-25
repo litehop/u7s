@@ -1117,6 +1117,7 @@ pub async fn delete_collection_resource<S: Store>(
 
     for obj in resp.items {
         // Extract name from the stored JSON for RBAC index eviction and protection.
+        let mut cluster_ip_to_release: Option<String> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
             let name = parsed["metadata"]["name"]
                 .as_str()
@@ -1138,9 +1139,21 @@ pub async fn delete_collection_resource<S: Store>(
                 let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
                 state.rbac_index.remove_object(&rbac_key);
             }
+            if group.is_empty() && plural == "services" {
+                let ip = parsed["spec"]["clusterIP"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                if !ip.is_empty() {
+                    cluster_ip_to_release = Some(ip);
+                }
+            }
         }
         // Ignore NotFound races (another writer may have deleted concurrently).
         let _ = state.store.delete(&obj.key, None).await;
+        if let Some(ref ip) = cluster_ip_to_release {
+            state.release_service_ip(ip).await;
+        }
     }
 
     Ok(Json(serde_json::json!({
@@ -1179,11 +1192,21 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
         .transpose()?;
 
     for obj in resp.items {
+        let mut cluster_ip_to_release: Option<String> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
             let name = parsed["metadata"]["name"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+            if group.is_empty() && plural == "services" {
+                let ip = parsed["spec"]["clusterIP"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                if !ip.is_empty() {
+                    cluster_ip_to_release = Some(ip);
+                }
+            }
             if let Some(ref pairs) = label_pairs {
                 let kept = apply_label_selector(vec![parsed], pairs);
                 if kept.is_empty() {
@@ -1196,6 +1219,9 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
             }
         }
         let _ = state.store.delete(&obj.key, None).await;
+        if let Some(ref ip) = cluster_ip_to_release {
+            state.release_service_ip(ip).await;
+        }
     }
 
     Ok(Json(serde_json::json!({
@@ -4461,5 +4487,108 @@ mod tests {
             v["spec"]["clusterIPs"].is_null(),
             "headless Service must not have clusterIPs set"
         );
+    }
+
+    // -- delete_collection_namespaced_resource releases clusterIP sentinels --
+
+    /// Deleting a Service collection must release the clusterIP sentinels so those
+    /// IPs can be re-allocated.  Without this fix, each create-then-delete cycle
+    /// leaks a sentinel, causing CIDR exhaustion on clusters that churn Services.
+    #[tokio::test]
+    async fn delete_collection_releases_cluster_ip_sentinels() {
+        use crate::state::ServiceIpAllocator;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        // /30 gives exactly one usable IP (.2); .1 is reserved for kubernetes service.
+        // Use /29 so we have two usable IPs for two Services.
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let alloc = ServiceIpAllocator::from_cidr("10.0.0.0/29").expect("valid CIDR");
+        let state = crate::state::AppState::new_with_ca(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+            None,
+            None,
+            Some(alloc),
+        );
+
+        // Create two Services — allocation attaches a sentinel for each IP.
+        for name in &["svc-a", "svc-b"] {
+            let svc = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": { "name": name, "namespace": "default" },
+                "spec": {}
+            });
+            let _ = create_namespaced_resource(
+                State(state.clone()),
+                Path(("".into(), "v1".into(), "default".into(), "services".into())),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Service create must succeed"))
+            .into_response();
+        }
+
+        // Confirm two sentinels exist.
+        let sentinel_prefix = crate::state::SERVICE_IP_PREFIX;
+        let sentinels_before = store
+            .list(sentinel_prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list sentinels");
+        assert_eq!(
+            sentinels_before.items.len(),
+            2,
+            "two Services must produce two clusterIP sentinels"
+        );
+
+        // Delete the entire services collection in the default namespace.
+        delete_collection_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("delete_collection must succeed"));
+
+        // Sentinels must be gone — without the fix they would remain and exhaust the CIDR.
+        let sentinels_after = store
+            .list(sentinel_prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list sentinels after delete");
+        assert_eq!(
+            sentinels_after.items.len(),
+            0,
+            "delete_collection must release clusterIP sentinels; \
+             leaked sentinels cause CIDR exhaustion"
+        );
+
+        // Verify the CIDR can be fully allocated again (two IPs available).
+        let ip1 = state
+            .allocate_service_ip(false)
+            .await
+            .expect("allocation must not error")
+            .expect("allocation must return Some after sentinels released");
+        let ip2 = state
+            .allocate_service_ip(false)
+            .await
+            .expect("allocation must not error")
+            .expect("second allocation must return Some after sentinels released");
+        assert_ne!(ip1, ip2, "reallocated IPs must be distinct");
     }
 }
