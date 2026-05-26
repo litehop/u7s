@@ -60,6 +60,8 @@ pub async fn core_list_resource<S: Store>(
                 query.allow_watch_bookmarks == Some(true),
                 user.username,
                 false,
+                "".into(),
+                "pods".into(),
             )
             .await
             .map(IntoResponse::into_response);

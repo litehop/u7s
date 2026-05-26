@@ -122,6 +122,8 @@ pub async fn list_csr<S: Store>(
             query.allow_watch_bookmarks == Some(true),
             user.username,
             false,
+            GROUP.to_string(),
+            PLURAL.to_string(),
         )
         .await;
     }

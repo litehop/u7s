@@ -257,6 +257,8 @@ pub(crate) async fn watch_generic<S: Store>(
     // "meta.k8s.io/v1"/"PartialObjectMetadata" for BOOKMARK and DELETED events.
     // The caller must also pass api_version="meta.k8s.io/v1" and kind="PartialObjectMetadata".
     as_partial_object_metadata: bool,
+    group: String,
+    plural: String,
 ) -> Result<Response, crate::status::StatusError> {
     // Enforce per-client watch concurrency limit. Try to acquire a permit from
     // this user's semaphore. If the semaphore is exhausted (client already has
@@ -380,21 +382,34 @@ pub(crate) async fn watch_generic<S: Store>(
                             // Apply labelSelector and fieldSelector: filter Added/Modified events.
                             // Deleted events always pass through so clients can clean up.
                             // Bookmark and Compacted are handled above.
-                            let skip = match &event {
-                                WatchEvent::Added(obj) | WatchEvent::Modified(obj) => {
-                                    let parsed: serde_json::Value =
-                                        serde_json::from_slice(&obj.value)
-                                            .unwrap_or(serde_json::Value::Null);
-                                    !object_matches_label_selector(&parsed, &label_selector)
-                                        || !object_matches_field_selector(&parsed, &field_selector)
+                            if let WatchEvent::Added(obj) | WatchEvent::Modified(obj) = &event {
+                                let event_type = match &event {
+                                    WatchEvent::Added(_) => "ADDED",
+                                    _ => "MODIFIED",
+                                };
+                                if let Ok(s) = std::str::from_utf8(&obj.value) {
+                                    let mut parsed: serde_json::Value =
+                                        serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+                                    if object_matches_label_selector(&parsed, &label_selector)
+                                        && object_matches_field_selector(&parsed, &field_selector)
+                                    {
+                                        super::defaults::apply_defaults(&group, &plural, &mut parsed);
+                                        let emit = if as_partial_object_metadata {
+                                            to_partial_object_metadata(&parsed)
+                                        } else {
+                                            parsed
+                                        };
+                                        let line = format!(
+                                            "{{\"type\":\"{event_type}\",\"object\":{}}}\n",
+                                            serde_json::to_string(&emit).unwrap_or_default()
+                                        );
+                                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
+                                    }
+                                } else {
+                                    tracing::warn!("watch {event_type} event has invalid UTF-8, skipping");
                                 }
-                                _ => false,
-                            };
-
-                            if !skip {
-                                if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
-                                    yield Ok::<Bytes, axum::BoxError>(chunk);
-                                }
+                            } else if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
+                                yield Ok::<Bytes, axum::BoxError>(chunk);
                             }
                         }
                     }
@@ -673,6 +688,8 @@ mod tests {
             false,
             "test-user".into(),
             false,
+            "".into(),
+            "".into(),
         )
         .await;
 
@@ -721,6 +738,8 @@ mod tests {
             false,
             "test-user".into(),
             false,
+            "".into(),
+            "".into(),
         )
         .await;
 
@@ -794,6 +813,8 @@ mod tests {
             false,
             "alice".into(),
             false,
+            "".into(),
+            "".into(),
         )
         .await;
 
@@ -894,6 +915,8 @@ mod tests {
             false,
             "bob".into(),
             false,
+            "".into(),
+            "".into(),
         )
         .await;
 
@@ -987,6 +1010,8 @@ mod tests {
             false,
             "test-user".into(),
             false,
+            "".into(),
+            "".into(),
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed for label selector test"));
@@ -1062,6 +1087,8 @@ mod tests {
             false,
             "test-user".into(),
             false,
+            "".into(),
+            "".into(),
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed"));
@@ -1138,6 +1165,8 @@ mod tests {
             false,
             "test-user".into(),
             false,
+            "".into(),
+            "".into(),
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed"));
@@ -1526,6 +1555,8 @@ mod tests {
             true, // allow_watch_bookmarks
             "test-user".into(),
             false,
+            "".into(),
+            "".into(),
         )
         .await
         {
@@ -1555,6 +1586,89 @@ mod tests {
             added_count >= 1,
             "watch_generic must emit at least one ADDED event for the seeded object before the BOOKMARK; got {:?}",
             lines
+        );
+    }
+
+    /// A Service stored without ipFamilies/ipFamilyPolicy must have those fields defaulted in
+    /// the watch ADDED event. KCM's endpoints-controller indexes IPFamilies[0] on every
+    /// watch event; if the field is absent from the watch stream (even though GET would default it),
+    /// KCM panics. This test fails if apply_defaults is removed from the watch event path.
+    #[tokio::test]
+    async fn watch_generic_service_added_event_has_ip_family_defaults() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": "my-svc",
+                "namespace": "default"
+            },
+            "spec": {
+                "clusterIP": "10.96.1.1",
+                "selector": { "app": "foo" }
+            }
+        });
+        store
+            .put(
+                "/registry/services/default/my-svc",
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let resp = watch_generic(
+            state,
+            "/registry/services/default/".into(),
+            "v1".into(),
+            "Service".into(),
+            0,
+            None,
+            None,
+            None,
+            false,
+            "test-user".into(),
+            false,
+            "".into(),
+            "services".into(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
+
+        let lines = read_watch_body_with_timeout(resp).await;
+        let added = lines
+            .iter()
+            .find(|v| v["type"] == "ADDED")
+            .unwrap_or_else(|| panic!("must emit ADDED event; got {:?}", lines));
+
+        assert_eq!(
+            added["object"]["spec"]["ipFamilyPolicy"], "SingleStack",
+            "watch ADDED event must carry ipFamilyPolicy default; \
+             KCM reads this field from watch events and panics if absent"
+        );
+        assert_eq!(
+            added["object"]["spec"]["ipFamilies"],
+            serde_json::json!(["IPv4"]),
+            "watch ADDED event must carry ipFamilies default; \
+             KCM indexes IPFamilies[0] and panics if the slice is nil"
+        );
+        assert_eq!(
+            added["object"]["spec"]["clusterIPs"],
+            serde_json::json!(["10.96.1.1"]),
+            "watch ADDED event must carry clusterIPs default"
         );
     }
 }

@@ -252,6 +252,8 @@ async fn watch_pods<S: Store>(
         allow_watch_bookmarks,
         username,
         false,
+        "".into(),
+        "pods".into(),
     )
     .await
 }

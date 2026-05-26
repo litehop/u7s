@@ -469,6 +469,8 @@ pub async fn list_cr<S: Store>(
             query.allow_watch_bookmarks == Some(true),
             username,
             pom,
+            group.clone(),
+            plural.clone(),
         )
         .await;
     }
@@ -789,6 +791,8 @@ pub async fn list_cr_namespaced<S: Store>(
             query.allow_watch_bookmarks == Some(true),
             username,
             pom,
+            group.clone(),
+            plural.clone(),
         )
         .await;
     }
