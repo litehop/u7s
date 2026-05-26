@@ -22,7 +22,7 @@ fi
 
 # Kill any stale kube-controller-manager from a previous run.
 limactl shell "$VM_NAME" bash -c \
-  "pkill -f '^kube-controller-manager' 2>/dev/null || true"
+  "if pgrep -f '^kube-controller-manager' >/dev/null 2>&1; then echo 'WARNING: kube-controller-manager already running — killing and restarting' >&2; pkill -f '^kube-controller-manager' 2>/dev/null || true; sleep 1; fi"
 
 # Run setup foreground (download, cert conversion, kubeconfig rewrite),
 # then background only the final binary launch.

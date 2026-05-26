@@ -26,7 +26,11 @@ fi
 
 mkdir -p "$WORKDIR"
 
-pkill -f u7s-scheduler 2>/dev/null || true
+if pgrep -f u7s-scheduler >/dev/null 2>&1; then
+  echo "WARNING: u7s-scheduler already running — killing and restarting" >&2
+  pkill -f u7s-scheduler 2>/dev/null || true
+  sleep 1
+fi
 
 echo "Starting u7s-scheduler (logs: $LOG) ..."
 nohup "$BINARY" \
