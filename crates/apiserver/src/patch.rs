@@ -231,6 +231,14 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
 
         path if path.ends_with(".ports") => MergeKeyKind::Key("containerPort"),
 
+        // conditions arrays use "type" as the merge key across all resource types
+        // (Node, Pod, Deployment, PVC, Job, etc.).  Two paths are needed: "conditions"
+        // when called from the /status subresource handler (path root is stripped to ""),
+        // and "status.conditions" when patching the full object.
+        path if path == "conditions" || path.ends_with(".conditions") => {
+            MergeKeyKind::Key("type")
+        }
+
         "rules" | "subjects" => MergeKeyKind::Replace,
 
         _ => MergeKeyKind::Unknown,
@@ -734,6 +742,74 @@ mod tests {
             port443.unwrap()["targetPort"],
             8443,
             "port 443 targetPort must be unchanged"
+        );
+    }
+
+    #[test]
+    fn test_smp_conditions_merge_by_type_preserves_status_on_heartbeat() {
+        // Kubelet sends a full condition on first write, then a heartbeat-only patch that
+        // omits "status", "reason", and "message" for conditions that haven't transitioned.
+        // Without "type" as the merge key for conditions, the heartbeat patch replaces the
+        // whole array and the "status":"True" field on the Ready condition is lost.
+        // The e2e BeforeSuite checks condition.Status == ConditionTrue — if it finds None,
+        // all 444 conformance tests are skipped.
+        let mut target = json!({
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "KubeletReady",
+                        "message": "kubelet is posting ready status",
+                        "lastHeartbeatTime": "2026-05-26T05:00:00Z",
+                        "lastTransitionTime": "2026-05-26T05:00:00Z"
+                    },
+                    {
+                        "type": "MemoryPressure",
+                        "status": "False",
+                        "reason": "KubeletHasSufficientMemory",
+                        "message": "kubelet has sufficient memory available",
+                        "lastHeartbeatTime": "2026-05-26T05:00:00Z",
+                        "lastTransitionTime": "2026-05-26T05:00:00Z"
+                    }
+                ]
+            }
+        });
+
+        // Heartbeat patch: only updates lastHeartbeatTime, omits status/reason/message.
+        let heartbeat_patch = json!({
+            "conditions": [
+                {"type": "Ready",         "lastHeartbeatTime": "2026-05-26T05:00:10Z"},
+                {"type": "MemoryPressure","lastHeartbeatTime": "2026-05-26T05:00:10Z"}
+            ]
+        });
+
+        // This is called from the /status subresource handler: patch is applied to the
+        // stored status object with path root "".
+        let status = target["status"].as_object_mut().unwrap();
+        let mut status_val = serde_json::Value::Object(status.clone());
+        strategic_merge_patch(&mut status_val, &heartbeat_patch).unwrap();
+        target["status"] = status_val;
+
+        let conds = target["status"]["conditions"].as_array().unwrap();
+        let ready = conds.iter().find(|c| c["type"] == "Ready").unwrap();
+        assert_eq!(
+            ready["status"], "True",
+            "status:True must survive a heartbeat-only patch that omits the status field"
+        );
+        assert_eq!(
+            ready["lastHeartbeatTime"], "2026-05-26T05:00:10Z",
+            "lastHeartbeatTime must be updated by the heartbeat patch"
+        );
+        assert_eq!(
+            ready["reason"], "KubeletReady",
+            "reason must survive a heartbeat-only patch"
+        );
+
+        let mem = conds.iter().find(|c| c["type"] == "MemoryPressure").unwrap();
+        assert_eq!(
+            mem["status"], "False",
+            "MemoryPressure status:False must survive a heartbeat-only patch"
         );
     }
 }
