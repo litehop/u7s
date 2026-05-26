@@ -48,6 +48,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("batch", "v1"),
     ("certificates.k8s.io", "v1"),
     ("coordination.k8s.io", "v1"),
+    ("discovery.k8s.io", "v1"),
     ("gateway.networking.k8s.io", "v1"),
     ("networking.k8s.io", "v1"),
     ("node.k8s.io", "v1"),
@@ -163,6 +164,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("batch", "v1") => Some(batch_v1_resources()),
         ("certificates.k8s.io", "v1") => Some(certificates_v1_resources()),
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
+        ("discovery.k8s.io", "v1") => Some(discovery_v1_resources()),
         ("gateway.networking.k8s.io", "v1") => Some(gateway_networking_v1_resources()),
         ("gateway.networking.k8s.io", "v1beta1") => Some(gateway_networking_v1beta1_resources()),
         ("networking.k8s.io", "v1") => Some(networking_v1_resources()),
@@ -466,6 +468,24 @@ fn coordination_v1_resources() -> serde_json::Value {
                 "singularName": "lease",
                 "namespaced": true,
                 "kind": "Lease",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn discovery_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "discovery.k8s.io/v1",
+        "resources": [
+            {
+                "name": "endpointslices",
+                "singularName": "endpointslice",
+                "namespaced": true,
+                "kind": "EndpointSlice",
+                "shortNames": ["eps"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -983,6 +1003,46 @@ mod tests {
         assert_eq!(
             group.preferred_version.version, "v1",
             "v1 (storage=true) must be the preferredVersion"
+        );
+    }
+
+    // discovery.k8s.io must appear in /apis — KCM's endpointslice-controller lists
+    // discovery.k8s.io/v1/endpointslices at startup; 404 causes log-spam back-off.
+    #[tokio::test]
+    async fn discovery_group_appears_in_api_group_list() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"discovery.k8s.io"),
+            "discovery.k8s.io must appear in /apis; got: {names:?}"
+        );
+    }
+
+    // discovery.k8s.io/v1 resource list must include endpointslices so KCM can watch them.
+    #[tokio::test]
+    async fn discovery_v1_resources_list() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("discovery.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"endpointslices"),
+            "endpointslices must be in discovery.k8s.io/v1; got: {names:?}"
         );
     }
 

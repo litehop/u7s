@@ -646,6 +646,12 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("Lease", true, false),
     );
 
+    // discovery.k8s.io/v1
+    m.insert(
+        rk("discovery.k8s.io", "v1", "endpointslices"),
+        rm("EndpointSlice", true, false),
+    );
+
     // policy/v1
     m.insert(
         rk("policy", "v1", "poddisruptionbudgets"),
@@ -801,6 +807,25 @@ mod tests {
             .expect("runtimeclasses must be in build_registry");
         assert!(!meta.namespaced, "runtimeclasses is cluster-scoped");
         assert_eq!(meta.kind, "RuntimeClass");
+    }
+
+    /// EndpointSlice must be registered in discovery.k8s.io/v1. Without this entry the
+    /// generic handler falls through to the CR handler (no CRD installed) and returns 404.
+    /// KCM's endpointslice-controller lists this resource at startup; 404 causes it to
+    /// enter exponential back-off and log "failed to list *v1.EndpointSlice" every ~45 s.
+    #[test]
+    fn endpointslice_registered_in_discovery_v1() {
+        let registry = build_registry();
+        let key = rk("discovery.k8s.io", "v1", "endpointslices");
+        let meta = registry
+            .get(&key)
+            .expect("endpointslices must be in build_registry");
+        assert!(meta.namespaced, "EndpointSlice is namespaced");
+        assert!(
+            !meta.has_status_subresource,
+            "EndpointSlice has no status subresource"
+        );
+        assert_eq!(meta.kind, "EndpointSlice");
     }
 
     /// DaemonSet must be in apps/v1. Without this, POST/GET/LIST on
