@@ -34,13 +34,16 @@ impl ObjectKey {
     }
 }
 
-/// Filters a list to objects where a dot-separated JSON field equals a value.
+/// Filters a list to objects where a dot-separated JSON field matches a value.
 #[derive(Debug, Clone)]
 pub struct FieldSelector {
     /// Dot-separated JSON path, e.g. "spec.nodeName".
     pub field: String,
     /// Expected value, e.g. "node-01".
     pub value: String,
+    /// When true, include objects where the field does NOT equal value (!=).
+    /// When false, include objects where the field equals value (=).
+    pub negated: bool,
 }
 
 /// Options for a list operation.
@@ -470,9 +473,11 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
     // because in-memory filtering may discard rows between the cursor and the limit boundary.
     let (items, continue_key) = match &opts.field_selector {
         // Indexed fast-path: spec.nodeName on pods — uses the partial index.
-        Some(FieldSelector { field, value })
-            if field == "spec.nodeName" && prefix.starts_with("/registry/pods/") =>
-        {
+        Some(FieldSelector {
+            field,
+            value,
+            negated: false,
+        }) if field == "spec.nodeName" && prefix.starts_with("/registry/pods/") => {
             let like_prefix = format!("{}%", prefix);
             let raw = if ck.is_empty() {
                 query_all(
@@ -495,7 +500,11 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         }
 
         // Generic field selector: full scan + in-memory filter + in-memory pagination.
-        Some(FieldSelector { field, value }) => {
+        Some(FieldSelector {
+            field,
+            value,
+            negated,
+        }) => {
             let raw = if upper.is_empty() {
                 if ck.is_empty() {
                     query_all(
@@ -533,10 +542,21 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
                     for part in &path_parts {
                         match cur.get(part) {
                             Some(next) => cur = next,
-                            None => return false,
+                            None => return *negated,
                         }
                     }
-                    cur.as_str().is_some_and(|s| s == value)
+                    let matches = match cur {
+                        serde_json::Value::String(s) => s == value,
+                        serde_json::Value::Bool(b) => value == if *b { "true" } else { "false" },
+                        serde_json::Value::Null => value.is_empty(),
+                        serde_json::Value::Number(n) => value.as_str() == n.to_string(),
+                        _ => false,
+                    };
+                    if *negated {
+                        !matches
+                    } else {
+                        matches
+                    }
                 })
                 .collect();
             paginate_in_memory(filtered, opts.limit)
@@ -1247,6 +1267,7 @@ mod tests {
             field_selector: Some(FieldSelector {
                 field: "spec.nodeName".to_string(),
                 value: "node-1".to_string(),
+                negated: false,
             }),
             ..Default::default()
         };
@@ -1301,6 +1322,7 @@ mod tests {
             field_selector: Some(FieldSelector {
                 field: "metadata.namespace".to_string(),
                 value: "default".to_string(),
+                negated: false,
             }),
             ..Default::default()
         };
@@ -1340,6 +1362,167 @@ mod tests {
         let keys: Vec<&str> = resp.items.iter().map(|o| o.key.as_str()).collect();
         assert!(keys.contains(&"/registry/pods/default/alpha"));
         assert!(keys.contains(&"/registry/pods/default/beta"));
+    }
+
+    fn node_json(name: &str, unschedulable: bool) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": { "name": name },
+                "spec": { "unschedulable": unschedulable }
+            })
+            .to_string(),
+        )
+    }
+
+    fn node_json_no_unschedulable(name: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": { "name": name },
+                "spec": {}
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_field_selector_neq_bool_excludes_matching_nodes() {
+        // GetReadySchedulableNodes uses fieldSelector=spec.unschedulable!=true.
+        // A schedulable node (spec.unschedulable=false) must be INCLUDED.
+        // An unschedulable node (spec.unschedulable=true) must be EXCLUDED.
+        // Before the fix, the '!' was included in the field name, so json_extract
+        // looked for "$.spec.unschedulable!" which finds nothing — returning 0 results.
+        let store = make_store();
+
+        store
+            .put(
+                "/registry/nodes/schedulable",
+                node_json("schedulable", false),
+                Some(0),
+            )
+            .await
+            .expect("create schedulable node");
+        store
+            .put(
+                "/registry/nodes/unschedulable",
+                node_json("unschedulable", true),
+                Some(0),
+            )
+            .await
+            .expect("create unschedulable node");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "spec.unschedulable".to_string(),
+                value: "true".to_string(),
+                negated: true,
+            }),
+            ..Default::default()
+        };
+        let resp = store.list("/registry/nodes/", opts).await.expect("list");
+
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "only the schedulable node must be returned when filtering spec.unschedulable!=true"
+        );
+        assert_eq!(
+            resp.items[0].key, "/registry/nodes/schedulable",
+            "the schedulable node (spec.unschedulable=false) must be included; \
+             the unschedulable node must be excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_selector_eq_bool_includes_only_matching() {
+        // fieldSelector=spec.unschedulable=true must return ONLY unschedulable nodes.
+        // This tests that bool JSON values are compared correctly via string "true"/"false".
+        let store = make_store();
+
+        store
+            .put(
+                "/registry/nodes/schedulable",
+                node_json("schedulable", false),
+                Some(0),
+            )
+            .await
+            .expect("create schedulable node");
+        store
+            .put(
+                "/registry/nodes/unschedulable",
+                node_json("unschedulable", true),
+                Some(0),
+            )
+            .await
+            .expect("create unschedulable node");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "spec.unschedulable".to_string(),
+                value: "true".to_string(),
+                negated: false,
+            }),
+            ..Default::default()
+        };
+        let resp = store.list("/registry/nodes/", opts).await.expect("list");
+
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "only the unschedulable node must be returned when filtering spec.unschedulable=true"
+        );
+        assert_eq!(
+            resp.items[0].key, "/registry/nodes/unschedulable",
+            "the unschedulable node (spec.unschedulable=true) must match the = selector"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_selector_neq_absent_field_included() {
+        // When spec.unschedulable is absent (field not in JSON), the node is schedulable
+        // by default in Kubernetes. A != selector must include objects where the field
+        // is absent, not silently exclude them.
+        let store = make_store();
+
+        store
+            .put(
+                "/registry/nodes/no-field",
+                node_json_no_unschedulable("no-field"),
+                Some(0),
+            )
+            .await
+            .expect("create node without unschedulable field");
+        store
+            .put(
+                "/registry/nodes/unschedulable",
+                node_json("unschedulable", true),
+                Some(0),
+            )
+            .await
+            .expect("create unschedulable node");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "spec.unschedulable".to_string(),
+                value: "true".to_string(),
+                negated: true,
+            }),
+            ..Default::default()
+        };
+        let resp = store.list("/registry/nodes/", opts).await.expect("list");
+
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "node with absent spec.unschedulable must be included by != selector"
+        );
+        assert_eq!(
+            resp.items[0].key, "/registry/nodes/no-field",
+            "absent field is not equal to 'true', so != selector must include it"
+        );
     }
 
     #[tokio::test]
