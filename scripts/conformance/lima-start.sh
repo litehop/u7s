@@ -115,10 +115,15 @@ HOST_IP=$(limactl shell "$VM_NAME" getent hosts host.lima.internal 2>/dev/null |
 if [ -z "$HOST_IP" ]; then
   echo "WARNING: could not resolve host.lima.internal — skipping DNAT rule" >&2
 else
+  # OUTPUT: catches traffic from processes on the VM host itself.
+  # PREROUTING: catches traffic from containers/pods (their own network namespaces).
+  # Both chains are needed so that both kubelet and in-pod API calls are routed correctly.
   limactl shell "$VM_NAME" sudo iptables -t nat -D OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443" 2>/dev/null || true
   limactl shell "$VM_NAME" sudo iptables -t nat -A OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443"
+  limactl shell "$VM_NAME" sudo iptables -t nat -D PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443" 2>/dev/null || true
+  limactl shell "$VM_NAME" sudo iptables -t nat -A PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443"
   limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:6443"
+  echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:6443 (OUTPUT + PREROUTING)"
 fi
 
 # Wait for the node to appear.

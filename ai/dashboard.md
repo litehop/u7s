@@ -1,41 +1,52 @@
 # Dashboard
-2026-05-24 05:00 UTC
-Session: f317c180-6e09-4912-b648-3b889a2d42d0 (CLOSED)
-Open beads: 2 (1×P2 stale in-progress, 1×P3 deferred)
+2026-05-26 06:21 UTC
+Session: 77df47c6-8519-40b9-ab7b-8df161b2a86d
+Open beads: 4 (2×P1, 2×P2)
 
-## What needs the operator now
+## What I need to do next
 
-**sonobuoy-run.sh has an uncommitted fix** — `--skip-preflight=dnscheck` added to
-`scripts/sonobuoy-run.sh`. Include in next commit before running sonobuoy.
+**Run sonobuoy** — conditions merge fix is on main. This is the gate for mayor-gtue (0 tests run). The root cause was confirmed: kubelet heartbeat patches were replacing the whole conditions array last-write-wins, dropping `status:"True"` from the Ready condition. BeforeSuite saw zero schedulable nodes and aborted. Fix is landed.
 
-**Decision on mayor-4na6 (P2, IN_PROGRESS since 2026-05-22):**
-Generify AppState over `S: Store`. The OCC tests it was meant to unlock were delivered
-without it (PRs #221–#222). Close as superseded, or dispatch for future testability?
-
-**Run sonobuoy** (Phase 3 exit criterion 2):
-```
+```bash
 scripts/conformance/run-all.sh --reset
 ```
 
+**mayor-gtue** should auto-close once sonobuoy shows tests actually executing. If it still shows 0 tests, the conditions fix didn't take — restart the apiserver first so it picks up the new binary.
+
+**mayor-f44c + mayor-jz57** — pod log 500 and kubelet client cert 401 — both touch the log proxy and kubelet auth surface. Related. Flag before dispatching (auth surface).
+
+**mayor-ahrc** — sonobuoy retrieve timing fix. Low urgency until sonobuoy is running end-to-end; then dispatch.
+
+No operator decisions pending.
+
 ## Forward-looking
 
-After sonobuoy: triage HIGH failures → file beads → conformance sprint (Phase 3 → Phase 4).
-`mayor-6w76` (P3) — proto decoder, activate only on observed decode failure.
+After sonobuoy confirms tests are executing: triage actual failures → file beads → next dispatch wave.
+
+Expected failure surface based on what we know:
+- Pod log proxy (mayor-f44c / mayor-jz57) — retrieve and `kubectl logs` both broken
+- Any conformance tests that exercise exec/attach (same proxy path)
+- Unknown failures from the test run itself
+
+mayor-f44c and mayor-jz57 share the log proxy surface — candidate for a cluster dispatch once sonobuoy gives us the full failure list.
 
 ## Recent progress
 
-**Session f317c180: 9 PRs merged (#217–#225), ~21 beads closed, 912 workspace tests (+56 from ~856).**
+**This session: 8 PRs merged, 6 P2 beads closed, 1 P1 bead closed (mayor-2wi0).**
 
-| Area | What landed |
-|------|-------------|
-| Conformance stack | reset.sh, --reset flag, 04-start-kcm.sh bash fix, sonobuoy dns preflight fix |
-| Security | CT token constant-time comparison, JWT sub guard, cert identity rename + 3 tests |
-| Store | Lagged emits compaction_horizon correctly (not message count) |
-| Scheduler | Double-bind dedup, bind_pod Err on non-2xx, drain_watch_buffer → client-util, +14 tests |
-| Handler coverage | cr, status, resource, namespaces, pods, approval, csr (+42 tests, PRs #221–#222) |
-| Final coverage | stream.rs splice/BiStream, tls.rs edge cases, proxy.rs node-not-found (+13 tests, PRs #223–#225) |
+| PR | What landed | Beads |
+|----|-------------|-------|
+| #251/#255 | rusqlite 0.40 (renovate, twice due to bad revert cycle) | — |
+| #252 | Node proxy subresource | — |
+| #253 | SelfSubjectAccessReview 415 fix | mayor-2duz |
+| #254 | Table response for `kubectl get` | mayor-1wjo |
+| #256 | Watch stream defaults + namespaced collection DELETE | mayor-s2i6, mayor-k2g6 |
+| main | conditions merge key (`type`) for strategic-merge-patch | mayor-2wi0 (P1) |
+| main | Remove unused PodStatus struct | — |
+
+**Root cause of 0 tests in sonobuoy diagnosed and fixed:** kubelet sends heartbeat-only status patches every 10s that omit `status`/`reason`/`message` for stable conditions. Without `type` as the SMP merge key, the whole conditions array was replaced last-write-wins on each heartbeat. Ready condition lost `status:"True"`. e2e BeforeSuite saw 0 schedulable nodes → 444 tests skipped in 100ms.
+
+Also: local Rust upgraded to 1.95.0 (unblocking future pushes).
 
 ## Stance
-Pre-alpha/greenfield — break freely, no backward compat, correctness first,
-performance-critical, kubectl-compatible surface, minimal deps. Mayor merges on
-green CI automatically; flags security/API/architecture for operator first.
+Pre-alpha/greenfield — break freely, no backward compat, correctness first, performance-critical (RSS/latency hard targets), kubectl-compatible API surface, minimal deps. Mayor merges on green CI automatically; flags security/API/architecture decisions first.

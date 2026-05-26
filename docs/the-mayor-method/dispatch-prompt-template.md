@@ -128,6 +128,16 @@ You are implementing bead **<BEAD_ID>** in <project description>.
 - Bash is for runtime commands only: `git`, `cargo`, `gh`, `kubectl`, `bd`.
 - These are not preferences — violating them triggers permission prompts that
   stall the session. Use the right tool the first time.
+
+## Code style rules (mandatory)
+
+- Write no comments by default. Only add one when the WHY is non-obvious: a hidden
+  constraint, a subtle invariant, a workaround for a specific bug.
+- Never reference bead IDs, PR numbers, issue refs, or task identifiers in source
+  code or comments. Those belong in the PR body and git log — they rot in code.
+- Never reference callers or "used by X" — that information belongs in git history.
+- Test WHY, not WHAT. Test names and assertion messages must state why the behaviour
+  matters (what breaks for a user if it regresses), not just describe what the code does.
 ```
 
 ## Worktree path convention
@@ -531,6 +541,10 @@ When a worker returns from a VM/sonobuoy-touching bead:
   and `limactl shell` are both available. For any bead touching `scripts/conformance/`,
   `scripts/*-start.sh`, or sonobuoy-exercised handlers, inject the Lima VM protocol
   block verbatim.
+- **Workers embed bead IDs and task refs in source comments.** These rot immediately
+  as beads close and PRs age. The fix: the common preamble now explicitly bans bead
+  IDs in source. Enforce it at review time — if a diff contains `(mayor-`, send
+  the worker back.
 - **Generic prompts produce generic work.** Always include file:line
   citations + concrete fix sketches.
 - **Findings docs leak into PRs.** `ai/findings/` is gitignored; never

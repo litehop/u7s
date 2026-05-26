@@ -240,13 +240,15 @@ fn advertise_host(advertise_address: Option<&str>) -> Option<String> {
 }
 
 /// Build the full SAN list for the server certificate.
-/// Always includes localhost, 127.0.0.1, and host.lima.internal.
+/// Always includes localhost, 127.0.0.1, host.lima.internal, and 10.96.0.1
+/// (the kubernetes ClusterIP used by in-cluster clients).
 /// If advertise_host is Some, appends it as an IP SAN or DNS SAN.
 fn build_server_sans(advertise_host_str: Option<&str>) -> anyhow::Result<Vec<SanType>> {
     let mut sans: Vec<SanType> = vec![
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         SanType::DnsName("host.lima.internal".try_into()?),
+        SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 96, 0, 1))),
     ];
     if let Some(host) = advertise_host_str {
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -534,6 +536,22 @@ mod tests {
         assert!(
             has_lima,
             "host.lima.internal must be in server SANs regardless of advertise_address"
+        );
+    }
+
+    /// build_server_sans must always include 10.96.0.1 (kubernetes ClusterIP).
+    /// In-cluster clients (sonobuoy, pods) use KUBERNETES_SERVICE_HOST=10.96.0.1
+    /// and verify the TLS cert against it. Without this SAN the TLS handshake fails
+    /// even after the DNAT rule routes the traffic to the host apiserver.
+    #[test]
+    fn build_server_sans_always_includes_cluster_ip() {
+        let sans = build_server_sans(None).expect("build_server_sans failed");
+        let has_cluster_ip = sans
+            .iter()
+            .any(|s| matches!(s, SanType::IpAddress(ip) if ip.to_string() == "10.96.0.1"));
+        assert!(
+            has_cluster_ip,
+            "10.96.0.1 (kubernetes ClusterIP) must be in server SANs for in-cluster clients"
         );
     }
 
