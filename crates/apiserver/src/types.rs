@@ -1046,8 +1046,6 @@ mod pod_typed_fields_tests {
         assert_eq!(out["emptyDir"]["sizeLimit"], "128Mi");
     }
 
-
-
     /// PodSpec with volumes round-trips: volumes survive deserialization and
     /// re-serialization intact.
     #[test]
