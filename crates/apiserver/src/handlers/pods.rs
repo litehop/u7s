@@ -22,6 +22,8 @@ use crate::{
 pub struct CollectionQuery {
     pub watch: Option<bool>,
     pub resource_version: Option<u64>,
+    #[serde(rename = "labelSelector")]
+    pub label_selector: Option<String>,
     pub field_selector: Option<String>,
     /// When true, the server emits existing pods as ADDED events before streaming
     /// live changes. Used by kubelet (Kubernetes 1.27+) for efficient informer startup.
@@ -209,6 +211,13 @@ pub async fn list_pods<S: Store>(
 
     let items = if let Some(ref sel) = query.field_selector {
         filter_pods_by_field_selector(items, sel)
+    } else {
+        items
+    };
+
+    let items = if let Some(ref sel) = query.label_selector {
+        let pairs = super::generic::parse_label_selector(sel)?;
+        super::generic::apply_label_selector(items, &pairs)
     } else {
         items
     };
@@ -700,6 +709,7 @@ mod watch_tests {
         let q = CollectionQuery {
             watch: Some(true),
             resource_version: Some(42),
+            label_selector: None,
             field_selector: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
@@ -714,6 +724,7 @@ mod watch_tests {
         let q = CollectionQuery {
             watch: None,
             resource_version: None,
+            label_selector: None,
             field_selector: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
@@ -861,6 +872,49 @@ mod field_selector_tests {
     #[test]
     fn pod_store_field_selector_empty_returns_none() {
         assert!(pod_store_field_selector("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod label_selector_tests {
+    fn pod_with_label(name: &str, key: &str, value: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": name,
+                "namespace": "sonobuoy",
+                "labels": {key: value}
+            },
+            "spec": {}
+        })
+    }
+
+    /// labelSelector on pods LIST must exclude pods whose labels do not match.
+    ///
+    /// sonobuoy issues `kubectl get pods -n sonobuoy -l sonobuoy-component=aggregator`
+    /// and expects only the aggregator pod. Without label filtering, the plugin pod
+    /// (sonobuoy-component=plugin) is also returned, causing sonobuoy to miscount
+    /// running pods and stall.
+    #[test]
+    fn label_selector_excludes_non_matching_pods() {
+        let aggregator = pod_with_label("sonobuoy", "sonobuoy-component", "aggregator");
+        let plugin = pod_with_label("sonobuoy-e2e-job-abc", "sonobuoy-component", "plugin");
+        let items = vec![aggregator, plugin];
+
+        let pairs =
+            super::super::generic::parse_label_selector("sonobuoy-component=aggregator").unwrap();
+        let result = super::super::generic::apply_label_selector(items, &pairs);
+
+        assert_eq!(
+            result.len(),
+            1,
+            "labelSelector must exclude the plugin pod — only the aggregator should be returned"
+        );
+        assert_eq!(
+            result[0]["metadata"]["name"], "sonobuoy",
+            "the returned pod must be the aggregator, not the plugin"
+        );
     }
 }
 
