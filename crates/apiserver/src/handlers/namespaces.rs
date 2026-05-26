@@ -16,7 +16,7 @@ use crate::{
     state::AppState,
     status::Status,
     types::{NamespacePhase, NamespaceStatus, Object, ObjectMeta},
-    util::{extract_body, parse_resource_version},
+    util::{extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
 /// Validate a namespace name: lowercase alphanumeric + hyphens, 1–63 chars.
@@ -210,6 +210,15 @@ pub async fn create_namespace<S: Store>(
         if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
             obj.body["metadata"]["uid"] =
                 serde_json::Value::String(uuid::Uuid::new_v4().to_string());
+        }
+    }
+
+    {
+        let meta: ObjectMeta =
+            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        if meta.creation_timestamp.is_none() {
+            obj.body["metadata"]["creationTimestamp"] =
+                serde_json::Value::String(utc_now_rfc3339());
         }
     }
 
@@ -705,6 +714,48 @@ mod tests {
              Without this, the namespace hard-deletes immediately, orphaning resources. \
              Got finalizers: {:?}",
             finalizers
+        );
+    }
+
+    // create_namespace must stamp metadata.creationTimestamp so it is never null.
+    //
+    // Kubernetes clients and the e2e framework rely on creationTimestamp being a
+    // non-null RFC3339 string. A null value causes JSON marshalling errors in
+    // client-go and breaks conformance tests that inspect namespace metadata.
+    // The KCM's namespace informer may also behave incorrectly on null timestamps.
+    #[tokio::test]
+    async fn create_namespace_stamps_creation_timestamp() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("ts-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "ts-ns"))
+            .await
+            .expect("store get must not error")
+            .expect("namespace must exist in store");
+        let body: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored value must be valid JSON");
+
+        let ts = body["metadata"]["creationTimestamp"].as_str().unwrap_or("");
+        assert!(
+            !ts.is_empty(),
+            "create_namespace must stamp metadata.creationTimestamp as a non-empty RFC3339 string; \
+             a null value breaks client-go JSON marshalling and e2e framework namespace setup"
+        );
+        assert!(
+            ts.contains('T'),
+            "creationTimestamp must be RFC3339 (contains 'T'); got: {ts}"
         );
     }
 
