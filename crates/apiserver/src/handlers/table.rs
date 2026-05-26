@@ -214,7 +214,7 @@ fn parse_rfc3339_to_secs(ts: &str) -> Option<u64> {
 }
 
 fn is_leap(year: u64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
 fn days_from_epoch_to_year(year: u64) -> u64 {
