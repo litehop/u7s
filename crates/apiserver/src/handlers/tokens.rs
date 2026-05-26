@@ -41,7 +41,7 @@ struct TokenRequestSpec {
 }
 
 fn default_expiration() -> u64 {
-    3600
+    3607
 }
 
 // ---------------------------------------------------------------------------
@@ -171,10 +171,17 @@ pub async fn create_token<S: Store>(
         .map_err(|e| Status::internal(format!("JWT encode error: {e}")))?;
 
     // 7. Build response.
+    // Include spec.expirationSeconds and spec.audiences in the response so that kubelet's
+    // token_manager can read them. Kubelet reads spec.expirationSeconds to schedule token
+    // refresh; if absent it logs "Expiration seconds was nil for token request" and falls back.
     let expiration_timestamp = secs_to_rfc3339(exp);
     let resp = serde_json::json!({
         "apiVersion": "authentication.k8s.io/v1",
         "kind": "TokenRequest",
+        "spec": {
+            "audiences": claims.aud,
+            "expirationSeconds": spec.expiration_seconds
+        },
         "status": {
             "token": token,
             "expirationTimestamp": expiration_timestamp
@@ -226,10 +233,13 @@ mod tests {
         assert_eq!(secs_to_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
     }
 
-    /// default_expiration must be 3600 seconds (1 hour), matching Kubernetes default.
+    /// default_expiration must be 3607 seconds, matching upstream Kubernetes default.
+    /// The 7-second offset from 1 hour is intentional in upstream to avoid thundering herd:
+    /// different SAs requesting the default get slightly different actual lifetimes due to
+    /// clock skew, preventing all tokens from expiring at the same instant.
     #[test]
-    fn default_expiration_is_one_hour() {
-        assert_eq!(default_expiration(), 3600);
+    fn default_expiration_is_3607() {
+        assert_eq!(default_expiration(), 3607);
     }
 
     /// unix_now must return a plausible timestamp (after 2024-01-01).
@@ -860,6 +870,79 @@ mod handler_tests {
             exp - iat >= 600,
             "expiration must be clamped to at least 600s, got exp-iat={}",
             exp - iat
+        );
+    }
+
+    /// Regression test for mayor-o30k: response must include spec.expirationSeconds so kubelet's
+    /// token_manager can schedule token refresh without falling back.
+    ///
+    /// Kubelet reads spec.expirationSeconds from the TokenRequest response to know when to
+    /// refresh. If absent it logs "Expiration seconds was nil for token request" and uses a
+    /// conservative fallback, causing unnecessary kubelet–apiserver round-trips. Without
+    /// spec.expirationSeconds in the response this test will fail, re-exposing the bug.
+    #[tokio::test]
+    async fn create_token_response_includes_spec_expiration_seconds() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-spec-test").await;
+
+        let req_body = serde_json::json!({
+            "spec": {
+                "expirationSeconds": 600
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "token request must succeed: status={} message={}",
+                e.0, e.1.message
+            ),
+        };
+
+        // status.token must be non-empty.
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("status.token must be present");
+        assert!(!token.is_empty(), "status.token must not be empty");
+
+        // status.expirationTimestamp must be present — kubelet uses it to know the absolute expiry.
+        let exp_ts = resp_body["status"]["expirationTimestamp"]
+            .as_str()
+            .expect("status.expirationTimestamp must be present");
+        assert!(
+            !exp_ts.is_empty(),
+            "status.expirationTimestamp must not be empty"
+        );
+
+        // spec.expirationSeconds must be echoed back — kubelet reads this to schedule refresh.
+        // Without it, kubelet logs "Expiration seconds was nil for token request".
+        let resp_exp_secs = resp_body["spec"]["expirationSeconds"]
+            .as_u64()
+            .expect("spec.expirationSeconds must be present in response (mayor-o30k regression)");
+        assert_eq!(
+            resp_exp_secs, 600,
+            "spec.expirationSeconds in response must match the requested value"
+        );
+
+        // spec.audiences must also be present.
+        assert!(
+            resp_body["spec"]["audiences"].is_array(),
+            "spec.audiences must be present in response"
+        );
+
+        // status.expirationTimestamp must be approximately now + 600s.
+        // Parse the RFC3339 timestamp and verify it's in the expected range.
+        let parsed = exp_ts.trim_end_matches('Z');
+        assert!(
+            parsed.contains('T'),
+            "expirationTimestamp must be in RFC3339 format"
         );
     }
 }
