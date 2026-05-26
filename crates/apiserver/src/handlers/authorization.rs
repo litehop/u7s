@@ -1,9 +1,20 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Extension, Json,
+};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use u7s_store::Store;
 
-use crate::{auth::UserInfo, rbac::AuthzRequest, state::AppState};
+use crate::{
+    auth::UserInfo,
+    rbac::AuthzRequest,
+    state::AppState,
+    util::{content_type, extract_body},
+};
 
 // ---------------------------------------------------------------------------
 // SelfSubjectAccessReview
@@ -53,9 +64,28 @@ struct AccessReviewStatus {
 pub async fn self_subject_access_review<S: Store>(
     State(state): State<AppState<S>>,
     Extension(user): Extension<UserInfo>,
-    Json(body): Json<SelfSubjectAccessReviewRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
-    let allowed = if let Some(attrs) = body.spec.resource_attributes {
+    let body = extract_body(&body, content_type(&headers));
+    let req: SelfSubjectAccessReviewRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "message": format!("invalid request body: {e}"),
+                    "reason": "BadRequest",
+                    "code": 400
+                })),
+            )
+                .into_response();
+        }
+    };
+    let allowed = if let Some(attrs) = req.spec.resource_attributes {
         let ns = if attrs.namespace.is_empty() {
             None
         } else {
@@ -88,7 +118,7 @@ pub async fn self_subject_access_review<S: Store>(
         status: AccessReviewStatus { allowed },
     };
 
-    (StatusCode::CREATED, Json(resp))
+    (StatusCode::CREATED, Json(resp)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -133,9 +163,28 @@ struct ResourceRule {
 pub async fn self_subject_rules_review<S: Store>(
     State(state): State<AppState<S>>,
     Extension(user): Extension<UserInfo>,
-    Json(body): Json<SelfSubjectRulesReviewRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
-    let namespace = &body.spec.namespace;
+    let body = extract_body(&body, content_type(&headers));
+    let req: SelfSubjectRulesReviewRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "message": format!("invalid request body: {e}"),
+                    "reason": "BadRequest",
+                    "code": 400
+                })),
+            )
+                .into_response();
+        }
+    };
+    let namespace = &req.spec.namespace;
     let policy_rules = state
         .rbac_index
         .enumerate_rules(&user.username, &user.groups, namespace);
@@ -159,7 +208,7 @@ pub async fn self_subject_rules_review<S: Store>(
         },
     };
 
-    (StatusCode::CREATED, Json(resp))
+    (StatusCode::CREATED, Json(resp)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,8 +241,28 @@ struct SubjectAccessReviewResponse {
 pub async fn subject_access_review<S: Store>(
     State(state): State<AppState<S>>,
     Extension(caller): Extension<UserInfo>,
-    Json(body): Json<SubjectAccessReviewRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
+    let body = extract_body(&body, content_type(&headers));
+    let parsed: SubjectAccessReviewRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "message": format!("invalid request body: {e}"),
+                    "reason": "BadRequest",
+                    "code": 400
+                })),
+            )
+                .into_response();
+        }
+    };
+
     // Defense-in-depth privilege check: only callers who have `create` on
     // `subjectaccessreviews` in the authorization.k8s.io group (or are in
     // system:masters) may use SAR to probe arbitrary subjects.
@@ -229,7 +298,7 @@ pub async fn subject_access_review<S: Store>(
             .into_response();
     }
 
-    let spec = body.spec;
+    let spec = parsed.spec;
     let allowed = if let Some(attrs) = spec.resource_attributes {
         let ns = if attrs.namespace.is_empty() {
             None
@@ -305,9 +374,28 @@ struct TokenReviewUser {
 
 pub async fn token_review<S: Store>(
     State(state): State<AppState<S>>,
-    Json(body): Json<TokenReviewRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
-    let token = body.spec.token;
+    let body = extract_body(&body, content_type(&headers));
+    let req: TokenReviewRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "message": format!("invalid request body: {e}"),
+                    "reason": "BadRequest",
+                    "code": 400
+                })),
+            )
+                .into_response();
+        }
+    };
+    let token = req.spec.token;
     let user_info =
         crate::auth::authenticate_token(&token, &state.token_map, state.sa_decoding_key.as_deref());
 
@@ -332,7 +420,7 @@ pub async fn token_review<S: Store>(
         status,
     };
 
-    (StatusCode::CREATED, Json(resp))
+    (StatusCode::CREATED, Json(resp)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,6 +1299,47 @@ mod handler_tests {
         assert!(
             val["status"]["user"].is_null(),
             "user field must be absent when not authenticated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: Content-Type: application/json must not produce 415
+    // -----------------------------------------------------------------------
+
+    /// `kubectl auth can-i` sends POST with Content-Type: application/json and expects
+    /// 201 CREATED. Before this fix the axum Json extractor rejected these requests with
+    /// 415 UnsupportedMediaType because it required a content-type match that was more
+    /// strict than the handler needed. The handler must accept any JSON-compatible body.
+    #[tokio::test]
+    async fn ssar_post_with_application_json_content_type_returns_201_not_415() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .with_state(state);
+
+        let body_bytes =
+            Bytes::from(serde_json::to_vec(&serde_json::json!({ "spec": {} })).unwrap());
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews")
+            .header("content-type", "application/json")
+            .body(Body::from(body_bytes))
+            .unwrap();
+        req.extensions_mut().insert(user("any-user", &[]));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type: application/json must not produce 415 — kubectl auth can-i would be broken"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "SelfSubjectAccessReview POST with application/json must return 201 CREATED"
         );
     }
 }
