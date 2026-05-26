@@ -390,24 +390,6 @@ pub struct VolumeProjection {
     pub rest: serde_json::Value,
 }
 
-/// Typed representation of the Pod `status` fields read by handlers.
-/// `phase` and `conditions` are the only fields the apiserver logic
-/// dereferences; everything else passes through opaquely via `rest`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PodStatus {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub phase: Option<String>,
-    /// Pod conditions stay opaque — the apiserver does not pattern-match
-    /// on individual condition fields, only on the array as a whole.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conditions: Option<Vec<serde_json::Value>>,
-    /// All other status fields.
-    #[serde(flatten)]
-    #[schemars(skip)]
-    pub rest: serde_json::Value,
-}
-
 // ---------------------------------------------------------------------------
 // Binding — typed Binding subresource body
 // ---------------------------------------------------------------------------
@@ -1064,33 +1046,7 @@ mod pod_typed_fields_tests {
         assert_eq!(out["emptyDir"]["sizeLimit"], "128Mi");
     }
 
-    /// PodStatus must deserialize `phase` and `conditions` and preserve other fields.
-    ///
-    /// Handlers read `phase` to check lifecycle; `conditions` is used in status
-    /// merge. If the typed struct drops `hostIP` or `podIP`, kubelet updates are
-    /// silently discarded.
-    #[test]
-    fn pod_status_round_trips_without_dropping_fields() {
-        let json = serde_json::json!({
-            "phase": "Running",
-            "conditions": [
-                {"type": "Ready", "status": "True"}
-            ],
-            "hostIP": "10.0.0.1",
-            "podIP": "172.16.0.5"
-        });
-        let status: PodStatus = serde_json::from_value(json).unwrap();
-        assert_eq!(status.phase.as_deref(), Some("Running"));
-        let conds = status.conditions.as_ref().unwrap();
-        assert_eq!(conds.len(), 1);
-        assert_eq!(conds[0]["type"], "Ready");
-        let out = serde_json::to_value(&status).unwrap();
-        // Typed fields present
-        assert_eq!(out["phase"], "Running");
-        // Untyped fields must survive (rest flatten)
-        assert_eq!(out["hostIP"], "10.0.0.1");
-        assert_eq!(out["podIP"], "172.16.0.5");
-    }
+
 
     /// PodSpec with volumes round-trips: volumes survive deserialization and
     /// re-serialization intact.
