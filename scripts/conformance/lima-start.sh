@@ -107,6 +107,84 @@ limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
 echo "Starting kubelet inside VM..."
 limactl shell "$VM_NAME" sudo systemctl restart kubelet
 
+# Start kube-controller-manager inside the VM (required for root-ca-cert-publisher,
+# SA tokens, GC, namespace lifecycle, etc. — pods stay Pending without it).
+echo "Starting kube-controller-manager inside VM..."
+REPO_KCM="$(cd "$(dirname "$0")/../.." && pwd)"
+WORKDIR_KCM="$REPO_KCM/temp/u7s"
+KCM_LOG="/tmp/kcm.log"
+limactl shell "$VM_NAME" bash -s <<KCMEOF
+set -euo pipefail
+
+WORKDIR="$WORKDIR_KCM"
+CACHE_DIR="\${KCM_CACHE_DIR:-\${HOME}/.cache/u7s/kcm}"
+KCM_LOG="$KCM_LOG"
+
+DEFAULT_VERSION="1.34.8"
+if command -v kubectl &>/dev/null; then
+  DETECTED=\$(kubectl version --client -o json 2>/dev/null \
+    | jq -r '.clientVersion.gitVersion' 2>/dev/null \
+    | sed 's/^v//' || true)
+  if [[ "\$DETECTED" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    DEFAULT_VERSION="\$DETECTED"
+  fi
+fi
+K8S_VERSION="\$DEFAULT_VERSION"
+
+ARCH="\$(uname -m)"
+case "\$ARCH" in
+  x86_64)  ARCH="amd64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
+  *) echo "error: unsupported architecture: \$ARCH" >&2; exit 1 ;;
+esac
+
+KCM_BINARY="\$CACHE_DIR/kube-controller-manager-\${K8S_VERSION}-linux-\${ARCH}"
+
+for f in "\$WORKDIR/kubeconfig" "\$WORKDIR/ca.crt" "\$WORKDIR/ca.key" "\$WORKDIR/sa.key"; do
+  if [ ! -f "\$f" ]; then
+    echo "error: missing required file: \$f" >&2
+    exit 1
+  fi
+done
+
+if [ ! -f "\$KCM_BINARY" ]; then
+  mkdir -p "\$CACHE_DIR"
+  URL="https://dl.k8s.io/release/v\${K8S_VERSION}/bin/linux/\${ARCH}/kube-controller-manager"
+  echo "Downloading kube-controller-manager v\${K8S_VERSION} (linux/\${ARCH}) ..."
+  curl -fsSL "\$URL" -o "\$KCM_BINARY"
+  chmod +x "\$KCM_BINARY"
+  echo "Cached at \$KCM_BINARY"
+fi
+
+pkill -f '^kube-controller-manager' 2>/dev/null || true
+
+TMPDIR_KCM="\$(mktemp -d)"
+openssl x509 -inform DER -in "\$WORKDIR/ca.crt" -out "\$TMPDIR_KCM/ca.pem"
+CA_CERT="\$TMPDIR_KCM/ca.pem"
+
+KUBECONFIG_FILE="\$WORKDIR/kubeconfig"
+if grep -q "127.0.0.1" "\$KUBECONFIG_FILE" && grep -q "host.lima.internal" /etc/hosts 2>/dev/null; then
+  sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "\$KUBECONFIG_FILE" > "\$TMPDIR_KCM/kubeconfig"
+  KUBECONFIG_FILE="\$TMPDIR_KCM/kubeconfig"
+fi
+
+setsid "\$KCM_BINARY" \\
+  --kubeconfig="\$KUBECONFIG_FILE" \\
+  --cluster-signing-cert-file="\$CA_CERT" \\
+  --cluster-signing-key-file="\$WORKDIR/ca.key" \\
+  --service-account-private-key-file="\$WORKDIR/sa.key" \\
+  --root-ca-file="\$CA_CERT" \\
+  --controllers=csrapproving,csrsigning,garbagecollector,deployment,replicaset,root-ca-cert-publisher,endpoints-controller,endpointslice-controller,namespace,serviceaccount \\
+  --use-service-account-credentials=false \\
+  --leader-elect=false \\
+  --bind-address=127.0.0.1 \\
+  --kube-api-content-type=application/json \\
+  > "\$KCM_LOG" 2>&1 &
+
+echo "kube-controller-manager running (PID \$!, log: \$KCM_LOG)"
+KCMEOF
+echo "To tail KCM logs: limactl shell $VM_NAME tail -f $KCM_LOG"
+
 # Route kubernetes ClusterIP (10.96.0.1:443) to the host apiserver inside the VM.
 # Pods use in-cluster config (KUBERNETES_SERVICE_HOST=10.96.0.1) to reach the apiserver.
 # Without this rule, 10.96.0.1 traffic has no route in the VM and times out.
