@@ -235,9 +235,7 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // (Node, Pod, Deployment, PVC, Job, etc.).  Two paths are needed: "conditions"
         // when called from the /status subresource handler (path root is stripped to ""),
         // and "status.conditions" when patching the full object.
-        path if path == "conditions" || path.ends_with(".conditions") => {
-            MergeKeyKind::Key("type")
-        }
+        path if path == "conditions" || path.ends_with(".conditions") => MergeKeyKind::Key("type"),
 
         "rules" | "subjects" => MergeKeyKind::Replace,
 
@@ -806,7 +804,10 @@ mod tests {
             "reason must survive a heartbeat-only patch"
         );
 
-        let mem = conds.iter().find(|c| c["type"] == "MemoryPressure").unwrap();
+        let mem = conds
+            .iter()
+            .find(|c| c["type"] == "MemoryPressure")
+            .unwrap();
         assert_eq!(
             mem["status"], "False",
             "MemoryPressure status:False must survive a heartbeat-only patch"
