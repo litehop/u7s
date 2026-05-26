@@ -1470,6 +1470,16 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
             serde_json::to_value(spec.enable_service_links).expect("bool is always serializable");
     }
 
+    // dnsPolicy: default to "ClusterFirst" when absent.
+    // Real kube-apiserver always stamps this field on create. The kubelet reads
+    // spec.dnsPolicy and rejects empty string with "invalid DNSPolicy=", which
+    // causes it to fall back to ClusterFirst for every pod — silently incorrect
+    // behaviour. Defaulting here matches kube-apiserver behaviour and preserves
+    // any explicit value set by the user (e.g. ClusterFirstWithHostNet, None).
+    if pod["spec"]["dnsPolicy"].is_null() {
+        pod["spec"]["dnsPolicy"] = serde_json::json!("ClusterFirst");
+    }
+
     // defaultMode for volume sources that require it.
     // The kubelet refuses to mount ConfigMap/Secret volumes whose defaultMode is absent:
     //   "no defaultMode used, not even the default value for it"
@@ -1792,6 +1802,88 @@ mod create_defaults_tests {
         assert_eq!(
             pod["spec"]["initContainers"][0]["env"][0]["valueFrom"]["fieldRef"]["apiVersion"],
             serde_json::json!("v1"),
+        );
+    }
+
+    // --- dnsPolicy defaulting tests ---
+
+    /// create_pod must default spec.dnsPolicy to "ClusterFirst" when absent.
+    ///
+    /// Real kube-apiserver always stamps this field on create. The kubelet reads
+    /// spec.dnsPolicy and logs "invalid DNSPolicy=" with an empty string, then
+    /// falls back to ClusterFirst for every pod — silently incorrect behaviour.
+    /// Without this default, every pod in a conformance run triggers the kubelet
+    /// error "Failed to get DNS type for pod. Falling back to DNSClusterFirst
+    /// policy. err=invalid DNSPolicy=".
+    #[test]
+    fn dns_policy_defaults_to_cluster_first_when_absent() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["dnsPolicy"],
+            serde_json::json!("ClusterFirst"),
+            "dnsPolicy must be defaulted to ClusterFirst when absent — \
+             kubelet rejects empty string with 'invalid DNSPolicy=' and falls back \
+             incorrectly, silently breaking pod DNS for every pod in a cluster"
+        );
+    }
+
+    /// create_pod must NOT override an explicit dnsPolicy value.
+    ///
+    /// A pod running in host network mode uses ClusterFirstWithHostNet so that
+    /// DNS resolution works correctly while sharing the host network namespace.
+    /// Overriding this to ClusterFirst would silently break DNS for such pods.
+    ///
+    /// This is also the round-trip regression test: a pod created with an explicit
+    /// dnsPolicy must have that exact value when read back from the store.
+    #[test]
+    fn dns_policy_explicit_value_is_preserved() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "hostnet-pod", "namespace": "default"},
+            "spec": {
+                "dnsPolicy": "ClusterFirstWithHostNet",
+                "hostNetwork": true,
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["dnsPolicy"],
+            serde_json::json!("ClusterFirstWithHostNet"),
+            "an explicit dnsPolicy must not be overridden by the default — \
+             ClusterFirstWithHostNet is required for pods using hostNetwork; \
+             overriding it would silently break DNS resolution for those pods"
+        );
+    }
+
+    /// create_pod must NOT override dnsPolicy: "None" (user-managed DNS).
+    ///
+    /// Pods with dnsPolicy=None manage DNS entirely via dnsConfig.nameservers.
+    /// Overriding to ClusterFirst would silently break their custom DNS setup.
+    #[test]
+    fn dns_policy_none_is_preserved() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "dnsPolicy": "None",
+                "dnsConfig": {"nameservers": ["1.1.1.1"]},
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["dnsPolicy"],
+            serde_json::json!("None"),
+            "dnsPolicy=None must be preserved — user-managed DNS pods configure \
+             nameservers via dnsConfig; overriding would silently redirect DNS traffic"
         );
     }
 
@@ -2721,6 +2813,139 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // dnsPolicy round-trip regression test (mayor-grmb)
+    // -----------------------------------------------------------------------
+
+    /// A pod created with spec.dnsPolicy: ClusterFirstWithHostNet must have that
+    /// exact value when read back via GET.
+    ///
+    /// Before the fix, spec.dnsPolicy was absent from the stored pod when not
+    /// explicitly set, causing the kubelet to log "invalid DNSPolicy=" for every
+    /// pod and fall back to ClusterFirst — silently incorrect behaviour.
+    ///
+    /// This test also verifies the full create→get round-trip so that a future
+    /// regression (e.g. a new defaulting pass that strips dnsPolicy) is caught.
+    #[tokio::test]
+    async fn create_pod_dns_policy_survives_round_trip() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .with_state(state);
+
+        // Create a pod with an explicit dnsPolicy.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "dns-pod", "namespace": "default"},
+            "spec": {
+                "dnsPolicy": "ClusterFirstWithHostNet",
+                "hostNetwork": true,
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let create_req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let create_resp = app.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(
+            create_resp.status(),
+            StatusCode::CREATED,
+            "pod creation must succeed"
+        );
+
+        // Read the pod back via GET.
+        let get_req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/dns-pod")
+            .body(Body::empty())
+            .unwrap();
+
+        let get_resp = app.oneshot(get_req).await.unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(get_resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            v["spec"]["dnsPolicy"],
+            serde_json::json!("ClusterFirstWithHostNet"),
+            "spec.dnsPolicy must survive the create→get round-trip unchanged — \
+             before mayor-grmb fix this was lost, causing kubelet to log \
+             'invalid DNSPolicy=' for every pod"
+        );
+
+        // Verify stored value directly in the store for defense-in-depth.
+        let stored = store
+            .get("/registry/pods/default/dns-pod")
+            .await
+            .unwrap()
+            .expect("pod must be in store");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["spec"]["dnsPolicy"],
+            serde_json::json!("ClusterFirstWithHostNet"),
+            "spec.dnsPolicy must be present in the stored object, not just the response"
+        );
+    }
+
+    /// A pod created without spec.dnsPolicy must have it defaulted to "ClusterFirst"
+    /// after creation (matching real kube-apiserver behaviour).
+    ///
+    /// Kubelet reads spec.dnsPolicy on every pod; an empty string causes it to
+    /// log "invalid DNSPolicy=" and fall back incorrectly for every pod.
+    #[tokio::test]
+    async fn create_pod_dns_policy_defaults_to_cluster_first_when_absent() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "no-dns-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/no-dns-pod")
+            .await
+            .unwrap()
+            .expect("pod must be in store");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["dnsPolicy"],
+            serde_json::json!("ClusterFirst"),
+            "dnsPolicy must be defaulted to ClusterFirst when absent at creation time — \
+             real kube-apiserver always stamps this field; the kubelet rejects empty string"
+        );
     }
 
     // -----------------------------------------------------------------------
