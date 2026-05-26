@@ -1,52 +1,44 @@
 # Dashboard
-2026-05-26 06:21 UTC
-Session: 77df47c6-8519-40b9-ab7b-8df161b2a86d
-Open beads: 4 (2×P1, 2×P2)
+2026-05-26 17:05 UTC
+Session: current — resume with `claude --continue` in /Users/balint.erdos/u7s
+Open beads: 0
 
 ## What I need to do next
 
-**Run sonobuoy** — conditions merge fix is on main. This is the gate for mayor-gtue (0 tests run). The root cause was confirmed: kubelet heartbeat patches were replacing the whole conditions array last-write-wins, dropping `status:"True"` from the Ready condition. BeforeSuite saw zero schedulable nodes and aborted. Fix is landed.
+**Operator action needed: one more `--reset` run.**
 
+The last sonobuoy run (07:18 UTC) started before PR #259 merged (07:25 UTC) so it used the old binary. The fix IS verified working end-to-end: SA token from inside the VM against `10.96.0.1:443` now returns lima-node correctly. Run:
 ```bash
 scripts/conformance/run-all.sh --reset
 ```
-
-**mayor-gtue** should auto-close once sonobuoy shows tests actually executing. If it still shows 0 tests, the conditions fix didn't take — restart the apiserver first so it picks up the new binary.
-
-**mayor-f44c + mayor-jz57** — pod log 500 and kubelet client cert 401 — both touch the log proxy and kubelet auth surface. Related. Flag before dispatching (auth surface).
-
-**mayor-ahrc** — sonobuoy retrieve timing fix. Low urgency until sonobuoy is running end-to-end; then dispatch.
+This time BeforeSuite should pass and real test failures will appear.
 
 No operator decisions pending.
 
 ## Forward-looking
 
-After sonobuoy confirms tests are executing: triage actual failures → file beads → next dispatch wave.
+**Next: sonobuoy triage wave.** Once we have real failures, expected surface from prior analysis:
+- `generateName` (mayor-l8f was filed — check if still open after bd sync)
+- JSON Patch / `application/json-patch+json` (mayor-jf3)
+- `spec.nodeName` fieldSelector on pods (probably works — we have the SQL fast-path)
+- Other fieldSelectors (mayor-yx5 — partial; `!=` now works, but other spec fields may not)
+- Namespace Terminating lifecycle (mayor-c3v)
+- Pod status subresource (mayor-b4g)
+- `kubectl logs` / log proxy returning 500 (known surface, was mayor-f44c)
 
-Expected failure surface based on what we know:
-- Pod log proxy (mayor-f44c / mayor-jz57) — retrieve and `kubectl logs` both broken
-- Any conformance tests that exercise exec/attach (same proxy path)
-- Unknown failures from the test run itself
+After sonobuoy: file beads → cluster by surface → dispatch 4-6 workers.
 
-mayor-f44c and mayor-jz57 share the log proxy surface — candidate for a cluster dispatch once sonobuoy gives us the full failure list.
+## Recent progress (this session)
 
-## Recent progress
+**PR #259 in CI:** fix fieldSelector `!=` operator and bool comparison — root cause of 0 tests running. Worker diagnosed: `parse_field_selector` split on first `=`, so `spec.unschedulable!=true` became field=`spec.unschedulable!`, value=`true`. Store returned 0 nodes. BeforeSuite aborted.
 
-**This session: 8 PRs merged, 6 P2 beads closed, 1 P1 bead closed (mayor-2wi0).**
+**Root cause investigation method:** read e2e log directly from kubelet emptyDir volume (`/var/lib/kubelet/pods/.../output-volume/`) via Lima MCP — no need for full sonobuoy run to diagnose. Also confirmed via `kubectl get nodes --field-selector=spec.unschedulable!=true` returning empty live.
 
-| PR | What landed | Beads |
-|----|-------------|-------|
-| #251/#255 | rusqlite 0.40 (renovate, twice due to bad revert cycle) | — |
-| #252 | Node proxy subresource | — |
-| #253 | SelfSubjectAccessReview 415 fix | mayor-2duz |
-| #254 | Table response for `kubectl get` | mayor-1wjo |
-| #256 | Watch stream defaults + namespaced collection DELETE | mayor-s2i6, mayor-k2g6 |
-| main | conditions merge key (`type`) for strategic-merge-patch | mayor-2wi0 (P1) |
-| main | Remove unused PodStatus struct | — |
-
-**Root cause of 0 tests in sonobuoy diagnosed and fixed:** kubelet sends heartbeat-only status patches every 10s that omit `status`/`reason`/`message` for stable conditions. Without `type` as the SMP merge key, the whole conditions array was replaced last-write-wins on each heartbeat. Ready condition lost `status:"True"`. e2e BeforeSuite saw 0 schedulable nodes → 444 tests skipped in 100ms.
-
-Also: local Rust upgraded to 1.95.0 (unblocking future pushes).
+| PR | What | Beads |
+|----|------|-------|
+| #259 ✓ merged | fieldSelector `!=` + bool comparison | mayor-gtue (P1, closed) |
+| #258 | kubelet client cert on log/exec proxy | — |
+| #257 | sonobuoy retrieve before aggregator exits | — |
 
 ## Stance
 Pre-alpha/greenfield — break freely, no backward compat, correctness first, performance-critical (RSS/latency hard targets), kubectl-compatible API surface, minimal deps. Mayor merges on green CI automatically; flags security/API/architecture decisions first.
