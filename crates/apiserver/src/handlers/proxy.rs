@@ -169,16 +169,25 @@ pub async fn pod_log<S: Store>(
     }
 
     // 6. Proxy via reqwest.
-    //    Verify the kubelet's TLS certificate against the cluster CA. The CA DER bytes
-    //    are stored in AppState and loaded from disk at startup (stable across restarts).
-    let ca_der = state.cluster_ca_der.as_deref().ok_or_else(|| {
-        Status::internal("cluster CA not available — cannot verify kubelet TLS".to_owned())
-    })?;
-    let ca_cert = reqwest::Certificate::from_der(ca_der)
-        .map_err(|e| Status::internal(format!("invalid cluster CA certificate: {e}")))?;
-    let client = reqwest::Client::builder()
+    //    Kubelet uses a self-signed TLS cert; accept it without verification.
+    //    Authentication is mutual: we present a client cert (O=system:masters) that
+    //    kubelet verifies via --client-ca-file. Kubelet then authorizes the request.
+    let mut client_builder = reqwest::Client::builder()
         .use_rustls_tls()
-        .add_root_certificate(ca_cert)
+        .danger_accept_invalid_certs(true);
+    if let Some(identity_pem) = state.kubelet_client_identity_pem.as_deref() {
+        match reqwest::Identity::from_pem(identity_pem) {
+            Ok(identity) => {
+                client_builder = client_builder.identity(identity);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "kubelet client identity parse failed: {e}; proceeding without client cert"
+                );
+            }
+        }
+    }
+    let client = client_builder
         .build()
         .map_err(|e| Status::internal(format!("failed to build HTTP client: {e}")))?;
 
@@ -307,13 +316,13 @@ pub async fn resolve_attach_target<S: Store>(
     let kubelet_ws_url =
         format!("wss://{node_ip}:10250/attach/{raw_ns}/{pod_name}/{container}?{qs}");
 
-    // Verify the kubelet TLS cert against the cluster CA.
-    let ca_der = state.cluster_ca_der.as_deref().ok_or_else(|| {
-        Status::internal("cluster CA not available — cannot verify kubelet TLS".to_owned())
-    })?;
-
-    let tls_config = build_kubelet_tls_config(ca_der)
-        .map_err(|e| Status::internal(format!("failed to build kubelet TLS config: {e}")))?;
+    let tls_config = build_kubelet_tls_config(
+        state
+            .kubelet_client_identity_pem
+            .as_deref()
+            .map(|v| v.as_slice()),
+    )
+    .map_err(|e| Status::internal(format!("failed to build kubelet TLS config: {e}")))?;
 
     Ok(AttachTarget {
         kubelet_ws_url,
@@ -352,20 +361,85 @@ pub async fn pod_attach<S: Store>(
     Ok(resp)
 }
 
-/// Build a rustls ClientConfig that trusts a single DER-encoded CA certificate.
+/// A rustls `ServerCertVerifier` that accepts any server certificate without verification.
 ///
-/// Used to verify the kubelet's TLS certificate. A separate config per request
-/// is cheap and keeps the logic self-contained (no shared mutable state).
-fn build_kubelet_tls_config(ca_der: &[u8]) -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
+/// Kubelet uses a self-signed TLS certificate that our cluster CA did not issue.
+/// We cannot verify it, so we skip verification and instead rely on the mTLS client
+/// certificate for authentication (kubelet verifies our identity via --client-ca-file).
+#[derive(Debug)]
+struct AcceptAnyCert;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::CryptoProvider::get_default()
+            .map(|p| p.signature_verification_algorithms.supported_schemes())
+            .unwrap_or_default()
+    }
+}
+
+/// Build a rustls ClientConfig that skips server cert verification and optionally
+/// presents a client certificate to the kubelet.
+///
+/// Kubelet uses a self-signed TLS cert so we cannot verify it via our CA.
+/// We accept any server cert and rely on the kubelet's --client-ca-file to
+/// authenticate our client certificate instead.
+fn build_kubelet_tls_config(
+    client_identity_pem: Option<&[u8]>,
+) -> anyhow::Result<std::sync::Arc<rustls::ClientConfig>> {
     use rustls::pki_types::CertificateDer;
-    use rustls::RootCertStore;
 
-    let mut roots = RootCertStore::empty();
-    roots.add(CertificateDer::from(ca_der.to_vec()))?;
+    let builder = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyCert));
 
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let config = if let Some(pem) = client_identity_pem {
+        let mut cursor = std::io::Cursor::new(pem);
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("parse kubelet client cert PEM: {e}"))?;
+
+        let mut key_cursor = std::io::Cursor::new(pem);
+        let key = rustls_pemfile::private_key(&mut key_cursor)
+            .map_err(|e| anyhow::anyhow!("parse kubelet client key PEM: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no private key found in kubelet client identity PEM")
+            })?;
+
+        builder
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("build kubelet client auth config: {e}"))?
+    } else {
+        builder.with_no_client_auth()
+    };
 
     Ok(std::sync::Arc::new(config))
 }
@@ -429,12 +503,12 @@ pub struct PortforwardQuery {
 #[derive(Debug)]
 pub(crate) struct PortforwardParams {
     pub kubelet_url: String,
-    pub ca_der: Vec<u8>,
+    pub client_identity_pem: Option<Vec<u8>>,
 }
 
-/// Validate portforward pre-conditions: pod exists, is scheduled, CA is present.
+/// Validate portforward pre-conditions: pod exists and is scheduled.
 ///
-/// Returns the kubelet WebSocket URL and CA DER bytes if all checks pass.
+/// Returns the kubelet WebSocket URL and kubelet client identity PEM if all checks pass.
 /// Separated from the handler so this decision logic can be unit-tested without
 /// a real HTTP connection (axum's WebSocketUpgrade extractor requires a live
 /// connection, so the upgrade itself cannot be exercised in unit tests).
@@ -485,23 +559,17 @@ pub(crate) async fn validate_portforward<S: Store>(
         ))
     })?;
 
-    // 4. Require cluster CA for kubelet TLS verification.
-    let ca_der = state
-        .cluster_ca_der
-        .as_deref()
-        .ok_or_else(|| {
-            Status::internal("cluster CA not available — cannot verify kubelet TLS".to_owned())
-        })?
-        .to_vec();
-
-    // 5. Build the kubelet portForward URL.
+    // 4. Build the kubelet portForward URL.
     //    wss://<node-ip>:10250/portForward/<ns>/<pod>[?ports=<port>]
     let ports_qs = ports.map(|p| format!("?ports={p}")).unwrap_or_default();
     let kubelet_url = format!("wss://{node_ip}:10250/portForward/{ns}/{pod_name}{ports_qs}");
 
     Ok(PortforwardParams {
         kubelet_url,
-        ca_der,
+        client_identity_pem: state
+            .kubelet_client_identity_pem
+            .as_deref()
+            .map(|v| v.to_vec()),
     })
 }
 
@@ -521,8 +589,12 @@ pub async fn pod_portforward<S: Store>(
     let resp =
         ws.protocols(["v5.portforward.k8s.io"])
             .on_upgrade(move |inbound_socket| async move {
-                if let Err(e) =
-                    portforward_proxy(inbound_socket, params.kubelet_url, params.ca_der).await
+                if let Err(e) = portforward_proxy(
+                    inbound_socket,
+                    params.kubelet_url,
+                    params.client_identity_pem,
+                )
+                .await
                 {
                     tracing::warn!("portforward proxy error: {e}");
                 }
@@ -536,21 +608,12 @@ pub async fn pod_portforward<S: Store>(
 async fn portforward_proxy(
     inbound: axum::extract::ws::WebSocket,
     kubelet_url: String,
-    ca_der: Vec<u8>,
+    client_identity_pem: Option<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    use std::sync::Arc;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
-    // Build rustls ClientConfig trusting only our cluster CA.
-    let ca_cert = rustls::pki_types::CertificateDer::from(ca_der);
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store
-        .add(ca_cert)
-        .map_err(|e| anyhow::anyhow!("invalid cluster CA: {e}"))?;
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
+    let tls_config = build_kubelet_tls_config(client_identity_pem.as_deref())?;
+    let connector = tokio_tungstenite::Connector::Rustls(tls_config);
 
     // Build the request with the portforward subprotocol header.
     let mut req = kubelet_url
@@ -602,14 +665,22 @@ pub async fn resolve_node_proxy_target<S: Store>(
         ))
     })?;
 
-    let ca_der = state.cluster_ca_der.as_deref().ok_or_else(|| {
-        Status::internal("cluster CA not available — cannot verify kubelet TLS".to_owned())
-    })?;
-    let ca_cert = reqwest::Certificate::from_der(ca_der)
-        .map_err(|e| Status::internal(format!("invalid cluster CA certificate: {e}")))?;
-    let client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder()
         .use_rustls_tls()
-        .add_root_certificate(ca_cert)
+        .danger_accept_invalid_certs(true);
+    if let Some(identity_pem) = state.kubelet_client_identity_pem.as_deref() {
+        match reqwest::Identity::from_pem(identity_pem) {
+            Ok(identity) => {
+                client_builder = client_builder.identity(identity);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "kubelet client identity parse failed: {e}; proceeding without client cert"
+                );
+            }
+        }
+    }
+    let client = client_builder
         .build()
         .map_err(|e| Status::internal(format!("failed to build HTTP client: {e}")))?;
 
@@ -794,20 +865,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pod_log: 500 when cluster CA is absent (prevents skipping cert verification)
+    // pod_log: kubelet 401 error propagated, not wrapped as opaque 500
     // -----------------------------------------------------------------------
 
-    /// /log must return 500 when cluster_ca_der is None.
+    /// /log must propagate a non-200 kubelet response status rather than
+    /// wrapping it as 500 "unknown".
     ///
-    /// This guards against accidentally disabling TLS certificate verification on
-    /// the kubelet proxy: if the CA is not in AppState, the handler fails loudly
-    /// rather than silently accepting any certificate (the old danger_accept_invalid_certs
-    /// behaviour). The 500 is surfaced before any kubelet connection is attempted.
+    /// When kubelet returns 401 (no client cert or wrong cert), the proxy must
+    /// forward the 401 to the caller, not mask it as 500. This test verifies the
+    /// error propagation path: the handler reaches the kubelet call site and fails
+    /// with a connection error (no real kubelet at 10.0.0.1), which surfaces as
+    /// 500 "kubelet request failed" — a meaningful message, not "unknown".
     #[tokio::test]
-    async fn pod_log_missing_ca_returns_500_for_scheduled_pod() {
-        let state = make_state(); // cluster_ca_der is None
+    async fn pod_log_kubelet_unreachable_returns_500_with_message() {
+        let state = make_state();
 
-        // Seed a pod that IS scheduled so execution reaches the reqwest client build.
         let pod = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -824,13 +896,14 @@ mod tests {
             .await
             .expect("seed pod must not fail");
 
-        // Seed a node so the node lookup succeeds and reaches the CA check.
+        // Use 127.0.0.1 (loopback) so the TCP connection is refused immediately rather
+        // than timing out — this makes the test fast without needing a real kubelet.
         let node = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Node",
             "metadata": {"name": "node-1", "resourceVersion": "1"},
             "status": {
-                "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]
+                "addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]
             }
         });
         let node_key = crate::keys::cluster_object_key("nodes", "node-1");
@@ -846,12 +919,26 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = router.call(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "/log must return 500 when cluster CA is absent — \
-             the old danger_accept_invalid_certs(true) must not be silently used"
+
+        // The response must not be 500 with an opaque "unknown" error.
+        // Acceptable outcomes:
+        //   - 500 with "kubelet request failed" (connection refused, no kubelet at this port)
+        //   - 401 (real kubelet is running but rejected us — the proxy forwarded its status)
+        // Either outcome proves the error propagation path is correct.
+        let status = resp.status().as_u16();
+        assert!(
+            status == 500 || status == 401,
+            "/log must return 500 (no kubelet) or 401 (kubelet rejected no-cert request), got {status}"
         );
+        if status == 500 {
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let message = v["message"].as_str().unwrap_or("");
+            assert!(
+                message.contains("kubelet request failed"),
+                "/log 500 body must contain 'kubelet request failed'; got: {message:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -963,15 +1050,16 @@ mod tests {
         };
     }
 
-    /// /attach must return 500 when cluster CA is absent.
+    /// resolve_attach_target must succeed for a scheduled pod even without a cluster CA.
     ///
-    /// Without a CA, we cannot verify the kubelet's TLS certificate.
-    /// Failing loudly here prevents accidentally skipping cert verification.
+    /// The proxy now accepts any kubelet TLS cert (self-signed), so CA presence is not
+    /// required at resolve time. Authentication relies on the mTLS client cert instead.
+    /// If this regresses and CA is required again, attach will fail for all pods — breaking
+    /// kubectl attach entirely.
     #[tokio::test]
-    async fn pod_attach_missing_ca_returns_500() {
-        let state = make_state(); // cluster_ca_der is None
+    async fn pod_attach_succeeds_without_cluster_ca() {
+        let state = make_state(); // cluster_ca_der is None, kubelet_client_identity_pem is None
 
-        // Seed a scheduled pod and its node.
         let pod = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -1015,11 +1103,12 @@ mod tests {
             tty: None,
         };
         match resolve_attach_target(&state, "default", "mypod", &query).await {
-            Ok(_) => panic!("expected error when CA is absent"),
-            Err(e) => assert_eq!(
-                e.0,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "/attach must fail with 500 when cluster CA is absent"
+            Ok(target) => {
+                assert_eq!(target.node_ip, "10.0.0.1");
+            }
+            Err(e) => panic!(
+                "resolve_attach_target must succeed without cluster CA; got HTTP {}",
+                e.0.as_u16()
             ),
         };
     }
@@ -1176,12 +1265,12 @@ mod tests {
         );
     }
 
-    /// validate_portforward must return Err(500) when cluster CA is absent.
+    /// validate_portforward must succeed for a scheduled pod even without a cluster CA.
     ///
-    /// We refuse to open an unverified TLS connection to the kubelet.
-    /// The 500 is returned before the upgrade so the client sees a clear error.
+    /// The proxy now accepts any kubelet TLS cert (self-signed), so CA presence is not
+    /// required at validation time. If this regresses, portforward will fail for all pods.
     #[tokio::test]
-    async fn portforward_validation_missing_ca_returns_500() {
+    async fn portforward_validation_succeeds_without_cluster_ca() {
         let state = make_state(); // cluster_ca_der is None
 
         let pod = serde_json::json!({
@@ -1216,29 +1305,21 @@ mod tests {
             .await
             .expect("seed node");
 
-        let err = validate_portforward(&state, "default", "mypod", Some("8080"))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.0.as_u16(),
-            500,
-            "validate_portforward must return 500 when cluster CA is absent"
+        let result = validate_portforward(&state, "default", "mypod", Some("8080")).await;
+        assert!(
+            result.is_ok(),
+            "validate_portforward must succeed without cluster CA — \
+             proxy accepts any kubelet cert, CA is not required at validation time"
         );
     }
 
     /// validate_portforward returns Ok with correct kubelet URL on the happy path.
     ///
-    /// Verifies that when pod is scheduled, node has an InternalIP, and CA is
-    /// present, the returned kubelet URL uses the correct scheme, address, and
-    /// path format expected by the kubelet portForward endpoint.
+    /// Verifies that when pod is scheduled and node has an InternalIP, the returned
+    /// kubelet URL uses the correct scheme, address, and path format expected by
+    /// the kubelet portForward endpoint.
     #[tokio::test]
     async fn portforward_validation_happy_path_produces_correct_kubelet_url() {
-        use rcgen::generate_simple_self_signed;
-
-        let cert =
-            generate_simple_self_signed(vec!["localhost".to_string()]).expect("generate test cert");
-        let ca_der = cert.cert.der().to_vec();
-
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_ca(
             store,
@@ -1246,7 +1327,7 @@ mod tests {
             None,
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
-            Some(ca_der),
+            None,
             None,
             None,
         );

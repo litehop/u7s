@@ -191,7 +191,12 @@ async fn main() -> anyhow::Result<()> {
     // webhook servers, so they can verify they are talking to the apiserver.
     let mut webhook_identity_pem = tls_material.admin_cert_pem.clone();
     webhook_identity_pem.extend_from_slice(&tls_material.admin_key_pem);
-    let state = AppState::new_with_ca(
+    // Combine kubelet client cert PEM + key PEM for the kubelet proxy client identity.
+    // The apiserver presents this certificate when proxying log/exec/attach requests to
+    // the kubelet. Kubelet accepts certs with O=system:masters signed by the cluster CA.
+    let mut kubelet_client_identity_pem = tls_material.kubelet_client_cert_pem.clone();
+    kubelet_client_identity_pem.extend_from_slice(&tls_material.kubelet_client_key_pem);
+    let state = state::AppState::new_with_ca_and_kubelet_identity(
         Arc::clone(&store),
         sa_encoding_key,
         sa_decoding_key,
@@ -200,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
         Some(tls_material.ca_cert_der.clone()),
         Some(webhook_identity_pem),
         service_ip_allocator,
+        Some(kubelet_client_identity_pem),
     );
 
     // 10a. Populate RBAC index from persisted objects before serving.
