@@ -47,6 +47,7 @@ fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
                 Some(u7s_store::FieldSelector {
                     field: field.to_string(),
                     value: value.to_string(),
+                    negated: false,
                 })
             })
         } else {
