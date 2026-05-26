@@ -543,7 +543,10 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
                     for part in &path_parts {
                         match cur.get(part) {
                             Some(next) => cur = next,
-                            None => { absent = true; break; }
+                            None => {
+                                absent = true;
+                                break;
+                            }
                         }
                     }
                     // Absent fields are treated as the zero value: "" for strings,
@@ -553,7 +556,9 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
                     } else {
                         match cur {
                             serde_json::Value::String(s) => s == value,
-                            serde_json::Value::Bool(b) => value == if *b { "true" } else { "false" },
+                            serde_json::Value::Bool(b) => {
+                                value == if *b { "true" } else { "false" }
+                            }
                             serde_json::Value::Null => value.is_empty(),
                             serde_json::Value::Number(n) => value.as_str() == n.to_string(),
                             _ => false,
