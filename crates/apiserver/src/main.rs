@@ -2470,14 +2470,17 @@ mod tests {
             None,
             "sonobuoy-runner-strict",
         );
-        let stored = store.get(&stored_key).await.expect("store.get must not fail");
+        let stored = store
+            .get(&stored_key)
+            .await
+            .expect("store.get must not fail");
         assert!(
             stored.is_some(),
             "ClusterRole sonobuoy-runner-strict must be persisted — \
              a 201 response without persisting the object would be misleading"
         );
-        let stored_val: serde_json::Value =
-            serde_json::from_slice(&stored.unwrap().value).expect("stored value must be valid JSON");
+        let stored_val: serde_json::Value = serde_json::from_slice(&stored.unwrap().value)
+            .expect("stored value must be valid JSON");
         assert_eq!(
             stored_val["kind"].as_str(),
             Some("ClusterRole"),
