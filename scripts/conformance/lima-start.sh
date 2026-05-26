@@ -107,6 +107,20 @@ limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
 echo "Starting kubelet inside VM..."
 limactl shell "$VM_NAME" sudo systemctl restart kubelet
 
+# Route kubernetes ClusterIP (10.96.0.1:443) to the host apiserver inside the VM.
+# Pods use in-cluster config (KUBERNETES_SERVICE_HOST=10.96.0.1) to reach the apiserver.
+# Without this rule, 10.96.0.1 traffic has no route in the VM and times out.
+echo "Adding iptables DNAT for kubernetes ClusterIP → host apiserver..."
+HOST_IP=$(limactl shell "$VM_NAME" getent hosts host.lima.internal 2>/dev/null | awk '{print $1}')
+if [ -z "$HOST_IP" ]; then
+  echo "WARNING: could not resolve host.lima.internal — skipping DNAT rule" >&2
+else
+  limactl shell "$VM_NAME" sudo iptables -t nat -D OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443" 2>/dev/null || true
+  limactl shell "$VM_NAME" sudo iptables -t nat -A OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443"
+  limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:6443"
+fi
+
 # Wait for the node to appear.
 echo "Waiting for lima-node to register (up to 60s)..."
 FOUND=0
