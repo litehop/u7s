@@ -572,6 +572,98 @@ async fn portforward_proxy(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// /api/v1/nodes/{name}/proxy/{*path} — forward to kubelet
+// ---------------------------------------------------------------------------
+
+/// Resolve node IP and build the kubelet HTTP URL for node proxy requests.
+///
+/// Separated from the handler for unit-testability: all error paths (404, 502)
+/// are reachable without a real HTTP connection.
+pub async fn resolve_node_proxy_target<S: Store>(
+    state: &AppState<S>,
+    node_name: &str,
+    path_suffix: &str,
+) -> Result<(String, reqwest::Client), crate::status::StatusError> {
+    let node_key = cluster_object_key("nodes", node_name);
+    let node_stored = state
+        .store
+        .get(&node_key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(node_name, "Node"))?;
+
+    let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
+
+    let node_ip = node_address(&node).ok_or_else(|| {
+        Status::internal(format!(
+            "node \"{node_name}\" has no usable address in status.addresses"
+        ))
+    })?;
+
+    let ca_der = state.cluster_ca_der.as_deref().ok_or_else(|| {
+        Status::internal("cluster CA not available — cannot verify kubelet TLS".to_owned())
+    })?;
+    let ca_cert = reqwest::Certificate::from_der(ca_der)
+        .map_err(|e| Status::internal(format!("invalid cluster CA certificate: {e}")))?;
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .add_root_certificate(ca_cert)
+        .build()
+        .map_err(|e| Status::internal(format!("failed to build HTTP client: {e}")))?;
+
+    let kubelet_url = format!("https://{node_ip}:10250/{path_suffix}");
+    Ok((kubelet_url, client))
+}
+
+/// Proxy a request to the kubelet node proxy endpoint.
+///
+/// GET /api/v1/nodes/{name}/proxy/{*path} → https://<node-ip>:10250/<path>
+///
+/// Returns 404 if the node is not in the store, 502 if the kubelet is unreachable.
+pub async fn node_proxy<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((node_name, path_suffix)): Path<(String, String)>,
+    req: axum::http::Request<Body>,
+) -> Result<Response, crate::status::StatusError> {
+    let (kubelet_url, client) = resolve_node_proxy_target(&state, &node_name, &path_suffix).await?;
+
+    let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
+        .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
+
+    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
+
+    let kubelet_resp = client
+        .request(method, &kubelet_url)
+        .body(body_bytes)
+        .send()
+        .await
+        .map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("kubelet unreachable: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                },
+            )
+        })?;
+
+    let kubelet_status = kubelet_resp.status();
+    let body = Body::from_stream(kubelet_resp.bytes_stream());
+
+    Response::builder()
+        .status(kubelet_status.as_u16())
+        .body(body)
+        .map_err(|e| Status::internal(e.to_string()))
+}
+
 fn not_implemented(subresource: &str) -> Response {
     let body = serde_json::json!({
         "kind": "Status",
@@ -1350,5 +1442,31 @@ mod tests {
     fn node_address_missing_status_returns_none() {
         let node = serde_json::json!({"metadata": {"name": "node1"}});
         assert!(node_address(&node).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // node_proxy: resolve_node_proxy_target unit tests
+    //
+    // The actual HTTP proxy requires a live kubelet and cannot be unit-tested.
+    // We test the pre-flight logic (resolve_node_proxy_target) which determines
+    // 404 vs. 500 vs. "proceed with request". This is the only decision tree
+    // exercisable without a real network connection.
+    // -----------------------------------------------------------------------
+
+    /// node proxy must return 404 when the node does not exist in the store.
+    ///
+    /// Without this check the proxy would attempt to connect to an unknown host,
+    /// producing a confusing 502 or 500 instead of a clear 404.
+    #[tokio::test]
+    async fn node_proxy_missing_node_returns_404() {
+        let state = make_state();
+        let result = resolve_node_proxy_target(&state, "ghost-node", "configz").await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            404,
+            "node proxy must return 404 when the node is not in the store — \
+             a 502 or 500 would mislead the caller into thinking the kubelet is down"
+        );
     }
 }
