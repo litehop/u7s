@@ -448,6 +448,112 @@ struct TokenRequestProto {
     status: Option<TokenRequestStatus>,
 }
 
+// --- k8s.io/api/rbac/v1/generated.proto ---
+
+/// PolicyRule — a single RBAC policy rule.
+#[derive(Clone, PartialEq, Message)]
+struct PolicyRule {
+    /// verbs (field 1, repeated string)
+    #[prost(string, repeated, tag = "1")]
+    verbs: Vec<String>,
+    /// apiGroups (field 2, repeated string)
+    #[prost(string, repeated, tag = "2")]
+    api_groups: Vec<String>,
+    /// resources (field 3, repeated string)
+    #[prost(string, repeated, tag = "3")]
+    resources: Vec<String>,
+    /// resourceNames (field 4, repeated string)
+    #[prost(string, repeated, tag = "4")]
+    resource_names: Vec<String>,
+    /// nonResourceURLs (field 5, repeated string)
+    #[prost(string, repeated, tag = "5")]
+    non_resource_urls: Vec<String>,
+}
+
+/// Subject — a user, group, or service account in a RoleBinding.
+#[derive(Clone, PartialEq, Message)]
+struct Subject {
+    /// kind (field 1, string)
+    #[prost(string, tag = "1")]
+    kind: String,
+    /// apiGroup (field 2, string)
+    #[prost(string, tag = "2")]
+    api_group: String,
+    /// name (field 3, string)
+    #[prost(string, tag = "3")]
+    name: String,
+    /// namespace (field 4, string)
+    #[prost(string, tag = "4")]
+    namespace: String,
+}
+
+/// RoleRef — reference to the role being bound.
+#[derive(Clone, PartialEq, Message)]
+struct RoleRef {
+    /// apiGroup (field 1, string)
+    #[prost(string, tag = "1")]
+    api_group: String,
+    /// kind (field 2, string)
+    #[prost(string, tag = "2")]
+    kind: String,
+    /// name (field 3, string)
+    #[prost(string, tag = "3")]
+    name: String,
+}
+
+/// ClusterRole — k8s.io/api/rbac/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct ClusterRole {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// rules (field 2, repeated PolicyRule)
+    #[prost(message, repeated, tag = "2")]
+    rules: Vec<PolicyRule>,
+    // aggregationRule (field 3) is intentionally omitted — not needed for kubectl compat
+}
+
+/// ClusterRoleBinding — k8s.io/api/rbac/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct ClusterRoleBinding {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// subjects (field 2, repeated Subject)
+    #[prost(message, repeated, tag = "2")]
+    subjects: Vec<Subject>,
+    /// roleRef (field 3, message RoleRef)
+    #[prost(message, tag = "3")]
+    role_ref: Option<RoleRef>,
+}
+
+/// Role — namespaced, same structure as ClusterRole but namespaced.
+/// k8s.io/api/rbac/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Role {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// rules (field 2, repeated PolicyRule)
+    #[prost(message, repeated, tag = "2")]
+    rules: Vec<PolicyRule>,
+}
+
+/// RoleBinding — namespaced.
+/// k8s.io/api/rbac/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct RoleBinding {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// subjects (field 2, repeated Subject)
+    #[prost(message, repeated, tag = "2")]
+    subjects: Vec<Subject>,
+    /// roleRef (field 3, message RoleRef)
+    #[prost(message, tag = "3")]
+    role_ref: Option<RoleRef>,
+}
+
 // ---------------------------------------------------------------------------
 // Encoder — produces Kubernetes protobuf wire format from a JSON value.
 // Used in tests only; not called from production handlers.
@@ -825,6 +931,171 @@ pub fn decode_token_request(raw: &[u8]) -> Option<TokenRequestFields> {
     })
 }
 
+/// Convert a prost PolicyRule into a serde_json::Value object.
+fn policy_rule_to_json(rule: PolicyRule) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !rule.verbs.is_empty() {
+        m.insert(
+            "verbs".to_string(),
+            serde_json::Value::Array(
+                rule.verbs
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !rule.api_groups.is_empty() {
+        m.insert(
+            "apiGroups".to_string(),
+            serde_json::Value::Array(
+                rule.api_groups
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !rule.resources.is_empty() {
+        m.insert(
+            "resources".to_string(),
+            serde_json::Value::Array(
+                rule.resources
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !rule.resource_names.is_empty() {
+        m.insert(
+            "resourceNames".to_string(),
+            serde_json::Value::Array(
+                rule.resource_names
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !rule.non_resource_urls.is_empty() {
+        m.insert(
+            "nonResourceURLs".to_string(),
+            serde_json::Value::Array(
+                rule.non_resource_urls
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Convert a prost Subject into a serde_json::Value object.
+fn subject_to_json(s: Subject) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !s.kind.is_empty() {
+        m.insert("kind".to_string(), serde_json::Value::String(s.kind));
+    }
+    if !s.api_group.is_empty() {
+        m.insert(
+            "apiGroup".to_string(),
+            serde_json::Value::String(s.api_group),
+        );
+    }
+    if !s.name.is_empty() {
+        m.insert("name".to_string(), serde_json::Value::String(s.name));
+    }
+    if !s.namespace.is_empty() {
+        m.insert(
+            "namespace".to_string(),
+            serde_json::Value::String(s.namespace),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Convert a prost RoleRef into a serde_json::Value object.
+fn role_ref_to_json(r: RoleRef) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !r.api_group.is_empty() {
+        m.insert(
+            "apiGroup".to_string(),
+            serde_json::Value::String(r.api_group),
+        );
+    }
+    if !r.kind.is_empty() {
+        m.insert("kind".to_string(), serde_json::Value::String(r.kind));
+    }
+    if !r.name.is_empty() {
+        m.insert("name".to_string(), serde_json::Value::String(r.name));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Decode a proto-encoded ClusterRole object into a `serde_json::Value`.
+pub fn decode_clusterrole_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let cr = ClusterRole::decode(data).ok()?;
+    let meta = object_meta_to_json(cr.metadata.unwrap_or_default());
+    let rules: Vec<serde_json::Value> = cr.rules.into_iter().map(policy_rule_to_json).collect();
+    Some(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": meta,
+        "rules": rules
+    }))
+}
+
+/// Decode a proto-encoded ClusterRoleBinding object into a `serde_json::Value`.
+pub fn decode_clusterrolebinding_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let crb = ClusterRoleBinding::decode(data).ok()?;
+    let meta = object_meta_to_json(crb.metadata.unwrap_or_default());
+    let subjects: Vec<serde_json::Value> = crb.subjects.into_iter().map(subject_to_json).collect();
+    let role_ref = crb
+        .role_ref
+        .map(role_ref_to_json)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    Some(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": meta,
+        "subjects": subjects,
+        "roleRef": role_ref
+    }))
+}
+
+/// Decode a proto-encoded Role object into a `serde_json::Value`.
+pub fn decode_role_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let role = Role::decode(data).ok()?;
+    let meta = object_meta_to_json(role.metadata.unwrap_or_default());
+    let rules: Vec<serde_json::Value> = role.rules.into_iter().map(policy_rule_to_json).collect();
+    Some(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "Role",
+        "metadata": meta,
+        "rules": rules
+    }))
+}
+
+/// Decode a proto-encoded RoleBinding object into a `serde_json::Value`.
+pub fn decode_rolebinding_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let rb = RoleBinding::decode(data).ok()?;
+    let meta = object_meta_to_json(rb.metadata.unwrap_or_default());
+    let subjects: Vec<serde_json::Value> = rb.subjects.into_iter().map(subject_to_json).collect();
+    let role_ref = rb
+        .role_ref
+        .map(role_ref_to_json)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    Some(serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": meta,
+        "subjects": subjects,
+        "roleRef": role_ref
+    }))
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -837,6 +1108,10 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "Lease" => decode_lease_proto(raw),
         "CSINode" => decode_csinode_proto(raw),
         "Event" => decode_event_proto(raw),
+        "ClusterRole" => decode_clusterrole_proto(raw),
+        "ClusterRoleBinding" => decode_clusterrolebinding_proto(raw),
+        "Role" => decode_role_proto(raw),
+        "RoleBinding" => decode_rolebinding_proto(raw),
         _ => None,
     }
 }
@@ -2064,6 +2339,200 @@ mod tests {
 
         assert_eq!(result["kind"], "Event");
         assert_eq!(result["metadata"]["name"], "myevent");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_clusterrole_proto / decode_core_proto_by_kind ClusterRole
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch ClusterRole proto to the correct decoder and
+    /// extract metadata, rules (with apiGroups, resources, verbs).
+    ///
+    /// This is the PRIMARY regression guard for mayor-hww0: kubectl create clusterrole sends
+    /// a proto-encoded ClusterRole in Unknown.raw with empty contentType. Previously,
+    /// decode_core_proto_by_kind returned None for "ClusterRole", so extract_body fell through
+    /// to JSON parsing and failed with "invalid JSON: expected value at line 1 column 1".
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_clusterrole() {
+        // Build: ClusterRole {
+        //   metadata: ObjectMeta { name: "test-rbac-fix" },
+        //   rules: [PolicyRule { verbs: ["get","list"], apiGroups: [""], resources: ["pods"] }]
+        // }
+        let obj_meta = encode_length_delimited(1, b"test-rbac-fix"); // ObjectMeta.name
+
+        // PolicyRule: field 1=verbs, field 2=apiGroups, field 3=resources
+        let mut rule = encode_length_delimited(1, b"get");
+        rule.extend_from_slice(&encode_length_delimited(1, b"list"));
+        rule.extend_from_slice(&encode_length_delimited(2, b"")); // apiGroup="" (core)
+        rule.extend_from_slice(&encode_length_delimited(3, b"pods"));
+
+        let mut clusterrole_proto = encode_length_delimited(1, &obj_meta); // field 1 = ObjectMeta
+        clusterrole_proto.extend_from_slice(&encode_length_delimited(2, &rule)); // field 2 = PolicyRule
+
+        let result = decode_core_proto_by_kind("ClusterRole", &clusterrole_proto)
+            .expect("ClusterRole must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "ClusterRole");
+        assert_eq!(result["apiVersion"], "rbac.authorization.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "test-rbac-fix");
+        assert!(result["metadata"]["creationTimestamp"].is_null());
+        // rules array must be present with the encoded rule
+        let rules = result["rules"].as_array().expect("rules must be an array");
+        assert_eq!(rules.len(), 1, "one rule must be present");
+        let rule0 = &rules[0];
+        // verbs must contain "get" and "list"
+        let verbs = rule0["verbs"].as_array().expect("verbs must be array");
+        assert!(
+            verbs.contains(&serde_json::Value::String("get".to_string())),
+            "verbs must contain 'get'"
+        );
+        assert!(
+            verbs.contains(&serde_json::Value::String("list".to_string())),
+            "verbs must contain 'list'"
+        );
+        let resources = rule0["resources"]
+            .as_array()
+            .expect("resources must be array");
+        assert_eq!(resources[0], "pods", "resources must contain 'pods'");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_clusterrolebinding_proto / decode_core_proto_by_kind ClusterRoleBinding
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch ClusterRoleBinding proto and extract
+    /// metadata, subjects, and roleRef.
+    ///
+    /// kubectl create clusterrolebinding sends a proto-encoded ClusterRoleBinding with
+    /// empty contentType. Without this decoder the request fails with "invalid JSON".
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_clusterrolebinding() {
+        // Build: ClusterRoleBinding {
+        //   metadata: ObjectMeta { name: "test-crb" },
+        //   subjects: [Subject { kind: "ServiceAccount", name: "default", namespace: "default",
+        //                        apiGroup: "" }],
+        //   roleRef: RoleRef { apiGroup: "rbac.authorization.k8s.io", kind: "ClusterRole",
+        //                      name: "test-rbac-fix" }
+        // }
+        let obj_meta = encode_length_delimited(1, b"test-crb"); // ObjectMeta.name
+
+        // Subject: field 1=kind, field 2=apiGroup, field 3=name, field 4=namespace
+        let mut subject = encode_length_delimited(1, b"ServiceAccount");
+        subject.extend_from_slice(&encode_length_delimited(2, b"")); // apiGroup="" for SA
+        subject.extend_from_slice(&encode_length_delimited(3, b"default"));
+        subject.extend_from_slice(&encode_length_delimited(4, b"default"));
+
+        // RoleRef: field 1=apiGroup, field 2=kind, field 3=name
+        let mut role_ref = encode_length_delimited(1, b"rbac.authorization.k8s.io");
+        role_ref.extend_from_slice(&encode_length_delimited(2, b"ClusterRole"));
+        role_ref.extend_from_slice(&encode_length_delimited(3, b"test-rbac-fix"));
+
+        let mut crb_proto = encode_length_delimited(1, &obj_meta); // field 1 = ObjectMeta
+        crb_proto.extend_from_slice(&encode_length_delimited(2, &subject)); // field 2 = Subject
+        crb_proto.extend_from_slice(&encode_length_delimited(3, &role_ref)); // field 3 = RoleRef
+
+        let result = decode_core_proto_by_kind("ClusterRoleBinding", &crb_proto)
+            .expect("ClusterRoleBinding must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "ClusterRoleBinding");
+        assert_eq!(result["apiVersion"], "rbac.authorization.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "test-crb");
+        let subjects = result["subjects"]
+            .as_array()
+            .expect("subjects must be array");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0]["kind"], "ServiceAccount");
+        assert_eq!(subjects[0]["name"], "default");
+        assert_eq!(subjects[0]["namespace"], "default");
+        assert_eq!(result["roleRef"]["apiGroup"], "rbac.authorization.k8s.io");
+        assert_eq!(result["roleRef"]["kind"], "ClusterRole");
+        assert_eq!(result["roleRef"]["name"], "test-rbac-fix");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_role_proto / decode_core_proto_by_kind Role
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch Role proto and extract metadata and rules.
+    ///
+    /// kubectl create role is namespaced; the proto structure is identical to ClusterRole
+    /// but with a namespace in ObjectMeta. Without this decoder the request fails.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_role() {
+        // Build: Role {
+        //   metadata: ObjectMeta { name: "pod-reader", namespace: "default" },
+        //   rules: [PolicyRule { verbs: ["get"], resources: ["pods"], apiGroups: [""] }]
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"pod-reader"); // name
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // namespace
+
+        let mut rule = encode_length_delimited(1, b"get");
+        rule.extend_from_slice(&encode_length_delimited(2, b"")); // apiGroup=""
+        rule.extend_from_slice(&encode_length_delimited(3, b"pods"));
+
+        let mut role_proto = encode_length_delimited(1, &obj_meta);
+        role_proto.extend_from_slice(&encode_length_delimited(2, &rule));
+
+        let result = decode_core_proto_by_kind("Role", &role_proto)
+            .expect("Role must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "Role");
+        assert_eq!(result["apiVersion"], "rbac.authorization.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "pod-reader");
+        assert_eq!(result["metadata"]["namespace"], "default");
+        let rules = result["rules"].as_array().expect("rules must be array");
+        assert_eq!(rules.len(), 1);
+        let verbs = rules[0]["verbs"].as_array().expect("verbs must be array");
+        assert!(verbs.contains(&serde_json::Value::String("get".to_string())));
+        assert_eq!(rules[0]["resources"][0], "pods");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_rolebinding_proto / decode_core_proto_by_kind RoleBinding
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch RoleBinding proto and extract
+    /// metadata, subjects, and roleRef.
+    ///
+    /// kubectl create rolebinding is namespaced. Without this decoder the request fails.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_rolebinding() {
+        // Build: RoleBinding {
+        //   metadata: ObjectMeta { name: "read-pods", namespace: "default" },
+        //   subjects: [Subject { kind: "User", name: "alice", apiGroup: "rbac.authorization.k8s.io" }],
+        //   roleRef: RoleRef { apiGroup: "rbac.authorization.k8s.io", kind: "Role", name: "pod-reader" }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"read-pods");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        let mut subject = encode_length_delimited(1, b"User");
+        subject.extend_from_slice(&encode_length_delimited(2, b"rbac.authorization.k8s.io"));
+        subject.extend_from_slice(&encode_length_delimited(3, b"alice"));
+
+        let mut role_ref = encode_length_delimited(1, b"rbac.authorization.k8s.io");
+        role_ref.extend_from_slice(&encode_length_delimited(2, b"Role"));
+        role_ref.extend_from_slice(&encode_length_delimited(3, b"pod-reader"));
+
+        let mut rb_proto = encode_length_delimited(1, &obj_meta);
+        rb_proto.extend_from_slice(&encode_length_delimited(2, &subject));
+        rb_proto.extend_from_slice(&encode_length_delimited(3, &role_ref));
+
+        let result = decode_core_proto_by_kind("RoleBinding", &rb_proto)
+            .expect("RoleBinding must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "RoleBinding");
+        assert_eq!(result["apiVersion"], "rbac.authorization.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "read-pods");
+        assert_eq!(result["metadata"]["namespace"], "default");
+        let subjects = result["subjects"]
+            .as_array()
+            .expect("subjects must be array");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0]["kind"], "User");
+        assert_eq!(subjects[0]["name"], "alice");
+        assert_eq!(subjects[0]["apiGroup"], "rbac.authorization.k8s.io");
+        assert_eq!(result["roleRef"]["kind"], "Role");
+        assert_eq!(result["roleRef"]["name"], "pod-reader");
     }
 
     // ---------------------------------------------------------------------------
