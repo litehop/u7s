@@ -937,31 +937,56 @@ fn policy_rule_to_json(rule: PolicyRule) -> serde_json::Value {
     if !rule.verbs.is_empty() {
         m.insert(
             "verbs".to_string(),
-            serde_json::Value::Array(rule.verbs.into_iter().map(serde_json::Value::String).collect()),
+            serde_json::Value::Array(
+                rule.verbs
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
         );
     }
     if !rule.api_groups.is_empty() {
         m.insert(
             "apiGroups".to_string(),
-            serde_json::Value::Array(rule.api_groups.into_iter().map(serde_json::Value::String).collect()),
+            serde_json::Value::Array(
+                rule.api_groups
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
         );
     }
     if !rule.resources.is_empty() {
         m.insert(
             "resources".to_string(),
-            serde_json::Value::Array(rule.resources.into_iter().map(serde_json::Value::String).collect()),
+            serde_json::Value::Array(
+                rule.resources
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
         );
     }
     if !rule.resource_names.is_empty() {
         m.insert(
             "resourceNames".to_string(),
-            serde_json::Value::Array(rule.resource_names.into_iter().map(serde_json::Value::String).collect()),
+            serde_json::Value::Array(
+                rule.resource_names
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
         );
     }
     if !rule.non_resource_urls.is_empty() {
         m.insert(
             "nonResourceURLs".to_string(),
-            serde_json::Value::Array(rule.non_resource_urls.into_iter().map(serde_json::Value::String).collect()),
+            serde_json::Value::Array(
+                rule.non_resource_urls
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
         );
     }
     serde_json::Value::Object(m)
@@ -974,13 +999,19 @@ fn subject_to_json(s: Subject) -> serde_json::Value {
         m.insert("kind".to_string(), serde_json::Value::String(s.kind));
     }
     if !s.api_group.is_empty() {
-        m.insert("apiGroup".to_string(), serde_json::Value::String(s.api_group));
+        m.insert(
+            "apiGroup".to_string(),
+            serde_json::Value::String(s.api_group),
+        );
     }
     if !s.name.is_empty() {
         m.insert("name".to_string(), serde_json::Value::String(s.name));
     }
     if !s.namespace.is_empty() {
-        m.insert("namespace".to_string(), serde_json::Value::String(s.namespace));
+        m.insert(
+            "namespace".to_string(),
+            serde_json::Value::String(s.namespace),
+        );
     }
     serde_json::Value::Object(m)
 }
@@ -989,7 +1020,10 @@ fn subject_to_json(s: Subject) -> serde_json::Value {
 fn role_ref_to_json(r: RoleRef) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if !r.api_group.is_empty() {
-        m.insert("apiGroup".to_string(), serde_json::Value::String(r.api_group));
+        m.insert(
+            "apiGroup".to_string(),
+            serde_json::Value::String(r.api_group),
+        );
     }
     if !r.kind.is_empty() {
         m.insert("kind".to_string(), serde_json::Value::String(r.kind));
@@ -1018,7 +1052,10 @@ pub fn decode_clusterrolebinding_proto(data: &[u8]) -> Option<serde_json::Value>
     let crb = ClusterRoleBinding::decode(data).ok()?;
     let meta = object_meta_to_json(crb.metadata.unwrap_or_default());
     let subjects: Vec<serde_json::Value> = crb.subjects.into_iter().map(subject_to_json).collect();
-    let role_ref = crb.role_ref.map(role_ref_to_json).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let role_ref = crb
+        .role_ref
+        .map(role_ref_to_json)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
     Some(serde_json::json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "ClusterRoleBinding",
@@ -1046,7 +1083,10 @@ pub fn decode_rolebinding_proto(data: &[u8]) -> Option<serde_json::Value> {
     let rb = RoleBinding::decode(data).ok()?;
     let meta = object_meta_to_json(rb.metadata.unwrap_or_default());
     let subjects: Vec<serde_json::Value> = rb.subjects.into_iter().map(subject_to_json).collect();
-    let role_ref = rb.role_ref.map(role_ref_to_json).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let role_ref = rb
+        .role_ref
+        .map(role_ref_to_json)
+        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
     Some(serde_json::json!({
         "apiVersion": "rbac.authorization.k8s.io/v1",
         "kind": "RoleBinding",
@@ -2350,7 +2390,9 @@ mod tests {
             verbs.contains(&serde_json::Value::String("list".to_string())),
             "verbs must contain 'list'"
         );
-        let resources = rule0["resources"].as_array().expect("resources must be array");
+        let resources = rule0["resources"]
+            .as_array()
+            .expect("resources must be array");
         assert_eq!(resources[0], "pods", "resources must contain 'pods'");
     }
 
@@ -2395,7 +2437,9 @@ mod tests {
         assert_eq!(result["kind"], "ClusterRoleBinding");
         assert_eq!(result["apiVersion"], "rbac.authorization.k8s.io/v1");
         assert_eq!(result["metadata"]["name"], "test-crb");
-        let subjects = result["subjects"].as_array().expect("subjects must be array");
+        let subjects = result["subjects"]
+            .as_array()
+            .expect("subjects must be array");
         assert_eq!(subjects.len(), 1);
         assert_eq!(subjects[0]["kind"], "ServiceAccount");
         assert_eq!(subjects[0]["name"], "default");
@@ -2480,7 +2524,9 @@ mod tests {
         assert_eq!(result["apiVersion"], "rbac.authorization.k8s.io/v1");
         assert_eq!(result["metadata"]["name"], "read-pods");
         assert_eq!(result["metadata"]["namespace"], "default");
-        let subjects = result["subjects"].as_array().expect("subjects must be array");
+        let subjects = result["subjects"]
+            .as_array()
+            .expect("subjects must be array");
         assert_eq!(subjects.len(), 1);
         assert_eq!(subjects[0]["kind"], "User");
         assert_eq!(subjects[0]["name"], "alice");
