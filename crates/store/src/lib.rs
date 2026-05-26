@@ -539,18 +539,30 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
                         return false;
                     };
                     let mut cur = &parsed;
+                    let mut absent = false;
                     for part in &path_parts {
                         match cur.get(part) {
                             Some(next) => cur = next,
-                            None => return *negated,
+                            None => {
+                                absent = true;
+                                break;
+                            }
                         }
                     }
-                    let matches = match cur {
-                        serde_json::Value::String(s) => s == value,
-                        serde_json::Value::Bool(b) => value == if *b { "true" } else { "false" },
-                        serde_json::Value::Null => value.is_empty(),
-                        serde_json::Value::Number(n) => value.as_str() == n.to_string(),
-                        _ => false,
+                    // Absent fields are treated as the zero value: "" for strings,
+                    // false for bools. Both compare equal to "false" or "".
+                    let matches = if absent {
+                        value.is_empty() || value == "false"
+                    } else {
+                        match cur {
+                            serde_json::Value::String(s) => s == value,
+                            serde_json::Value::Bool(b) => {
+                                value == if *b { "true" } else { "false" }
+                            }
+                            serde_json::Value::Null => value.is_empty(),
+                            serde_json::Value::Number(n) => value.as_str() == n.to_string(),
+                            _ => false,
+                        }
                     };
                     if *negated {
                         !matches
@@ -1522,6 +1534,50 @@ mod tests {
         assert_eq!(
             resp.items[0].key, "/registry/nodes/no-field",
             "absent field is not equal to 'true', so != selector must include it"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_selector_eq_false_matches_absent_field() {
+        // e2e BeforeSuite queries spec.unschedulable=false. A node with no
+        // spec.unschedulable field must be included because absent == zero value == false.
+        let store = make_store();
+
+        store
+            .put(
+                "/registry/nodes/no-field",
+                node_json_no_unschedulable("no-field"),
+                Some(0),
+            )
+            .await
+            .expect("create node without unschedulable field");
+        store
+            .put(
+                "/registry/nodes/unschedulable",
+                node_json("unschedulable", true),
+                Some(0),
+            )
+            .await
+            .expect("create unschedulable node");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "spec.unschedulable".to_string(),
+                value: "false".to_string(),
+                negated: false,
+            }),
+            ..Default::default()
+        };
+        let resp = store.list("/registry/nodes/", opts).await.expect("list");
+
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "node with absent spec.unschedulable must match spec.unschedulable=false"
+        );
+        assert_eq!(
+            resp.items[0].key, "/registry/nodes/no-field",
+            "only the schedulable node (absent field) must be returned"
         );
     }
 
