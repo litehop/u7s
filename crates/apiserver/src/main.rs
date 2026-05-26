@@ -264,6 +264,14 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/namespaces",
             get(handlers::namespaces::list_namespaces).post(handlers::namespaces::create_namespace),
         )
+        // Namespaces — finalize subresource (must be before the named-resource catch-all)
+        // The KCM namespace controller calls PUT /api/v1/namespaces/{name}/finalize after
+        // draining resources to remove the "kubernetes" finalizer. Without this route the
+        // request hits 404 and the namespace stays stuck in Terminating forever.
+        .route(
+            "/api/v1/namespaces/{name}/finalize",
+            axum::routing::put(handlers::namespaces::finalize_namespace),
+        )
         // Namespaces — named resource
         .route(
             "/api/v1/namespaces/{name}",
