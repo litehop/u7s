@@ -1,48 +1,51 @@
 # Dashboard
-2026-05-26 17:30 UTC
-Session: current — resume with `claude --continue` in /Users/balint.erdos/u7s
-Open beads: 1
+2026-05-26 20:05 UTC
+Session: 12e18241-6ee6-4356-a78e-a00a900aac86 — resume with `claude --continue` in /Users/balint.erdos/u7s
+Open beads: 3 (1 P1, 2 P2) — all in-progress, PRs open, waiting on CI
 
 ## What I need to do next
 
-**Operator action needed: wait for PR #260 to go green, then `--reset` run.**
+**No operator action needed — waiting on GitHub Actions to start CI on 3 PRs.**
 
-PR #260 fixes the second BeforeSuite blocker: `spec.unschedulable=false` returned 0 nodes because absent fields weren't treated as the zero value. Two-bug chain:
-1. `!=` parsing bug (PR #259 ✓) — nodes query was malformed
-2. `=false` absent-field bug (PR #260 pending CI) — nodes returned but filtered out
+PRs are open and CLEAN; GitHub CI has not fired yet (~10 min since push, infra lag):
+- #263 — namespace `/finalize` endpoint (P1, mayor-trbl)
+- #264 — `spec.dnsPolicy` default (P2, mayor-grmb)
+- #265 — `TokenRequest spec.expirationSeconds` (P2, mayor-o30k)
 
-Once #260 merges, run:
-```bash
-scripts/conformance/run-all.sh --reset
-```
+Once CI is green on all three, merge in order (#263 first — it's P1 and blocks sonobuoy re-runs).
 
-No operator decisions pending.
+After merging: rebuild + restart conformance stack and re-run sonobuoy to surface actual test failures.
 
 ## Forward-looking
 
-**Next: sonobuoy triage wave.** Once we have real failures, expected surface from prior analysis:
-- `generateName` (mayor-l8f — check status)
-- JSON Patch / `application/json-patch+json` (mayor-jf3)
-- `spec.nodeName` fieldSelector on pods (probably works — SQL fast-path)
-- Other fieldSelectors (mayor-yx5 — partial; `!=` now works, `=false` on absent now works too)
-- Namespace Terminating lifecycle (mayor-c3v)
-- Pod status subresource (mayor-b4g)
-- `kubectl logs` / log proxy returning 500 (known surface, was mayor-f44c)
+With all three merged:
+- Namespace termination unblocked — sonobuoy can clean up and re-run without stuck namespaces
+- dnsPolicy stamped at creation — kubelet DNS fallback noise gone
+- TokenRequest expiry populated — SA token refresh cycle correct
 
-After sonobuoy: file beads → cluster by surface → dispatch 4-6 workers.
+Outstanding unknown: e2e container still exited immediately in the last run (0 tests, result=unknown). Root cause not yet identified — was investigating CRI-O/kubelet logs when interrupted. This will resurface after the next sonobuoy run.
 
-## Recent progress (this session)
+Also pending: logging fix (default `info` level) ships with next `cargo build --release` on the next conformance run — no action needed.
 
-**PR #260 in CI:** fix fieldSelector `=false` on absent field. Root cause of SECOND BeforeSuite failure. The e2e framework queries `spec.unschedulable=false` (not `!=true`!). Our node has `spec.unschedulable` absent. Old code: absent field returns `*negated` = `false` (excluded). Fix: absent fields match `""` or `"false"` (Kubernetes zero-value semantics).
+## Recent progress
 
-**Investigation method:** extracted e2e.log from sonobuoy tarball inside kubelet emptyDir volume. Confirmed: DNAT works from container network (tested via `nsenter -n -t <coredns-pid>`). Bug was pure store logic, not network.
+This session:
 
-| PR | What | Beads |
-|----|------|-------|
-| #260 🟡 CI | fieldSelector `=false` on absent field | mayor-mc5q (P1) |
-| #259 ✓ merged | fieldSelector `!=` + bool comparison | mayor-gtue (P1, closed) |
-| #258 ✓ merged | kubelet client cert on log/exec proxy | — |
-| #257 ✓ merged | sonobuoy retrieve before aggregator exits | — |
+| PR | What | Bead |
+|----|------|------|
+| #265 open | TokenRequest spec.expirationSeconds populated | mayor-o30k |
+| #264 open | spec.dnsPolicy defaults to ClusterFirst on create | mayor-grmb |
+| #263 open | PUT /api/v1/namespaces/{name}/finalize endpoint | mayor-trbl (filed+dispatched this session) |
+| #262 ✓ | KCM serviceaccount-controller enabled | mayor-01lp |
+| #261 ✓ | pods LIST labelSelector fix | mayor-a2cz |
+| #260 ✓ | fieldSelector =false on absent fields | mayor-mc5q |
+| #259 ✓ | fieldSelector != operator + bool comparison | mayor-gtue |
+
+Also shipped: `fix(apiserver): default log level to info` — apiserver.log now populates when run backgrounded.
+
+Root cause confirmed for namespace Terminating hang: upstream KCM calls `PUT /api/v1/namespaces/{name}/finalize` which had no route → 404 → finalizer never removed. PR #263 adds the endpoint.
+
+Session metrics: 4 PRs merged, 3 PRs in-flight, 1 bead filed, 0 operator decisions pending.
 
 ## Stance
-Pre-alpha/greenfield — break freely, no backward compat, correctness first, performance-critical (RSS/latency hard targets), kubectl-compatible API surface, minimal deps. Mayor merges on green CI automatically; flags security/API/architecture decisions first.
+Pre-alpha/greenfield — break freely, no backward compat, correctness first, performance-critical, kubectl-compatible API, minimal deps. Mayor merges on green CI automatically; flags security/API/architecture decisions first.

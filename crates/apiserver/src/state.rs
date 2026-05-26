@@ -213,7 +213,7 @@ impl<S: Store> AppState<S> {
     /// the kubelet proxy client cert. In production this is
     /// `kubelet_client_cert_pem + kubelet_client_key_pem` from `TlsMaterial`.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_ca(
+    pub(crate) fn new_with_ca(
         store: Arc<S>,
         sa_key: Option<jsonwebtoken::EncodingKey>,
         sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
