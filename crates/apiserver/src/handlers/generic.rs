@@ -292,6 +292,12 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
     if has_finalizers {
         // Soft delete: stamp deletionTimestamp.
         obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+        // The upstream KCM namespace controller watches for status.phase == "Terminating"
+        // to trigger finalizer removal. Without this field the namespace hangs forever
+        // because KCM never begins the drain cycle (mayor-qyfg).
+        if obj.body["kind"].as_str() == Some("Namespace") {
+            obj.body["status"]["phase"] = serde_json::Value::String("Terminating".to_string());
+        }
         Some(obj.body.clone())
     } else {
         None
@@ -1734,6 +1740,70 @@ mod collection_query_rename_tests {
         assert!(
             q.resource_version.is_none(),
             "snake_case 'resource_version' must NOT populate resource_version after rename"
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_delete_policy_tests {
+    use super::apply_delete_policy;
+    use crate::types::Object;
+
+    fn make_obj(kind: &str, finalizers: &[&str]) -> Object {
+        let finalizer_json: Vec<serde_json::Value> =
+            finalizers.iter().map(|f| serde_json::json!(f)).collect();
+        Object {
+            body: serde_json::json!({
+                "kind": kind,
+                "apiVersion": "v1",
+                "metadata": {
+                    "name": "test",
+                    "finalizers": finalizer_json
+                }
+            }),
+        }
+    }
+
+    /// A Namespace with finalizers must have status.phase == "Terminating" after soft-delete.
+    ///
+    /// The upstream KCM namespace controller only begins its drain cycle when it observes
+    /// status.phase == "Terminating" on the watch event. Without this field the KCM never
+    /// removes the kubernetes finalizer and the namespace hangs forever (mayor-qyfg).
+    #[test]
+    fn namespace_with_finalizers_gets_terminating_phase() {
+        let mut obj = make_obj("Namespace", &["kubernetes"]);
+        let body =
+            apply_delete_policy(&mut obj).expect("Namespace with finalizers must be soft-deleted");
+
+        assert_eq!(
+            body["status"]["phase"].as_str(),
+            Some("Terminating"),
+            "status.phase must be \"Terminating\" so KCM starts the drain cycle; \
+             without it the namespace hangs forever (mayor-qyfg)"
+        );
+        assert!(
+            body["metadata"]["deletionTimestamp"].as_str().is_some(),
+            "deletionTimestamp must also be stamped on soft-delete"
+        );
+    }
+
+    /// A non-Namespace object (e.g. Pod) must NOT have status.phase set by apply_delete_policy.
+    ///
+    /// Setting status.phase on arbitrary resource types would corrupt their status fields
+    /// since phase semantics are resource-specific (e.g. Pod phase has different values).
+    #[test]
+    fn non_namespace_with_finalizers_does_not_get_phase() {
+        let mut obj = make_obj("Pod", &["my-controller/cleanup"]);
+        let body = apply_delete_policy(&mut obj).expect("Pod with finalizers must be soft-deleted");
+
+        assert!(
+            body["status"]["phase"].is_null(),
+            "status.phase must NOT be set on non-Namespace objects; \
+             only Namespaces need this field to trigger KCM drain (mayor-qyfg)"
+        );
+        assert!(
+            body["metadata"]["deletionTimestamp"].as_str().is_some(),
+            "deletionTimestamp must still be stamped for non-Namespace soft-delete"
         );
     }
 }
