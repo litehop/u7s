@@ -375,6 +375,85 @@ pub async fn patch_namespace<S: Store>(
     Ok(Json(current.body).into_response())
 }
 
+/// PUT /api/v1/namespaces/{name}/finalize
+///
+/// Implements the Kubernetes namespace finalize subresource. The upstream
+/// kube-controller-manager namespace controller calls this after draining all
+/// resources from the namespace to remove the "kubernetes" finalizer. Unlike a
+/// full PUT, this endpoint only updates spec.finalizers (stored as
+/// metadata.finalizers). If deletionTimestamp is set and finalizers are now
+/// empty, the namespace is hard-deleted.
+pub async fn finalize_namespace<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    // Parse the finalizers from the request body.
+    // KCM sends the finalizers in spec.finalizers. We also accept metadata.finalizers
+    // as a fallback for clients that write the field in standard metadata position.
+    let req: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // KCM writes spec.finalizers; fall back to metadata.finalizers.
+    let new_finalizers = if !req["spec"]["finalizers"].is_null()
+        && req["spec"].get("finalizers").is_some()
+    {
+        req["spec"]["finalizers"].clone()
+    } else {
+        req["metadata"]["finalizers"].clone()
+    };
+
+    // Fetch the current namespace from the store.
+    let key = cluster_object_key("namespaces", &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    // Update only the finalizers field (stored in metadata.finalizers).
+    current.body["metadata"]["finalizers"] = new_finalizers;
+    // Keep spec.finalizers in sync so the response body is consistent.
+    if current.body.get("spec").is_some() {
+        current.body["spec"]["finalizers"] = current.body["metadata"]["finalizers"].clone();
+    }
+
+    // Check: if deletionTimestamp is set and finalizers are now empty → hard-delete.
+    let current_meta: ObjectMeta =
+        serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
+    let deletion_ts_set = current_meta.deletion_timestamp.is_some();
+    let finalizers_empty = current_meta
+        .finalizers
+        .as_deref()
+        .map(|f| f.is_empty())
+        .unwrap_or(true);
+
+    if deletion_ts_set && finalizers_empty {
+        state
+            .store
+            .delete(&key, None)
+            .await
+            .map_err(|e| store_err_to_status(e, &name))?;
+        return Ok(Json(current.body).into_response());
+    }
+
+    // Finalizers remain — persist the updated object and return it.
+    let expected_rv = parse_resource_version(current.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, &name))?;
+
+    current.set_resource_version(new_rv);
+
+    Ok(Json(current.body).into_response())
+}
+
 pub async fn delete_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
@@ -1459,6 +1538,193 @@ mod tests {
             StatusCode::CONFLICT,
             "stale resourceVersion on replace_namespace must return 409 Conflict — \
              OCC is the guard against lost-update races in concurrent namespace updates"
+        );
+    }
+
+    // finalize_namespace (PUT /api/v1/namespaces/{name}/finalize) must hard-delete
+    // the namespace when deletionTimestamp is set and spec.finalizers is empty.
+    //
+    // This is the exact call the KCM namespace controller makes after draining all
+    // resources. Without this endpoint the namespace stays Terminating forever.
+    #[tokio::test]
+    async fn finalize_namespace_hard_deletes_when_spec_finalizers_empty_with_deletion_ts() {
+        let state = make_state();
+
+        // Create with the kubernetes finalizer.
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body_with_finalizers("finalize-ns", &["kubernetes"]),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Soft-delete to set deletionTimestamp + phase=Terminating.
+        assert!(
+            delete_namespace(State(state.clone()), Path("finalize-ns".to_string()))
+                .await
+                .is_ok(),
+            "soft-delete must succeed"
+        );
+
+        // The namespace must still be in the store (Terminating, not hard-deleted).
+        assert!(
+            state
+                .store
+                .get(&crate::keys::cluster_object_key("namespaces", "finalize-ns"))
+                .await
+                .unwrap()
+                .is_some(),
+            "namespace must still exist after soft-delete"
+        );
+
+        // KCM calls PUT /finalize with spec.finalizers: [] to remove the finalizer.
+        // This must trigger a hard-delete.
+        let finalize_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "finalize-ns" },
+                "spec": { "finalizers": [] }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            finalize_namespace(
+                State(state.clone()),
+                Path("finalize-ns".to_string()),
+                finalize_body,
+            )
+            .await
+            .is_ok(),
+            "finalize with empty spec.finalizers must succeed"
+        );
+
+        // The namespace must now be gone — hard-deleted by finalize_namespace.
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "finalize-ns"))
+            .await
+            .expect("store get must not error");
+        assert!(
+            stored.is_none(),
+            "PUT /finalize with empty spec.finalizers while deletionTimestamp is set \
+             must hard-delete the namespace — without this the namespace stays Terminating forever. \
+             This is the critical path the KCM uses to complete namespace termination."
+        );
+    }
+
+    // finalize_namespace must only update finalizers and persist (not hard-delete)
+    // when spec.finalizers is non-empty after the PUT.
+    //
+    // The KCM may call finalize with some finalizers remaining if multiple controllers
+    // registered finalizers. Only the last removal (empty finalizers) triggers hard-delete.
+    #[tokio::test]
+    async fn finalize_namespace_persists_when_spec_finalizers_non_empty() {
+        let state = make_state();
+
+        // Create with two finalizers.
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body_with_finalizers("multi-fin-ns", &["kubernetes", "other"]),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Soft-delete to set deletionTimestamp.
+        assert!(
+            delete_namespace(State(state.clone()), Path("multi-fin-ns".to_string()))
+                .await
+                .is_ok(),
+            "soft-delete must succeed"
+        );
+
+        // Call finalize with one finalizer remaining (kubernetes removed, other stays).
+        let finalize_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "multi-fin-ns" },
+                "spec": { "finalizers": ["other"] }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            finalize_namespace(
+                State(state.clone()),
+                Path("multi-fin-ns".to_string()),
+                finalize_body,
+            )
+            .await
+            .is_ok(),
+            "finalize with non-empty spec.finalizers must succeed"
+        );
+
+        // The namespace must still exist — non-empty finalizers mean no hard-delete yet.
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "multi-fin-ns"))
+            .await
+            .expect("store get must not error")
+            .expect("namespace must still exist — finalizers remain, no hard-delete yet");
+        let body: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("parse stored namespace");
+
+        let finalizers = body["metadata"]["finalizers"]
+            .as_array()
+            .expect("metadata.finalizers must be an array");
+        assert_eq!(
+            finalizers.len(),
+            1,
+            "after finalize with spec.finalizers=[other], only one finalizer must remain"
+        );
+        assert_eq!(
+            finalizers[0].as_str(),
+            Some("other"),
+            "the remaining finalizer must be 'other'"
+        );
+    }
+
+    // finalize_namespace must return 404 when the namespace does not exist.
+    // The KCM should not encounter this in practice, but the handler must be correct.
+    #[tokio::test]
+    async fn finalize_namespace_returns_404_for_missing() {
+        let state = make_state();
+
+        let finalize_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "no-such-ns" },
+                "spec": { "finalizers": [] }
+            })
+            .to_string(),
+        );
+
+        let result = finalize_namespace(
+            State(state.clone()),
+            Path("no-such-ns".to_string()),
+            finalize_body,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 404 for missing namespace"),
+        };
+        assert_eq!(
+            err.0,
+            StatusCode::NOT_FOUND,
+            "finalize on non-existent namespace must return 404"
         );
     }
 
