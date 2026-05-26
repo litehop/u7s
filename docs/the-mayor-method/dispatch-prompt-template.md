@@ -17,26 +17,28 @@ Placeholders used throughout (substitute per project):
 
 ## Worktree boundary — mandatory in every editing dispatch
 
-### Root cause (why the block exists)
+**Why this block exists.** Shell commands use `workdir`, but `apply_patch` and
+some edit tools have no workdir, so relative patch paths can resolve against
+the mayor checkout instead of the assigned worktree. "Use your worktree" is
+not a strong enough prompt. Workers must verify before each edit and check
+both checkouts after the first one.
 
-Workers understand they're assigned to separate worktrees, and their shell
-commands generally use the right `workdir`. The failure mode is subtler:
-**`apply_patch` has no explicit `workdir`**, so relative patch paths can
-resolve against the session/default checkout, not the shell worktree the
-worker just used. "Use your worktree" is not a strong enough prompt. Patch
-tools and shell tools do not share the same scoping guarantees.
+**The path-resolution leak failure mode.** Observed repeatedly in audit
+dispatches: the worker correctly ran the worktree guard and got the right
+`WORKTREE_ROOT`, then a file `Write` (especially of a new `ai/findings/<name>.md`
+file) landed in the mayor checkout because the edit tool resolved a
+repo-relative path against the agent's session root instead of the worker's
+git root. Symptoms:
 
-### The safe delegation pattern
+- `git status` inside the worker worktree shows no new findings file.
+- `git status` inside the mayor checkout shows a new untracked file under
+  `ai/findings/` that the worker thinks it wrote to its worktree.
+- The findings file is gitignored so neither side commits it — the boundary
+  fails *silently*.
 
-- Shell commands use `workdir` / `cd` inside the assigned worktree.
-- Edit tools use paths that are **relative to the session root** and
-  explicitly walk into the assigned worktree.
-- The worker checks both the worker worktree AND the mayor checkout
-  immediately after the first edit.
-
-
-Repo-relative paths are **forbidden** for worker `apply_patch` calls
-unless the agent session root is itself the assigned worker worktree.
+**Defence:** any `Write` of a brand-new file (especially under `ai/findings/`)
+must be IMMEDIATELY followed by verifying the file landed in the worker
+worktree and NOT in the mayor checkout (see the block below).
 
 ### The block (paste verbatim into every editing-worker dispatch)
 
@@ -51,8 +53,11 @@ The mayor checkout is:
 
 Never edit the mayor checkout.
 
-Shell workdir is not enough protection. apply_patch has no workdir, so
-relative patch paths can land in the mayor checkout.
+Shell workdir is not enough protection. apply_patch and Write tools have no
+workdir, so relative patch / write paths can land in the mayor checkout.
+This is the path-resolution leak failure mode — the worktree guard at
+session start does NOT catch it, because the leak happens mid-session in a
+single tool call.
 
 Before every file edit, run:
 
@@ -61,37 +66,46 @@ pwd; git rev-parse --show-toplevel; git status --short --branch
 Only edit if git rev-parse --show-toplevel prints exactly:
 <ASSIGNED_WORKTREE>
 
-When using apply_patch or any edit tool, use absolute file paths under
-<ASSIGNED_WORKTREE> if the tool accepts them.
-
-If the edit tool does not accept absolute paths, use paths relative to
-the session root that explicitly target the worker worktree. That
-usually means walking out of the mayor checkout and into the worktree
-root:
-
+When using apply_patch, Write, or any edit tool, use ABSOLUTE file paths
+under <ASSIGNED_WORKTREE> wherever the tool accepts them. If the tool only
+accepts relative paths, use paths relative to the session root that
+explicitly target the worker worktree:
 <WORKTREE_ROOT>/<WORKTREE_NAME>/<repo-relative-path>
-
-Never use repo-relative edit paths such as `<repo-relative-path>` on
-their own unless `git rev-parse --show-toplevel` for the agent session
-root itself is the assigned worktree.
+Never use bare repo-relative paths unless `git rev-parse --show-toplevel`
+for the agent session root is itself the assigned worktree.
 
 After the first edit, immediately run:
 
 git -C <ASSIGNED_WORKTREE> status --short --branch
 git -C <MAYOR_CHECKOUT> status --short --branch
 
-Continue only if the worker worktree is dirty and the mayor checkout
-did not receive code edits.
+Continue only if the worker worktree is dirty and the mayor checkout did
+not receive code edits.
 
-If any edit lands outside <ASSIGNED_WORKTREE>, stop immediately and
-report it. Do not repair, restore, clean up, commit, or push until the
-mayor tells you what to do.
+NEW-FILE EXTRA CHECK (path-resolution leak). When you Write a brand-new
+file (most-common offender: ai/findings/<name>.md from an audit), the
+path-resolution leak silently routes the write into the mayor checkout
+because the file did not previously exist in either tree. After every
+new-file Write, verify BOTH locations:
+
+  ls <ASSIGNED_WORKTREE>/<repo-relative-path>    # must exist
+  ls <MAYOR_CHECKOUT>/<repo-relative-path>       # must NOT exist
+
+Only the first should succeed. If the mayor-side ls returns a file, STOP —
+you've leaked. Do not retry the write, do not delete the leaked file, do
+not commit. Report the leak with both results and let the mayor decide.
+
+If any edit lands outside <ASSIGNED_WORKTREE>, stop immediately and report
+it. Do not repair, restore, commit, or push until the mayor tells you what
+to do.
 ```
 
 ### Mayor checks after dispatch
 
 - Check the mayor checkout immediately after dispatching:
   `git status --short --branch`.
+- Also scan: `ls <MAYOR_CHECKOUT>/ai/findings/` to spot leaked gitignored
+  findings the worker meant to put in its own worktree.
 - If the mayor checkout gains unexpected code changes, interrupt the
   worker before it does more work.
 - Preserve any accidental changes into the worker worktree before
@@ -158,176 +172,75 @@ For this project the correct root is `<MAYOR_CHECKOUT>/ai/worktrees/`.
 
 ## Shape 1 — Solo bead implementation
 
-```
-<COMMON PREAMBLE>
+One bead, one PR. Standard shape. Sections: bead ID + verbatim title; 2–4
+paragraphs of context with `file:line` citations; numbered concrete steps;
+worktree at `<WORKTREE_ROOT>/<descriptive>-<BEAD_ID>` with branch
+`worker/<descriptive>-<BEAD_ID>`; include worktree-boundary block; `bd
+update <BEAD_ID> --claim` + `--status=in_progress`; quality gates with exact
+commands; push + `gh pr create` titled `<scope>(<artefact>): <summary>
+(<BEAD_ID>)`; return PR URL + per-step summary + test deltas, under <N> words.
 
-## Bead
-
-```
-<verbatim bead title + priority + source-finding-doc>
-```
-
-## Context
-
-<2-4 paragraphs explaining what's wrong and why it matters; cite file:line>
-
-## Concrete steps
-
-1. <numbered, file:line-precise actions>
-2. ...
-
-## Process
-
-**Your worktree is already created by the mayor at `<WORKTREE_ROOT>/<descriptive>-<BEAD_ID>`, branch `worker/<descriptive>-<BEAD_ID>`.**
-
-Step 0 — verify (do NOT start with `cd` — it is not in the Bash allowlist and will be denied):
+Step 0 — verify (do NOT start with `cd`):
 ```bash
 git -C <ASSIGNED_WORKTREE> rev-parse --show-toplevel
 git -C <ASSIGNED_WORKTREE> branch --show-current
 git -C <ASSIGNED_WORKTREE> status --short
 ```
 Only proceed if `rev-parse --show-toplevel` prints exactly `<ASSIGNED_WORKTREE>`.
-You may `cd` into the worktree after these pass — but not as your first command.
 
-1. `bd update <BEAD_ID> --claim` then `bd update <BEAD_ID> --status=in_progress`.
-2. Implement.
-3. **Quality gate — mandatory, run in this exact order, paste the output into your return:**
-   ```bash
-   cargo fmt --all
-   cargo fmt --all -- --check
-   cargo test --workspace --quiet
-   cargo clippy --workspace --tests --quiet -- -D warnings
-   ```
-   Do not proceed to step 4 if any command fails. Fix the failure first.
-   Note: `gh pr create` and `git push` are both intercepted by a pre-tool hook
-   that re-runs fmt+test+clippy and will block if they fail. Running them here
-   first means you see the failure with context, not as a cryptic hook rejection.
-4. Push branch + `gh pr create` with title `<scope>(<artefact>): <summary> (<BEAD_ID>)`.
-
-## Return
-
-Under <N> words: PR URL + per-step summary + test deltas (how many tests before/after).
-
-<COMMON CONSTRAINTS>
+Quality gate — mandatory, run in this exact order, paste output into return:
+```bash
+cargo fmt --all
+cargo fmt --all -- --check
+cargo test --workspace --quiet
+cargo clippy --workspace --tests --quiet -- -D warnings
 ```
+Do not proceed to PR if any command fails. Note: `gh pr create` and `git push`
+are intercepted by a pre-tool hook that re-runs fmt+test+clippy and will block
+if they fail — running them here first means you see the failure with context.
 
 ---
 
 ## Shape 2 — Cluster (multiple beads, single PR, sequenced commits)
 
-```
-<COMMON PREAMBLE adapted for "CLUSTER of N beads">
-
-## Cluster: "<descriptive name>"
-
-N beads from <audit/source>. Findings (local-only):
-`ai/findings/<doc>.md`. Surface: <shared file/artefact>.
-
-## Beads + commit ordering (smallest cleanup → biggest correctness fix)
-
-**Commit format**: `<scope>(<artefact>): <summary> (<BEAD_ID>)`.
-
-1. **<BEAD_ID-1> (P3)** — <one-line + scope>
-2. **<BEAD_ID-2> (P3)** — <one-line>
-...
-N. **<BEAD_ID-N> (P1 BUG)** — <one-line + concrete fix sketch + regression test ask>
-
-## Process
-
-**Your worktree is already created by the mayor at `<WORKTREE_ROOT>/<cluster-name>-<HEAD_BEAD_ID>`, branch `worker/<cluster-name>-<HEAD_BEAD_ID>`.**
-
-Step 0 — verify and enter:
-```bash
-cd /Users/balint.erdos/u7s/ai/worktrees/<cluster-name>-<HEAD_BEAD_ID>
-pwd; git rev-parse --show-toplevel; git branch --show-current
-```
-Only proceed if show-toplevel prints `/Users/balint.erdos/u7s/ai/worktrees/<cluster-name>-<HEAD_BEAD_ID>`.
-
-1. For each bead: `bd update <BEAD_ID> --claim` + `--status=in_progress`
-   BEFORE that bead's commit.
-2. Run quality gates after EACH commit. After ALL: full regression.
-3. Push + `gh pr create` with title
-   `<scope>(<artefact>): <cluster name> (N beads incl. <P1 highlights>)`.
-
-## Return
-
-Under <N> words: PR URL + per-bead one-line + test deltas + cross-bead unifications.
-
-<COMMON CONSTRAINTS>
-```
+3–12 beads on a shared surface. Sections: cluster name + N beads + source
+findings; numbered bead list ordered **smallest cleanup → biggest correctness
+fix** (so a failing P1 fix doesn't strand the small cleanups); commit format
+`<scope>(<artefact>): <summary> (<BEAD_ID>)`; worktree at
+`<WORKTREE_ROOT>/<cluster-name>-<HEAD_BEAD_ID>`; pre-claim each bead BEFORE
+its commit (so bd state mirrors history one-to-one and a stalled cluster
+leaves a clean partial trail); quality gates after EACH commit + full
+regression after ALL; PR titled `<scope>(<artefact>): <cluster name> (N beads
+incl. <P1 highlights>)`; return PR URL + per-bead one-liner + cross-bead
+unifications spotted. Disjoint-surface "small-misc" clusters are valid at
+the tail of a drain — the binding rule is hot-zone parallelism, not strict
+same-surface.
 
 Key cluster discipline:
 
-- **Smallest+safest commit first; biggest correctness fix last.** If the
-  P1 fix breaks something, the small refactors land cleanly first.
+- **Smallest+safest commit first; biggest correctness fix last.** If the P1
+  fix breaks something, the small refactors land cleanly first.
 - **Spell out commit ordering.** Don't leave it to the agent.
-- **Note cross-bead unifications.** They surface real wins (e.g. a cluster
-  may find a multi-commit refactor arc shared across several beads, or
-  unify duplicate helper code that wasn't previously visible as a
-  single concern).
-- **Bead pre-claim before each commit.** So bd state mirrors commit
-  history one-to-one and a stalled cluster leaves a clean partial trail.
+- **Note cross-bead unifications.** They surface real wins.
+- **Bead pre-claim before each commit.** So bd state mirrors commit history
+  one-to-one and a stalled cluster leaves a clean partial trail.
 
 ---
 
 ## Shape 3 — Audit (read-only research)
 
-```
-<COMMON PREAMBLE adapted for "audit bead <BEAD_ID>">
-
-## Goal
-
-Read `<surface>` end-to-end and produce a findings report identifying:
-1. **Correctness drifts** — places where impl diverges from spec
-2. **Performance hotspots** — allocations, missed batching, double-walks
-3. **API hygiene** — fn names, public surface, missing docstrings
-4. **Testing gaps** — concurrency, hot-reload, error paths
-5. **Cross-artefact coupling**
-
-## Reference
-
-- <surface paths>
-- <relevant spec docs>
-- <recent landings affecting this surface — name them so the audit reads
-  the post-landing reality>
-- <prior audit findings docs to avoid re-discovering>
-
-## Process
-
-**Your worktree is already created by the mayor at `<WORKTREE_ROOT>/<surface>-audit-<BEAD_ID>`, branch `worker/<surface>-audit-<BEAD_ID>`.**
-
-Step 0 — verify and enter:
-```bash
-cd /Users/balint.erdos/u7s/ai/worktrees/<surface>-audit-<BEAD_ID>
-pwd; git rev-parse --show-toplevel; git branch --show-current
-```
-Only proceed if show-toplevel prints `/Users/balint.erdos/u7s/ai/worktrees/<surface>-audit-<BEAD_ID>`.
-
-1. Worktree at
-   `<WORKTREE_ROOT>/<surface>-audit-<BEAD_ID>`
-   with branch `worker/<surface>-audit-<BEAD_ID>`.
-2. Include worktree-boundary block.
-3. `bd update <BEAD_ID> --status=in_progress`.
-4. **WRITE FINDINGS DOC FIRST** to
-   `ai/findings/<surface>-slice-audit-YYYY-MM-DD.md`
-   (local-only; gitignored — `ai/findings/` is not tracked).
-   Do all analysis + write findings BEFORE running any `bd create`.
-   Earlier audits stalled mid-bead-filing and lost analysis.
-5. File follow-ons via `bd create` ONE AT A TIME (after each, append the
-   new bead ID to <BEAD_ID> notes — partial progress stays durable).
-6. Close <BEAD_ID> with verdict + cross-refs.
-7. **No PR by default.** Findings docs are local-only and must NOT be
-   committed. Trivial one-line obvious fixes are OK to bundle into a
-   small PR.
-
-## Return
-
-Under 400 words: per-finding file:line citations + follow-on bead IDs +
-severity counts (HIGH/MED/LOW/DEFER) + verdict.
-
-<COMMON CONSTRAINTS adapted: "You're READING surfaces concurrent agents
-are writing — that's fine for audits but flag any rendezvous concerns.">
-```
+One bead asks for a finding, not a fix. Sections: goal (read `<surface>`
+end-to-end; identify correctness drifts, perf hotspots, API hygiene, testing
+gaps, cross-artefact coupling); reference (surface paths, relevant spec
+docs, recent landings that changed the surface, prior audit findings to avoid
+re-discovering); worktree + boundary block + `--status=in_progress`;
+**WRITE THE FINDINGS DOC FIRST** to `ai/findings/<surface>-audit-YYYY-MM-DD.md`
+(gitignored — never commit findings); file follow-on beads ONE AT A TIME after
+the doc lands, appending each bead ID to the audit-bead's notes so partial
+progress is durable across a watchdog timeout; close audit-bead with verdict +
+cross-refs; no PR by default (trivial one-line obvious fixes can ride along in
+a small PR); return under 400 words with per-finding `file:line` citations +
+follow-on bead IDs + severity counts (HIGH/MED/LOW/DEFER) + verdict.
 
 Critical learnings:
 
@@ -336,107 +249,39 @@ Critical learnings:
   the analysis even if the bead-filing loop never completes.
 - **One bd-create at a time + update parent notes after each.** Partial
   progress survives a watchdog timeout.
-- **Name the recent landings** so the audit reads the current reality,
-  not a stale picture.
-- **Severity tags** (HIGH/MED/LOW/DEFER) make later cluster-formation
-  trivial.
-- **`ai/findings/` is gitignored.** Never open a PR that adds a findings
-  doc. Convert actionable findings into bead bodies / spec / docs.
+- **Name the recent landings** so the audit reads the current reality.
+- **Severity tags** (HIGH/MED/LOW/DEFER) make later cluster-formation trivial.
+- **`ai/findings/` is gitignored.** Never open a PR that adds a findings doc.
 
 ---
 
 ## Shape 4 — Cluster reviewer (research + recommendation only, no dispatch)
 
-```
-You are a clustering reviewer for the project's bead queue.
-**Research + recommendation only — do NOT dispatch agents, do NOT change
-bd state.** Report findings.
-
-## Context
-
-<repo + time>
-
-## Cluster policy (the operator's words verbatim)
-
-> When multiple open beads target the same surface ... [policy text]
-
-## In-flight (do NOT recommend changes that touch these)
-
-<agents working + surfaces>
-<PRs in queue + surfaces locked>
-
-## Your task
-
-1. Enumerate beads filed in last ~30 min via
-   `git log -p --since='35 minutes ago' -- .beads/issues.jsonl`.
-2. For each, determine surface via `bd show <id>`.
-3. Decide per-bead:
-   - (A) Add to in-flight cluster
-   - (B) Form NEW cluster (3+ beads on shared non-in-flight surface)
-   - (C) Solo dispatch (P0/P1 correctness, structural >250 LoC,
-         decision-resolved, cross-cutting)
-   - (D) Defer
-4. <Specific question about this round's pattern>
-
-## Output format
-
-<structured template>
-
-## Net recommendation
-
-2-3 sentences. Specific timing + dispatch shape.
-```
-
-Used between major dispatch waves to shape the next round. Saves operator
-effort by surfacing the optimal cluster shape from the audit-then-cluster
-cycle. **Read-only — no worktree boundary block needed.**
+Used between major dispatch waves to shape the next round. Read-only — no
+worktree boundary block needed. Sections: cluster policy verbatim; in-flight
+workers + their surfaces (do NOT recommend changes that touch these); enumerate
+beads filed in the last ~30 min via
+`git log -p --since='35 minutes ago' -- .beads/issues.jsonl`; per-bead decide:
+(A) add to in-flight cluster / (B) form new cluster (3+ beads on shared
+non-in-flight surface) / (C) solo (P0/P1 correctness, structural >250 LoC,
+decision-resolved, cross-cutting) / (D) defer; structured output template;
+net recommendation in 2–3 sentences with specific timing + dispatch shape.
+**Do not change bd state.**
 
 ---
 
 ## Shape 5 — Fix CI failure on a specific PR
 
-```
-<COMMON PREAMBLE>
-
-PR #NNNN (`<title>`) has a CI failure: `<failing check>`.
-
-## Failure
-
-```
-<paste failing log lines verbatim>
-```
-
-## Hypotheses (likely)
-
-1. <root cause guess 1>
-2. <root cause guess 2>
-
-## Concrete steps
-
-1. **Worktree**: `git worktree add
-   <WORKTREE_ROOT>/<branch-name>-fix <branch>`.
-2. Include worktree-boundary block.
-3. <investigation steps>
-4. **Pick the fix**:
-   - **(A)** <surgical option>
-   - **(B)** <medium option>
-   - **(C)** Skip + file follow-on bead — appropriate when the project
-     stance allows a safe-out (e.g. pre-alpha) and (A)/(B) prove deeper
-     than the bead's scope.
-5. Verify locally if possible.
-6. Push fix to PR branch (not main).
-
-## Return
-
-Under 300 words: root cause + fix chosen + verification.
-
-<COMMON CONSTRAINTS — additional: "Push to existing PR branch, not main.">
-```
-
-Diagnosis often surfaces deeper insight than the failure log shows. A
-classic example: "X subsystem can't find port" turns out to be a missing
-callback option in a higher layer, not the network failure the log
-suggested. Worker should test their hypothesis before applying the fix.
+One PR has a failing check that isn't obviously irrelevant. Sections:
+the failing check name + log lines verbatim; 2–3 root-cause hypotheses;
+worktree at `<WORKTREE_ROOT>/<branch-name>-fix` checking out the existing
+branch (not a new one); boundary block; investigation steps; pick the fix:
+(A) surgical / (B) medium / (C) skip + file follow-on bead (appropriate when
+stance allows a safe-out and the fix proves deeper than the bead's scope);
+verify locally; **push to the existing PR branch, not main**; return under 300
+words with root cause + fix chosen + verification. Diagnosis often surfaces
+deeper insight than the failure log shows — test the hypothesis before applying
+the fix.
 
 ---
 
@@ -502,48 +347,47 @@ When a worker returns from a VM/sonobuoy-touching bead:
 
 ---
 
-## What goes WRONG without these patterns
+## Common failure modes these patterns close
 
 - **Agents add back-compat shims by default.** Pre-alpha posture must be
-  explicit in every prompt.
+  explicit in every preamble.
 - **Same-file races between concurrent agents.** "Concurrent agents on
   disjoint surfaces: <list>" prevents this.
 - **Workers leak edits into mayor checkout.** The worktree-boundary block
-  (separate doc) is the only reliable defence.
+  is the only reliable defence.
+- **Path-resolution leak on new-file Write** (especially `ai/findings/*` from
+  an audit) routes the file into the mayor checkout silently → new-file
+  double-check with `ls` on both paths in the worktree-boundary block.
 - **Stalled agents lose analysis.** "Findings doc FIRST" recovery protocol
   salvages partial progress.
 - **Clusters split when they should be one PR.** Cluster reviewer
   pre-validates dispatch shape.
-- **Hot-zone files cause merge conflicts.** Explicit hot-zone list in every
-  prompt.
+- **Hot-zone files cause merge conflicts.** Explicit hot-zone list in every prompt.
 - **Agents re-discover known issues.** Naming recent landings + prior
   findings docs prevents this.
 - **Workers use `gh pr create` to bypass the pre-push hook.** The PreToolUse
-  hook now intercepts `gh pr create` and `gh pr edit` the same way it intercepts
-  `git push` — running fmt+test+clippy before either is allowed. But the dispatch
-  prompt must also mandate running quality gates explicitly before pushing, so
-  workers see failures with context rather than as a hook rejection.
+  hook intercepts `gh pr create` and `gh pr edit` the same way it intercepts
+  `git push`. Dispatch prompt must also mandate running quality gates before
+  pushing so workers see failures with context, not as a hook rejection.
 - **Workers pass cargo tests but skip sonobuoy smoke verification.** Unit tests
-  cannot cover the runtime RBAC/auth/collection-delete/namespace-drain path that
-  sonobuoy exercises. For any bead touching those surfaces, inject the Lima VM
-  protocol block and enforce VM evidence at return-review time. Do not merge
-  without it.
-- **Workers use Python or shell tools instead of permitted built-ins.** `python3 -c`
-  for JSON, `cat`/`head` for file reads, `sed`/`awk` for edits — all trigger
-  permission prompts and slow the session. The common preamble tooling rules
-  prevent this if injected. Always inject the common preamble verbatim.
-- **Mayor "gets into the flow" and codes instead of dispatching.** The three-
-  condition exception test is easy to rationalize past once the mayor has already
-  read several files. The fourth condition (≤2 files read) is the circuit breaker.
-  If the mayor is debugging a runtime issue, it has already failed the test.
-  Workers have the lima-node MCP server and can debug live. Write a better brief.
-- **Workers guess at VM behaviour instead of observing it.** `mcp__lima-node__*`
-  and `limactl shell` are both available. For any bead touching `scripts/conformance/`,
-  `scripts/*-start.sh`, or sonobuoy-exercised handlers, inject the Lima VM protocol
-  block verbatim.
-- **Workers embed bead IDs and task refs in source comments.** These rot immediately
-  as beads close and PRs age. The fix: the common preamble now explicitly bans bead
-  IDs in source. Enforce it at review time — if a diff contains `(mayor-`, send
+  cannot cover the runtime RBAC/auth/collection-delete/namespace-drain path.
+  Inject the Lima VM protocol block and enforce VM evidence at return-review time.
+- **Workers use Python or shell tools instead of permitted built-ins.**
+  `python3 -c` for JSON, `cat`/`head` for file reads, `sed`/`awk` for edits
+  — all trigger permission prompts and slow the session. Always inject the
+  common preamble verbatim.
+- **Mayor "gets into the flow" and codes instead of dispatching.** The
+  four-condition exception test is easy to rationalize past once the mayor has
+  already read several files. The fourth condition (≤2 files read) is the
+  circuit breaker. Workers have the lima-node MCP server and can debug live.
+  Write a better brief.
+- **Workers guess at VM behaviour instead of observing it.**
+  `mcp__lima-node__*` and `limactl shell` are both available. Inject the Lima
+  VM protocol block for any bead touching `scripts/conformance/`,
+  `scripts/*-start.sh`, or sonobuoy-exercised handlers.
+- **Workers embed bead IDs and task refs in source comments.** These rot
+  immediately as beads close and PRs age. The common preamble bans bead IDs
+  in source. Enforce it at review time — if a diff contains `(mayor-`, send
   the worker back.
 - **Generic prompts produce generic work.** Always include file:line
   citations + concrete fix sketches.
@@ -554,31 +398,29 @@ When a worker returns from a VM/sonobuoy-touching bead:
   infra flake (e.g. `fatal: could not read Username`, checkout auth failure,
   runner timeout unrelated to the diff), rerun the specific job with
   `gh run rerun <run-id> --failed` and wait for green. Only merge when ALL
-  checks are green. `--admin` bypasses branch protection and is not appropriate
-  even for obvious infra flakes.
+  checks are green.
 - **Branch-delete-on-merge fails.** See Mayor Merge Protocol in
   [`bootstrap.md`](./bootstrap.md) (the PR merge `/loop` block).
 
 ## What goes RIGHT with these patterns
 
-A long live Mayor session that ran these patterns end-to-end tends to
-produce, in a single working day:
+A long-lived mayor session running these patterns end-to-end tends to produce,
+in a single working day:
 
-- A dozen or more audit umbrellas that surface dozens of follow-on
-  beads; those beads cluster cleanly and ship as a small number of PRs
-  with substantive per-PR scope rather than churn.
-- Multiple P1 correctness fixes shipped alongside measurable
-  performance wins (the audit-then-cluster cycle surfaces inefficiencies
-  the bead system hadn't framed as bugs).
-- API surfaces tighten as cross-bead unifications get spotted during
-  cluster authoring.
-- The project's stance (pre-alpha, production-stable, refactor-only,
-  etc.) becomes culture — agents reach for the right shape of fix by
-  default instead of needing the policy re-stated in every prompt.
+- A dozen or more audit umbrellas that surface dozens of follow-on beads;
+  those beads cluster cleanly and ship as a small number of PRs with
+  substantive per-PR scope rather than churn.
+- Multiple P1 correctness fixes shipped alongside measurable performance wins
+  (the audit-then-cluster cycle surfaces inefficiencies the bead system hadn't
+  framed as bugs).
+- API surfaces tighten as cross-bead unifications get spotted during cluster
+  authoring.
+- The project's stance becomes culture — agents reach for the right shape of
+  fix by default instead of needing the policy re-stated in every prompt.
 
-The compounding effect is the point: each audit informs the next
-cluster; each merged cluster removes scope from the next audit; the
-operator's attention concentrates on decisions instead of bookkeeping.
+The compounding effect is the point: each audit informs the next cluster; each
+merged cluster removes scope from the next audit; the operator's attention
+concentrates on decisions instead of bookkeeping.
 
 ## Pointers to canonical examples
 

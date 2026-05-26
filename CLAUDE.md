@@ -4,50 +4,85 @@
 
 Bias: caution over speed on non-trivial work. Use judgment on trivial tasks.
 
-### Rule 1 — Think Before Coding
-State assumptions explicitly. Ask rather than guess. Present multiple interpretations when ambiguity exists. Push back when a simpler approach exists. Stop when confused — name what's unclear.
+### Rule 1 — State Success Before You Start
+Before any tool call: write one sentence naming the done-when criterion.
+If you cannot state it, ask — do not start. If mid-task you lose track of
+what "done" looks like, stop and restate it before continuing.
 
 ### Rule 2 — Simplicity First
-Minimum code that solves the problem. Nothing speculative. No features beyond what was asked. No abstractions for single-use code. Would a senior engineer call this overcomplicated? If yes, simplify.
+For every piece of code you are about to write, ask: would removing this
+leave the test passing and the feature working? If yes, remove it. No
+speculative features. No abstractions for single-use code. No fallbacks for
+scenarios that cannot happen.
 
 ### Rule 3 — Surgical Changes
-Touch only what you must. Clean up only your own mess. Don't improve adjacent code, comments, or formatting. Don't refactor what isn't broken. Match existing style.
+Gate: does this file path appear in the task description, the failing test
+output, or the diff you were asked to produce? If not, do not touch it.
+Clean up only your own mess. Match existing style without comment.
 
 ### Rule 4 — Goal-Driven Execution
-Define success criteria before starting. Loop until verified. Don't follow steps mechanically — define success and iterate toward it.
+Define done-when criteria before the first tool call. At each checkpoint,
+compare actual state to those criteria — not to a checklist of steps. If
+the steps are done but the criteria aren't met, keep going. If the criteria
+are met before the steps are done, stop.
 
 ### Rule 5 — Use the Model Only for Judgment Calls
-Use for: classification, drafting, summarization, extraction. Not for: routing, retries, deterministic transforms. If code can answer, code answers.
+Use for: classification, drafting, summarization, extraction.
+Not for: routing, retries, regex, JSON parsing, deterministic transforms.
+If code can answer, code answers.
 
-### Rule 6 — Token Budgets Are Not Advisory
-Per-task: 4,000 tokens. Per-session: 30,000 tokens. If approaching budget, summarize and start fresh. Surface the breach — don't silently overrun.
+### Rule 6 — Surface Budget Pressure
+If a single task is burning more than ~20,000 tokens without a clear
+checkpoint, stop and summarize what's done, what's verified, and what
+remains. Overruns happen; silent overruns without a handoff are the problem.
 
 ### Rule 7 — Surface Conflicts, Don't Average Them
-If two patterns contradict, pick one (more recent / more tested), explain why, and flag the other for cleanup. Don't blend conflicting patterns.
+If two patterns contradict, pick the more recent or more tested one, explain
+the choice in one line, and flag the other for cleanup. Never blend
+conflicting patterns into a third thing neither was.
 
 ### Rule 8 — Read Before You Write
-Before adding code, read exports, immediate callers, and shared utilities. "Looks orthogonal" is dangerous. If unsure why code is structured a certain way, ask.
+Before adding code, read exports, immediate callers, and shared utilities.
+"Looks orthogonal" is not safe. If you do not know why something is
+structured a certain way, ask before changing it.
 
 ### Rule 9 — Tests Verify Intent, Not Just Behavior
-Tests must encode WHY behavior matters, not just WHAT it does. A test that can't fail when business logic changes is wrong.
+A test that cannot fail when business logic breaks is wrong. Test names and
+assertion messages must state WHY the behaviour matters (what breaks for a
+user if it regresses), not just WHAT the code does.
 
 ### Rule 10 — Checkpoint After Every Significant Step
-Summarize what was done, what's verified, what's left. If you lose track, stop and restate before continuing.
+After each meaningful unit of work: one sentence on what changed, one
+sentence on what's verified, one sentence on what's next. If you find
+yourself in step 4 without having done this at step 2, stop and do it now.
 
 ### Rule 11 — Match the Codebase's Conventions
-Conformance > taste. If you genuinely think a convention is harmful, surface it. Don't fork silently.
+Conformance over taste. If you genuinely believe a convention is harmful,
+surface it with a concrete example — then follow it while you wait for a
+decision. Do not silently fork.
 
 ### Rule 12 — Fail Loud
-"Completed" is wrong if anything was skipped silently. "Tests pass" is wrong if any were skipped. Default to surfacing uncertainty.
+"Completed" means done AND verified. "Tests pass" means all tests ran, none
+were skipped. If anything was skipped or assumed, say so explicitly. Default
+to surfacing uncertainty rather than papering over it.
 
 ### Rule 13 — Prefer Native Tooling
-Use Bash and Rust over Python. Do not introduce Python scripts or Python dependencies. Prefer the agent's native tools for file operations. Read over cat/head/tail. Edit over sed/awk. Write over echo>/heredoc. Grep over shell grep/find. Bash is for runtime commands: git, test runners, builds, installs — not file I/O.
+Use Bash and Rust over Python. Do not introduce Python scripts or Python
+dependencies. For file I/O: Read over cat/head/tail; Edit over sed/awk;
+Write over echo>/heredoc; Grep over shell grep/find. Bash is for runtime
+commands only: git, cargo, gh, kubectl, bd.
 
 ### Rule 14 — Every Bug Fix Ships with a Regression Test
-A bug fix without a test is incomplete. The test must fail if the fix is reverted. If the fix touches an async handler that can't be called in isolation, extract the decision logic into a pure function and test that. Decision trees buried in handlers are a code smell — unit-testable functions are the goal.
+Gate: can this test fail if the fix is reverted? If not, it is not a
+regression test — it is documentation. Extract untestable async handler logic
+into a pure function and test that. A fix without a failing-on-revert test is
+not complete.
 
 ### Rule 15 — Prefer Merge Commits for PRs
-Use `gh pr merge --merge` (a regular merge commit) by default. This preserves the full branch history and keeps individual commits readable in `git log`. Use `--squash` only when a branch has many noisy debug or fixup commits (e.g. repeated CI tweaks) that would clutter the log. Never use `--rebase` — it rewrites commit SHAs and makes history chaotic. When squashing, say why in the merge message. Likewise, when trying to resolve a pull request conflict, do so by merging `main` into the branch and resolving conflicts in the merge commit. Force pushing is forbidden and blocked.
+Use `gh pr merge --merge` by default. Use `--squash` only for branches with
+many noisy fixup commits — and say why in the merge message. Never `--rebase`
+(rewrites SHAs, breaks history). Resolve merge conflicts by merging `main`
+into the branch; do not force-push.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:7510c1e2 -->
 ## Beads Issue Tracker

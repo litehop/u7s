@@ -13,16 +13,6 @@ This project uses **bd** (beads) for issue tracking. Run `bd prime` for full wor
 > source of truth; don't `bd import` during normal operation; don't
 > reach for third-party Dolt hosting before trying the default).
 
-## Quick Reference
-
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
-```
-
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
@@ -31,21 +21,18 @@ Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interac
 
 **Use these forms instead:**
 ```bash
-# Force overwrite without prompting
 cp -f source dest           # NOT: cp source dest
 mv -f source dest           # NOT: mv source dest
 rm -f file                  # NOT: rm file
-
-# For recursive operations
 rm -rf directory            # NOT: rm -r directory
 cp -rf source dest          # NOT: cp -r source dest
 ```
 
 **Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+- `scp` — use `-o BatchMode=yes`
+- `ssh` — use `-o BatchMode=yes`
+- `apt-get` — use `-y`
+- `brew` — use `HOMEBREW_NO_AUTO_UPDATE=1`
 
 **Prefer native file tools over shell equivalents:**
 Use your agent's built-in file read/write/edit operations instead of `cat`, `sed`, `awk`, `echo >`, or `find` for file I/O. Reserve shell commands for git, test runners, builds, and installs.
