@@ -1,48 +1,47 @@
 # Dashboard
-2026-05-26 17:30 UTC
-Session: current — resume with `claude --continue` in /Users/balint.erdos/u7s
-Open beads: 1
+2026-05-26 19:50 UTC
+Session: 12e18241-6ee6-4356-a78e-a00a900aac86 — resume with `claude --continue` in /Users/balint.erdos/u7s
+Open beads: 3 (1 P1, 2 P2) — all in-progress with workers
 
 ## What I need to do next
 
-**Operator action needed: wait for PR #260 to go green, then `--reset` run.**
+**No operator action needed right now — 3 workers are running.**
 
-PR #260 fixes the second BeforeSuite blocker: `spec.unschedulable=false` returned 0 nodes because absent fields weren't treated as the zero value. Two-bug chain:
-1. `!=` parsing bug (PR #259 ✓) — nodes query was malformed
-2. `=false` absent-field bug (PR #260 pending CI) — nodes returned but filtered out
+Wait for worker PRs to land:
+- mayor-trbl (P1): `PUT /api/v1/namespaces/{name}/finalize` — unblocks namespace termination
+- mayor-grmb (P2): `spec.dnsPolicy` round-trip fix
+- mayor-o30k (P2): `TokenRequest` ExpirationTimestamp fix
 
-Once #260 merges, run:
-```bash
-scripts/conformance/run-all.sh --reset
-```
-
-No operator decisions pending.
+Once PRs are open and CI is green, merge them. Then restart the conformance run.
 
 ## Forward-looking
 
-**Next: sonobuoy triage wave.** Once we have real failures, expected surface from prior analysis:
-- `generateName` (mayor-l8f — check status)
-- JSON Patch / `application/json-patch+json` (mayor-jf3)
-- `spec.nodeName` fieldSelector on pods (probably works — SQL fast-path)
-- Other fieldSelectors (mayor-yx5 — partial; `!=` now works, `=false` on absent now works too)
-- Namespace Terminating lifecycle (mayor-c3v)
-- Pod status subresource (mayor-b4g)
-- `kubectl logs` / log proxy returning 500 (known surface, was mayor-f44c)
+After these three land:
+- Namespace termination will unblock sonobuoy re-runs (namespaces clean up properly)
+- dnsPolicy fix stops kubelet DNS fallback noise
+- TokenRequest fix closes the SA token conformance gap
 
-After sonobuoy: file beads → cluster by surface → dispatch 4-6 workers.
+Next sonobuoy run should actually reach test execution (e2e container was exiting immediately — root cause still unknown, likely a separate issue surfaced once BeforeSuite passes cleanly). Expect a fresh triage wave after the run.
 
-## Recent progress (this session)
+Known remaining gap: e2e container exits immediately with 0 tests run (result=unknown). This needs investigation after the current fixes land and sonobuoy can start cleanly.
 
-**PR #260 in CI:** fix fieldSelector `=false` on absent field. Root cause of SECOND BeforeSuite failure. The e2e framework queries `spec.unschedulable=false` (not `!=true`!). Our node has `spec.unschedulable` absent. Old code: absent field returns `*negated` = `false` (excluded). Fix: absent fields match `""` or `"false"` (Kubernetes zero-value semantics).
+## Recent progress
 
-**Investigation method:** extracted e2e.log from sonobuoy tarball inside kubelet emptyDir volume. Confirmed: DNAT works from container network (tested via `nsenter -n -t <coredns-pid>`). Bug was pure store logic, not network.
+This session:
 
-| PR | What | Beads |
-|----|------|-------|
-| #260 🟡 CI | fieldSelector `=false` on absent field | mayor-mc5q (P1) |
-| #259 ✓ merged | fieldSelector `!=` + bool comparison | mayor-gtue (P1, closed) |
-| #258 ✓ merged | kubelet client cert on log/exec proxy | — |
-| #257 ✓ merged | sonobuoy retrieve before aggregator exits | — |
+| PR | What | Bead |
+|----|------|------|
+| #262 ✓ | KCM serviceaccount-controller enabled | mayor-01lp |
+| #261 ✓ | pods LIST labelSelector fix | mayor-a2cz |
+| #260 ✓ | fieldSelector =false on absent fields | mayor-mc5q |
+| #259 ✓ | fieldSelector != operator + bool comparison | mayor-gtue |
+
+Newly filed and dispatched (in-flight):
+- mayor-trbl (P1): namespace /finalize endpoint — dispatched to worker
+- mayor-grmb (P2): dnsPolicy round-trip — dispatched to worker
+- mayor-o30k (P2): TokenRequest expiry — dispatched to worker
+
+Root cause found for namespace Terminating hang: upstream KCM calls `PUT /api/v1/namespaces/{name}/finalize` which has no route in our apiserver → 404 → finalizer never removed → namespace stuck forever.
 
 ## Stance
-Pre-alpha/greenfield — break freely, no backward compat, correctness first, performance-critical (RSS/latency hard targets), kubectl-compatible API surface, minimal deps. Mayor merges on green CI automatically; flags security/API/architecture decisions first.
+Pre-alpha/greenfield — break freely, no backward compat, correctness first, performance-critical, kubectl-compatible API, minimal deps. Mayor merges on green CI automatically; flags security/API/architecture decisions first.
