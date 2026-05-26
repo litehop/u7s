@@ -103,6 +103,10 @@ pub struct AppState<S = SqliteStore> {
     pub webhook_client: reqwest::Client,
     /// DER-encoded cluster CA certificate used to verify kubelet TLS. None in tests.
     pub cluster_ca_der: Option<Arc<Vec<u8>>>,
+    /// Concatenated PEM (cert + key) for the kubelet proxy client certificate.
+    /// Kubelet accepts clients with O=system:masters when --client-ca-file is our cluster CA.
+    /// Stored as bytes so reqwest::Identity can be constructed per-request (Identity: !Clone).
+    pub kubelet_client_identity_pem: Option<Arc<Vec<u8>>>,
     /// Service CIDR allocator. None means auto-allocation is disabled.
     pub service_ip_allocator: Option<Arc<ServiceIpAllocator>>,
 }
@@ -121,6 +125,7 @@ impl<S> Clone for AppState<S> {
             watch_limit: self.watch_limit.clone(),
             webhook_client: self.webhook_client.clone(),
             cluster_ca_der: self.cluster_ca_der.clone(),
+            kubelet_client_identity_pem: self.kubelet_client_identity_pem.clone(),
             service_ip_allocator: self.service_ip_allocator.clone(),
         }
     }
@@ -203,6 +208,10 @@ impl<S: Store> AppState<S> {
     /// `webhook_identity_pem`: optional concatenated PEM bytes of (cert, key) for mTLS.
     /// In production this is `admin_cert_pem + admin_key_pem` from `TlsMaterial`.
     /// Pass `None` in tests that do not exercise real webhook HTTPS connections.
+    ///
+    /// `kubelet_client_identity_pem`: optional concatenated PEM bytes of (cert, key) for
+    /// the kubelet proxy client cert. In production this is
+    /// `kubelet_client_cert_pem + kubelet_client_key_pem` from `TlsMaterial`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_ca(
         store: Arc<S>,
@@ -213,6 +222,31 @@ impl<S: Store> AppState<S> {
         cluster_ca_der: Option<Vec<u8>>,
         webhook_identity_pem: Option<Vec<u8>>,
         service_ip_allocator: Option<ServiceIpAllocator>,
+    ) -> Self {
+        Self::new_with_ca_and_kubelet_identity(
+            store,
+            sa_key,
+            sa_decoding_key,
+            token_map,
+            server_address,
+            cluster_ca_der,
+            webhook_identity_pem,
+            service_ip_allocator,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_ca_and_kubelet_identity(
+        store: Arc<S>,
+        sa_key: Option<jsonwebtoken::EncodingKey>,
+        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+        token_map: HashMap<String, UserInfo>,
+        server_address: String,
+        cluster_ca_der: Option<Vec<u8>>,
+        webhook_identity_pem: Option<Vec<u8>>,
+        service_ip_allocator: Option<ServiceIpAllocator>,
+        kubelet_client_identity_pem: Option<Vec<u8>>,
     ) -> Self {
         let registry = build_registry();
         let webhook_client =
@@ -228,6 +262,7 @@ impl<S: Store> AppState<S> {
             watch_limit: WatchLimitState::new(),
             webhook_client,
             cluster_ca_der: cluster_ca_der.map(Arc::new),
+            kubelet_client_identity_pem: kubelet_client_identity_pem.map(Arc::new),
             service_ip_allocator: service_ip_allocator.map(Arc::new),
         }
     }

@@ -218,6 +218,10 @@ pub struct TlsMaterial {
     pub admin_cert_pem: Vec<u8>,
     /// PEM-encoded admin private key (written into kubeconfig).
     pub admin_key_pem: Vec<u8>,
+    /// PEM-encoded kubelet client certificate (CN=kube-apiserver-kubelet-client, O=system:masters).
+    pub kubelet_client_cert_pem: Vec<u8>,
+    /// PEM-encoded kubelet client private key.
+    pub kubelet_client_key_pem: Vec<u8>,
     /// Configured rustls ServerConfig for the axum server.
     pub server_config: Arc<ServerConfig>,
 }
@@ -296,6 +300,20 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         .push(rcgen::DnType::OrganizationName, "system:masters");
     let admin_cert = admin_params.signed_by(&admin_key, &ca_issuer)?;
 
+    // --- Kubelet client cert ---
+    // Kubelet's --client-ca-file trusts our cluster CA, and kubelet accepts clients
+    // from the system:masters organization as trusted. CN and O must match exactly
+    // what real kube-apiserver uses so kubelet authorizes the proxy requests.
+    let kubelet_client_key = KeyPair::generate()?;
+    let mut kubelet_client_params = CertificateParams::default();
+    kubelet_client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "kube-apiserver-kubelet-client");
+    kubelet_client_params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, "system:masters");
+    let kubelet_client_cert = kubelet_client_params.signed_by(&kubelet_client_key, &ca_issuer)?;
+
     // --- Build rustls ServerConfig ---
     // Use ca_cert_der (the stable, original bytes) for the chain and trust store —
     // not ca_cert.der(), which is re-issued on each load and would differ from disk.
@@ -329,11 +347,15 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
 
     let admin_cert_der = admin_cert.der().to_vec();
     let admin_cert_pem = pem_encode("CERTIFICATE", &admin_cert_der);
+    let kubelet_client_cert_der = kubelet_client_cert.der().to_vec();
+    let kubelet_client_cert_pem = pem_encode("CERTIFICATE", &kubelet_client_cert_der);
     Ok(TlsMaterial {
         ca_cert_der,
         admin_cert_der,
         admin_cert_pem,
         admin_key_pem: admin_key.serialize_pem().into_bytes(),
+        kubelet_client_cert_pem,
+        kubelet_client_key_pem: kubelet_client_key.serialize_pem().into_bytes(),
         server_config: Arc::new(server_config),
     })
 }
