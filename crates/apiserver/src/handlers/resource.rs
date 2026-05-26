@@ -69,6 +69,7 @@ pub async fn list_resource<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let pom = wants_partial_object_metadata(accept);
+    let table = super::table::wants_table(accept);
 
     if query.watch == Some(true) {
         let (watch_api_version, watch_kind) = if pom {
@@ -153,6 +154,10 @@ pub async fn list_resource<S: Store>(
             "items": pom_items
         });
         return Ok(Json(body).into_response());
+    }
+
+    if table {
+        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
     }
 
     let body = build_list_response(
@@ -672,6 +677,7 @@ pub async fn list_namespaced_resource<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let pom = wants_partial_object_metadata(accept);
+    let table = super::table::wants_table(accept);
 
     if query.watch == Some(true) {
         let (watch_api_version, watch_kind) = if pom {
@@ -756,6 +762,10 @@ pub async fn list_namespaced_resource<S: Store>(
             "items": pom_items
         });
         return Ok(Json(body).into_response());
+    }
+
+    if table {
+        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
     }
 
     let body = build_list_response(
