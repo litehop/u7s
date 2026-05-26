@@ -39,6 +39,12 @@ echo "Cleaning up any previous sonobuoy run..."
 limactl shell "$VM_NAME" sudo sonobuoy delete --all --wait \
   --kubeconfig /tmp/sonobuoy-kubeconfig 2>/dev/null || true
 
+echo "Waiting for sonobuoy namespace to fully drain..."
+until ! limactl shell "$VM_NAME" sudo sonobuoy status \
+  --kubeconfig /tmp/sonobuoy-kubeconfig &>/dev/null; do
+  sleep 2
+done
+
 SONOBUOY_ARGS="run --mode=non-disruptive-conformance --wait --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
 if [ -n "$FOCUS" ]; then
   SONOBUOY_ARGS="$SONOBUOY_ARGS --e2e-focus=$FOCUS"
