@@ -212,6 +212,7 @@ impl<S: Store> AppState<S> {
     /// `kubelet_client_identity_pem`: optional concatenated PEM bytes of (cert, key) for
     /// the kubelet proxy client cert. In production this is
     /// `kubelet_client_cert_pem + kubelet_client_key_pem` from `TlsMaterial`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_ca(
         store: Arc<S>,
@@ -524,6 +525,7 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("ServiceAccount", true, false),
     );
     m.insert(rk("", "v1", "configmaps"), rm("ConfigMap", true, false));
+    m.insert(rk("", "v1", "podtemplates"), rm("PodTemplate", true, false));
     m.insert(rk("", "v1", "secrets"), rm("Secret", true, false));
     m.insert(rk("", "v1", "events"), rm_cou("Event", true));
     m.insert(rk("", "v1", "endpoints"), rm("Endpoints", true, false));
