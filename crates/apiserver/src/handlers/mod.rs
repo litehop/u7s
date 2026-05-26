@@ -15,5 +15,6 @@ pub mod resource;
 pub mod scale;
 pub mod status;
 pub mod stream;
+pub mod table;
 pub mod tokens;
 pub mod watch;
