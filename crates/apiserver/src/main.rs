@@ -2107,6 +2107,68 @@ mod tests {
         );
     }
 
+    /// GET /apis/discovery.k8s.io/v1/namespaces/{ns}/endpointslices must return an empty list,
+    /// not 404, for a namespace that has no EndpointSlices yet.
+    ///
+    /// KCM's endpointslice-controller opens a LIST+WATCH on this path at startup. If the
+    /// resource is unregistered the generic handler falls through to the CR handler which
+    /// returns 404 (no CRD installed), causing the controller to enter exponential back-off
+    /// and log "failed to list *v1.EndpointSlice: Resource not found" every ~45 s.
+    #[tokio::test]
+    async fn endpointslice_list_returns_empty_for_new_namespace() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/apis/discovery.k8s.io/v1/namespaces/default/endpointslices")
+            .body(axum::body::Body::empty())
+            .expect("request must build");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "test".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
+        let resp = router.call(req).await.expect("router must not error");
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET /apis/discovery.k8s.io/v1/namespaces/default/endpointslices must not return 404 — \
+             KCM's endpointslice-controller lists this path at startup; 404 causes log-spam back-off"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "empty namespace must return 200 with an empty EndpointSliceList"
+        );
+
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let val: serde_json::Value = serde_json::from_slice(&body).expect("response must be JSON");
+        assert_eq!(
+            val["kind"], "EndpointSliceList",
+            "response kind must be EndpointSliceList — client-go informer requires this exact kind"
+        );
+        let items = val["items"].as_array().expect("items must be an array");
+        assert!(
+            items.is_empty(),
+            "items must be empty for a namespace with no EndpointSlices"
+        );
+    }
+
     /// DELETE /apis/rbac.authorization.k8s.io/v1/clusterrolebindings must return 200,
     /// not 405 Method Not Allowed.
     ///
