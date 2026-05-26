@@ -75,6 +75,8 @@ pub async fn list_namespaces<S: Store>(
             query.allow_watch_bookmarks == Some(true),
             user.username,
             false,
+            "".to_string(),
+            "namespaces".to_string(),
         )
         .await;
     }

@@ -238,6 +238,8 @@ pub async fn list_crds<S: Store>(
             query.allow_watch_bookmarks == Some(true),
             user.username,
             pom,
+            GROUP.to_string(),
+            PLURAL.to_string(),
         )
         .await;
     }

@@ -100,6 +100,8 @@ pub async fn list_resource<S: Store>(
             query.allow_watch_bookmarks == Some(true),
             user.username,
             pom,
+            group.clone(),
+            plural.clone(),
         )
         .await;
     }
@@ -708,6 +710,8 @@ pub async fn list_namespaced_resource<S: Store>(
             query.allow_watch_bookmarks == Some(true),
             user.username,
             pom,
+            group.clone(),
+            plural.clone(),
         )
         .await;
     }

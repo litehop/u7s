@@ -22,9 +22,10 @@ use super::generic::{
 };
 use super::json_patch::PatchQuery;
 use super::resource::{
-    create_namespaced_resource, create_resource, delete_namespaced_resource, delete_resource,
-    get_namespaced_resource, get_resource, list_namespaced_resource, list_resource,
-    patch_namespaced_resource, patch_resource, replace_namespaced_resource, replace_resource,
+    create_namespaced_resource, create_resource, delete_collection_namespaced_resource,
+    delete_namespaced_resource, delete_resource, get_namespaced_resource, get_resource,
+    list_namespaced_resource, list_resource, patch_namespaced_resource, patch_resource,
+    replace_namespaced_resource, replace_resource,
 };
 use super::status::{
     get_namespaced_resource_status, get_resource_status, patch_namespaced_resource_status,
@@ -60,6 +61,8 @@ pub async fn core_list_resource<S: Store>(
                 query.allow_watch_bookmarks == Some(true),
                 user.username,
                 false,
+                "".into(),
+                "pods".into(),
             )
             .await
             .map(IntoResponse::into_response);
@@ -280,6 +283,19 @@ pub async fn core_delete_namespaced_resource<S: Store>(
     delete_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
+    )
+    .await
+}
+
+pub async fn core_delete_collection_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, plural)): Path<(String, String)>,
+    Query(query): Query<CollectionQuery>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    delete_collection_namespaced_resource(
+        State(state),
+        Path(("".into(), "v1".into(), ns, plural)),
+        Query(query),
     )
     .await
 }
