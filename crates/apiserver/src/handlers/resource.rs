@@ -1888,6 +1888,7 @@ mod tests {
             )),
             axum::extract::Query(PatchQuery {
                 field_manager: Some("argocd".to_string()),
+                field_validation: None,
             }),
             ssa_headers.clone(),
             patch_bytes.clone(),
@@ -1961,6 +1962,7 @@ mod tests {
             )),
             axum::extract::Query(PatchQuery {
                 field_manager: Some("argocd".to_string()),
+                field_validation: None,
             }),
             ssa_headers,
             update_bytes,
@@ -4590,5 +4592,65 @@ mod tests {
             .expect("allocation must not error")
             .expect("second allocation must return Some after sentinels released");
         assert_ne!(ip1, ip2, "reallocated IPs must be distinct");
+    }
+
+    // ---------------------------------------------------------------------------
+    // fieldValidation query param regression (mayor-hww0)
+    // ---------------------------------------------------------------------------
+
+    /// create_resource with a valid ClusterRole body must return 201.
+    ///
+    /// `kubectl create` always sends `?fieldValidation=Strict` in the query string.
+    /// The handler must accept and ignore unknown query parameters — it has no Query
+    /// extractor, so serde never sees them, but this test guards the handler body-parsing
+    /// path against regressions that could cause the body to appear empty or invalid.
+    ///
+    /// If this test fails it means the ClusterRole handler itself is broken, not the
+    /// query-param routing. The full-router regression (in main.rs) validates the
+    /// query-param path end-to-end.
+    #[tokio::test]
+    async fn create_clusterrole_with_valid_body_returns_201() {
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+
+        let state = make_state();
+
+        // kubectl create clusterrole body shape — minimal but structurally correct.
+        let body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": { "name": "sonobuoy-clusteradmin" },
+            "rules": [
+                { "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }
+            ]
+        });
+
+        let result = create_resource(
+            State(state),
+            Path((
+                "rbac.authorization.k8s.io".into(),
+                "v1".into(),
+                "clusterroles".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "kubectl".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+
+        let resp = result
+            .unwrap_or_else(|e| panic!("ClusterRole create must succeed; got error: {e:?}"))
+            .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "valid ClusterRole body must produce 201 Created — \
+             kubectl create always sends this shape and must not get 400"
+        );
     }
 }

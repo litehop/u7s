@@ -2365,4 +2365,123 @@ mod tests {
             "two services must not share a clusterIP — duplicate IPs mis-route traffic"
         );
     }
+
+    /// POST /apis/rbac.authorization.k8s.io/v1/clusterroles with ?fieldValidation=Strict must
+    /// return 201 Created, not 400.
+    ///
+    /// `kubectl create` always sends ?fieldValidation=Strict. If the server rejects this query
+    /// param, all `kubectl create` RBAC operations fail — including sonobuoy's setup phase which
+    /// creates the ClusterRole and ClusterRoleBinding that the aggregator pod needs.
+    ///
+    /// The fix: accept and ignore ?fieldValidation=<any value> on all write endpoints.
+    /// This test exercises the full router path (path matching + handler dispatch) to catch
+    /// any routing or middleware bug that might inspect or reject unknown query params.
+    #[tokio::test]
+    async fn field_validation_query_param_does_not_break_clusterrole_create() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        // Admin user injected directly into request extensions — bypasses the auth layer
+        // (which is not wired in this test) while still satisfying the handler's
+        // Extension(user): Extension<UserInfo> extractor.
+        let admin = auth::UserInfo {
+            username: "admin".to_string(),
+            uid: String::new(),
+            groups: vec!["system:masters".to_string()],
+        };
+
+        let make_role_req = |name: &str, query: &str| {
+            let body = serde_json::json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRole",
+                "metadata": { "name": name },
+                "rules": [
+                    { "apiGroups": ["*"], "resources": ["*"], "verbs": ["*"] }
+                ]
+            });
+            let uri = format!(
+                "/apis/rbac.authorization.k8s.io/v1/clusterroles?fieldManager=kubectl-create{}",
+                query
+            );
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("request must build")
+        };
+
+        // Case 1: ?fieldValidation=Strict — kubectl create always sends this.
+        let mut req = make_role_req("sonobuoy-runner-strict", "&fieldValidation=Strict");
+        req.extensions_mut().insert(admin.clone());
+        let resp = router.call(req).await.expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "POST with ?fieldValidation=Strict must return 201 — \
+             kubectl create always sends this param and must not get 400"
+        );
+        let body_bytes = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("collect response body");
+        let resp_val: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("response must be JSON");
+        assert_eq!(
+            resp_val["kind"].as_str(),
+            Some("ClusterRole"),
+            "response kind must be ClusterRole when fieldValidation=Strict is present"
+        );
+
+        // Case 2: ?fieldValidation=Warn — must also succeed.
+        let mut req2 = make_role_req("sonobuoy-runner-warn", "&fieldValidation=Warn");
+        req2.extensions_mut().insert(admin.clone());
+        let resp2 = router.call(req2).await.expect("router must not error");
+        assert_eq!(
+            resp2.status(),
+            StatusCode::CREATED,
+            "POST with ?fieldValidation=Warn must return 201"
+        );
+
+        // Case 3: no fieldValidation param — baseline must still succeed.
+        let mut req3 = make_role_req("sonobuoy-runner-baseline", "");
+        req3.extensions_mut().insert(admin.clone());
+        let resp3 = router.call(req3).await.expect("router must not error");
+        assert_eq!(
+            resp3.status(),
+            StatusCode::CREATED,
+            "POST without ?fieldValidation must return 201 (baseline)"
+        );
+
+        // Verify the Strict-case ClusterRole was actually stored (not just accepted silently).
+        let stored_key = keys::group_object_key(
+            "rbac.authorization.k8s.io",
+            "clusterroles",
+            None,
+            "sonobuoy-runner-strict",
+        );
+        let stored = store.get(&stored_key).await.expect("store.get must not fail");
+        assert!(
+            stored.is_some(),
+            "ClusterRole sonobuoy-runner-strict must be persisted — \
+             a 201 response without persisting the object would be misleading"
+        );
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.unwrap().value).expect("stored value must be valid JSON");
+        assert_eq!(
+            stored_val["kind"].as_str(),
+            Some("ClusterRole"),
+            "stored object kind must be ClusterRole"
+        );
+    }
 }

@@ -3,11 +3,19 @@ use serde::Deserialize;
 
 use crate::{status::Status, util::content_type};
 
-/// Query parameters accepted by PATCH endpoints.
+/// Query parameters accepted by PATCH and write endpoints.
+///
+/// `field_validation` is accepted and ignored — the server does not implement
+/// server-side field validation. Accepting it prevents 400 responses when clients
+/// like `kubectl create` send `?fieldValidation=Strict` or `?fieldValidation=Warn`.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct PatchQuery {
     #[serde(rename = "fieldManager")]
     pub field_manager: Option<String>,
+    /// Accepted and ignored: we do not implement server-side field validation.
+    #[allow(dead_code)]
+    #[serde(rename = "fieldValidation")]
+    pub field_validation: Option<String>,
 }
 
 /// Strip `managedFields` from an SSA apply body before merging.
