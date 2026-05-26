@@ -395,13 +395,12 @@ pub async fn finalize_namespace<S: Store>(
         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
     // KCM writes spec.finalizers; fall back to metadata.finalizers.
-    let new_finalizers = if !req["spec"]["finalizers"].is_null()
-        && req["spec"].get("finalizers").is_some()
-    {
-        req["spec"]["finalizers"].clone()
-    } else {
-        req["metadata"]["finalizers"].clone()
-    };
+    let new_finalizers =
+        if !req["spec"]["finalizers"].is_null() && req["spec"].get("finalizers").is_some() {
+            req["spec"]["finalizers"].clone()
+        } else {
+            req["metadata"]["finalizers"].clone()
+        };
 
     // Fetch the current namespace from the store.
     let key = cluster_object_key("namespaces", &name);
@@ -1574,7 +1573,10 @@ mod tests {
         assert!(
             state
                 .store
-                .get(&crate::keys::cluster_object_key("namespaces", "finalize-ns"))
+                .get(&crate::keys::cluster_object_key(
+                    "namespaces",
+                    "finalize-ns"
+                ))
                 .await
                 .unwrap()
                 .is_some(),
@@ -1607,7 +1609,10 @@ mod tests {
         // The namespace must now be gone — hard-deleted by finalize_namespace.
         let stored = state
             .store
-            .get(&crate::keys::cluster_object_key("namespaces", "finalize-ns"))
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "finalize-ns",
+            ))
             .await
             .expect("store get must not error");
         assert!(
@@ -1672,7 +1677,10 @@ mod tests {
         // The namespace must still exist — non-empty finalizers mean no hard-delete yet.
         let stored = state
             .store
-            .get(&crate::keys::cluster_object_key("namespaces", "multi-fin-ns"))
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "multi-fin-ns",
+            ))
             .await
             .expect("store get must not error")
             .expect("namespace must still exist — finalizers remain, no hard-delete yet");
