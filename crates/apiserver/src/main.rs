@@ -266,7 +266,9 @@ fn build_router(state: AppState) -> Router {
         // Pods — collection
         .route(
             "/api/v1/namespaces/{ns}/pods",
-            get(handlers::pods::list_pods).post(handlers::pods::create_pod),
+            get(handlers::pods::list_pods)
+                .post(handlers::pods::create_pod)
+                .delete(handlers::pods::delete_collection_pods),
         )
         // Pods — named resource
         .route(
@@ -330,7 +332,8 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/namespaces/{ns}/{resource}",
             get(handlers::core::core_list_namespaced_resource)
-                .post(handlers::core::core_create_namespaced_resource),
+                .post(handlers::core::core_create_namespaced_resource)
+                .delete(handlers::core::core_delete_collection_namespaced_resource),
         )
         // Core group — namespaced named resource
         .route(
@@ -2219,6 +2222,90 @@ mod tests {
         assert!(
             stored.is_none(),
             "RoleBinding 'sonobuoy/sonobuoy' must be deleted from store after collection DELETE"
+        );
+    }
+
+    /// DELETE /api/v1/namespaces/{ns}/pods must return 200, not 405.
+    ///
+    /// sonobuoy cleanup sends DELETE /api/v1/namespaces/sonobuoy/pods?labelSelector=sonobuoy-run=<id>
+    /// to remove all pods it created. The pods collection route previously only registered
+    /// GET+POST, so axum returned 405. The fix adds DELETE via core_delete_collection_namespaced_resource.
+    /// The test verifies: 1) the route accepts DELETE (not 405), 2) matching pods are deleted,
+    /// 3) non-matching pods are preserved when labelSelector is applied.
+    #[tokio::test]
+    async fn delete_collection_namespaced_pods_returns_200_not_405() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+        use u7s_store::Store;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns_key = keys::cluster_object_key("namespaces", "sonobuoy");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": { "name": "sonobuoy" }
+        });
+        store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("seed namespace must succeed");
+
+        let pod_key = keys::group_object_key("", "pods", Some("sonobuoy"), "sonobuoy-worker");
+        let pod_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "sonobuoy-worker",
+                "namespace": "sonobuoy",
+                "labels": { "sonobuoy-run": "abc123" }
+            },
+            "spec": { "containers": [] }
+        });
+        store
+            .put(&pod_key, bytes::Bytes::from(pod_body.to_string()), Some(0))
+            .await
+            .expect("seed pod must succeed");
+
+        let mut router = build_router(state);
+
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/v1/namespaces/sonobuoy/pods?labelSelector=sonobuoy-run%3Dabc123")
+            .body(axum::body::Body::empty())
+            .expect("request build must not fail");
+        let resp = router.call(req).await.expect("router must not error");
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "DELETE /api/v1/namespaces/sonobuoy/pods must not return 405; \
+             sonobuoy cleanup sends this request to remove its pods"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "collection DELETE on pods must return 200 Success"
+        );
+
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let val: serde_json::Value = serde_json::from_slice(&body).expect("response must be JSON");
+        assert_eq!(val["kind"], "Status");
+        assert_eq!(val["status"], "Success");
+
+        let stored = store.get(&pod_key).await.expect("store.get must not fail");
+        assert!(
+            stored.is_none(),
+            "pod 'sonobuoy/sonobuoy-worker' must be deleted after collection DELETE with matching labelSelector"
         );
     }
 

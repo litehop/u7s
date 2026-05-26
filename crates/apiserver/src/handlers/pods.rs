@@ -376,6 +376,50 @@ pub async fn replace_pod<S: Store>(
     Ok(Json(obj.body))
 }
 
+/// DELETE /api/v1/namespaces/{ns}/pods — collection delete with optional labelSelector.
+///
+/// sonobuoy cleanup sends this to remove all pods it created in a namespace.
+/// Applies the labelSelector if present; deletes all matching pods.
+pub async fn delete_collection_pods<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns,)): Path<(String,)>,
+    Query(query): Query<super::generic::CollectionQuery>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns, &state).await?;
+    let prefix = list_prefix("pods", ns.as_str());
+
+    let resp = state
+        .store
+        .list(&prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let label_pairs = query
+        .label_selector
+        .as_deref()
+        .map(super::generic::parse_label_selector)
+        .transpose()?;
+
+    for obj in resp.items {
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
+            if let Some(ref pairs) = label_pairs {
+                let kept = super::generic::apply_label_selector(vec![parsed], pairs);
+                if kept.is_empty() {
+                    continue;
+                }
+            }
+        }
+        let _ = state.store.delete(&obj.key, None).await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "code": 200
+    })))
+}
+
 pub async fn delete_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
