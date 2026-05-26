@@ -907,14 +907,19 @@ mod handler_tests {
         };
 
         // status.token must be non-empty.
-        let token = resp_body["status"]["token"].as_str().expect("status.token must be present");
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("status.token must be present");
         assert!(!token.is_empty(), "status.token must not be empty");
 
         // status.expirationTimestamp must be present — kubelet uses it to know the absolute expiry.
         let exp_ts = resp_body["status"]["expirationTimestamp"]
             .as_str()
             .expect("status.expirationTimestamp must be present");
-        assert!(!exp_ts.is_empty(), "status.expirationTimestamp must not be empty");
+        assert!(
+            !exp_ts.is_empty(),
+            "status.expirationTimestamp must not be empty"
+        );
 
         // spec.expirationSeconds must be echoed back — kubelet reads this to schedule refresh.
         // Without it, kubelet logs "Expiration seconds was nil for token request".
