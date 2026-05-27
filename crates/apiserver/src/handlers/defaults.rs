@@ -13,6 +13,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "services") = (group, plural) {
         default_service(obj);
     }
+    if let ("", "events") = (group, plural) {
+        normalize_event_timestamps(obj);
+    }
 }
 
 /// Apply all Service defaults in the correct order.
@@ -93,9 +96,6 @@ fn default_node_ports(obj: &mut serde_json::Value) {
         port["nodePort"] = serde_json::Value::Number(next_candidate.into());
         used.insert(next_candidate);
         next_candidate += 1;
-    }
-    if let ("", "events") = (group, plural) {
-        normalize_event_timestamps(obj);
     }
 }
 
