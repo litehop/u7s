@@ -2966,9 +2966,7 @@ mod tests {
         obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
 
         // JobSpec field 6 = backoffLimit (int32, wire 0): tag = (6 << 3) | 0 = 0x30, value = 3
-        let mut job_spec = Vec::new();
-        job_spec.push(0x30); // (6 << 3) | 0 = field 6, wire type 0
-        job_spec.push(0x03); // varint 3
+        let job_spec = vec![0x30_u8, 0x03]; // field 6 (backoffLimit), wire type 0, varint 3
 
         // JobTemplateSpec: field 2 = JobSpec
         let job_template_spec = encode_length_delimited(2, &job_spec);
