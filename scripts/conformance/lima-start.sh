@@ -103,7 +103,36 @@ rm "$REWRITTEN"
 limactl shell "$VM_NAME" sudo cp /tmp/kubelet-kubeconfig /etc/kubelet-kubeconfig
 limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
 
-# Restart kubelet so it picks up the new kubeconfig/cert.
+# Copy cluster CA so the kubelet can authenticate the apiserver's mTLS client cert
+# when proxying log/exec/attach requests. Without --client-ca-file the kubelet falls
+# back to webhook auth and rejects the apiserver's cert with 401.
+# ca.crt is DER-encoded; kubelet requires PEM.
+CA_CERT="$(dirname "$KUBECONFIG_PATH")/ca.crt"
+CA_PEM=$(mktemp)
+trap 'rm -f "$CA_PEM"' EXIT
+if [ -f "$CA_CERT" ]; then
+  openssl x509 -in "$CA_CERT" -inform DER -out "$CA_PEM" -outform PEM
+  limactl copy "$CA_PEM" "${VM_NAME}:/tmp/kubelet-ca.crt"
+  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-ca.crt /etc/kubelet-ca.crt
+  limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-ca.crt
+  # Write --client-ca-file into the kubelet drop-in (idempotent: overwrite each run).
+  limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=/usr/bin/kubelet \
+  --config=/etc/kubelet-config.yaml \
+  --kubeconfig=/etc/kubelet-kubeconfig \
+  --client-ca-file=/etc/kubelet-ca.crt \
+  --hostname-override=lima-node \
+  --v=2
+EOF'
+  limactl shell "$VM_NAME" sudo systemctl daemon-reload
+  echo "Kubelet client-ca-file configured."
+else
+  echo "WARNING: $CA_CERT not found — kubelet client auth will not work (logs/exec will return 401)" >&2
+fi
+
+# Restart kubelet so it picks up the new kubeconfig/cert/CA.
 echo "Starting kubelet inside VM..."
 limactl shell "$VM_NAME" sudo systemctl restart kubelet
 

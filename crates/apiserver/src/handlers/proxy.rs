@@ -55,6 +55,19 @@ pub struct LogQuery {
 /// Prefers InternalIP (routable within the cluster), falls back to Hostname.
 /// Returns None if the node has no usable address — this would mean the node
 /// object is incomplete, which is a bug in the scheduler/kubelet registration.
+/// Resolve the address to use for kubelet proxy requests.
+/// When `preferred` is set (via --kubelet-preferred-address), it overrides the node's
+/// InternalIP — needed when the apiserver runs on a different host than the kubelet.
+pub fn resolve_kubelet_address(
+    node: &serde_json::Value,
+    preferred: Option<&str>,
+) -> Option<String> {
+    if let Some(addr) = preferred {
+        return Some(addr.to_owned());
+    }
+    node_address(node)
+}
+
 pub fn node_address(node: &serde_json::Value) -> Option<String> {
     let addresses = node["status"]["addresses"].as_array()?;
     // Prefer InternalIP — it's guaranteed routable inside the cluster.
@@ -115,11 +128,15 @@ pub async fn pod_log<S: Store>(
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
 
-    let node_ip = node_address(&node).ok_or_else(|| {
-        Status::internal(format!(
-            "node \"{node_name}\" has no usable address in status.addresses"
-        ))
-    })?;
+    let node_ip = resolve_kubelet_address(
+        &node,
+        state.kubelet_preferred_address.as_deref().map(|s| s.as_str()),
+    )
+    .ok_or_else(|| {
+            Status::internal(format!(
+                "node \"{node_name}\" has no usable address in status.addresses"
+            ))
+        })?;
 
     // 4. Determine which container to tail. Default to first container if unspecified.
     let container = match query.container.as_deref() {
@@ -278,11 +295,15 @@ pub async fn resolve_attach_target<S: Store>(
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
 
-    let node_ip = node_address(&node).ok_or_else(|| {
-        Status::internal(format!(
-            "node \"{node_name}\" has no usable address in status.addresses"
-        ))
-    })?;
+    let node_ip = resolve_kubelet_address(
+        &node,
+        state.kubelet_preferred_address.as_deref().map(|s| s.as_str()),
+    )
+    .ok_or_else(|| {
+            Status::internal(format!(
+                "node \"{node_name}\" has no usable address in status.addresses"
+            ))
+        })?;
 
     // Determine container (first container if unspecified).
     let container = match query.container.as_deref() {
@@ -553,11 +574,15 @@ pub(crate) async fn validate_portforward<S: Store>(
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
 
-    let node_ip = node_address(&node).ok_or_else(|| {
-        Status::internal(format!(
-            "node \"{node_name}\" has no usable address in status.addresses"
-        ))
-    })?;
+    let node_ip = resolve_kubelet_address(
+        &node,
+        state.kubelet_preferred_address.as_deref().map(|s| s.as_str()),
+    )
+    .ok_or_else(|| {
+            Status::internal(format!(
+                "node \"{node_name}\" has no usable address in status.addresses"
+            ))
+        })?;
 
     // 4. Build the kubelet portForward URL.
     //    wss://<node-ip>:10250/portForward/<ns>/<pod>[?ports=<port>]
@@ -659,11 +684,15 @@ pub async fn resolve_node_proxy_target<S: Store>(
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
 
-    let node_ip = node_address(&node).ok_or_else(|| {
-        Status::internal(format!(
-            "node \"{node_name}\" has no usable address in status.addresses"
-        ))
-    })?;
+    let node_ip = resolve_kubelet_address(
+        &node,
+        state.kubelet_preferred_address.as_deref().map(|s| s.as_str()),
+    )
+    .ok_or_else(|| {
+            Status::internal(format!(
+                "node \"{node_name}\" has no usable address in status.addresses"
+            ))
+        })?;
 
     let mut client_builder = reqwest::Client::builder()
         .use_rustls_tls()

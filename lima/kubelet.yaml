@@ -22,6 +22,12 @@ images:
   - location: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
     arch: aarch64
 
+portForwards:
+  # Expose the kubelet API to the Mac host so the apiserver can proxy log/exec/attach.
+  # Without this, the kubelet's InternalIP (192.168.5.x) is not routable from the host.
+  - guestPort: 10250
+    hostPort: 10250
+
 mounts:
   - location: "~"
     writable: false

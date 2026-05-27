@@ -87,6 +87,13 @@ struct Args {
     /// Matches kubeadm's default. Set to empty string to disable auto-allocation.
     #[arg(long, default_value = "10.96.0.0/12")]
     service_cluster_ip_range: String,
+
+    /// Hostname or IP to use for all kubelet proxy requests (log, exec, attach, port-forward).
+    /// When set, overrides the node's InternalIP from status.addresses. Useful when the
+    /// apiserver runs on a different host than the kubelet (e.g. Mac host + Lima VM) and
+    /// the node's InternalIP is not directly reachable from the apiserver.
+    #[arg(long)]
+    kubelet_preferred_address: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -200,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
     // the kubelet. Kubelet accepts certs with O=system:masters signed by the cluster CA.
     let mut kubelet_client_identity_pem = tls_material.kubelet_client_cert_pem.clone();
     kubelet_client_identity_pem.extend_from_slice(&tls_material.kubelet_client_key_pem);
-    let state = state::AppState::new_with_ca_and_kubelet_identity(
+    let state = state::AppState::new_with_ca_and_kubelet_identity_and_address(
         Arc::clone(&store),
         sa_encoding_key,
         sa_decoding_key,
@@ -210,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
         Some(webhook_identity_pem),
         service_ip_allocator,
         Some(kubelet_client_identity_pem),
+        args.kubelet_preferred_address,
     );
 
     // 10a. Populate RBAC index from persisted objects before serving.
@@ -539,7 +547,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["secrets"],      "verbs": ["get","list","watch"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch"] },
-            { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] }
+            { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] },
+            // Kubelet webhook authorizer and authenticator call back to the apiserver via
+            // SubjectAccessReview and TokenReview. Without these the kubelet denies all
+            // proxy requests (logs, exec, attach) with "Authorization error".
+            { "apiGroups": ["authorization.k8s.io"], "resources": ["subjectaccessreviews"], "verbs": ["create"] },
+            { "apiGroups": ["authentication.k8s.io"], "resources": ["tokenreviews"], "verbs": ["create"] }
         ]
     });
     store
@@ -1176,6 +1189,44 @@ mod tests {
         assert!(
             state.rbac_index.is_allowed(&lease_create),
             "system:nodes must be allowed to create leases — kubelet heartbeat depends on this"
+        );
+
+        // A kubelet in system:nodes must be able to create SubjectAccessReviews so its
+        // webhook authorizer can call back to the apiserver (needed for logs/exec/attach).
+        let sar_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "authorization.k8s.io",
+            resource: "subjectaccessreviews",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&sar_create),
+            "system:nodes must be allowed to create subjectaccessreviews — \
+             kubelet webhook authorizer calls back to the apiserver for proxy requests (logs/exec/attach)"
+        );
+
+        // A kubelet in system:nodes must be able to create TokenReviews so its
+        // webhook authenticator can validate bearer tokens.
+        let tr_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "authentication.k8s.io",
+            resource: "tokenreviews",
+            subresource: "",
+            namespace: None,
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&tr_create),
+            "system:nodes must be allowed to create tokenreviews — \
+             kubelet webhook authenticator calls back to the apiserver"
         );
 
         // A user NOT in system:nodes must be denied — the binding is group-specific.
