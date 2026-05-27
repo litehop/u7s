@@ -75,7 +75,17 @@ pub fn extract_body(bytes: &Bytes, content_type: &str) -> Bytes {
     }
     // Fallback: if raw bytes look like JSON (start with '{'), return them directly.
     // This handles non-core types that send JSON with empty contentType.
+    // Reject if the JSON kind field contradicts the envelope kind (both non-empty and differ).
     if env.raw.first() == Some(&b'{') {
+        if !env.kind.is_empty() {
+            if let Ok(obj) = serde_json::from_slice::<serde_json::Value>(&env.raw) {
+                if let Some(json_kind) = obj["kind"].as_str() {
+                    if !json_kind.is_empty() && json_kind != env.kind {
+                        return bytes.clone();
+                    }
+                }
+            }
+        }
         return Bytes::from(env.raw);
     }
     // Cannot decode — return original bytes so the handler reports a meaningful error.
@@ -723,6 +733,62 @@ mod tests {
         assert_eq!(
             containers[0]["image"], "nginx:latest",
             "container image must survive"
+        );
+    }
+
+    /// test_extract_body_kind_mismatch_rejects_json_fallback
+    ///
+    /// When the proto envelope declares kind="Foo" but the raw JSON body contains kind="Secret",
+    /// extract_body must return the original proto bytes (reject), not the mismatched JSON.
+    ///
+    /// This prevents a spoofing vector where a client crafts a proto envelope whose TypeMeta says
+    /// one kind but whose JSON payload claims another. Without this check, the JSON would be
+    /// accepted and the wrong kind would be persisted under the Foo resource endpoint.
+    #[test]
+    fn test_extract_body_kind_mismatch_rejects_json_fallback() {
+        // Inner JSON claims kind="Secret" but the envelope says kind="Foo"
+        let inner_json = br#"{"apiVersion":"v1","kind":"Secret","metadata":{"name":"tricky"}}"#;
+
+        // No contentType in envelope (empty), so we fall through to the JSON fallback path
+        let body = build_kubectl_proto_body(b"v1", b"Foo", inner_json, None);
+        let bytes = Bytes::from(body.clone());
+
+        let result = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        // Must return the original proto bytes, not the inner JSON
+        assert_eq!(
+            result.as_ref(),
+            bytes.as_ref(),
+            "proto envelope with kind='Foo' but JSON body kind='Secret' must be rejected: \
+             returning original bytes prevents the mismatched JSON from being stored as Foo"
+        );
+
+        // Confirm the returned bytes are NOT the inner JSON
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&result).is_err()
+                || serde_json::from_slice::<serde_json::Value>(&result)
+                    .map(|v| v["kind"] != "Secret")
+                    .unwrap_or(true),
+            "rejected body must not be the mismatched Secret JSON"
+        );
+    }
+
+    /// test_extract_body_kind_match_allows_json_fallback
+    ///
+    /// When the proto envelope kind and the JSON body kind match, the JSON fallback path must
+    /// still work correctly (non-core types send JSON with empty contentType and matching kind).
+    #[test]
+    fn test_extract_body_kind_match_allows_json_fallback() {
+        let inner_json =
+            br#"{"apiVersion":"example.com/v1","kind":"Widget","metadata":{"name":"w1"}}"#;
+        let body = build_kubectl_proto_body(b"example.com/v1", b"Widget", inner_json, None);
+        let bytes = Bytes::from(body);
+
+        let result = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let json: serde_json::Value =
+            serde_json::from_slice(&result).expect("matching kind must allow JSON fallback");
+        assert_eq!(
+            json["kind"], "Widget",
+            "JSON with matching kind must pass through the fallback path"
         );
     }
 
