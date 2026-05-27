@@ -331,7 +331,9 @@ pub async fn patch_namespace<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !content_type.contains("application/merge-patch+json") {
+    if !content_type.contains("application/merge-patch+json")
+        && !content_type.contains("application/strategic-merge-patch+json")
+    {
         return Err(Status::unsupported_media_type(format!(
             "unsupported media type '{content_type}'; use application/merge-patch+json"
         )));
