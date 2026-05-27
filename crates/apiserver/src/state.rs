@@ -107,6 +107,10 @@ pub struct AppState<S = SqliteStore> {
     /// Kubelet accepts clients with O=system:masters when --client-ca-file is our cluster CA.
     /// Stored as bytes so reqwest::Identity can be constructed per-request (Identity: !Clone).
     pub kubelet_client_identity_pem: Option<Arc<Vec<u8>>>,
+    /// When set, use this hostname/IP instead of node_address() for all kubelet proxy
+    /// requests. Needed when the apiserver runs on a different host than the kubelet
+    /// (e.g. Mac host + Lima VM) and the node's InternalIP is not reachable from the host.
+    pub kubelet_preferred_address: Option<Arc<String>>,
     /// Service CIDR allocator. None means auto-allocation is disabled.
     pub service_ip_allocator: Option<Arc<ServiceIpAllocator>>,
 }
@@ -126,6 +130,7 @@ impl<S> Clone for AppState<S> {
             webhook_client: self.webhook_client.clone(),
             cluster_ca_der: self.cluster_ca_der.clone(),
             kubelet_client_identity_pem: self.kubelet_client_identity_pem.clone(),
+            kubelet_preferred_address: self.kubelet_preferred_address.clone(),
             service_ip_allocator: self.service_ip_allocator.clone(),
         }
     }
@@ -249,6 +254,33 @@ impl<S: Store> AppState<S> {
         service_ip_allocator: Option<ServiceIpAllocator>,
         kubelet_client_identity_pem: Option<Vec<u8>>,
     ) -> Self {
+        Self::new_with_ca_and_kubelet_identity_and_address(
+            store,
+            sa_key,
+            sa_decoding_key,
+            token_map,
+            server_address,
+            cluster_ca_der,
+            webhook_identity_pem,
+            service_ip_allocator,
+            kubelet_client_identity_pem,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_ca_and_kubelet_identity_and_address(
+        store: Arc<S>,
+        sa_key: Option<jsonwebtoken::EncodingKey>,
+        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+        token_map: HashMap<String, UserInfo>,
+        server_address: String,
+        cluster_ca_der: Option<Vec<u8>>,
+        webhook_identity_pem: Option<Vec<u8>>,
+        service_ip_allocator: Option<ServiceIpAllocator>,
+        kubelet_client_identity_pem: Option<Vec<u8>>,
+        kubelet_preferred_address: Option<String>,
+    ) -> Self {
         let registry = build_registry();
         let webhook_client =
             Self::build_webhook_client(cluster_ca_der.as_deref(), webhook_identity_pem.as_deref());
@@ -264,6 +296,7 @@ impl<S: Store> AppState<S> {
             webhook_client,
             cluster_ca_der: cluster_ca_der.map(Arc::new),
             kubelet_client_identity_pem: kubelet_client_identity_pem.map(Arc::new),
+            kubelet_preferred_address: kubelet_preferred_address.map(Arc::new),
             service_ip_allocator: service_ip_allocator.map(Arc::new),
         }
     }

@@ -67,6 +67,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --sa-pub     "$WORKDIR/sa.pub" \
     --ca-key     "$WORKDIR/ca.key" \
     --ca-cert    "$WORKDIR/ca.crt" \
+    --kubelet-preferred-address "127.0.0.1" \
     > "$LOG" 2>&1 &
   SERVER_PID=$!
   disown "$SERVER_PID"
@@ -79,6 +80,7 @@ else
     --sa-pub     "$WORKDIR/sa.pub" \
     --ca-key     "$WORKDIR/ca.key" \
     --ca-cert    "$WORKDIR/ca.crt" \
+    --kubelet-preferred-address "127.0.0.1" \
     &
   # No --advertise-address: server cert already includes localhost, 127.0.0.1,
   # and host.lima.internal unconditionally (see crates/apiserver/src/tls.rs).

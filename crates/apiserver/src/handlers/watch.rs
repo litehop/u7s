@@ -275,7 +275,10 @@ pub(crate) async fn watch_generic<S: Store>(
 
     // Check compaction horizon BEFORE committing headers so clients get a synchronous HTTP 410.
     // If from_rv > 0 and below the horizon, the revision is expired — return 410 immediately.
-    if from_revision > 0 {
+    // Skip this check when sendInitialEvents is active: initial_items already holds a fresh
+    // list snapshot at the current revision, and watch_from_rv below will be set to list_rv,
+    // not from_revision. The stale from_revision is irrelevant in that path.
+    if from_revision > 0 && initial_items.is_none() {
         let horizon = state.store.compaction_horizon();
         if from_revision < horizon {
             return Err(Status::expired(format!(
@@ -747,6 +750,54 @@ mod tests {
             result.is_ok(),
             "rv=0 (full watch) must not trigger the 410 expiry check, \
              even when a compaction horizon exists"
+        );
+    }
+
+    /// watch_generic with sendInitialEvents=true (initial_items is Some) and an expired
+    /// from_revision must NOT return 410 — the stale rv is irrelevant because the watch
+    /// starts from the fresh list_rv, not from_revision. Without this fix sonobuoy's
+    /// configmap watches get stuck in a 410 retry loop once the ring buffer fills.
+    #[tokio::test]
+    async fn watch_generic_send_initial_events_bypasses_410_for_expired_rv() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        store.set_compaction_horizon_for_test(50);
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // initial_items=Some simulates sendInitialEvents=true having already fetched a
+        // fresh list snapshot. from_revision=10 is below the horizon of 50.
+        let result = watch_generic(
+            state,
+            "/registry/test/".into(),
+            "v1".into(),
+            "ConfigMap".into(),
+            10,                 // expired — below horizon of 50
+            Some((vec![], 50)), // sendInitialEvents already fetched snapshot at rv=50
+            None,
+            None,
+            false,
+            "test-user".into(),
+            false,
+            "".into(),
+            "".into(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "watch_generic must not return 410 when sendInitialEvents=true (initial_items is Some), \
+             even if from_revision is below the compaction horizon — the watch starts from list_rv, \
+             not from_revision"
         );
     }
 
