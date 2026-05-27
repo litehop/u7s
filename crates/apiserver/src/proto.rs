@@ -484,6 +484,17 @@ struct EventSource {
     host: String,
 }
 
+/// EventSeries — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct EventSeries {
+    /// count (field 1, int32)
+    #[prost(int32, tag = "1")]
+    count: i32,
+    /// lastObservedTime (field 2, MicroTime)
+    #[prost(message, tag = "2")]
+    last_observed_time: Option<MicroTime>,
+}
+
 /// Event — k8s.io/api/core/v1/generated.proto
 #[derive(Clone, PartialEq, Message)]
 struct Event {
@@ -517,9 +528,9 @@ struct Event {
     /// eventTime (field 10, MicroTime)
     #[prost(message, tag = "10")]
     event_time: Option<MicroTime>,
-    /// series (field 11, bytes) — EventSeries, decoded as raw bytes
-    #[prost(bytes = "vec", tag = "11")]
-    series: Vec<u8>,
+    /// series (field 11, message EventSeries)
+    #[prost(message, tag = "11")]
+    series: Option<EventSeries>,
     /// action (field 12, string)
     #[prost(string, tag = "12")]
     action: String,
@@ -1168,6 +1179,12 @@ fn object_meta_to_json(meta: ObjectMeta) -> serde_json::Value {
     if !meta.resource_version.is_empty() {
         m["resourceVersion"] = serde_json::Value::String(meta.resource_version);
     }
+    if let Some(ts) = meta.creation_timestamp {
+        if ts.seconds != 0 {
+            m["creationTimestamp"] =
+                serde_json::Value::String(crate::util::secs_to_rfc3339(ts.seconds as u64));
+        }
+    }
     if !meta.labels.is_empty() {
         let labels: serde_json::Map<String, serde_json::Value> = meta
             .labels
@@ -1804,6 +1821,26 @@ pub fn decode_event_proto(data: &[u8]) -> Option<serde_json::Value> {
     }
     if !event.r#type.is_empty() {
         obj["type"] = serde_json::Value::String(event.r#type);
+    }
+    if let Some(s) = event.series {
+        let mut sm = serde_json::Map::new();
+        if s.count != 0 {
+            sm.insert(
+                "count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(s.count)),
+            );
+        }
+        if let Some(t) = s.last_observed_time {
+            if t.seconds != 0 {
+                sm.insert(
+                    "lastObservedTime".to_string(),
+                    serde_json::Value::String(crate::util::secs_to_rfc3339(t.seconds as u64)),
+                );
+            }
+        }
+        if !sm.is_empty() {
+            obj["series"] = serde_json::Value::Object(sm);
+        }
     }
     Some(obj)
 }
@@ -3657,6 +3694,44 @@ mod tests {
         assert_eq!(result["message"], "Started container myapp");
         assert_eq!(result["count"], 1);
         assert_eq!(result["type"], "Normal");
+    }
+
+    /// decode_event_proto must include series.count and series.lastObservedTime in the output.
+    /// kubelet/controllers patch Events with series to track repeated events; if series is
+    /// silently dropped the client's GET sees series=nil, causing the update to overwrite the
+    /// stored object without series and the conformance test (core_events.go:144) to fail.
+    #[test]
+    fn decode_event_proto_includes_series() {
+        // Build: Event {
+        //   metadata: ObjectMeta { name: "test.series" },
+        //   series: EventSeries { count: 100, lastObservedTime: 1704067200 (2024-01-01T00:00:00Z) }
+        // }
+        let obj_meta = encode_length_delimited(1, b"test.series");
+
+        // EventSeries: field 1 = count (varint wire 0), field 2 = MicroTime (wire 2).
+        // count=100: tag=(1<<3)|0=0x08, value=0x64
+        let mut event_series = vec![0x08, 0x64];
+        // MicroTime message content: field 1 (seconds, int64, wire 0) = 1704067200
+        let mut microtime_content = encode_varint(1 << 3); // field 1, wire type 0 (varint)
+        microtime_content.extend_from_slice(&encode_varint(1_704_067_200u64));
+        event_series.extend_from_slice(&encode_length_delimited(2, &microtime_content));
+
+        // Event: field 1 = ObjectMeta, field 11 = EventSeries
+        let mut event_proto = encode_length_delimited(1, &obj_meta);
+        event_proto.extend_from_slice(&encode_length_delimited(11, &event_series));
+
+        let result = decode_event_proto(&event_proto).expect("must decode Event proto with series");
+
+        assert_eq!(
+            result["series"]["count"], 100,
+            "series.count must be decoded and present in JSON; \
+             dropping it causes client GETs to see series=nil and subsequent \
+             PUTs to overwrite the object without series"
+        );
+        assert_eq!(
+            result["series"]["lastObservedTime"], "2024-01-01T00:00:00Z",
+            "series.lastObservedTime must be decoded as RFC3339"
+        );
     }
 
     /// decode_core_proto_by_kind must dispatch to decode_event_proto for kind="Event".

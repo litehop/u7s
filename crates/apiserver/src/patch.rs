@@ -3,7 +3,7 @@ use thiserror::Error;
 /// Apply a JSON Merge Patch (RFC 7396) to `target`.
 ///
 /// Rules:
-/// - null value → remove key from object
+/// - null value → remove key from object (except creationTimestamp which is immutable)
 /// - object value → recurse
 /// - any other value → overwrite
 /// - if patch or target is not an object → replace target with patch clone
@@ -11,7 +11,9 @@ pub fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
     if let (Some(t), Some(p)) = (target.as_object_mut(), patch.as_object()) {
         for (k, v) in p {
             if v.is_null() {
-                t.remove(k);
+                if k != "creationTimestamp" {
+                    t.remove(k);
+                }
             } else if v.is_object() {
                 let entry = t
                     .entry(k)
@@ -64,7 +66,9 @@ fn strategic_merge_patch_at(
 
     for (key, value) in patch_obj {
         if value.is_null() {
-            target_obj.remove(key);
+            if key != "creationTimestamp" {
+                target_obj.remove(key);
+            }
             continue;
         }
 
@@ -811,6 +815,77 @@ mod tests {
         assert_eq!(
             mem["status"], "False",
             "MemoryPressure status:False must survive a heartbeat-only patch"
+        );
+    }
+
+    /// merge_patch must not remove creationTimestamp when the patch includes it as null.
+    /// Go client-go serializes v1.Time{} (zero time) as null in JSON; if merge_patch
+    /// deleted creationTimestamp on every Event PATCH, the conformance test
+    /// (core_events.go:144) would see CreationTimestamp=v1.Time{} instead of the
+    /// original timestamp.
+    #[test]
+    fn merge_patch_preserves_creation_timestamp_when_patched_as_null() {
+        let mut target = json!({
+            "metadata": {
+                "name": "my-event",
+                "creationTimestamp": "2026-05-27T02:24:57Z"
+            },
+            "series": null
+        });
+        // Simulate what client-go sends: creationTimestamp null (zero time), series set.
+        let patch = json!({
+            "metadata": {
+                "creationTimestamp": null
+            },
+            "series": {"count": 100, "lastObservedTime": "2017-09-19T13:49:16Z"}
+        });
+
+        merge_patch(&mut target, &patch);
+
+        assert_eq!(
+            target["metadata"]["creationTimestamp"], "2026-05-27T02:24:57Z",
+            "creationTimestamp must not be removed by a null patch: \
+             client-go serializes zero time as null but the server-stamped \
+             creationTimestamp is immutable"
+        );
+        assert_eq!(
+            target["series"]["count"], 100,
+            "series.count must be set by the patch"
+        );
+        assert_eq!(
+            target["series"]["lastObservedTime"], "2017-09-19T13:49:16Z",
+            "series.lastObservedTime must be set by the patch"
+        );
+    }
+
+    /// strategic_merge_patch must not remove creationTimestamp when the patch includes it as null.
+    /// Same invariant as for merge_patch: creationTimestamp is immutable and client-go
+    /// routinely includes it as null in strategic-merge patches.
+    #[test]
+    fn strategic_merge_patch_preserves_creation_timestamp_when_patched_as_null() {
+        let mut target = json!({
+            "metadata": {
+                "name": "my-event",
+                "creationTimestamp": "2026-05-27T02:24:57Z"
+            }
+        });
+        let patch = json!({
+            "metadata": {
+                "creationTimestamp": null,
+                "labels": {"patched": "yes"}
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        assert_eq!(
+            target["metadata"]["creationTimestamp"], "2026-05-27T02:24:57Z",
+            "creationTimestamp must not be removed by a null strategic-merge patch: \
+             it is immutable and client-go serializes zero time as null"
+        );
+        assert_eq!(
+            target["metadata"]["labels"]["patched"], "yes",
+            "other patched fields must be applied"
         );
     }
 }
