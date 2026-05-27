@@ -236,6 +236,8 @@ pub async fn create_resource<S: Store>(
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
+    super::defaults::validate_resource(&group, &plural, &obj.body)
+        .map_err(Status::bad_request)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -320,6 +322,8 @@ pub async fn replace_resource<S: Store>(
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
+    super::defaults::validate_resource(&group, &plural, &obj.body)
+        .map_err(Status::bad_request)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -486,6 +490,8 @@ pub(crate) async fn do_patch<S: Store>(
             serde_json::to_value(obj_meta).map_err(|e| Status::internal(e.to_string()))?;
         stamp_metadata(&mut obj);
         super::defaults::apply_defaults(group, plural, &mut obj.body);
+        super::defaults::validate_resource(group, plural, &obj.body)
+            .map_err(Status::bad_request)?;
         let new_rv = match state.store.put(key, obj.to_bytes(), Some(0)).await {
             Ok(rv) => rv,
             Err(StoreError::AlreadyExists { .. }) => {
@@ -504,6 +510,8 @@ pub(crate) async fn do_patch<S: Store>(
                 crate::patch::strategic_merge_patch(&mut current.body, &patch)
                     .map_err(|e| Status::bad_request(e.to_string()))?;
                 super::defaults::apply_defaults(group, plural, &mut current.body);
+                super::defaults::validate_resource(group, plural, &current.body)
+                    .map_err(Status::bad_request)?;
                 if let Some(fm) = field_manager {
                     let api_ver = current.body["apiVersion"]
                         .as_str()
@@ -563,6 +571,8 @@ pub(crate) async fn do_patch<S: Store>(
         }
     }
     super::defaults::apply_defaults(group, plural, &mut current.body);
+    super::defaults::validate_resource(group, plural, &current.body)
+        .map_err(Status::bad_request)?;
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
     let current_meta: ObjectMeta =
@@ -887,6 +897,8 @@ pub async fn create_namespaced_resource<S: Store>(
     }
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
+    super::defaults::validate_resource(&group, &plural, &obj.body)
+        .map_err(Status::bad_request)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -973,6 +985,8 @@ pub async fn replace_namespaced_resource<S: Store>(
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
+    super::defaults::validate_resource(&group, &plural, &obj.body)
+        .map_err(Status::bad_request)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {

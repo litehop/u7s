@@ -161,6 +161,29 @@ pub fn default_service_ip_fields(obj: &mut serde_json::Value) {
     }
 }
 
+/// Validate a resource after defaults have been applied. Returns an error string
+/// suitable for a 400 Bad Request if required fields are missing.
+///
+/// Must be called after `apply_defaults` so that fields defaultable from other
+/// fields (e.g. spec.selector from template labels) have already been filled in.
+pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> Result<(), String> {
+    if let ("apps", "deployments") = (group, plural) {
+        validate_deployment(obj)?;
+    }
+    Ok(())
+}
+
+fn validate_deployment(obj: &serde_json::Value) -> Result<(), String> {
+    if obj["spec"]["selector"].is_null() {
+        return Err(
+            "Deployment.spec.selector is required and could not be defaulted \
+             (spec.template.metadata.labels is also missing)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn default_deployment(obj: &mut serde_json::Value) {
     // spec.selector defaults to matchLabels from spec.template.metadata.labels.
     // Upstream kube-apiserver rejects Deployments without spec.selector; u7s stores
@@ -322,6 +345,78 @@ mod tests {
             obj["spec"]["selector"],
             serde_json::json!({ "matchLabels": { "app": "test", "version": "v1" } }),
             "spec.selector must be defaulted from template labels — nil selector panics the KCM deployment-controller"
+        );
+    }
+
+    /// A Deployment with neither spec.selector nor template labels must be rejected.
+    ///
+    /// Upstream kube-apiserver returns 422 for this case. Without rejection, u7s stores
+    /// the object, KCM reads it, CloneSelectorAndAddLabel(nil) panics, and the entire
+    /// KCM process dies — taking the serviceaccount-controller with it.
+    #[test]
+    fn deployment_without_selector_or_labels_rejected() {
+        let obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "bad", "namespace": "test" },
+            "spec": {
+                "template": { "spec": { "containers": [] } }
+            }
+        });
+
+        let result = validate_resource("apps", "deployments", &obj);
+        assert!(
+            result.is_err(),
+            "Deployment with no selector and no template labels must be rejected — \
+             nil selector panics KCM deployment-controller"
+        );
+        assert!(
+            result.unwrap_err().contains("spec.selector"),
+            "error message must mention spec.selector"
+        );
+    }
+
+    /// A Deployment with an explicit spec.selector must pass validation.
+    #[test]
+    fn deployment_with_valid_selector_passes_validation() {
+        let obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "ok", "namespace": "test" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": { "spec": { "containers": [] } }
+            }
+        });
+
+        assert!(
+            validate_resource("apps", "deployments", &obj).is_ok(),
+            "Deployment with explicit spec.selector must pass validation"
+        );
+    }
+
+    /// apply_defaults + validate_resource must succeed for Deployments with template labels.
+    ///
+    /// Verifies the full write-path pipeline: selector is defaulted from template labels,
+    /// then validation confirms the selector is present.
+    #[test]
+    fn deployment_selector_defaulted_then_passes_validation() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "test" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+        assert!(
+            validate_resource("apps", "deployments", &obj).is_ok(),
+            "Deployment with template labels must pass validation after selector is defaulted"
         );
     }
 
