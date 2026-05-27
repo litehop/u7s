@@ -1052,6 +1052,68 @@ struct Job {
     status: Vec<u8>,
 }
 
+// --- k8s.io/api/apps/v1/generated.proto ---
+
+/// StatefulSet — k8s.io/api/apps/v1/generated.proto
+/// Only metadata is decoded; spec is deeply nested and not needed for routing.
+#[derive(Clone, PartialEq, Message)]
+struct StatefulSet {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// Deployment — k8s.io/api/apps/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Deployment {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// DaemonSet — k8s.io/api/apps/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct DaemonSet {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// ReplicaSet — k8s.io/api/apps/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct ReplicaSet {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// ServiceAccount — k8s.io/api/core/v1/generated.proto
+/// secrets (field 2), imagePullSecrets (field 3), automountServiceAccountToken (field 4)
+/// are skipped — not needed for routing.
+#[derive(Clone, PartialEq, Message)]
+struct ServiceAccount {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// PersistentVolumeClaim — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct PersistentVolumeClaim {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// Endpoints — k8s.io/api/core/v1/generated.proto
+/// subsets (field 2, repeated EndpointSubset) is skipped — not needed for routing.
+#[derive(Clone, PartialEq, Message)]
+struct Endpoints {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
 // ---------------------------------------------------------------------------
 // Encoder — produces Kubernetes protobuf wire format from a JSON value.
 // Used in tests only; not called from production handlers.
@@ -2299,6 +2361,83 @@ pub fn decode_job_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
+/// Decode a proto-encoded StatefulSet object into a `serde_json::Value`.
+pub fn decode_statefulset_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = StatefulSet::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded Deployment object into a `serde_json::Value`.
+pub fn decode_deployment_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = Deployment::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded DaemonSet object into a `serde_json::Value`.
+pub fn decode_daemonset_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = DaemonSet::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "DaemonSet",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded ReplicaSet object into a `serde_json::Value`.
+pub fn decode_replicaset_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = ReplicaSet::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded ServiceAccount object into a `serde_json::Value`.
+pub fn decode_serviceaccount_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = ServiceAccount::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded PersistentVolumeClaim object into a `serde_json::Value`.
+pub fn decode_persistentvolumeclaim_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = PersistentVolumeClaim::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded Endpoints object into a `serde_json::Value`.
+pub fn decode_endpoints_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = Endpoints::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": meta
+    }))
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -2327,6 +2466,13 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "Job" => decode_job_proto(raw),
         "RuntimeClass" => decode_runtimeclass_proto(raw),
         "VolumeAttachment" => decode_volumeattachment_proto(raw),
+        "StatefulSet" => decode_statefulset_proto(raw),
+        "Deployment" => decode_deployment_proto(raw),
+        "DaemonSet" => decode_daemonset_proto(raw),
+        "ReplicaSet" => decode_replicaset_proto(raw),
+        "ServiceAccount" => decode_serviceaccount_proto(raw),
+        "PersistentVolumeClaim" => decode_persistentvolumeclaim_proto(raw),
+        "Endpoints" => decode_endpoints_proto(raw),
         _ => None,
     }
 }
@@ -2690,7 +2836,7 @@ mod tests {
         assert_eq!(cm_json["metadata"]["name"], "test-cm");
 
         // Unknown kind returns None
-        assert!(decode_core_proto_by_kind("Deployment", &namespace_proto).is_none());
+        assert!(decode_core_proto_by_kind("UnknownKind", &namespace_proto).is_none());
     }
 
     // ---------------------------------------------------------------------------
@@ -4701,5 +4847,185 @@ mod tests {
         assert_eq!(result["spec"]["attacher"], "csi.example.com");
         assert_eq!(result["spec"]["nodeName"], "node-1");
         assert_eq!(result["spec"]["source"]["persistentVolumeName"], "my-pv");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — apps/v1 workload types (StatefulSet, Deployment, DaemonSet, ReplicaSet)
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch StatefulSet to a decoder that returns valid JSON.
+    ///
+    /// Without this decoder, clients sending Content-Type: application/vnd.kubernetes.protobuf
+    /// for StatefulSet receive 400 'invalid JSON: expected value at line 1 column 1'.
+    #[test]
+    fn decode_statefulset_proto_extracts_metadata() {
+        // StatefulSet { metadata: ObjectMeta { name: "my-sts", namespace: "default" } }
+        let name = encode_length_delimited(1, b"my-sts");
+        let ns = encode_length_delimited(3, b"default");
+        let mut meta = name;
+        meta.extend_from_slice(&ns);
+
+        let proto = encode_length_delimited(1, &meta);
+
+        let result = decode_core_proto_by_kind("StatefulSet", &proto).expect(
+            "StatefulSet must decode via decode_core_proto_by_kind — \
+             proto clients receive 400 without this decoder",
+        );
+
+        assert_eq!(result["kind"], "StatefulSet", "kind must be StatefulSet");
+        assert_eq!(result["apiVersion"], "apps/v1", "apiVersion must be apps/v1");
+        assert_eq!(result["metadata"]["name"], "my-sts");
+        assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    /// decode_core_proto_by_kind must dispatch Deployment to a decoder that returns valid JSON.
+    ///
+    /// Without this decoder, clients sending Content-Type: application/vnd.kubernetes.protobuf
+    /// for Deployment receive 400 'invalid JSON: expected value at line 1 column 1'.
+    #[test]
+    fn decode_deployment_proto_extracts_metadata() {
+        // Deployment { metadata: ObjectMeta { name: "my-deploy", namespace: "default" } }
+        let name = encode_length_delimited(1, b"my-deploy");
+        let ns = encode_length_delimited(3, b"default");
+        let mut meta = name;
+        meta.extend_from_slice(&ns);
+
+        let proto = encode_length_delimited(1, &meta);
+
+        let result = decode_core_proto_by_kind("Deployment", &proto).expect(
+            "Deployment must decode via decode_core_proto_by_kind — \
+             proto clients receive 400 without this decoder",
+        );
+
+        assert_eq!(result["kind"], "Deployment", "kind must be Deployment");
+        assert_eq!(result["apiVersion"], "apps/v1", "apiVersion must be apps/v1");
+        assert_eq!(result["metadata"]["name"], "my-deploy");
+    }
+
+    /// decode_core_proto_by_kind must dispatch DaemonSet to a decoder that returns valid JSON.
+    ///
+    /// Without this decoder, clients sending Content-Type: application/vnd.kubernetes.protobuf
+    /// for DaemonSet receive 400 'invalid JSON: expected value at line 1 column 1'.
+    #[test]
+    fn decode_daemonset_proto_extracts_metadata() {
+        // DaemonSet { metadata: ObjectMeta { name: "my-ds", namespace: "kube-system" } }
+        let name = encode_length_delimited(1, b"my-ds");
+        let ns = encode_length_delimited(3, b"kube-system");
+        let mut meta = name;
+        meta.extend_from_slice(&ns);
+
+        let proto = encode_length_delimited(1, &meta);
+
+        let result = decode_core_proto_by_kind("DaemonSet", &proto).expect(
+            "DaemonSet must decode via decode_core_proto_by_kind — \
+             proto clients receive 400 without this decoder",
+        );
+
+        assert_eq!(result["kind"], "DaemonSet", "kind must be DaemonSet");
+        assert_eq!(result["apiVersion"], "apps/v1", "apiVersion must be apps/v1");
+        assert_eq!(result["metadata"]["name"], "my-ds");
+    }
+
+    /// decode_core_proto_by_kind must dispatch ReplicaSet to a decoder that returns valid JSON.
+    ///
+    /// Without this decoder, clients sending Content-Type: application/vnd.kubernetes.protobuf
+    /// for ReplicaSet receive 400 'invalid JSON: expected value at line 1 column 1'.
+    #[test]
+    fn decode_replicaset_proto_extracts_metadata() {
+        // ReplicaSet { metadata: ObjectMeta { name: "my-rs", namespace: "default" } }
+        let name = encode_length_delimited(1, b"my-rs");
+        let ns = encode_length_delimited(3, b"default");
+        let mut meta = name;
+        meta.extend_from_slice(&ns);
+
+        let proto = encode_length_delimited(1, &meta);
+
+        let result = decode_core_proto_by_kind("ReplicaSet", &proto).expect(
+            "ReplicaSet must decode via decode_core_proto_by_kind — \
+             proto clients receive 400 without this decoder",
+        );
+
+        assert_eq!(result["kind"], "ReplicaSet", "kind must be ReplicaSet");
+        assert_eq!(result["apiVersion"], "apps/v1", "apiVersion must be apps/v1");
+        assert_eq!(result["metadata"]["name"], "my-rs");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — core/v1 types (ServiceAccount, PersistentVolumeClaim, Endpoints)
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch ServiceAccount to a decoder that returns valid JSON.
+    ///
+    /// Without this decoder, clients sending Content-Type: application/vnd.kubernetes.protobuf
+    /// for ServiceAccount receive 400 'invalid JSON: expected value at line 1 column 1'.
+    #[test]
+    fn decode_serviceaccount_proto_extracts_metadata() {
+        // ServiceAccount { metadata: ObjectMeta { name: "my-sa", namespace: "default" } }
+        let name = encode_length_delimited(1, b"my-sa");
+        let ns = encode_length_delimited(3, b"default");
+        let mut meta = name;
+        meta.extend_from_slice(&ns);
+
+        let proto = encode_length_delimited(1, &meta);
+
+        let result = decode_core_proto_by_kind("ServiceAccount", &proto).expect(
+            "ServiceAccount must decode via decode_core_proto_by_kind — \
+             proto clients receive 400 without this decoder",
+        );
+
+        assert_eq!(result["kind"], "ServiceAccount", "kind must be ServiceAccount");
+        assert_eq!(result["apiVersion"], "v1", "apiVersion must be v1");
+        assert_eq!(result["metadata"]["name"], "my-sa");
+        assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    /// decode_core_proto_by_kind must dispatch PersistentVolumeClaim to a decoder that returns valid JSON.
+    ///
+    /// Without this decoder, clients sending Content-Type: application/vnd.kubernetes.protobuf
+    /// for PersistentVolumeClaim receive 400 'invalid JSON: expected value at line 1 column 1'.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_extracts_metadata() {
+        // PersistentVolumeClaim { metadata: ObjectMeta { name: "my-pvc", namespace: "default" } }
+        let name = encode_length_delimited(1, b"my-pvc");
+        let ns = encode_length_delimited(3, b"default");
+        let mut meta = name;
+        meta.extend_from_slice(&ns);
+
+        let proto = encode_length_delimited(1, &meta);
+
+        let result = decode_core_proto_by_kind("PersistentVolumeClaim", &proto).expect(
+            "PersistentVolumeClaim must decode via decode_core_proto_by_kind — \
+             proto clients receive 400 without this decoder",
+        );
+
+        assert_eq!(result["kind"], "PersistentVolumeClaim", "kind must be PersistentVolumeClaim");
+        assert_eq!(result["apiVersion"], "v1", "apiVersion must be v1");
+        assert_eq!(result["metadata"]["name"], "my-pvc");
+        assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    /// decode_core_proto_by_kind must dispatch Endpoints to a decoder that returns valid JSON.
+    ///
+    /// Without this decoder, clients sending Content-Type: application/vnd.kubernetes.protobuf
+    /// for Endpoints receive 400 'invalid JSON: expected value at line 1 column 1'.
+    #[test]
+    fn decode_endpoints_proto_extracts_metadata() {
+        // Endpoints { metadata: ObjectMeta { name: "my-ep", namespace: "default" } }
+        let name = encode_length_delimited(1, b"my-ep");
+        let ns = encode_length_delimited(3, b"default");
+        let mut meta = name;
+        meta.extend_from_slice(&ns);
+
+        let proto = encode_length_delimited(1, &meta);
+
+        let result = decode_core_proto_by_kind("Endpoints", &proto).expect(
+            "Endpoints must decode via decode_core_proto_by_kind — \
+             proto clients receive 400 without this decoder",
+        );
+
+        assert_eq!(result["kind"], "Endpoints", "kind must be Endpoints");
+        assert_eq!(result["apiVersion"], "v1", "apiVersion must be v1");
+        assert_eq!(result["metadata"]["name"], "my-ep");
+        assert_eq!(result["metadata"]["namespace"], "default");
     }
 }
