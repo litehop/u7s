@@ -282,6 +282,16 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/namespaces/{name}/finalize",
             axum::routing::put(handlers::namespaces::finalize_namespace),
         )
+        // Namespaces — status subresource (must be before named-resource catch-all)
+        // The KCM namespace controller PATCHes this to set status.conditions (e.g.
+        // NamespaceDeletionContentFailure) during namespace deletion. Without it the
+        // condition never gets set and conformance test OrderedNamespaceDeletion times out.
+        .route(
+            "/api/v1/namespaces/{name}/status",
+            get(handlers::namespaces::get_namespace_status)
+                .put(handlers::namespaces::put_namespace_status)
+                .patch(handlers::namespaces::patch_namespace_status),
+        )
         // Namespaces — named resource
         .route(
             "/api/v1/namespaces/{name}",
