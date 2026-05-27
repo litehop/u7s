@@ -1297,9 +1297,7 @@ pub fn decode_cronjob_proto(data: &[u8]) -> Option<serde_json::Value> {
         if spec.starting_deadline_seconds != 0 {
             spec_map.insert(
                 "startingDeadlineSeconds".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(
-                    spec.starting_deadline_seconds,
-                )),
+                serde_json::Value::Number(serde_json::Number::from(spec.starting_deadline_seconds)),
             );
         }
         if !spec.concurrency_policy.is_empty() {
@@ -1322,9 +1320,7 @@ pub fn decode_cronjob_proto(data: &[u8]) -> Option<serde_json::Value> {
         if spec.failed_jobs_history_limit != 0 {
             spec_map.insert(
                 "failedJobsHistoryLimit".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(
-                    spec.failed_jobs_history_limit,
-                )),
+                serde_json::Value::Number(serde_json::Number::from(spec.failed_jobs_history_limit)),
             );
         }
         if !spec.time_zone.is_empty() {
@@ -1344,9 +1340,7 @@ pub fn decode_cronjob_proto(data: &[u8]) -> Option<serde_json::Value> {
             .job_template
             .and_then(|jt| jt.spec)
             .map(job_spec_to_json)
-            .unwrap_or_else(|| {
-                serde_json::json!({"template": {}})
-            });
+            .unwrap_or_else(|| serde_json::json!({"template": {}}));
         spec_map.insert(
             "jobTemplate".to_string(),
             serde_json::json!({

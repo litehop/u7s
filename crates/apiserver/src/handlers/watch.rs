@@ -781,7 +781,7 @@ mod tests {
             "/registry/test/".into(),
             "v1".into(),
             "ConfigMap".into(),
-            10, // expired — below horizon of 50
+            10,                 // expired — below horizon of 50
             Some((vec![], 50)), // sendInitialEvents already fetched snapshot at rv=50
             None,
             None,
