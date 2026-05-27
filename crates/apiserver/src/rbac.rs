@@ -32,32 +32,10 @@ pub struct RoleRef {
     pub name: String,
 }
 
-/// Label selector entry: all key/value pairs must match the target's labels.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct LabelSelector {
-    #[serde(rename = "matchLabels", default)]
-    pub match_labels: std::collections::HashMap<String, String>,
-}
-
-/// Aggregation rule specifying which sub-roles contribute rules to this role.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[allow(dead_code)]
-pub struct AggregationRule {
-    #[serde(rename = "clusterRoleSelectors", default)]
-    pub cluster_role_selectors: Vec<LabelSelector>,
-}
-
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RbacRole {
     #[serde(default)]
     pub rules: Vec<PolicyRule>,
-    /// Parsed for schema completeness; the aggregation controller (in
-    /// u7s-controller-manager) handles the actual rule merging and writes the
-    /// merged rules back to the store. The apiserver RBAC engine does not need
-    /// to act on this field directly.
-    #[allow(dead_code)]
-    #[serde(rename = "aggregationRule")]
-    pub aggregation_rule: Option<AggregationRule>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
