@@ -174,6 +174,65 @@ struct PodTemplate {
     // for routing/storage. The template is preserved as an empty object in the output JSON.
 }
 
+/// Container — minimal decode: name (field 1) and image (field 2).
+/// All other Container fields are ignored (ports, env, volumeMounts, probes, etc.)
+/// because we only need name+image to produce a valid stored Pod JSON.
+#[derive(Clone, PartialEq, Message)]
+struct Container {
+    /// name (field 1, string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// image (field 2, string)
+    #[prost(string, tag = "2")]
+    image: String,
+    /// command (field 3, repeated string)
+    #[prost(string, repeated, tag = "3")]
+    command: Vec<String>,
+    /// args (field 4, repeated string)
+    #[prost(string, repeated, tag = "4")]
+    args: Vec<String>,
+    /// imagePullPolicy (field 15, string)
+    #[prost(string, tag = "15")]
+    image_pull_policy: String,
+    /// terminationMessagePath (field 14, string)
+    #[prost(string, tag = "14")]
+    termination_message_path: String,
+    /// terminationMessagePolicy (field 21, string)
+    #[prost(string, tag = "21")]
+    termination_message_policy: String,
+}
+
+/// PodSpec — only containers (field 3) is decoded; other fields are ignored.
+#[derive(Clone, PartialEq, Message)]
+struct PodSpec {
+    /// containers (field 3, repeated Container)
+    #[prost(message, repeated, tag = "3")]
+    containers: Vec<Container>,
+    /// restartPolicy (field 4, string)
+    #[prost(string, tag = "4")]
+    restart_policy: String,
+    /// serviceAccountName (field 9, string)
+    #[prost(string, tag = "9")]
+    service_account_name: String,
+    /// nodeName (field 11, string)
+    #[prost(string, tag = "11")]
+    node_name: String,
+}
+
+/// Pod — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Pod {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message PodSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<PodSpec>,
+    /// status (field 3, bytes) — not decoded on input
+    #[prost(bytes = "vec", tag = "3")]
+    status: Vec<u8>,
+}
+
 /// ConfigMap — k8s.io/api/core/v1/generated.proto
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMap {
@@ -945,6 +1004,96 @@ pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
+/// Decode a proto-encoded Pod object into a `serde_json::Value`.
+///
+/// Decodes metadata and spec.containers (name + image). All other PodSpec fields are omitted
+/// because PodSpec is deeply nested — the goal is to produce a valid JSON object that passes
+/// Object::from_bytes validation and can be stored, so CREATE returns 201 instead of 400.
+pub fn decode_pod_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let pod = Pod::decode(data).ok()?;
+    let meta = object_meta_to_json(pod.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": meta
+    });
+
+    let spec = pod.spec.unwrap_or_default();
+    let containers: Vec<serde_json::Value> = spec
+        .containers
+        .into_iter()
+        .map(|c| {
+            let mut cm = serde_json::Map::new();
+            if !c.name.is_empty() {
+                cm.insert("name".to_string(), serde_json::Value::String(c.name));
+            }
+            if !c.image.is_empty() {
+                cm.insert("image".to_string(), serde_json::Value::String(c.image));
+            }
+            if !c.image_pull_policy.is_empty() {
+                cm.insert(
+                    "imagePullPolicy".to_string(),
+                    serde_json::Value::String(c.image_pull_policy),
+                );
+            }
+            if !c.termination_message_path.is_empty() {
+                cm.insert(
+                    "terminationMessagePath".to_string(),
+                    serde_json::Value::String(c.termination_message_path),
+                );
+            }
+            if !c.termination_message_policy.is_empty() {
+                cm.insert(
+                    "terminationMessagePolicy".to_string(),
+                    serde_json::Value::String(c.termination_message_policy),
+                );
+            }
+            if !c.command.is_empty() {
+                cm.insert(
+                    "command".to_string(),
+                    serde_json::Value::Array(
+                        c.command.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+            if !c.args.is_empty() {
+                cm.insert(
+                    "args".to_string(),
+                    serde_json::Value::Array(
+                        c.args.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+            serde_json::Value::Object(cm)
+        })
+        .collect();
+
+    let mut spec_map = serde_json::Map::new();
+    spec_map.insert("containers".to_string(), serde_json::Value::Array(containers));
+    if !spec.restart_policy.is_empty() {
+        spec_map.insert(
+            "restartPolicy".to_string(),
+            serde_json::Value::String(spec.restart_policy),
+        );
+    }
+    if !spec.service_account_name.is_empty() {
+        spec_map.insert(
+            "serviceAccountName".to_string(),
+            serde_json::Value::String(spec.service_account_name),
+        );
+    }
+    if !spec.node_name.is_empty() {
+        spec_map.insert(
+            "nodeName".to_string(),
+            serde_json::Value::String(spec.node_name),
+        );
+    }
+    obj["spec"] = serde_json::Value::Object(spec_map);
+
+    Some(obj)
+}
+
 /// Decode a proto-encoded PodTemplate object into a `serde_json::Value`.
 ///
 /// Only metadata is decoded; the template field (PodTemplateSpec) is omitted from the output
@@ -1592,6 +1741,7 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
     match kind {
         "Namespace" => decode_namespace_proto(raw),
         "ConfigMap" => decode_configmap_proto(raw),
+        "Pod" => decode_pod_proto(raw),
         "PodTemplate" => decode_podtemplate_proto(raw),
         "Node" => decode_node_proto(raw),
         "Lease" => decode_lease_proto(raw),
@@ -1968,7 +2118,7 @@ mod tests {
         assert_eq!(cm_json["metadata"]["name"], "test-cm");
 
         // Unknown kind returns None
-        assert!(decode_core_proto_by_kind("Pod", &namespace_proto).is_none());
+        assert!(decode_core_proto_by_kind("Deployment", &namespace_proto).is_none());
     }
 
     // ---------------------------------------------------------------------------
@@ -2013,6 +2163,114 @@ mod tests {
             result["template"].is_object(),
             "template must be an empty object (not missing), required by the k8s schema"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_pod_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_pod_proto must extract metadata and spec.containers from a proto-encoded Pod.
+    ///
+    /// The e2e conformance tests create Pods via proto (expansion.go:269, and many others).
+    /// Without this decoder, decode_core_proto_by_kind returns None for "Pod", extract_body
+    /// returns raw proto bytes, Object::from_bytes fails with "invalid JSON", and the apiserver
+    /// returns 400 — causing every Pod-creating conformance test to fail immediately.
+    #[test]
+    fn decode_pod_proto_extracts_name_namespace_and_containers() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "test-pod", namespace: "default" },
+        //   spec: PodSpec {
+        //     containers: [Container { name: "myapp", image: "myapp:latest",
+        //                             imagePullPolicy: "IfNotPresent" }]
+        //   }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"test-pod"); // ObjectMeta.name
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
+
+        // Container: field 1=name, field 2=image, field 15=imagePullPolicy
+        let mut container = encode_length_delimited(1, b"myapp"); // name
+        container.extend_from_slice(&encode_length_delimited(2, b"myapp:latest")); // image
+        container.extend_from_slice(&encode_length_delimited(15, b"IfNotPresent")); // imagePullPolicy
+
+        // PodSpec: field 3 = repeated Container
+        let pod_spec = encode_length_delimited(3, &container);
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta); // Pod.field 1 = ObjectMeta
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec)); // Pod.field 2 = PodSpec
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must return Some — without this decoder, Pod creation via proto \
+                     returns 400 'invalid JSON' and all container-related conformance tests fail");
+
+        assert_eq!(result["kind"], "Pod");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(
+            result["metadata"]["name"], "test-pod",
+            "name must be extracted so the object is stored under the correct key"
+        );
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert!(result["metadata"]["creationTimestamp"].is_null());
+
+        let containers = result["spec"]["containers"]
+            .as_array()
+            .expect("spec.containers must be an array");
+        assert_eq!(containers.len(), 1, "one container must be decoded");
+        assert_eq!(
+            containers[0]["name"], "myapp",
+            "container name must be extracted"
+        );
+        assert_eq!(
+            containers[0]["image"], "myapp:latest",
+            "container image must be extracted"
+        );
+        assert_eq!(containers[0]["imagePullPolicy"], "IfNotPresent");
+    }
+
+    /// decode_core_proto_by_kind must dispatch Pod proto and return a valid JSON object.
+    ///
+    /// This is the dispatch-level regression: even if the inner decoder works, the kind
+    /// dispatch must route "Pod" correctly so extract_body can convert proto bodies to JSON.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_pod() {
+        // Build: Pod { metadata: ObjectMeta { name: "dispatch-pod", namespace: "test" },
+        //              spec: PodSpec { containers: [Container { name: "c", image: "img" }] } }
+        let mut obj_meta = encode_length_delimited(1, b"dispatch-pod");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"test"));
+
+        let mut container = encode_length_delimited(1, b"c");
+        container.extend_from_slice(&encode_length_delimited(2, b"img"));
+
+        let pod_spec = encode_length_delimited(3, &container);
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_core_proto_by_kind("Pod", &pod_proto)
+            .expect("Pod must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "Pod");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "dispatch-pod");
+        assert_eq!(result["metadata"]["namespace"], "test");
+        assert_eq!(result["spec"]["containers"][0]["name"], "c");
+        assert_eq!(result["spec"]["containers"][0]["image"], "img");
+    }
+
+    /// decode_pod_proto must not panic when the Pod has no spec or containers.
+    /// Empty Pod objects (used in tests to probe apiserver behavior) must decode gracefully.
+    #[test]
+    fn decode_pod_proto_handles_pod_with_no_containers() {
+        let obj_meta = encode_length_delimited(1, b"empty-pod");
+        let pod_proto = encode_length_delimited(1, &obj_meta);
+
+        let result = decode_pod_proto(&pod_proto).expect("must decode Pod with no spec");
+
+        assert_eq!(result["kind"], "Pod");
+        assert_eq!(result["metadata"]["name"], "empty-pod");
+        let containers = result["spec"]["containers"]
+            .as_array()
+            .expect("containers must be an empty array when Pod has no containers");
+        assert!(containers.is_empty(), "containers array must be empty");
     }
 
     // ---------------------------------------------------------------------------
