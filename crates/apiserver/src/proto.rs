@@ -403,6 +403,84 @@ struct CsiNode {
     spec: Option<CsiNodeSpec>,
 }
 
+// --- k8s.io/api/authorization/v1/generated.proto ---
+
+/// ResourceAttributes — describes a resource request in SubjectAccessReviewSpec.
+#[derive(Clone, PartialEq, Message)]
+struct ResourceAttributes {
+    /// namespace (field 1, string)
+    #[prost(string, tag = "1")]
+    namespace: String,
+    /// verb (field 2, string)
+    #[prost(string, tag = "2")]
+    verb: String,
+    /// group (field 3, string)
+    #[prost(string, tag = "3")]
+    group: String,
+    /// version (field 4, string)
+    #[prost(string, tag = "4")]
+    version: String,
+    /// resource (field 5, string)
+    #[prost(string, tag = "5")]
+    resource: String,
+    /// subresource (field 6, string)
+    #[prost(string, tag = "6")]
+    subresource: String,
+    /// name (field 7, string)
+    #[prost(string, tag = "7")]
+    name: String,
+}
+
+/// SubjectAccessReviewSpec — the input to a SubjectAccessReview.
+#[derive(Clone, PartialEq, Message)]
+struct SubjectAccessReviewSpec {
+    /// resourceAttributes (field 1, message ResourceAttributes)
+    #[prost(message, tag = "1")]
+    resource_attributes: Option<ResourceAttributes>,
+    // field 2 (NonResourceAttributes) — intentionally omitted
+    /// user (field 3, string)
+    #[prost(string, tag = "3")]
+    user: String,
+    /// groups (field 4, repeated string)
+    #[prost(string, repeated, tag = "4")]
+    groups: Vec<String>,
+}
+
+/// SubjectAccessReview — k8s.io/api/authorization/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct SubjectAccessReviewProto {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message SubjectAccessReviewSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<SubjectAccessReviewSpec>,
+    // status (field 3) — ignored on input
+}
+
+/// TokenReviewSpec — k8s.io/api/authentication/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct TokenReviewSpec {
+    /// token (field 1, string)
+    #[prost(string, tag = "1")]
+    token: String,
+    /// audiences (field 2, repeated string)
+    #[prost(string, repeated, tag = "2")]
+    audiences: Vec<String>,
+}
+
+/// TokenReview — k8s.io/api/authentication/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct TokenReviewProto {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message TokenReviewSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<TokenReviewSpec>,
+    // status (field 3) — ignored on input
+}
+
 // --- k8s.io/api/authentication/v1/generated.proto ---
 
 /// BoundObjectReference — used in TokenRequestSpec
@@ -1125,6 +1203,98 @@ pub fn decode_rolebinding_proto(data: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
+/// Decode a proto-encoded SubjectAccessReview object into a `serde_json::Value`.
+///
+/// The kubelet uses Webhook authorization mode (default in k8s 1.36 with --config), which
+/// calls back to /apis/authorization.k8s.io/v1/subjectaccessreviews with
+/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder, the raw proto
+/// bytes reach serde_json::from_slice and produce "expected value at line 1 column 1".
+/// The kubelet interprets the 400/500 failure as an authorization denial.
+pub fn decode_subject_access_review_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let sar = SubjectAccessReviewProto::decode(data).ok()?;
+    let spec = sar.spec.unwrap_or_default();
+
+    let mut spec_map = serde_json::Map::new();
+    if !spec.user.is_empty() {
+        spec_map.insert("user".to_string(), serde_json::Value::String(spec.user));
+    }
+    if !spec.groups.is_empty() {
+        spec_map.insert(
+            "groups".to_string(),
+            serde_json::Value::Array(
+                spec.groups
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(ra) = spec.resource_attributes {
+        let mut ra_map = serde_json::Map::new();
+        if !ra.namespace.is_empty() {
+            ra_map.insert(
+                "namespace".to_string(),
+                serde_json::Value::String(ra.namespace),
+            );
+        }
+        if !ra.verb.is_empty() {
+            ra_map.insert("verb".to_string(), serde_json::Value::String(ra.verb));
+        }
+        if !ra.group.is_empty() {
+            ra_map.insert("group".to_string(), serde_json::Value::String(ra.group));
+        }
+        if !ra.version.is_empty() {
+            ra_map.insert("version".to_string(), serde_json::Value::String(ra.version));
+        }
+        if !ra.resource.is_empty() {
+            ra_map.insert(
+                "resource".to_string(),
+                serde_json::Value::String(ra.resource),
+            );
+        }
+        if !ra.subresource.is_empty() {
+            ra_map.insert(
+                "subresource".to_string(),
+                serde_json::Value::String(ra.subresource),
+            );
+        }
+        if !ra.name.is_empty() {
+            ra_map.insert("name".to_string(), serde_json::Value::String(ra.name));
+        }
+        if !ra_map.is_empty() {
+            spec_map.insert(
+                "resourceAttributes".to_string(),
+                serde_json::Value::Object(ra_map),
+            );
+        }
+    }
+
+    Some(serde_json::json!({
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "SubjectAccessReview",
+        "spec": serde_json::Value::Object(spec_map)
+    }))
+}
+
+/// Decode a proto-encoded TokenReview object into a `serde_json::Value`.
+///
+/// The kubelet uses Webhook authentication mode, which calls back to
+/// /apis/authentication.k8s.io/v1/tokenreviews with Content-Type: application/vnd.kubernetes.protobuf.
+/// Without this decoder, the raw proto bytes reach serde_json::from_slice and produce
+/// "expected value at line 1 column 1", causing authentication failures.
+pub fn decode_token_review_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let tr = TokenReviewProto::decode(data).ok()?;
+    let spec = tr.spec.unwrap_or_default();
+
+    Some(serde_json::json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": {
+            "token": spec.token
+        }
+    }))
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -1142,6 +1312,8 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "ClusterRoleBinding" => decode_clusterrolebinding_proto(raw),
         "Role" => decode_role_proto(raw),
         "RoleBinding" => decode_rolebinding_proto(raw),
+        "SubjectAccessReview" => decode_subject_access_review_proto(raw),
+        "TokenReview" => decode_token_review_proto(raw),
         _ => None,
     }
 }
@@ -2607,6 +2779,173 @@ mod tests {
         assert_eq!(subjects[0]["apiGroup"], "rbac.authorization.k8s.io");
         assert_eq!(result["roleRef"]["kind"], "Role");
         assert_eq!(result["roleRef"]["name"], "pod-reader");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_subject_access_review_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_subject_access_review_proto must extract spec.user, spec.groups, and
+    /// spec.resourceAttributes from a synthetic protobuf payload.
+    ///
+    /// The kubelet uses Webhook authorization (default in k8s 1.36 --config) and sends
+    /// SubjectAccessReview with Content-Type: application/vnd.kubernetes.protobuf.
+    /// Without this decoder, the server returns 400/500, which the kubelet interprets as
+    /// an authorization denial — kubectl commands fail with InternalError.
+    #[test]
+    fn decode_subject_access_review_proto_extracts_all_fields() {
+        // Build ResourceAttributes: field 2=verb, field 5=resource
+        let mut resource_attrs = encode_length_delimited(2, b"get"); // verb
+        resource_attrs.extend_from_slice(&encode_length_delimited(5, b"pods")); // resource
+
+        // Build SubjectAccessReviewSpec:
+        //   field 1 = ResourceAttributes
+        //   field 3 = user (string)
+        //   field 4 = groups (repeated string)
+        let mut spec = encode_length_delimited(1, &resource_attrs);
+        spec.extend_from_slice(&encode_length_delimited(3, b"system:admin")); // user
+        spec.extend_from_slice(&encode_length_delimited(4, b"system:masters")); // groups[0]
+
+        // Build SubjectAccessReview: field 2 = spec
+        let sar_proto = encode_length_delimited(2, &spec);
+
+        let result = decode_subject_access_review_proto(&sar_proto)
+            .expect("must decode SubjectAccessReview proto — without this decoder, kubelet Webhook authz fails");
+
+        assert_eq!(result["apiVersion"], "authorization.k8s.io/v1");
+        assert_eq!(result["kind"], "SubjectAccessReview");
+        assert_eq!(
+            result["spec"]["user"], "system:admin",
+            "user must be extracted from spec field 3"
+        );
+        assert_eq!(
+            result["spec"]["groups"][0], "system:masters",
+            "groups must be extracted from spec field 4"
+        );
+        assert_eq!(
+            result["spec"]["resourceAttributes"]["verb"], "get",
+            "verb must be extracted from ResourceAttributes field 2"
+        );
+        assert_eq!(
+            result["spec"]["resourceAttributes"]["resource"], "pods",
+            "resource must be extracted from ResourceAttributes field 5"
+        );
+    }
+
+    /// decode_core_proto_by_kind must dispatch SubjectAccessReview proto and return a JSON
+    /// object that handlers/authorization.rs can parse with serde_json::from_slice.
+    ///
+    /// This is the dispatch-level regression: even if the inner decoder works,
+    /// the kind dispatch must also route "SubjectAccessReview" correctly.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_subject_access_review() {
+        // Build: SubjectAccessReview { spec: { resourceAttributes: { verb: "get", resource: "pods" },
+        //                                      user: "system:admin", groups: ["system:masters"] } }
+        let mut resource_attrs = encode_length_delimited(2, b"get"); // verb
+        resource_attrs.extend_from_slice(&encode_length_delimited(5, b"pods")); // resource
+
+        let mut spec = encode_length_delimited(1, &resource_attrs);
+        spec.extend_from_slice(&encode_length_delimited(3, b"system:admin")); // user
+        spec.extend_from_slice(&encode_length_delimited(4, b"system:masters")); // groups[0]
+
+        let sar_proto = encode_length_delimited(2, &spec);
+
+        let result = decode_core_proto_by_kind("SubjectAccessReview", &sar_proto)
+            .expect("SubjectAccessReview must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "SubjectAccessReview");
+        assert_eq!(result["spec"]["resourceAttributes"]["verb"], "get");
+        assert_eq!(result["spec"]["resourceAttributes"]["resource"], "pods");
+        assert_eq!(result["spec"]["user"], "system:admin");
+        assert_eq!(result["spec"]["groups"][0], "system:masters");
+    }
+
+    /// Full k8s proto envelope dispatch for SubjectAccessReview — simulates the kubelet
+    /// sending a proto-encoded SAR body. The envelope has TypeMeta kind="SubjectAccessReview"
+    /// and raw = the proto-encoded SubjectAccessReview body.
+    #[test]
+    fn full_sar_proto_envelope_dispatch() {
+        // Build inner proto payload
+        let mut resource_attrs = encode_length_delimited(2, b"get"); // verb
+        resource_attrs.extend_from_slice(&encode_length_delimited(5, b"pods")); // resource
+
+        let mut spec = encode_length_delimited(1, &resource_attrs);
+        spec.extend_from_slice(&encode_length_delimited(3, b"system:admin")); // user
+        spec.extend_from_slice(&encode_length_delimited(4, b"system:masters")); // groups[0]
+
+        let sar_proto = encode_length_delimited(2, &spec);
+
+        // Wrap in k8s Unknown envelope with TypeMeta kind="SubjectAccessReview"
+        let type_meta: Vec<u8> = {
+            let mut t = encode_length_delimited(1, b"authorization.k8s.io/v1"); // apiVersion
+            t.extend_from_slice(&encode_length_delimited(2, b"SubjectAccessReview")); // kind
+            t
+        };
+        let mut unknown = encode_length_delimited(1, &type_meta); // TypeMeta
+        unknown.extend_from_slice(&encode_length_delimited(2, &sar_proto)); // raw
+        unknown.extend_from_slice(&encode_length_delimited(
+            4,
+            b"application/vnd.kubernetes.protobuf",
+        )); // contentType
+
+        let mut body = K8S_PROTO_MAGIC.to_vec();
+        body.extend_from_slice(&unknown);
+
+        let env = decode_k8s_proto_envelope(&body).expect("envelope decode must succeed");
+        assert_eq!(env.kind, "SubjectAccessReview");
+        assert_eq!(env.content_type, "application/vnd.kubernetes.protobuf");
+
+        let json = decode_core_proto_by_kind(&env.kind, &env.raw)
+            .expect("SubjectAccessReview proto decode via dispatch must succeed");
+
+        assert_eq!(json["kind"], "SubjectAccessReview");
+        assert_eq!(json["spec"]["user"], "system:admin");
+        assert_eq!(json["spec"]["groups"][0], "system:masters");
+        assert_eq!(json["spec"]["resourceAttributes"]["verb"], "get");
+        assert_eq!(json["spec"]["resourceAttributes"]["resource"], "pods");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_token_review_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_token_review_proto must extract spec.token from a synthetic protobuf payload.
+    ///
+    /// The kubelet uses Webhook authentication mode and sends TokenReview with
+    /// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder, the server
+    /// returns 400/500, causing authentication failures for all kubelet requests.
+    #[test]
+    fn decode_token_review_proto_extracts_token() {
+        // Build TokenReviewSpec: field 1 = token (string)
+        let spec = encode_length_delimited(1, b"my-token");
+
+        // Build TokenReview: field 2 = spec
+        let tr_proto = encode_length_delimited(2, &spec);
+
+        let result = decode_token_review_proto(&tr_proto).expect(
+            "must decode TokenReview proto — without this decoder, kubelet Webhook authn fails",
+        );
+
+        assert_eq!(result["apiVersion"], "authentication.k8s.io/v1");
+        assert_eq!(result["kind"], "TokenReview");
+        assert_eq!(
+            result["spec"]["token"], "my-token",
+            "token must be extracted from spec field 1"
+        );
+    }
+
+    /// decode_core_proto_by_kind must dispatch TokenReview proto and return JSON that
+    /// handlers/authorization.rs token_review can parse with serde_json::from_slice.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_token_review() {
+        let spec = encode_length_delimited(1, b"my-token");
+        let tr_proto = encode_length_delimited(2, &spec);
+
+        let result = decode_core_proto_by_kind("TokenReview", &tr_proto)
+            .expect("TokenReview must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "TokenReview");
+        assert_eq!(result["spec"]["token"], "my-token");
     }
 
     // ---------------------------------------------------------------------------
