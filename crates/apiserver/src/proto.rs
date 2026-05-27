@@ -20,6 +20,12 @@ use prost::Message;
 
 const K8S_PROTO_MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
 
+/// Maximum size of the proto envelope payload (after stripping the 4-byte magic prefix).
+/// A varint bomb can claim a multi-GiB allocation with only a few bytes of actual payload;
+/// this cap prevents prost from attempting such an allocation. 16 MiB covers the largest
+/// legitimate kubectl requests (etcd's hard limit is ~1.5 MiB per value).
+const MAX_PROTO_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Prost-generated message types
 // All field numbers match the official k8s .proto definitions exactly.
@@ -1219,6 +1225,11 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
         return None;
     }
     let proto_bytes = &body[4..];
+    // Reject oversized envelopes before handing them to prost. A varint bomb can claim a
+    // multi-GiB allocation from a tiny payload; this check prevents the allocation entirely.
+    if proto_bytes.len() > MAX_PROTO_ENVELOPE_BYTES {
+        return None;
+    }
     let unknown = Unknown::decode(proto_bytes).ok()?;
     // raw field must be non-empty — we require a payload
     if unknown.raw.is_empty() {
@@ -2632,6 +2643,72 @@ mod tests {
         assert_eq!(result.raw, json);
         assert_eq!(result.content_type, "application/json");
         assert_eq!(result.kind, "Pod");
+    }
+
+    /// decode_k8s_proto_envelope must return None when the proto payload (after the 4-byte magic)
+    /// exceeds MAX_PROTO_ENVELOPE_BYTES, without attempting to decode it.
+    ///
+    /// Without this check, prost honors the embedded varint length field and attempts to allocate
+    /// the claimed size. A varint bomb (e.g. a length varint claiming 2 GiB) with a tiny actual
+    /// payload causes the server to OOM before any auth or business logic runs. The size check
+    /// must be done on the raw byte slice length, not on a decoded field value, so it fires
+    /// before any allocation.
+    #[test]
+    fn rejects_oversized_proto_envelope_before_decode() {
+        // Craft an oversized body: magic prefix + (MAX_PROTO_ENVELOPE_BYTES + 1) zero bytes.
+        // The bytes themselves are not a valid proto message, but that doesn't matter —
+        // the size check must fire before prost ever tries to decode them.
+        // If the check is absent, prost returns Err (invalid wire format) for all-zero bytes,
+        // but a real varint bomb with a valid length prefix would OOM first.
+        let mut body = K8S_PROTO_MAGIC.to_vec();
+        body.extend(std::iter::repeat(0u8).take(MAX_PROTO_ENVELOPE_BYTES + 1));
+        assert!(
+            decode_k8s_proto_envelope(&body).is_none(),
+            "proto envelope larger than MAX_PROTO_ENVELOPE_BYTES ({} bytes) must be rejected \
+             without decoding — varint bombs can cause OOM if prost attempts the claimed allocation",
+            MAX_PROTO_ENVELOPE_BYTES
+        );
+    }
+
+    /// decode_k8s_proto_envelope must not reject a payload that is exactly at the limit.
+    ///
+    /// Ensures the size check is `> MAX` (strictly greater than), not `>= MAX`, so legitimate
+    /// payloads right at the boundary are not incorrectly rejected.
+    #[test]
+    fn accepts_proto_envelope_at_exact_size_limit() {
+        // Build an Unknown envelope (field 2 = raw payload) whose total encoded byte length
+        // equals exactly MAX_PROTO_ENVELOPE_BYTES so that `proto_bytes.len() == MAX` passes
+        // the `> MAX` check.
+        //
+        // Encoding of a length-delimited field:
+        //   tag byte (1 byte: field_number=2, wire_type=2 → 0x12)
+        //   + varint(payload_len)
+        //   + payload bytes
+        //
+        // For payload_len near 16 MiB (= 2^24 bytes), the varint encoding requires 4 bytes
+        // (values up to 2^28 - 1 fit in 4 varint bytes since each byte carries 7 bits).
+        // So: 1 (tag) + 4 (varint) + payload_len = MAX_PROTO_ENVELOPE_BYTES
+        //     payload_len = MAX_PROTO_ENVELOPE_BYTES - 5
+        let payload_len = MAX_PROTO_ENVELOPE_BYTES - 5;
+        let raw_payload: Vec<u8> = vec![b'x'; payload_len];
+        let field2 = encode_length_delimited(2, &raw_payload);
+        assert_eq!(
+            field2.len(),
+            MAX_PROTO_ENVELOPE_BYTES,
+            "test setup: encoded field must be exactly MAX_PROTO_ENVELOPE_BYTES bytes"
+        );
+
+        let mut body = K8S_PROTO_MAGIC.to_vec();
+        body.extend_from_slice(&field2);
+        // The size check is `proto_bytes.len() > MAX_PROTO_ENVELOPE_BYTES`; at exactly MAX
+        // this must not fire. The raw payload is all 'x' bytes, which prost accepts for a
+        // `bytes` field, so decode_k8s_proto_envelope returns Some.
+        let result = decode_k8s_proto_envelope(&body);
+        assert!(
+            result.is_some(),
+            "a proto envelope of exactly MAX_PROTO_ENVELOPE_BYTES must not be rejected — \
+             the size guard must use strictly-greater-than to avoid an off-by-one rejection"
+        );
     }
 
     /// decode_varint must round-trip a single-byte value.
