@@ -236,8 +236,7 @@ pub async fn create_resource<S: Store>(
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body)
-        .map_err(Status::bad_request)?;
+    super::defaults::validate_resource(&group, &plural, &obj.body).map_err(Status::bad_request)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -322,8 +321,7 @@ pub async fn replace_resource<S: Store>(
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body)
-        .map_err(Status::bad_request)?;
+    super::defaults::validate_resource(&group, &plural, &obj.body).map_err(Status::bad_request)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -897,8 +895,7 @@ pub async fn create_namespaced_resource<S: Store>(
     }
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body)
-        .map_err(Status::bad_request)?;
+    super::defaults::validate_resource(&group, &plural, &obj.body).map_err(Status::bad_request)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -985,8 +982,7 @@ pub async fn replace_namespaced_resource<S: Store>(
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body)
-        .map_err(Status::bad_request)?;
+    super::defaults::validate_resource(&group, &plural, &obj.body).map_err(Status::bad_request)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
