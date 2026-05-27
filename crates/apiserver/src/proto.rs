@@ -174,6 +174,65 @@ struct PodTemplate {
     // for routing/storage. The template is preserved as an empty object in the output JSON.
 }
 
+/// Container — minimal decode: name (field 1) and image (field 2).
+/// All other Container fields are ignored (ports, env, volumeMounts, probes, etc.)
+/// because we only need name+image to produce a valid stored Pod JSON.
+#[derive(Clone, PartialEq, Message)]
+struct Container {
+    /// name (field 1, string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// image (field 2, string)
+    #[prost(string, tag = "2")]
+    image: String,
+    /// command (field 3, repeated string)
+    #[prost(string, repeated, tag = "3")]
+    command: Vec<String>,
+    /// args (field 4, repeated string)
+    #[prost(string, repeated, tag = "4")]
+    args: Vec<String>,
+    /// imagePullPolicy (field 15, string)
+    #[prost(string, tag = "15")]
+    image_pull_policy: String,
+    /// terminationMessagePath (field 14, string)
+    #[prost(string, tag = "14")]
+    termination_message_path: String,
+    /// terminationMessagePolicy (field 21, string)
+    #[prost(string, tag = "21")]
+    termination_message_policy: String,
+}
+
+/// PodSpec — only containers (field 3) is decoded; other fields are ignored.
+#[derive(Clone, PartialEq, Message)]
+struct PodSpec {
+    /// containers (field 3, repeated Container)
+    #[prost(message, repeated, tag = "3")]
+    containers: Vec<Container>,
+    /// restartPolicy (field 4, string)
+    #[prost(string, tag = "4")]
+    restart_policy: String,
+    /// serviceAccountName (field 9, string)
+    #[prost(string, tag = "9")]
+    service_account_name: String,
+    /// nodeName (field 11, string)
+    #[prost(string, tag = "11")]
+    node_name: String,
+}
+
+/// Pod — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Pod {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message PodSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<PodSpec>,
+    /// status (field 3, bytes) — not decoded on input
+    #[prost(bytes = "vec", tag = "3")]
+    status: Vec<u8>,
+}
+
 /// ConfigMap — k8s.io/api/core/v1/generated.proto
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMap {
@@ -189,6 +248,163 @@ struct ConfigMap {
     /// immutable (field 4, bool)
     #[prost(bool, tag = "4")]
     immutable: bool,
+}
+
+/// ServicePort — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct ServicePort {
+    /// name (field 1, string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// protocol (field 2, string)
+    #[prost(string, tag = "2")]
+    protocol: String,
+    /// port (field 3, int32)
+    #[prost(int32, tag = "3")]
+    port: i32,
+    /// targetPort (field 4, IntOrString) — decoded as raw bytes (union type)
+    #[prost(bytes = "vec", tag = "4")]
+    target_port: Vec<u8>,
+    /// nodePort (field 5, int32)
+    #[prost(int32, tag = "5")]
+    node_port: i32,
+    /// appProtocol (field 6, string)
+    #[prost(string, tag = "6")]
+    app_protocol: String,
+}
+
+/// ServiceSpec — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct ServiceSpec {
+    /// ports (field 1, repeated ServicePort)
+    #[prost(message, repeated, tag = "1")]
+    ports: Vec<ServicePort>,
+    /// selector (field 2, map<string,string>)
+    #[prost(map = "string, string", tag = "2")]
+    selector: std::collections::HashMap<String, String>,
+    /// clusterIP (field 3, string)
+    #[prost(string, tag = "3")]
+    cluster_ip: String,
+    /// type (field 4, string)
+    #[prost(string, tag = "4")]
+    r#type: String,
+    /// externalIPs (field 5, repeated string)
+    #[prost(string, repeated, tag = "5")]
+    external_ips: Vec<String>,
+    /// sessionAffinity (field 7, string)
+    #[prost(string, tag = "7")]
+    session_affinity: String,
+    /// externalName (field 10, string)
+    #[prost(string, tag = "10")]
+    external_name: String,
+    /// externalTrafficPolicy (field 11, string)
+    #[prost(string, tag = "11")]
+    external_traffic_policy: String,
+    /// ipFamilyPolicy (field 21, string)
+    #[prost(string, tag = "21")]
+    ip_family_policy: String,
+    /// internalTrafficPolicy (field 24, string)
+    #[prost(string, tag = "24")]
+    internal_traffic_policy: String,
+}
+
+/// Service — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Service {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message ServiceSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<ServiceSpec>,
+    /// status (field 3, bytes) — not decoded on input
+    #[prost(bytes = "vec", tag = "3")]
+    status: Vec<u8>,
+}
+
+/// Secret — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Secret {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// data (field 2, map<string,bytes>)
+    #[prost(map = "string, bytes", tag = "2")]
+    data: std::collections::HashMap<String, Vec<u8>>,
+    /// stringData (field 3, map<string,string>)
+    #[prost(map = "string, string", tag = "3")]
+    string_data: std::collections::HashMap<String, String>,
+    /// type (field 4, string)
+    #[prost(string, tag = "4")]
+    r#type: String,
+    /// immutable (field 5, bool)
+    #[prost(bool, tag = "5")]
+    immutable: bool,
+}
+
+/// ReplicationControllerSpec — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct ReplicationControllerSpec {
+    /// replicas (field 1, int32)
+    #[prost(int32, tag = "1")]
+    replicas: i32,
+    /// selector (field 2, map<string,string>)
+    #[prost(map = "string, string", tag = "2")]
+    selector: std::collections::HashMap<String, String>,
+    /// template (field 3, PodTemplateSpec) — decoded as raw bytes
+    #[prost(bytes = "vec", tag = "3")]
+    template: Vec<u8>,
+}
+
+/// ReplicationController — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct ReplicationController {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message ReplicationControllerSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<ReplicationControllerSpec>,
+    /// status (field 3, bytes) — not decoded on input
+    #[prost(bytes = "vec", tag = "3")]
+    status: Vec<u8>,
+}
+
+/// PersistentVolumeSpec — k8s.io/api/core/v1/generated.proto (key fields only)
+#[derive(Clone, PartialEq, Message)]
+struct PersistentVolumeSpec {
+    /// capacity (field 1, map<string,Quantity>) — decoded as raw bytes (Quantity is complex)
+    #[prost(bytes = "vec", tag = "1")]
+    capacity: Vec<u8>,
+    /// accessModes (field 6, repeated string)
+    #[prost(string, repeated, tag = "6")]
+    access_modes: Vec<String>,
+    /// claimRef (field 33, message ObjectReference) — decoded as raw bytes
+    #[prost(bytes = "vec", tag = "33")]
+    claim_ref: Vec<u8>,
+    /// persistentVolumeReclaimPolicy (field 26, string)
+    #[prost(string, tag = "26")]
+    persistent_volume_reclaim_policy: String,
+    /// storageClassName (field 29, string)
+    #[prost(string, tag = "29")]
+    storage_class_name: String,
+    /// volumeMode (field 31, string)
+    #[prost(string, tag = "31")]
+    volume_mode: String,
+}
+
+/// PersistentVolume — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct PersistentVolume {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message PersistentVolumeSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<PersistentVolumeSpec>,
+    /// status (field 3, bytes) — not decoded on input
+    #[prost(bytes = "vec", tag = "3")]
+    status: Vec<u8>,
 }
 
 /// NodeSpec — k8s.io/api/core/v1/generated.proto
@@ -401,6 +617,64 @@ struct CsiNode {
     /// spec (field 2, message CSINodeSpec)
     #[prost(message, tag = "2")]
     spec: Option<CsiNodeSpec>,
+}
+
+/// VolumeAttachmentSource — k8s.io/api/storage/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct VolumeAttachmentSource {
+    /// persistentVolumeName (field 1, string)
+    #[prost(string, tag = "1")]
+    persistent_volume_name: String,
+    /// inlineVolumeSpec (field 2, bytes) — complex, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "2")]
+    inline_volume_spec: Vec<u8>,
+}
+
+/// VolumeAttachmentSpec — k8s.io/api/storage/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct VolumeAttachmentSpec {
+    /// attacher (field 1, string)
+    #[prost(string, tag = "1")]
+    attacher: String,
+    /// source (field 2, message VolumeAttachmentSource)
+    #[prost(message, tag = "2")]
+    source: Option<VolumeAttachmentSource>,
+    /// nodeName (field 3, string)
+    #[prost(string, tag = "3")]
+    node_name: String,
+}
+
+/// VolumeAttachment — k8s.io/api/storage/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct VolumeAttachment {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message VolumeAttachmentSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<VolumeAttachmentSpec>,
+    /// status (field 3, bytes) — not decoded on input
+    #[prost(bytes = "vec", tag = "3")]
+    status: Vec<u8>,
+}
+
+// --- k8s.io/api/node/v1/generated.proto ---
+
+/// RuntimeClass — k8s.io/api/node/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct RuntimeClass {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// handler (field 2, string)
+    #[prost(string, tag = "2")]
+    handler: String,
+    /// overhead (field 3, bytes) — complex message, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "3")]
+    overhead: Vec<u8>,
+    /// scheduling (field 4, bytes) — complex message, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "4")]
+    scheduling: Vec<u8>,
 }
 
 // --- k8s.io/api/authorization/v1/generated.proto ---
@@ -673,12 +947,30 @@ struct JobSpec {
     /// manualSelector (field 7, bool)
     #[prost(bool, tag = "7")]
     manual_selector: bool,
-    /// completionMode (field 8, string)
+    /// completionMode (field 8, string) — "NonIndexed" or "Indexed"
     #[prost(string, tag = "8")]
     completion_mode: String,
     /// suspend (field 9, bool)
     #[prost(bool, tag = "9")]
     suspend: bool,
+    /// podReplacementPolicy (field 10, string) — added k8s 1.28
+    #[prost(string, tag = "10")]
+    pod_replacement_policy: String,
+    /// podFailurePolicy (field 11, bytes) — complex message, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "11")]
+    pod_failure_policy: Vec<u8>,
+    /// successPolicy (field 12, bytes) — complex message, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "12")]
+    success_policy: Vec<u8>,
+    /// backoffLimitPerIndex (field 13, int32) — added k8s 1.28
+    #[prost(int32, tag = "13")]
+    backoff_limit_per_index: i32,
+    /// maxFailedIndexes (field 14, int32) — added k8s 1.28
+    #[prost(int32, tag = "14")]
+    max_failed_indexes: i32,
+    /// managedBy (field 15, string) — added k8s 1.30
+    #[prost(string, tag = "15")]
+    managed_by: String,
 }
 
 /// JobTemplateSpec — field 1=ObjectMeta, field 2=JobSpec
@@ -927,6 +1219,102 @@ pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
+/// Decode a proto-encoded Pod object into a `serde_json::Value`.
+///
+/// Decodes metadata and spec.containers (name + image). All other PodSpec fields are omitted
+/// because PodSpec is deeply nested — the goal is to produce a valid JSON object that passes
+/// Object::from_bytes validation and can be stored, so CREATE returns 201 instead of 400.
+pub fn decode_pod_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let pod = Pod::decode(data).ok()?;
+    let meta = object_meta_to_json(pod.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": meta
+    });
+
+    let spec = pod.spec.unwrap_or_default();
+    let containers: Vec<serde_json::Value> = spec
+        .containers
+        .into_iter()
+        .map(|c| {
+            let mut cm = serde_json::Map::new();
+            if !c.name.is_empty() {
+                cm.insert("name".to_string(), serde_json::Value::String(c.name));
+            }
+            if !c.image.is_empty() {
+                cm.insert("image".to_string(), serde_json::Value::String(c.image));
+            }
+            if !c.image_pull_policy.is_empty() {
+                cm.insert(
+                    "imagePullPolicy".to_string(),
+                    serde_json::Value::String(c.image_pull_policy),
+                );
+            }
+            if !c.termination_message_path.is_empty() {
+                cm.insert(
+                    "terminationMessagePath".to_string(),
+                    serde_json::Value::String(c.termination_message_path),
+                );
+            }
+            if !c.termination_message_policy.is_empty() {
+                cm.insert(
+                    "terminationMessagePolicy".to_string(),
+                    serde_json::Value::String(c.termination_message_policy),
+                );
+            }
+            if !c.command.is_empty() {
+                cm.insert(
+                    "command".to_string(),
+                    serde_json::Value::Array(
+                        c.command
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+            if !c.args.is_empty() {
+                cm.insert(
+                    "args".to_string(),
+                    serde_json::Value::Array(
+                        c.args.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+            serde_json::Value::Object(cm)
+        })
+        .collect();
+
+    let mut spec_map = serde_json::Map::new();
+    spec_map.insert(
+        "containers".to_string(),
+        serde_json::Value::Array(containers),
+    );
+    if !spec.restart_policy.is_empty() {
+        spec_map.insert(
+            "restartPolicy".to_string(),
+            serde_json::Value::String(spec.restart_policy),
+        );
+    }
+    if !spec.service_account_name.is_empty() {
+        spec_map.insert(
+            "serviceAccountName".to_string(),
+            serde_json::Value::String(spec.service_account_name),
+        );
+    }
+    if !spec.node_name.is_empty() {
+        spec_map.insert(
+            "nodeName".to_string(),
+            serde_json::Value::String(spec.node_name),
+        );
+    }
+    obj["spec"] = serde_json::Value::Object(spec_map);
+
+    Some(obj)
+}
+
 /// Decode a proto-encoded PodTemplate object into a `serde_json::Value`.
 ///
 /// Only metadata is decoded; the template field (PodTemplateSpec) is omitted from the output
@@ -941,6 +1329,314 @@ pub fn decode_podtemplate_proto(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta,
         "template": {}
     }))
+}
+
+/// Decode a proto-encoded Service object into a `serde_json::Value`.
+pub fn decode_service_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let svc = Service::decode(data).ok()?;
+    let meta = object_meta_to_json(svc.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": meta
+    });
+
+    if let Some(spec) = svc.spec {
+        let mut spec_map = serde_json::Map::new();
+
+        if !spec.cluster_ip.is_empty() {
+            spec_map.insert(
+                "clusterIP".to_string(),
+                serde_json::Value::String(spec.cluster_ip),
+            );
+        }
+        if !spec.r#type.is_empty() {
+            spec_map.insert("type".to_string(), serde_json::Value::String(spec.r#type));
+        }
+        if !spec.session_affinity.is_empty() {
+            spec_map.insert(
+                "sessionAffinity".to_string(),
+                serde_json::Value::String(spec.session_affinity),
+            );
+        }
+        if !spec.external_name.is_empty() {
+            spec_map.insert(
+                "externalName".to_string(),
+                serde_json::Value::String(spec.external_name),
+            );
+        }
+        if !spec.external_traffic_policy.is_empty() {
+            spec_map.insert(
+                "externalTrafficPolicy".to_string(),
+                serde_json::Value::String(spec.external_traffic_policy),
+            );
+        }
+        if !spec.ip_family_policy.is_empty() {
+            spec_map.insert(
+                "ipFamilyPolicy".to_string(),
+                serde_json::Value::String(spec.ip_family_policy),
+            );
+        }
+        if !spec.internal_traffic_policy.is_empty() {
+            spec_map.insert(
+                "internalTrafficPolicy".to_string(),
+                serde_json::Value::String(spec.internal_traffic_policy),
+            );
+        }
+        if !spec.selector.is_empty() {
+            let sel: serde_json::Map<String, serde_json::Value> = spec
+                .selector
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            spec_map.insert("selector".to_string(), serde_json::Value::Object(sel));
+        }
+        if !spec.external_ips.is_empty() {
+            spec_map.insert(
+                "externalIPs".to_string(),
+                serde_json::Value::Array(
+                    spec.external_ips
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        let ports: Vec<serde_json::Value> = spec
+            .ports
+            .into_iter()
+            .map(|p| {
+                let mut pm = serde_json::Map::new();
+                if !p.name.is_empty() {
+                    pm.insert("name".to_string(), serde_json::Value::String(p.name));
+                }
+                if !p.protocol.is_empty() {
+                    pm.insert(
+                        "protocol".to_string(),
+                        serde_json::Value::String(p.protocol),
+                    );
+                }
+                if p.port != 0 {
+                    pm.insert(
+                        "port".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(p.port)),
+                    );
+                }
+                if p.node_port != 0 {
+                    pm.insert(
+                        "nodePort".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(p.node_port)),
+                    );
+                }
+                if !p.app_protocol.is_empty() {
+                    pm.insert(
+                        "appProtocol".to_string(),
+                        serde_json::Value::String(p.app_protocol),
+                    );
+                }
+                serde_json::Value::Object(pm)
+            })
+            .collect();
+        if !ports.is_empty() {
+            spec_map.insert("ports".to_string(), serde_json::Value::Array(ports));
+        }
+
+        obj["spec"] = serde_json::Value::Object(spec_map);
+    }
+
+    Some(obj)
+}
+
+/// Decode a proto-encoded Secret object into a `serde_json::Value`.
+pub fn decode_secret_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let secret = Secret::decode(data).ok()?;
+    let meta = object_meta_to_json(secret.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": meta
+    });
+
+    if !secret.r#type.is_empty() {
+        obj["type"] = serde_json::Value::String(secret.r#type);
+    }
+    if !secret.data.is_empty() {
+        let data_map: serde_json::Map<String, serde_json::Value> = secret
+            .data
+            .into_iter()
+            .map(|(k, v)| {
+                use base64::Engine;
+                (
+                    k,
+                    serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&v)),
+                )
+            })
+            .collect();
+        obj["data"] = serde_json::Value::Object(data_map);
+    }
+    if !secret.string_data.is_empty() {
+        let sd_map: serde_json::Map<String, serde_json::Value> = secret
+            .string_data
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        obj["stringData"] = serde_json::Value::Object(sd_map);
+    }
+
+    Some(obj)
+}
+
+/// Decode a proto-encoded ReplicationController object into a `serde_json::Value`.
+pub fn decode_replicationcontroller_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let rc = ReplicationController::decode(data).ok()?;
+    let meta = object_meta_to_json(rc.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ReplicationController",
+        "metadata": meta
+    });
+
+    if let Some(spec) = rc.spec {
+        let mut spec_map = serde_json::Map::new();
+        if spec.replicas != 0 {
+            spec_map.insert(
+                "replicas".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(spec.replicas)),
+            );
+        }
+        if !spec.selector.is_empty() {
+            let sel: serde_json::Map<String, serde_json::Value> = spec
+                .selector
+                .into_iter()
+                .map(|(k, v)| (k, serde_json::Value::String(v)))
+                .collect();
+            spec_map.insert("selector".to_string(), serde_json::Value::Object(sel));
+        }
+        spec_map.insert(
+            "template".to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+        obj["spec"] = serde_json::Value::Object(spec_map);
+    }
+
+    Some(obj)
+}
+
+/// Decode a proto-encoded RuntimeClass object into a `serde_json::Value`.
+pub fn decode_runtimeclass_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let rc = RuntimeClass::decode(data).ok()?;
+    let meta = object_meta_to_json(rc.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "node.k8s.io/v1",
+        "kind": "RuntimeClass",
+        "metadata": meta,
+        "handler": rc.handler
+    });
+
+    if obj["handler"]
+        .as_str()
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
+        obj["handler"] = serde_json::Value::String(String::new());
+    }
+
+    Some(obj)
+}
+
+/// Decode a proto-encoded PersistentVolume object into a `serde_json::Value`.
+pub fn decode_persistentvolume_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let pv = PersistentVolume::decode(data).ok()?;
+    let meta = object_meta_to_json(pv.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": meta
+    });
+
+    if let Some(spec) = pv.spec {
+        let mut spec_map = serde_json::Map::new();
+        if !spec.access_modes.is_empty() {
+            spec_map.insert(
+                "accessModes".to_string(),
+                serde_json::Value::Array(
+                    spec.access_modes
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !spec.persistent_volume_reclaim_policy.is_empty() {
+            spec_map.insert(
+                "persistentVolumeReclaimPolicy".to_string(),
+                serde_json::Value::String(spec.persistent_volume_reclaim_policy),
+            );
+        }
+        if !spec.storage_class_name.is_empty() {
+            spec_map.insert(
+                "storageClassName".to_string(),
+                serde_json::Value::String(spec.storage_class_name),
+            );
+        }
+        if !spec.volume_mode.is_empty() {
+            spec_map.insert(
+                "volumeMode".to_string(),
+                serde_json::Value::String(spec.volume_mode),
+            );
+        }
+        if !spec_map.is_empty() {
+            obj["spec"] = serde_json::Value::Object(spec_map);
+        }
+    }
+
+    Some(obj)
+}
+
+/// Decode a proto-encoded VolumeAttachment object into a `serde_json::Value`.
+pub fn decode_volumeattachment_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let va = VolumeAttachment::decode(data).ok()?;
+    let meta = object_meta_to_json(va.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "VolumeAttachment",
+        "metadata": meta
+    });
+
+    if let Some(spec) = va.spec {
+        let mut spec_map = serde_json::Map::new();
+        if !spec.attacher.is_empty() {
+            spec_map.insert(
+                "attacher".to_string(),
+                serde_json::Value::String(spec.attacher),
+            );
+        }
+        if !spec.node_name.is_empty() {
+            spec_map.insert(
+                "nodeName".to_string(),
+                serde_json::Value::String(spec.node_name),
+            );
+        }
+        let mut source_map = serde_json::Map::new();
+        if let Some(src) = spec.source {
+            if !src.persistent_volume_name.is_empty() {
+                source_map.insert(
+                    "persistentVolumeName".to_string(),
+                    serde_json::Value::String(src.persistent_volume_name),
+                );
+            }
+        }
+        spec_map.insert("source".to_string(), serde_json::Value::Object(source_map));
+        obj["spec"] = serde_json::Value::Object(spec_map);
+    }
+
+    Some(obj)
 }
 
 /// Decode a proto-encoded Node object into a `serde_json::Value`.
@@ -1437,6 +2133,30 @@ fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
     if spec.suspend {
         m.insert("suspend".to_string(), serde_json::Value::Bool(true));
     }
+    if !spec.pod_replacement_policy.is_empty() {
+        m.insert(
+            "podReplacementPolicy".to_string(),
+            serde_json::Value::String(spec.pod_replacement_policy),
+        );
+    }
+    if spec.backoff_limit_per_index != 0 {
+        m.insert(
+            "backoffLimitPerIndex".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.backoff_limit_per_index)),
+        );
+    }
+    if spec.max_failed_indexes != 0 {
+        m.insert(
+            "maxFailedIndexes".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.max_failed_indexes)),
+        );
+    }
+    if !spec.managed_by.is_empty() {
+        m.insert(
+            "managedBy".to_string(),
+            serde_json::Value::String(spec.managed_by),
+        );
+    }
     // template is always present as an empty object — required by the k8s schema
     m.insert(
         "template".to_string(),
@@ -1550,8 +2270,13 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
     match kind {
         "Namespace" => decode_namespace_proto(raw),
         "ConfigMap" => decode_configmap_proto(raw),
+        "Pod" => decode_pod_proto(raw),
         "PodTemplate" => decode_podtemplate_proto(raw),
         "Node" => decode_node_proto(raw),
+        "Service" => decode_service_proto(raw),
+        "Secret" => decode_secret_proto(raw),
+        "ReplicationController" => decode_replicationcontroller_proto(raw),
+        "PersistentVolume" => decode_persistentvolume_proto(raw),
         "Lease" => decode_lease_proto(raw),
         "CSINode" => decode_csinode_proto(raw),
         "Event" => decode_event_proto(raw),
@@ -1563,6 +2288,8 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "TokenReview" => decode_token_review_proto(raw),
         "CronJob" => decode_cronjob_proto(raw),
         "Job" => decode_job_proto(raw),
+        "RuntimeClass" => decode_runtimeclass_proto(raw),
+        "VolumeAttachment" => decode_volumeattachment_proto(raw),
         _ => None,
     }
 }
@@ -1926,7 +2653,7 @@ mod tests {
         assert_eq!(cm_json["metadata"]["name"], "test-cm");
 
         // Unknown kind returns None
-        assert!(decode_core_proto_by_kind("Pod", &namespace_proto).is_none());
+        assert!(decode_core_proto_by_kind("Deployment", &namespace_proto).is_none());
     }
 
     // ---------------------------------------------------------------------------
@@ -1971,6 +2698,115 @@ mod tests {
             result["template"].is_object(),
             "template must be an empty object (not missing), required by the k8s schema"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_pod_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_pod_proto must extract metadata and spec.containers from a proto-encoded Pod.
+    ///
+    /// The e2e conformance tests create Pods via proto (expansion.go:269, and many others).
+    /// Without this decoder, decode_core_proto_by_kind returns None for "Pod", extract_body
+    /// returns raw proto bytes, Object::from_bytes fails with "invalid JSON", and the apiserver
+    /// returns 400 — causing every Pod-creating conformance test to fail immediately.
+    #[test]
+    fn decode_pod_proto_extracts_name_namespace_and_containers() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "test-pod", namespace: "default" },
+        //   spec: PodSpec {
+        //     containers: [Container { name: "myapp", image: "myapp:latest",
+        //                             imagePullPolicy: "IfNotPresent" }]
+        //   }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"test-pod"); // ObjectMeta.name
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
+
+        // Container: field 1=name, field 2=image, field 15=imagePullPolicy
+        let mut container = encode_length_delimited(1, b"myapp"); // name
+        container.extend_from_slice(&encode_length_delimited(2, b"myapp:latest")); // image
+        container.extend_from_slice(&encode_length_delimited(15, b"IfNotPresent")); // imagePullPolicy
+
+        // PodSpec: field 3 = repeated Container
+        let pod_spec = encode_length_delimited(3, &container);
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta); // Pod.field 1 = ObjectMeta
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec)); // Pod.field 2 = PodSpec
+
+        let result = decode_pod_proto(&pod_proto).expect(
+            "decode_pod_proto must return Some — without this decoder, Pod creation via proto \
+                     returns 400 'invalid JSON' and all container-related conformance tests fail",
+        );
+
+        assert_eq!(result["kind"], "Pod");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(
+            result["metadata"]["name"], "test-pod",
+            "name must be extracted so the object is stored under the correct key"
+        );
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert!(result["metadata"]["creationTimestamp"].is_null());
+
+        let containers = result["spec"]["containers"]
+            .as_array()
+            .expect("spec.containers must be an array");
+        assert_eq!(containers.len(), 1, "one container must be decoded");
+        assert_eq!(
+            containers[0]["name"], "myapp",
+            "container name must be extracted"
+        );
+        assert_eq!(
+            containers[0]["image"], "myapp:latest",
+            "container image must be extracted"
+        );
+        assert_eq!(containers[0]["imagePullPolicy"], "IfNotPresent");
+    }
+
+    /// decode_core_proto_by_kind must dispatch Pod proto and return a valid JSON object.
+    ///
+    /// This is the dispatch-level regression: even if the inner decoder works, the kind
+    /// dispatch must route "Pod" correctly so extract_body can convert proto bodies to JSON.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_pod() {
+        // Build: Pod { metadata: ObjectMeta { name: "dispatch-pod", namespace: "test" },
+        //              spec: PodSpec { containers: [Container { name: "c", image: "img" }] } }
+        let mut obj_meta = encode_length_delimited(1, b"dispatch-pod");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"test"));
+
+        let mut container = encode_length_delimited(1, b"c");
+        container.extend_from_slice(&encode_length_delimited(2, b"img"));
+
+        let pod_spec = encode_length_delimited(3, &container);
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_core_proto_by_kind("Pod", &pod_proto)
+            .expect("Pod must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "Pod");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "dispatch-pod");
+        assert_eq!(result["metadata"]["namespace"], "test");
+        assert_eq!(result["spec"]["containers"][0]["name"], "c");
+        assert_eq!(result["spec"]["containers"][0]["image"], "img");
+    }
+
+    /// decode_pod_proto must not panic when the Pod has no spec or containers.
+    /// Empty Pod objects (used in tests to probe apiserver behavior) must decode gracefully.
+    #[test]
+    fn decode_pod_proto_handles_pod_with_no_containers() {
+        let obj_meta = encode_length_delimited(1, b"empty-pod");
+        let pod_proto = encode_length_delimited(1, &obj_meta);
+
+        let result = decode_pod_proto(&pod_proto).expect("must decode Pod with no spec");
+
+        assert_eq!(result["kind"], "Pod");
+        assert_eq!(result["metadata"]["name"], "empty-pod");
+        let containers = result["spec"]["containers"]
+            .as_array()
+            .expect("containers must be an empty array when Pod has no containers");
+        assert!(containers.is_empty(), "containers array must be empty");
     }
 
     // ---------------------------------------------------------------------------
@@ -3416,5 +4252,379 @@ mod tests {
     #[test]
     fn decode_job_proto_returns_none_for_garbage() {
         assert!(decode_job_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    /// decode_job_proto must handle an indexed Job with completionMode=Indexed,
+    /// backoffLimitPerIndex, maxFailedIndexes, and a podFailurePolicy message.
+    ///
+    /// The e2e conformance tests create Jobs with these fields (job.go:621, :658, :753).
+    /// Without handling these fields, the prost decode fails and decode_job_proto returns None,
+    /// causing 400 "invalid JSON" responses for all indexed Job creation requests.
+    #[test]
+    fn decode_job_proto_handles_indexed_job_with_failure_policy() {
+        use prost::Message as _;
+
+        let job = Job {
+            metadata: Some(ObjectMeta {
+                name: "indexed-job".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(JobSpec {
+                completions: 5,
+                parallelism: 2,
+                backoff_limit: 6,
+                completion_mode: "Indexed".to_string(),
+                backoff_limit_per_index: 1,
+                max_failed_indexes: 3,
+                pod_failure_policy: vec![0x0a, 0x04, 0x08, 0x01, 0x10, 0x01],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_job_proto(&buf).expect(
+            "decode_job_proto must return Some for indexed Job — conformance tests at job.go:621,:658,:753 \
+             create Jobs with completionMode=Indexed, backoffLimitPerIndex, and podFailurePolicy; \
+             returning None causes 400 'invalid JSON' responses"
+        );
+
+        assert_eq!(result["kind"], "Job");
+        assert_eq!(result["apiVersion"], "batch/v1");
+        assert_eq!(result["metadata"]["name"], "indexed-job");
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert_eq!(
+            result["spec"]["completionMode"], "Indexed",
+            "completionMode must be extracted for indexed jobs"
+        );
+        assert_eq!(result["spec"]["completions"], 5);
+        assert_eq!(result["spec"]["parallelism"], 2);
+        assert_eq!(
+            result["spec"]["backoffLimitPerIndex"], 1,
+            "backoffLimitPerIndex must be present in output for k8s client compatibility"
+        );
+        assert_eq!(result["spec"]["maxFailedIndexes"], 3);
+        assert!(
+            result["spec"]["template"].is_object(),
+            "spec.template must always be present as empty object (required by k8s schema)"
+        );
+    }
+
+    /// decode_job_proto must handle a Job with successPolicy — conformance test job.go:502 and
+    /// job.go:582 create Jobs with successPolicy (k8s 1.30+ field at proto field 12).
+    #[test]
+    fn decode_job_proto_handles_job_with_success_policy() {
+        use prost::Message as _;
+
+        let job = Job {
+            metadata: Some(ObjectMeta {
+                name: "success-policy-job".to_string(),
+                namespace: "test-ns".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(JobSpec {
+                completions: 3,
+                completion_mode: "Indexed".to_string(),
+                success_policy: vec![0x0a, 0x02, 0x08, 0x02],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_job_proto(&buf).expect(
+            "decode_job_proto must return Some for Job with successPolicy — conformance tests at \
+             job.go:502 and job.go:582 fail with 400 'invalid JSON' when this field is present",
+        );
+
+        assert_eq!(result["kind"], "Job");
+        assert_eq!(result["metadata"]["name"], "success-policy-job");
+        assert_eq!(result["spec"]["completionMode"], "Indexed");
+        assert_eq!(result["spec"]["completions"], 3);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_service_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_service_proto must extract metadata, spec.type, spec.clusterIP, and spec.ports.
+    ///
+    /// The conformance suite creates Services (ClusterIP, NodePort, ExternalName) via proto.
+    /// Without this decoder, decode_core_proto_by_kind returns None and the server returns 400.
+    #[test]
+    fn decode_service_proto_extracts_metadata_and_spec() {
+        // Build: Service {
+        //   metadata: ObjectMeta { name: "my-svc", namespace: "default" },
+        //   spec: ServiceSpec { type: "ClusterIP", clusterIP: "10.96.0.1",
+        //                       sessionAffinity: "None",
+        //                       ports: [ServicePort { name: "http", protocol: "TCP", port: 80 }] }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"my-svc");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        // ServicePort: field 1=name, field 2=protocol, field 3=port
+        let mut port = encode_length_delimited(1, b"http");
+        port.extend_from_slice(&encode_length_delimited(2, b"TCP"));
+        // port=80: tag=(3<<3)|0=0x18, value=80=0x50
+        port.push(0x18);
+        port.push(0x50);
+
+        // ServiceSpec: field 1=ports, field 3=clusterIP, field 4=type, field 7=sessionAffinity
+        let mut svc_spec = encode_length_delimited(1, &port);
+        svc_spec.extend_from_slice(&encode_length_delimited(3, b"10.96.0.1"));
+        svc_spec.extend_from_slice(&encode_length_delimited(4, b"ClusterIP"));
+        svc_spec.extend_from_slice(&encode_length_delimited(7, b"None"));
+
+        let mut svc_proto = encode_length_delimited(1, &obj_meta);
+        svc_proto.extend_from_slice(&encode_length_delimited(2, &svc_spec));
+
+        let result = decode_core_proto_by_kind("Service", &svc_proto).expect(
+            "Service must decode via decode_core_proto_by_kind — conformance suite creates \
+                     Services via proto and fails with 400 'invalid JSON' without this decoder",
+        );
+
+        assert_eq!(result["kind"], "Service");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "my-svc");
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert_eq!(result["spec"]["clusterIP"], "10.96.0.1");
+        assert_eq!(result["spec"]["type"], "ClusterIP");
+        assert_eq!(result["spec"]["sessionAffinity"], "None");
+        let ports = result["spec"]["ports"]
+            .as_array()
+            .expect("spec.ports must be an array");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0]["name"], "http");
+        assert_eq!(ports[0]["protocol"], "TCP");
+        assert_eq!(ports[0]["port"], 80);
+    }
+
+    /// decode_service_proto must handle a headless Service (clusterIP="None").
+    #[test]
+    fn decode_service_proto_handles_headless_service() {
+        let mut obj_meta = encode_length_delimited(1, b"headless-svc");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"test-ns"));
+
+        let mut svc_spec = encode_length_delimited(3, b"None"); // clusterIP=None
+        svc_spec.extend_from_slice(&encode_length_delimited(4, b"ClusterIP")); // type
+
+        let mut svc_proto = encode_length_delimited(1, &obj_meta);
+        svc_proto.extend_from_slice(&encode_length_delimited(2, &svc_spec));
+
+        let result = decode_service_proto(&svc_proto)
+            .expect("must decode headless Service — conformance test creates headless Services");
+
+        assert_eq!(result["kind"], "Service");
+        assert_eq!(result["spec"]["clusterIP"], "None");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_secret_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_secret_proto must extract metadata, type, and data (base64-encoded bytes).
+    ///
+    /// The conformance suite creates Secrets of various types (Opaque, kubernetes.io/tls, etc.)
+    /// via proto. Without this decoder, all Secret creation returns 400 'invalid JSON'.
+    #[test]
+    fn decode_secret_proto_extracts_metadata_type_and_data() {
+        // Build: Secret {
+        //   metadata: ObjectMeta { name: "test-secret", namespace: "default" },
+        //   type: "Opaque",
+        //   data: { "key": b"secret-value" }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"test-secret");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        // Secret.data is map<string,bytes> — each entry: field 1=key, field 2=value
+        let mut data_entry = encode_length_delimited(1, b"key");
+        data_entry.extend_from_slice(&encode_length_delimited(2, b"secret-value"));
+
+        let mut secret_proto = encode_length_delimited(1, &obj_meta);
+        secret_proto.extend_from_slice(&encode_length_delimited(2, &data_entry)); // data
+        secret_proto.extend_from_slice(&encode_length_delimited(4, b"Opaque")); // type
+
+        let result = decode_core_proto_by_kind("Secret", &secret_proto).expect(
+            "Secret must decode via decode_core_proto_by_kind — conformance suite creates \
+                     Secrets via proto and fails with 400 'invalid JSON' without this decoder",
+        );
+
+        assert_eq!(result["kind"], "Secret");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "test-secret");
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert_eq!(result["type"], "Opaque");
+        // data["key"] must be base64-encoded "secret-value"
+        use base64::Engine;
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(b"secret-value");
+        assert_eq!(
+            result["data"]["key"], expected_b64,
+            "Secret data values must be base64-encoded so kubectl can decode them"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_replicationcontroller_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_replicationcontroller_proto must extract metadata, spec.replicas, and spec.selector.
+    ///
+    /// The conformance suite creates ReplicationControllers via proto.
+    /// Without this decoder, RC creation fails with 400 'invalid JSON'.
+    #[test]
+    fn decode_replicationcontroller_proto_extracts_metadata_and_spec() {
+        // Build: ReplicationController {
+        //   metadata: ObjectMeta { name: "my-rc", namespace: "default" },
+        //   spec: ReplicationControllerSpec { replicas: 3, selector: {"app": "myapp"} }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"my-rc");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        // replicas=3: tag=(1<<3)|0=0x08, value=3=0x03
+        let mut rc_spec = vec![0x08, 0x03]; // field 1 (replicas), varint 3
+                                            // selector map entry: field 1=key, field 2=value
+        let mut sel_entry = encode_length_delimited(1, b"app");
+        sel_entry.extend_from_slice(&encode_length_delimited(2, b"myapp"));
+        rc_spec.extend_from_slice(&encode_length_delimited(2, &sel_entry));
+
+        let mut rc_proto = encode_length_delimited(1, &obj_meta);
+        rc_proto.extend_from_slice(&encode_length_delimited(2, &rc_spec));
+
+        let result = decode_core_proto_by_kind("ReplicationController", &rc_proto).expect(
+            "ReplicationController must decode via decode_core_proto_by_kind — \
+                     conformance suite creates RCs via proto and returns 400 without this decoder",
+        );
+
+        assert_eq!(result["kind"], "ReplicationController");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "my-rc");
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert_eq!(result["spec"]["replicas"], 3);
+        assert_eq!(result["spec"]["selector"]["app"], "myapp");
+        assert!(
+            result["spec"]["template"].is_object(),
+            "spec.template must be present as empty object (required by k8s schema)"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_runtimeclass_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_runtimeclass_proto must extract metadata and handler.
+    ///
+    /// The conformance suite creates RuntimeClass objects via proto.
+    /// Without this decoder, RuntimeClass creation fails with 400 'invalid JSON'.
+    #[test]
+    fn decode_runtimeclass_proto_extracts_metadata_and_handler() {
+        // Build: RuntimeClass {
+        //   metadata: ObjectMeta { name: "myruntime" },
+        //   handler: "myhandler"
+        // }
+        let obj_meta = encode_length_delimited(1, b"myruntime");
+        let handler = encode_length_delimited(2, b"myhandler");
+
+        let mut rc_proto = encode_length_delimited(1, &obj_meta);
+        rc_proto.extend_from_slice(&handler);
+
+        let result = decode_core_proto_by_kind("RuntimeClass", &rc_proto).expect(
+            "RuntimeClass must decode via decode_core_proto_by_kind — \
+                     conformance suite creates RuntimeClass objects via proto",
+        );
+
+        assert_eq!(result["kind"], "RuntimeClass");
+        assert_eq!(result["apiVersion"], "node.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "myruntime");
+        assert_eq!(result["handler"], "myhandler");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_persistentvolume_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_persistentvolume_proto must extract metadata and spec fields.
+    ///
+    /// The conformance suite creates PersistentVolumes via proto.
+    /// Without this decoder, PV creation fails with 400 'invalid JSON'.
+    #[test]
+    fn decode_persistentvolume_proto_extracts_metadata_and_spec() {
+        // Build: PersistentVolume {
+        //   metadata: ObjectMeta { name: "my-pv" },
+        //   spec: PersistentVolumeSpec { accessModes: ["ReadWriteOnce"],
+        //                                storageClassName: "standard",
+        //                                persistentVolumeReclaimPolicy: "Delete" }
+        // }
+        let obj_meta = encode_length_delimited(1, b"my-pv");
+
+        // PersistentVolumeSpec: field 6=accessModes (repeated string), field 26=reclaimPolicy,
+        // field 29=storageClassName
+        let mut pv_spec = encode_length_delimited(6, b"ReadWriteOnce"); // accessModes[0]
+        pv_spec.extend_from_slice(&encode_length_delimited(26, b"Delete")); // reclaimPolicy
+        pv_spec.extend_from_slice(&encode_length_delimited(29, b"standard")); // storageClassName
+
+        let mut pv_proto = encode_length_delimited(1, &obj_meta);
+        pv_proto.extend_from_slice(&encode_length_delimited(2, &pv_spec));
+
+        let result = decode_core_proto_by_kind("PersistentVolume", &pv_proto).expect(
+            "PersistentVolume must decode via decode_core_proto_by_kind — \
+                     conformance suite creates PVs via proto and returns 400 without this decoder",
+        );
+
+        assert_eq!(result["kind"], "PersistentVolume");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "my-pv");
+        assert_eq!(result["spec"]["accessModes"][0], "ReadWriteOnce");
+        assert_eq!(result["spec"]["persistentVolumeReclaimPolicy"], "Delete");
+        assert_eq!(result["spec"]["storageClassName"], "standard");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_volumeattachment_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_volumeattachment_proto must extract metadata, spec.attacher, spec.nodeName, and
+    /// spec.source.persistentVolumeName.
+    ///
+    /// The conformance suite creates VolumeAttachments via proto.
+    /// Without this decoder, VolumeAttachment creation fails with 400 'invalid JSON'.
+    #[test]
+    fn decode_volumeattachment_proto_extracts_metadata_and_spec() {
+        // Build: VolumeAttachment {
+        //   metadata: ObjectMeta { name: "csi-va-1" },
+        //   spec: VolumeAttachmentSpec {
+        //     attacher: "csi.example.com",
+        //     source: { persistentVolumeName: "my-pv" },
+        //     nodeName: "node-1"
+        //   }
+        // }
+        let obj_meta = encode_length_delimited(1, b"csi-va-1");
+
+        // VolumeAttachmentSource: field 1=persistentVolumeName
+        let source = encode_length_delimited(1, b"my-pv");
+
+        // VolumeAttachmentSpec: field 1=attacher, field 2=source, field 3=nodeName
+        let mut va_spec = encode_length_delimited(1, b"csi.example.com");
+        va_spec.extend_from_slice(&encode_length_delimited(2, &source));
+        va_spec.extend_from_slice(&encode_length_delimited(3, b"node-1"));
+
+        let mut va_proto = encode_length_delimited(1, &obj_meta);
+        va_proto.extend_from_slice(&encode_length_delimited(2, &va_spec));
+
+        let result = decode_core_proto_by_kind("VolumeAttachment", &va_proto).expect(
+            "VolumeAttachment must decode via decode_core_proto_by_kind — \
+                     conformance suite creates VolumeAttachments via proto",
+        );
+
+        assert_eq!(result["kind"], "VolumeAttachment");
+        assert_eq!(result["apiVersion"], "storage.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "csi-va-1");
+        assert_eq!(result["spec"]["attacher"], "csi.example.com");
+        assert_eq!(result["spec"]["nodeName"], "node-1");
+        assert_eq!(result["spec"]["source"]["persistentVolumeName"], "my-pv");
     }
 }
