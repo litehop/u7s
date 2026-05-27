@@ -49,12 +49,14 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("certificates.k8s.io", "v1"),
     ("coordination.k8s.io", "v1"),
     ("discovery.k8s.io", "v1"),
+    ("events.k8s.io", "v1"),
     ("flowcontrol.apiserver.k8s.io", "v1"),
     ("gateway.networking.k8s.io", "v1"),
     ("networking.k8s.io", "v1"),
     ("node.k8s.io", "v1"),
     ("policy", "v1"),
     ("rbac.authorization.k8s.io", "v1"),
+    ("scheduling.k8s.io", "v1"),
     ("storage.k8s.io", "v1"),
 ];
 
@@ -166,6 +168,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("certificates.k8s.io", "v1") => Some(certificates_v1_resources()),
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
         ("discovery.k8s.io", "v1") => Some(discovery_v1_resources()),
+        ("events.k8s.io", "v1") => Some(events_v1_resources()),
         ("flowcontrol.apiserver.k8s.io", "v1") => Some(flowcontrol_v1_resources()),
         ("gateway.networking.k8s.io", "v1") => Some(gateway_networking_v1_resources()),
         ("gateway.networking.k8s.io", "v1beta1") => Some(gateway_networking_v1beta1_resources()),
@@ -173,6 +176,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("node.k8s.io", "v1") => Some(node_v1_resources()),
         ("policy", "v1") => Some(policy_v1_resources()),
         ("rbac.authorization.k8s.io", "v1") => Some(rbac_v1_resources()),
+        ("scheduling.k8s.io", "v1") => Some(scheduling_v1_resources()),
         ("storage.k8s.io", "v1") => Some(storage_v1_resources()),
         _ => None,
     }
@@ -410,10 +414,17 @@ fn admissionregistration_v1_resources() -> serde_json::Value {
         "groupVersion": "admissionregistration.k8s.io/v1",
         "resources": [
             {
-                "name": "validatingwebhookconfigurations",
-                "singularName": "validatingwebhookconfiguration",
+                "name": "mutatingadmissionpolicies",
+                "singularName": "mutatingadmissionpolicy",
                 "namespaced": false,
-                "kind": "ValidatingWebhookConfiguration",
+                "kind": "MutatingAdmissionPolicy",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "mutatingadmissionpolicybindings",
+                "singularName": "mutatingadmissionpolicybinding",
+                "namespaced": false,
+                "kind": "MutatingAdmissionPolicyBinding",
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
@@ -421,6 +432,27 @@ fn admissionregistration_v1_resources() -> serde_json::Value {
                 "singularName": "mutatingwebhookconfiguration",
                 "namespaced": false,
                 "kind": "MutatingWebhookConfiguration",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "validatingadmissionpolicies",
+                "singularName": "validatingadmissionpolicy",
+                "namespaced": false,
+                "kind": "ValidatingAdmissionPolicy",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "validatingadmissionpolicybindings",
+                "singularName": "validatingadmissionpolicybinding",
+                "namespaced": false,
+                "kind": "ValidatingAdmissionPolicyBinding",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "validatingwebhookconfigurations",
+                "singularName": "validatingwebhookconfiguration",
+                "namespaced": false,
+                "kind": "ValidatingWebhookConfiguration",
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -525,11 +557,25 @@ fn networking_v1_resources() -> serde_json::Value {
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             },
             {
+                "name": "ipaddresses",
+                "singularName": "ipaddress",
+                "namespaced": false,
+                "kind": "IPAddress",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
                 "name": "networkpolicies",
                 "singularName": "networkpolicy",
                 "namespaced": true,
                 "kind": "NetworkPolicy",
                 "shortNames": ["netpol"],
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "servicecidrs",
+                "singularName": "servicecidr",
+                "namespaced": false,
+                "kind": "ServiceCIDR",
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -715,6 +761,49 @@ fn storage_v1_resources() -> serde_json::Value {
                 "singularName": "volumeattachment",
                 "namespaced": false,
                 "kind": "VolumeAttachment",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "volumeattributesclasses",
+                "singularName": "volumeattributesclass",
+                "namespaced": false,
+                "kind": "VolumeAttributesClass",
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn events_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "events.k8s.io/v1",
+        "resources": [
+            {
+                "name": "events",
+                "singularName": "event",
+                "namespaced": true,
+                "kind": "Event",
+                "shortNames": ["ev"],
+                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn scheduling_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "scheduling.k8s.io/v1",
+        "resources": [
+            {
+                "name": "priorityclasses",
+                "singularName": "priorityclass",
+                "namespaced": false,
+                "kind": "PriorityClass",
+                "shortNames": ["pc"],
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -1407,6 +1496,185 @@ mod tests {
         assert!(
             val.get("paths").is_some(),
             "/openapi/v3 must contain a \"paths\" key so kubectl can fall back to /openapi/v2"
+        );
+    }
+
+    // scheduling.k8s.io must appear in /apis — kube-scheduler reads PriorityClasses
+    // at startup to assign pod scheduling priority. Without this group, scheduling
+    // conformance tests fail with "resource not found".
+    #[tokio::test]
+    async fn scheduling_group_appears_in_api_group_list() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"scheduling.k8s.io"),
+            "scheduling.k8s.io must appear in /apis — kube-scheduler probes it for PriorityClasses; got: {names:?}"
+        );
+    }
+
+    // scheduling.k8s.io/v1 must include priorityclasses — kube-scheduler reads these
+    // to assign pod scheduling priority; missing this causes scheduling failures.
+    #[tokio::test]
+    async fn scheduling_v1_resources_includes_priorityclasses() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("scheduling.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"priorityclasses"),
+            "priorityclasses must be in scheduling.k8s.io/v1 — kube-scheduler requires it; got: {names:?}"
+        );
+    }
+
+    // events.k8s.io must appear in /apis — conformance tests use events.k8s.io/v1 Event
+    // (the stable replacement for core/v1 Event). Without this group, conformance tests
+    // fail with "resource not found".
+    #[tokio::test]
+    async fn events_group_appears_in_api_group_list() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"events.k8s.io"),
+            "events.k8s.io must appear in /apis — conformance tests use events.k8s.io/v1; got: {names:?}"
+        );
+    }
+
+    // events.k8s.io/v1 must include events — this is the GA Event type since k8s 1.21;
+    // conformance tests create and watch events via this API group.
+    #[tokio::test]
+    async fn events_v1_resources_includes_events() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("events.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"events"),
+            "events must be in events.k8s.io/v1 — conformance tests require it; got: {names:?}"
+        );
+    }
+
+    // storage.k8s.io/v1 must include volumeattributesclasses — GA since k8s 1.31;
+    // sonobuoy conformance tests fail with "resource not found" without it.
+    #[tokio::test]
+    async fn storage_v1_resources_includes_volumeattributesclasses() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("storage.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"volumeattributesclasses"),
+            "volumeattributesclasses must be in storage.k8s.io/v1 — GA since k8s 1.31; got: {names:?}"
+        );
+    }
+
+    // networking.k8s.io/v1 must include servicecidrs and ipaddresses — GA since k8s 1.31;
+    // sonobuoy conformance tests fail with "resource not found" without them.
+    #[tokio::test]
+    async fn networking_v1_resources_includes_servicecidrs_and_ipaddresses() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("networking.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"servicecidrs"),
+            "servicecidrs must be in networking.k8s.io/v1 — GA since k8s 1.31; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"ipaddresses"),
+            "ipaddresses must be in networking.k8s.io/v1 — GA since k8s 1.31; got: {names:?}"
+        );
+    }
+
+    // admissionregistration.k8s.io/v1 must include validatingadmissionpolicies and
+    // mutatingadmissionpolicies — GA since k8s 1.30/1.32 respectively; conformance
+    // tests fail with "resource not found" without them.
+    #[tokio::test]
+    async fn admissionregistration_v1_resources_includes_admission_policies() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("admissionregistration.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"validatingadmissionpolicies"),
+            "validatingadmissionpolicies must be in admissionregistration.k8s.io/v1 — \
+             CEL-based admission GA since k8s 1.30; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"mutatingadmissionpolicies"),
+            "mutatingadmissionpolicies must be in admissionregistration.k8s.io/v1 — \
+             GA since k8s 1.32; got: {names:?}"
         );
     }
 
