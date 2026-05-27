@@ -113,6 +113,9 @@ pub struct AppState<S = SqliteStore> {
     pub kubelet_preferred_address: Option<Arc<String>>,
     /// Service CIDR allocator. None means auto-allocation is disabled.
     pub service_ip_allocator: Option<Arc<ServiceIpAllocator>>,
+    /// 32-byte HMAC-SHA256 signing key for continue tokens.
+    /// Generated fresh at server startup; tokens from a previous run are rejected (410).
+    pub continue_token_key: Arc<[u8; 32]>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -134,6 +137,9 @@ pub struct AppStateConfig<S> {
     /// In production: `kubelet_client_cert_pem + kubelet_client_key_pem` from `TlsMaterial`.
     pub kubelet_client_identity_pem: Option<Vec<u8>>,
     pub kubelet_preferred_address: Option<String>,
+    /// 32-byte HMAC-SHA256 signing key for continue tokens.
+    /// Pass `None` to generate a fresh random key.
+    pub continue_token_key: Option<[u8; 32]>,
 }
 
 // Manual Clone so we don't impose S: Clone (Arc<S> is always Clone).
@@ -153,6 +159,7 @@ impl<S> Clone for AppState<S> {
             kubelet_client_identity_pem: self.kubelet_client_identity_pem.clone(),
             kubelet_preferred_address: self.kubelet_preferred_address.clone(),
             service_ip_allocator: self.service_ip_allocator.clone(),
+            continue_token_key: self.continue_token_key.clone(),
         }
     }
 }
@@ -178,6 +185,7 @@ impl<S: Store> AppState<S> {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            continue_token_key: None,
         })
     }
 
@@ -243,6 +251,16 @@ impl<S: Store> AppState<S> {
             cfg.cluster_ca_der.as_deref(),
             cfg.webhook_identity_pem.as_deref(),
         );
+        // If no key is supplied, generate a fresh random 32-byte key from the OS CSPRNG.
+        // uuid::Uuid::new_v4() uses getrandom internally — two UUIDs give 32 bytes.
+        let continue_token_key: [u8; 32] = cfg.continue_token_key.unwrap_or_else(|| {
+            let a = uuid::Uuid::new_v4().into_bytes();
+            let b = uuid::Uuid::new_v4().into_bytes();
+            let mut key = [0u8; 32];
+            key[..16].copy_from_slice(&a);
+            key[16..].copy_from_slice(&b);
+            key
+        });
         AppState {
             store: cfg.store,
             resource_registry: Arc::new(registry),
@@ -257,6 +275,7 @@ impl<S: Store> AppState<S> {
             kubelet_client_identity_pem: cfg.kubelet_client_identity_pem.map(Arc::new),
             kubelet_preferred_address: cfg.kubelet_preferred_address.map(Arc::new),
             service_ip_allocator: cfg.service_ip_allocator.map(Arc::new),
+            continue_token_key: Arc::new(continue_token_key),
         }
     }
 
@@ -1046,6 +1065,7 @@ mod tests {
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            continue_token_key: None,
         })
     }
 

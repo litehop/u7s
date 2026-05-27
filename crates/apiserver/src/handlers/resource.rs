@@ -116,7 +116,7 @@ pub async fn list_resource<S: Store>(
     let continue_key = query
         .continue_token
         .as_deref()
-        .map(decode_continue)
+        .map(|t| decode_continue(t, &state.continue_token_key))
         .transpose()?;
     let resp = state
         .store
@@ -172,6 +172,7 @@ pub async fn list_resource<S: Store>(
         items,
         resp.continue_key,
         resp.remaining_count,
+        &state.continue_token_key,
     );
     Ok(Json(body).into_response())
 }
@@ -753,7 +754,7 @@ pub async fn list_namespaced_resource<S: Store>(
     let continue_key = query
         .continue_token
         .as_deref()
-        .map(decode_continue)
+        .map(|t| decode_continue(t, &state.continue_token_key))
         .transpose()?;
     let resp = state
         .store
@@ -809,6 +810,7 @@ pub async fn list_namespaced_resource<S: Store>(
         items,
         resp.continue_key,
         resp.remaining_count,
+        &state.continue_token_key,
     );
     Ok(Json(body).into_response())
 }
@@ -4572,6 +4574,7 @@ mod tests {
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            continue_token_key: None,
         });
 
         // Create two Services — allocation attaches a sentinel for each IP.

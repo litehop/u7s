@@ -517,6 +517,7 @@ pub async fn list_cr<S: Store>(
         items,
         resp.continue_key,
         resp.remaining_count,
+        &state.continue_token_key,
     );
     Ok(Json(body).into_response())
 }
@@ -843,6 +844,7 @@ pub async fn list_cr_namespaced<S: Store>(
         items,
         resp.continue_key,
         resp.remaining_count,
+        &state.continue_token_key,
     );
     Ok(Json(body).into_response())
 }
@@ -4119,6 +4121,7 @@ mod tests {
     //   if group.is_empty() { version } else { format!("{}/{}", group, version) }
     #[test]
     fn build_list_response_empty_group_omits_slash() {
+        let signing_key: &[u8; 32] = b"test-signing-key-32-bytes-padded";
         let body = super::super::generic::build_list_response(
             "Foo",
             "", // empty group
@@ -4127,6 +4130,7 @@ mod tests {
             vec![],
             None,
             None,
+            signing_key,
         );
         let api_version = body["apiVersion"].as_str().unwrap_or("");
         assert_eq!(

@@ -218,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         service_ip_allocator,
         kubelet_client_identity_pem: Some(kubelet_client_identity_pem),
         kubelet_preferred_address: args.kubelet_preferred_address,
+        continue_token_key: None, // fresh random key generated at startup
     });
 
     // 10a. Populate RBAC index from persisted objects before serving.
@@ -2468,6 +2469,7 @@ mod tests {
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            continue_token_key: None,
         })
     }
 
