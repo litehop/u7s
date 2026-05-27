@@ -13,9 +13,8 @@ pub(crate) struct PatchQuery {
     #[serde(rename = "fieldManager")]
     pub field_manager: Option<String>,
     /// Accepted and ignored: we do not implement server-side field validation.
-    #[allow(dead_code)]
     #[serde(rename = "fieldValidation")]
-    pub field_validation: Option<String>,
+    pub _field_validation: Option<String>,
 }
 
 /// Strip `managedFields` from an SSA apply body before merging.

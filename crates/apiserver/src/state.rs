@@ -498,19 +498,21 @@ fn rk(group: &str, version: &str, plural: &str) -> ResourceKey {
     }
 }
 
-fn rm(kind: &str, namespaced: bool, has_status: bool) -> ResourceMeta {
+fn rm(kind: &str, _namespaced: bool, has_status: bool) -> ResourceMeta {
     ResourceMeta {
         kind: kind.to_string(),
-        namespaced,
+        #[cfg(test)]
+        namespaced: _namespaced,
         has_status_subresource: has_status,
         create_or_update: false,
     }
 }
 
-fn rm_cou(kind: &str, namespaced: bool) -> ResourceMeta {
+fn rm_cou(kind: &str, _namespaced: bool) -> ResourceMeta {
     ResourceMeta {
         kind: kind.to_string(),
-        namespaced,
+        #[cfg(test)]
+        namespaced: _namespaced,
         has_status_subresource: false,
         create_or_update: true,
     }

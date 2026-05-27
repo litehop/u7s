@@ -1902,7 +1902,7 @@ mod tests {
             )),
             axum::extract::Query(PatchQuery {
                 field_manager: Some("argocd".to_string()),
-                field_validation: None,
+                _field_validation: None,
             }),
             ssa_headers.clone(),
             patch_bytes.clone(),
@@ -1976,7 +1976,7 @@ mod tests {
             )),
             axum::extract::Query(PatchQuery {
                 field_manager: Some("argocd".to_string()),
-                field_validation: None,
+                _field_validation: None,
             }),
             ssa_headers,
             update_bytes,

@@ -219,7 +219,10 @@ pub struct ResourceKey {
 #[derive(Debug, Clone)]
 pub struct ResourceMeta {
     pub kind: String,
-    #[allow(dead_code)]
+    /// Whether this resource is namespace-scoped. Set at registration time; read in tests
+    /// to verify the registry is wired correctly. Production routing is determined by the
+    /// URL pattern, not this field.
+    #[cfg(test)]
     pub namespaced: bool,
     pub has_status_subresource: bool,
     /// If true, POST behaves as createOrUpdate: if the object already exists, replace it.
