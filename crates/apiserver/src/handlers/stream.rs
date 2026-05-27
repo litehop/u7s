@@ -4,9 +4,23 @@
 /// future HTTP/3 QUIC streams) so that splice logic in /attach and /portforward
 /// can be written once and swapped at the call site.
 ///
-/// The `+ Send` bounds on the associated futures are required by tokio::spawn.
+/// `split()` consumes the stream and returns independent read and write halves.
+/// This is required by `splice()` so it can drive reads and writes in separate
+/// tasks without holding a mutex across an async recv() call.
 pub trait BiStream: Send + 'static {
+    type Reader: BiStreamReader;
+    type Writer: BiStreamWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer);
+}
+
+/// Read half of a split BiStream.
+pub trait BiStreamReader: Send + 'static {
     fn recv(&mut self) -> impl std::future::Future<Output = Option<bytes::Bytes>> + Send;
+}
+
+/// Write half of a split BiStream.
+pub trait BiStreamWriter: Send + 'static {
     fn send(
         &mut self,
         data: bytes::Bytes,
@@ -20,35 +34,55 @@ pub trait BiStream: Send + 'static {
 
 /// Wraps an axum `WebSocket` so it satisfies `BiStream`.
 ///
-/// Binary frames are passed through as-is. Text frames are coerced to bytes.
-/// Control frames (Ping/Pong/Close) are skipped — the splice loop handles data only.
+/// split() uses futures_util::StreamExt::split() to give independent halves
+/// that can be driven from separate tasks without any mutex.
 pub struct AxumWs(pub axum::extract::ws::WebSocket);
 
+pub struct AxumWsReader(futures_util::stream::SplitStream<axum::extract::ws::WebSocket>);
+
+pub struct AxumWsWriter(
+    futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
+);
+
 impl BiStream for AxumWs {
+    type Reader = AxumWsReader;
+    type Writer = AxumWsWriter;
+
+    fn split(self) -> (AxumWsReader, AxumWsWriter) {
+        use futures_util::StreamExt as _;
+        let (sink, stream) = self.0.split();
+        (AxumWsReader(stream), AxumWsWriter(sink))
+    }
+}
+
+impl BiStreamReader for AxumWsReader {
     async fn recv(&mut self) -> Option<bytes::Bytes> {
+        use futures_util::StreamExt as _;
         loop {
-            match self.0.recv().await? {
+            match self.0.next().await? {
                 Ok(axum::extract::ws::Message::Binary(b)) => return Some(b),
                 Ok(axum::extract::ws::Message::Text(t)) => {
                     return Some(bytes::Bytes::copy_from_slice(t.as_bytes()))
                 }
-                Ok(_) => continue, // Ping, Pong, Close — skip
+                Ok(_) => continue,
                 Err(_) => return None,
             }
         }
     }
+}
 
+impl BiStreamWriter for AxumWsWriter {
     async fn send(&mut self, data: bytes::Bytes) -> anyhow::Result<()> {
-        use axum::extract::ws::Message;
+        use futures_util::SinkExt as _;
         self.0
-            .send(Message::Binary(data))
+            .send(axum::extract::ws::Message::Binary(data))
             .await
             .map_err(anyhow::Error::from)
     }
 
     async fn close(&mut self) {
-        use axum::extract::ws::Message;
-        let _ = self.0.send(Message::Close(None)).await;
+        use futures_util::SinkExt as _;
+        let _ = self.0.send(axum::extract::ws::Message::Close(None)).await;
     }
 }
 
@@ -63,7 +97,27 @@ use tokio_tungstenite::WebSocketStream;
 /// The stream `S` is typically `tokio_rustls::client::TlsStream<tokio::net::TcpStream>`.
 pub struct TungsteniteWs<S>(pub WebSocketStream<S>);
 
+pub struct TungsteniteWsReader<S>(futures_util::stream::SplitStream<WebSocketStream<S>>);
+
+pub struct TungsteniteWsWriter<S>(
+    futures_util::stream::SplitSink<WebSocketStream<S>, tokio_tungstenite::tungstenite::Message>,
+);
+
 impl<S> BiStream for TungsteniteWs<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    type Reader = TungsteniteWsReader<S>;
+    type Writer = TungsteniteWsWriter<S>;
+
+    fn split(self) -> (TungsteniteWsReader<S>, TungsteniteWsWriter<S>) {
+        use futures_util::StreamExt as _;
+        let (sink, stream) = self.0.split();
+        (TungsteniteWsReader(stream), TungsteniteWsWriter(sink))
+    }
+}
+
+impl<S> BiStreamReader for TungsteniteWsReader<S>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -74,12 +128,17 @@ where
             match self.0.next().await? {
                 Ok(Message::Binary(b)) => return Some(bytes::Bytes::from(b.to_vec())),
                 Ok(Message::Text(t)) => return Some(bytes::Bytes::copy_from_slice(t.as_bytes())),
-                Ok(_) => continue, // Ping, Pong, Close, Frame
+                Ok(_) => continue,
                 Err(_) => return None,
             }
         }
     }
+}
 
+impl<S> BiStreamWriter for TungsteniteWsWriter<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     async fn send(&mut self, data: bytes::Bytes) -> anyhow::Result<()> {
         use futures_util::SinkExt as _;
         use tokio_tungstenite::tungstenite::Message;
@@ -90,7 +149,8 @@ where
     }
 
     async fn close(&mut self) {
-        let _ = self.0.close(None).await;
+        use futures_util::SinkExt as _;
+        let _ = self.0.close().await;
     }
 }
 
@@ -100,71 +160,73 @@ where
 
 /// Relay bytes between two BiStream endpoints until either side closes.
 ///
-/// Spawns two tasks, one per direction. Each task reads from one end and writes
-/// to the other. When one direction completes (recv returns None or send errors),
-/// the opposite end is closed and the other task is aborted. This ensures clean
-/// shutdown without leaking tasks.
-pub async fn splice<A, B>(a: A, b: B)
-where
-    A: BiStream,
-    B: BiStream,
-{
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
+/// Uses four tasks connected by two channels. Each stream is split into
+/// independent read and write halves so that no mutex is held across an
+/// async recv() call — eliminating the deadlock that the old Arc<Mutex<>>
+/// approach suffered during large one-directional transfers.
+///
+/// The portforward tarball deadlock (pre-fix): kubelet streams a large tarball
+/// B→A while kubectl is silent. The old read_a task held mutex-A suspended in
+/// recv(), while write_a needed the same mutex to flush tarball data to kubectl.
+/// With split halves there is no shared state between read_a and write_a at all.
+///
+/// Layout:
+///   read_a  → a_to_b channel → write_b
+///   read_b  → b_to_a channel → write_a
+///
+/// Shutdown: when read_a gets None (A closed), it drops a_to_b_tx, which causes
+/// write_b's recv() to return None, and write_b closes B's write half.
+/// Symmetrically for read_b.
+pub async fn splice<A: BiStream, B: BiStream>(a: A, b: B) {
+    use tokio::sync::mpsc;
 
-    // Split into independent halves so each task can hold its own lock without
-    // blocking the other direction.
-    let a_recv = Arc::new(Mutex::new(a));
-    let b_send = Arc::new(Mutex::new(b));
+    let (mut ar, mut aw) = a.split();
+    let (mut br, mut bw) = b.split();
 
-    // We need send access to b from t1 and recv access to b from t2.
-    // Since we can't split a single BiStream, share it via Arc<Mutex<>> and
-    // accept that the two tasks alternate rather than run in true parallel.
-    // For WebSocket proxying this is fine — frames arrive at human-scale rates.
-    let a_send = Arc::clone(&a_recv);
-    let b_recv = Arc::clone(&b_send);
+    let (a_to_b_tx, mut a_to_b_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
+    let (b_to_a_tx, mut b_to_a_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
 
-    // a → b
-    let t1 = tokio::spawn(async move {
-        loop {
-            let msg = a_recv.lock().await.recv().await;
-            match msg {
-                None => break,
-                Some(data) => {
-                    if b_send.lock().await.send(data).await.is_err() {
-                        break;
-                    }
-                }
+    // read_a: drain A into a_to_b channel.
+    let read_a = tokio::spawn(async move {
+        while let Some(data) = ar.recv().await {
+            if a_to_b_tx.send(data).is_err() {
+                break;
             }
         }
-        // A is done sending; signal B to stop by closing it.
-        b_send.lock().await.close().await;
+        // a_to_b_tx dropped here → write_b will drain and close B's write half.
     });
 
-    // b → a
-    let t2 = tokio::spawn(async move {
-        loop {
-            let msg = b_recv.lock().await.recv().await;
-            match msg {
-                None => break,
-                Some(data) => {
-                    if a_send.lock().await.send(data).await.is_err() {
-                        break;
-                    }
-                }
+    // read_b: drain B into b_to_a channel.
+    let read_b = tokio::spawn(async move {
+        while let Some(data) = br.recv().await {
+            if b_to_a_tx.send(data).is_err() {
+                break;
             }
         }
-        // B is done sending; signal A to stop by closing it.
-        a_send.lock().await.close().await;
+        // b_to_a_tx dropped here → write_a will drain and close A's write half.
     });
 
-    // When either direction finishes, abort the other so tasks don't leak.
-    let t2_abort = t2.abort_handle();
-    let t1_abort = t1.abort_handle();
-    tokio::select! {
-        _ = t1 => { t2_abort.abort(); }
-        _ = t2 => { t1_abort.abort(); }
-    }
+    // write_b: forward a_to_b channel messages to B's write half.
+    let write_b = tokio::spawn(async move {
+        while let Some(data) = a_to_b_rx.recv().await {
+            if bw.send(data).await.is_err() {
+                break;
+            }
+        }
+        bw.close().await;
+    });
+
+    // write_a: forward b_to_a channel messages to A's write half.
+    let write_a = tokio::spawn(async move {
+        while let Some(data) = b_to_a_rx.recv().await {
+            if aw.send(data).await.is_err() {
+                break;
+            }
+        }
+        aw.close().await;
+    });
+
+    let _ = tokio::join!(read_a, read_b, write_a, write_b);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,31 +240,58 @@ mod tests {
     use std::sync::Arc;
 
     /// In-memory BiStream for testing splice logic without real WebSockets.
+    ///
+    /// Uses a tokio mpsc channel for the incoming (recv) side so that recv()
+    /// is cancel-safe: the channel's recv() does not consume a message until
+    /// the future resolves. This is required for correct behaviour under
+    /// tokio::select! (used in tests that drive splice indirectly).
     struct MemStream {
-        incoming: std::collections::VecDeque<Bytes>,
-        pub outgoing: Arc<std::sync::Mutex<Vec<Bytes>>>,
+        rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+        outgoing: Arc<std::sync::Mutex<Vec<Bytes>>>,
+    }
+
+    struct MemStreamReader {
+        rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    }
+
+    struct MemStreamWriter {
+        outgoing: Arc<std::sync::Mutex<Vec<Bytes>>>,
         closed: bool,
     }
 
     impl MemStream {
         fn new(incoming: Vec<Bytes>, outgoing: Arc<std::sync::Mutex<Vec<Bytes>>>) -> Self {
-            Self {
-                incoming: incoming.into(),
-                outgoing,
-                closed: false,
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            for msg in incoming {
+                let _ = tx.send(msg);
             }
+            drop(tx); // close sender so recv returns None once queue drains
+            Self { rx, outgoing }
         }
     }
 
     impl BiStream for MemStream {
-        async fn recv(&mut self) -> Option<Bytes> {
-            // Drain the queue regardless of closed state; return None only when empty.
-            // close() marks that no further messages will be queued, but already-queued
-            // messages should still be delivered — matching real WebSocket behavior where
-            // buffered data is readable even after the peer closes.
-            self.incoming.pop_front()
-        }
+        type Reader = MemStreamReader;
+        type Writer = MemStreamWriter;
 
+        fn split(self) -> (MemStreamReader, MemStreamWriter) {
+            (
+                MemStreamReader { rx: self.rx },
+                MemStreamWriter {
+                    outgoing: self.outgoing,
+                    closed: false,
+                },
+            )
+        }
+    }
+
+    impl BiStreamReader for MemStreamReader {
+        async fn recv(&mut self) -> Option<Bytes> {
+            self.rx.recv().await
+        }
+    }
+
+    impl BiStreamWriter for MemStreamWriter {
         async fn send(&mut self, data: Bytes) -> anyhow::Result<()> {
             self.outgoing.lock().unwrap().push(data);
             Ok(())
@@ -210,8 +299,6 @@ mod tests {
 
         async fn close(&mut self) {
             self.closed = true;
-            // Drain pending sends — mimic half-close: no more reads, but already-sent
-            // data was captured in outgoing.
         }
     }
 
@@ -258,26 +345,21 @@ mod tests {
         let a_out = Arc::new(std::sync::Mutex::new(Vec::new()));
         let b_out = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        // A has no queued messages — recv returns None immediately.
         let a = MemStream::new(vec![], Arc::clone(&a_out));
         let b = MemStream::new(vec![Bytes::from("ignored")], Arc::clone(&b_out));
 
-        // Must complete; would hang if splice failed to detect the closed side.
         tokio::time::timeout(std::time::Duration::from_secs(1), splice(a, b))
             .await
             .expect("splice must finish when one side closes immediately");
     }
 
     /// splice must terminate promptly when the B side produces no messages.
-    ///
-    /// Symmetric counterpart to the A-closes test — guards both directions.
     #[tokio::test]
     async fn splice_terminates_when_b_closes_immediately() {
         let a_out = Arc::new(std::sync::Mutex::new(Vec::new()));
         let b_out = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         let a = MemStream::new(vec![Bytes::from("ignored")], Arc::clone(&a_out));
-        // B has no queued messages — recv returns None immediately.
         let b = MemStream::new(vec![], Arc::clone(&b_out));
 
         tokio::time::timeout(std::time::Duration::from_secs(1), splice(a, b))
@@ -285,33 +367,39 @@ mod tests {
             .expect("splice must finish when B closes immediately");
     }
 
-    /// A MemStream that always returns Err from send, simulating a broken connection.
-    struct FailingSendStream {
-        incoming: std::collections::VecDeque<Bytes>,
-        closed: bool,
+    /// A MemStream whose writer always errors on send — simulates a broken connection.
+    struct FailingWriterStream {
+        rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
     }
 
-    impl FailingSendStream {
+    struct FailingWriter;
+
+    impl FailingWriterStream {
         fn new(incoming: Vec<Bytes>) -> Self {
-            Self {
-                incoming: incoming.into(),
-                closed: false,
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            for msg in incoming {
+                let _ = tx.send(msg);
             }
+            drop(tx);
+            Self { rx }
         }
     }
 
-    impl BiStream for FailingSendStream {
-        async fn recv(&mut self) -> Option<Bytes> {
-            self.incoming.pop_front()
-        }
+    impl BiStream for FailingWriterStream {
+        type Reader = MemStreamReader;
+        type Writer = FailingWriter;
 
+        fn split(self) -> (MemStreamReader, FailingWriter) {
+            (MemStreamReader { rx: self.rx }, FailingWriter)
+        }
+    }
+
+    impl BiStreamWriter for FailingWriter {
         async fn send(&mut self, _data: Bytes) -> anyhow::Result<()> {
             Err(anyhow::anyhow!("send failed: connection broken"))
         }
 
-        async fn close(&mut self) {
-            self.closed = true;
-        }
+        async fn close(&mut self) {}
     }
 
     /// splice must stop relaying when a send call returns an error.
@@ -322,9 +410,8 @@ mod tests {
     async fn splice_terminates_on_send_error() {
         let a_out = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        // A sends one message; B.send() always fails.
         let a = MemStream::new(vec![Bytes::from("trigger")], Arc::clone(&a_out));
-        let b = FailingSendStream::new(vec![]);
+        let b = FailingWriterStream::new(vec![]);
 
         tokio::time::timeout(std::time::Duration::from_secs(1), splice(a, b))
             .await
@@ -339,21 +426,22 @@ mod tests {
     #[tokio::test]
     async fn mem_stream_recv_is_fifo_then_none() {
         let out = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut s = MemStream::new(
+        let s = MemStream::new(
             vec![Bytes::from("first"), Bytes::from("second")],
             Arc::clone(&out),
         );
+        let (mut reader, _writer) = s.split();
 
-        assert_eq!(s.recv().await, Some(Bytes::from("first")));
-        assert_eq!(s.recv().await, Some(Bytes::from("second")));
+        assert_eq!(reader.recv().await, Some(Bytes::from("first")));
+        assert_eq!(reader.recv().await, Some(Bytes::from("second")));
         assert_eq!(
-            s.recv().await,
+            reader.recv().await,
             None,
             "recv must return None once the queue is drained"
         );
     }
 
-    /// BiStream::close on MemStream sets the closed flag.
+    /// BiStream::close on MemStream's writer sets the closed flag.
     ///
     /// The splice loop calls close() on the opposite endpoint when one direction
     /// finishes. If close() were a no-op that silently dropped the signal, the
@@ -361,11 +449,12 @@ mod tests {
     #[tokio::test]
     async fn mem_stream_close_sets_closed_flag() {
         let out = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut s = MemStream::new(vec![], Arc::clone(&out));
+        let s = MemStream::new(vec![], Arc::clone(&out));
+        let (_reader, mut writer) = s.split();
 
-        assert!(!s.closed, "stream must start open");
-        s.close().await;
-        assert!(s.closed, "close() must mark the stream as closed");
+        assert!(!writer.closed, "stream must start open");
+        writer.close().await;
+        assert!(writer.closed, "close() must mark the stream as closed");
     }
 
     /// BiStream::send on MemStream appends to the shared outgoing buffer.
@@ -376,16 +465,61 @@ mod tests {
     #[tokio::test]
     async fn mem_stream_send_appends_to_outgoing() {
         let out = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut s = MemStream::new(vec![], Arc::clone(&out));
+        let s = MemStream::new(vec![], Arc::clone(&out));
+        let (_reader, mut writer) = s.split();
 
-        s.send(Bytes::from("a")).await.unwrap();
-        s.send(Bytes::from("b")).await.unwrap();
+        writer.send(Bytes::from("a")).await.unwrap();
+        writer.send(Bytes::from("b")).await.unwrap();
 
         let captured = out.lock().unwrap().clone();
         assert_eq!(
             captured,
             vec![Bytes::from("a"), Bytes::from("b")],
             "send() must append messages to the outgoing buffer in order"
+        );
+    }
+
+    /// Regression: splice must not deadlock when one direction has many more
+    /// messages than the other (e.g. portforward tarball download).
+    ///
+    /// The portforward EOF bug: kubelet sends a large tarball (many B→A frames)
+    /// while kubectl is silent (no A→B frames). The old Arc<Mutex<>> approach
+    /// deadlocked because the reader held mutex-A across recv().await, blocking
+    /// the writer from sending tarball data to kubectl through the same mutex.
+    ///
+    /// With split halves, there is no shared state between the read and write
+    /// tasks for the same stream, so this deadlock cannot occur.
+    #[tokio::test]
+    async fn splice_handles_large_one_directional_transfer() {
+        let a_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let b_out = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // A sends nothing — simulates kubectl waiting for data.
+        let a = MemStream::new(vec![], Arc::clone(&a_out));
+
+        // B sends 1000 messages — simulates kubelet streaming a tarball.
+        let b_msgs: Vec<Bytes> = (0u32..1000)
+            .map(|i| Bytes::from(i.to_be_bytes().to_vec()))
+            .collect();
+        let b = MemStream::new(b_msgs.clone(), Arc::clone(&b_out));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            splice(a, b),
+        )
+        .await
+        .expect("splice must not deadlock during large one-directional transfer (portforward tarball regression)");
+
+        // All B messages must have arrived at A.
+        let a_received = a_out.lock().unwrap().clone();
+        assert_eq!(
+            a_received.len(),
+            1000,
+            "all 1000 messages from B must reach A — deadlock would cause fewer or none to arrive"
+        );
+        assert_eq!(
+            a_received, b_msgs,
+            "messages must arrive at A in order and unmodified"
         );
     }
 }
