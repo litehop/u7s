@@ -67,6 +67,9 @@ pub struct ListResponse {
     /// Set when more items remain after this page. Clients pass this back as `continue_key`
     /// (after base64-encoding) to get the next page.
     pub continue_key: Option<String>,
+    /// Number of items remaining after this page (i.e. not returned in items).
+    /// Set only when continue_key is Some; None when all items fit in this page.
+    pub remaining_count: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -631,12 +634,36 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         |r| r.get::<_, i64>(0).map(|v| v as u64),
     )?;
 
+    // When there are more pages, count the remaining items so callers can populate
+    // metadata.remainingItemCount in list responses (required by chunking conformance).
+    let remaining_count = match &continue_key {
+        None => None,
+        Some(cursor) => {
+            let upper = prefix_upper_bound(prefix);
+            let count: u64 = if upper.is_empty() {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM objects WHERE key >= ?1 AND key > ?2",
+                    params![prefix, cursor],
+                    |r| r.get::<_, i64>(0).map(|v| v as u64),
+                )?
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3",
+                    params![prefix, &upper, cursor],
+                    |r| r.get::<_, i64>(0).map(|v| v as u64),
+                )?
+            };
+            Some(count)
+        }
+    };
+
     conn.execute_batch("COMMIT")?;
 
     Ok(ListResponse {
         items,
         revision: snapshot_revision,
         continue_key,
+        remaining_count,
     })
 }
 

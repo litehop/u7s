@@ -173,6 +173,7 @@ pub async fn list_csr<S: Store>(
         resp.revision,
         items,
         resp.continue_key,
+        resp.remaining_count,
     );
     Ok(Json(body).into_response())
 }

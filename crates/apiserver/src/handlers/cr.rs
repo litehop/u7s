@@ -513,7 +513,8 @@ pub async fn list_cr<S: Store>(
         &version,
         resp.revision,
         items,
-        None,
+        resp.continue_key,
+        resp.remaining_count,
     );
     Ok(Json(body).into_response())
 }
@@ -834,7 +835,8 @@ pub async fn list_cr_namespaced<S: Store>(
         &version,
         resp.revision,
         items,
-        None,
+        resp.continue_key,
+        resp.remaining_count,
     );
     Ok(Json(body).into_response())
 }
@@ -4116,6 +4118,7 @@ mod tests {
             "v1alpha1",
             42,
             vec![],
+            None,
             None,
         );
         let api_version = body["apiVersion"].as_str().unwrap_or("");
