@@ -229,31 +229,6 @@ impl<S: Store> AppState<S> {
         webhook_identity_pem: Option<Vec<u8>>,
         service_ip_allocator: Option<ServiceIpAllocator>,
     ) -> Self {
-        Self::new_with_ca_and_kubelet_identity(
-            store,
-            sa_key,
-            sa_decoding_key,
-            token_map,
-            server_address,
-            cluster_ca_der,
-            webhook_identity_pem,
-            service_ip_allocator,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_ca_and_kubelet_identity(
-        store: Arc<S>,
-        sa_key: Option<jsonwebtoken::EncodingKey>,
-        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
-        token_map: HashMap<String, UserInfo>,
-        server_address: String,
-        cluster_ca_der: Option<Vec<u8>>,
-        webhook_identity_pem: Option<Vec<u8>>,
-        service_ip_allocator: Option<ServiceIpAllocator>,
-        kubelet_client_identity_pem: Option<Vec<u8>>,
-    ) -> Self {
         Self::new_with_ca_and_kubelet_identity_and_address(
             store,
             sa_key,
@@ -263,7 +238,7 @@ impl<S: Store> AppState<S> {
             cluster_ca_der,
             webhook_identity_pem,
             service_ip_allocator,
-            kubelet_client_identity_pem,
+            None,
             None,
         )
     }
