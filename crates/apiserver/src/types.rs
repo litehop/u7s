@@ -525,7 +525,9 @@ impl Object {
         // serde_json::Value always serializes to a Vec<u8>: the writer
         // (Vec<u8>) never produces I/O errors and Value holds only
         // JSON-representable data.
-        Bytes::from(serde_json::to_vec(&self.body).expect("serde_json::Value is always serializable"))
+        Bytes::from(
+            serde_json::to_vec(&self.body).expect("serde_json::Value is always serializable"),
+        )
     }
 
     pub fn from_bytes(bytes: &Bytes) -> Result<Self, serde_json::Error> {
