@@ -202,20 +202,32 @@ struct Container {
     termination_message_policy: String,
 }
 
-/// PodSpec — only containers (field 3) is decoded; other fields are ignored.
+/// PodSpec — k8s.io/api/core/v1/generated.proto
+/// Field numbers match the official proto exactly:
+///   field 1  = volumes (skipped — not needed for routing)
+///   field 2  = containers (repeated Container)
+///   field 3  = restartPolicy (string)
+///   field 4  = terminationGracePeriodSeconds (int64, skipped)
+///   field 5  = activeDeadlineSeconds (int64, skipped)
+///   field 6  = dnsPolicy (string, skipped)
+///   field 7  = nodeSelector (map, skipped)
+///   field 8  = serviceAccountName (string)
+///   field 9  = automountServiceAccountToken (bool, skipped)
+///   field 10 = nodeName (string)
+///   field 11 = hostNetwork (bool, skipped)
 #[derive(Clone, PartialEq, Message)]
 struct PodSpec {
-    /// containers (field 3, repeated Container)
-    #[prost(message, repeated, tag = "3")]
+    /// containers (field 2, repeated Container)
+    #[prost(message, repeated, tag = "2")]
     containers: Vec<Container>,
-    /// restartPolicy (field 4, string)
-    #[prost(string, tag = "4")]
+    /// restartPolicy (field 3, string)
+    #[prost(string, tag = "3")]
     restart_policy: String,
-    /// serviceAccountName (field 9, string)
-    #[prost(string, tag = "9")]
+    /// serviceAccountName (field 8, string)
+    #[prost(string, tag = "8")]
     service_account_name: String,
-    /// nodeName (field 11, string)
-    #[prost(string, tag = "11")]
+    /// nodeName (field 10, string)
+    #[prost(string, tag = "10")]
     node_name: String,
 }
 
@@ -2910,8 +2922,8 @@ mod tests {
         container.extend_from_slice(&encode_length_delimited(2, b"myapp:latest")); // image
         container.extend_from_slice(&encode_length_delimited(15, b"IfNotPresent")); // imagePullPolicy
 
-        // PodSpec: field 3 = repeated Container
-        let pod_spec = encode_length_delimited(3, &container);
+        // PodSpec: field 2 = repeated Container (k8s.io/api/core/v1/generated.proto)
+        let pod_spec = encode_length_delimited(2, &container);
 
         let mut pod_proto = encode_length_delimited(1, &obj_meta); // Pod.field 1 = ObjectMeta
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec)); // Pod.field 2 = PodSpec
@@ -2959,7 +2971,8 @@ mod tests {
         let mut container = encode_length_delimited(1, b"c");
         container.extend_from_slice(&encode_length_delimited(2, b"img"));
 
-        let pod_spec = encode_length_delimited(3, &container);
+        // PodSpec.containers = field 2 (k8s.io/api/core/v1/generated.proto)
+        let pod_spec = encode_length_delimited(2, &container);
 
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
@@ -2990,6 +3003,114 @@ mod tests {
             .as_array()
             .expect("containers must be an empty array when Pod has no containers");
         assert!(containers.is_empty(), "containers array must be empty");
+    }
+
+    /// decode_pod_proto must decode a realistic kubectl pod proto with restartPolicy set.
+    ///
+    /// kubectl run nginx --image=nginx sends PodSpec with containers at field 2 (k8s proto) and
+    /// restartPolicy at field 3 (k8s proto). The previous PodSpec struct used field 3 for
+    /// containers and field 4 for restartPolicy — wrong field numbers — causing prost to try to
+    /// decode the restartPolicy string ("Always") as a Container sub-message, which fails with a
+    /// wire-type error and makes decode_pod_proto return None. That triggers extract_body to
+    /// return raw proto bytes, and Object::from_bytes fails with "invalid JSON".
+    #[test]
+    fn decode_pod_proto_with_restart_policy_survives_decode() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "nginx", namespace: "default" },
+        //   spec: PodSpec {
+        //     containers: [Container { name: "nginx", image: "nginx:latest" }],  // field 2
+        //     restartPolicy: "Always",                                            // field 3
+        //   }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"nginx");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        let mut container = encode_length_delimited(1, b"nginx");
+        container.extend_from_slice(&encode_length_delimited(2, b"nginx:latest"));
+
+        // PodSpec: field 2 = containers, field 3 = restartPolicy
+        let mut pod_spec = encode_length_delimited(2, &container);
+        pod_spec.extend_from_slice(&encode_length_delimited(3, b"Always"));
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto).expect(
+            "decode_pod_proto must return Some even when restartPolicy is present — \
+             without the fix, prost tries to decode restartPolicy string as Container \
+             sub-message, hits an invalid wire type, and returns Err; that causes \
+             extract_body to return raw proto bytes and Object::from_bytes to fail \
+             with 'invalid JSON: expected value at line 1 column 1'",
+        );
+
+        assert_eq!(result["kind"], "Pod");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "nginx", "name must be decoded");
+        assert_eq!(
+            result["metadata"]["namespace"], "default",
+            "namespace must be decoded"
+        );
+        assert_eq!(
+            result["spec"]["restartPolicy"], "Always",
+            "restartPolicy must be decoded from field 3 — regression for the wrong-field-number bug"
+        );
+        let containers = result["spec"]["containers"]
+            .as_array()
+            .expect("spec.containers must be an array");
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0]["name"], "nginx");
+        assert_eq!(containers[0]["image"], "nginx:latest");
+    }
+
+    /// decode_pod_proto must decode serviceAccountName and nodeName at the correct field numbers.
+    ///
+    /// kubectl run uses serviceAccountName=default (field 8 in k8s PodSpec proto) and
+    /// nodeName is set by the scheduler (field 10). The previous struct placed these at fields
+    /// 9 and 11 respectively, causing field 9 (automountServiceAccountToken, bool) to mismatch
+    /// when decoded as string and field 11 (hostNetwork, bool) to mismatch similarly — both
+    /// can trigger prost DecodeError returning None from decode_pod_proto.
+    #[test]
+    fn decode_pod_proto_with_service_account_and_node_name() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "app", namespace: "default" },
+        //   spec: PodSpec {
+        //     containers: [Container { name: "app", image: "app:v1" }],  // field 2
+        //     restartPolicy: "Always",                                    // field 3
+        //     serviceAccountName: "my-sa",                               // field 8
+        //     nodeName: "node-1",                                        // field 10
+        //   }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"app");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        let mut container = encode_length_delimited(1, b"app");
+        container.extend_from_slice(&encode_length_delimited(2, b"app:v1"));
+
+        let mut pod_spec = encode_length_delimited(2, &container); // containers = field 2
+        pod_spec.extend_from_slice(&encode_length_delimited(3, b"Always")); // restartPolicy = field 3
+        pod_spec.extend_from_slice(&encode_length_delimited(8, b"my-sa")); // serviceAccountName = field 8
+        pod_spec.extend_from_slice(&encode_length_delimited(10, b"node-1")); // nodeName = field 10
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto).expect(
+            "decode_pod_proto must succeed with serviceAccountName and nodeName — \
+             wrong field numbers (9 vs 8 for serviceAccountName, 11 vs 10 for nodeName) \
+             cause type mismatches with automountServiceAccountToken (bool) and \
+             hostNetwork (bool) which trigger DecodeError",
+        );
+
+        assert_eq!(result["kind"], "Pod");
+        assert_eq!(result["metadata"]["name"], "app");
+        assert_eq!(
+            result["spec"]["serviceAccountName"], "my-sa",
+            "serviceAccountName must be decoded from field 8"
+        );
+        assert_eq!(
+            result["spec"]["nodeName"], "node-1",
+            "nodeName must be decoded from field 10"
+        );
     }
 
     // ---------------------------------------------------------------------------

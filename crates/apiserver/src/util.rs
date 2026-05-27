@@ -655,4 +655,124 @@ mod tests {
             "inner JSON must be returned as-is when contentType=application/json"
         );
     }
+
+    /// test_pod_create_kubectl_wire_format
+    ///
+    /// kubectl run nginx --image=nginx sends a proto-encoded Pod in the k8s protobuf envelope
+    /// with empty contentType (no field 4 in the Unknown). The Pod proto uses k8s field numbers:
+    ///   PodSpec.containers = field 2 (NOT field 3 as was incorrectly assumed)
+    ///   PodSpec.restartPolicy = field 3 (NOT field 4)
+    ///
+    /// With the wrong field numbers, prost tried to decode the restartPolicy string "Always" as
+    /// a repeated Container sub-message, hit an invalid wire type in the string bytes, returned
+    /// DecodeError, decode_pod_proto returned None, extract_body returned raw proto bytes, and
+    /// Object::from_bytes failed with "invalid JSON: expected value at line 1 column 1".
+    /// This caused ~175 pod creation failures in sonobuoy e2e.
+    #[test]
+    fn test_pod_create_kubectl_wire_format() {
+        // Build ObjectMeta { name: "nginx", namespace: "default" }
+        let obj_meta = build_object_meta(b"nginx", Some(b"default"));
+
+        // Build Container { name: "nginx", image: "nginx:latest" }
+        let mut container = encode_ld(1, b"nginx"); // name
+        container.extend_from_slice(&encode_ld(2, b"nginx:latest")); // image
+
+        // PodSpec { containers (field 2) = [container], restartPolicy (field 3) = "Always" }
+        let mut pod_spec = encode_ld(2, &container); // containers = field 2 in k8s proto
+        pod_spec.extend_from_slice(&encode_ld(3, b"Always")); // restartPolicy = field 3
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let mut pod_proto = encode_ld(1, &obj_meta); // metadata
+        pod_proto.extend_from_slice(&encode_ld(2, &pod_spec)); // spec
+
+        // kubectl omits contentType field 4 for core types
+        let body = build_kubectl_proto_body(b"v1", b"Pod", &pod_proto, None);
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect(
+            "extract_body must produce valid JSON for a kubectl pod proto — \
+             before the fix, PodSpec used wrong field numbers (containers at field 3 instead \
+             of 2, restartPolicy at field 4 instead of 3), causing decode_pod_proto to return \
+             None when restartPolicy 'Always' was misinterpreted as Container bytes, \
+             triggering 'invalid JSON' on all Pod creations (sonobuoy: ~175 failures)",
+        );
+
+        assert_eq!(json["kind"], "Pod", "kind must be Pod");
+        assert_eq!(json["apiVersion"], "v1", "apiVersion must be v1");
+        assert_eq!(
+            json["metadata"]["name"], "nginx",
+            "name must survive proto decode"
+        );
+        assert_eq!(
+            json["metadata"]["namespace"], "default",
+            "namespace must survive proto decode"
+        );
+        assert_eq!(
+            json["spec"]["restartPolicy"], "Always",
+            "restartPolicy must be decoded from field 3 in PodSpec"
+        );
+        let containers = json["spec"]["containers"]
+            .as_array()
+            .expect("spec.containers must be an array");
+        assert_eq!(containers.len(), 1, "one container must be decoded");
+        assert_eq!(
+            containers[0]["name"], "nginx",
+            "container name must survive"
+        );
+        assert_eq!(
+            containers[0]["image"], "nginx:latest",
+            "container image must survive"
+        );
+    }
+
+    /// test_crd_create_proto_envelope_json_body
+    ///
+    /// kubectl create -f crd.yaml with Content-Type: application/vnd.kubernetes.protobuf sends
+    /// a k8s proto envelope with contentType="application/json" and the CRD JSON as raw bytes.
+    /// kubectl does this because CustomResourceDefinition is not a core type — it has no
+    /// registered proto codec in client-go, so it falls back to JSON-inside-proto-envelope.
+    ///
+    /// extract_body must return the inner JSON unchanged via the contentType="application/json"
+    /// path. Previously there was no test for this path with CRDs, so the sonobuoy failures
+    /// (~18 cases with "invalid JSON") were invisible until e2e.
+    #[test]
+    fn test_crd_create_proto_envelope_json_body() {
+        let crd_json = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": "widgets.example.com" },
+            "spec": {
+                "group": "example.com",
+                "names": { "kind": "Widget", "plural": "widgets", "singular": "widget" },
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true, "schema": {
+                    "openAPIV3Schema": { "type": "object" }
+                }}]
+            }
+        });
+        let crd_json_bytes = serde_json::to_vec(&crd_json).unwrap();
+
+        // kubectl sends CRDs as JSON inside the protobuf envelope with contentType=application/json
+        let body = build_kubectl_proto_body(
+            b"apiextensions.k8s.io/v1",
+            b"CustomResourceDefinition",
+            &crd_json_bytes,
+            Some(b"application/json"),
+        );
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect(
+            "extract_body must return the inner JSON for CRD proto envelope — \
+             CRD has no proto codec so kubectl wraps JSON in the proto envelope with \
+             contentType=application/json; extract_body must return it via the \
+             env.content_type == 'application/json' path",
+        );
+
+        assert_eq!(json["kind"], "CustomResourceDefinition");
+        assert_eq!(json["apiVersion"], "apiextensions.k8s.io/v1");
+        assert_eq!(json["metadata"]["name"], "widgets.example.com");
+        assert_eq!(json["spec"]["group"], "example.com");
+    }
 }
