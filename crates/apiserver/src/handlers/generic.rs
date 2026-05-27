@@ -841,7 +841,7 @@ mod tests {
         let mut mac = <Hmac<Sha256>>::new_from_slice(TEST_KEY).expect("HMAC accepts any key size");
         mac.update(payload.as_bytes());
         let sig = mac.finalize().into_bytes();
-        let stale_token = format!("{payload_b64}.{}", b64.encode(&sig));
+        let stale_token = format!("{payload_b64}.{}", b64.encode(sig));
 
         let err = decode_continue(&stale_token, TEST_KEY).unwrap_err();
         assert_eq!(
