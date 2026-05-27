@@ -228,18 +228,20 @@ pub async fn list_crds<S: Store>(
         .await?;
         return super::watch::watch_generic(
             state,
-            prefix,
-            watch_api_version,
-            watch_kind,
-            query.resource_version.unwrap_or(0),
-            initial_items,
-            query.label_selector,
-            query.field_selector,
-            query.allow_watch_bookmarks == Some(true),
-            user.username,
-            pom,
-            GROUP.to_string(),
-            PLURAL.to_string(),
+            super::watch::WatchConfig {
+                prefix,
+                api_version: watch_api_version,
+                kind: watch_kind,
+                from_revision: query.resource_version.unwrap_or(0),
+                initial_items,
+                label_selector: query.label_selector,
+                field_selector: query.field_selector,
+                allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
+                username: user.username,
+                as_partial_object_metadata: pom,
+                group: GROUP.to_string(),
+                plural: PLURAL.to_string(),
+            },
         )
         .await;
     }

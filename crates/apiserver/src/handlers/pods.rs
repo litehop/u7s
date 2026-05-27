@@ -173,15 +173,22 @@ pub async fn list_pods<S: Store>(
         } else {
             None
         };
-        return watch_pods(
+        return super::watch::watch_generic(
             state,
-            prefix,
-            ns,
-            from_rv,
-            query.field_selector,
-            initial_pods,
-            query.allow_watch_bookmarks == Some(true),
-            user.username,
+            super::watch::WatchConfig {
+                prefix,
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                from_revision: from_rv,
+                initial_items: initial_pods,
+                label_selector: None,
+                field_selector: query.field_selector,
+                allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
+                username: user.username,
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "pods".into(),
+            },
         )
         .await;
     }
@@ -230,42 +237,6 @@ pub async fn list_pods<S: Store>(
     });
 
     Ok(Json(body).into_response())
-}
-
-/// Thin wrapper: delegate pod watch to `watch_generic`.
-///
-/// Pod-specific field selectors (spec.nodeName =, !=) are handled by
-/// `generic::object_matches_field_selector`, which was extended to support
-/// `spec.nodeName` alongside `metadata.name` / `metadata.namespace`.
-/// The `initial_pods` list is already filtered by the caller (list_pods)
-/// before being passed here, so `watch_generic` emits them as-is.
-#[allow(clippy::too_many_arguments)]
-async fn watch_pods<S: Store>(
-    state: AppState<S>,
-    prefix: String,
-    _ns: Namespace,
-    from_revision: u64,
-    field_selector: Option<String>,
-    initial_pods: Option<(Vec<serde_json::Value>, u64)>,
-    allow_watch_bookmarks: bool,
-    username: String,
-) -> Result<Response, crate::status::StatusError> {
-    super::watch::watch_generic(
-        state,
-        prefix,
-        "v1".into(),
-        "Pod".into(),
-        from_revision,
-        initial_pods,
-        None, // label_selector: pods watch does not filter by label
-        field_selector,
-        allow_watch_bookmarks,
-        username,
-        false,
-        "".into(),
-        "pods".into(),
-    )
-    .await
 }
 
 pub async fn create_pod<S: Store>(

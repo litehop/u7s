@@ -207,18 +207,18 @@ async fn main() -> anyhow::Result<()> {
     // the kubelet. Kubelet accepts certs with O=system:masters signed by the cluster CA.
     let mut kubelet_client_identity_pem = tls_material.kubelet_client_cert_pem.clone();
     kubelet_client_identity_pem.extend_from_slice(&tls_material.kubelet_client_key_pem);
-    let state = state::AppState::new_with_ca_and_kubelet_identity_and_address(
-        Arc::clone(&store),
-        sa_encoding_key,
+    let state = state::AppState::new_with_config(state::AppStateConfig {
+        store: Arc::clone(&store),
+        sa_key: sa_encoding_key,
         sa_decoding_key,
         token_map,
         server_address,
-        Some(tls_material.ca_cert_der.clone()),
-        Some(webhook_identity_pem),
+        cluster_ca_der: Some(tls_material.ca_cert_der.clone()),
+        webhook_identity_pem: Some(webhook_identity_pem),
         service_ip_allocator,
-        Some(kubelet_client_identity_pem),
-        args.kubelet_preferred_address,
-    );
+        kubelet_client_identity_pem: Some(kubelet_client_identity_pem),
+        kubelet_preferred_address: args.kubelet_preferred_address,
+    });
 
     // 10a. Populate RBAC index from persisted objects before serving.
     state.init().await;
@@ -2457,16 +2457,18 @@ mod tests {
         use std::sync::Arc;
         let store = Arc::new(make_store());
         let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
-        state::AppState::new_with_ca(
+        state::AppState::new_with_config(state::AppStateConfig {
             store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-            None,
-            None,
-            Some(alloc),
-        )
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: Some(alloc),
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+        })
     }
 
     /// POST a Service with no clusterIP → GET it back → clusterIP is in the configured CIDR.

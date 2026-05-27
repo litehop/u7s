@@ -65,18 +65,20 @@ pub async fn list_namespaces<S: Store>(
         .await?;
         return super::watch::watch_generic(
             state,
-            prefix,
-            "v1".to_string(),
-            "Namespace".to_string(),
-            query.resource_version.unwrap_or(0),
-            initial,
-            query.label_selector,
-            query.field_selector,
-            query.allow_watch_bookmarks == Some(true),
-            user.username,
-            false,
-            "".to_string(),
-            "namespaces".to_string(),
+            super::watch::WatchConfig {
+                prefix,
+                api_version: "v1".to_string(),
+                kind: "Namespace".to_string(),
+                from_revision: query.resource_version.unwrap_or(0),
+                initial_items: initial,
+                label_selector: query.label_selector,
+                field_selector: query.field_selector,
+                allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
+                username: user.username,
+                as_partial_object_metadata: false,
+                group: "".to_string(),
+                plural: "namespaces".to_string(),
+            },
         )
         .await;
     }

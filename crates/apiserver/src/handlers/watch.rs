@@ -231,35 +231,55 @@ pub(crate) fn object_matches_field_selector(obj: &serde_json::Value, selector: &
     true
 }
 
+/// Parameters for `watch_generic`.
+///
+/// Groups the arguments that previously caused a `clippy::too_many_arguments` warning.
+pub(crate) struct WatchConfig {
+    pub prefix: String,
+    pub api_version: String,
+    pub kind: String,
+    pub from_revision: u64,
+    pub initial_items: Option<(Vec<serde_json::Value>, u64)>,
+    pub label_selector: Option<String>,
+    pub field_selector: Option<String>,
+    pub allow_watch_bookmarks: bool,
+    pub username: String,
+    /// When true, wrap each ADDED/MODIFIED object as PartialObjectMetadata and use
+    /// "meta.k8s.io/v1"/"PartialObjectMetadata" for BOOKMARK and DELETED events.
+    /// The caller must also pass api_version="meta.k8s.io/v1" and kind="PartialObjectMetadata".
+    pub as_partial_object_metadata: bool,
+    pub group: String,
+    pub plural: String,
+}
+
 /// Stream watch events for a given store prefix in NDJSON format.
 /// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
 ///
-/// When `initial_items` is Some, those items are emitted as ADDED events first
+/// When `cfg.initial_items` is Some, those items are emitted as ADDED events first
 /// (implementing the Kubernetes 1.27+ sendInitialEvents protocol), followed by a
-/// BOOKMARK, before streaming live changes from `from_revision`.
+/// BOOKMARK, before streaming live changes from `cfg.from_revision`.
 ///
-/// `username` is the authenticated client identity used to enforce the per-client
+/// `cfg.username` is the authenticated client identity used to enforce the per-client
 /// watch stream concurrency limit (MAX_WATCHES_PER_CLIENT). Exceeding the limit
 /// returns HTTP 429 immediately without opening a watch stream.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn watch_generic<S: Store>(
     state: AppState<S>,
-    prefix: String,
-    api_version: String,
-    kind: String,
-    from_revision: u64,
-    initial_items: Option<(Vec<serde_json::Value>, u64)>,
-    label_selector: Option<String>,
-    field_selector: Option<String>,
-    allow_watch_bookmarks: bool,
-    username: String,
-    // When true, wrap each ADDED/MODIFIED object as PartialObjectMetadata and use
-    // "meta.k8s.io/v1"/"PartialObjectMetadata" for BOOKMARK and DELETED events.
-    // The caller must also pass api_version="meta.k8s.io/v1" and kind="PartialObjectMetadata".
-    as_partial_object_metadata: bool,
-    group: String,
-    plural: String,
+    cfg: WatchConfig,
 ) -> Result<Response, crate::status::StatusError> {
+    let WatchConfig {
+        prefix,
+        api_version,
+        kind,
+        from_revision,
+        initial_items,
+        label_selector,
+        field_selector,
+        allow_watch_bookmarks,
+        username,
+        as_partial_object_metadata,
+        group,
+        plural,
+    } = cfg;
     // Enforce per-client watch concurrency limit. Try to acquire a permit from
     // this user's semaphore. If the semaphore is exhausted (client already has
     // MAX_WATCHES_PER_CLIENT open streams), return 429 immediately.
@@ -681,18 +701,20 @@ mod tests {
 
         let result = watch_generic(
             state,
-            "/registry/test/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            10, // expired
-            None,
-            None,
-            None,
-            false,
-            "test-user".into(),
-            false,
-            "".into(),
-            "".into(),
+            WatchConfig {
+                prefix: "/registry/test/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 10, // expired
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+            },
         )
         .await;
 
@@ -731,18 +753,20 @@ mod tests {
 
         let result = watch_generic(
             state,
-            "/registry/test/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            0, // not expired
-            None,
-            None,
-            None,
-            false,
-            "test-user".into(),
-            false,
-            "".into(),
-            "".into(),
+            WatchConfig {
+                prefix: "/registry/test/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0, // not expired
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+            },
         )
         .await;
 
@@ -778,18 +802,20 @@ mod tests {
         // fresh list snapshot. from_revision=10 is below the horizon of 50.
         let result = watch_generic(
             state,
-            "/registry/test/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            10,                 // expired — below horizon of 50
-            Some((vec![], 50)), // sendInitialEvents already fetched snapshot at rv=50
-            None,
-            None,
-            false,
-            "test-user".into(),
-            false,
-            "".into(),
-            "".into(),
+            WatchConfig {
+                prefix: "/registry/test/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 10,                 // expired — below horizon of 50
+                initial_items: Some((vec![], 50)), // sendInitialEvents already fetched snapshot at rv=50
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+            },
         )
         .await;
 
@@ -854,18 +880,20 @@ mod tests {
 
         let result = watch_generic(
             state.clone(),
-            "/registry/test/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            0,
-            None,
-            None,
-            None,
-            false,
-            "alice".into(),
-            false,
-            "".into(),
-            "".into(),
+            WatchConfig {
+                prefix: "/registry/test/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "alice".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+            },
         )
         .await;
 
@@ -956,18 +984,20 @@ mod tests {
 
         let result = watch_generic(
             state.clone(),
-            "/registry/test/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            0,
-            None,
-            None,
-            None,
-            false,
-            "bob".into(),
-            false,
-            "".into(),
-            "".into(),
+            WatchConfig {
+                prefix: "/registry/test/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "bob".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+            },
         )
         .await;
 
@@ -1051,18 +1081,20 @@ mod tests {
         // Subscribe from rv=0 with a matching label selector; ring buffer will replay the event.
         let resp = watch_generic(
             state,
-            "/registry/configmaps/default/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            0,
-            None,
-            Some("app=frontend".into()),
-            None,
-            false,
-            "test-user".into(),
-            false,
-            "".into(),
-            "".into(),
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: Some("app=frontend".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+            },
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed for label selector test"));
@@ -1128,18 +1160,20 @@ mod tests {
         // Label selector "app=frontend" — the stored object has "app=backend".
         let resp = watch_generic(
             state,
-            "/registry/configmaps/default/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            0,
-            None,
-            Some("app=frontend".into()),
-            None,
-            false,
-            "test-user".into(),
-            false,
-            "".into(),
-            "".into(),
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: Some("app=frontend".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+            },
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed"));
@@ -1206,18 +1240,20 @@ mod tests {
         // The DELETED event must still arrive (not suppressed by the selector).
         let resp = watch_generic(
             state,
-            "/registry/configmaps/default/".into(),
-            "v1".into(),
-            "ConfigMap".into(),
-            0,
-            None,
-            Some("app=frontend".into()),
-            None,
-            false,
-            "test-user".into(),
-            false,
-            "".into(),
-            "".into(),
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: Some("app=frontend".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+            },
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed"));
@@ -1596,18 +1632,20 @@ mod tests {
 
         let resp = match watch_generic(
             state,
-            "/registry/gateway.networking.k8s.io/v1/gatewayclasses/".into(),
-            "gateway.networking.k8s.io/v1".into(),
-            "GatewayClass".into(),
-            0,
-            initial_items,
-            None,
-            None,
-            true, // allow_watch_bookmarks
-            "test-user".into(),
-            false,
-            "".into(),
-            "".into(),
+            WatchConfig {
+                prefix: "/registry/gateway.networking.k8s.io/v1/gatewayclasses/".into(),
+                api_version: "gateway.networking.k8s.io/v1".into(),
+                kind: "GatewayClass".into(),
+                from_revision: 0,
+                initial_items,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: true,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+            },
         )
         .await
         {
@@ -1683,18 +1721,20 @@ mod tests {
 
         let resp = watch_generic(
             state,
-            "/registry/services/default/".into(),
-            "v1".into(),
-            "Service".into(),
-            0,
-            None,
-            None,
-            None,
-            false,
-            "test-user".into(),
-            false,
-            "".into(),
-            "services".into(),
+            WatchConfig {
+                prefix: "/registry/services/default/".into(),
+                api_version: "v1".into(),
+                kind: "Service".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "services".into(),
+            },
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed"));
