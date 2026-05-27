@@ -13,6 +13,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "services") = (group, plural) {
         default_service(obj);
     }
+    if let ("", "events") = (group, plural) {
+        normalize_event_timestamps(obj);
+    }
 }
 
 /// Apply all Service defaults in the correct order.
@@ -93,6 +96,24 @@ fn default_node_ports(obj: &mut serde_json::Value) {
         port["nodePort"] = serde_json::Value::Number(next_candidate.into());
         used.insert(next_candidate);
         next_candidate += 1;
+    }
+}
+
+/// Normalize Event timestamp fields to include microsecond precision.
+///
+/// client-go's MicroTime codec (used for `eventTime`) and some Event field
+/// parsers require fractional seconds: `2017-09-20T13:49:16.000000Z`.
+/// Without the `.000000` suffix, client-go raises:
+///   `parsing time "…Z" as "…000000Z07:00": cannot parse "Z" as ".000000"`.
+///
+/// This function normalizes `lastTimestamp`, `firstTimestamp`, and `eventTime`
+/// in-place by appending `.000000` to any second-precision RFC3339 string.
+pub fn normalize_event_timestamps(obj: &mut serde_json::Value) {
+    for field in &["lastTimestamp", "firstTimestamp", "eventTime"] {
+        if let Some(s) = obj[field].as_str() {
+            let normalized = crate::util::normalize_rfc3339_to_micro(s);
+            obj[*field] = serde_json::Value::String(normalized);
+        }
     }
 }
 
@@ -424,6 +445,95 @@ mod tests {
             obj["spec"]["clusterIPs"],
             serde_json::json!(["10.96.0.1", "fd00::1"]),
             "existing clusterIPs must not be overwritten"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Event timestamp normalization
+    // ---------------------------------------------------------------------------
+
+    /// Event timestamps without microseconds must be normalized to include `.000000`.
+    ///
+    /// client-go's MicroTime codec uses format `2006-01-02T15:04:05.000000Z07:00`
+    /// and fails to parse `2017-09-20T13:49:16Z` with:
+    ///   `cannot parse "Z" as ".000000"`
+    /// If this normalization is removed, conformance Event lifecycle tests will fail.
+    #[test]
+    fn event_timestamps_normalized_to_microsecond_precision() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "lastTimestamp": "2017-09-20T13:49:16Z",
+            "firstTimestamp": "2017-09-20T13:49:10Z",
+            "eventTime": "2017-09-20T13:49:16Z"
+        });
+
+        apply_defaults("", "events", &mut obj);
+
+        assert_eq!(
+            obj["lastTimestamp"], "2017-09-20T13:49:16.000000Z",
+            "lastTimestamp must have .000000 suffix so client-go MicroTime parses it"
+        );
+        assert_eq!(
+            obj["firstTimestamp"], "2017-09-20T13:49:10.000000Z",
+            "firstTimestamp must have .000000 suffix so client-go MicroTime parses it"
+        );
+        assert_eq!(
+            obj["eventTime"], "2017-09-20T13:49:16.000000Z",
+            "eventTime must have .000000 suffix so client-go MicroTime parses it"
+        );
+    }
+
+    /// Already-precise timestamps must not be modified (idempotent).
+    ///
+    /// If already-precise timestamps were overwritten, sub-microsecond precision
+    /// from client-go (e.g. `.123456`) would be silently truncated.
+    #[test]
+    fn event_timestamps_already_precise_are_unchanged() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "lastTimestamp": "2017-09-20T13:49:16.123456Z",
+            "firstTimestamp": "2017-09-20T13:49:10.000001Z",
+            "eventTime": "2017-09-20T13:49:16.999999Z"
+        });
+
+        apply_defaults("", "events", &mut obj);
+
+        assert_eq!(
+            obj["lastTimestamp"], "2017-09-20T13:49:16.123456Z",
+            "existing sub-second precision must not be overwritten"
+        );
+        assert_eq!(
+            obj["firstTimestamp"], "2017-09-20T13:49:10.000001Z",
+            "existing sub-second precision must not be overwritten"
+        );
+        assert_eq!(
+            obj["eventTime"], "2017-09-20T13:49:16.999999Z",
+            "existing sub-second precision must not be overwritten"
+        );
+    }
+
+    /// Events without timestamp fields must not be modified.
+    ///
+    /// Prevents panics when optional fields are absent.
+    #[test]
+    fn event_without_timestamps_is_unchanged() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "message": "something happened"
+        });
+        let original = obj.clone();
+
+        apply_defaults("", "events", &mut obj);
+
+        assert_eq!(
+            obj, original,
+            "Event without timestamp fields must not be modified"
         );
     }
 

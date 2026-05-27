@@ -122,6 +122,38 @@ pub fn secs_to_rfc3339(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+/// Normalize an RFC3339 timestamp string to include microsecond precision.
+///
+/// client-go's `metav1.MicroTime` (used for `Event.eventTime`) and some Event
+/// time field codecs require the fractional-seconds component to be present, e.g.
+/// `2017-09-20T13:49:16.000000Z`.  Timestamps produced without sub-second parts
+/// (`2017-09-20T13:49:16Z`) cause a parse error in client-go:
+///   `parsing time "…Z" as "…000000Z07:00": cannot parse "Z" as ".000000"`.
+///
+/// This function appends `.000000` when the string is a bare RFC3339 timestamp
+/// (19-char date-time part ending with `Z` or `+HH:MM`/`-HH:MM`) with no
+/// fractional-seconds component already present.  Already-precise strings are
+/// returned unchanged.  Non-timestamp strings (null, empty) are returned as-is.
+pub fn normalize_rfc3339_to_micro(s: &str) -> String {
+    // A bare second-precision RFC3339 with Z suffix looks like:
+    //   "2017-09-20T13:49:16Z"  (20 chars, ends with 'Z', 'T' at index 10)
+    // With +HH:MM offset:
+    //   "2017-09-20T13:49:16+00:00"  (25 chars)
+    // Already has fractional seconds if a '.' appears after the 'T'.
+    if let Some(t_pos) = s.find('T') {
+        let after_t = &s[t_pos + 1..];
+        if !after_t.contains('.') {
+            // No fractional seconds — insert `.000000` before the timezone suffix.
+            // Find where the timezone starts: 'Z' or '+'/'-' after the time digits.
+            if let Some(tz_pos) = after_t.find(['Z', '+', '-']) {
+                let (date_time, tz) = s.split_at(t_pos + 1 + tz_pos);
+                return format!("{date_time}.000000{tz}");
+            }
+        }
+    }
+    s.to_string()
+}
+
 fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     // 400-year cycle = 146097 days
     let n400 = days / 146097;
@@ -331,6 +363,53 @@ mod tests {
         assert!(
             now.as_str() >= "2024-01-01T00:00:00Z",
             "implausibly old: {now}"
+        );
+    }
+
+    // -- normalize_rfc3339_to_micro --
+
+    /// Bare RFC3339 (no fractional seconds) must gain `.000000` suffix.
+    ///
+    /// client-go's MicroTime codec requires the fractional part; without it,
+    /// Event lifecycle conformance tests fail with "cannot parse Z as .000000".
+    #[test]
+    fn normalize_rfc3339_to_micro_appends_zeros_for_bare_z() {
+        assert_eq!(
+            normalize_rfc3339_to_micro("2017-09-20T13:49:16Z"),
+            "2017-09-20T13:49:16.000000Z",
+            "bare RFC3339 with Z suffix must gain .000000"
+        );
+    }
+
+    /// Already-precise timestamps must be returned unchanged.
+    ///
+    /// Sub-microsecond precision from client-go must not be silently truncated.
+    #[test]
+    fn normalize_rfc3339_to_micro_leaves_precise_unchanged() {
+        assert_eq!(
+            normalize_rfc3339_to_micro("2017-09-20T13:49:16.123456Z"),
+            "2017-09-20T13:49:16.123456Z",
+            "timestamp with fractional seconds must not be modified"
+        );
+    }
+
+    /// Zero-precision suffix (`.000000`) must be left unchanged (idempotent).
+    #[test]
+    fn normalize_rfc3339_to_micro_idempotent_on_zeros() {
+        assert_eq!(
+            normalize_rfc3339_to_micro("2017-09-20T13:49:16.000000Z"),
+            "2017-09-20T13:49:16.000000Z",
+            "already-normalized timestamp must not be double-suffixed"
+        );
+    }
+
+    /// Timezone-offset variant must also gain `.000000` before the offset.
+    #[test]
+    fn normalize_rfc3339_to_micro_handles_tz_offset() {
+        assert_eq!(
+            normalize_rfc3339_to_micro("2017-09-20T13:49:16+05:30"),
+            "2017-09-20T13:49:16.000000+05:30",
+            "bare RFC3339 with numeric TZ offset must gain .000000 before offset"
         );
     }
 
