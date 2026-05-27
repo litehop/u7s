@@ -4873,7 +4873,10 @@ mod tests {
         );
 
         assert_eq!(result["kind"], "StatefulSet", "kind must be StatefulSet");
-        assert_eq!(result["apiVersion"], "apps/v1", "apiVersion must be apps/v1");
+        assert_eq!(
+            result["apiVersion"], "apps/v1",
+            "apiVersion must be apps/v1"
+        );
         assert_eq!(result["metadata"]["name"], "my-sts");
         assert_eq!(result["metadata"]["namespace"], "default");
     }
@@ -4898,7 +4901,10 @@ mod tests {
         );
 
         assert_eq!(result["kind"], "Deployment", "kind must be Deployment");
-        assert_eq!(result["apiVersion"], "apps/v1", "apiVersion must be apps/v1");
+        assert_eq!(
+            result["apiVersion"], "apps/v1",
+            "apiVersion must be apps/v1"
+        );
         assert_eq!(result["metadata"]["name"], "my-deploy");
     }
 
@@ -4922,7 +4928,10 @@ mod tests {
         );
 
         assert_eq!(result["kind"], "DaemonSet", "kind must be DaemonSet");
-        assert_eq!(result["apiVersion"], "apps/v1", "apiVersion must be apps/v1");
+        assert_eq!(
+            result["apiVersion"], "apps/v1",
+            "apiVersion must be apps/v1"
+        );
         assert_eq!(result["metadata"]["name"], "my-ds");
     }
 
@@ -4946,7 +4955,10 @@ mod tests {
         );
 
         assert_eq!(result["kind"], "ReplicaSet", "kind must be ReplicaSet");
-        assert_eq!(result["apiVersion"], "apps/v1", "apiVersion must be apps/v1");
+        assert_eq!(
+            result["apiVersion"], "apps/v1",
+            "apiVersion must be apps/v1"
+        );
         assert_eq!(result["metadata"]["name"], "my-rs");
     }
 
@@ -4973,7 +4985,10 @@ mod tests {
              proto clients receive 400 without this decoder",
         );
 
-        assert_eq!(result["kind"], "ServiceAccount", "kind must be ServiceAccount");
+        assert_eq!(
+            result["kind"], "ServiceAccount",
+            "kind must be ServiceAccount"
+        );
         assert_eq!(result["apiVersion"], "v1", "apiVersion must be v1");
         assert_eq!(result["metadata"]["name"], "my-sa");
         assert_eq!(result["metadata"]["namespace"], "default");
@@ -4998,7 +5013,10 @@ mod tests {
              proto clients receive 400 without this decoder",
         );
 
-        assert_eq!(result["kind"], "PersistentVolumeClaim", "kind must be PersistentVolumeClaim");
+        assert_eq!(
+            result["kind"], "PersistentVolumeClaim",
+            "kind must be PersistentVolumeClaim"
+        );
         assert_eq!(result["apiVersion"], "v1", "apiVersion must be v1");
         assert_eq!(result["metadata"]["name"], "my-pvc");
         assert_eq!(result["metadata"]["namespace"], "default");
