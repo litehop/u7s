@@ -645,6 +645,110 @@ struct RoleBinding {
     role_ref: Option<RoleRef>,
 }
 
+// --- k8s.io/api/batch/v1/generated.proto ---
+
+/// JobSpec — k8s.io/api/batch/v1/generated.proto
+/// Only scalar/string fields are decoded; template (field 5, PodTemplateSpec) is skipped —
+/// PodSpec is deeply nested and the same strategy as PodTemplate applies.
+#[derive(Clone, PartialEq, Message)]
+struct JobSpec {
+    /// parallelism (field 1, int32)
+    #[prost(int32, tag = "1")]
+    parallelism: i32,
+    /// completions (field 2, int32)
+    #[prost(int32, tag = "2")]
+    completions: i32,
+    /// activeDeadlineSeconds (field 3, int64)
+    #[prost(int64, tag = "3")]
+    active_deadline_seconds: i64,
+    /// selector (field 4, message LabelSelector) — decoded as raw bytes, not needed for routing
+    #[prost(bytes = "vec", tag = "4")]
+    selector: Vec<u8>,
+    /// template (field 5, PodTemplateSpec) — decoded as raw bytes; PodSpec is deeply nested
+    #[prost(bytes = "vec", tag = "5")]
+    template: Vec<u8>,
+    /// backoffLimit (field 6, int32)
+    #[prost(int32, tag = "6")]
+    backoff_limit: i32,
+    /// manualSelector (field 7, bool)
+    #[prost(bool, tag = "7")]
+    manual_selector: bool,
+    /// completionMode (field 8, string)
+    #[prost(string, tag = "8")]
+    completion_mode: String,
+    /// suspend (field 9, bool)
+    #[prost(bool, tag = "9")]
+    suspend: bool,
+}
+
+/// JobTemplateSpec — field 1=ObjectMeta, field 2=JobSpec
+#[derive(Clone, PartialEq, Message)]
+struct JobTemplateSpec {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message JobSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<JobSpec>,
+}
+
+/// CronJobSpec — k8s.io/api/batch/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct CronJobSpec {
+    /// schedule (field 1, string)
+    #[prost(string, tag = "1")]
+    schedule: String,
+    /// startingDeadlineSeconds (field 2, int64)
+    #[prost(int64, tag = "2")]
+    starting_deadline_seconds: i64,
+    /// concurrencyPolicy (field 3, string)
+    #[prost(string, tag = "3")]
+    concurrency_policy: String,
+    /// suspend (field 4, bool)
+    #[prost(bool, tag = "4")]
+    suspend: bool,
+    /// jobTemplate (field 5, message JobTemplateSpec)
+    #[prost(message, tag = "5")]
+    job_template: Option<JobTemplateSpec>,
+    /// successfulJobsHistoryLimit (field 6, int32)
+    #[prost(int32, tag = "6")]
+    successful_jobs_history_limit: i32,
+    /// failedJobsHistoryLimit (field 7, int32)
+    #[prost(int32, tag = "7")]
+    failed_jobs_history_limit: i32,
+    /// timeZone (field 8, string)
+    #[prost(string, tag = "8")]
+    time_zone: String,
+}
+
+/// CronJob — k8s.io/api/batch/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct CronJob {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message CronJobSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<CronJobSpec>,
+    /// status (field 3, bytes) — not decoded on input
+    #[prost(bytes = "vec", tag = "3")]
+    status: Vec<u8>,
+}
+
+/// Job — k8s.io/api/batch/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct Job {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message JobSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<JobSpec>,
+    /// status (field 3, bytes) — not decoded on input
+    #[prost(bytes = "vec", tag = "3")]
+    status: Vec<u8>,
+}
+
 // ---------------------------------------------------------------------------
 // Encoder — produces Kubernetes protobuf wire format from a JSON value.
 // Used in tests only; not called from production handlers.
@@ -1295,6 +1399,149 @@ pub fn decode_token_review_proto(data: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
+/// Convert a prost JobSpec into a serde_json::Value object.
+/// The template field (PodTemplateSpec) is omitted — PodSpec is deeply nested and
+/// the same pattern as PodTemplate applies: store as empty object so the schema is valid.
+fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if spec.parallelism != 0 {
+        m.insert(
+            "parallelism".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.parallelism)),
+        );
+    }
+    if spec.completions != 0 {
+        m.insert(
+            "completions".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.completions)),
+        );
+    }
+    if spec.active_deadline_seconds != 0 {
+        m.insert(
+            "activeDeadlineSeconds".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.active_deadline_seconds)),
+        );
+    }
+    if spec.backoff_limit != 0 {
+        m.insert(
+            "backoffLimit".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.backoff_limit)),
+        );
+    }
+    if !spec.completion_mode.is_empty() {
+        m.insert(
+            "completionMode".to_string(),
+            serde_json::Value::String(spec.completion_mode),
+        );
+    }
+    if spec.suspend {
+        m.insert("suspend".to_string(), serde_json::Value::Bool(true));
+    }
+    // template is always present as an empty object — required by the k8s schema
+    m.insert(
+        "template".to_string(),
+        serde_json::Value::Object(serde_json::Map::new()),
+    );
+    serde_json::Value::Object(m)
+}
+
+/// Decode a proto-encoded CronJob object into a `serde_json::Value`.
+pub fn decode_cronjob_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let cj = CronJob::decode(data).ok()?;
+    let meta = object_meta_to_json(cj.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "batch/v1",
+        "kind": "CronJob",
+        "metadata": meta
+    });
+
+    if let Some(spec) = cj.spec {
+        let mut spec_map = serde_json::Map::new();
+        if !spec.schedule.is_empty() {
+            spec_map.insert(
+                "schedule".to_string(),
+                serde_json::Value::String(spec.schedule),
+            );
+        }
+        if spec.starting_deadline_seconds != 0 {
+            spec_map.insert(
+                "startingDeadlineSeconds".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(spec.starting_deadline_seconds)),
+            );
+        }
+        if !spec.concurrency_policy.is_empty() {
+            spec_map.insert(
+                "concurrencyPolicy".to_string(),
+                serde_json::Value::String(spec.concurrency_policy),
+            );
+        }
+        if spec.suspend {
+            spec_map.insert("suspend".to_string(), serde_json::Value::Bool(true));
+        }
+        if spec.successful_jobs_history_limit != 0 {
+            spec_map.insert(
+                "successfulJobsHistoryLimit".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    spec.successful_jobs_history_limit,
+                )),
+            );
+        }
+        if spec.failed_jobs_history_limit != 0 {
+            spec_map.insert(
+                "failedJobsHistoryLimit".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(spec.failed_jobs_history_limit)),
+            );
+        }
+        if !spec.time_zone.is_empty() {
+            spec_map.insert(
+                "timeZone".to_string(),
+                serde_json::Value::String(spec.time_zone),
+            );
+        }
+        // jobTemplate: always emit with at least an empty spec.template
+        let jt_meta = spec
+            .job_template
+            .as_ref()
+            .and_then(|jt| jt.metadata.clone())
+            .map(object_meta_to_json)
+            .unwrap_or_else(|| serde_json::json!({"creationTimestamp": serde_json::Value::Null}));
+        let jt_spec = spec
+            .job_template
+            .and_then(|jt| jt.spec)
+            .map(job_spec_to_json)
+            .unwrap_or_else(|| serde_json::json!({"template": {}}));
+        spec_map.insert(
+            "jobTemplate".to_string(),
+            serde_json::json!({
+                "metadata": jt_meta,
+                "spec": jt_spec
+            }),
+        );
+        obj["spec"] = serde_json::Value::Object(spec_map);
+    }
+
+    Some(obj)
+}
+
+/// Decode a proto-encoded Job object into a `serde_json::Value`.
+pub fn decode_job_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let job = Job::decode(data).ok()?;
+    let meta = object_meta_to_json(job.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": meta
+    });
+
+    if let Some(spec) = job.spec {
+        obj["spec"] = job_spec_to_json(spec);
+    }
+
+    Some(obj)
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -1314,6 +1561,8 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "RoleBinding" => decode_rolebinding_proto(raw),
         "SubjectAccessReview" => decode_subject_access_review_proto(raw),
         "TokenReview" => decode_token_review_proto(raw),
+        "CronJob" => decode_cronjob_proto(raw),
+        "Job" => decode_job_proto(raw),
         _ => None,
     }
 }
@@ -3033,5 +3282,139 @@ mod tests {
             "expirationSeconds=7200 must be decoded correctly; None here means the \
              hand-rolled decoder was reading the wrong field number"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_cronjob_proto / decode_core_proto_by_kind CronJob
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch CronJob proto and extract metadata and
+    /// spec.schedule. This is the primary regression guard for mayor-50f3: the e2e CronJob
+    /// conformance test sends CronJob objects with Content-Type: application/vnd.kubernetes.protobuf.
+    /// Without this decoder, decode_core_proto_by_kind returns None for "CronJob", extract_body
+    /// returns raw proto bytes, Object::from_bytes fails with "expected value at line 1 column 1",
+    /// and the apiserver returns 400/500.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_cronjob() {
+        // Build: CronJob {
+        //   metadata: ObjectMeta { name: "my-cron", namespace: "default" },
+        //   spec: CronJobSpec { schedule: "*/5 * * * *", concurrencyPolicy: "Allow",
+        //                       jobTemplate: { spec: { backoffLimit: 3 } } }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"my-cron"); // ObjectMeta.name
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
+
+        // JobSpec field 6 = backoffLimit (int32, wire 0): tag = (6 << 3) | 0 = 0x30, value = 3
+        let job_spec = vec![0x30_u8, 0x03]; // field 6 (backoffLimit), wire type 0, varint 3
+
+        // JobTemplateSpec: field 2 = JobSpec
+        let job_template_spec = encode_length_delimited(2, &job_spec);
+
+        // CronJobSpec: field 1=schedule, field 3=concurrencyPolicy, field 5=jobTemplate
+        let mut cronjob_spec = encode_length_delimited(1, b"*/5 * * * *"); // schedule
+        cronjob_spec.extend_from_slice(&encode_length_delimited(3, b"Allow")); // concurrencyPolicy
+        cronjob_spec.extend_from_slice(&encode_length_delimited(5, &job_template_spec)); // jobTemplate
+
+        // CronJob: field 1=ObjectMeta, field 2=CronJobSpec
+        let mut cronjob_proto = encode_length_delimited(1, &obj_meta);
+        cronjob_proto.extend_from_slice(&encode_length_delimited(2, &cronjob_spec));
+
+        let result = decode_core_proto_by_kind("CronJob", &cronjob_proto)
+            .expect("CronJob must decode via decode_core_proto_by_kind — without this, the e2e CronJob conformance test fails with 400/500");
+
+        assert_eq!(
+            result["kind"], "CronJob",
+            "kind must be CronJob so Object::from_bytes can route the object"
+        );
+        assert_eq!(result["apiVersion"], "batch/v1");
+        assert_eq!(
+            result["metadata"]["name"], "my-cron",
+            "name must be extracted so the object is stored under the correct key"
+        );
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert!(
+            result["metadata"]["creationTimestamp"].is_null(),
+            "creationTimestamp must be null for kubectl compatibility"
+        );
+        assert_eq!(
+            result["spec"]["schedule"], "*/5 * * * *",
+            "schedule must be extracted from CronJobSpec field 1 — this field is required by the k8s schema"
+        );
+        assert_eq!(result["spec"]["concurrencyPolicy"], "Allow");
+        assert!(
+            result["spec"]["jobTemplate"]["spec"]["template"].is_object(),
+            "jobTemplate.spec.template must be present as an empty object (k8s schema requires it)"
+        );
+        assert_eq!(
+            result["spec"]["jobTemplate"]["spec"]["backoffLimit"], 3,
+            "backoffLimit must be decoded from JobSpec field 6"
+        );
+    }
+
+    /// decode_cronjob_proto must return None for malformed proto input.
+    #[test]
+    fn decode_cronjob_proto_returns_none_for_garbage() {
+        assert!(decode_cronjob_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_job_proto / decode_core_proto_by_kind Job
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch Job proto and extract metadata and spec fields.
+    /// The e2e CronJob conformance test also creates standalone Jobs; without this decoder,
+    /// Job creation via proto fails with "expected value at line 1 column 1".
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_job() {
+        // Build: Job {
+        //   metadata: ObjectMeta { name: "test-job", namespace: "default" },
+        //   spec: JobSpec { completions: 1, backoffLimit: 4 }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"test-job"); // ObjectMeta.name
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
+
+        // JobSpec: field 2=completions (varint), field 6=backoffLimit (varint)
+        // completions=1: tag = (2 << 3) | 0 = 0x10, value = 0x01
+        // backoffLimit=4: tag = (6 << 3) | 0 = 0x30, value = 0x04
+        let job_spec = vec![0x10, 0x01, 0x30, 0x04];
+
+        let mut job_proto = encode_length_delimited(1, &obj_meta); // Job.field 1 = ObjectMeta
+        job_proto.extend_from_slice(&encode_length_delimited(2, &job_spec)); // Job.field 2 = JobSpec
+
+        let result = decode_core_proto_by_kind("Job", &job_proto)
+            .expect("Job must decode via decode_core_proto_by_kind — without this, Job creation via proto fails");
+
+        assert_eq!(
+            result["kind"], "Job",
+            "kind must be Job so Object::from_bytes can route the object"
+        );
+        assert_eq!(result["apiVersion"], "batch/v1");
+        assert_eq!(
+            result["metadata"]["name"], "test-job",
+            "name must be extracted so the object is stored under the correct key"
+        );
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert!(
+            result["metadata"]["creationTimestamp"].is_null(),
+            "creationTimestamp must be null for kubectl compatibility"
+        );
+        assert_eq!(
+            result["spec"]["completions"], 1,
+            "completions must be decoded from JobSpec field 2"
+        );
+        assert_eq!(
+            result["spec"]["backoffLimit"], 4,
+            "backoffLimit must be decoded from JobSpec field 6"
+        );
+        assert!(
+            result["spec"]["template"].is_object(),
+            "spec.template must be present as an empty object (k8s schema requires it)"
+        );
+    }
+
+    /// decode_job_proto must return None for malformed proto input.
+    #[test]
+    fn decode_job_proto_returns_none_for_garbage() {
+        assert!(decode_job_proto(&[0xff, 0xff, 0xff]).is_none());
     }
 }

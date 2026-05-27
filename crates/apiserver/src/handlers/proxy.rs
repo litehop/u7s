@@ -130,13 +130,16 @@ pub async fn pod_log<S: Store>(
 
     let node_ip = resolve_kubelet_address(
         &node,
-        state.kubelet_preferred_address.as_deref().map(|s| s.as_str()),
+        state
+            .kubelet_preferred_address
+            .as_deref()
+            .map(|s| s.as_str()),
     )
     .ok_or_else(|| {
-            Status::internal(format!(
-                "node \"{node_name}\" has no usable address in status.addresses"
-            ))
-        })?;
+        Status::internal(format!(
+            "node \"{node_name}\" has no usable address in status.addresses"
+        ))
+    })?;
 
     // 4. Determine which container to tail. Default to first container if unspecified.
     let container = match query.container.as_deref() {
@@ -297,13 +300,16 @@ pub async fn resolve_attach_target<S: Store>(
 
     let node_ip = resolve_kubelet_address(
         &node,
-        state.kubelet_preferred_address.as_deref().map(|s| s.as_str()),
+        state
+            .kubelet_preferred_address
+            .as_deref()
+            .map(|s| s.as_str()),
     )
     .ok_or_else(|| {
-            Status::internal(format!(
-                "node \"{node_name}\" has no usable address in status.addresses"
-            ))
-        })?;
+        Status::internal(format!(
+            "node \"{node_name}\" has no usable address in status.addresses"
+        ))
+    })?;
 
     // Determine container (first container if unspecified).
     let container = match query.container.as_deref() {
@@ -576,13 +582,16 @@ pub(crate) async fn validate_portforward<S: Store>(
 
     let node_ip = resolve_kubelet_address(
         &node,
-        state.kubelet_preferred_address.as_deref().map(|s| s.as_str()),
+        state
+            .kubelet_preferred_address
+            .as_deref()
+            .map(|s| s.as_str()),
     )
     .ok_or_else(|| {
-            Status::internal(format!(
-                "node \"{node_name}\" has no usable address in status.addresses"
-            ))
-        })?;
+        Status::internal(format!(
+            "node \"{node_name}\" has no usable address in status.addresses"
+        ))
+    })?;
 
     // 4. Build the kubelet portForward URL.
     //    wss://<node-ip>:10250/portForward/<ns>/<pod>[?ports=<port>]
@@ -686,13 +695,16 @@ pub async fn resolve_node_proxy_target<S: Store>(
 
     let node_ip = resolve_kubelet_address(
         &node,
-        state.kubelet_preferred_address.as_deref().map(|s| s.as_str()),
+        state
+            .kubelet_preferred_address
+            .as_deref()
+            .map(|s| s.as_str()),
     )
     .ok_or_else(|| {
-            Status::internal(format!(
-                "node \"{node_name}\" has no usable address in status.addresses"
-            ))
-        })?;
+        Status::internal(format!(
+            "node \"{node_name}\" has no usable address in status.addresses"
+        ))
+    })?;
 
     let mut client_builder = reqwest::Client::builder()
         .use_rustls_tls()
