@@ -1,47 +1,21 @@
 #!/usr/bin/env bash
-# Local E2E setup: u7s on Mac host + kubelet inside lima VM.
+# Reconnect the lima-node kubelet to a (re)started u7s apiserver.
 #
-# Architecture:
-#   - u7s runs natively on the Mac (fast cargo rebuild loop)
-#   - kubelet + CRI-O run inside the lima VM (Linux kernel required)
-#   - kubelet reaches u7s via host.lima.internal:6443
-#   - kubectl runs on the Mac against 127.0.0.1:6443
+# Use this after: cargo build --release && scripts/u7s-start.sh [--reset]
+# The VM must already be provisioned. For first-time setup: scripts/conformance/lima-start.sh
 #
-# Quick start:
-#   1. cargo build --release -p u7s-apiserver
-#      scripts/u7s-start.sh       # starts server, prints export KUBECONFIG=...
+# What this does (idempotent, safe to re-run):
+#   - Copies the new kubeconfig and CA cert into the VM
+#   - Rewrites the kubelet drop-in and restarts kubelet
+#   - Re-applies the iptables DNAT rule for in-cluster API access
+#   - Waits for the node to re-register
 #
-#   2. export KUBECONFIG=./temp/u7s/kubeconfig
-#      scripts/lima-start.sh
-#
-#   3. kubectl get nodes        # lima-node should appear within ~30s
-#      kubectl get pods -A
-#
-# Re-running after u7s restart:
-#   Just re-run this script — it rewrites the kubeconfig in the VM and
-#   restarts kubelet, so the new TLS cert is picked up automatically.
-#
-# Troubleshooting:
-#   kubelet not registering:
-#     limactl shell lima-node sudo journalctl -u kubelet --no-pager -n 50
-#   CRI-O issues:
-#     limactl shell lima-node sudo journalctl -u crio --no-pager -n 30
-#   Container sandbox failures ("unknown version specified"):
-#     Two possible causes:
-#     1. System crun used instead of CRI-O's bundled one (10-crun.conf drop-in):
-#        Fix: limactl shell lima-node sudo rm /etc/crio/crio.conf.d/10-crun.conf
-#             limactl shell lima-node sudo systemctl restart crio
-#     2. Wrong CNI config format (10-crio-bridge.conf 0.4.0 instead of 1.0.0 conflist):
-#        Fix: limactl shell lima-node sudo mv /etc/cni/net.d/10-crio-bridge.conf /etc/cni/net.d/10-crio-bridge.conf.disabled
-#             limactl shell lima-node sudo mv /etc/cni/net.d/10-crio-bridge.conflist.disabled /etc/cni/net.d/10-crio-bridge.conflist
-#             limactl shell lima-node sudo systemctl restart crio
-#     (lima/kubelet.yaml provision now prevents both — delete+reprovision fixes them permanently)
+# Usage:
+#   export KUBECONFIG=./temp/u7s/kubeconfig   # set by u7s-start.sh
+#   scripts/kubelet-reconnect.sh
 set -euo pipefail
 
-# For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
-# instead — it skips VM provisioning and just reconnects the kubelet.
 VM_NAME="lima-node"
-LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
 
 check_deps() {
   local missing=0
@@ -82,19 +56,19 @@ if ! kubectl --kubeconfig="$KUBECONFIG_PATH" get namespaces &>/dev/null; then
 fi
 echo "u7s is reachable."
 
-# Start or resume the lima VM.
-if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${VM_NAME}$"; then
-  STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${VM_NAME} / {print \$2}")
-  if [ "$STATUS" != "Running" ]; then
-    echo "Starting stopped VM '$VM_NAME'..."
-    limactl start "$VM_NAME"
-  else
-    echo "VM '$VM_NAME' already running."
-  fi
-else
-  echo "Provisioning VM '$VM_NAME' (first run, takes ~5 min)..."
-  limactl start --name="$VM_NAME" "$LIMA_YAML"
+# Fail fast if the VM is not already running.
+STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${VM_NAME} / {print \$2}")
+if [ -z "$STATUS" ]; then
+  echo "error: VM '$VM_NAME' does not exist." >&2
+  echo "Run scripts/conformance/lima-start.sh first to provision the VM." >&2
+  exit 1
 fi
+if [ "$STATUS" != "Running" ]; then
+  echo "error: VM '$VM_NAME' is not running (status: $STATUS)." >&2
+  echo "Run scripts/conformance/lima-start.sh to start and reconnect it." >&2
+  exit 1
+fi
+echo "VM '$VM_NAME' is running."
 
 # Rewrite server address from 127.0.0.1 to host.lima.internal for in-VM use.
 echo "Copying kubeconfig into VM..."
@@ -105,10 +79,7 @@ rm "$REWRITTEN"
 limactl shell "$VM_NAME" sudo cp /tmp/kubelet-kubeconfig /etc/kubelet-kubeconfig
 limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-kubeconfig
 
-# Copy cluster CA so the kubelet can authenticate the apiserver's mTLS client cert
-# when proxying log/exec/attach requests. Without --client-ca-file the kubelet falls
-# back to webhook auth and rejects the apiserver's cert with 401.
-# ca.crt is DER-encoded; kubelet requires PEM.
+# Copy CA cert (DER→PEM) so kubelet can authenticate the apiserver's mTLS client cert.
 CA_CERT="$(dirname "$KUBECONFIG_PATH")/ca.crt"
 CA_PEM=$(mktemp)
 trap 'rm -f "$CA_PEM"' EXIT
@@ -117,7 +88,6 @@ if [ -f "$CA_CERT" ]; then
   limactl copy "$CA_PEM" "${VM_NAME}:/tmp/kubelet-ca.crt"
   limactl shell "$VM_NAME" sudo cp /tmp/kubelet-ca.crt /etc/kubelet-ca.crt
   limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-ca.crt
-  # Write --client-ca-file into the kubelet drop-in (idempotent: overwrite each run).
   limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
 [Service]
 ExecStart=
@@ -135,20 +105,15 @@ else
 fi
 
 # Restart kubelet so it picks up the new kubeconfig/cert/CA.
-echo "Starting kubelet inside VM..."
+echo "Restarting kubelet..."
 limactl shell "$VM_NAME" sudo systemctl restart kubelet
 
-# Route kubernetes ClusterIP (10.96.0.1:443) to the host apiserver inside the VM.
-# Pods use in-cluster config (KUBERNETES_SERVICE_HOST=10.96.0.1) to reach the apiserver.
-# Without this rule, 10.96.0.1 traffic has no route in the VM and times out.
-echo "Adding iptables DNAT for kubernetes ClusterIP → host apiserver..."
+# Re-apply iptables DNAT: 10.96.0.1:443 → host apiserver (idempotent delete+add).
+echo "Re-applying iptables DNAT for kubernetes ClusterIP → host apiserver..."
 HOST_IP=$(limactl shell "$VM_NAME" getent hosts host.lima.internal 2>/dev/null | awk '{print $1}')
 if [ -z "$HOST_IP" ]; then
   echo "WARNING: could not resolve host.lima.internal — skipping DNAT rule" >&2
 else
-  # OUTPUT: catches traffic from processes on the VM host itself.
-  # PREROUTING: catches traffic from containers/pods (their own network namespaces).
-  # Both chains are needed so that both kubelet and in-pod API calls are routed correctly.
   limactl shell "$VM_NAME" sudo iptables -t nat -D OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443" 2>/dev/null || true
   limactl shell "$VM_NAME" sudo iptables -t nat -A OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443"
   limactl shell "$VM_NAME" sudo iptables -t nat -D PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443" 2>/dev/null || true
@@ -157,7 +122,7 @@ else
   echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:6443 (OUTPUT + PREROUTING)"
 fi
 
-# Wait for the node to appear.
+# Wait for the node to re-register.
 echo "Waiting for lima-node to register (up to 60s)..."
 FOUND=0
 for i in $(seq 1 60); do
@@ -178,8 +143,3 @@ fi
 echo ""
 echo "Success! Node registered:"
 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
-echo ""
-echo "Run kubectl commands with:"
-echo "  export KUBECONFIG=$KUBECONFIG_PATH"
-echo "  kubectl get nodes"
-echo "  kubectl run test --image=busybox:1.36 --restart=Never --overrides='{\"spec\":{\"nodeName\":\"lima-node\",\"hostNetwork\":true,\"dnsPolicy\":\"None\",\"dnsConfig\":{}}}' -- sh -c 'echo hello'"
