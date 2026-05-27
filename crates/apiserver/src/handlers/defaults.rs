@@ -10,6 +10,15 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("apps", "deployments") = (group, plural) {
         default_deployment(obj);
     }
+    if let ("apps", "replicasets") = (group, plural) {
+        default_replicaset(obj);
+    }
+    if let ("apps", "statefulsets") = (group, plural) {
+        default_statefulset(obj);
+    }
+    if let ("apps", "daemonsets") = (group, plural) {
+        default_daemonset(obj);
+    }
     if let ("", "services") = (group, plural) {
         default_service(obj);
     }
@@ -170,6 +179,12 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if let ("apps", "deployments") = (group, plural) {
         validate_deployment(obj)?;
     }
+    if let ("apps", "replicasets") = (group, plural) {
+        validate_selector(obj, "ReplicaSet")?;
+    }
+    if let ("apps", "statefulsets") = (group, plural) {
+        validate_selector(obj, "StatefulSet")?;
+    }
     Ok(())
 }
 
@@ -182,6 +197,62 @@ fn validate_deployment(obj: &serde_json::Value) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn validate_selector(obj: &serde_json::Value, kind: &str) -> Result<(), String> {
+    if obj["spec"]["selector"].is_null() {
+        return Err(format!("{kind}.spec.selector is required"));
+    }
+    Ok(())
+}
+
+fn default_replicaset(obj: &mut serde_json::Value) {
+    if obj["spec"]["replicas"].is_null() {
+        obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
+    }
+}
+
+fn default_statefulset(obj: &mut serde_json::Value) {
+    if obj["spec"]["replicas"].is_null() {
+        obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
+    }
+    if obj["spec"]["podManagementPolicy"].is_null() {
+        obj["spec"]["podManagementPolicy"] = serde_json::Value::String("OrderedReady".into());
+    }
+    if obj["spec"]["updateStrategy"]["type"].is_null() {
+        if !obj["spec"]["updateStrategy"].is_object() {
+            obj["spec"]["updateStrategy"] = serde_json::json!({});
+        }
+        obj["spec"]["updateStrategy"]["type"] = serde_json::Value::String("RollingUpdate".into());
+    }
+    if obj["spec"]["revisionHistoryLimit"].is_null() {
+        obj["spec"]["revisionHistoryLimit"] = serde_json::Value::Number(10.into());
+    }
+}
+
+fn default_daemonset(obj: &mut serde_json::Value) {
+    if obj["spec"]["updateStrategy"]["type"].is_null() {
+        if !obj["spec"]["updateStrategy"].is_object() {
+            obj["spec"]["updateStrategy"] = serde_json::json!({});
+        }
+        obj["spec"]["updateStrategy"]["type"] = serde_json::Value::String("RollingUpdate".into());
+    }
+    if obj["spec"]["updateStrategy"]["type"].as_str() == Some("RollingUpdate") {
+        if !obj["spec"]["updateStrategy"]["rollingUpdate"].is_object() {
+            obj["spec"]["updateStrategy"]["rollingUpdate"] = serde_json::json!({});
+        }
+        if obj["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"].is_null() {
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"] =
+                serde_json::Value::Number(1.into());
+        }
+        if obj["spec"]["updateStrategy"]["rollingUpdate"]["maxSurge"].is_null() {
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxSurge"] =
+                serde_json::Value::Number(0.into());
+        }
+    }
+    if obj["spec"]["revisionHistoryLimit"].is_null() {
+        obj["spec"]["revisionHistoryLimit"] = serde_json::Value::Number(10.into());
+    }
 }
 
 fn default_deployment(obj: &mut serde_json::Value) {
@@ -677,6 +748,179 @@ mod tests {
             obj["eventTime"], "2017-09-20T13:49:16.999999Z",
             "existing sub-second precision must not be overwritten"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // ReplicaSet defaults
+    // ---------------------------------------------------------------------------
+
+    /// A ReplicaSet with no spec.replicas must have it defaulted to 1.
+    ///
+    /// KCM's replicaset-controller dereferences *rs.Spec.Replicas unconditionally.
+    /// Nil causes a nil-pointer panic that kills the entire KCM process.
+    #[test]
+    fn replicaset_replicas_defaults_to_1() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {}
+            }
+        });
+
+        apply_defaults("apps", "replicasets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["replicas"],
+            serde_json::Value::Number(1.into()),
+            "spec.replicas must default to 1 — nil replicas panics KCM replicaset-controller"
+        );
+    }
+
+    /// Existing spec.replicas on a ReplicaSet must not be overwritten.
+    #[test]
+    fn replicaset_existing_replicas_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": { "replicas": 3 }
+        });
+
+        apply_defaults("apps", "replicasets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["replicas"],
+            serde_json::Value::Number(3.into()),
+            "existing spec.replicas must not be overwritten"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // StatefulSet defaults
+    // ---------------------------------------------------------------------------
+
+    /// A StatefulSet with no spec fields must have all four defaults applied.
+    ///
+    /// KCM's statefulset-controller dereferences *ss.Spec.Replicas and indexes
+    /// UpdateStrategy fields without nil checks.
+    #[test]
+    fn statefulset_defaults_applied() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {}
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["replicas"],
+            serde_json::Value::Number(1.into()),
+            "spec.replicas must default to 1"
+        );
+        assert_eq!(
+            obj["spec"]["podManagementPolicy"], "OrderedReady",
+            "spec.podManagementPolicy must default to OrderedReady"
+        );
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["type"], "RollingUpdate",
+            "spec.updateStrategy.type must default to RollingUpdate"
+        );
+        assert_eq!(
+            obj["spec"]["revisionHistoryLimit"],
+            serde_json::Value::Number(10.into()),
+            "spec.revisionHistoryLimit must default to 10"
+        );
+    }
+
+    /// Existing StatefulSet fields must not be overwritten.
+    #[test]
+    fn statefulset_existing_values_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "replicas": 5,
+                "podManagementPolicy": "Parallel",
+                "updateStrategy": { "type": "OnDelete" },
+                "revisionHistoryLimit": 3
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+
+        assert_eq!(obj["spec"]["replicas"], serde_json::Value::Number(5.into()));
+        assert_eq!(obj["spec"]["podManagementPolicy"], "Parallel");
+        assert_eq!(obj["spec"]["updateStrategy"]["type"], "OnDelete");
+        assert_eq!(obj["spec"]["revisionHistoryLimit"], serde_json::Value::Number(3.into()));
+    }
+
+    // ---------------------------------------------------------------------------
+    // DaemonSet defaults
+    // ---------------------------------------------------------------------------
+
+    /// A DaemonSet with no updateStrategy must have type, maxUnavailable, and maxSurge defaulted.
+    #[test]
+    fn daemonset_defaults_applied() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {}
+        });
+
+        apply_defaults("apps", "daemonsets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["type"], "RollingUpdate",
+            "spec.updateStrategy.type must default to RollingUpdate"
+        );
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"],
+            serde_json::Value::Number(1.into()),
+            "rollingUpdate.maxUnavailable must default to 1"
+        );
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxSurge"],
+            serde_json::Value::Number(0.into()),
+            "rollingUpdate.maxSurge must default to 0"
+        );
+        assert_eq!(
+            obj["spec"]["revisionHistoryLimit"],
+            serde_json::Value::Number(10.into()),
+            "spec.revisionHistoryLimit must default to 10"
+        );
+    }
+
+    /// Existing DaemonSet updateStrategy must not be overwritten.
+    #[test]
+    fn daemonset_existing_values_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "updateStrategy": { "type": "OnDelete" },
+                "revisionHistoryLimit": 5
+            }
+        });
+
+        apply_defaults("apps", "daemonsets", &mut obj);
+
+        assert_eq!(obj["spec"]["updateStrategy"]["type"], "OnDelete");
+        assert!(
+            obj["spec"]["updateStrategy"]["rollingUpdate"].is_null(),
+            "rollingUpdate must not be injected for OnDelete strategy"
+        );
+        assert_eq!(obj["spec"]["revisionHistoryLimit"], serde_json::Value::Number(5.into()));
     }
 
     /// Events without timestamp fields must not be modified.
