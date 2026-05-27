@@ -673,12 +673,30 @@ struct JobSpec {
     /// manualSelector (field 7, bool)
     #[prost(bool, tag = "7")]
     manual_selector: bool,
-    /// completionMode (field 8, string)
+    /// completionMode (field 8, string) — "NonIndexed" or "Indexed"
     #[prost(string, tag = "8")]
     completion_mode: String,
     /// suspend (field 9, bool)
     #[prost(bool, tag = "9")]
     suspend: bool,
+    /// podReplacementPolicy (field 10, string) — added k8s 1.28
+    #[prost(string, tag = "10")]
+    pod_replacement_policy: String,
+    /// podFailurePolicy (field 11, bytes) — complex message, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "11")]
+    pod_failure_policy: Vec<u8>,
+    /// successPolicy (field 12, bytes) — complex message, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "12")]
+    success_policy: Vec<u8>,
+    /// backoffLimitPerIndex (field 13, int32) — added k8s 1.28
+    #[prost(int32, tag = "13")]
+    backoff_limit_per_index: i32,
+    /// maxFailedIndexes (field 14, int32) — added k8s 1.28
+    #[prost(int32, tag = "14")]
+    max_failed_indexes: i32,
+    /// managedBy (field 15, string) — added k8s 1.30
+    #[prost(string, tag = "15")]
+    managed_by: String,
 }
 
 /// JobTemplateSpec — field 1=ObjectMeta, field 2=JobSpec
@@ -1436,6 +1454,30 @@ fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
     }
     if spec.suspend {
         m.insert("suspend".to_string(), serde_json::Value::Bool(true));
+    }
+    if !spec.pod_replacement_policy.is_empty() {
+        m.insert(
+            "podReplacementPolicy".to_string(),
+            serde_json::Value::String(spec.pod_replacement_policy),
+        );
+    }
+    if spec.backoff_limit_per_index != 0 {
+        m.insert(
+            "backoffLimitPerIndex".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.backoff_limit_per_index)),
+        );
+    }
+    if spec.max_failed_indexes != 0 {
+        m.insert(
+            "maxFailedIndexes".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.max_failed_indexes)),
+        );
+    }
+    if !spec.managed_by.is_empty() {
+        m.insert(
+            "managedBy".to_string(),
+            serde_json::Value::String(spec.managed_by),
+        );
     }
     // template is always present as an empty object — required by the k8s schema
     m.insert(
@@ -3416,5 +3458,99 @@ mod tests {
     #[test]
     fn decode_job_proto_returns_none_for_garbage() {
         assert!(decode_job_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    /// decode_job_proto must handle an indexed Job with completionMode=Indexed,
+    /// backoffLimitPerIndex, maxFailedIndexes, and a podFailurePolicy message.
+    ///
+    /// The e2e conformance tests create Jobs with these fields (job.go:621, :658, :753).
+    /// Without handling these fields, the prost decode fails and decode_job_proto returns None,
+    /// causing 400 "invalid JSON" responses for all indexed Job creation requests.
+    #[test]
+    fn decode_job_proto_handles_indexed_job_with_failure_policy() {
+        use prost::Message as _;
+
+        let job = Job {
+            metadata: Some(ObjectMeta {
+                name: "indexed-job".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(JobSpec {
+                completions: 5,
+                parallelism: 2,
+                backoff_limit: 6,
+                completion_mode: "Indexed".to_string(),
+                backoff_limit_per_index: 1,
+                max_failed_indexes: 3,
+                pod_failure_policy: vec![0x0a, 0x04, 0x08, 0x01, 0x10, 0x01],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_job_proto(&buf).expect(
+            "decode_job_proto must return Some for indexed Job — conformance tests at job.go:621,:658,:753 \
+             create Jobs with completionMode=Indexed, backoffLimitPerIndex, and podFailurePolicy; \
+             returning None causes 400 'invalid JSON' responses"
+        );
+
+        assert_eq!(result["kind"], "Job");
+        assert_eq!(result["apiVersion"], "batch/v1");
+        assert_eq!(result["metadata"]["name"], "indexed-job");
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert_eq!(
+            result["spec"]["completionMode"], "Indexed",
+            "completionMode must be extracted for indexed jobs"
+        );
+        assert_eq!(result["spec"]["completions"], 5);
+        assert_eq!(result["spec"]["parallelism"], 2);
+        assert_eq!(
+            result["spec"]["backoffLimitPerIndex"], 1,
+            "backoffLimitPerIndex must be present in output for k8s client compatibility"
+        );
+        assert_eq!(result["spec"]["maxFailedIndexes"], 3);
+        assert!(
+            result["spec"]["template"].is_object(),
+            "spec.template must always be present as empty object (required by k8s schema)"
+        );
+    }
+
+    /// decode_job_proto must handle a Job with successPolicy — conformance test job.go:502 and
+    /// job.go:582 create Jobs with successPolicy (k8s 1.30+ field at proto field 12).
+    #[test]
+    fn decode_job_proto_handles_job_with_success_policy() {
+        use prost::Message as _;
+
+        let job = Job {
+            metadata: Some(ObjectMeta {
+                name: "success-policy-job".to_string(),
+                namespace: "test-ns".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(JobSpec {
+                completions: 3,
+                completion_mode: "Indexed".to_string(),
+                success_policy: vec![0x0a, 0x02, 0x08, 0x02],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_job_proto(&buf).expect(
+            "decode_job_proto must return Some for Job with successPolicy — conformance tests at \
+             job.go:502 and job.go:582 fail with 400 'invalid JSON' when this field is present",
+        );
+
+        assert_eq!(result["kind"], "Job");
+        assert_eq!(result["metadata"]["name"], "success-policy-job");
+        assert_eq!(result["spec"]["completionMode"], "Indexed");
+        assert_eq!(result["spec"]["completions"], 3);
     }
 }
