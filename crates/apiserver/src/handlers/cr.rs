@@ -189,18 +189,17 @@ pub async fn find_crd<S: Store>(
             continue;
         }
         // Matching group + plural. Now check version is served.
-        let matched_version = crd
+        let Some(matched_version) = crd
             .spec
             .versions
             .iter()
-            .find(|v| v.name == version && v.served);
-        if matched_version.is_none() {
+            .find(|v| v.name == version && v.served)
+        else {
             return Err(Status::not_found(
                 &format!("{group}/{version}/{plural}"),
                 "Resource",
             ));
-        }
-        let matched_version = matched_version.unwrap();
+        };
         // Extract openAPIV3Schema from the matched version's schema field.
         let schema = matched_version
             .schema
@@ -492,9 +491,10 @@ pub async fn list_cr<S: Store>(
 
     // Convert all items if needed. Batch the conversion in a single webhook call.
     if needs_conversion && !items.is_empty() {
-        let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
-        let desired_api_version = format!("{group}/{version}");
-        items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
+        if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
+            let desired_api_version = format!("{group}/{version}");
+            items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
+        }
     }
 
     if pom {
@@ -551,23 +551,24 @@ pub async fn get_cr<S: Store>(
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
 
     if needs_conversion {
-        let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
-        let obj: serde_json::Value =
-            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
-        let desired_api_version = format!("{group}/{version}");
-        let mut converted =
-            call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
-        let converted_obj = converted
-            .pop()
-            .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
-        let bytes =
-            serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
-        return Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            bytes,
-        )
-            .into_response());
+        if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
+            let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let desired_api_version = format!("{group}/{version}");
+            let mut converted =
+                call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
+            let converted_obj = converted
+                .pop()
+                .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
+            let bytes =
+                serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
+            return Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response());
+        }
     }
 
     Ok((
@@ -816,9 +817,10 @@ pub async fn list_cr_namespaced<S: Store>(
     }
 
     if needs_conversion && !items.is_empty() {
-        let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
-        let desired_api_version = format!("{group}/{version}");
-        items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
+        if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
+            let desired_api_version = format!("{group}/{version}");
+            items = call_conversion_webhook(&state, cfg, items, &desired_api_version).await?;
+        }
     }
 
     if pom {
@@ -873,23 +875,24 @@ pub async fn get_cr_namespaced<S: Store>(
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
 
     if needs_conversion {
-        let cfg = ctx.conversion_webhook_client_config.as_ref().unwrap();
-        let obj: serde_json::Value =
-            serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
-        let desired_api_version = format!("{group}/{version}");
-        let mut converted =
-            call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
-        let converted_obj = converted
-            .pop()
-            .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
-        let bytes =
-            serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
-        return Ok((
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            bytes,
-        )
-            .into_response());
+        if let Some(cfg) = ctx.conversion_webhook_client_config.as_ref() {
+            let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let desired_api_version = format!("{group}/{version}");
+            let mut converted =
+                call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
+            let converted_obj = converted
+                .pop()
+                .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
+            let bytes =
+                serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
+            return Ok((
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response());
+        }
     }
 
     Ok((

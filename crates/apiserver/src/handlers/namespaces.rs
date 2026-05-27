@@ -181,7 +181,7 @@ pub async fn create_namespace<S: Store>(
             phase: Some(NamespacePhase::Active),
             rest: serde_json::Value::Object(Default::default()),
         })
-        .expect("NamespaceStatus serializes");
+        .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
     }
 
     // Stamp the "kubernetes" finalizer at creation time.
@@ -489,7 +489,7 @@ pub async fn delete_namespace<S: Store>(
             phase: Some(NamespacePhase::Terminating),
             rest: serde_json::Value::Object(Default::default()),
         })
-        .expect("NamespaceStatus serializes");
+        .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
         obj.body = soft;
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
