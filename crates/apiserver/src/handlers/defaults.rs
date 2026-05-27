@@ -860,7 +860,10 @@ mod tests {
         assert_eq!(obj["spec"]["replicas"], serde_json::Value::Number(5.into()));
         assert_eq!(obj["spec"]["podManagementPolicy"], "Parallel");
         assert_eq!(obj["spec"]["updateStrategy"]["type"], "OnDelete");
-        assert_eq!(obj["spec"]["revisionHistoryLimit"], serde_json::Value::Number(3.into()));
+        assert_eq!(
+            obj["spec"]["revisionHistoryLimit"],
+            serde_json::Value::Number(3.into())
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -920,7 +923,10 @@ mod tests {
             obj["spec"]["updateStrategy"]["rollingUpdate"].is_null(),
             "rollingUpdate must not be injected for OnDelete strategy"
         );
-        assert_eq!(obj["spec"]["revisionHistoryLimit"], serde_json::Value::Number(5.into()));
+        assert_eq!(
+            obj["spec"]["revisionHistoryLimit"],
+            serde_json::Value::Number(5.into())
+        );
     }
 
     /// Events without timestamp fields must not be modified.
