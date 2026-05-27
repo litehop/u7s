@@ -2661,7 +2661,7 @@ mod tests {
         // If the check is absent, prost returns Err (invalid wire format) for all-zero bytes,
         // but a real varint bomb with a valid length prefix would OOM first.
         let mut body = K8S_PROTO_MAGIC.to_vec();
-        body.extend(std::iter::repeat(0u8).take(MAX_PROTO_ENVELOPE_BYTES + 1));
+        body.extend(std::iter::repeat_n(0u8, MAX_PROTO_ENVELOPE_BYTES + 1));
         assert!(
             decode_k8s_proto_envelope(&body).is_none(),
             "proto envelope larger than MAX_PROTO_ENVELOPE_BYTES ({} bytes) must be rejected \
