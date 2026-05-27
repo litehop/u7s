@@ -38,9 +38,7 @@ pub trait BiStreamWriter: Send + 'static {
 /// that can be driven from separate tasks without any mutex.
 pub struct AxumWs(pub axum::extract::ws::WebSocket);
 
-pub struct AxumWsReader(
-    futures_util::stream::SplitStream<axum::extract::ws::WebSocket>,
-);
+pub struct AxumWsReader(futures_util::stream::SplitStream<axum::extract::ws::WebSocket>);
 
 pub struct AxumWsWriter(
     futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
@@ -84,10 +82,7 @@ impl BiStreamWriter for AxumWsWriter {
 
     async fn close(&mut self) {
         use futures_util::SinkExt as _;
-        let _ = self
-            .0
-            .send(axum::extract::ws::Message::Close(None))
-            .await;
+        let _ = self.0.send(axum::extract::ws::Message::Close(None)).await;
     }
 }
 
@@ -102,9 +97,7 @@ use tokio_tungstenite::WebSocketStream;
 /// The stream `S` is typically `tokio_rustls::client::TlsStream<tokio::net::TcpStream>`.
 pub struct TungsteniteWs<S>(pub WebSocketStream<S>);
 
-pub struct TungsteniteWsReader<S>(
-    futures_util::stream::SplitStream<WebSocketStream<S>>,
-);
+pub struct TungsteniteWsReader<S>(futures_util::stream::SplitStream<WebSocketStream<S>>);
 
 pub struct TungsteniteWsWriter<S>(
     futures_util::stream::SplitSink<WebSocketStream<S>, tokio_tungstenite::tungstenite::Message>,
