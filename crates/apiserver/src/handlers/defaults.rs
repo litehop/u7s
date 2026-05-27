@@ -11,7 +11,88 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
         default_deployment(obj);
     }
     if let ("", "services") = (group, plural) {
-        default_service_ip_fields(obj);
+        default_service(obj);
+    }
+}
+
+/// Apply all Service defaults in the correct order.
+///
+/// 1. Default spec.type to "ClusterIP" when absent — conformance tests check that a
+///    Service with no explicit type comes back as ClusterIP.
+/// 2. Allocate NodePorts for NodePort/LoadBalancer services — ports without a nodePort
+///    get one assigned from the standard 30000-32767 range.
+/// 3. Skip ClusterIP-family defaults for ExternalName — ExternalName services must not
+///    have ipFamilies/ipFamilyPolicy/clusterIPs set (they have no cluster IP at all).
+fn default_service(obj: &mut serde_json::Value) {
+    // Ensure spec exists as an object.
+    if !obj["spec"].is_object() {
+        obj["spec"] = serde_json::json!({});
+    }
+
+    // 1. Default spec.type to "ClusterIP".
+    if obj["spec"]["type"].is_null() {
+        obj["spec"]["type"] = serde_json::Value::String("ClusterIP".to_string());
+    }
+
+    let svc_type = obj["spec"]["type"]
+        .as_str()
+        .unwrap_or("ClusterIP")
+        .to_string();
+
+    // 2. Allocate NodePorts for NodePort and LoadBalancer services.
+    if svc_type == "NodePort" || svc_type == "LoadBalancer" {
+        default_node_ports(obj);
+    }
+
+    // 3. ExternalName services must not have ClusterIP-family fields.
+    if svc_type == "ExternalName" {
+        return;
+    }
+
+    default_service_ip_fields(obj);
+}
+
+/// Assign NodePorts to ports that don't have one yet.
+///
+/// Scans spec.ports for any port with protocol TCP/UDP/SCTP that lacks a nodePort.
+/// Assigns ports sequentially from 30000, skipping values already in use within this
+/// object. The range 30000-32767 matches the Kubernetes default nodePort range.
+///
+/// Idempotent: ports that already have a nodePort are not modified.
+fn default_node_ports(obj: &mut serde_json::Value) {
+    let ports = match obj["spec"]["ports"].as_array_mut() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Collect already-assigned NodePorts so we don't re-use them.
+    let mut used: std::collections::HashSet<u16> = ports
+        .iter()
+        .filter_map(|p| p["nodePort"].as_u64())
+        .filter(|&n| (30000..=32767).contains(&n))
+        .map(|n| n as u16)
+        .collect();
+
+    let mut next_candidate: u16 = 30000;
+
+    for port in ports.iter_mut() {
+        // Skip ports that already have a nodePort.
+        if !port["nodePort"].is_null() {
+            continue;
+        }
+
+        // Find the next unused port in the range.
+        while used.contains(&next_candidate) || next_candidate > 32767 {
+            next_candidate = next_candidate.saturating_add(1);
+            if next_candidate > 32767 {
+                // Range exhausted — leave remaining ports without a nodePort.
+                return;
+            }
+        }
+
+        port["nodePort"] = serde_json::Value::Number(next_candidate.into());
+        used.insert(next_candidate);
+        next_candidate += 1;
     }
 }
 
@@ -28,6 +109,8 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
 /// - clusterIPs    → [clusterIP] if clusterIP is non-empty and not "None"
 ///
 /// Only sets fields that are absent or null; never overwrites existing values.
+///
+/// Must NOT be called for ExternalName services (they have no ClusterIP family).
 pub fn default_service_ip_fields(obj: &mut serde_json::Value) {
     // Ensure spec exists as an object.
     if !obj["spec"].is_object() {
@@ -341,6 +424,236 @@ mod tests {
             obj["spec"]["clusterIPs"],
             serde_json::json!(["10.96.0.1", "fd00::1"]),
             "existing clusterIPs must not be overwritten"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: spec.type defaulting (mayor-51ji)
+    // ---------------------------------------------------------------------------
+
+    /// A Service with no spec.type must have spec.type defaulted to "ClusterIP".
+    ///
+    /// Sonobuoy conformance tests create Services without a type and assert the
+    /// response carries type=ClusterIP. Without this default, the field comes back
+    /// empty and the tests fail with "unexpected Spec.Type () for service, expected ClusterIP".
+    #[test]
+    fn service_without_type_defaults_to_cluster_ip() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "my-svc", "namespace": "default" },
+            "spec": { "selector": { "app": "foo" }, "ports": [{ "port": 80 }] }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["type"], "ClusterIP",
+            "spec.type must default to ClusterIP — sonobuoy checks the field and fails if empty"
+        );
+    }
+
+    /// An existing spec.type must not be overwritten by defaulting.
+    ///
+    /// If idempotency breaks here, a NodePort service would be silently downgraded
+    /// to ClusterIP on every read, breaking external traffic routing.
+    #[test]
+    fn service_existing_type_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "np-svc", "namespace": "default" },
+            "spec": {
+                "type": "NodePort",
+                "ports": [{ "port": 80, "nodePort": 31000 }]
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["type"], "NodePort",
+            "existing spec.type must not be overwritten — changing NodePort to ClusterIP breaks external access"
+        );
+        // NodePort must not be re-allocated when already set.
+        assert_eq!(
+            obj["spec"]["ports"][0]["nodePort"], 31000,
+            "existing nodePort must not be overwritten"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: NodePort allocation (mayor-51ji)
+    // ---------------------------------------------------------------------------
+
+    /// A NodePort Service with no nodePort on its ports must have one assigned.
+    ///
+    /// Sonobuoy tests create NodePort services and assert Spec.Ports[0].NodePort != 0.
+    /// Without allocation, NodePort comes back as 0 and the tests fail.
+    #[test]
+    fn nodeport_service_gets_node_port_assigned() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "np-svc", "namespace": "default" },
+            "spec": {
+                "type": "NodePort",
+                "ports": [{ "port": 80, "protocol": "TCP" }]
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        let node_port = obj["spec"]["ports"][0]["nodePort"]
+            .as_u64()
+            .expect("nodePort must be a number after defaulting");
+        assert!(
+            (30000..=32767).contains(&node_port),
+            "nodePort must be in [30000, 32767], got {node_port} — sonobuoy checks for non-zero nodePort"
+        );
+    }
+
+    /// Two ports on a NodePort service must each get a distinct nodePort.
+    ///
+    /// If both ports share the same nodePort, the OS will reject one bind and
+    /// kube-proxy cannot set up the iptables rule for the second port.
+    #[test]
+    fn nodeport_service_multiple_ports_get_distinct_node_ports() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "np-multi", "namespace": "default" },
+            "spec": {
+                "type": "NodePort",
+                "ports": [
+                    { "port": 80, "protocol": "TCP" },
+                    { "port": 443, "protocol": "TCP" }
+                ]
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        let np0 = obj["spec"]["ports"][0]["nodePort"]
+            .as_u64()
+            .expect("port 0 must have nodePort");
+        let np1 = obj["spec"]["ports"][1]["nodePort"]
+            .as_u64()
+            .expect("port 1 must have nodePort");
+        assert_ne!(np0, np1, "each port must receive a distinct nodePort — duplicates break kube-proxy iptables rules");
+        assert!((30000..=32767).contains(&np0));
+        assert!((30000..=32767).contains(&np1));
+    }
+
+    /// LoadBalancer services also need NodePorts (cloud LBs route via nodePort internally).
+    #[test]
+    fn loadbalancer_service_gets_node_port_assigned() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "lb-svc", "namespace": "default" },
+            "spec": {
+                "type": "LoadBalancer",
+                "ports": [{ "port": 80 }]
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        let node_port = obj["spec"]["ports"][0]["nodePort"]
+            .as_u64()
+            .expect("LoadBalancer port must have nodePort after defaulting");
+        assert!(
+            (30000..=32767).contains(&node_port),
+            "LoadBalancer nodePort must be in [30000, 32767], got {node_port}"
+        );
+    }
+
+    /// ClusterIP service must NOT get a nodePort injected.
+    ///
+    /// ClusterIP services have no node-level port mapping. Injecting a nodePort
+    /// would confuse clients and waste ports from the NodePort range.
+    #[test]
+    fn clusterip_service_does_not_get_node_port() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "ci-svc", "namespace": "default" },
+            "spec": {
+                "type": "ClusterIP",
+                "ports": [{ "port": 80 }]
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        assert!(
+            obj["spec"]["ports"][0]["nodePort"].is_null(),
+            "ClusterIP service must not have a nodePort — injecting one wastes ports and confuses clients"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: ExternalName ClusterIP (mayor-bdum)
+    // ---------------------------------------------------------------------------
+
+    /// An ExternalName service must NOT get ipFamilies, ipFamilyPolicy, or clusterIPs.
+    ///
+    /// ExternalName services resolve to an external DNS name; they have no ClusterIP.
+    /// Conformance tests fail with "unexpected Spec.ClusterIP (10.96.x.x) for ExternalName service"
+    /// if we apply ClusterIP-family defaults to ExternalName.
+    #[test]
+    fn external_name_service_gets_no_ip_family_defaults() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "ext-svc", "namespace": "default" },
+            "spec": {
+                "type": "ExternalName",
+                "externalName": "example.com"
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        assert!(
+            obj["spec"]["ipFamilyPolicy"].is_null(),
+            "ExternalName service must not have ipFamilyPolicy — it has no cluster IP"
+        );
+        assert!(
+            obj["spec"]["ipFamilies"].is_null(),
+            "ExternalName service must not have ipFamilies — it has no cluster IP"
+        );
+        assert!(
+            obj["spec"]["clusterIPs"].is_null(),
+            "ExternalName service must not have clusterIPs — it has no cluster IP"
+        );
+        assert!(
+            obj["spec"]["clusterIP"].is_null(),
+            "ExternalName service must not have clusterIP set by defaults"
+        );
+    }
+
+    /// ExternalName service must get spec.type defaulted correctly when type is explicit.
+    ///
+    /// spec.type="ExternalName" is preserved (not overwritten to ClusterIP).
+    #[test]
+    fn external_name_type_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "ext2", "namespace": "default" },
+            "spec": {
+                "type": "ExternalName",
+                "externalName": "db.example.com"
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["type"], "ExternalName",
+            "spec.type=ExternalName must not be overwritten to ClusterIP"
         );
     }
 }

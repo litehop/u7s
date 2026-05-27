@@ -1260,12 +1260,19 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
 ///
 /// Sets `spec.clusterIP` in `body` when allocation succeeds.
 /// If `spec.clusterIP` is already set (non-empty string), does nothing.
+/// ExternalName services are skipped entirely — they must not have a ClusterIP.
 async fn maybe_allocate_cluster_ip<S: Store>(
     state: &AppState<S>,
     ns: &str,
     name: &str,
     body: &mut serde_json::Value,
 ) -> Result<(), crate::status::StatusError> {
+    // ExternalName services must not have a ClusterIP; skip allocation entirely.
+    let svc_type = body["spec"]["type"].as_str().unwrap_or("");
+    if svc_type == "ExternalName" {
+        return Ok(());
+    }
+
     // Only auto-allocate when clusterIP is absent or empty.
     let existing = body["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
     if !existing.is_empty() {
