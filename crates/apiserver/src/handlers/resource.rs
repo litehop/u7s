@@ -4554,16 +4554,18 @@ mod tests {
         // Use /29 so we have two usable IPs for two Services.
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let alloc = ServiceIpAllocator::from_cidr("10.0.0.0/29").expect("valid CIDR");
-        let state = crate::state::AppState::new_with_ca(
-            store.clone(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-            None,
-            None,
-            Some(alloc),
-        );
+        let state = crate::state::AppState::new_with_config(crate::state::AppStateConfig {
+            store: store.clone(),
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: Some(alloc),
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+        });
 
         // Create two Services — allocation attaches a sentinel for each IP.
         for name in &["svc-a", "svc-b"] {

@@ -2457,16 +2457,18 @@ mod tests {
         use std::sync::Arc;
         let store = Arc::new(make_store());
         let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
-        state::AppState::new_with_ca(
+        state::AppState::new_with_config(state::AppStateConfig {
             store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-            None,
-            None,
-            Some(alloc),
-        )
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: Some(alloc),
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+        })
     }
 
     /// POST a Service with no clusterIP → GET it back → clusterIP is in the configured CIDR.

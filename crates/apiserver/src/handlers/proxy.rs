@@ -1169,16 +1169,18 @@ mod tests {
         let ca_der = cert.cert.der().to_vec();
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
-        let state = AppState::new_with_ca(
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-            Some(ca_der),
-            None,
-            None,
-        );
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+        });
 
         let pod = serde_json::json!({
             "apiVersion": "v1",
@@ -1362,16 +1364,18 @@ mod tests {
     #[tokio::test]
     async fn portforward_validation_happy_path_produces_correct_kubelet_url() {
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
-        let state = AppState::new_with_ca(
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-            None,
-            None,
-            None,
-        );
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+        });
 
         let pod = serde_json::json!({
             "apiVersion": "v1",

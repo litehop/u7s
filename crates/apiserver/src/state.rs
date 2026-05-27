@@ -260,36 +260,6 @@ impl<S: Store> AppState<S> {
         }
     }
 
-    /// Test-only helper: `cluster_ca_der` and `webhook_identity_pem` set, rest None.
-    ///
-    /// `webhook_identity_pem`: optional concatenated PEM bytes of (cert, key) for mTLS.
-    /// In production this is `admin_cert_pem + admin_key_pem` from `TlsMaterial`.
-    /// Pass `None` in tests that do not exercise real webhook HTTPS connections.
-    #[cfg(test)]
-    pub(crate) fn new_with_ca(
-        store: Arc<S>,
-        sa_key: Option<jsonwebtoken::EncodingKey>,
-        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
-        token_map: HashMap<String, UserInfo>,
-        server_address: String,
-        cluster_ca_der: Option<Vec<u8>>,
-        webhook_identity_pem: Option<Vec<u8>>,
-        service_ip_allocator: Option<ServiceIpAllocator>,
-    ) -> Self {
-        Self::new_with_config(AppStateConfig {
-            store,
-            sa_key,
-            sa_decoding_key,
-            token_map,
-            server_address,
-            cluster_ca_der,
-            webhook_identity_pem,
-            service_ip_allocator,
-            kubelet_client_identity_pem: None,
-            kubelet_preferred_address: None,
-        })
-    }
-
     /// Populate the RBAC index from objects already persisted in the store.
     ///
     /// Must be called once at startup before serving requests.  Scans the four
@@ -976,7 +946,7 @@ mod tests {
     /// build_webhook_client succeeds when given valid DER-encoded CA bytes.
     ///
     /// This is the happy-path construction test. If it fails, the apiserver cannot
-    /// start at all (new_with_ca panics). The security property: the CA must be
+    /// start at all (new_with_config panics). The security property: the CA must be
     /// parseable so CA-pinning is actually applied.
     #[test]
     fn build_webhook_client_succeeds_with_valid_ca_der() {
@@ -1065,16 +1035,18 @@ mod tests {
     fn make_state_with_cidr(cidr: &str) -> AppState<SqliteStore> {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
-        AppState::new_with_ca(
+        AppState::new_with_config(AppStateConfig {
             store,
-            None,
-            None,
-            std::collections::HashMap::new(),
-            "https://localhost:6443".into(),
-            None,
-            None,
-            Some(alloc),
-        )
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: Some(alloc),
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+        })
     }
 
     /// Two successive allocations must return different IPs.
