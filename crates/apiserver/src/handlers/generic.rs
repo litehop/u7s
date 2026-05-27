@@ -251,13 +251,37 @@ pub(crate) fn parse_field_selector(
     })
 }
 
+/// TTL for continue tokens. Tokens older than this are rejected with 410 Gone.
+/// Kubernetes etcd compacts old revisions; we simulate this by expiring tokens after 5 minutes.
+/// The conformance test polls every 20s and expects 410 within a reasonable window.
+pub(crate) const CONTINUE_TOKEN_TTL_SECS: u64 = 300; // 5 minutes
+
+/// Return current Unix time in seconds using only std::time (no external deps).
+fn unix_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Encode a store key as a URL-safe base64 continue token (no padding).
+/// The token is a JSON envelope `{"k":"<store_key>","t":<unix_secs>}` so that
+/// `decode_continue` can reject stale tokens with 410 Gone (Kubernetes spec: expired
+/// continue tokens must return 410, not silently re-serve stale pages).
 fn encode_continue(key: &str) -> String {
     use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_bytes())
+    let payload = serde_json::json!({"k": key, "t": unix_now()}).to_string();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes())
 }
 
 /// Decode a URL-safe base64 continue token back to a store key string.
+///
+/// Returns `Err` with:
+/// - HTTP 400 if the token is malformed (bad base64 or missing fields)
+/// - HTTP 410 Gone with `reason: "Expired"` if the token is older than
+///   `CONTINUE_TOKEN_TTL_SECS`. Kubernetes clients that receive 410 know to
+///   re-list from scratch rather than resuming pagination.
 pub(crate) fn decode_continue(token: &str) -> Result<String, crate::status::StatusError> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -267,8 +291,25 @@ pub(crate) fn decode_continue(token: &str) -> Result<String, crate::status::Stat
                 "invalid continue token '{token}': base64 decode failed"
             ))
         })?;
-    String::from_utf8(bytes).map_err(|_| {
-        Status::bad_request(format!("invalid continue token '{token}': not valid UTF-8"))
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+        Status::bad_request(format!("invalid continue token '{token}': not valid JSON"))
+    })?;
+    let issued_at = payload["t"].as_u64().ok_or_else(|| {
+        Status::bad_request(format!(
+            "invalid continue token '{token}': missing issued-at field"
+        ))
+    })?;
+    let age = unix_now().saturating_sub(issued_at);
+    if age > CONTINUE_TOKEN_TTL_SECS {
+        return Err(Status::expired(format!(
+            "continue token expired: issued {age}s ago (TTL is {CONTINUE_TOKEN_TTL_SECS}s); \
+             re-list from the beginning"
+        )));
+    }
+    payload["k"].as_str().map(str::to_string).ok_or_else(|| {
+        Status::bad_request(format!(
+            "invalid continue token '{token}': missing key field"
+        ))
     })
 }
 
@@ -743,6 +784,46 @@ mod tests {
         // A malformed continue token from a client must return 400, not 500 or a panic.
         let err = decode_continue("!!!not-valid-base64!!!").unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn decode_expired_continue_token_returns_410() {
+        // An expired continue token must return HTTP 410 Gone with reason "Expired".
+        // Kubernetes conformance test [sig-api-machinery] chunking polls for 410 after
+        // etcd compacts old revisions; without expiry the test waits 600+ seconds before failing.
+        // This test forges a token with an ancient timestamp to verify expiry without sleeping.
+        use base64::Engine;
+        let old_iat = 0u64; // Unix epoch — definitely expired
+        let payload = serde_json::json!({"k": "/registry/podtemplates/default/foo", "t": old_iat})
+            .to_string();
+        let stale_token =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+
+        let err = decode_continue(&stale_token).unwrap_err();
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GONE,
+            "expired continue token must return 410 Gone, not 200 or 400, so clients know \
+             to re-list from the beginning (Kubernetes spec: 410 with reason Expired)"
+        );
+        assert_eq!(
+            err.1.reason, "Expired",
+            "Status.reason must be 'Expired' so client-go recognises the pagination reset"
+        );
+    }
+
+    #[test]
+    fn decode_fresh_continue_token_within_ttl_succeeds() {
+        // A token issued just now must be accepted (not incorrectly rejected as expired).
+        // Regressions here would break all pagination immediately after the first page.
+        let key = "/registry/podtemplates/default/bar";
+        let token = encode_continue(key);
+        let decoded = ok(decode_continue(&token));
+        assert_eq!(
+            decoded, key,
+            "a fresh continue token must decode to the original store key; \
+             premature expiry would break all paginated LIST requests"
+        );
     }
 
     #[test]
