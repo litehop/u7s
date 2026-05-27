@@ -11,7 +11,10 @@ use std::process::Command;
 
 #[derive(Clone, Default)]
 pub struct U7sTools {
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "read by #[tool_router] macro-generated ServerHandler impl"
+    )]
     tool_router: ToolRouter<U7sTools>,
 }
 
