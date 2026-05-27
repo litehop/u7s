@@ -183,13 +183,13 @@ pub async fn splice<A: BiStream, B: BiStream>(a: A, b: B) {
     let (mut ar, mut aw) = a.split();
     let (mut br, mut bw) = b.split();
 
-    let (a_to_b_tx, mut a_to_b_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
-    let (b_to_a_tx, mut b_to_a_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
+    let (a_to_b_tx, mut a_to_b_rx) = mpsc::channel::<bytes::Bytes>(256);
+    let (b_to_a_tx, mut b_to_a_rx) = mpsc::channel::<bytes::Bytes>(256);
 
     // read_a: drain A into a_to_b channel.
     let read_a = tokio::spawn(async move {
         while let Some(data) = ar.recv().await {
-            if a_to_b_tx.send(data).is_err() {
+            if a_to_b_tx.send(data).await.is_err() {
                 break;
             }
         }
@@ -199,7 +199,7 @@ pub async fn splice<A: BiStream, B: BiStream>(a: A, b: B) {
     // read_b: drain B into b_to_a channel.
     let read_b = tokio::spawn(async move {
         while let Some(data) = br.recv().await {
-            if b_to_a_tx.send(data).is_err() {
+            if b_to_a_tx.send(data).await.is_err() {
                 break;
             }
         }

@@ -1906,9 +1906,12 @@ pub fn decode_event_proto(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(t) = s.last_observed_time {
             if t.seconds != 0 {
+                let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
+                    t.seconds as u64,
+                ));
                 sm.insert(
                     "lastObservedTime".to_string(),
-                    serde_json::Value::String(crate::util::secs_to_rfc3339(t.seconds as u64)),
+                    serde_json::Value::String(ts),
                 );
             }
         }
@@ -3996,8 +3999,10 @@ mod tests {
              PUTs to overwrite the object without series"
         );
         assert_eq!(
-            result["series"]["lastObservedTime"], "2024-01-01T00:00:00Z",
-            "series.lastObservedTime must be decoded as RFC3339"
+            result["series"]["lastObservedTime"], "2024-01-01T00:00:00.000000Z",
+            "series.lastObservedTime must be normalized to microsecond precision; \
+             client-go's MicroTime codec rejects bare RFC3339 (no fractional part) with \
+             'cannot parse Z as .000000', breaking Event series conformance tests"
         );
     }
 

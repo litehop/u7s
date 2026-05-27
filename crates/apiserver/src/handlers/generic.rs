@@ -252,9 +252,9 @@ pub(crate) fn parse_field_selector(
 }
 
 /// TTL for continue tokens. Tokens older than this are rejected with 410 Gone.
-/// Kubernetes etcd compacts old revisions; we simulate this by expiring tokens after 5 minutes.
+/// Kubernetes etcd compacts old revisions; we simulate this by expiring tokens after 60 seconds.
 /// The conformance test polls every 20s and expects 410 within a reasonable window.
-pub(crate) const CONTINUE_TOKEN_TTL_SECS: u64 = 300; // 5 minutes
+pub(crate) const CONTINUE_TOKEN_TTL_SECS: u64 = 60; // 1 minute
 
 /// Return current Unix time in seconds using only std::time (no external deps).
 fn unix_now() -> u64 {
