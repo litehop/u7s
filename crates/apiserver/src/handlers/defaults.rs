@@ -162,6 +162,16 @@ pub fn default_service_ip_fields(obj: &mut serde_json::Value) {
 }
 
 fn default_deployment(obj: &mut serde_json::Value) {
+    // spec.selector defaults to matchLabels from spec.template.metadata.labels.
+    // Upstream kube-apiserver rejects Deployments without spec.selector; u7s stores
+    // them as-is, so the KCM deployment-controller hits a nil selector and panics.
+    if obj["spec"]["selector"].is_null() {
+        let labels = obj["spec"]["template"]["metadata"]["labels"].clone();
+        if labels.is_object() {
+            obj["spec"]["selector"] = serde_json::json!({ "matchLabels": labels });
+        }
+    }
+
     // spec.replicas defaults to 1
     if obj["spec"]["replicas"].is_null() {
         obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
@@ -282,6 +292,64 @@ mod tests {
         assert!(
             obj["spec"]["strategy"]["rollingUpdate"].is_null(),
             "rollingUpdate must not be added when strategy is Recreate"
+        );
+    }
+
+    /// Deployment without spec.selector must have it defaulted from template labels.
+    ///
+    /// Upstream kube-apiserver rejects Deployments without spec.selector; u7s doesn't
+    /// validate this. The KCM deployment-controller calls CloneSelectorAndAddLabel on
+    /// spec.selector and panics with a nil-pointer dereference, killing the entire KCM
+    /// process (including the serviceaccount-controller). This causes all new namespaces
+    /// to never get a default ServiceAccount, breaking sonobuoy job tests.
+    #[test]
+    fn deployment_without_selector_gets_default_from_template_labels() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "test", "version": "v1" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "test", "version": "v1" } }),
+            "spec.selector must be defaulted from template labels — nil selector panics the KCM deployment-controller"
+        );
+    }
+
+    /// Existing spec.selector must not be overwritten.
+    ///
+    /// A Deployment may use a selector that's a strict subset of the template labels.
+    /// Overwriting it would break the controller's ability to identify owned ReplicaSets.
+    #[test]
+    fn deployment_existing_selector_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "my-app" } },
+                "template": {
+                    "metadata": { "labels": { "app": "my-app", "extra": "label" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "my-app" } }),
+            "existing spec.selector must not be overwritten — changing it breaks ReplicaSet ownership"
         );
     }
 
