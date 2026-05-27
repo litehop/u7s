@@ -28,7 +28,7 @@ use super::json_patch::{
     apply_json_patch, detect_patch_type, inject_managed_fields, strip_managed_fields, PatchQuery,
     PatchType,
 };
-use super::watch::{fetch_initial_events, watch_generic};
+use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
 // ---------------------------------------------------------------------------
 // Cluster-scoped handlers  (group/version/resource)
@@ -90,18 +90,20 @@ pub async fn list_resource<S: Store>(
             fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
         return watch_generic(
             state,
-            prefix,
-            watch_api_version,
-            watch_kind,
-            from_rv,
-            initial,
-            query.label_selector,
-            query.field_selector,
-            query.allow_watch_bookmarks == Some(true),
-            user.username,
-            pom,
-            group.clone(),
-            plural.clone(),
+            WatchConfig {
+                prefix,
+                api_version: watch_api_version,
+                kind: watch_kind,
+                from_revision: from_rv,
+                initial_items: initial,
+                label_selector: query.label_selector,
+                field_selector: query.field_selector,
+                allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
+                username: user.username,
+                as_partial_object_metadata: pom,
+                group: group.clone(),
+                plural: plural.clone(),
+            },
         )
         .await;
     }
@@ -418,27 +420,49 @@ pub async fn delete_resource<S: Store>(
     .into_response())
 }
 
+/// Parameters for `do_patch`.
+///
+/// Groups the arguments that previously caused a `clippy::too_many_arguments` warning.
+pub(crate) struct PatchConfig<'a> {
+    pub key: &'a str,
+    pub meta: &'a crate::types::ResourceMeta,
+    pub group: &'a str,
+    pub version: &'a str,
+    pub plural: &'a str,
+    /// `None` for cluster-scoped resources, `Some(namespace)` for namespaced ones.
+    pub ns: Option<&'a str>,
+    pub name: &'a str,
+    pub is_ssa: bool,
+    /// Value of the `?fieldManager=` query param; used only for SSA to
+    /// populate the synthetic `managedFields` echo in the response.
+    pub field_manager: Option<&'a str>,
+    pub patch_type: PatchType,
+    pub body: Bytes,
+}
+
 /// Shared patch logic for cluster-scoped and namespaced resources.
 ///
-/// `ns` is `None` for cluster-scoped resources and `Some(namespace)` for namespaced ones.
-/// The caller supplies the pre-computed `key` and resolved `meta`.
-/// `field_manager` is the value of the `?fieldManager=` query param; used only for SSA to
+/// `cfg.ns` is `None` for cluster-scoped resources and `Some(namespace)` for namespaced ones.
+/// The caller supplies the pre-computed `cfg.key` and resolved `cfg.meta`.
+/// `cfg.field_manager` is the value of the `?fieldManager=` query param; used only for SSA to
 /// populate the synthetic `managedFields` echo in the response.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn do_patch<S: Store>(
     state: &AppState<S>,
-    key: &str,
-    meta: &crate::types::ResourceMeta,
-    group: &str,
-    version: &str,
-    plural: &str,
-    ns: Option<&str>,
-    name: &str,
-    is_ssa: bool,
-    field_manager: Option<&str>,
-    patch_type: PatchType,
-    body: Bytes,
+    cfg: PatchConfig<'_>,
 ) -> Result<Response, crate::status::StatusError> {
+    let PatchConfig {
+        key,
+        meta,
+        group,
+        version,
+        plural,
+        ns,
+        name,
+        is_ssa,
+        field_manager,
+        patch_type,
+        body,
+    } = cfg;
     let stored_opt = state
         .store
         .get(key)
@@ -633,17 +657,19 @@ pub async fn patch_resource<S: Store>(
     let key = group_object_key(&group, &plural, None, &name);
     do_patch(
         &state,
-        &key,
-        &meta,
-        &group,
-        &version,
-        &plural,
-        None,
-        &name,
-        is_ssa,
-        patch_query.field_manager.as_deref(),
-        patch_type,
-        body,
+        PatchConfig {
+            key: &key,
+            meta: &meta,
+            group: &group,
+            version: &version,
+            plural: &plural,
+            ns: None,
+            name: &name,
+            is_ssa,
+            field_manager: patch_query.field_manager.as_deref(),
+            patch_type,
+            body,
+        },
     )
     .await
 }
@@ -701,18 +727,20 @@ pub async fn list_namespaced_resource<S: Store>(
             fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
         return watch_generic(
             state,
-            prefix,
-            watch_api_version,
-            watch_kind,
-            from_rv,
-            initial,
-            query.label_selector,
-            query.field_selector,
-            query.allow_watch_bookmarks == Some(true),
-            user.username,
-            pom,
-            group.clone(),
-            plural.clone(),
+            WatchConfig {
+                prefix,
+                api_version: watch_api_version,
+                kind: watch_kind,
+                from_revision: from_rv,
+                initial_items: initial,
+                label_selector: query.label_selector,
+                field_selector: query.field_selector,
+                allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
+                username: user.username,
+                as_partial_object_metadata: pom,
+                group: group.clone(),
+                plural: plural.clone(),
+            },
         )
         .await;
     }
@@ -1083,17 +1111,19 @@ pub async fn patch_namespaced_resource<S: Store>(
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     do_patch(
         &state,
-        &key,
-        &meta,
-        &group,
-        &version,
-        &plural,
-        Some(&ns),
-        &name,
-        is_ssa,
-        patch_query.field_manager.as_deref(),
-        patch_type,
-        body,
+        PatchConfig {
+            key: &key,
+            meta: &meta,
+            group: &group,
+            version: &version,
+            plural: &plural,
+            ns: Some(&ns),
+            name: &name,
+            is_ssa,
+            field_manager: patch_query.field_manager.as_deref(),
+            patch_type,
+            body,
+        },
     )
     .await
 }

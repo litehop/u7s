@@ -31,7 +31,7 @@ use super::status::{
     get_namespaced_resource_status, get_resource_status, patch_namespaced_resource_status,
     patch_resource_status, put_namespaced_resource_status, put_resource_status,
 };
-use super::watch::{fetch_initial_events, watch_generic};
+use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
 pub async fn core_list_resource<S: Store>(
     State(state): State<AppState<S>>,
@@ -51,18 +51,20 @@ pub async fn core_list_resource<S: Store>(
                     .await?;
             return watch_generic(
                 state,
-                prefix,
-                "v1".into(),
-                "Pod".into(),
-                from_rv,
-                initial,
-                query.label_selector,
-                query.field_selector,
-                query.allow_watch_bookmarks == Some(true),
-                user.username,
-                false,
-                "".into(),
-                "pods".into(),
+                WatchConfig {
+                    prefix,
+                    api_version: "v1".into(),
+                    kind: "Pod".into(),
+                    from_revision: from_rv,
+                    initial_items: initial,
+                    label_selector: query.label_selector,
+                    field_selector: query.field_selector,
+                    allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
+                    username: user.username,
+                    as_partial_object_metadata: false,
+                    group: "".into(),
+                    plural: "pods".into(),
+                },
             )
             .await
             .map(IntoResponse::into_response);

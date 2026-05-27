@@ -115,6 +115,27 @@ pub struct AppState<S = SqliteStore> {
     pub service_ip_allocator: Option<Arc<ServiceIpAllocator>>,
 }
 
+/// Configuration passed to [`AppState::new_with_config`].
+///
+/// Groups the parameters that previously caused `clippy::too_many_arguments` warnings
+/// on the old `new_with_ca_and_kubelet_identity_and_address` constructor.
+pub struct AppStateConfig<S> {
+    pub store: Arc<S>,
+    pub sa_key: Option<jsonwebtoken::EncodingKey>,
+    pub sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
+    pub token_map: HashMap<String, UserInfo>,
+    pub server_address: String,
+    pub cluster_ca_der: Option<Vec<u8>>,
+    /// Concatenated PEM bytes of (cert, key) for admission webhook mTLS.
+    /// In production: `admin_cert_pem + admin_key_pem` from `TlsMaterial`.
+    pub webhook_identity_pem: Option<Vec<u8>>,
+    pub service_ip_allocator: Option<ServiceIpAllocator>,
+    /// Concatenated PEM bytes of (cert, key) for the kubelet proxy client cert.
+    /// In production: `kubelet_client_cert_pem + kubelet_client_key_pem` from `TlsMaterial`.
+    pub kubelet_client_identity_pem: Option<Vec<u8>>,
+    pub kubelet_preferred_address: Option<String>,
+}
+
 // Manual Clone so we don't impose S: Clone (Arc<S> is always Clone).
 impl<S> Clone for AppState<S> {
     fn clone(&self) -> Self {
@@ -137,8 +158,7 @@ impl<S> Clone for AppState<S> {
 }
 
 impl<S: Store> AppState<S> {
-    /// Convenience constructor for tests: cluster_ca_der, webhook_identity_pem, and
-    /// service_ip_allocator default to None.
+    /// Convenience constructor for tests: all optional fields default to None.
     #[cfg(test)]
     pub fn new(
         store: Arc<S>,
@@ -147,16 +167,18 @@ impl<S: Store> AppState<S> {
         token_map: HashMap<String, UserInfo>,
         server_address: String,
     ) -> Self {
-        Self::new_with_ca(
+        Self::new_with_config(AppStateConfig {
             store,
             sa_key,
             sa_decoding_key,
             token_map,
             server_address,
-            None,
-            None,
-            None,
-        )
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+        })
     }
 
     /// Build a pinned `reqwest::Client` for admission webhook calls.
@@ -210,15 +232,40 @@ impl<S: Store> AppState<S> {
         builder.build().expect("webhook HTTP client must build")
     }
 
+    /// Construct an `AppState` from an [`AppStateConfig`].
+    ///
+    /// This is the primary constructor used by both production code (`main.rs`) and tests.
+    /// Test helpers that need only a subset of fields should build an `AppStateConfig`
+    /// with the remaining fields set to `None`.
+    pub fn new_with_config(cfg: AppStateConfig<S>) -> Self {
+        let registry = build_registry();
+        let webhook_client = Self::build_webhook_client(
+            cfg.cluster_ca_der.as_deref(),
+            cfg.webhook_identity_pem.as_deref(),
+        );
+        AppState {
+            store: cfg.store,
+            resource_registry: Arc::new(registry),
+            rbac_index: Arc::new(RbacIndex::new()),
+            sa_key: cfg.sa_key.map(Arc::new),
+            sa_decoding_key: cfg.sa_decoding_key.map(Arc::new),
+            token_map: Arc::new(cfg.token_map),
+            server_address: cfg.server_address,
+            watch_limit: WatchLimitState::new(),
+            webhook_client,
+            cluster_ca_der: cfg.cluster_ca_der.map(Arc::new),
+            kubelet_client_identity_pem: cfg.kubelet_client_identity_pem.map(Arc::new),
+            kubelet_preferred_address: cfg.kubelet_preferred_address.map(Arc::new),
+            service_ip_allocator: cfg.service_ip_allocator.map(Arc::new),
+        }
+    }
+
+    /// Test-only helper: `cluster_ca_der` and `webhook_identity_pem` set, rest None.
+    ///
     /// `webhook_identity_pem`: optional concatenated PEM bytes of (cert, key) for mTLS.
     /// In production this is `admin_cert_pem + admin_key_pem` from `TlsMaterial`.
     /// Pass `None` in tests that do not exercise real webhook HTTPS connections.
-    ///
-    /// `kubelet_client_identity_pem`: optional concatenated PEM bytes of (cert, key) for
-    /// the kubelet proxy client cert. In production this is
-    /// `kubelet_client_cert_pem + kubelet_client_key_pem` from `TlsMaterial`.
     #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_ca(
         store: Arc<S>,
         sa_key: Option<jsonwebtoken::EncodingKey>,
@@ -229,7 +276,7 @@ impl<S: Store> AppState<S> {
         webhook_identity_pem: Option<Vec<u8>>,
         service_ip_allocator: Option<ServiceIpAllocator>,
     ) -> Self {
-        Self::new_with_ca_and_kubelet_identity_and_address(
+        Self::new_with_config(AppStateConfig {
             store,
             sa_key,
             sa_decoding_key,
@@ -238,42 +285,9 @@ impl<S: Store> AppState<S> {
             cluster_ca_der,
             webhook_identity_pem,
             service_ip_allocator,
-            None,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_ca_and_kubelet_identity_and_address(
-        store: Arc<S>,
-        sa_key: Option<jsonwebtoken::EncodingKey>,
-        sa_decoding_key: Option<jsonwebtoken::DecodingKey>,
-        token_map: HashMap<String, UserInfo>,
-        server_address: String,
-        cluster_ca_der: Option<Vec<u8>>,
-        webhook_identity_pem: Option<Vec<u8>>,
-        service_ip_allocator: Option<ServiceIpAllocator>,
-        kubelet_client_identity_pem: Option<Vec<u8>>,
-        kubelet_preferred_address: Option<String>,
-    ) -> Self {
-        let registry = build_registry();
-        let webhook_client =
-            Self::build_webhook_client(cluster_ca_der.as_deref(), webhook_identity_pem.as_deref());
-        AppState {
-            store,
-            resource_registry: Arc::new(registry),
-            rbac_index: Arc::new(RbacIndex::new()),
-            sa_key: sa_key.map(Arc::new),
-            sa_decoding_key: sa_decoding_key.map(Arc::new),
-            token_map: Arc::new(token_map),
-            server_address,
-            watch_limit: WatchLimitState::new(),
-            webhook_client,
-            cluster_ca_der: cluster_ca_der.map(Arc::new),
-            kubelet_client_identity_pem: kubelet_client_identity_pem.map(Arc::new),
-            kubelet_preferred_address: kubelet_preferred_address.map(Arc::new),
-            service_ip_allocator: service_ip_allocator.map(Arc::new),
-        }
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+        })
     }
 
     /// Populate the RBAC index from objects already persisted in the store.

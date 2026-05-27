@@ -33,7 +33,7 @@ use crate::{
             parse_field_selector, parse_label_selector, resolve_name, stamp_metadata,
             validate_name, CollectionQuery,
         },
-        watch::{fetch_initial_events, watch_generic},
+        watch::{fetch_initial_events, watch_generic, WatchConfig},
     },
     keys::{group_list_prefix, group_object_key},
     state::AppState,
@@ -112,18 +112,20 @@ pub async fn list_csr<S: Store>(
             fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
         return watch_generic(
             state,
-            prefix,
-            format!("{GROUP}/{VERSION}"),
-            kind,
-            from_rv,
-            initial,
-            query.label_selector,
-            query.field_selector,
-            query.allow_watch_bookmarks == Some(true),
-            user.username,
-            false,
-            GROUP.to_string(),
-            PLURAL.to_string(),
+            WatchConfig {
+                prefix,
+                api_version: format!("{GROUP}/{VERSION}"),
+                kind,
+                from_revision: from_rv,
+                initial_items: initial,
+                label_selector: query.label_selector,
+                field_selector: query.field_selector,
+                allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
+                username: user.username,
+                as_partial_object_metadata: false,
+                group: GROUP.to_string(),
+                plural: PLURAL.to_string(),
+            },
         )
         .await;
     }
