@@ -1180,6 +1180,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            continue_token_key: None,
         });
 
         let pod = serde_json::json!({
@@ -1375,6 +1376,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            continue_token_key: None,
         });
 
         let pod = serde_json::json!({

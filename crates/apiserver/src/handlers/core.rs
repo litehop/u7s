@@ -77,7 +77,7 @@ pub async fn core_list_resource<S: Store>(
         let continue_key = query
             .continue_token
             .as_deref()
-            .map(decode_continue)
+            .map(|t| decode_continue(t, &state.continue_token_key))
             .transpose()?;
         let resp = state
             .store
@@ -111,6 +111,7 @@ pub async fn core_list_resource<S: Store>(
             items,
             resp.continue_key,
             resp.remaining_count,
+            &state.continue_token_key,
         );
         return Ok(Json(body).into_response());
     }

@@ -265,39 +265,71 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Encode a store key as a URL-safe base64 continue token (no padding).
-/// The token is a JSON envelope `{"k":"<store_key>","t":<unix_secs>}` so that
-/// `decode_continue` can reject stale tokens with 410 Gone (Kubernetes spec: expired
-/// continue tokens must return 410, not silently re-serve stale pages).
-fn encode_continue(key: &str) -> String {
+/// Encode a store key as a signed continue token.
+///
+/// Token format: `base64url(payload) + "." + base64url(hmac_sha256(signing_key, payload))`
+///
+/// The payload is a JSON envelope `{"k":"<store_key>","t":<unix_secs>}`.
+/// The HMAC prevents a client from forging tokens that point to a different
+/// namespace's store prefix (cross-namespace pagination forgery).
+fn encode_continue(key: &str, signing_key: &[u8; 32]) -> String {
     use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let payload = serde_json::json!({"k": key, "t": unix_now()}).to_string();
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes())
+    let payload_b64 = b64.encode(payload.as_bytes());
+    let mut mac = <Hmac<Sha256>>::new_from_slice(signing_key).expect("HMAC accepts any key size");
+    mac.update(payload.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    let sig_b64 = b64.encode(&sig[..]);
+    format!("{payload_b64}.{sig_b64}")
 }
 
-/// Decode a URL-safe base64 continue token back to a store key string.
+/// Decode and verify a signed continue token, returning the store key.
 ///
 /// Returns `Err` with:
-/// - HTTP 400 if the token is malformed (bad base64 or missing fields)
-/// - HTTP 410 Gone with `reason: "Expired"` if the token is older than
-///   `CONTINUE_TOKEN_TTL_SECS`. Kubernetes clients that receive 410 know to
-///   re-list from scratch rather than resuming pagination.
-pub(crate) fn decode_continue(token: &str) -> Result<String, crate::status::StatusError> {
+/// - HTTP 410 Gone with `reason: "Expired"` if the HMAC signature is invalid
+///   (includes unsigned tokens from a previous server start) or if the token
+///   is older than `CONTINUE_TOKEN_TTL_SECS`.
+/// - HTTP 400 if the token format is structurally malformed.
+///
+/// Returning 410 for bad signatures matches the Kubernetes spec for expired
+/// tokens and prompts clients to re-list from scratch.
+pub(crate) fn decode_continue(
+    token: &str,
+    signing_key: &[u8; 32],
+) -> Result<String, crate::status::StatusError> {
     use base64::Engine;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token)
-        .map_err(|_| {
-            Status::bad_request(format!(
-                "invalid continue token '{token}': base64 decode failed"
-            ))
-        })?;
-    let payload: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-        Status::bad_request(format!("invalid continue token '{token}': not valid JSON"))
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    // Split into payload_b64 and sig_b64.
+    let (payload_b64, sig_b64) = token.split_once('.').ok_or_else(|| {
+        Status::bad_request("invalid continue token: missing signature separator".to_string())
     })?;
+
+    // Decode and verify HMAC before touching the payload.
+    let payload_bytes = b64.decode(payload_b64).map_err(|_| {
+        Status::bad_request("invalid continue token: payload base64 decode failed".to_string())
+    })?;
+    let sig_bytes = b64.decode(sig_b64).map_err(|_| {
+        Status::bad_request("invalid continue token: signature base64 decode failed".to_string())
+    })?;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(signing_key).expect("HMAC accepts any key size");
+    mac.update(&payload_bytes);
+    // verify_slice uses constant-time comparison.
+    mac.verify_slice(&sig_bytes).map_err(|_| {
+        // Return 410 so clients re-list; matches behaviour for expired tokens.
+        Status::expired("continue token signature invalid; re-list from the beginning".to_string())
+    })?;
+
+    // Signature valid — parse payload.
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|_| Status::bad_request("invalid continue token: not valid JSON".to_string()))?;
     let issued_at = payload["t"].as_u64().ok_or_else(|| {
-        Status::bad_request(format!(
-            "invalid continue token '{token}': missing issued-at field"
-        ))
+        Status::bad_request("invalid continue token: missing issued-at field".to_string())
     })?;
     let age = unix_now().saturating_sub(issued_at);
     if age > CONTINUE_TOKEN_TTL_SECS {
@@ -306,13 +338,13 @@ pub(crate) fn decode_continue(token: &str) -> Result<String, crate::status::Stat
              re-list from the beginning"
         )));
     }
-    payload["k"].as_str().map(str::to_string).ok_or_else(|| {
-        Status::bad_request(format!(
-            "invalid continue token '{token}': missing key field"
-        ))
-    })
+    payload["k"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| Status::bad_request("invalid continue token: missing key field".to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_list_response(
     kind: &str,
     group: &str,
@@ -321,6 +353,7 @@ pub(crate) fn build_list_response(
     items: Vec<serde_json::Value>,
     continue_key: Option<String>,
     remaining_count: Option<u64>,
+    signing_key: &[u8; 32],
 ) -> serde_json::Value {
     let api_version = if group.is_empty() {
         version.to_string()
@@ -329,7 +362,7 @@ pub(crate) fn build_list_response(
     };
     let mut metadata = serde_json::json!({ "resourceVersion": revision.to_string() });
     if let Some(key) = continue_key {
-        metadata["continue"] = serde_json::Value::String(encode_continue(&key));
+        metadata["continue"] = serde_json::Value::String(encode_continue(&key, signing_key));
     }
     if let Some(count) = remaining_count {
         metadata["remainingItemCount"] = serde_json::Value::Number(count.into());
@@ -533,17 +566,19 @@ mod tests {
 
     // -- build_list_response --
 
+    const TEST_KEY: &[u8; 32] = b"test-signing-key-32-bytes-padded";
+
     #[test]
     fn core_group_api_version_is_version_only() {
         // For core group (group=""), apiVersion should be just "v1", not "/v1".
-        let body = build_list_response("Node", "", "v1", 0, vec![], None, None);
+        let body = build_list_response("Node", "", "v1", 0, vec![], None, None, TEST_KEY);
         assert_eq!(body["apiVersion"], "v1");
         assert_eq!(body["kind"], "NodeList");
     }
 
     #[test]
     fn non_core_group_api_version_includes_group() {
-        let body = build_list_response("Deployment", "apps", "v1", 0, vec![], None, None);
+        let body = build_list_response("Deployment", "apps", "v1", 0, vec![], None, None, TEST_KEY);
         assert_eq!(body["apiVersion"], "apps/v1");
     }
 
@@ -771,8 +806,8 @@ mod tests {
         // The continue token is opaque to clients; they must get back the original key after
         // base64 round-trip. A broken encoding loses the cursor and re-scans from the start.
         let key = "/registry/pods/default/my-pod";
-        let token = encode_continue(key);
-        let decoded = ok(decode_continue(&token));
+        let token = encode_continue(key, TEST_KEY);
+        let decoded = ok(decode_continue(&token, TEST_KEY));
         assert_eq!(
             decoded, key,
             "decoded continue token must equal the original store key"
@@ -781,8 +816,8 @@ mod tests {
 
     #[test]
     fn decode_invalid_continue_token_is_400() {
-        // A malformed continue token from a client must return 400, not 500 or a panic.
-        let err = decode_continue("!!!not-valid-base64!!!").unwrap_err();
+        // A malformed continue token from a client (no '.' separator) must return 400.
+        let err = decode_continue("!!!not-valid-base64!!!", TEST_KEY).unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
@@ -791,15 +826,24 @@ mod tests {
         // An expired continue token must return HTTP 410 Gone with reason "Expired".
         // Kubernetes conformance test [sig-api-machinery] chunking polls for 410 after
         // etcd compacts old revisions; without expiry the test waits 600+ seconds before failing.
-        // This test forges a token with an ancient timestamp to verify expiry without sleeping.
-        use base64::Engine;
+        // This test builds a valid signed token with an ancient timestamp to verify expiry
+        // without sleeping.
         let old_iat = 0u64; // Unix epoch — definitely expired
         let payload = serde_json::json!({"k": "/registry/podtemplates/default/foo", "t": old_iat})
             .to_string();
-        let stale_token =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        // Build a properly signed token with the old timestamp so TTL check triggers,
+        // not the signature check.
+        use base64::Engine;
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload_b64 = b64.encode(payload.as_bytes());
+        let mut mac = <Hmac<Sha256>>::new_from_slice(TEST_KEY).expect("HMAC accepts any key size");
+        mac.update(payload.as_bytes());
+        let sig = mac.finalize().into_bytes();
+        let stale_token = format!("{payload_b64}.{}", b64.encode(&sig));
 
-        let err = decode_continue(&stale_token).unwrap_err();
+        let err = decode_continue(&stale_token, TEST_KEY).unwrap_err();
         assert_eq!(
             err.0,
             axum::http::StatusCode::GONE,
@@ -817,8 +861,8 @@ mod tests {
         // A token issued just now must be accepted (not incorrectly rejected as expired).
         // Regressions here would break all pagination immediately after the first page.
         let key = "/registry/podtemplates/default/bar";
-        let token = encode_continue(key);
-        let decoded = ok(decode_continue(&token));
+        let token = encode_continue(key, TEST_KEY);
+        let decoded = ok(decode_continue(&token, TEST_KEY));
         assert_eq!(
             decoded, key,
             "a fresh continue token must decode to the original store key; \
@@ -838,13 +882,14 @@ mod tests {
             vec![],
             Some("/registry/pods/default/foo".to_string()),
             None,
+            TEST_KEY,
         );
         let token = body["metadata"]["continue"].as_str().unwrap_or("");
         assert!(
             !token.is_empty(),
             "metadata.continue must be set when continue_key is Some"
         );
-        let decoded = ok(decode_continue(token));
+        let decoded = ok(decode_continue(token, TEST_KEY));
         assert_eq!(decoded, "/registry/pods/default/foo");
     }
 
@@ -852,7 +897,7 @@ mod tests {
     fn build_list_response_without_continue_key_omits_metadata_continue() {
         // When all items fit in one page, metadata.continue must be absent.
         // An empty string would also confuse clients into requesting an unnecessary next page.
-        let body = build_list_response("Pod", "", "v1", 5, vec![], None, None);
+        let body = build_list_response("Pod", "", "v1", 5, vec![], None, None, TEST_KEY);
         assert!(
             body["metadata"]["continue"].is_null(),
             "metadata.continue must be absent when continue_key is None"
@@ -871,6 +916,7 @@ mod tests {
             vec![],
             Some("/registry/podtemplates/default/z".to_string()),
             Some(12),
+            TEST_KEY,
         );
         assert_eq!(
             body["metadata"]["remainingItemCount"],
@@ -883,10 +929,52 @@ mod tests {
     fn build_list_response_without_remaining_count_omits_metadata_field() {
         // When all items fit in one page, remainingItemCount must be absent (not 0).
         // Kubernetes clients treat null and missing identically; an explicit 0 is misleading.
-        let body = build_list_response("Pod", "", "v1", 5, vec![], None, None);
+        let body = build_list_response("Pod", "", "v1", 5, vec![], None, None, TEST_KEY);
         assert!(
             body["metadata"]["remainingItemCount"].is_null(),
             "remainingItemCount must be absent when remaining_count is None"
+        );
+    }
+
+    // -- HMAC signing regression: tampered token must be rejected --
+
+    #[test]
+    fn decode_tampered_continue_token_returns_410() {
+        // Security: a client that receives a valid continue token for namespace A must not
+        // be able to modify the 'k' field to point to namespace B's store prefix and
+        // resume pagination there. This test encodes a real token for namespace A,
+        // replaces the payload with one pointing to namespace B (keeping the old signature),
+        // and asserts that decode rejects it.
+        //
+        // If this test passes after reverting the HMAC fix, the security property is broken.
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        // Encode a legitimate token for namespace "default".
+        let legit_token = encode_continue("/registry/pods/default/cursor", TEST_KEY);
+
+        // Extract the signature from the legitimate token.
+        let (_, sig_b64) = legit_token.split_once('.').unwrap();
+
+        // Build a forged payload pointing to a different namespace.
+        let forged_payload =
+            serde_json::json!({"k": "/registry/pods/kube-system/cursor", "t": unix_now()})
+                .to_string();
+        let forged_payload_b64 = b64.encode(forged_payload.as_bytes());
+
+        // Reassemble with original signature (signature mismatch).
+        let forged_token = format!("{forged_payload_b64}.{sig_b64}");
+
+        let err = decode_continue(&forged_token, TEST_KEY).unwrap_err();
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GONE,
+            "a token whose payload was tampered must be rejected with 410 (invalid signature); \
+             accepting it would allow cross-namespace pagination forgery"
+        );
+        assert_eq!(
+            err.1.reason, "Expired",
+            "tampered token must return reason=Expired (same as bad-MAC path)"
         );
     }
 

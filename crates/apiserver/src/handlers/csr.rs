@@ -138,7 +138,7 @@ pub async fn list_csr<S: Store>(
     let continue_key = query
         .continue_token
         .as_deref()
-        .map(decode_continue)
+        .map(|t| decode_continue(t, &state.continue_token_key))
         .transpose()?;
 
     let resp = state
@@ -176,6 +176,7 @@ pub async fn list_csr<S: Store>(
         items,
         resp.continue_key,
         resp.remaining_count,
+        &state.continue_token_key,
     );
     Ok(Json(body).into_response())
 }
