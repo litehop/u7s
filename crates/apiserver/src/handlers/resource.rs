@@ -169,6 +169,7 @@ pub async fn list_resource<S: Store>(
         resp.revision,
         items,
         resp.continue_key,
+        resp.remaining_count,
     );
     Ok(Json(body).into_response())
 }
@@ -779,6 +780,7 @@ pub async fn list_namespaced_resource<S: Store>(
         resp.revision,
         items,
         resp.continue_key,
+        resp.remaining_count,
     );
     Ok(Json(body).into_response())
 }

@@ -279,6 +279,7 @@ pub(crate) fn build_list_response(
     revision: u64,
     items: Vec<serde_json::Value>,
     continue_key: Option<String>,
+    remaining_count: Option<u64>,
 ) -> serde_json::Value {
     let api_version = if group.is_empty() {
         version.to_string()
@@ -288,6 +289,9 @@ pub(crate) fn build_list_response(
     let mut metadata = serde_json::json!({ "resourceVersion": revision.to_string() });
     if let Some(key) = continue_key {
         metadata["continue"] = serde_json::Value::String(encode_continue(&key));
+    }
+    if let Some(count) = remaining_count {
+        metadata["remainingItemCount"] = serde_json::Value::Number(count.into());
     }
     serde_json::json!({
         "kind": format!("{}List", kind),
@@ -491,14 +495,14 @@ mod tests {
     #[test]
     fn core_group_api_version_is_version_only() {
         // For core group (group=""), apiVersion should be just "v1", not "/v1".
-        let body = build_list_response("Node", "", "v1", 0, vec![], None);
+        let body = build_list_response("Node", "", "v1", 0, vec![], None, None);
         assert_eq!(body["apiVersion"], "v1");
         assert_eq!(body["kind"], "NodeList");
     }
 
     #[test]
     fn non_core_group_api_version_includes_group() {
-        let body = build_list_response("Deployment", "apps", "v1", 0, vec![], None);
+        let body = build_list_response("Deployment", "apps", "v1", 0, vec![], None, None);
         assert_eq!(body["apiVersion"], "apps/v1");
     }
 
@@ -752,6 +756,7 @@ mod tests {
             5,
             vec![],
             Some("/registry/pods/default/foo".to_string()),
+            None,
         );
         let token = body["metadata"]["continue"].as_str().unwrap_or("");
         assert!(
@@ -766,10 +771,41 @@ mod tests {
     fn build_list_response_without_continue_key_omits_metadata_continue() {
         // When all items fit in one page, metadata.continue must be absent.
         // An empty string would also confuse clients into requesting an unnecessary next page.
-        let body = build_list_response("Pod", "", "v1", 5, vec![], None);
+        let body = build_list_response("Pod", "", "v1", 5, vec![], None, None);
         assert!(
             body["metadata"]["continue"].is_null(),
             "metadata.continue must be absent when continue_key is None"
+        );
+    }
+
+    #[test]
+    fn build_list_response_with_remaining_count_sets_metadata_field() {
+        // Conformance test chunking.go:108 asserts remainingItemCount is non-nil on a paginated
+        // list. Without this field clients cannot tell how many items remain after the current page.
+        let body = build_list_response(
+            "PodTemplate",
+            "",
+            "v1",
+            7,
+            vec![],
+            Some("/registry/podtemplates/default/z".to_string()),
+            Some(12),
+        );
+        assert_eq!(
+            body["metadata"]["remainingItemCount"],
+            serde_json::Value::Number(12u64.into()),
+            "remainingItemCount must be set to the count of items after the current page"
+        );
+    }
+
+    #[test]
+    fn build_list_response_without_remaining_count_omits_metadata_field() {
+        // When all items fit in one page, remainingItemCount must be absent (not 0).
+        // Kubernetes clients treat null and missing identically; an explicit 0 is misleading.
+        let body = build_list_response("Pod", "", "v1", 5, vec![], None, None);
+        assert!(
+            body["metadata"]["remainingItemCount"].is_null(),
+            "remainingItemCount must be absent when remaining_count is None"
         );
     }
 

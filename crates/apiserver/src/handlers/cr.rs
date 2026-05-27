@@ -513,7 +513,8 @@ pub async fn list_cr<S: Store>(
         &version,
         resp.revision,
         items,
-        None,
+        resp.continue_key,
+        resp.remaining_count,
     );
     Ok(Json(body).into_response())
 }
@@ -834,7 +835,8 @@ pub async fn list_cr_namespaced<S: Store>(
         &version,
         resp.revision,
         items,
-        None,
+        resp.continue_key,
+        resp.remaining_count,
     );
     Ok(Json(body).into_response())
 }
@@ -1060,20 +1062,15 @@ fn validate_patch_content_type(headers: &HeaderMap) -> Result<(), crate::status:
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if content_type.contains("application/strategic-merge-patch+json") {
-        return Err(Status::unsupported_media_type(
-            "strategic merge patch is not supported for custom resources; use application/merge-patch+json"
-                .into(),
-        ));
+    if content_type.contains("application/merge-patch+json")
+        || content_type.contains("application/strategic-merge-patch+json")
+    {
+        return Ok(());
     }
 
-    if !content_type.contains("application/merge-patch+json") {
-        return Err(Status::unsupported_media_type(format!(
-            "unsupported media type '{content_type}'; use application/merge-patch+json"
-        )));
-    }
-
-    Ok(())
+    Err(Status::unsupported_media_type(format!(
+        "unsupported media type '{content_type}'; use application/merge-patch+json"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2075,33 +2072,39 @@ mod tests {
         );
     }
 
-    // validate_patch_content_type must reject strategic-merge-patch+json with 415 (not 400)
-    // and a user-friendly message that contains no dev-era notes like "Phase".
-    // 415 is the correct Kubernetes API convention for unsupported media types;
-    // returning 400 would mislead clients into thinking the request body was malformed.
+    // validate_patch_content_type must accept application/strategic-merge-patch+json.
+    // Conformance tests (label/annotation patches on Namespaces and DaemonSets) send
+    // this content type; rejecting it with 415 breaks those tests. For CRDs the
+    // strategic-merge array directives are not meaningful, but the JSON merge-patch
+    // semantics (scalar overwrite, object recurse, null remove) are identical, so
+    // we apply merge-patch logic regardless of which of the two types is sent.
     #[test]
-    fn strategic_merge_patch_rejected_with_415() {
+    fn strategic_merge_patch_accepted_for_cr() {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::CONTENT_TYPE,
             "application/strategic-merge-patch+json".parse().unwrap(),
         );
+        assert!(
+            validate_patch_content_type(&headers).is_ok(),
+            "strategic-merge-patch must be accepted — conformance tests patch CRs with this type"
+        );
+    }
+
+    // validate_patch_content_type must still reject genuinely unsupported types with 415.
+    // Clients that accidentally send application/json get a clear 415, not a cryptic error.
+    #[test]
+    fn application_json_content_type_rejected_with_415() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
         let err = validate_patch_content_type(&headers).unwrap_err();
-        // Must be 415, not 400 — wrong status code misleads clients about root cause.
         assert_eq!(
             err.0,
             axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "strategic-merge-patch must be rejected with 415 Unsupported Media Type"
-        );
-        let body = serde_json::to_string(&err.1).unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&body).unwrap()["code"],
-            415,
-            "status body code field must be 415"
-        );
-        assert!(
-            !body.to_lowercase().contains("phase"),
-            "error message must not contain 'phase' (got: {body})"
+            "application/json must be rejected with 415 Unsupported Media Type"
         );
     }
 
@@ -4115,6 +4118,7 @@ mod tests {
             "v1alpha1",
             42,
             vec![],
+            None,
             None,
         );
         let api_version = body["apiVersion"].as_str().unwrap_or("");

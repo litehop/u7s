@@ -101,7 +101,15 @@ pub async fn core_list_resource<S: Store>(
         } else {
             items
         };
-        let body = build_list_response("Pod", "", "v1", resp.revision, items, resp.continue_key);
+        let body = build_list_response(
+            "Pod",
+            "",
+            "v1",
+            resp.revision,
+            items,
+            resp.continue_key,
+            resp.remaining_count,
+        );
         return Ok(Json(body).into_response());
     }
 
