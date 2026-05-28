@@ -118,13 +118,38 @@ to do.
 ```bash
 # 1. Create the worktree (settings.json is already present — it's tracked in git)
 git worktree add ai/worktrees/<name> -b worker/<name>
-# 2. Verify clean
+# 2. Wire the hooks (pre-commit: fmt check; pre-push: test+clippy — both live in .githooks/)
+git -C ai/worktrees/<name> config core.hooksPath .githooks
+# 3. Verify clean
 git -C ai/worktrees/<name> status --short --branch
 ```
 
 No file copying needed: `settings.json` is tracked in git and present in every
 fresh worktree. `agents/worker.md` is loaded from the mayor's `.claude/agents/`
 by the harness, not from the worktree.
+
+**Agent tool call — mandatory fields:**
+
+```python
+Agent(
+    subagent_type="worker",          # required — loads worker.md with permissionMode:auto
+    run_in_background=True,
+    isolation=None,                  # NEVER use isolation="worktree" — CWD stays at repo
+    prompt="... include permission line + Step 0 below ...",
+)
+```
+
+**Every dispatch prompt must include these two things:**
+
+1. The permission line (without it, permissionMode:auto still prompts on the first Bash call):
+   > "You have full permission to use all tools: Bash, Read, Edit, Write, Glob, Grep. Proceed without asking for permission — do not ask, just act."
+
+2. Step 0 that does NOT start with `cd` (cd is not in the Bash allowlist; a denial on the first call can abort the worker):
+   ```bash
+   git -C <ASSIGNED_WORKTREE> rev-parse --show-toplevel
+   git -C <ASSIGNED_WORKTREE> branch --show-current
+   git -C <ASSIGNED_WORKTREE> status --short
+   ```
 
 ## Common preamble (every dispatch)
 
@@ -190,14 +215,13 @@ Only proceed if `rev-parse --show-toplevel` prints exactly `<ASSIGNED_WORKTREE>`
 
 Quality gate — mandatory, run in this exact order, paste output into return:
 ```bash
-cargo fmt --all
-cargo fmt --all -- --check
 cargo test --workspace --quiet
 cargo clippy --workspace --tests --quiet -- -D warnings
 ```
-Do not proceed to PR if any command fails. Note: `gh pr create` and `git push`
-are intercepted by a pre-tool hook that re-runs fmt+test+clippy and will block
-if they fail — running them here first means you see the failure with context.
+Do not proceed to commit if any command fails. The pre-commit hook checks
+`cargo fmt` (formatting only) and the pre-push hook re-runs test+clippy —
+running them here first means you see failures with context, not as a hook
+rejection that gives you no stacktrace.
 
 ---
 
@@ -349,6 +373,10 @@ When a worker returns from a VM/sonobuoy-touching bead:
 
 ## Common failure modes these patterns close
 
+- **Mayor uses `isolation="worktree"` in Agent tool call.** The `WorktreeCreate`
+  hook creates the directory but the subagent CWD stays at the repo root on
+  branch main — causing path-resolution and permission bugs. Always pre-create
+  the worktree manually (see checklist above) and omit `isolation` entirely.
 - **Agents add back-compat shims by default.** Pre-alpha posture must be
   explicit in every preamble.
 - **Same-file races between concurrent agents.** "Concurrent agents on
@@ -376,6 +404,10 @@ When a worker returns from a VM/sonobuoy-touching bead:
   `python3 -c` for JSON, `cat`/`head` for file reads, `sed`/`awk` for edits
   — all trigger permission prompts and slow the session. Always inject the
   common preamble verbatim.
+- **Hook split: pre-commit checks fmt; pre-push checks test+clippy.** Workers
+  who only run `cargo fmt` before committing will hit a test failure at push
+  time with no stacktrace. Quality gate (test+clippy) must run before commit,
+  not just before push.
 - **Mayor "gets into the flow" and codes instead of dispatching.** The
   four-condition exception test is easy to rationalize past once the mayor has
   already read several files. The fourth condition (≤2 files read) is the
