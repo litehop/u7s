@@ -339,7 +339,15 @@ fn authn_v1_resources() -> serde_json::Value {
         "kind": "APIResourceList",
         "apiVersion": "v1",
         "groupVersion": "authentication.k8s.io/v1",
-        "resources": []
+        "resources": [
+            {
+                "name": "tokenreviews",
+                "singularName": "tokenreview",
+                "namespaced": false,
+                "kind": "TokenReview",
+                "verbs": ["create"]
+            }
+        ]
     })
 }
 
@@ -1721,6 +1729,42 @@ mod tests {
         assert_eq!(
             widget["shortNames"][0], "wdg",
             "CRD shortNames must be forwarded into the APIResourceList entry"
+        );
+    }
+
+    // authentication.k8s.io/v1 must include tokenreviews — KCM's namespace controller calls
+    // ServerPreferredNamespacedResources on every sync; client-go treats a group with zero
+    // resources as an error, which blocks ALL namespace deletion. The tokenreviews endpoint
+    // already exists (POST .../tokenreviews) and must be reflected in discovery.
+    #[tokio::test]
+    async fn authn_v1_resources_includes_tokenreviews() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("authentication.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        assert!(
+            !resources.is_empty(),
+            "authentication.k8s.io/v1 must have at least one resource — an empty list causes \
+             client-go discovery errors and blocks namespace deletion via KCM"
+        );
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"tokenreviews"),
+            "tokenreviews must be in authentication.k8s.io/v1 — \
+             the endpoint already exists and must be discoverable; got: {names:?}"
         );
     }
 
