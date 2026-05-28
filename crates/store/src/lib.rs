@@ -475,6 +475,20 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
     // When a field selector is present, collect all matching rows then paginate in memory,
     // because in-memory filtering may discard rows between the cursor and the limit boundary.
     let (items, continue_key) = match &opts.field_selector {
+        // Fast-path: metadata.name=<value> — compute the exact key and do a single lookup.
+        // The prefix already encodes resource and namespace (namespaced) or just resource
+        // (cluster-scoped), so appending the name gives the full key without a scan.
+        Some(FieldSelector {
+            field,
+            value,
+            negated: false,
+        }) if field == "metadata.name" => {
+            let exact_key = format!("{}{}", prefix, value);
+            let item = get_sync(conn, &exact_key)?;
+            let items = item.into_iter().collect::<Vec<_>>();
+            (items, None)
+        }
+
         // Indexed fast-path: spec.nodeName on pods — uses the partial index.
         Some(FieldSelector {
             field,
@@ -1401,6 +1415,136 @@ mod tests {
         let keys: Vec<&str> = resp.items.iter().map(|o| o.key.as_str()).collect();
         assert!(keys.contains(&"/registry/pods/default/alpha"));
         assert!(keys.contains(&"/registry/pods/default/beta"));
+    }
+
+    #[tokio::test]
+    async fn test_field_selector_metadata_name_namespaced_returns_exact_object() {
+        // fieldSelector=metadata.name=<value> on a namespaced resource must return only
+        // the object with that name, without scanning all objects in the prefix.
+        // If the fast-path is removed and replaced with a generic full-scan filter, the
+        // correctness is unchanged but the key insight (direct key lookup) is lost.
+        // This test verifies: (a) the matching object is returned, (b) non-matching objects
+        // in the same prefix are excluded, (c) objects in other namespaces are excluded.
+        let store = make_store();
+
+        store
+            .put("/registry/pods/default/target", pod_json("target"), Some(0))
+            .await
+            .expect("create target pod");
+        store
+            .put("/registry/pods/default/other", pod_json("other"), Some(0))
+            .await
+            .expect("create other pod in same namespace");
+        store
+            .put(
+                "/registry/pods/kube-system/target",
+                pod_json("target"),
+                Some(0),
+            )
+            .await
+            .expect("create target pod in different namespace");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "metadata.name".to_string(),
+                value: "target".to_string(),
+                negated: false,
+            }),
+            ..Default::default()
+        };
+        let resp = store
+            .list("/registry/pods/default/", opts)
+            .await
+            .expect("list");
+
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "metadata.name selector must return exactly one object for the matching name; \
+             a full scan would include 'other' pod if the fast-path were broken"
+        );
+        assert_eq!(
+            resp.items[0].key, "/registry/pods/default/target",
+            "the returned object must be the one with the matching name in the specified prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_selector_metadata_name_cluster_scoped_returns_exact_object() {
+        // fieldSelector=metadata.name=<value> on a cluster-scoped resource (prefix ends at
+        // the resource level) must return only the matching object.
+        // Kubernetes clients use this to fetch a single node by name via list, not get.
+        let store = make_store();
+
+        store
+            .put(
+                "/registry/nodes/node-a",
+                node_json("node-a", false),
+                Some(0),
+            )
+            .await
+            .expect("create node-a");
+        store
+            .put(
+                "/registry/nodes/node-b",
+                node_json("node-b", false),
+                Some(0),
+            )
+            .await
+            .expect("create node-b");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "metadata.name".to_string(),
+                value: "node-a".to_string(),
+                negated: false,
+            }),
+            ..Default::default()
+        };
+        let resp = store.list("/registry/nodes/", opts).await.expect("list");
+
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "metadata.name selector on cluster-scoped resource must return exactly one object; \
+             a scan would return all nodes if the key prefix computation were wrong"
+        );
+        assert_eq!(
+            resp.items[0].key, "/registry/nodes/node-a",
+            "only node-a must be returned, not node-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_selector_metadata_name_absent_returns_empty() {
+        // metadata.name=<nonexistent> must return an empty list, not an error.
+        // Kubernetes clients rely on empty lists from get-by-name selectors when
+        // an object doesn't exist (e.g., checking if a resource was deleted).
+        let store = make_store();
+
+        store
+            .put("/registry/pods/default/alpha", pod_json("alpha"), Some(0))
+            .await
+            .expect("create alpha");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "metadata.name".to_string(),
+                value: "nonexistent".to_string(),
+                negated: false,
+            }),
+            ..Default::default()
+        };
+        let resp = store
+            .list("/registry/pods/default/", opts)
+            .await
+            .expect("list");
+
+        assert_eq!(
+            resp.items.len(),
+            0,
+            "metadata.name selector for a non-existent name must return empty list, not an error"
+        );
     }
 
     fn node_json(name: &str, unschedulable: bool) -> Bytes {
