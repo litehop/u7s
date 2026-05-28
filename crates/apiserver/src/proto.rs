@@ -1132,6 +1132,54 @@ struct Endpoints {
     metadata: Option<ObjectMeta>,
 }
 
+// --- k8s.io/api/storage/v1/generated.proto ---
+
+/// StorageClass — k8s.io/api/storage/v1/generated.proto
+/// spec fields (provisioner, parameters, etc.) are deeply nested; only metadata is decoded.
+#[derive(Clone, PartialEq, Message)]
+struct StorageClass {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// VolumeAttributesClass — k8s.io/api/storage/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct VolumeAttributesClass {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+// --- k8s.io/api/core/v1/generated.proto (resource management types) ---
+
+/// ResourceQuota — k8s.io/api/core/v1/generated.proto
+/// spec/status fields (hard limits, scopes) are not needed for routing.
+#[derive(Clone, PartialEq, Message)]
+struct ResourceQuota {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// LimitRange — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct LimitRange {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+// --- k8s.io/api/policy/v1/generated.proto ---
+
+/// PodDisruptionBudget — k8s.io/api/policy/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct PodDisruptionBudget {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
 // ---------------------------------------------------------------------------
 // Encoder — produces Kubernetes protobuf wire format from a JSON value.
 // Used in tests only; not called from production handlers.
@@ -2464,6 +2512,67 @@ pub fn decode_endpoints_proto(data: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
+/// Decode a proto-encoded StorageClass object into a `serde_json::Value`.
+///
+/// kubectl sends StorageClass with Content-Type: application/vnd.kubernetes.protobuf.
+/// Without this decoder, create_resource returns "invalid JSON: expected value at line 1 column 1".
+pub fn decode_storageclass_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = StorageClass::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "StorageClass",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded VolumeAttributesClass object into a `serde_json::Value`.
+pub fn decode_volumeattributesclass_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = VolumeAttributesClass::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "VolumeAttributesClass",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded ResourceQuota object into a `serde_json::Value`.
+///
+/// kubectl sends ResourceQuota (core/v1) with proto encoding. Without this decoder,
+/// create_namespaced_resource returns "invalid JSON: expected value at line 1 column 1".
+pub fn decode_resourcequota_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = ResourceQuota::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded LimitRange object into a `serde_json::Value`.
+pub fn decode_limitrange_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = LimitRange::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded PodDisruptionBudget object into a `serde_json::Value`.
+pub fn decode_poddisruptionbudget_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = PodDisruptionBudget::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": meta
+    }))
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -2499,6 +2608,11 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "ServiceAccount" => decode_serviceaccount_proto(raw),
         "PersistentVolumeClaim" => decode_persistentvolumeclaim_proto(raw),
         "Endpoints" => decode_endpoints_proto(raw),
+        "StorageClass" => decode_storageclass_proto(raw),
+        "VolumeAttributesClass" => decode_volumeattributesclass_proto(raw),
+        "ResourceQuota" => decode_resourcequota_proto(raw),
+        "LimitRange" => decode_limitrange_proto(raw),
+        "PodDisruptionBudget" => decode_poddisruptionbudget_proto(raw),
         _ => None,
     }
 }
@@ -5247,6 +5361,137 @@ mod tests {
         assert_eq!(result["kind"], "Endpoints", "kind must be Endpoints");
         assert_eq!(result["apiVersion"], "v1", "apiVersion must be v1");
         assert_eq!(result["metadata"]["name"], "my-ep");
+        assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — StorageClass, VolumeAttributesClass, ResourceQuota, LimitRange, PodDisruptionBudget
+    //
+    // kubectl sends these types as proto-encoded bytes with empty contentType.
+    // Without decoders, decode_core_proto_by_kind returns None, extract_body returns the raw
+    // proto bytes, Object::from_bytes fails with "invalid JSON: expected value at line 1 column 1",
+    // and the apiserver returns HTTP 400. Adding decoders fixes the create path for these types.
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch StorageClass to a decoder that returns valid JSON.
+    ///
+    /// kubectl sends StorageClass (storage.k8s.io/v1) with Content-Type: application/vnd.kubernetes.protobuf.
+    /// Without this decoder, create_resource returns 400 'invalid JSON: expected value at line 1 column 1',
+    /// causing e2e StorageClasses lifecycle tests to fail.
+    #[test]
+    fn decode_storageclass_proto_extracts_metadata() {
+        // StorageClass { metadata: ObjectMeta { name: "fast-ssd" } }
+        let name = encode_length_delimited(1, b"fast-ssd");
+        let proto = encode_length_delimited(1, &name);
+
+        let result = decode_core_proto_by_kind("StorageClass", &proto).expect(
+            "StorageClass must decode via decode_core_proto_by_kind — \
+             without this decoder, StorageClass creates via proto return 400 'invalid JSON', \
+             causing e2e StorageClasses lifecycle tests to fail",
+        );
+
+        assert_eq!(
+            result["kind"], "StorageClass",
+            "kind must be StorageClass so the object is routed and stored correctly"
+        );
+        assert_eq!(
+            result["apiVersion"], "storage.k8s.io/v1",
+            "apiVersion must be storage.k8s.io/v1"
+        );
+        assert_eq!(
+            result["metadata"]["name"], "fast-ssd",
+            "name must survive proto decode — used for store key and uniqueness check"
+        );
+    }
+
+    /// decode_core_proto_by_kind must dispatch VolumeAttributesClass to a decoder.
+    ///
+    /// VolumeAttributesClass (storage.k8s.io/v1) is a relatively new type; without a decoder
+    /// proto creates return 400 'invalid JSON'.
+    #[test]
+    fn decode_volumeattributesclass_proto_extracts_metadata() {
+        // VolumeAttributesClass { metadata: ObjectMeta { name: "premium-rwo" } }
+        let name = encode_length_delimited(1, b"premium-rwo");
+        let proto = encode_length_delimited(1, &name);
+
+        let result = decode_core_proto_by_kind("VolumeAttributesClass", &proto).expect(
+            "VolumeAttributesClass must decode via decode_core_proto_by_kind — \
+             without this decoder, creates via proto return 400 'invalid JSON'",
+        );
+
+        assert_eq!(result["kind"], "VolumeAttributesClass");
+        assert_eq!(result["apiVersion"], "storage.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "premium-rwo");
+    }
+
+    /// decode_core_proto_by_kind must dispatch ResourceQuota to a decoder that returns valid JSON.
+    ///
+    /// kubectl sends ResourceQuota (core/v1, namespaced) with proto encoding. Without this decoder,
+    /// create_namespaced_resource returns 400, causing e2e ResourceQuota tests to fail.
+    #[test]
+    fn decode_resourcequota_proto_extracts_metadata() {
+        // ResourceQuota { metadata: ObjectMeta { name: "compute-quota", namespace: "default" } }
+        let mut meta_bytes = encode_length_delimited(1, b"compute-quota");
+        meta_bytes.extend_from_slice(&encode_length_delimited(3, b"default"));
+        let proto = encode_length_delimited(1, &meta_bytes);
+
+        let result = decode_core_proto_by_kind("ResourceQuota", &proto).expect(
+            "ResourceQuota must decode via decode_core_proto_by_kind — \
+             without this decoder, ResourceQuota creates via proto return 400 'invalid JSON', \
+             causing e2e ResourceQuota tests to fail in BeforeEach",
+        );
+
+        assert_eq!(
+            result["kind"], "ResourceQuota",
+            "kind must be ResourceQuota so the object is stored under the correct key"
+        );
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "compute-quota");
+        assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    /// decode_core_proto_by_kind must dispatch LimitRange to a decoder that returns valid JSON.
+    ///
+    /// LimitRange (core/v1, namespaced) is sent via proto by kubectl. Without this decoder,
+    /// creates return 400, causing e2e LimitRange tests to fail.
+    #[test]
+    fn decode_limitrange_proto_extracts_metadata() {
+        // LimitRange { metadata: ObjectMeta { name: "limits", namespace: "default" } }
+        let mut meta_bytes = encode_length_delimited(1, b"limits");
+        meta_bytes.extend_from_slice(&encode_length_delimited(3, b"default"));
+        let proto = encode_length_delimited(1, &meta_bytes);
+
+        let result = decode_core_proto_by_kind("LimitRange", &proto).expect(
+            "LimitRange must decode via decode_core_proto_by_kind — \
+             without this decoder, LimitRange creates via proto return 400 'invalid JSON'",
+        );
+
+        assert_eq!(result["kind"], "LimitRange");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "limits");
+        assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    /// decode_core_proto_by_kind must dispatch PodDisruptionBudget to a decoder.
+    ///
+    /// PodDisruptionBudget (policy/v1, namespaced) is sent via proto by kubectl. Without this
+    /// decoder, creates return 400, causing e2e DisruptionController tests to fail.
+    #[test]
+    fn decode_poddisruptionbudget_proto_extracts_metadata() {
+        // PodDisruptionBudget { metadata: ObjectMeta { name: "my-pdb", namespace: "default" } }
+        let mut meta_bytes = encode_length_delimited(1, b"my-pdb");
+        meta_bytes.extend_from_slice(&encode_length_delimited(3, b"default"));
+        let proto = encode_length_delimited(1, &meta_bytes);
+
+        let result = decode_core_proto_by_kind("PodDisruptionBudget", &proto).expect(
+            "PodDisruptionBudget must decode via decode_core_proto_by_kind — \
+             without this decoder, PDB creates via proto return 400 'invalid JSON', \
+             causing e2e DisruptionController tests to fail",
+        );
+
+        assert_eq!(result["kind"], "PodDisruptionBudget");
+        assert_eq!(result["apiVersion"], "policy/v1");
+        assert_eq!(result["metadata"]["name"], "my-pdb");
         assert_eq!(result["metadata"]["namespace"], "default");
     }
 }
