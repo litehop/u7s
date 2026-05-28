@@ -5525,4 +5525,186 @@ mod tests {
             "spec.selector must be populated from spec.template.metadata.labels"
         );
     }
+
+    // -- expired continue token returns 410 Gone (mayor-snp5) --
+
+    /// Build a continue token payload signed with the given 32-byte key and the given
+    /// issued-at timestamp.  Mirrors the format of `encode_continue` in generic.rs so
+    /// we can forge a token with a controlled (expired) `t` field without sleeping.
+    fn build_signed_token(store_key: &str, signing_key: &[u8; 32], issued_at: u64) -> String {
+        use base64::Engine;
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload = serde_json::json!({"k": store_key, "t": issued_at}).to_string();
+        let payload_b64 = b64.encode(payload.as_bytes());
+        let mut mac = <Hmac<Sha256>>::new_from_slice(signing_key).expect("HMAC accepts any key");
+        mac.update(payload.as_bytes());
+        let sig = mac.finalize().into_bytes();
+        format!("{payload_b64}.{}", b64.encode(sig))
+    }
+
+    /// A list request that carries an expired continue token must return HTTP 410 Gone
+    /// with Status.reason == "Expired", not HTTP 200 with items.
+    ///
+    /// Without this property the Kubernetes chunking conformance test accumulates
+    /// 40 (first page) + 400 (full re-list) = 440 items instead of restarting
+    /// cleanly from scratch after the server signals expiry via 410.
+    ///
+    /// This test exercises the full handler path (list_namespaced_resource) so that
+    /// it would catch any regression in the `?` propagation of the decode_continue error,
+    /// not just the decode_continue unit in isolation.
+    #[tokio::test]
+    async fn list_namespaced_resource_expired_continue_token_returns_410() {
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        // Fixed signing key so we can forge a token with a controlled `t` field.
+        let signing_key: [u8; 32] = *b"test-signing-key-32-bytes-padded";
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            continue_token_key: Some(signing_key),
+        });
+
+        // Forge a properly signed token whose `t` (issued-at) is Unix epoch 0 — always expired.
+        let expired_token = build_signed_token(
+            "/registry/podtemplates/default/pt-0",
+            &signing_key,
+            0, // Unix epoch — definitely older than CONTINUE_TOKEN_TTL_SECS (60s)
+        );
+
+        let result = list_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "podtemplates".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: Some(40),
+                continue_token: Some(expired_token),
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            axum::http::HeaderMap::new(),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await;
+
+        let err = result.expect_err(
+            "list with expired continue token must return Err(StatusError), not Ok(200 with items); \
+             a 200 response causes client-go to append items across pages, yielding wrong counts",
+        );
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GONE,
+            "expired continue token must return HTTP 410 Gone so client-go knows \
+             to restart the list from the beginning (Kubernetes chunking contract)"
+        );
+        assert_eq!(
+            err.1.reason, "Expired",
+            "Status.reason must be 'Expired' so client-go's pagination handler \
+             recognises the signal and re-issues a fresh list without a continue token"
+        );
+    }
+
+    /// A list request with an invalid (garbage) continue token whose HMAC signature
+    /// does not match must also return HTTP 410 Gone with Status.reason == "Expired".
+    ///
+    /// The Kubernetes spec treats any unverifiable continue token as expired, so
+    /// client-go retries from the beginning rather than propagating a hard error.
+    #[tokio::test]
+    async fn list_resource_invalid_continue_token_returns_410() {
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let signing_key: [u8; 32] = *b"test-signing-key-32-bytes-padded";
+        let other_key: [u8; 32] = *b"different-key-32-bytes-padding!x";
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            continue_token_key: Some(signing_key),
+        });
+
+        // Token signed with a DIFFERENT key — HMAC verification fails.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let wrong_sig_token = build_signed_token(
+            "/registry/podtemplates/default/pt-0",
+            &other_key, // signed with wrong key
+            now,
+        );
+
+        let result = list_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "podtemplates".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: Some(40),
+                continue_token: Some(wrong_sig_token),
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            axum::http::HeaderMap::new(),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await;
+
+        let err = result.expect_err(
+            "list with wrong-signature continue token must return Err, not Ok; \
+             accepting a forged token could allow cross-namespace pagination attacks",
+        );
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GONE,
+            "a token whose HMAC does not match must return 410 Gone (treated as expired) \
+             so client-go restarts the list cleanly"
+        );
+        assert_eq!(
+            err.1.reason, "Expired",
+            "Status.reason must be 'Expired' for invalid-signature tokens"
+        );
+    }
 }
