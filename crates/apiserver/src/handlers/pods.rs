@@ -1232,6 +1232,55 @@ mod status_tests {
         );
     }
 
+    /// apply_status_patch with containerStatuses[].restartCount=3 must persist the value.
+    ///
+    /// The kubelet increments restartCount after each container restart triggered by a
+    /// failing liveness probe. If apply_status_patch silently drops or zeros restartCount,
+    /// the e2e test "should have monotonically increasing restart count" always sees 0
+    /// and fails. This is failure mode B for mayor-4ath.
+    #[test]
+    fn patch_pod_status_restart_count_persists() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "liveness-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "busybox",
+                    "livenessProbe": {"exec": {"command": ["/bin/false"]},
+                        "initialDelaySeconds": 1, "periodSeconds": 1}}]
+            },
+            "status": {"phase": "Running"}
+        });
+        // Kubelet sends a status PATCH after the container restarts; it includes the
+        // full containerStatuses array with the updated restartCount.
+        let patch = serde_json::json!({
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{
+                    "name": "app",
+                    "ready": false,
+                    "restartCount": 3,
+                    "image": "busybox",
+                    "imageID": "",
+                    "state": {"running": {"startedAt": "2024-01-01T00:00:01Z"}}
+                }]
+            }
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+
+        assert_eq!(
+            result["status"]["containerStatuses"][0]["restartCount"], 3,
+            "restartCount must be preserved after status PATCH — kubelet increments this \
+             after each liveness probe restart; if it's zeroed, the e2e monotonic-restart-count \
+             test always sees 0 restarts (mayor-4ath failure mode B)"
+        );
+        assert_eq!(
+            result["spec"]["containers"][0]["livenessProbe"]["exec"]["command"][0], "/bin/false",
+            "spec.containers[].livenessProbe must be untouched by status PATCH"
+        );
+    }
+
     /// apply_status_patch that adds a new condition to status.conditions merges correctly.
     /// For merge-patch semantics: arrays are replaced, so patching with a new conditions
     /// array replaces the old one. This is the expected RFC 7396 behavior.
@@ -2043,6 +2092,64 @@ mod create_defaults_tests {
         assert_eq!(
             mount_count, 1,
             "duplicate SA mount must not be added when container already has one"
+        );
+    }
+
+    /// apply_pod_create_defaults must preserve spec.containers[].livenessProbe intact.
+    ///
+    /// The kubelet reads livenessProbe from the pod spec it receives from the apiserver.
+    /// If apply_pod_create_defaults (or any other CREATE-path code) strips or transforms
+    /// livenessProbe, the kubelet never sees the probe config and cannot run it — causing
+    /// the container to never restart even when the probe command fails. This is failure
+    /// mode A for mayor-4ath: the probe config is dropped before the kubelet can act on it.
+    #[test]
+    fn liveness_probe_is_preserved_through_create_defaults() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "liveness-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox",
+                    "livenessProbe": {
+                        "exec": {"command": ["/bin/sh", "-c", "exit 1"]},
+                        "initialDelaySeconds": 5,
+                        "periodSeconds": 2,
+                        "failureThreshold": 3
+                    }
+                }]
+            }
+        });
+
+        apply_pod_create_defaults(&mut pod);
+
+        let probe = &pod["spec"]["containers"][0]["livenessProbe"];
+        assert!(
+            probe.is_object(),
+            "livenessProbe must remain an object after apply_pod_create_defaults — \
+             kubelet reads it to schedule probe runs; if missing, probes never fire \
+             and restartCount stays at 0 (mayor-4ath failure mode A)"
+        );
+        assert_eq!(
+            probe["exec"]["command"][0], "/bin/sh",
+            "livenessProbe.exec.command must be preserved exactly"
+        );
+        assert_eq!(
+            probe["exec"]["command"][2], "exit 1",
+            "livenessProbe.exec.command payload must be preserved"
+        );
+        assert_eq!(
+            probe["initialDelaySeconds"], 5,
+            "livenessProbe.initialDelaySeconds must be preserved"
+        );
+        assert_eq!(
+            probe["periodSeconds"], 2,
+            "livenessProbe.periodSeconds must be preserved"
+        );
+        assert_eq!(
+            probe["failureThreshold"], 3,
+            "livenessProbe.failureThreshold must be preserved"
         );
     }
 }
