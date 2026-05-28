@@ -55,7 +55,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("node.k8s.io", "v1"),
     ("policy", "v1"),
     ("rbac.authorization.k8s.io", "v1"),
-    ("resource.k8s.io", "v1alpha3"),
+    ("resource.k8s.io", "v1"),
     ("scheduling.k8s.io", "v1"),
     ("storage.k8s.io", "v1"),
 ];
@@ -175,7 +175,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("node.k8s.io", "v1") => Some(node_v1_resources()),
         ("policy", "v1") => Some(policy_v1_resources()),
         ("rbac.authorization.k8s.io", "v1") => Some(rbac_v1_resources()),
-        ("resource.k8s.io", "v1alpha3") => Some(resource_v1alpha3_resources()),
+        ("resource.k8s.io", "v1") => Some(resource_v1_resources()),
         ("scheduling.k8s.io", "v1") => Some(scheduling_v1_resources()),
         ("storage.k8s.io", "v1") => Some(storage_v1_resources()),
         _ => None,
@@ -415,11 +415,11 @@ fn rbac_v1_resources() -> serde_json::Value {
     })
 }
 
-fn resource_v1alpha3_resources() -> serde_json::Value {
+fn resource_v1_resources() -> serde_json::Value {
     serde_json::json!({
         "kind": "APIResourceList",
         "apiVersion": "v1",
-        "groupVersion": "resource.k8s.io/v1alpha3",
+        "groupVersion": "resource.k8s.io/v1",
         "resources": [
             {
                 "name": "deviceclasses",
@@ -1883,7 +1883,7 @@ mod tests {
     }
 
     // resource.k8s.io must appear in /apis — Dynamic Resource Allocation (DRA) uses this
-    // group for ResourceClaim, ResourceClaimTemplate, ResourceSlice, and DeviceClass.
+    // group for ResourceClaim, ResourceClaimTemplate, ResourceSlice, and DeviceClass (GA since k8s 1.32).
     // kubectl and admission webhooks depend on this group being discoverable; without it,
     // `kubectl get resourceclaims` returns "the server doesn't have a resource type".
     #[tokio::test]
@@ -1898,23 +1898,23 @@ mod tests {
         );
     }
 
-    // resource.k8s.io/v1alpha3 must include all four DRA resource types — ResourceClaim,
+    // resource.k8s.io/v1 must include all four DRA resource types — ResourceClaim,
     // ResourceClaimTemplate, ResourceSlice, and DeviceClass are the core DRA objects.
-    // Missing any of them causes `kubectl get resourceclaims` or scheduler DRA plugins
-    // to fail at startup with "resource not found".
+    // DRA is GA since k8s 1.32; missing any of them causes `kubectl get resourceclaims`
+    // or scheduler DRA plugins to fail at startup with "resource not found".
     #[tokio::test]
-    async fn resource_v1alpha3_resources_list() {
+    async fn resource_v1_resources_list() {
         let state = make_state();
         let resp = api_group_resources(
             State(state),
-            Path(("resource.k8s.io".to_string(), "v1alpha3".to_string())),
+            Path(("resource.k8s.io".to_string(), "v1".to_string())),
         )
         .await;
 
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "GET /apis/resource.k8s.io/v1alpha3 must return 200"
+            "GET /apis/resource.k8s.io/v1 must return 200"
         );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -1928,19 +1928,19 @@ mod tests {
             .collect();
         assert!(
             names.contains(&"resourceclaims"),
-            "resourceclaims must be in resource.k8s.io/v1alpha3 — core DRA type; got: {names:?}"
+            "resourceclaims must be in resource.k8s.io/v1 — core DRA type (GA since k8s 1.32); got: {names:?}"
         );
         assert!(
             names.contains(&"resourceclaimtemplates"),
-            "resourceclaimtemplates must be in resource.k8s.io/v1alpha3 — core DRA type; got: {names:?}"
+            "resourceclaimtemplates must be in resource.k8s.io/v1 — core DRA type (GA since k8s 1.32); got: {names:?}"
         );
         assert!(
             names.contains(&"resourceslices"),
-            "resourceslices must be in resource.k8s.io/v1alpha3 — DRA node plugin reporting; got: {names:?}"
+            "resourceslices must be in resource.k8s.io/v1 — DRA node plugin reporting (GA since k8s 1.32); got: {names:?}"
         );
         assert!(
             names.contains(&"deviceclasses"),
-            "deviceclasses must be in resource.k8s.io/v1alpha3 — DRA device class; got: {names:?}"
+            "deviceclasses must be in resource.k8s.io/v1 — DRA device class (GA since k8s 1.32); got: {names:?}"
         );
     }
 
