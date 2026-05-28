@@ -554,8 +554,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["pods/status"],  "verbs": ["get","update","patch"] },
             { "apiGroups": [""], "resources": ["pods/log"],     "verbs": ["get"] },
             { "apiGroups": [""], "resources": ["events"],       "verbs": ["create","patch","update"] },
-            { "apiGroups": [""], "resources": ["configmaps"],   "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["secrets"],      "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["configmaps"],          "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["secrets"],             "verbs": ["get","list","watch"] },
+            // Kubelet calls TokenRequest to project SA tokens into pods (projected volumes).
+            // Without this rule the kubelet's POST to serviceaccounts/{name}/token returns 403
+            // and containers never get an SA token, breaking in-cluster API calls.
+            { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] },
@@ -1265,6 +1269,28 @@ mod tests {
             state.rbac_index.is_allowed(&tr_create),
             "system:nodes must be allowed to create tokenreviews — \
              kubelet webhook authenticator calls back to the apiserver"
+        );
+
+        // Regression test for mayor-7vbe: kubelet must be allowed to POST
+        // /api/v1/namespaces/{ns}/serviceaccounts/{name}/token (TokenRequest subresource).
+        // Without this rule the projected SA token volume never gets populated —
+        // the kubelet's POST returns 403 and containers never receive an SA token,
+        // breaking all in-cluster API calls.
+        let sa_token_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "",
+            resource: "serviceaccounts",
+            subresource: "token",
+            namespace: Some("default"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&sa_token_create),
+            "system:nodes must be allowed to create serviceaccounts/token — \
+             kubelet needs this to project SA tokens into pod volumes (mayor-7vbe)"
         );
 
         // A user NOT in system:nodes must be denied — the binding is group-specific.
