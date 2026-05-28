@@ -1651,6 +1651,7 @@ mod tests {
     // is still there. This is the false-positive 409 reported in kcm.log.
     #[tokio::test]
     async fn delete_namespace_hard_delete_cascades_to_namespace_resources() {
+        use crate::handlers::json_patch::CreateQuery;
         use crate::handlers::resource::create_namespaced_resource;
         use axum::extract::{Path, State};
         use axum::http::StatusCode;
@@ -1748,6 +1749,7 @@ mod tests {
                 "recycled-ns".into(),
                 "configmaps".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             headers,
             cm_post_body,
         )

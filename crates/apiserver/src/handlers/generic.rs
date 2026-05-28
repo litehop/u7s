@@ -1598,6 +1598,7 @@ mod escalation_tests {
     /// cluster-admin.
     #[tokio::test]
     async fn create_clusterrolebinding_denied_for_unprivileged_user() {
+        use super::super::json_patch::CreateQuery;
         use super::super::resource::create_resource;
         let state = make_state();
         let group = "rbac.authorization.k8s.io";
@@ -1643,6 +1644,7 @@ mod escalation_tests {
                 version.to_string(),
                 "clusterroles".to_string(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             admin_user,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&admin_role).unwrap()),
@@ -1683,6 +1685,7 @@ mod escalation_tests {
                 version.to_string(),
                 "clusterroles".to_string(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             admin_user2.clone(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&carol_role).unwrap()),
@@ -1696,6 +1699,7 @@ mod escalation_tests {
                 version.to_string(),
                 "clusterrolebindings".to_string(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             admin_user2,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&carol_binding).unwrap()),
@@ -1726,6 +1730,7 @@ mod escalation_tests {
                 version.to_string(),
                 "clusterrolebindings".to_string(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             carol_user,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&escalating_crb).unwrap()),
@@ -1830,6 +1835,7 @@ mod escalation_tests {
     // handler path with the seeded binding.
     #[tokio::test]
     async fn create_clusterrolebinding_allowed_for_system_masters() {
+        use super::super::json_patch::CreateQuery;
         use super::super::resource::create_resource;
         let state = make_state();
         let group = "rbac.authorization.k8s.io";
@@ -1879,6 +1885,7 @@ mod escalation_tests {
                 version.to_string(),
                 "clusterroles".to_string(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             admin_user.clone(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&admin_role).unwrap()),
@@ -1904,6 +1911,7 @@ mod escalation_tests {
                 version.to_string(),
                 "clusterrolebindings".to_string(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             admin_user,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),

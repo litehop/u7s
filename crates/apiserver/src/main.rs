@@ -1705,6 +1705,7 @@ mod tests {
                 "default".to_string(),
                 "jobs".to_string(),
             )),
+            axum::extract::Query(handlers::json_patch::CreateQuery::default()),
             headers,
             body_bytes,
         )
@@ -1822,6 +1823,7 @@ mod tests {
                 "v1".to_string(),
                 "storageclasses".to_string(),
             )),
+            axum::extract::Query(handlers::json_patch::CreateQuery::default()),
             axum::Extension(auth::UserInfo {
                 username: "admin".into(),
                 uid: "".into(),
@@ -1885,6 +1887,7 @@ mod tests {
                 "default".to_string(),
                 "gateways".to_string(),
             )),
+            axum::extract::Query(handlers::json_patch::CreateQuery::default()),
             headers,
             body_bytes,
         )
@@ -1978,6 +1981,7 @@ mod tests {
                 "v1".to_string(),
                 "csinodes".to_string(),
             )),
+            axum::extract::Query(handlers::json_patch::CreateQuery::default()),
             axum::Extension(auth::UserInfo {
                 username: "system:node:ci-node".into(),
                 uid: "".into(),

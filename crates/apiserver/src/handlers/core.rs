@@ -20,7 +20,7 @@ use super::generic::{
     apply_label_selector, build_list_response, decode_continue, parse_field_selector,
     parse_label_selector, CollectionQuery,
 };
-use super::json_patch::PatchQuery;
+use super::json_patch::{CreateQuery, PatchQuery};
 use super::resource::{
     create_namespaced_resource, create_resource, delete_collection_namespaced_resource,
     delete_namespaced_resource, delete_resource, get_namespaced_resource, get_resource,
@@ -138,6 +138,7 @@ pub async fn core_get_resource<S: Store>(
 pub async fn core_create_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path(plural): Path<String>,
+    Query(create_query): Query<CreateQuery>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
@@ -145,6 +146,7 @@ pub async fn core_create_resource<S: Store>(
     create_resource(
         State(state),
         Path(("".into(), "v1".into(), plural)),
+        Query(create_query),
         Extension(user),
         headers,
         body,
@@ -261,12 +263,14 @@ pub async fn core_get_namespaced_resource<S: Store>(
 pub async fn core_create_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural)): Path<(String, String)>,
+    Query(create_query): Query<CreateQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     create_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural)),
+        Query(create_query),
         headers,
         body,
     )
