@@ -64,6 +64,7 @@ pub async fn core_list_resource<S: Store>(
                     as_partial_object_metadata: false,
                     group: "".into(),
                     plural: "pods".into(),
+                    timeout_seconds: query.timeout_seconds,
                 },
             )
             .await

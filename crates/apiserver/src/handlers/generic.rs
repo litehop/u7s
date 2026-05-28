@@ -33,6 +33,13 @@ pub struct CollectionQuery {
     /// (except the end-of-list BOOKMARK from sendInitialEvents, which is always sent).
     #[serde(rename = "allowWatchBookmarks")]
     pub allow_watch_bookmarks: Option<bool>,
+    /// Server-side timeout for watch streams in seconds. When provided, the server closes
+    /// the watch stream after this many seconds and sends a final BOOKMARK. The client then
+    /// starts a new watch from the last known resourceVersion. Kubernetes clients use this
+    /// to control watch stream lifetime (typically 5–10 minutes). When absent, the server
+    /// uses a default of 5 minutes. Watches MUST be exempt from any shorter request timeout.
+    #[serde(rename = "timeoutSeconds")]
+    pub timeout_seconds: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,6 +1097,7 @@ mod tests {
             continue_token: None,
             send_initial_events: None,
             allow_watch_bookmarks: Some(true),
+            timeout_seconds: None,
         };
         assert!(
             q_true.allow_watch_bookmarks == Some(true),
@@ -1106,6 +1114,7 @@ mod tests {
             continue_token: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
+            timeout_seconds: None,
         };
         assert_ne!(
             q_none.allow_watch_bookmarks,
@@ -1123,6 +1132,7 @@ mod tests {
             continue_token: None,
             send_initial_events: None,
             allow_watch_bookmarks: Some(false),
+            timeout_seconds: None,
         };
         assert_ne!(
             q_false.allow_watch_bookmarks,

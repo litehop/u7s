@@ -1637,6 +1637,100 @@ mod tests {
         assert_eq!(parsed["metadata"]["name"].as_str(), Some("ci-job"));
     }
 
+    /// POST /apis/storage.k8s.io/v1/storageclasses with proto body must return non-empty JSON.
+    ///
+    /// kubectl sends StorageClass with Content-Type: application/vnd.kubernetes.protobuf.
+    /// Previously, decode_core_proto_by_kind returned None for "StorageClass", extract_body
+    /// returned the raw proto bytes unchanged, Object::from_bytes failed with
+    /// "invalid JSON: expected value at line 1 column 1", and the handler returned HTTP 400.
+    /// The Go client then received a proper Status error body but the CREATE had failed,
+    /// causing all StorageClasses e2e lifecycle tests to fail.
+    ///
+    /// This test fails if the StorageClass proto decoder is removed from decode_core_proto_by_kind:
+    /// create_resource will return Err(Status::bad_request("invalid JSON: ...")) and the test
+    /// assertion `create_result.is_ok()` will fail.
+    #[tokio::test]
+    async fn storageclass_create_via_proto_returns_non_empty_response() {
+        use std::sync::Arc;
+
+        // Proto encoding helpers (self-contained — no dependency on proto.rs test-only functions).
+        fn encode_varint(mut v: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+            out
+        }
+        fn encode_ld(field_number: u64, payload: &[u8]) -> Vec<u8> {
+            let tag = (field_number << 3) | 2;
+            let mut out = encode_varint(tag);
+            out.extend_from_slice(&encode_varint(payload.len() as u64));
+            out.extend_from_slice(payload);
+            out
+        }
+
+        // Build: StorageClass { metadata: ObjectMeta { name: "proto-fast" } }
+        let mut obj_meta = encode_ld(1, b"proto-fast"); // ObjectMeta.name (field 1)
+        obj_meta.extend_from_slice(&encode_ld(8, &[])); // ObjectMeta.creationTimestamp (field 8, empty Time)
+        let storageclass_proto = encode_ld(1, &obj_meta); // StorageClass.metadata (field 1)
+
+        // Build the k8s proto envelope: magic + Unknown{TypeMeta, raw, no contentType}
+        const MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
+        let mut type_meta = encode_ld(1, b"storage.k8s.io/v1"); // TypeMeta.apiVersion
+        type_meta.extend_from_slice(&encode_ld(2, b"StorageClass")); // TypeMeta.kind
+        let mut unknown = encode_ld(1, &type_meta); // Unknown.TypeMeta (field 1)
+        unknown.extend_from_slice(&encode_ld(2, &storageclass_proto)); // Unknown.raw (field 2)
+        let mut proto_body = MAGIC.to_vec();
+        proto_body.extend_from_slice(&unknown);
+
+        let store = Arc::new(make_store());
+        let state = state::AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/vnd.kubernetes.protobuf"),
+        );
+
+        // POST with proto body — must succeed (not return 400 "invalid JSON").
+        let create_result = handlers::resource::create_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".to_string(),
+                "v1".to_string(),
+                "storageclasses".to_string(),
+            )),
+            axum::Extension(auth::UserInfo {
+                username: "admin".into(),
+                uid: "".into(),
+                groups: vec!["system:masters".into()],
+            }),
+            headers,
+            bytes::Bytes::from(proto_body),
+        )
+        .await;
+
+        assert!(
+            create_result.is_ok(),
+            "POST /apis/storage.k8s.io/v1/storageclasses with proto body must succeed — \
+             before the fix, decode_core_proto_by_kind returned None for 'StorageClass', \
+             extract_body returned raw proto bytes, and the handler returned \
+             HTTP 400 'invalid JSON: expected value at line 1 column 1'"
+        );
+    }
+
     /// Verifies that POST /apis/gateway.networking.k8s.io/v1/namespaces/default/gateways
     /// creates a Gateway and GET retrieves it.
     ///

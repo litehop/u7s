@@ -103,6 +103,7 @@ pub async fn list_resource<S: Store>(
                 as_partial_object_metadata: pom,
                 group: group.clone(),
                 plural: plural.clone(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -760,6 +761,7 @@ pub async fn list_namespaced_resource<S: Store>(
                 as_partial_object_metadata: pom,
                 group: group.clone(),
                 plural: plural.clone(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -1692,6 +1694,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             axum::http::HeaderMap::new(),
             Extension(crate::auth::UserInfo {
@@ -2194,6 +2197,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             axum::http::HeaderMap::new(),
             axum::Extension(crate::auth::UserInfo {
@@ -2531,6 +2535,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
         )
         .await;
@@ -3151,6 +3156,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             axum::http::HeaderMap::new(),
             Extension(crate::auth::UserInfo {
@@ -3936,6 +3942,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             pom_accept_headers(),
             axum::Extension(crate::auth::UserInfo {
@@ -4031,6 +4038,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: Some(true),
                 allow_watch_bookmarks: Some(true),
+                timeout_seconds: None,
             }),
             pom_accept_headers(),
             axum::Extension(crate::auth::UserInfo {
@@ -4655,6 +4663,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
         )
         .await
@@ -4816,6 +4825,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
         )
         .await
@@ -5162,6 +5172,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "configmaps".into(),
+                timeout_seconds: None,
             },
         )
         .await
@@ -5334,6 +5345,184 @@ mod tests {
             rv_int > 0,
             "metadata.resourceVersion must be > 0 after first write; got: {rv_int} \
              (mayor-bdsj: store counter starts at 1)"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: selector defaulting for Deployment/RS/StatefulSet (mayor-2fja)
+    // ---------------------------------------------------------------------------
+
+    /// POST a Deployment without spec.selector returns 201 and spec.selector is
+    /// populated from spec.template.metadata.labels.
+    ///
+    /// Conformance workload tests create Deployments without an explicit selector,
+    /// relying on the apiserver to default it from template labels (matching real
+    /// kube-apiserver behavior). Without this fix the server returns 400 with
+    /// "spec.selector is required", blocking all Deployment workload tests.
+    ///
+    /// This test fails if the selector-defaulting code in default_deployment is removed.
+    #[tokio::test]
+    async fn deployment_without_selector_is_accepted_and_selector_defaulted() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "my-deploy", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "my-deploy", "env": "test" } },
+                    "spec": { "containers": [{ "name": "c", "image": "nginx" }] }
+                }
+            }
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Deployment POST without selector must return 201, got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "Deployment without spec.selector must be accepted (201) — spec.selector \
+             must be defaulted from template labels, not rejected"
+        );
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "my-deploy", "env": "test" } }),
+            "spec.selector must be populated from spec.template.metadata.labels — \
+             a nil selector panics the KCM deployment-controller"
+        );
+    }
+
+    /// POST a ReplicaSet without spec.selector returns 201 and spec.selector is
+    /// populated from spec.template.metadata.labels.
+    ///
+    /// Conformance workload tests create ReplicaSets without spec.selector. Without
+    /// this fix the server returns 400 "spec.selector is required", blocking RS tests.
+    ///
+    /// This test fails if the selector-defaulting code in default_replicaset is removed.
+    #[tokio::test]
+    async fn replicaset_without_selector_is_accepted_and_selector_defaulted() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "my-rs", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "my-rs" } },
+                    "spec": { "containers": [{ "name": "c", "image": "nginx" }] }
+                }
+            }
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "replicasets".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ReplicaSet POST without selector must return 201, got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "ReplicaSet without spec.selector must be accepted (201) — spec.selector \
+             must be defaulted from template labels, not rejected"
+        );
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "my-rs" } }),
+            "spec.selector must be populated from spec.template.metadata.labels"
+        );
+    }
+
+    /// POST a StatefulSet without spec.selector returns 201 and spec.selector is
+    /// populated from spec.template.metadata.labels.
+    ///
+    /// Conformance workload tests create StatefulSets without spec.selector. Without
+    /// this fix the server returns 400 "spec.selector is required", blocking SS tests.
+    ///
+    /// This test fails if the selector-defaulting code in default_statefulset is removed.
+    #[tokio::test]
+    async fn statefulset_without_selector_is_accepted_and_selector_defaulted() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let ss = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "my-ss", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "my-ss" } },
+                    "spec": { "containers": [{ "name": "c", "image": "nginx" }] }
+                }
+            }
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "statefulsets".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&ss).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("StatefulSet POST without selector must return 201, got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "StatefulSet without spec.selector must be accepted (201) — spec.selector \
+             must be defaulted from template labels, not rejected"
+        );
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "my-ss" } }),
+            "spec.selector must be populated from spec.template.metadata.labels"
         );
     }
 }

@@ -207,12 +207,34 @@ fn validate_selector(obj: &serde_json::Value, kind: &str) -> Result<(), String> 
 }
 
 fn default_replicaset(obj: &mut serde_json::Value) {
+    // spec.selector defaults to matchLabels from spec.template.metadata.labels.
+    // Real kube-apiserver rejects ReplicaSets without spec.selector. Without
+    // defaulting, validate_resource rejects objects that omit selector when
+    // template labels are present (conformance pattern used by workload tests).
+    if obj["spec"]["selector"].is_null() {
+        let labels = obj["spec"]["template"]["metadata"]["labels"].clone();
+        if labels.is_object() {
+            obj["spec"]["selector"] = serde_json::json!({ "matchLabels": labels });
+        }
+    }
+
     if obj["spec"]["replicas"].is_null() {
         obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
     }
 }
 
 fn default_statefulset(obj: &mut serde_json::Value) {
+    // spec.selector defaults to matchLabels from spec.template.metadata.labels.
+    // Real kube-apiserver rejects StatefulSets without spec.selector. Without
+    // defaulting, validate_resource rejects objects that omit selector when
+    // template labels are present (conformance pattern used by workload tests).
+    if obj["spec"]["selector"].is_null() {
+        let labels = obj["spec"]["template"]["metadata"]["labels"].clone();
+        if labels.is_object() {
+            obj["spec"]["selector"] = serde_json::json!({ "matchLabels": labels });
+        }
+    }
+
     if obj["spec"]["replicas"].is_null() {
         obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
     }
@@ -798,6 +820,88 @@ mod tests {
         );
     }
 
+    /// ReplicaSet without spec.selector must have it defaulted from template labels.
+    ///
+    /// Conformance workload tests create ReplicaSets without spec.selector, relying
+    /// on the apiserver to default it from spec.template.metadata.labels (matching
+    /// real kube behavior). Without this default, validate_resource rejects the
+    /// object with 'spec.selector is required', blocking all RS-based workload tests.
+    #[test]
+    fn replicaset_without_selector_gets_default_from_template_labels() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "test", "version": "v1" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "replicasets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "test", "version": "v1" } }),
+            "spec.selector must be defaulted from template labels — missing selector causes \
+             validate_resource to reject the object with 'spec.selector is required'"
+        );
+    }
+
+    /// ReplicaSet: existing spec.selector must not be overwritten.
+    ///
+    /// A ReplicaSet may specify a selector that is a strict subset of template labels.
+    /// Overwriting it would change which Pods the RS considers owned.
+    #[test]
+    fn replicaset_existing_selector_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "my-app" } },
+                "template": {
+                    "metadata": { "labels": { "app": "my-app", "extra": "label" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "replicasets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "my-app" } }),
+            "existing spec.selector must not be overwritten — changing it breaks Pod ownership"
+        );
+    }
+
+    /// ReplicaSet with template labels passes validation after selector is defaulted.
+    ///
+    /// Verifies the full write-path pipeline: selector is defaulted then validation passes.
+    #[test]
+    fn replicaset_selector_defaulted_then_passes_validation() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "test" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "replicasets", &mut obj);
+        assert!(
+            validate_resource("apps", "replicasets", &obj).is_ok(),
+            "ReplicaSet with template labels must pass validation after selector is defaulted"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // StatefulSet defaults
     // ---------------------------------------------------------------------------
@@ -837,6 +941,88 @@ mod tests {
             obj["spec"]["revisionHistoryLimit"],
             serde_json::Value::Number(10.into()),
             "spec.revisionHistoryLimit must default to 10"
+        );
+    }
+
+    /// StatefulSet without spec.selector must have it defaulted from template labels.
+    ///
+    /// Conformance workload tests create StatefulSets without spec.selector, relying
+    /// on the apiserver to default it from spec.template.metadata.labels (matching
+    /// real kube behavior). Without this default, validate_resource rejects the
+    /// object with 'spec.selector is required', blocking all SS-based workload tests.
+    #[test]
+    fn statefulset_without_selector_gets_default_from_template_labels() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "test", "tier": "db" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "test", "tier": "db" } }),
+            "spec.selector must be defaulted from template labels — missing selector causes \
+             validate_resource to reject the object with 'spec.selector is required'"
+        );
+    }
+
+    /// StatefulSet: existing spec.selector must not be overwritten.
+    ///
+    /// A StatefulSet may specify a selector that is a strict subset of template labels.
+    /// Overwriting it would change which Pods the SS considers owned.
+    #[test]
+    fn statefulset_existing_selector_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "my-db" } },
+                "template": {
+                    "metadata": { "labels": { "app": "my-db", "extra": "label" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "my-db" } }),
+            "existing spec.selector must not be overwritten — changing it breaks Pod ownership"
+        );
+    }
+
+    /// StatefulSet with template labels passes validation after selector is defaulted.
+    ///
+    /// Verifies the full write-path pipeline: selector is defaulted then validation passes.
+    #[test]
+    fn statefulset_selector_defaulted_then_passes_validation() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "test" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+        assert!(
+            validate_resource("apps", "statefulsets", &obj).is_ok(),
+            "StatefulSet with template labels must pass validation after selector is defaulted"
         );
     }
 

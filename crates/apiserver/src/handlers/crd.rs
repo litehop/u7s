@@ -240,6 +240,7 @@ pub async fn list_crds<S: Store>(
                 as_partial_object_metadata: pom,
                 group: GROUP.to_string(),
                 plural: PLURAL.to_string(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -691,6 +692,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             HeaderMap::new(),
             Extension(UserInfo {
@@ -792,6 +794,7 @@ mod tests {
             continue_token: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
+            timeout_seconds: None,
         });
 
         let resp = match list_crds(
@@ -954,6 +957,7 @@ mod tests {
             continue_token: None,
             send_initial_events: Some(true),
             allow_watch_bookmarks: Some(true),
+            timeout_seconds: None,
         });
 
         let resp = list_crds(
