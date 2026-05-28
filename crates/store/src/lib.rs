@@ -166,6 +166,19 @@ pub trait Store: Send + Sync + 'static {
         Output = Result<impl futures_core::Stream<Item = WatchEvent> + Send + 'static>,
     > + Send;
 
+    /// Delete all objects belonging to the given namespace.
+    ///
+    /// Atomically removes every stored object whose `metadata.namespace` matches
+    /// `namespace`. Returns the list of deleted store keys.
+    ///
+    /// Used by the namespace hard-delete path to prevent orphaned resources from
+    /// causing false 409 AlreadyExists errors when the same namespace name is
+    /// later re-created.
+    fn delete_namespace_resources(
+        &self,
+        namespace: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
+
     /// Return the current compaction horizon.
     /// Any revision below this value has been compacted out of the ring buffer.
     /// Returns 0 when no compaction has occurred.
@@ -443,6 +456,50 @@ fn delete_sync(conn: &Connection, key: &str, expected_revision: Option<u64>) -> 
     conn.execute("DELETE FROM objects WHERE key = ?1", params![key])?;
     conn.execute_batch("COMMIT")?;
     Ok(new_revision)
+}
+
+/// Delete all objects in a namespace atomically.
+///
+/// Returns the keys that were deleted (may be empty) and the new revision
+/// (only meaningful when at least one object was deleted).
+fn delete_namespace_sync(conn: &Connection, namespace: &str) -> Result<(u64, Vec<String>)> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    // Collect all keys in the namespace.
+    let mut stmt = conn.prepare("SELECT key FROM objects WHERE ns = ?1")?;
+    let keys: Vec<String> = stmt
+        .query_map(params![namespace], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if keys.is_empty() {
+        conn.execute_batch("ROLLBACK")?;
+        // Return current revision without incrementing (nothing was deleted).
+        let rev: u64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
+                [],
+                |r| r.get::<_, i64>(0).map(|v| v as u64),
+            )
+            .unwrap_or(0);
+        return Ok((rev, vec![]));
+    }
+
+    // Increment global revision once for the batch.
+    conn.execute(
+        "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
+        [],
+    )?;
+    let new_revision: u64 = conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
+        [],
+        |r| r.get::<_, i64>(0).map(|v| v as u64),
+    )?;
+
+    // Delete all objects in the namespace.
+    conn.execute("DELETE FROM objects WHERE ns = ?1", params![namespace])?;
+    conn.execute_batch("COMMIT")?;
+    Ok((new_revision, keys))
 }
 
 fn get_sync(conn: &Connection, key: &str) -> Result<Option<StoreObject>> {
@@ -875,6 +932,31 @@ impl Store for SqliteStore {
         }));
 
         Ok(revision)
+    }
+
+    async fn delete_namespace_resources(&self, namespace: &str) -> Result<Vec<String>> {
+        let conn = self.write_conn.clone();
+        let ns = namespace.to_string();
+        let (revision, keys) = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            delete_namespace_sync(&conn, &ns)
+        })
+        .await??;
+
+        if !keys.is_empty() {
+            self.last_written_revision
+                .fetch_max(revision, Ordering::Release);
+            for key in &keys {
+                self.push_event(Arc::new(InternalEvent {
+                    key: key.clone(),
+                    revision,
+                    value: None,
+                    is_create: false,
+                }));
+            }
+        }
+
+        Ok(keys)
     }
 
     async fn watch(

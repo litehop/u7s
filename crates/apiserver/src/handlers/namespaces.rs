@@ -652,6 +652,12 @@ pub async fn delete_namespace<S: Store>(
     }
 
     // No finalizers — hard-delete immediately.
+    // Cascade-delete all resources in the namespace first so that re-creating
+    // a namespace with the same name does not inherit orphaned objects and
+    // cause false 409 AlreadyExists errors on subsequent POSTs.
+    if let Err(e) = state.store.delete_namespace_resources(&name).await {
+        tracing::warn!("namespace {name}: cascade delete failed: {e}");
+    }
     state
         .store
         .delete(&key, None)
@@ -1628,6 +1634,128 @@ mod tests {
             stored.is_none(),
             "namespace without finalizers must be hard-deleted immediately — \
              this path applies to namespaces that predate the finalizer-stamping fix"
+        );
+    }
+
+    // Cascade-delete removes namespace resources on hard-delete so re-creating a
+    // namespace with the same name does not inherit stale objects.
+    //
+    // Without the cascade: if a configmap is created in namespace "recycled-ns" and
+    // the namespace is then hard-deleted (no finalizers), the configmap remains in the
+    // store. When the KCM root CA publisher later POSTs "kube-root-ca.crt" in the
+    // re-created "recycled-ns", it gets 409 AlreadyExists because the stale configmap
+    // is still there. This is the false-positive 409 reported in kcm.log.
+    #[tokio::test]
+    async fn delete_namespace_hard_delete_cascades_to_namespace_resources() {
+        use crate::handlers::resource::create_namespaced_resource;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        // Write a namespace directly to the store WITHOUT a finalizer so
+        // delete_namespace takes the hard-delete path (no soft-delete).
+        let ns_key = crate::keys::cluster_object_key("namespaces", "recycled-ns");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "recycled-ns",
+                "uid": "00000000-0000-0000-0000-000000000099",
+                "resourceVersion": "1"
+            },
+            "status": { "phase": "Active" }
+        });
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("namespace write must succeed");
+
+        // Seed a configmap in the namespace — simulates KCM creating kube-root-ca.crt.
+        let cm_key = crate::keys::object_key("configmaps", "recycled-ns", "kube-root-ca.crt");
+        let cm_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "kube-root-ca.crt",
+                "namespace": "recycled-ns",
+                "resourceVersion": "2"
+            },
+            "data": { "ca.crt": "CERT" }
+        });
+        state
+            .store
+            .put(&cm_key, bytes::Bytes::from(cm_body.to_string()), Some(0))
+            .await
+            .expect("configmap write must succeed");
+
+        // Hard-delete the namespace (no finalizers → immediate delete).
+        delete_namespace(State(state.clone()), Path("recycled-ns".to_string()))
+            .await
+            .expect("namespace delete must succeed");
+
+        // The configmap must have been cascade-deleted along with the namespace.
+        // If it still exists, re-creating the namespace will produce false 409s.
+        let stored_cm = state
+            .store
+            .get(&cm_key)
+            .await
+            .expect("store get must not error");
+        assert!(
+            stored_cm.is_none(),
+            "configmap must be cascade-deleted when its namespace is hard-deleted — \
+             without cascade, re-creating the namespace causes false 409 AlreadyExists \
+             errors when KCM tries to POST kube-root-ca.crt"
+        );
+
+        // Re-create the namespace.
+        state
+            .store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("namespace re-create must succeed");
+
+        // Now POST the same configmap name — must return 201 (not 409).
+        let cm_post_body = bytes::Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": "kube-root-ca.crt", "namespace": "recycled-ns" },
+                "data": { "ca.crt": "CERT" }
+            })
+            .to_string(),
+        );
+        let headers = {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            h
+        };
+        let resp = create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "recycled-ns".into(),
+                "configmaps".into(),
+            )),
+            headers,
+            cm_post_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("POST must not hard-error; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "POST configmap to re-created namespace must return 201 Created, not 409 — \
+             false 409 occurs when namespace hard-delete leaves orphaned resources in the store"
         );
     }
 
