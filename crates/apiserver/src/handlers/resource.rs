@@ -4746,6 +4746,94 @@ mod tests {
         );
     }
 
+    /// delete_collection_namespaced_resource must remove every object in the
+    /// namespace so that the KCM namespace controller can finish namespace
+    /// deletion.  Without this, services linger after namespace deletion and
+    /// the finalizer is never removed, blocking namespace cleanup indefinitely.
+    #[tokio::test]
+    async fn delete_collection_namespaced_removes_all_objects() {
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        for name in &["alpha", "beta"] {
+            let body = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": { "name": name, "namespace": "test-ns" },
+                "spec": { "holderIdentity": name }
+            });
+            create_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "test-ns".into(),
+                    "leases".into(),
+                )),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Lease create must succeed"));
+        }
+
+        let prefix =
+            crate::keys::group_list_prefix("coordination.k8s.io", "leases", Some("test-ns"));
+        let before = store
+            .list(&prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list before delete");
+        assert_eq!(
+            before.items.len(),
+            2,
+            "two Leases must exist before collection delete"
+        );
+
+        delete_collection_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "test-ns".into(),
+                "leases".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("delete_collection must succeed"));
+
+        let after = store
+            .list(&prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list after delete");
+        assert_eq!(
+            after.items.len(),
+            0,
+            "delete_collection must remove all objects in namespace — \
+             lingering objects block namespace finalizer removal and prevent \
+             namespace deletion from completing"
+        );
+    }
+
     /// POST conflict on a namespaced resource must return 409 with the existing object body.
     ///
     /// KCM's token publisher POSTs kube-root-ca.crt on every namespace reconcile. When the

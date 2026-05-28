@@ -213,7 +213,7 @@ pub async fn api_group_resources<S: Store>(
                     "namespaced": crd.spec.scope == "Namespaced",
                     "kind": crd.spec.names.kind,
                     "shortNames": crd.spec.names.short_names,
-                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                    "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
                 })
             })
             .collect();
@@ -259,7 +259,7 @@ fn apiextensions_v1_resources() -> serde_json::Value {
                 "namespaced": false,
                 "kind": "CustomResourceDefinition",
                 "shortNames": ["crd", "crds"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -277,7 +277,7 @@ fn apps_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "DaemonSet",
                 "shortNames": ["ds"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "deployments",
@@ -285,7 +285,7 @@ fn apps_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "Deployment",
                 "shortNames": ["deploy"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "deployments/scale",
@@ -302,7 +302,7 @@ fn apps_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "ReplicaSet",
                 "shortNames": ["rs"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "replicasets/scale",
@@ -319,7 +319,7 @@ fn apps_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "StatefulSet",
                 "shortNames": ["sts"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "statefulsets/scale",
@@ -386,28 +386,28 @@ fn rbac_v1_resources() -> serde_json::Value {
                 "singularName": "clusterrole",
                 "namespaced": false,
                 "kind": "ClusterRole",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "clusterrolebindings",
                 "singularName": "clusterrolebinding",
                 "namespaced": false,
                 "kind": "ClusterRoleBinding",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "roles",
                 "singularName": "role",
                 "namespaced": true,
                 "kind": "Role",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "rolebindings",
                 "singularName": "rolebinding",
                 "namespaced": true,
                 "kind": "RoleBinding",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -424,42 +424,42 @@ fn admissionregistration_v1_resources() -> serde_json::Value {
                 "singularName": "mutatingadmissionpolicy",
                 "namespaced": false,
                 "kind": "MutatingAdmissionPolicy",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "mutatingadmissionpolicybindings",
                 "singularName": "mutatingadmissionpolicybinding",
                 "namespaced": false,
                 "kind": "MutatingAdmissionPolicyBinding",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "mutatingwebhookconfigurations",
                 "singularName": "mutatingwebhookconfiguration",
                 "namespaced": false,
                 "kind": "MutatingWebhookConfiguration",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "validatingadmissionpolicies",
                 "singularName": "validatingadmissionpolicy",
                 "namespaced": false,
                 "kind": "ValidatingAdmissionPolicy",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "validatingadmissionpolicybindings",
                 "singularName": "validatingadmissionpolicybinding",
                 "namespaced": false,
                 "kind": "ValidatingAdmissionPolicyBinding",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "validatingwebhookconfigurations",
                 "singularName": "validatingwebhookconfiguration",
                 "namespaced": false,
                 "kind": "ValidatingWebhookConfiguration",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -477,7 +477,7 @@ fn certificates_v1_resources() -> serde_json::Value {
                 "namespaced": false,
                 "kind": "CertificateSigningRequest",
                 "shortNames": ["csr"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "certificatesigningrequests/approval",
@@ -508,7 +508,7 @@ fn coordination_v1_resources() -> serde_json::Value {
                 "singularName": "lease",
                 "namespaced": true,
                 "kind": "Lease",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -526,7 +526,7 @@ fn discovery_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "EndpointSlice",
                 "shortNames": ["eps"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -543,7 +543,7 @@ fn networking_v1_resources() -> serde_json::Value {
                 "singularName": "ingressclass",
                 "namespaced": false,
                 "kind": "IngressClass",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "ingresses",
@@ -551,14 +551,14 @@ fn networking_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "Ingress",
                 "shortNames": ["ing"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "ipaddresses",
                 "singularName": "ipaddress",
                 "namespaced": false,
                 "kind": "IPAddress",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "networkpolicies",
@@ -566,14 +566,14 @@ fn networking_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "NetworkPolicy",
                 "shortNames": ["netpol"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "servicecidrs",
                 "singularName": "servicecidr",
                 "namespaced": false,
                 "kind": "ServiceCIDR",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -591,7 +591,7 @@ fn gateway_networking_v1_resources() -> serde_json::Value {
                 "namespaced": false,
                 "kind": "GatewayClass",
                 "shortNames": ["gc"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "gateways",
@@ -599,14 +599,14 @@ fn gateway_networking_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "Gateway",
                 "shortNames": ["gtw"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "httproutes",
                 "singularName": "httproute",
                 "namespaced": true,
                 "kind": "HTTPRoute",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -623,7 +623,7 @@ fn gateway_networking_v1beta1_resources() -> serde_json::Value {
                 "singularName": "referencegrant",
                 "namespaced": true,
                 "kind": "ReferenceGrant",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -641,7 +641,7 @@ fn policy_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "PodDisruptionBudget",
                 "shortNames": ["pdb"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -658,7 +658,7 @@ fn node_v1_resources() -> serde_json::Value {
                 "singularName": "runtimeclass",
                 "namespaced": false,
                 "kind": "RuntimeClass",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -676,14 +676,14 @@ fn batch_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "CronJob",
                 "shortNames": ["cj"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "jobs",
                 "singularName": "job",
                 "namespaced": true,
                 "kind": "Job",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -701,7 +701,7 @@ fn autoscaling_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "HorizontalPodAutoscaler",
                 "shortNames": ["hpa"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -719,7 +719,7 @@ fn autoscaling_v2_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "HorizontalPodAutoscaler",
                 "shortNames": ["hpa"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -736,14 +736,14 @@ fn storage_v1_resources() -> serde_json::Value {
                 "singularName": "csidriver",
                 "namespaced": false,
                 "kind": "CSIDriver",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "csinodes",
                 "singularName": "csinode",
                 "namespaced": false,
                 "kind": "CSINode",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "storageclasses",
@@ -751,21 +751,21 @@ fn storage_v1_resources() -> serde_json::Value {
                 "namespaced": false,
                 "kind": "StorageClass",
                 "shortNames": ["sc"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "volumeattachments",
                 "singularName": "volumeattachment",
                 "namespaced": false,
                 "kind": "VolumeAttachment",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
                 "name": "volumeattributesclasses",
                 "singularName": "volumeattributesclass",
                 "namespaced": false,
                 "kind": "VolumeAttributesClass",
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -783,7 +783,7 @@ fn events_v1_resources() -> serde_json::Value {
                 "namespaced": true,
                 "kind": "Event",
                 "shortNames": ["ev"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -801,7 +801,7 @@ fn scheduling_v1_resources() -> serde_json::Value {
                 "namespaced": false,
                 "kind": "PriorityClass",
                 "shortNames": ["pc"],
-                "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
