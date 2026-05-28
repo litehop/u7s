@@ -45,7 +45,7 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-SONOBUOY_ARGS="run --mode=non-disruptive-conformance --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
+SONOBUOY_ARGS="run --mode=non-disruptive-conformance --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
 if [ -n "$FOCUS" ]; then
   SONOBUOY_ARGS="$SONOBUOY_ARGS --e2e-focus=$FOCUS"
 fi

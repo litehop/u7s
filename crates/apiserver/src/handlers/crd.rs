@@ -127,7 +127,6 @@ const BUILTIN_GROUPS: &[&str] = &[
     "node.k8s.io",
     "discovery.k8s.io",
     "events.k8s.io",
-    "flowcontrol.apiserver.k8s.io",
     "internal.apiserver.k8s.io",
 ];
 

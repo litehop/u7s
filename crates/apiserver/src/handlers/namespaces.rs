@@ -10,7 +10,10 @@ use u7s_store::{ListOptions, Store, StoreError};
 use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
-    handlers::generic::apply_delete_policy,
+    handlers::{
+        generic::apply_delete_policy,
+        json_patch::{apply_json_patch, detect_patch_type, PatchType},
+    },
     keys::{cluster_list_prefix, cluster_object_key},
     proto,
     state::AppState,
@@ -464,6 +467,126 @@ pub async fn finalize_namespace<S: Store>(
     current.set_resource_version(new_rv);
 
     Ok(Json(current.body).into_response())
+}
+
+/// GET /api/v1/namespaces/{name}/status
+///
+/// Returns the full namespace object. Status is embedded, not a separate subresource store.
+pub async fn get_namespace_status<S: Store>(
+    state: State<AppState<S>>,
+    Path(name): Path<String>,
+) -> Result<Response, crate::status::StatusError> {
+    get_namespace(state, Path(name)).await
+}
+
+/// PUT /api/v1/namespaces/{name}/status
+///
+/// Replaces only the status field of a namespace. The KCM namespace controller calls this
+/// to set status.conditions (e.g. NamespaceDeletionContentFailure) during namespace deletion.
+pub async fn put_namespace_status<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let body = extract_body(&body, ct);
+    let incoming =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let key = cluster_object_key("namespaces", &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    match &incoming.body["status"] {
+        serde_json::Value::Null => {
+            current.body.as_object_mut().map(|m| m.remove("status"));
+        }
+        v => {
+            current.body["status"] = v.clone();
+        }
+    }
+
+    let expected_rv = parse_resource_version(current.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, &name))?;
+
+    current.set_resource_version(new_rv);
+    Ok(Json(current.body))
+}
+
+/// PATCH /api/v1/namespaces/{name}/status
+///
+/// Patches only the status field of a namespace. Supports merge-patch, strategic-merge-patch,
+/// and json-patch. The KCM namespace controller uses strategic-merge-patch to update conditions.
+pub async fn patch_namespace_status<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let patch_type = detect_patch_type(&headers)?;
+
+    let key = cluster_object_key("namespaces", &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Namespace"))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    match patch_type {
+        PatchType::Json => {
+            apply_json_patch(&mut current.body, &patch)?;
+        }
+        _ => {
+            if let Some(status_patch) = patch.get("status") {
+                let entry = current.body.as_object_mut().map(|m| {
+                    m.entry("status")
+                        .or_insert(serde_json::Value::Object(Default::default()))
+                });
+                if let Some(entry) = entry {
+                    match patch_type {
+                        PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
+                        PatchType::StrategicMerge => {
+                            crate::patch::strategic_merge_patch(entry, status_patch)
+                                .map_err(|e| Status::bad_request(e.to_string()))?;
+                        }
+                        PatchType::Json => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    let expected_rv = parse_resource_version(current.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, &name))?;
+
+    current.set_resource_version(new_rv);
+    Ok(Json(current.body))
 }
 
 pub async fn delete_namespace<S: Store>(
@@ -1864,6 +1987,221 @@ mod tests {
             after.is_none(),
             "namespace must be hard-deleted when all finalizers are removed via PUT while \
              deletionTimestamp is set"
+        );
+    }
+
+    // get_namespace_status must return 200 with the full namespace body.
+    // Status is embedded in the object, not a separate store entry.
+    #[tokio::test]
+    async fn get_namespace_status_returns_200() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("status-get-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let resp = get_namespace_status(State(state.clone()), Path("status-get-ns".to_string()))
+            .await
+            .expect("get_namespace_status must not error");
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /status must return 200 for existing namespace"
+        );
+    }
+
+    // put_namespace_status must update status.conditions without touching metadata or spec.
+    // The KCM namespace controller calls this to set NamespaceDeletionContentFailure
+    // so the test can detect that namespace deletion is making progress.
+    #[tokio::test]
+    async fn put_namespace_status_updates_conditions() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("status-put-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let stored_before = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-put-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&stored_before.value).unwrap();
+        let rv = before["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("1");
+
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "status-put-ns", "resourceVersion": rv },
+                "status": {
+                    "phase": "Terminating",
+                    "conditions": [{
+                        "type": "NamespaceDeletionContentFailure",
+                        "status": "True",
+                        "reason": "ContentDeletionFailed",
+                        "message": "test-pod has a finalizer"
+                    }]
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            put_namespace_status(
+                State(state.clone()),
+                Path("status-put-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                status_body,
+            )
+            .await
+            .is_ok(),
+            "put_namespace_status must succeed"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-put-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            body["status"]["conditions"][0]["type"],
+            "NamespaceDeletionContentFailure",
+            "PUT /status must persist conditions; KCM uses this to signal namespace deletion progress. \
+             Without this endpoint the test waits 5 minutes and times out."
+        );
+        assert_eq!(
+            body["metadata"]["name"], "status-put-ns",
+            "metadata must be unchanged after PUT /status"
+        );
+    }
+
+    // put_namespace_status must return 404 for a namespace that does not exist.
+    #[tokio::test]
+    async fn put_namespace_status_returns_404_for_missing() {
+        let state = make_state();
+
+        let status_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "ghost-status-ns" },
+                "status": { "phase": "Terminating" }
+            })
+            .to_string(),
+        );
+
+        let result = put_namespace_status(
+            State(state.clone()),
+            Path("ghost-status-ns".to_string()),
+            axum::http::HeaderMap::new(),
+            status_body,
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected 404 for missing namespace"),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::NOT_FOUND,
+            "PUT /status on non-existent namespace must return 404"
+        );
+    }
+
+    // patch_namespace_status must update status via merge-patch without touching spec/metadata.
+    // The KCM uses this to append conditions without replacing the entire status object.
+    #[tokio::test]
+    async fn patch_namespace_status_applies_merge_patch() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("status-patch-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "status": {
+                    "conditions": [{
+                        "type": "NamespaceDeletionContentFailure",
+                        "status": "False"
+                    }]
+                }
+            })
+            .to_string(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        assert!(
+            patch_namespace_status(
+                State(state.clone()),
+                Path("status-patch-ns".to_string()),
+                headers,
+                patch_body,
+            )
+            .await
+            .is_ok(),
+            "patch_namespace_status must succeed"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-patch-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            body["status"]["conditions"][0]["type"], "NamespaceDeletionContentFailure",
+            "PATCH /status must persist the condition; KCM uses merge-patch to update conditions \
+             without replacing the whole status. Without this the condition is never visible."
+        );
+        assert_eq!(
+            body["metadata"]["name"], "status-patch-ns",
+            "metadata must be unchanged after PATCH /status"
         );
     }
 }

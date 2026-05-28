@@ -12,7 +12,7 @@ rosetta:
   enabled: true
   binfmt: true
 
-cpus: 2
+cpus: 8
 memory: 4GiB
 disk: 20GiB
 
