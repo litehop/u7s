@@ -61,6 +61,10 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
 ];
 
 pub async fn api_group_list<S: Store>(State(state): State<AppState<S>>) -> Json<APIGroupList> {
+    Json(api_group_list_inner(&state).await)
+}
+
+pub(crate) async fn api_group_list_inner<S: Store>(state: &AppState<S>) -> APIGroupList {
     let mut groups: Vec<APIGroup> = STATIC_GROUPS
         .iter()
         .map(|(name, version)| {
@@ -112,11 +116,11 @@ pub async fn api_group_list<S: Store>(State(state): State<AppState<S>>) -> Json<
         }
     }
 
-    Json(APIGroupList {
+    APIGroupList {
         kind: "APIGroupList",
         api_version: "v1",
         groups,
-    })
+    }
 }
 
 /// Return the preferred (storage=true, else first) version name for a CRD.
@@ -148,6 +152,157 @@ fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
         versions,
         preferred_version,
     }
+}
+
+// ---------------------------------------------------------------------------
+// AggregatedDiscovery — /apis + /discovery/v2 with Accept negotiation
+// ---------------------------------------------------------------------------
+
+/// Build an `APIGroupDiscoveryList` from all registered API groups and versions.
+///
+/// This is the GA AggregatedDiscovery format (k8s 1.27+). The conformance tests
+/// send `Accept: application/json;g=apidiscovery.k8s.io;v=v2beta1` and expect
+/// this response.
+pub(crate) async fn build_aggregated_discovery<S: Store>(state: &AppState<S>) -> serde_json::Value {
+    // Collect all groups+versions (same logic as api_group_list_inner).
+    let group_list = api_group_list_inner(state).await;
+
+    // Build the core group item (group="", apiVersion="v1").
+    let core_resources = api_resources_to_discovery_resources(&api_v1_resource_list_value());
+    let core_item = serde_json::json!({
+        "metadata": { "name": "" },
+        "versions": [{
+            "version": "v1",
+            "resources": core_resources,
+            "freshness": "Current"
+        }]
+    });
+
+    // Build one item per non-core group.
+    let mut items: Vec<serde_json::Value> = vec![core_item];
+    for group in &group_list.groups {
+        let mut versions_arr: Vec<serde_json::Value> = Vec::new();
+        for gv in &group.versions {
+            let resources = if let Some(rl) =
+                static_group_resources(group.name.as_str(), gv.version.as_str())
+            {
+                api_resources_to_discovery_resources(&rl)
+            } else {
+                serde_json::Value::Array(vec![])
+            };
+            versions_arr.push(serde_json::json!({
+                "version": gv.version,
+                "resources": resources,
+                "freshness": "Current"
+            }));
+        }
+        items.push(serde_json::json!({
+            "metadata": { "name": group.name },
+            "versions": versions_arr
+        }));
+    }
+
+    // Compute a simple ETag from the number of items (sufficient for conformance).
+    let resource_version = format!("{}", items.len());
+
+    serde_json::json!({
+        "kind": "APIGroupDiscoveryList",
+        "apiVersion": "apidiscovery.k8s.io/v2beta1",
+        "metadata": { "resourceVersion": resource_version },
+        "items": items
+    })
+}
+
+/// Convert an `APIResourceList` JSON value into the `APIGroupDiscovery` resource entry array.
+fn api_resources_to_discovery_resources(resource_list: &serde_json::Value) -> serde_json::Value {
+    let empty = vec![];
+    let resources = resource_list["resources"].as_array().unwrap_or(&empty);
+    let entries: Vec<serde_json::Value> = resources
+        .iter()
+        .map(|r| {
+            let name = r["name"].as_str().unwrap_or("");
+            // Skip subresources (names with "/") — they appear as subresources in their parent.
+            let is_subresource = name.contains('/');
+            let kind = r["kind"].as_str().unwrap_or("");
+            let singular = r["singularName"].as_str().unwrap_or("");
+            let namespaced = r["namespaced"].as_bool().unwrap_or(false);
+            let scope = if namespaced { "Namespaced" } else { "Cluster" };
+            let verbs = r["verbs"].clone();
+            let short_names = r
+                .get("shortNames")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+
+            // Find subresources that belong to this resource.
+            let sub_entries: Vec<serde_json::Value> = if !is_subresource {
+                let prefix = format!("{name}/");
+                resources
+                    .iter()
+                    .filter(|s| {
+                        s["name"]
+                            .as_str()
+                            .map(|n| n.starts_with(&prefix))
+                            .unwrap_or(false)
+                    })
+                    .map(|s| {
+                        let sub_name = s["name"].as_str().unwrap_or("").trim_start_matches(&prefix);
+                        let sub_kind = s["kind"].as_str().unwrap_or("");
+                        serde_json::json!({
+                            "subresource": sub_name,
+                            "responseKind": { "kind": sub_kind },
+                            "verbs": s["verbs"]
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            if is_subresource {
+                return serde_json::Value::Null; // filtered out below
+            }
+
+            let mut entry = serde_json::json!({
+                "resource": name,
+                "responseKind": { "kind": kind },
+                "scope": scope,
+                "singularResource": singular,
+                "verbs": verbs
+            });
+            if !short_names.is_null()
+                && short_names
+                    .as_array()
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+            {
+                entry["shortNames"] = short_names;
+            }
+            if !sub_entries.is_empty() {
+                entry["subresources"] = serde_json::Value::Array(sub_entries);
+            }
+            entry
+        })
+        .filter(|v| !v.is_null())
+        .collect();
+    serde_json::Value::Array(entries)
+}
+
+/// Return the core v1 resource list as a JSON value (for aggregated discovery).
+fn api_v1_resource_list_value() -> serde_json::Value {
+    let list = crate::types::ApiResourceList::v1();
+    serde_json::to_value(&list).unwrap_or(serde_json::Value::Null)
+}
+
+/// Handler for `GET /discovery/v2` — always returns the aggregated discovery list.
+pub async fn aggregated_discovery_v2<S: Store>(State(state): State<AppState<S>>) -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json;g=apidiscovery.k8s.io;v=v2beta1",
+        )],
+        Json(build_aggregated_discovery(&state).await),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -988,7 +1143,7 @@ mod tests {
             "create must succeed"
         );
 
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
             names.contains(&"example.io"),
@@ -1000,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn static_groups_always_present() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         for (group, _) in STATIC_GROUPS {
             assert!(
@@ -1068,7 +1223,7 @@ mod tests {
             .await
             .expect("direct store insert must succeed");
 
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let apps_count = list.groups.iter().filter(|g| g.name == "apps").count();
         assert_eq!(
             apps_count, 1,
@@ -1163,7 +1318,7 @@ mod tests {
             "create must succeed"
         );
 
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let group = list
             .groups
             .iter()
@@ -1191,7 +1346,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_group_appears_in_api_group_list() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
             names.contains(&"discovery.k8s.io"),
@@ -1230,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn storage_group_appears_in_api_group_list() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
             names.contains(&"storage.k8s.io"),
@@ -1242,7 +1397,7 @@ mod tests {
     #[tokio::test]
     async fn node_group_appears_in_api_group_list() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
             names.contains(&"node.k8s.io"),
@@ -1391,7 +1546,7 @@ mod tests {
     #[tokio::test]
     async fn batch_group_appears_in_api_group_list() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
             names.contains(&"batch"),
@@ -1432,7 +1587,7 @@ mod tests {
     #[tokio::test]
     async fn autoscaling_group_appears_in_api_group_list_with_both_versions() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let group = list
             .groups
             .iter()
@@ -1660,7 +1815,7 @@ mod tests {
     #[tokio::test]
     async fn scheduling_group_appears_in_api_group_list() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
             names.contains(&"scheduling.k8s.io"),
@@ -1702,7 +1857,7 @@ mod tests {
     #[tokio::test]
     async fn events_group_appears_in_api_group_list() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
             names.contains(&"events.k8s.io"),
@@ -1933,7 +2088,7 @@ mod tests {
     #[tokio::test]
     async fn resource_group_appears_in_api_group_list() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
             names.contains(&"resource.k8s.io"),
@@ -1995,7 +2150,7 @@ mod tests {
     #[tokio::test]
     async fn flowcontrol_group_absent_from_api_group_list() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
             !names.contains(&"flowcontrol.apiserver.k8s.io"),
@@ -2020,6 +2175,139 @@ mod tests {
             StatusCode::NOT_FOUND,
             "GET /apis/flowcontrol.apiserver.k8s.io/v1 must return 404 — \
              the group is not served and must not be reachable"
+        );
+    }
+
+    // GET /apis must always return a plain APIGroupList — /apis is the legacy discovery
+    // endpoint used by kubectl and all Kubernetes clients. Aggregated discovery is only
+    // served from /discovery/v2, which clients probe separately. Returning an
+    // APIGroupDiscoveryList from /apis breaks clients that expect APIGroupList.
+    #[tokio::test]
+    async fn apis_returns_api_group_list() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+
+        assert_eq!(
+            list.kind, "APIGroupList",
+            "GET /apis must return kind=APIGroupList — all kubectl versions expect this format"
+        );
+        assert!(
+            !list.groups.is_empty(),
+            "APIGroupList must contain at least one group"
+        );
+    }
+
+    // GET /discovery/v2 must return an APIGroupDiscoveryList with correct Content-Type,
+    // core group resources, and apps/v1 resources. Conformance tests use this dedicated
+    // endpoint rather than Accept-header negotiation on /apis.
+    #[tokio::test]
+    async fn discovery_v2_returns_aggregated_discovery_list_with_correct_content_type() {
+        let app = Router::new()
+            .route(
+                "/discovery/v2",
+                get(aggregated_discovery_v2::<u7s_store::SqliteStore>),
+            )
+            .with_state(make_state());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/discovery/v2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            ct, "application/json;g=apidiscovery.k8s.io;v=v2beta1",
+            "/discovery/v2 must carry Content-Type 'application/json;g=apidiscovery.k8s.io;v=v2beta1' \
+             so conformance tests recognise it as aggregated discovery"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(val["kind"], "APIGroupDiscoveryList");
+        assert_eq!(val["apiVersion"], "apidiscovery.k8s.io/v2beta1");
+        assert!(val["metadata"]["resourceVersion"].as_str().is_some());
+
+        let items = val["items"].as_array().expect("items must be an array");
+
+        let core = items.iter().find(|i| i["metadata"]["name"] == "");
+        assert!(core.is_some(), "core group must appear in /discovery/v2");
+        let core_resources = core.unwrap()["versions"][0]["resources"]
+            .as_array()
+            .unwrap();
+        let core_names: Vec<&str> = core_resources
+            .iter()
+            .filter_map(|r| r["resource"].as_str())
+            .collect();
+        assert!(
+            core_names.contains(&"pods"),
+            "core/v1 must include pods; got: {core_names:?}"
+        );
+
+        let apps = items.iter().find(|i| i["metadata"]["name"] == "apps");
+        assert!(apps.is_some(), "apps group must appear in /discovery/v2");
+        let apps_resources = apps.unwrap()["versions"][0]["resources"]
+            .as_array()
+            .unwrap();
+        let apps_names: Vec<&str> = apps_resources
+            .iter()
+            .filter_map(|r| r["resource"].as_str())
+            .collect();
+        assert!(
+            apps_names.contains(&"deployments"),
+            "apps/v1 must include deployments; got: {apps_names:?}"
+        );
+    }
+
+    // GET /discovery/v2 must always return an APIGroupDiscoveryList regardless of Accept header.
+    // This is the dedicated aggregated discovery endpoint used by conformance tests.
+    #[tokio::test]
+    async fn discovery_v2_route_returns_api_group_discovery_list() {
+        let app = Router::new()
+            .route(
+                "/discovery/v2",
+                get(aggregated_discovery_v2::<u7s_store::SqliteStore>),
+            )
+            .with_state(make_state());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/discovery/v2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /discovery/v2 must return 200 — AggregatedDiscovery conformance tests hit this endpoint"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value =
+            serde_json::from_slice(&body).expect("/discovery/v2 body must be valid JSON");
+        assert_eq!(
+            val["kind"], "APIGroupDiscoveryList",
+            "/discovery/v2 must return kind=APIGroupDiscoveryList"
+        );
+        assert!(
+            val["items"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            "/discovery/v2 must return a non-empty items array"
         );
     }
 

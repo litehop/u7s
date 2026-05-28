@@ -263,6 +263,12 @@ fn build_router(state: AppState) -> Router {
         // Core discovery
         .route("/api", get(handlers::discovery::api_versions))
         .route("/api/v1", get(handlers::discovery::api_v1_resources))
+        // AggregatedDiscovery (k8s 1.27+ GA) — returns APIGroupDiscoveryList
+        // Serves both the dedicated endpoint and the Accept-header-based negotiation on /apis.
+        .route(
+            "/discovery/v2",
+            get(handlers::discovery::aggregated_discovery_v2),
+        )
         // Non-core group discovery
         .route("/apis", get(handlers::discovery::api_group_list))
         .route(
