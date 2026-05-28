@@ -55,7 +55,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("node.k8s.io", "v1"),
     ("policy", "v1"),
     ("rbac.authorization.k8s.io", "v1"),
-    ("resource.k8s.io", "v1alpha3"),
+    ("resource.k8s.io", "v1"),
     ("scheduling.k8s.io", "v1"),
     ("storage.k8s.io", "v1"),
 ];
@@ -360,7 +360,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("node.k8s.io", "v1") => Some(node_v1_resources()),
         ("policy", "v1") => Some(policy_v1_resources()),
         ("rbac.authorization.k8s.io", "v1") => Some(rbac_v1_resources()),
-        ("resource.k8s.io", "v1alpha3") => Some(resource_v1alpha3_resources()),
+        ("resource.k8s.io", "v1") => Some(resource_v1_resources()),
         ("scheduling.k8s.io", "v1") => Some(scheduling_v1_resources()),
         ("storage.k8s.io", "v1") => Some(storage_v1_resources()),
         _ => None,
@@ -600,11 +600,11 @@ fn rbac_v1_resources() -> serde_json::Value {
     })
 }
 
-fn resource_v1alpha3_resources() -> serde_json::Value {
+fn resource_v1_resources() -> serde_json::Value {
     serde_json::json!({
         "kind": "APIResourceList",
         "apiVersion": "v1",
-        "groupVersion": "resource.k8s.io/v1alpha3",
+        "groupVersion": "resource.k8s.io/v1",
         "resources": [
             {
                 "name": "deviceclasses",
@@ -1037,13 +1037,53 @@ fn scheduling_v1_resources() -> serde_json::Value {
 // OpenAPI stub endpoints
 // ---------------------------------------------------------------------------
 
-/// Minimal Swagger 2.0 stub — stops 404s for clients like Argo CD that call
-/// /openapi/v2 on startup. No field schemas are defined yet.
-pub async fn openapi_v2() -> Json<serde_json::Value> {
+/// Swagger 2.0 document with synthesized definitions for installed CRDs.
+/// Polls the store at request time so that newly-created CRDs appear without
+/// a restart — required by the CustomResourcePublishOpenAPI conformance test.
+pub async fn openapi_v2<S: Store>(State(state): State<AppState<S>>) -> Json<serde_json::Value> {
+    let mut definitions = serde_json::Map::new();
+
+    if let Ok(resp) = state
+        .store
+        .list(
+            "/registry/apiextensions.k8s.io/customresourcedefinitions/",
+            ListOptions::default(),
+        )
+        .await
+    {
+        for obj in &resp.items {
+            let Ok(crd) = serde_json::from_slice::<CustomResourceDefinition>(&obj.value) else {
+                continue;
+            };
+            let group = &crd.spec.group;
+            let kind = &crd.spec.names.kind;
+            // Reverse the domain segments: "example.io" → "io.example"
+            let reversed: String = group.split('.').rev().collect::<Vec<_>>().join(".");
+            for ver in &crd.spec.versions {
+                // Key format: io.example.v1.Foo
+                let key = format!("{}.{}.{}", reversed, ver.name, kind);
+                definitions.insert(
+                    key,
+                    serde_json::json!({
+                        "type": "object",
+                        "x-kubernetes-group-version-kind": [
+                            {
+                                "group": group,
+                                "version": ver.name,
+                                "kind": kind
+                            }
+                        ]
+                    }),
+                );
+            }
+        }
+    }
+
     Json(serde_json::json!({
         "swagger": "2.0",
         "info": {"title": "u7s", "version": "v1"},
-        "paths": {}
+        "paths": {},
+        "definitions": definitions
     }))
 }
 
@@ -1701,7 +1741,8 @@ mod tests {
     // on startup and hard-fail if the endpoint is missing or returns malformed JSON.
     #[tokio::test]
     async fn openapi_v2_returns_swagger_2_0() {
-        let Json(val) = openapi_v2().await;
+        let state = make_state();
+        let Json(val) = openapi_v2(State(state)).await;
         assert_eq!(
             val.get("swagger").and_then(|v| v.as_str()),
             Some("2.0"),
@@ -1729,7 +1770,10 @@ mod tests {
     // a route being removed from the router.
     #[tokio::test]
     async fn openapi_v2_route_returns_200_with_swagger_field() {
-        let app = Router::new().route("/openapi/v2", get(openapi_v2));
+        let state = make_state();
+        let app = Router::new()
+            .route("/openapi/v2", get(openapi_v2))
+            .with_state(state);
 
         let req = Request::builder()
             .method("GET")
@@ -2068,7 +2112,7 @@ mod tests {
     }
 
     // resource.k8s.io must appear in /apis — Dynamic Resource Allocation (DRA) uses this
-    // group for ResourceClaim, ResourceClaimTemplate, ResourceSlice, and DeviceClass.
+    // group for ResourceClaim, ResourceClaimTemplate, ResourceSlice, and DeviceClass (GA since k8s 1.32).
     // kubectl and admission webhooks depend on this group being discoverable; without it,
     // `kubectl get resourceclaims` returns "the server doesn't have a resource type".
     #[tokio::test]
@@ -2083,23 +2127,23 @@ mod tests {
         );
     }
 
-    // resource.k8s.io/v1alpha3 must include all four DRA resource types — ResourceClaim,
+    // resource.k8s.io/v1 must include all four DRA resource types — ResourceClaim,
     // ResourceClaimTemplate, ResourceSlice, and DeviceClass are the core DRA objects.
-    // Missing any of them causes `kubectl get resourceclaims` or scheduler DRA plugins
-    // to fail at startup with "resource not found".
+    // DRA is GA since k8s 1.32; missing any of them causes `kubectl get resourceclaims`
+    // or scheduler DRA plugins to fail at startup with "resource not found".
     #[tokio::test]
-    async fn resource_v1alpha3_resources_list() {
+    async fn resource_v1_resources_list() {
         let state = make_state();
         let resp = api_group_resources(
             State(state),
-            Path(("resource.k8s.io".to_string(), "v1alpha3".to_string())),
+            Path(("resource.k8s.io".to_string(), "v1".to_string())),
         )
         .await;
 
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "GET /apis/resource.k8s.io/v1alpha3 must return 200"
+            "GET /apis/resource.k8s.io/v1 must return 200"
         );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -2113,19 +2157,19 @@ mod tests {
             .collect();
         assert!(
             names.contains(&"resourceclaims"),
-            "resourceclaims must be in resource.k8s.io/v1alpha3 — core DRA type; got: {names:?}"
+            "resourceclaims must be in resource.k8s.io/v1 — core DRA type (GA since k8s 1.32); got: {names:?}"
         );
         assert!(
             names.contains(&"resourceclaimtemplates"),
-            "resourceclaimtemplates must be in resource.k8s.io/v1alpha3 — core DRA type; got: {names:?}"
+            "resourceclaimtemplates must be in resource.k8s.io/v1 — core DRA type (GA since k8s 1.32); got: {names:?}"
         );
         assert!(
             names.contains(&"resourceslices"),
-            "resourceslices must be in resource.k8s.io/v1alpha3 — DRA node plugin reporting; got: {names:?}"
+            "resourceslices must be in resource.k8s.io/v1 — DRA node plugin reporting (GA since k8s 1.32); got: {names:?}"
         );
         assert!(
             names.contains(&"deviceclasses"),
-            "deviceclasses must be in resource.k8s.io/v1alpha3 — DRA device class; got: {names:?}"
+            "deviceclasses must be in resource.k8s.io/v1 — DRA device class (GA since k8s 1.32); got: {names:?}"
         );
     }
 
@@ -2335,6 +2379,93 @@ mod tests {
                 .map(|a| !a.is_empty())
                 .unwrap_or(false),
             "/discovery/v2 must return a non-empty items array"
+        );
+    }
+
+    // After creating a CRD, GET /openapi/v2 must include a definition entry with the
+    // reversed-domain key for that CRD's kind. CustomResourcePublishOpenAPI conformance
+    // test polls /openapi/v2 waiting for this entry to appear; if openapi_v2 is static
+    // (no store lookup) the test times out after 60 s.
+    #[tokio::test]
+    async fn openapi_v2_contains_crd_definition_after_crd_create() {
+        let state = make_state();
+
+        let body = crd_bytes("example.io", "foos", "foo", "Foo", "Namespaced", "v1");
+        assert!(
+            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create_crd must succeed"
+        );
+
+        let Json(doc) = openapi_v2(State(state)).await;
+        let defs = doc["definitions"]
+            .as_object()
+            .expect("definitions must be a JSON object");
+
+        // Reversed-domain key: example.io/v1/Foo → io.example.v1.Foo
+        let expected_key = "io.example.v1.Foo";
+        assert!(
+            defs.contains_key(expected_key),
+            "definitions must contain '{expected_key}' after CRD create — \
+             CustomResourcePublishOpenAPI conformance test polls /openapi/v2 for this key; \
+             got keys: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+
+        let gvk = &defs[expected_key]["x-kubernetes-group-version-kind"][0];
+        assert_eq!(gvk["group"], "example.io");
+        assert_eq!(gvk["version"], "v1");
+        assert_eq!(gvk["kind"], "Foo");
+    }
+
+    // create_crd must stamp status.conditions Established=True and NamesAccepted=True
+    // so that controllers (e.g. kube-controller-manager CRD controller) do not wait
+    // for a separate status update that never comes in u7s's single-process model.
+    #[tokio::test]
+    async fn create_crd_stamps_established_and_names_accepted_conditions() {
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        let body = crd_bytes("example.io", "bars", "bar", "Bar", "Cluster", "v1alpha1");
+        assert!(
+            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create_crd must succeed"
+        );
+
+        // Read back the stored CRD and verify status.conditions.
+        let stored = state
+            .store
+            .get("/registry/apiextensions.k8s.io/customresourcedefinitions/bars.example.io")
+            .await
+            .expect("store get must not fail")
+            .expect("stored CRD must exist");
+        let val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored CRD must be valid JSON");
+
+        let conditions = val["status"]["conditions"]
+            .as_array()
+            .expect("status.conditions must be present after create_crd");
+
+        let established = conditions
+            .iter()
+            .find(|c| c["type"] == "Established")
+            .expect("Established condition must be present — controllers wait for it");
+        assert_eq!(
+            established["status"], "True",
+            "Established condition must be True so controllers see the CRD as ready"
+        );
+
+        let accepted = conditions
+            .iter()
+            .find(|c| c["type"] == "NamesAccepted")
+            .expect("NamesAccepted condition must be present — controllers wait for it");
+        assert_eq!(
+            accepted["status"], "True",
+            "NamesAccepted condition must be True so controllers see the CRD as ready"
         );
     }
 }

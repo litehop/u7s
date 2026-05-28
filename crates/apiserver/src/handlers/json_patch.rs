@@ -1,4 +1,4 @@
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 
 use crate::{status::Status, util::content_type};
@@ -15,6 +15,218 @@ pub(crate) struct PatchQuery {
     /// Accepted and ignored: we do not implement server-side field validation.
     #[serde(rename = "fieldValidation")]
     pub _field_validation: Option<String>,
+}
+
+/// Query parameters accepted by CREATE endpoints (POST).
+///
+/// `field_validation` drives server-side unknown-field detection:
+///   - `Strict`  → 422 UnprocessableEntity with Status body listing unknown fields
+///   - `Warn`    → 200/201 with `Warning: 299 - "..."` response header
+///   - `Ignore`  → silently strip (default, existing behaviour)
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct CreateQuery {
+    #[serde(rename = "fieldManager")]
+    pub _field_manager: Option<String>,
+    #[serde(rename = "fieldValidation")]
+    pub field_validation: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Known-field sets for top-level and metadata field validation
+// ---------------------------------------------------------------------------
+
+/// Known top-level fields for any Kubernetes typed object.
+///
+/// `apiVersion`, `kind`, `metadata` are universal.  The remaining fields cover
+/// every resource in the static registry; unknown top-level keys trigger the
+/// Strict/Warn validation path.
+fn known_top_level_fields(group: &str, plural: &str) -> &'static [&'static str] {
+    // Resource-specific extra fields beyond the universal set.
+    match (group, plural) {
+        // ConfigMap / Secret
+        ("", "configmaps") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "data",
+            "binaryData",
+            "immutable",
+        ],
+        ("", "secrets") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "data",
+            "stringData",
+            "type",
+            "immutable",
+        ],
+        // ServiceAccount
+        ("", "serviceaccounts") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "secrets",
+            "imagePullSecrets",
+            "automountServiceAccountToken",
+        ],
+        // RBAC — cluster-scoped
+        ("rbac.authorization.k8s.io", "clusterroles") => {
+            &["apiVersion", "kind", "metadata", "rules", "aggregationRule"]
+        }
+        ("rbac.authorization.k8s.io", "clusterrolebindings") => {
+            &["apiVersion", "kind", "metadata", "subjects", "roleRef"]
+        }
+        // RBAC — namespaced
+        ("rbac.authorization.k8s.io", "roles") => &["apiVersion", "kind", "metadata", "rules"],
+        ("rbac.authorization.k8s.io", "rolebindings") => {
+            &["apiVersion", "kind", "metadata", "subjects", "roleRef"]
+        }
+        // StorageClass
+        ("storage.k8s.io", "storageclasses") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "provisioner",
+            "parameters",
+            "reclaimPolicy",
+            "volumeBindingMode",
+            "allowVolumeExpansion",
+            "mountOptions",
+            "allowedTopologies",
+        ],
+        // VolumeAttributesClass
+        ("storage.k8s.io", "volumeattributesclasses") => {
+            &["apiVersion", "kind", "metadata", "driverName", "parameters"]
+        }
+        // PriorityClass
+        ("scheduling.k8s.io", "priorityclasses") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "value",
+            "preemptionPolicy",
+            "globalDefault",
+            "description",
+        ],
+        // RuntimeClass
+        ("node.k8s.io", "runtimeclasses") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "handler",
+            "overhead",
+            "scheduling",
+        ],
+        // IngressClass
+        ("networking.k8s.io", "ingressclasses") => &["apiVersion", "kind", "metadata", "spec"],
+        // PodDisruptionBudget
+        ("policy", "poddisruptionbudgets") => &["apiVersion", "kind", "metadata", "spec", "status"],
+        // ControllerRevision
+        ("apps", "controllerrevisions") => &["apiVersion", "kind", "metadata", "data", "revision"],
+        // Lease
+        ("coordination.k8s.io", "leases") => &["apiVersion", "kind", "metadata", "spec"],
+        // Default: universal set + spec + status covers most resources
+        _ => &["apiVersion", "kind", "metadata", "spec", "status"],
+    }
+}
+
+/// Known fields within `metadata` for any Kubernetes object.
+///
+/// This matches the full `ObjectMeta` schema from the Kubernetes API.
+/// Unknown metadata keys (e.g. a misspelled annotation key at the wrong level)
+/// trigger validation errors in Strict mode.
+const KNOWN_METADATA_FIELDS: &[&str] = &[
+    "name",
+    "generateName",
+    "namespace",
+    "selfLink",
+    "uid",
+    "resourceVersion",
+    "generation",
+    "creationTimestamp",
+    "deletionTimestamp",
+    "deletionGracePeriodSeconds",
+    "labels",
+    "annotations",
+    "ownerReferences",
+    "finalizers",
+    "managedFields",
+    "clusterName",
+];
+
+/// Detect unknown top-level keys and unknown metadata keys in `body`.
+///
+/// Returns a list of dot-separated field paths that are not part of the
+/// resource's known schema, e.g. `["unknownField", "metadata.bogusKey"]`.
+pub(crate) fn detect_unknown_fields(
+    body: &serde_json::Value,
+    group: &str,
+    plural: &str,
+) -> Vec<String> {
+    let mut unknown = Vec::new();
+    let known_top = known_top_level_fields(group, plural);
+
+    if let Some(obj) = body.as_object() {
+        for key in obj.keys() {
+            if !known_top.contains(&key.as_str()) {
+                unknown.push(key.clone());
+            }
+        }
+
+        // Check metadata fields.
+        if let Some(meta) = obj.get("metadata").and_then(|m| m.as_object()) {
+            for key in meta.keys() {
+                if !KNOWN_METADATA_FIELDS.contains(&key.as_str()) {
+                    unknown.push(format!("metadata.{key}"));
+                }
+            }
+        }
+    }
+
+    unknown
+}
+
+/// Apply `?fieldValidation=` semantics.
+///
+/// - `Strict`  → returns `Err(422)` when unknown fields are detected.
+/// - `Warn`    → returns `Ok(Some(warning_header_value))` when unknown fields are detected.
+/// - `Ignore`  → returns `Ok(None)` unconditionally (existing strip-and-store behaviour).
+/// - absent    → same as `Ignore`.
+pub(crate) fn apply_field_validation(
+    body: &serde_json::Value,
+    mode: Option<&str>,
+    group: &str,
+    plural: &str,
+) -> Result<Option<HeaderValue>, crate::status::StatusError> {
+    let mode = mode.unwrap_or("Ignore");
+    if mode == "Ignore" {
+        return Ok(None);
+    }
+
+    let unknown = detect_unknown_fields(body, group, plural);
+    if unknown.is_empty() {
+        return Ok(None);
+    }
+
+    match mode {
+        "Strict" => {
+            let fields = unknown.join(", ");
+            Err(Status::unprocessable_entity(format!(
+                "strict decoding error: unknown field \"{fields}\""
+            )))
+        }
+        "Warn" => {
+            let fields = unknown.join(", ");
+            let msg = format!("299 - \"unknown field: {fields}\"");
+            let hv = HeaderValue::from_str(&msg).unwrap_or_else(|_| {
+                HeaderValue::from_static("299 - \"unknown field(s) detected\"")
+            });
+            Ok(Some(hv))
+        }
+        // Any other value: treat as Ignore.
+        _ => Ok(None),
+    }
 }
 
 /// Strip `managedFields` from an SSA apply body before merging.

@@ -1162,12 +1162,58 @@ struct ResourceQuota {
     metadata: Option<ObjectMeta>,
 }
 
+/// Quantity — k8s.io/apimachinery/pkg/api/resource/generated.proto
+///
+/// Only field 1 (string representation) is decoded; binary/decimal forms are ignored.
+/// This is sufficient for LimitRange admission: we only need the human-readable value
+/// (e.g. "500m", "128Mi") to pass through to JSON.
+#[derive(Clone, PartialEq, Message)]
+struct Quantity {
+    /// string representation (field 1, e.g. "500m", "128Mi", "1")
+    #[prost(string, optional, tag = "1")]
+    string: Option<String>,
+}
+
+/// LimitRangeItem — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct LimitRangeItem {
+    /// type (field 1, string) — "Container", "Pod", or "PersistentVolumeClaim"
+    #[prost(string, tag = "1")]
+    r#type: String,
+    /// max (field 2, map<string, Quantity>)
+    #[prost(btree_map = "string, message", tag = "2")]
+    max: std::collections::BTreeMap<String, Quantity>,
+    /// min (field 3, map<string, Quantity>)
+    #[prost(btree_map = "string, message", tag = "3")]
+    min: std::collections::BTreeMap<String, Quantity>,
+    /// default (field 4, map<string, Quantity>)
+    #[prost(btree_map = "string, message", tag = "4")]
+    default: std::collections::BTreeMap<String, Quantity>,
+    /// defaultRequest (field 5, map<string, Quantity>)
+    #[prost(btree_map = "string, message", tag = "5")]
+    default_request: std::collections::BTreeMap<String, Quantity>,
+    /// maxLimitRequestRatio (field 6, map<string, Quantity>)
+    #[prost(btree_map = "string, message", tag = "6")]
+    max_limit_request_ratio: std::collections::BTreeMap<String, Quantity>,
+}
+
+/// LimitRangeSpec — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct LimitRangeSpec {
+    /// limits (field 1, repeated LimitRangeItem)
+    #[prost(message, repeated, tag = "1")]
+    limits: Vec<LimitRangeItem>,
+}
+
 /// LimitRange — k8s.io/api/core/v1/generated.proto
 #[derive(Clone, PartialEq, Message)]
 struct LimitRange {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message LimitRangeSpec)
+    #[prost(message, optional, tag = "2")]
+    spec: Option<LimitRangeSpec>,
 }
 
 // --- k8s.io/api/policy/v1/generated.proto ---
@@ -2574,14 +2620,63 @@ pub fn decode_resourcequota_proto(data: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// Decode a proto-encoded LimitRange object into a `serde_json::Value`.
+///
+/// Decodes metadata and spec.limits (with type, max, min, default, defaultRequest).
+/// The spec is required by the LimitRange admission plugin to inject defaults into pods;
+/// without it, pods created after a LimitRange get no defaults applied.
 pub fn decode_limitrange_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = LimitRange::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "v1",
         "kind": "LimitRange",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = obj.spec {
+        let limits: Vec<serde_json::Value> = spec
+            .limits
+            .into_iter()
+            .map(|item| {
+                let mut obj = serde_json::json!({ "type": item.r#type });
+                if !item.max.is_empty() {
+                    obj["max"] = limitrange_quantity_map_to_json(item.max);
+                }
+                if !item.min.is_empty() {
+                    obj["min"] = limitrange_quantity_map_to_json(item.min);
+                }
+                if !item.default.is_empty() {
+                    obj["default"] = limitrange_quantity_map_to_json(item.default);
+                }
+                if !item.default_request.is_empty() {
+                    obj["defaultRequest"] = limitrange_quantity_map_to_json(item.default_request);
+                }
+                if !item.max_limit_request_ratio.is_empty() {
+                    obj["maxLimitRequestRatio"] =
+                        limitrange_quantity_map_to_json(item.max_limit_request_ratio);
+                }
+                obj
+            })
+            .collect();
+        result["spec"] = serde_json::json!({ "limits": limits });
+    }
+    Some(result)
+}
+
+/// Convert a map of resource name to Quantity into a serde_json::Value object.
+///
+/// Only quantities that have a non-empty string representation are included.
+/// Quantities with no string field (binary/decimal only) are skipped.
+fn limitrange_quantity_map_to_json(
+    map: std::collections::BTreeMap<String, Quantity>,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for (k, v) in map {
+        let s = v.string.unwrap_or_default();
+        if !s.is_empty() {
+            out.insert(k, serde_json::Value::String(s));
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Decode a proto-encoded PodDisruptionBudget object into a `serde_json::Value`.
@@ -5575,5 +5670,72 @@ mod tests {
         assert_eq!(result["apiVersion"], "policy/v1");
         assert_eq!(result["metadata"]["name"], "my-pdb");
         assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    /// decode_limitrange_proto must decode spec.limits so the admission plugin can apply defaults.
+    ///
+    /// Without spec decoding, a kubectl-created LimitRange (proto-encoded) has no limits in the
+    /// store. The admission plugin then finds no limits and injects no defaults into pods, causing
+    /// the conformance test "should create a LimitRange with defaults and ensure pod has those
+    /// defaults applied" to fail (the Go Expect assertion panics at runtime/panic.go:236).
+    #[test]
+    fn decode_limitrange_proto_extracts_spec_limits() {
+        // Build the proto bytes for:
+        //   LimitRange {
+        //     metadata: ObjectMeta { name: "limits", namespace: "default" },
+        //     spec: LimitRangeSpec {
+        //       limits: [LimitRangeItem {
+        //         type: "Container",
+        //         default: {"cpu": Quantity{string: "500m"}},
+        //         defaultRequest: {"cpu": Quantity{string: "100m"}},
+        //       }]
+        //     }
+        //   }
+        //
+        // Helper: encode a proto Quantity{string: s} message bytes (field 1 = string).
+        let encode_quantity = |s: &[u8]| -> Vec<u8> { encode_length_delimited(1, s) };
+
+        // Helper: encode a proto map entry message with key (field 1) and value (field 2).
+        let encode_map_entry = |key: &[u8], val_bytes: &[u8]| -> Vec<u8> {
+            let mut entry = encode_length_delimited(1, key);
+            entry.extend_from_slice(&encode_length_delimited(2, val_bytes));
+            entry
+        };
+
+        // Encode one LimitRangeItem.
+        let mut item_bytes = encode_length_delimited(1, b"Container"); // type = "Container"
+                                                                       // default["cpu"] = "500m"  (field 4 in LimitRangeItem)
+        let cpu_default = encode_map_entry(b"cpu", &encode_quantity(b"500m"));
+        item_bytes.extend_from_slice(&encode_length_delimited(4, &cpu_default));
+        // defaultRequest["cpu"] = "100m"  (field 5 in LimitRangeItem)
+        let cpu_req = encode_map_entry(b"cpu", &encode_quantity(b"100m"));
+        item_bytes.extend_from_slice(&encode_length_delimited(5, &cpu_req));
+
+        // Encode LimitRangeSpec { limits: [item] }  (field 1 = repeated LimitRangeItem)
+        let spec_bytes = encode_length_delimited(1, &item_bytes);
+
+        // Encode LimitRange { metadata, spec }
+        let mut meta_bytes = encode_length_delimited(1, b"limits");
+        meta_bytes.extend_from_slice(&encode_length_delimited(3, b"default"));
+        let mut proto = encode_length_delimited(1, &meta_bytes); // field 1 = metadata
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes)); // field 2 = spec
+
+        let result = decode_core_proto_by_kind("LimitRange", &proto)
+            .expect("LimitRange with spec must decode successfully");
+
+        assert_eq!(result["kind"], "LimitRange");
+        assert_eq!(result["metadata"]["name"], "limits");
+        assert_eq!(
+            result["spec"]["limits"][0]["type"], "Container",
+            "spec.limits[0].type must be decoded — without this the admission plugin              skips the LimitRangeItem and injects no defaults into pods"
+        );
+        assert_eq!(
+            result["spec"]["limits"][0]["default"]["cpu"], "500m",
+            "spec.limits[0].default.cpu must be decoded — this is the default that              the admission plugin injects into pod containers with no cpu limit set"
+        );
+        assert_eq!(
+            result["spec"]["limits"][0]["defaultRequest"]["cpu"], "100m",
+            "spec.limits[0].defaultRequest.cpu must be decoded"
+        );
     }
 }

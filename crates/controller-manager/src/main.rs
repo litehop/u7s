@@ -16,8 +16,9 @@ use tracing::{error, info, warn};
 use u7s_client_util::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use u7s_controller_manager::{
     build_sa_token_secret, cluster_role_patch_path, cluster_roles_watch_path,
-    compute_aggregated_rules, namespace_controller, parse_cluster_role_event, parse_sa_added_event,
-    secrets_path, token_request_path, ClusterRoleSnapshot,
+    compute_aggregated_rules, endpoint_slice_controller, endpoint_slice_mirroring_controller,
+    namespace_controller, parse_cluster_role_event, parse_sa_added_event, secrets_path,
+    token_request_path, ClusterRoleSnapshot,
 };
 
 // ---------------------------------------------------------------------------
@@ -110,6 +111,389 @@ async fn http_patch_json(
     client
         .request(Method::PATCH, path, Some(serde_json::to_string(payload)?))
         .await
+}
+
+// ---------------------------------------------------------------------------
+// EndpointSlice controller (selector-based)
+// ---------------------------------------------------------------------------
+
+/// Reconcile EndpointSlices for all Services in a namespace by listing pods
+/// and checking which match each Service's selector.
+async fn reconcile_endpoint_slices_for_namespace(
+    client: &HyperApiClient,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    // List all services in the namespace.
+    let svc_path = endpoint_slice_controller::services_list_path(namespace);
+    let (status, body) = client
+        .request(Method::GET, &svc_path, None)
+        .await
+        .with_context(|| format!("list services in {namespace}"))?;
+    if !status.is_success() {
+        return Ok(()); // namespace may not exist yet
+    }
+    let svc_list: Value = serde_json::from_str(&body)
+        .with_context(|| format!("parse service list in {namespace}"))?;
+    let services: Vec<Value> = svc_list["items"].as_array().cloned().unwrap_or_default();
+
+    // List all pods in the namespace.
+    let pod_path = endpoint_slice_controller::pods_list_path(namespace);
+    let (pod_status, pod_body) = client
+        .request(Method::GET, &pod_path, None)
+        .await
+        .with_context(|| format!("list pods in {namespace}"))?;
+    let pods: Vec<endpoint_slice_controller::PodObject> = if pod_status.is_success() {
+        let pod_list: Value = serde_json::from_str(&pod_body)
+            .with_context(|| format!("parse pod list in {namespace}"))?;
+        pod_list["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(endpoint_slice_controller::parse_pod)
+            .collect()
+    } else {
+        vec![]
+    };
+
+    for svc_obj in &services {
+        let Some(svc) = endpoint_slice_controller::parse_service(svc_obj) else {
+            continue;
+        };
+
+        // Skip Services with no selector (those use EndpointSlice mirroring).
+        let selector = match &svc.selector {
+            Some(sel) if !sel.is_empty() => sel.clone(),
+            _ => {
+                // Create an empty EndpointSlice for no-selector Services so tests can observe it.
+                upsert_endpoint_slice(client, &svc.name, &svc.namespace, &svc.ports, &[]).await;
+                continue;
+            }
+        };
+
+        // Find matching pods and extract endpoints.
+        let endpoints: Vec<endpoint_slice_controller::PodEndpoint> = pods
+            .iter()
+            .filter(|pod| {
+                endpoint_slice_controller::pod_matches_selector(&pod.metadata.labels, &selector)
+            })
+            .filter_map(endpoint_slice_controller::extract_pod_endpoint)
+            .collect();
+
+        upsert_endpoint_slice(client, &svc.name, &svc.namespace, &svc.ports, &endpoints).await;
+    }
+    Ok(())
+}
+
+/// Create or replace the EndpointSlice for a single Service.
+async fn upsert_endpoint_slice(
+    client: &HyperApiClient,
+    service_name: &str,
+    namespace: &str,
+    ports: &[endpoint_slice_controller::ServicePort],
+    endpoints: &[endpoint_slice_controller::PodEndpoint],
+) {
+    let slice =
+        endpoint_slice_controller::build_endpoint_slice(service_name, namespace, ports, endpoints);
+    let slice_name = endpoint_slice_controller::endpoint_slice_name(service_name);
+    let slice_path = endpoint_slice_controller::endpoint_slice_path(namespace, &slice_name);
+    let post_path = endpoint_slice_controller::endpoint_slices_post_path(namespace);
+
+    let body_str = serde_json::to_string(&slice).expect("slice serializes");
+
+    // Try PUT first (update). If 404, POST (create).
+    match client
+        .request(Method::PUT, &slice_path, Some(body_str.clone()))
+        .await
+    {
+        Ok((status, _)) if status.is_success() => {
+            info!("updated EndpointSlice {namespace}/{slice_name} for service {service_name}");
+        }
+        Ok((status, _)) if status.as_u16() == 404 || status.as_u16() == 405 => {
+            // Slice doesn't exist yet — create it.
+            match client
+                .request(Method::POST, &post_path, Some(body_str))
+                .await
+            {
+                Ok((post_status, _)) if post_status.is_success() || post_status.as_u16() == 409 => {
+                    info!(
+                        "created EndpointSlice {namespace}/{slice_name} for service {service_name}"
+                    );
+                }
+                Ok((post_status, post_body)) => {
+                    warn!(
+                        "POST EndpointSlice {namespace}/{slice_name} failed ({post_status}): {post_body}"
+                    );
+                }
+                Err(e) => {
+                    error!("POST EndpointSlice {namespace}/{slice_name}: {e}");
+                }
+            }
+        }
+        Ok((status, body)) => {
+            warn!("PUT EndpointSlice {namespace}/{slice_name} failed ({status}): {body}");
+        }
+        Err(e) => {
+            error!("PUT EndpointSlice {namespace}/{slice_name}: {e}");
+        }
+    }
+}
+
+/// Watch Services across all namespaces and reconcile EndpointSlices.
+/// Also watches Pods and re-reconciles when pods change.
+async fn run_endpoint_slice_controller(
+    server: String,
+    connector: tokio_rustls::TlsConnector,
+    bearer_token: Option<String>,
+) {
+    // Shared set of known namespaces to reconcile when pods change.
+    // We collect namespaces from Service events.
+    let known_namespaces: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+
+    // Spawn a pod watcher that triggers re-reconcile of affected namespace.
+    {
+        let server_p = server.clone();
+        let connector_p = connector.clone();
+        let bearer_p = bearer_token.clone();
+        let ns_map = std::sync::Arc::clone(&known_namespaces);
+        tokio::spawn(async move {
+            loop {
+                info!("EndpointSlice controller: starting pod watch");
+                let client = HyperApiClient {
+                    server: server_p.clone(),
+                    connector: connector_p.clone(),
+                    bearer: bearer_p.clone(),
+                };
+                let result = client
+                    .watch_stream(endpoint_slice_controller::pods_watch_path(), |event| {
+                        let event_type = event["type"].as_str().unwrap_or("").to_owned();
+                        if !matches!(event_type.as_str(), "ADDED" | "MODIFIED" | "DELETED") {
+                            return;
+                        }
+                        let namespace = event["object"]["metadata"]["namespace"]
+                            .as_str()
+                            .unwrap_or("default")
+                            .to_owned();
+                        let ns_map_clone = std::sync::Arc::clone(&ns_map);
+                        let server_clone = server_p.clone();
+                        let connector_clone = connector_p.clone();
+                        let bearer_clone = bearer_p.clone();
+                        tokio::spawn(async move {
+                            // Only reconcile if we know about this namespace.
+                            let known = ns_map_clone.lock().await.contains(&namespace);
+                            if known {
+                                let client = HyperApiClient {
+                                    server: server_clone,
+                                    connector: connector_clone,
+                                    bearer: bearer_clone,
+                                };
+                                if let Err(e) =
+                                    reconcile_endpoint_slices_for_namespace(&client, &namespace)
+                                        .await
+                                {
+                                    error!("reconcile namespace {namespace} on pod event: {e}");
+                                }
+                            }
+                        });
+                    })
+                    .await;
+                if let Err(e) = result {
+                    error!("EndpointSlice pod watch error: {e} — reconnecting in 5s");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+
+    // Main loop: watch Services and reconcile on every change.
+    loop {
+        info!("EndpointSlice controller: starting service watch");
+        let client = HyperApiClient {
+            server: server.clone(),
+            connector: connector.clone(),
+            bearer: bearer_token.clone(),
+        };
+        let ns_map = std::sync::Arc::clone(&known_namespaces);
+        let result = client
+            .watch_stream(endpoint_slice_controller::services_watch_path(), |event| {
+                let event_type = event["type"].as_str().unwrap_or("").to_owned();
+                if !matches!(event_type.as_str(), "ADDED" | "MODIFIED" | "DELETED") {
+                    return;
+                }
+                let namespace = event["object"]["metadata"]["namespace"]
+                    .as_str()
+                    .unwrap_or("default")
+                    .to_owned();
+
+                let ns_map_clone = std::sync::Arc::clone(&ns_map);
+                let server_clone = server.clone();
+                let connector_clone = connector.clone();
+                let bearer_clone = bearer_token.clone();
+                tokio::spawn(async move {
+                    // Track this namespace for pod-triggered reconcile.
+                    ns_map_clone.lock().await.insert(namespace.clone());
+
+                    let client = HyperApiClient {
+                        server: server_clone,
+                        connector: connector_clone,
+                        bearer: bearer_clone,
+                    };
+                    if let Err(e) =
+                        reconcile_endpoint_slices_for_namespace(&client, &namespace).await
+                    {
+                        error!("reconcile namespace {namespace} on service event: {e}");
+                    }
+                });
+            })
+            .await;
+        if let Err(e) = result {
+            error!("EndpointSlice service watch error: {e} — reconnecting in 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EndpointSliceMirroring controller
+// ---------------------------------------------------------------------------
+
+/// Watch all Endpoints objects and mirror them to EndpointSlices.
+async fn run_endpoint_slice_mirroring_controller(
+    server: String,
+    connector: tokio_rustls::TlsConnector,
+    bearer_token: Option<String>,
+) {
+    loop {
+        info!("EndpointSliceMirroring controller: starting endpoints watch");
+        let client = HyperApiClient {
+            server: server.clone(),
+            connector: connector.clone(),
+            bearer: bearer_token.clone(),
+        };
+
+        let result = client
+            .watch_stream(
+                endpoint_slice_mirroring_controller::endpoints_watch_path(),
+                |event| {
+                    let action = endpoint_slice_mirroring_controller::parse_endpoints_event(&event);
+
+                    let server_clone = server.clone();
+                    let connector_clone = connector.clone();
+                    let bearer_clone = bearer_token.clone();
+
+                    tokio::spawn(async move {
+                        let client = HyperApiClient {
+                            server: server_clone,
+                            connector: connector_clone,
+                            bearer: bearer_clone,
+                        };
+                        match action {
+                            endpoint_slice_mirroring_controller::EndpointsAction::Upsert {
+                                name,
+                                namespace,
+                                subsets,
+                            } => {
+                                upsert_mirrored_endpoint_slice(
+                                    &client, &name, &namespace, &subsets,
+                                )
+                                .await;
+                            }
+                            endpoint_slice_mirroring_controller::EndpointsAction::Delete {
+                                name,
+                                namespace,
+                            } => {
+                                delete_mirrored_endpoint_slice(&client, &name, &namespace).await;
+                            }
+                            endpoint_slice_mirroring_controller::EndpointsAction::None => {}
+                        }
+                    });
+                },
+            )
+            .await;
+
+        if let Err(e) = result {
+            error!("EndpointSliceMirroring watch error: {e} — reconnecting in 5s");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Create or replace a mirrored EndpointSlice for an Endpoints object.
+async fn upsert_mirrored_endpoint_slice(
+    client: &HyperApiClient,
+    endpoints_name: &str,
+    namespace: &str,
+    subsets: &[endpoint_slice_mirroring_controller::MirroredSubset],
+) {
+    let slice = endpoint_slice_mirroring_controller::build_mirrored_endpoint_slice(
+        endpoints_name,
+        namespace,
+        subsets,
+    );
+    let slice_path =
+        endpoint_slice_mirroring_controller::mirror_slice_path(namespace, endpoints_name);
+    let post_path = endpoint_slice_mirroring_controller::mirror_slice_post_path(namespace);
+
+    let body_str = serde_json::to_string(&slice).expect("slice serializes");
+
+    match client
+        .request(Method::PUT, &slice_path, Some(body_str.clone()))
+        .await
+    {
+        Ok((status, _)) if status.is_success() => {
+            info!("updated mirrored EndpointSlice for {namespace}/{endpoints_name}");
+        }
+        Ok((status, _)) if status.as_u16() == 404 || status.as_u16() == 405 => {
+            match client
+                .request(Method::POST, &post_path, Some(body_str))
+                .await
+            {
+                Ok((post_status, _)) if post_status.is_success() || post_status.as_u16() == 409 => {
+                    info!("created mirrored EndpointSlice for {namespace}/{endpoints_name}");
+                }
+                Ok((post_status, post_body)) => {
+                    warn!("POST mirrored EndpointSlice {namespace}/{endpoints_name} failed ({post_status}): {post_body}");
+                }
+                Err(e) => {
+                    error!("POST mirrored EndpointSlice {namespace}/{endpoints_name}: {e}");
+                }
+            }
+        }
+        Ok((status, body)) => {
+            warn!(
+                "PUT mirrored EndpointSlice {namespace}/{endpoints_name} failed ({status}): {body}"
+            );
+        }
+        Err(e) => {
+            error!("PUT mirrored EndpointSlice {namespace}/{endpoints_name}: {e}");
+        }
+    }
+}
+
+/// Delete the mirrored EndpointSlice for a deleted Endpoints object.
+async fn delete_mirrored_endpoint_slice(
+    client: &HyperApiClient,
+    endpoints_name: &str,
+    namespace: &str,
+) {
+    let slice_path =
+        endpoint_slice_mirroring_controller::mirror_slice_path(namespace, endpoints_name);
+    match client.request(Method::DELETE, &slice_path, None).await {
+        Ok((status, _)) if status.is_success() || status.as_u16() == 404 => {
+            info!("deleted mirrored EndpointSlice for {namespace}/{endpoints_name}");
+        }
+        Ok((status, body)) => {
+            warn!(
+                "DELETE mirrored EndpointSlice {namespace}/{endpoints_name} failed ({status}): {body}"
+            );
+        }
+        Err(e) => {
+            error!("DELETE mirrored EndpointSlice {namespace}/{endpoints_name}: {e}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +629,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn the ClusterRole aggregation controller as a background task.
     tokio::spawn(run_clusterrole_aggregation_controller(
+        server.clone(),
+        connector.clone(),
+        bearer_token.clone(),
+    ));
+
+    // Spawn the EndpointSlice controller (selector-based).
+    tokio::spawn(run_endpoint_slice_controller(
+        server.clone(),
+        connector.clone(),
+        bearer_token.clone(),
+    ));
+
+    // Spawn the EndpointSliceMirroring controller.
+    tokio::spawn(run_endpoint_slice_mirroring_controller(
         server.clone(),
         connector.clone(),
         bearer_token.clone(),

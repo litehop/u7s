@@ -333,6 +333,13 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::pods::replace_pod_status)
                 .patch(handlers::pods::patch_pod_status),
         )
+        // Pods — resize subresource (in-place resource update, GA k8s 1.33+)
+        // Must be before the generic catch-all so axum doesn't interpret "resize" as a pod name.
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/resize",
+            axum::routing::patch(handlers::pods::patch_pod_resize)
+                .put(handlers::pods::patch_pod_resize),
+        )
         // Pods — log subresource (kubelet proxy): must be before generic catch-all
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/log",
@@ -1711,6 +1718,7 @@ mod tests {
                 "default".to_string(),
                 "jobs".to_string(),
             )),
+            axum::extract::Query(handlers::json_patch::CreateQuery::default()),
             headers,
             body_bytes,
         )
@@ -1828,6 +1836,7 @@ mod tests {
                 "v1".to_string(),
                 "storageclasses".to_string(),
             )),
+            axum::extract::Query(handlers::json_patch::CreateQuery::default()),
             axum::Extension(auth::UserInfo {
                 username: "admin".into(),
                 uid: "".into(),
@@ -1891,6 +1900,7 @@ mod tests {
                 "default".to_string(),
                 "gateways".to_string(),
             )),
+            axum::extract::Query(handlers::json_patch::CreateQuery::default()),
             headers,
             body_bytes,
         )
@@ -1984,6 +1994,7 @@ mod tests {
                 "v1".to_string(),
                 "csinodes".to_string(),
             )),
+            axum::extract::Query(handlers::json_patch::CreateQuery::default()),
             axum::Extension(auth::UserInfo {
                 username: "system:node:ci-node".into(),
                 uid: "".into(),
