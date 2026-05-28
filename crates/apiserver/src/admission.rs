@@ -585,6 +585,24 @@ async fn invoke_mutating_webhook<S: Store>(
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Returns true if the resource being admitted is in the `admissionregistration.k8s.io` group.
+///
+/// All resources in `admissionregistration.k8s.io` must be exempt from the admission
+/// pipeline to prevent bootstrap deadlocks:
+///
+/// - MutatingWebhookConfiguration / ValidatingWebhookConfiguration: if creating one of
+///   these triggered the admission webhooks, the newly-registered webhook would call itself
+///   (or call an endpoint that doesn't exist yet), causing a deadlock or error.
+/// - ValidatingAdmissionPolicy / MutatingAdmissionPolicy and their bindings: these are
+///   the CEL-based policy objects; exempting them prevents the same class of bootstrap
+///   problems and matches Kubernetes upstream behavior.
+///
+/// This matches Kubernetes upstream behavior: the entire `admissionregistration.k8s.io`
+/// group bypasses the webhook admission chain.
+fn is_webhook_configuration_resource(ctx: &AdmissionContext<'_>) -> bool {
+    ctx.group == "admissionregistration.k8s.io"
+}
+
 /// Run the mutating admission webhook chain.
 ///
 /// Fetches all MutatingWebhookConfiguration objects from the store, filters by
@@ -598,6 +616,12 @@ pub async fn run_mutating_webhooks<S: Store>(
     mut object: serde_json::Value,
     ctx: &AdmissionContext<'_>,
 ) -> Result<serde_json::Value, StatusError> {
+    // Skip the webhook pipeline for webhook configuration resources themselves
+    // to prevent a bootstrap deadlock (see is_webhook_configuration_resource).
+    if is_webhook_configuration_resource(ctx) {
+        return Ok(object);
+    }
+
     let configs = fetch_mutating_configs(state).await;
     if configs.is_empty() {
         return Ok(object);
@@ -647,6 +671,12 @@ pub async fn run_validating_webhooks<S: Store>(
     object: &serde_json::Value,
     ctx: &AdmissionContext<'_>,
 ) -> Result<(), StatusError> {
+    // Skip the webhook pipeline for webhook configuration resources themselves
+    // to prevent a bootstrap deadlock (see is_webhook_configuration_resource).
+    if is_webhook_configuration_resource(ctx) {
+        return Ok(());
+    }
+
     let configs = fetch_validating_configs(state).await;
     if configs.is_empty() {
         return Ok(());
@@ -785,6 +815,140 @@ mod tests {
             "resources": [resource],
             "operations": [operation]
         })
+    }
+
+    // -- bootstrap deadlock prevention tests --
+
+    /// Creating a MutatingWebhookConfiguration must bypass the admission pipeline entirely.
+    ///
+    /// If the admission webhooks were invoked when a MutatingWebhookConfiguration is
+    /// being created, the newly-registered webhook would immediately call itself
+    /// (or call an endpoint that doesn't exist yet), causing a deadlock or error.
+    /// Kubernetes resolves this by making webhook configuration resources exempt from
+    /// the admission pipeline.
+    #[tokio::test]
+    async fn run_mutating_webhooks_skips_for_webhook_configuration_resources() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a wildcard MutatingWebhookConfiguration with failurePolicy=Fail and unreachable URL.
+        // If the pipeline is NOT skipped for webhook configuration resources, this webhook
+        // would be invoked when another MutatingWebhookConfiguration is created, causing
+        // a connection error and failing the test.
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "wildcard-mwc"},
+            "webhooks": [{
+                "name": "deadlock.webhook.example.com",
+                "clientConfig": {
+                    "url": "http://127.0.0.1:1"  // unreachable — would cause Fail if invoked
+                },
+                "rules": [{
+                    "apiGroups": ["*"],
+                    "apiVersions": ["*"],
+                    "resources": ["*"],
+                    "operations": ["*"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/wildcard-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let new_mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "new-mwc"}
+        });
+        // Simulate create of another MutatingWebhookConfiguration.
+        let ctx = AdmissionContext {
+            group: "admissionregistration.k8s.io",
+            version: "v1",
+            resource: "mutatingwebhookconfigurations",
+            name: "new-mwc",
+            namespace: None,
+            operation: "CREATE",
+        };
+        // Must succeed without invoking any webhook (skipped by deadlock prevention).
+        let result = run_mutating_webhooks(&state, new_mwc.clone(), &ctx).await;
+        assert!(
+            result.is_ok(),
+            "MutatingWebhookConfiguration create must bypass admission pipeline to prevent deadlock"
+        );
+        assert_eq!(
+            result.unwrap_or_else(|_| panic!("must succeed")),
+            new_mwc,
+            "object must be returned unchanged when pipeline is bypassed"
+        );
+    }
+
+    /// Creating a ValidatingWebhookConfiguration must bypass the admission pipeline entirely.
+    ///
+    /// Same reasoning as the mutating variant: webhook configuration resources are exempt
+    /// from the admission pipeline to prevent deadlocks and bootstrap issues.
+    #[tokio::test]
+    async fn run_validating_webhooks_skips_for_webhook_configuration_resources() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Wildcard ValidatingWebhookConfiguration with unreachable URL and Fail policy.
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "wildcard-vwc"},
+            "webhooks": [{
+                "name": "deadlock.validating.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["*"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/wildcard-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let new_vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "new-vwc"}
+        });
+        let ctx = AdmissionContext {
+            group: "admissionregistration.k8s.io",
+            version: "v1",
+            resource: "validatingwebhookconfigurations",
+            name: "new-vwc",
+            namespace: None,
+            operation: "CREATE",
+        };
+        let result = run_validating_webhooks(&state, &new_vwc, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "ValidatingWebhookConfiguration create must bypass admission pipeline to prevent deadlock"
+        );
     }
 
     // -- matches_rule tests --
@@ -2151,6 +2315,126 @@ mod tests {
         assert!(
             result.is_err(),
             "service not found with failurePolicy=Fail must return an error"
+        );
+    }
+
+    // -- end-to-end: register MutatingWebhookConfiguration, create resource, verify mutation --
+
+    /// Register a MutatingWebhookConfiguration pointing to a live mock HTTP handler,
+    /// call run_mutating_webhooks for a ConfigMap, and verify the webhook was called
+    /// and the mutation (label injection) was applied to the object.
+    ///
+    /// This is the core correctness test for the webhook invocation pipeline:
+    /// if run_mutating_webhooks fails to POST to the webhook or fails to apply the patch,
+    /// controllers that rely on sidecar injection or label defaulting will see stale objects.
+    #[tokio::test]
+    async fn mutating_webhook_called_and_mutation_applied_for_configmap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // Counter to verify the webhook was actually called.
+        let call_count = StdArc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // Webhook that injects a label "managed-by=webhook" into ConfigMaps.
+        let router = Router::new().route(
+            "/mutate",
+            post(move || {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let patch = serde_json::json!([
+                        {"op": "add", "path": "/metadata/labels", "value": {"managed-by": "webhook"}}
+                    ]);
+                    let patch_b64 = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        serde_json::to_string(&patch).unwrap(),
+                    );
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {
+                            "uid": "configmap-uid",
+                            "allowed": true,
+                            "patch": patch_b64,
+                            "patchType": "JSONPatch"
+                        }
+                    }))
+                }
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_webhook_server(router).await;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Register the MutatingWebhookConfiguration targeting core/v1/configmaps.
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "configmap-labeler"},
+            "webhooks": [{
+                "name": "configmap.labeler.example.com",
+                "clientConfig": { "url": format!("{base_url}/mutate") },
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/configmap-labeler",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let configmap = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "my-config", "namespace": "default"}
+        });
+
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "my-config",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+
+        let result = run_mutating_webhooks(&state, configmap, &ctx).await;
+
+        assert!(
+            result.is_ok(),
+            "mutating webhook pipeline must succeed for ConfigMap create"
+        );
+
+        let count = call_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 1,
+            "webhook must be called exactly once for ConfigMap create; \
+             not calling it means mutations (sidecar injection, label defaults) are skipped"
+        );
+
+        let mutated = result.unwrap_or_else(|_| panic!("must succeed"));
+        assert_eq!(
+            mutated["metadata"]["labels"]["managed-by"], "webhook",
+            "webhook must have injected the 'managed-by=webhook' label into the ConfigMap; \
+             missing label means the patch was not applied correctly"
         );
     }
 }
