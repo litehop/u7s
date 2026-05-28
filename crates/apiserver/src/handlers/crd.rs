@@ -315,6 +315,25 @@ pub async fn create_crd<S: Store>(
             .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
     }
 
+    // Stamp status.conditions so controllers and conformance tests see the CRD
+    // as ready immediately after creation (no separate status update loop).
+    crd.status = Some(serde_json::json!({
+        "conditions": [
+            {
+                "type": "Established",
+                "status": "True",
+                "reason": "InitialNamesAccepted",
+                "message": "the initial names have been accepted"
+            },
+            {
+                "type": "NamesAccepted",
+                "status": "True",
+                "reason": "NoConflicts",
+                "message": "no conflicts found"
+            }
+        ]
+    }));
+
     let key = store_key(&name);
     let rv = state
         .store

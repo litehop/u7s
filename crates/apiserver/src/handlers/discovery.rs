@@ -852,13 +852,53 @@ fn scheduling_v1_resources() -> serde_json::Value {
 // OpenAPI stub endpoints
 // ---------------------------------------------------------------------------
 
-/// Minimal Swagger 2.0 stub — stops 404s for clients like Argo CD that call
-/// /openapi/v2 on startup. No field schemas are defined yet.
-pub async fn openapi_v2() -> Json<serde_json::Value> {
+/// Swagger 2.0 document with synthesized definitions for installed CRDs.
+/// Polls the store at request time so that newly-created CRDs appear without
+/// a restart — required by the CustomResourcePublishOpenAPI conformance test.
+pub async fn openapi_v2<S: Store>(State(state): State<AppState<S>>) -> Json<serde_json::Value> {
+    let mut definitions = serde_json::Map::new();
+
+    if let Ok(resp) = state
+        .store
+        .list(
+            "/registry/apiextensions.k8s.io/customresourcedefinitions/",
+            ListOptions::default(),
+        )
+        .await
+    {
+        for obj in &resp.items {
+            let Ok(crd) = serde_json::from_slice::<CustomResourceDefinition>(&obj.value) else {
+                continue;
+            };
+            let group = &crd.spec.group;
+            let kind = &crd.spec.names.kind;
+            // Reverse the domain segments: "example.io" → "io.example"
+            let reversed: String = group.split('.').rev().collect::<Vec<_>>().join(".");
+            for ver in &crd.spec.versions {
+                // Key format: io.example.v1.Foo
+                let key = format!("{}.{}.{}", reversed, ver.name, kind);
+                definitions.insert(
+                    key,
+                    serde_json::json!({
+                        "type": "object",
+                        "x-kubernetes-group-version-kind": [
+                            {
+                                "group": group,
+                                "version": ver.name,
+                                "kind": kind
+                            }
+                        ]
+                    }),
+                );
+            }
+        }
+    }
+
     Json(serde_json::json!({
         "swagger": "2.0",
         "info": {"title": "u7s", "version": "v1"},
-        "paths": {}
+        "paths": {},
+        "definitions": definitions
     }))
 }
 
@@ -1516,7 +1556,8 @@ mod tests {
     // on startup and hard-fail if the endpoint is missing or returns malformed JSON.
     #[tokio::test]
     async fn openapi_v2_returns_swagger_2_0() {
-        let Json(val) = openapi_v2().await;
+        let state = make_state();
+        let Json(val) = openapi_v2(State(state)).await;
         assert_eq!(
             val.get("swagger").and_then(|v| v.as_str()),
             Some("2.0"),
@@ -1544,7 +1585,10 @@ mod tests {
     // a route being removed from the router.
     #[tokio::test]
     async fn openapi_v2_route_returns_200_with_swagger_field() {
-        let app = Router::new().route("/openapi/v2", get(openapi_v2));
+        let state = make_state();
+        let app = Router::new()
+            .route("/openapi/v2", get(openapi_v2))
+            .with_state(state);
 
         let req = Request::builder()
             .method("GET")
@@ -1976,6 +2020,93 @@ mod tests {
             StatusCode::NOT_FOUND,
             "GET /apis/flowcontrol.apiserver.k8s.io/v1 must return 404 — \
              the group is not served and must not be reachable"
+        );
+    }
+
+    // After creating a CRD, GET /openapi/v2 must include a definition entry with the
+    // reversed-domain key for that CRD's kind. CustomResourcePublishOpenAPI conformance
+    // test polls /openapi/v2 waiting for this entry to appear; if openapi_v2 is static
+    // (no store lookup) the test times out after 60 s.
+    #[tokio::test]
+    async fn openapi_v2_contains_crd_definition_after_crd_create() {
+        let state = make_state();
+
+        let body = crd_bytes("example.io", "foos", "foo", "Foo", "Namespaced", "v1");
+        assert!(
+            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create_crd must succeed"
+        );
+
+        let Json(doc) = openapi_v2(State(state)).await;
+        let defs = doc["definitions"]
+            .as_object()
+            .expect("definitions must be a JSON object");
+
+        // Reversed-domain key: example.io/v1/Foo → io.example.v1.Foo
+        let expected_key = "io.example.v1.Foo";
+        assert!(
+            defs.contains_key(expected_key),
+            "definitions must contain '{expected_key}' after CRD create — \
+             CustomResourcePublishOpenAPI conformance test polls /openapi/v2 for this key; \
+             got keys: {:?}",
+            defs.keys().collect::<Vec<_>>()
+        );
+
+        let gvk = &defs[expected_key]["x-kubernetes-group-version-kind"][0];
+        assert_eq!(gvk["group"], "example.io");
+        assert_eq!(gvk["version"], "v1");
+        assert_eq!(gvk["kind"], "Foo");
+    }
+
+    // create_crd must stamp status.conditions Established=True and NamesAccepted=True
+    // so that controllers (e.g. kube-controller-manager CRD controller) do not wait
+    // for a separate status update that never comes in u7s's single-process model.
+    #[tokio::test]
+    async fn create_crd_stamps_established_and_names_accepted_conditions() {
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        let body = crd_bytes("example.io", "bars", "bar", "Bar", "Cluster", "v1alpha1");
+        assert!(
+            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
+                .await
+                .is_ok(),
+            "create_crd must succeed"
+        );
+
+        // Read back the stored CRD and verify status.conditions.
+        let stored = state
+            .store
+            .get("/registry/apiextensions.k8s.io/customresourcedefinitions/bars.example.io")
+            .await
+            .expect("store get must not fail")
+            .expect("stored CRD must exist");
+        let val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored CRD must be valid JSON");
+
+        let conditions = val["status"]["conditions"]
+            .as_array()
+            .expect("status.conditions must be present after create_crd");
+
+        let established = conditions
+            .iter()
+            .find(|c| c["type"] == "Established")
+            .expect("Established condition must be present — controllers wait for it");
+        assert_eq!(
+            established["status"], "True",
+            "Established condition must be True so controllers see the CRD as ready"
+        );
+
+        let accepted = conditions
+            .iter()
+            .find(|c| c["type"] == "NamesAccepted")
+            .expect("NamesAccepted condition must be present — controllers wait for it");
+        assert_eq!(
+            accepted["status"], "True",
+            "NamesAccepted condition must be True so controllers see the CRD as ready"
         );
     }
 }
