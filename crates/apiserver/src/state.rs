@@ -570,6 +570,10 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rk("apps", "v1", "statefulsets"),
         rm("StatefulSet", true, true),
     );
+    m.insert(
+        rk("apps", "v1", "controllerrevisions"),
+        rm("ControllerRevision", true, false),
+    );
 
     // batch/v1
     m.insert(rk("batch", "v1", "jobs"), rm("Job", true, true));
@@ -636,6 +640,14 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rk("networking.k8s.io", "v1", "ingressclasses"),
         rm("IngressClass", false, false),
     );
+    m.insert(
+        rk("networking.k8s.io", "v1", "ipaddresses"),
+        rm("IPAddress", false, false),
+    );
+    m.insert(
+        rk("networking.k8s.io", "v1", "servicecidrs"),
+        rm("ServiceCIDR", false, true),
+    );
 
     // admissionregistration.k8s.io/v1
     m.insert(
@@ -653,6 +665,38 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
             "mutatingwebhookconfigurations",
         ),
         rm("MutatingWebhookConfiguration", false, false),
+    );
+    m.insert(
+        rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "mutatingadmissionpolicies",
+        ),
+        rm("MutatingAdmissionPolicy", false, false),
+    );
+    m.insert(
+        rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "mutatingadmissionpolicybindings",
+        ),
+        rm("MutatingAdmissionPolicyBinding", false, false),
+    );
+    m.insert(
+        rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "validatingadmissionpolicies",
+        ),
+        rm("ValidatingAdmissionPolicy", false, true),
+    );
+    m.insert(
+        rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "validatingadmissionpolicybindings",
+        ),
+        rm("ValidatingAdmissionPolicyBinding", false, true),
     );
 
     // coordination.k8s.io/v1
@@ -690,6 +734,16 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
     m.insert(
         rk("storage.k8s.io", "v1", "volumeattachments"),
         rm("VolumeAttachment", false, true),
+    );
+    m.insert(
+        rk("storage.k8s.io", "v1", "volumeattributesclasses"),
+        rm("VolumeAttributesClass", false, false),
+    );
+
+    // scheduling.k8s.io/v1 — cluster-scoped
+    m.insert(
+        rk("scheduling.k8s.io", "v1", "priorityclasses"),
+        rm("PriorityClass", false, false),
     );
 
     // node.k8s.io/v1 — cluster-scoped
@@ -1217,5 +1271,141 @@ mod tests {
             result.is_none(),
             "allocation must return None when no CIDR is configured"
         );
+    }
+
+    /// ControllerRevision must be registered as namespaced in apps/v1.
+    /// DaemonSet and StatefulSet controllers write ControllerRevisions to track rollout
+    /// history. Without this entry, POST to /apis/apps/v1/namespaces/{ns}/controllerrevisions
+    /// returns 404, breaking rollback and update history.
+    #[test]
+    fn controllerrevisions_registered_as_namespaced_in_apps_v1() {
+        let registry = build_registry();
+        let key = rk("apps", "v1", "controllerrevisions");
+        let meta = registry
+            .get(&key)
+            .expect("controllerrevisions must be in build_registry");
+        assert!(meta.namespaced, "ControllerRevision is namespaced");
+        assert!(
+            !meta.has_status_subresource,
+            "ControllerRevision has no status subresource"
+        );
+        assert_eq!(meta.kind, "ControllerRevision");
+    }
+
+    /// PriorityClass must be registered as cluster-scoped in scheduling.k8s.io/v1.
+    /// kube-scheduler probes this resource at startup; 404 causes a tight error loop.
+    #[test]
+    fn priorityclasses_registered_as_cluster_scoped() {
+        let registry = build_registry();
+        let key = rk("scheduling.k8s.io", "v1", "priorityclasses");
+        let meta = registry
+            .get(&key)
+            .expect("priorityclasses must be in build_registry");
+        assert!(!meta.namespaced, "PriorityClass is cluster-scoped");
+        assert_eq!(meta.kind, "PriorityClass");
+    }
+
+    /// IPAddress must be registered as cluster-scoped in networking.k8s.io/v1.
+    /// KCM's service IP controller watches this resource; 404 causes a continuous informer
+    /// retry loop.
+    #[test]
+    fn ipaddresses_registered_as_cluster_scoped() {
+        let registry = build_registry();
+        let key = rk("networking.k8s.io", "v1", "ipaddresses");
+        let meta = registry
+            .get(&key)
+            .expect("ipaddresses must be in build_registry");
+        assert!(!meta.namespaced, "IPAddress is cluster-scoped");
+        assert_eq!(meta.kind, "IPAddress");
+    }
+
+    /// ServiceCIDR must be registered as cluster-scoped in networking.k8s.io/v1.
+    /// KCM manages service CIDR allocation through this resource; 404 breaks IP allocation.
+    #[test]
+    fn servicecidrs_registered_as_cluster_scoped() {
+        let registry = build_registry();
+        let key = rk("networking.k8s.io", "v1", "servicecidrs");
+        let meta = registry
+            .get(&key)
+            .expect("servicecidrs must be in build_registry");
+        assert!(!meta.namespaced, "ServiceCIDR is cluster-scoped");
+        assert_eq!(meta.kind, "ServiceCIDR");
+    }
+
+    /// VolumeAttributesClass must be registered as cluster-scoped in storage.k8s.io/v1.
+    /// KCM watches this resource; 404 causes it to enter an exponential backoff loop.
+    #[test]
+    fn volumeattributesclasses_registered_as_cluster_scoped() {
+        let registry = build_registry();
+        let key = rk("storage.k8s.io", "v1", "volumeattributesclasses");
+        let meta = registry
+            .get(&key)
+            .expect("volumeattributesclasses must be in build_registry");
+        assert!(!meta.namespaced, "VolumeAttributesClass is cluster-scoped");
+        assert_eq!(meta.kind, "VolumeAttributesClass");
+    }
+
+    /// The four admission policy resources must be registered as cluster-scoped in
+    /// admissionregistration.k8s.io/v1. Without these entries, the admission controller
+    /// informers receive 404 and retry continuously, causing log spam and CPU waste.
+    #[test]
+    fn admission_policy_resources_registered_as_cluster_scoped() {
+        let registry = build_registry();
+
+        let map_key = rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "mutatingadmissionpolicies",
+        );
+        let map_meta = registry
+            .get(&map_key)
+            .expect("mutatingadmissionpolicies must be in build_registry");
+        assert!(
+            !map_meta.namespaced,
+            "MutatingAdmissionPolicy is cluster-scoped"
+        );
+        assert_eq!(map_meta.kind, "MutatingAdmissionPolicy");
+
+        let mapb_key = rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "mutatingadmissionpolicybindings",
+        );
+        let mapb_meta = registry
+            .get(&mapb_key)
+            .expect("mutatingadmissionpolicybindings must be in build_registry");
+        assert!(
+            !mapb_meta.namespaced,
+            "MutatingAdmissionPolicyBinding is cluster-scoped"
+        );
+        assert_eq!(mapb_meta.kind, "MutatingAdmissionPolicyBinding");
+
+        let vap_key = rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "validatingadmissionpolicies",
+        );
+        let vap_meta = registry
+            .get(&vap_key)
+            .expect("validatingadmissionpolicies must be in build_registry");
+        assert!(
+            !vap_meta.namespaced,
+            "ValidatingAdmissionPolicy is cluster-scoped"
+        );
+        assert_eq!(vap_meta.kind, "ValidatingAdmissionPolicy");
+
+        let vapb_key = rk(
+            "admissionregistration.k8s.io",
+            "v1",
+            "validatingadmissionpolicybindings",
+        );
+        let vapb_meta = registry
+            .get(&vapb_key)
+            .expect("validatingadmissionpolicybindings must be in build_registry");
+        assert!(
+            !vapb_meta.namespaced,
+            "ValidatingAdmissionPolicyBinding is cluster-scoped"
+        );
+        assert_eq!(vapb_meta.kind, "ValidatingAdmissionPolicyBinding");
     }
 }
