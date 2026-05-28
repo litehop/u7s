@@ -50,7 +50,6 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("coordination.k8s.io", "v1"),
     ("discovery.k8s.io", "v1"),
     ("events.k8s.io", "v1"),
-    ("flowcontrol.apiserver.k8s.io", "v1"),
     ("gateway.networking.k8s.io", "v1"),
     ("networking.k8s.io", "v1"),
     ("node.k8s.io", "v1"),
@@ -169,7 +168,6 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
         ("discovery.k8s.io", "v1") => Some(discovery_v1_resources()),
         ("events.k8s.io", "v1") => Some(events_v1_resources()),
-        ("flowcontrol.apiserver.k8s.io", "v1") => Some(flowcontrol_v1_resources()),
         ("gateway.networking.k8s.io", "v1") => Some(gateway_networking_v1_resources()),
         ("gateway.networking.k8s.io", "v1beta1") => Some(gateway_networking_v1beta1_resources()),
         ("networking.k8s.io", "v1") => Some(networking_v1_resources()),
@@ -523,15 +521,6 @@ fn discovery_v1_resources() -> serde_json::Value {
                 "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]
             }
         ]
-    })
-}
-
-fn flowcontrol_v1_resources() -> serde_json::Value {
-    serde_json::json!({
-        "kind": "APIResourceList",
-        "apiVersion": "v1",
-        "groupVersion": "flowcontrol.apiserver.k8s.io/v1",
-        "resources": []
     })
 }
 
@@ -1735,24 +1724,26 @@ mod tests {
         );
     }
 
-    // flowcontrol.apiserver.k8s.io must appear in /apis — conformance tests assert its
-    // presence in discovery before attempting any flowcontrol operations. Without this
-    // group, flowcontrol conformance tests fail immediately with "group not found".
+    // flowcontrol.apiserver.k8s.io must NOT appear in /apis — no u7s handlers exist for
+    // flowcontrol resources. client-go treats a group with zero resources as an error
+    // ("received empty response"), which causes KCM's namespace controller to refuse
+    // finalizing any namespace, blocking ALL namespace deletion.
     #[tokio::test]
-    async fn flowcontrol_group_appears_in_api_group_list() {
+    async fn flowcontrol_group_absent_from_api_group_list() {
         let state = make_state();
         let Json(list) = api_group_list(State(state)).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
-            names.contains(&"flowcontrol.apiserver.k8s.io"),
-            "flowcontrol.apiserver.k8s.io must appear in /apis — conformance tests check discovery before any flowcontrol operation; got: {names:?}"
+            !names.contains(&"flowcontrol.apiserver.k8s.io"),
+            "flowcontrol.apiserver.k8s.io must not appear in /apis — advertising a group \
+             with zero resources causes client-go discovery errors and blocks namespace deletion; got: {names:?}"
         );
     }
 
-    // flowcontrol.apiserver.k8s.io/v1 must return 200 with a valid APIResourceList —
-    // conformance tests GET this endpoint to verify the group is functional, not just listed.
+    // flowcontrol.apiserver.k8s.io/v1 must return 404 — the group is not served.
+    // client-go must not attempt to list flowcontrol resources and get an empty response.
     #[tokio::test]
-    async fn flowcontrol_v1_resources_returns_200() {
+    async fn flowcontrol_v1_resources_returns_404() {
         let state = make_state();
         let resp = api_group_resources(
             State(state),
@@ -1762,24 +1753,9 @@ mod tests {
 
         assert_eq!(
             resp.status(),
-            StatusCode::OK,
-            "GET /apis/flowcontrol.apiserver.k8s.io/v1 must return 200 — \
-             conformance tests assert the group endpoint is reachable"
-        );
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(
-            val["kind"].as_str(),
-            Some("APIResourceList"),
-            "response must be an APIResourceList"
-        );
-        assert_eq!(
-            val["groupVersion"].as_str(),
-            Some("flowcontrol.apiserver.k8s.io/v1"),
-            "groupVersion must match the requested group/version"
+            StatusCode::NOT_FOUND,
+            "GET /apis/flowcontrol.apiserver.k8s.io/v1 must return 404 — \
+             the group is not served and must not be reachable"
         );
     }
 }
