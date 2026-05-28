@@ -5444,4 +5444,115 @@ mod tests {
             "spec.selector must be populated from spec.template.metadata.labels"
         );
     }
+
+    /// POST a ReplicaSet then PUT with the resourceVersion from the POST response must succeed.
+    ///
+    /// The RS controller (KCM) creates a ReplicaSet via POST, extracts the resourceVersion
+    /// from the response, and subsequently PUTs the same object with that resourceVersion as
+    /// the optimistic-concurrency precondition.  If the POST response returns a stale or
+    /// incorrect resourceVersion (e.g. "0" or None because set_resource_version was not called),
+    /// the PUT is rejected with 409 Conflict and the RS controller log shows:
+    ///   "read version X is not as new as written version Y for group resource replicasets.apps"
+    ///
+    /// This test fails if `obj.set_resource_version(new_rv)` is removed from
+    /// create_namespaced_resource, because the response would then contain no resourceVersion
+    /// (or the pre-store value), and the subsequent PUT with that value would be rejected.
+    #[tokio::test]
+    async fn replicaset_post_then_put_with_create_rv_succeeds() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "my-rs", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "my-rs" } },
+                "template": {
+                    "metadata": { "labels": { "app": "my-rs" } },
+                    "spec": { "containers": [{ "name": "c", "image": "nginx" }] }
+                }
+            }
+        });
+        let body_bytes = bytes::Bytes::from(serde_json::to_vec(&rs).unwrap());
+
+        // Step 1: POST to create the ReplicaSet.
+        let create_resp = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "replicasets".into(),
+            )),
+            json_headers(),
+            body_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ReplicaSet POST must succeed; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            create_resp.status(),
+            axum::http::StatusCode::CREATED,
+            "POST must return 201 Created"
+        );
+
+        let create_body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+
+        // The POST response must include a non-zero resourceVersion stamped by the store.
+        // If set_resource_version(new_rv) is not called, this will be missing or "0",
+        // and the subsequent PUT will be rejected with 409 Conflict.
+        let rv = created["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("POST response must include metadata.resourceVersion");
+        let rv_num: u64 = rv
+            .parse()
+            .expect("metadata.resourceVersion must be a valid integer string");
+        assert!(
+            rv_num > 0,
+            "POST response resourceVersion must be > 0 (the store-assigned revision); \
+             got '{}' — if this is 0 or missing, the RS controller's subsequent PUT \
+             will be rejected with 409 Conflict",
+            rv
+        );
+
+        // Step 2: PUT with the resourceVersion from the POST response.
+        // This simulates the RS controller's first sync after creation.
+        // The PUT body must include the resourceVersion so the store can verify
+        // the precondition (optimistic concurrency).
+        let mut put_body = created.clone();
+        put_body["metadata"]["resourceVersion"] = serde_json::Value::String(rv.to_string());
+        // Remove status — the replace handler strips it for resources with a status subresource.
+        if let Some(m) = put_body.as_object_mut() {
+            m.remove("status");
+        }
+        let put_bytes = bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap());
+
+        let put_result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "replicasets".into(),
+                "my-rs".into(),
+            )),
+            json_headers(),
+            put_bytes,
+        )
+        .await;
+
+        assert!(
+            put_result.is_ok(),
+            "PUT with resourceVersion from POST response must succeed — a 409 here means \
+             the POST response returned a stale resourceVersion that doesn't match the store, \
+             which causes the RS controller to log 'read version X is not as new as written \
+             version Y for group resource replicasets.apps'; got: {:?}",
+            put_result.err()
+        );
+    }
 }
