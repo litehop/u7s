@@ -1539,6 +1539,39 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     }
     // If spec.volumes is None, there is nothing to default.
 
+    // Initialize status.conditions with PodScheduled=False when absent.
+    //
+    // Real kube-apiserver always stamps this condition on Pod create.  Conformance
+    // scheduling tests (e.g. scheduling/predicates.go) wait for PodScheduled to
+    // appear in status.conditions before declaring scheduling success.  Without this
+    // initial False, the field is absent after create and the scheduler never has a
+    // condition to flip to True — so tests that wait for "scheduled condition" time out.
+    //
+    // Idempotent: the condition is only inserted when status.conditions is absent or
+    // does not already contain a PodScheduled entry.
+    let conditions_absent = pod["status"]["conditions"].is_null()
+        || pod["status"]["conditions"].as_array().is_none_or(|arr| {
+            arr.iter()
+                .all(|c| c["type"].as_str() != Some("PodScheduled"))
+        });
+    if conditions_absent {
+        if !pod["status"].is_object() {
+            pod["status"] = serde_json::json!({});
+        }
+        let now = crate::util::utc_now_rfc3339();
+        let scheduled_false = serde_json::json!({
+            "type": "PodScheduled",
+            "status": "False",
+            "reason": "Unschedulable",
+            "message": "pod not yet scheduled",
+            "lastTransitionTime": now
+        });
+        match pod["status"]["conditions"].as_array_mut() {
+            Some(arr) => arr.push(scheduled_false),
+            None => pod["status"]["conditions"] = serde_json::json!([scheduled_false]),
+        }
+    }
+
     // Default fieldRef.apiVersion to "v1" for all containers (including initContainers).
     // The kubelet calls ConvertDownwardAPIFieldLabel(apiVersion, ...) which errors with
     // "unsupported pod version: <empty>" when apiVersion is absent.
@@ -2158,6 +2191,123 @@ mod create_defaults_tests {
             "livenessProbe.failureThreshold must be preserved"
         );
     }
+
+    /// apply_pod_create_defaults must insert PodScheduled=False into status.conditions.
+    ///
+    /// Real kube-apiserver always stamps this condition on create.  Conformance scheduling
+    /// tests (scheduling/predicates.go) wait for `PodScheduled` to appear in
+    /// `pod.status.conditions`; without this default the field is absent after create and
+    /// those tests time out with "Did not find scheduled condition for pod".
+    ///
+    /// This test fails if the PodScheduled initialization is removed — proving it is a
+    /// genuine regression test, not just documentation.
+    #[test]
+    fn pod_create_defaults_sets_pod_scheduled_false() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pfpod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        apply_pod_create_defaults(&mut pod);
+
+        let conditions = pod["status"]["conditions"]
+            .as_array()
+            .expect("status.conditions must be an array after apply_pod_create_defaults");
+        let scheduled = conditions
+            .iter()
+            .find(|c| c["type"].as_str() == Some("PodScheduled"))
+            .expect(
+                "PodScheduled condition must be present — scheduling tests wait for it and \
+                 time out with 'Did not find scheduled condition for pod' if absent",
+            );
+        assert_eq!(
+            scheduled["status"], "False",
+            "PodScheduled must start as False — the scheduler flips it to True after binding; \
+             if missing, scheduling tests cannot observe the transition"
+        );
+        assert_eq!(
+            scheduled["reason"], "Unschedulable",
+            "PodScheduled reason must be Unschedulable before the pod is bound to a node"
+        );
+    }
+
+    /// apply_pod_create_defaults must not overwrite a pre-existing PodScheduled condition.
+    ///
+    /// Idempotency: if the pod already carries PodScheduled (e.g. from a webhook or
+    /// a second call to apply_pod_create_defaults), the existing value must survive.
+    #[test]
+    fn pod_create_defaults_does_not_overwrite_existing_pod_scheduled() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pfpod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {
+                "conditions": [{
+                    "type": "PodScheduled",
+                    "status": "True",
+                    "reason": "PodScheduled",
+                    "lastTransitionTime": "2024-01-01T00:00:00Z"
+                }]
+            }
+        });
+
+        apply_pod_create_defaults(&mut pod);
+
+        let conditions = pod["status"]["conditions"]
+            .as_array()
+            .expect("conditions must still be an array");
+        let scheduled = conditions
+            .iter()
+            .find(|c| c["type"].as_str() == Some("PodScheduled"))
+            .expect("PodScheduled condition must be present");
+        assert_eq!(
+            scheduled["status"], "True",
+            "pre-existing PodScheduled=True must not be overwritten to False"
+        );
+    }
+}
+
+/// Flip the PodScheduled condition to True in-place.
+///
+/// Finds an existing PodScheduled entry in `status.conditions` and sets its status to
+/// "True" with reason "PodScheduled".  If no entry exists, appends one.
+/// `now` must be an RFC3339 timestamp string (used as `lastTransitionTime`).
+///
+/// Extracted for testability — the full `bind_pod` handler is async and requires a live store.
+pub fn set_pod_scheduled_true(pod: &mut serde_json::Value, now: &str) {
+    if !pod["status"].is_object() {
+        pod["status"] = serde_json::json!({});
+    }
+    if let Some(conditions) = pod["status"]["conditions"].as_array_mut() {
+        for cond in conditions.iter_mut() {
+            if cond["type"].as_str() == Some("PodScheduled") {
+                cond["status"] = serde_json::json!("True");
+                cond["reason"] = serde_json::json!("PodScheduled");
+                cond["message"] = serde_json::json!("");
+                cond["lastTransitionTime"] = serde_json::json!(now);
+                return;
+            }
+        }
+        // No existing PodScheduled condition — append one.
+        conditions.push(serde_json::json!({
+            "type": "PodScheduled",
+            "status": "True",
+            "reason": "PodScheduled",
+            "message": "",
+            "lastTransitionTime": now
+        }));
+    } else {
+        pod["status"]["conditions"] = serde_json::json!([{
+            "type": "PodScheduled",
+            "status": "True",
+            "reason": "PodScheduled",
+            "message": "",
+            "lastTransitionTime": now
+        }]);
+    }
 }
 
 /// Extract the target node name from a Binding object body.
@@ -2204,6 +2354,15 @@ pub async fn bind_pod<S: Store>(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     obj.body["spec"]["nodeName"] = serde_json::Value::String(node_name);
+
+    // Set PodScheduled=True now that the pod has a node assignment.
+    //
+    // In real k8s the scheduler does a separate PATCH on the status subresource to
+    // flip PodScheduled from False→True.  In u7s we do it atomically inside bind_pod
+    // so no separate scheduler status-patch is required.  Conformance scheduling tests
+    // wait for PodScheduled=True before asserting the pod is running.
+    let now = utc_now_rfc3339();
+    set_pod_scheduled_true(&mut obj.body, &now);
 
     let expected_rv = parse_resource_version(obj.resource_version())?;
 
@@ -2705,6 +2864,117 @@ mod pure_logic_tests {
         let binding = serde_json::json!({"kind": "Binding"});
         let result = extract_binding_node_name(&binding);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // set_pod_scheduled_true
+    // -----------------------------------------------------------------------
+
+    /// set_pod_scheduled_true must flip an existing PodScheduled=False to True.
+    ///
+    /// bind_pod calls this after setting spec.nodeName.  If it doesn't flip the
+    /// condition, scheduling conformance tests that wait for PodScheduled=True will
+    /// time out.  This test fails if set_pod_scheduled_true is reverted to a no-op.
+    #[test]
+    fn set_pod_scheduled_true_flips_false_condition() {
+        let mut pod = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "PodScheduled",
+                    "status": "False",
+                    "reason": "Unschedulable",
+                    "lastTransitionTime": "2024-01-01T00:00:00Z"
+                }]
+            }
+        });
+
+        set_pod_scheduled_true(&mut pod, "2024-01-01T00:00:01Z");
+
+        let conditions = pod["status"]["conditions"]
+            .as_array()
+            .expect("conditions must be an array");
+        let scheduled = conditions
+            .iter()
+            .find(|c| c["type"].as_str() == Some("PodScheduled"))
+            .expect("PodScheduled condition must still be present after flip");
+        assert_eq!(
+            scheduled["status"], "True",
+            "PodScheduled must be True after bind_pod calls set_pod_scheduled_true — \
+             scheduling conformance tests wait for this transition"
+        );
+        assert_eq!(
+            scheduled["reason"], "PodScheduled",
+            "reason must change to PodScheduled after binding"
+        );
+    }
+
+    /// set_pod_scheduled_true must append PodScheduled=True when no condition exists.
+    ///
+    /// Handles pods that were created without the initial PodScheduled=False default
+    /// (e.g. pods seeded directly into the store in tests).
+    #[test]
+    fn set_pod_scheduled_true_appends_when_absent() {
+        let mut pod = serde_json::json!({
+            "status": {"phase": "Pending"}
+        });
+
+        set_pod_scheduled_true(&mut pod, "2024-01-01T00:00:01Z");
+
+        let conditions = pod["status"]["conditions"]
+            .as_array()
+            .expect("conditions must be an array after append");
+        let scheduled = conditions
+            .iter()
+            .find(|c| c["type"].as_str() == Some("PodScheduled"))
+            .expect("PodScheduled condition must be present after append");
+        assert_eq!(
+            scheduled["status"], "True",
+            "appended PodScheduled condition must have status=True"
+        );
+    }
+
+    /// set_pod_scheduled_true must not disturb other conditions.
+    ///
+    /// Pods may already have Initialized/Ready conditions set by kubelet; only
+    /// PodScheduled must be touched.
+    #[test]
+    fn set_pod_scheduled_true_leaves_other_conditions_intact() {
+        let mut pod = serde_json::json!({
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Initialized",
+                        "status": "True",
+                        "lastTransitionTime": "2024-01-01T00:00:00Z"
+                    },
+                    {
+                        "type": "PodScheduled",
+                        "status": "False",
+                        "reason": "Unschedulable",
+                        "lastTransitionTime": "2024-01-01T00:00:00Z"
+                    }
+                ]
+            }
+        });
+
+        set_pod_scheduled_true(&mut pod, "2024-01-01T00:00:01Z");
+
+        let conditions = pod["status"]["conditions"]
+            .as_array()
+            .expect("conditions must be an array");
+        assert_eq!(
+            conditions.len(),
+            2,
+            "only PodScheduled must be touched; Initialized must survive"
+        );
+        let initialized = conditions
+            .iter()
+            .find(|c| c["type"].as_str() == Some("Initialized"))
+            .expect("Initialized condition must survive");
+        assert_eq!(
+            initialized["status"], "True",
+            "Initialized condition must not be modified by set_pod_scheduled_true"
+        );
     }
 }
 
