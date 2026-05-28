@@ -265,6 +265,7 @@ pub async fn create_pod<S: Store>(
     crate::handlers::generic::stamp_metadata(&mut obj);
 
     apply_pod_create_defaults(&mut obj.body);
+    initialize_pod_generation(&mut obj.body);
     inject_sa_token_volume(&mut obj.body, &name);
 
     // Admission webhook pipeline (mutating then validating).
@@ -337,6 +338,18 @@ pub async fn replace_pod<S: Store>(
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
+    // Fetch the stored object to compare spec (needed for generation tracking).
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+    let stored_obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+    let spec_before = stored_obj.body["spec"].clone();
+
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
         group: "",
@@ -349,7 +362,8 @@ pub async fn replace_pod<S: Store>(
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
-    let key = object_key("pods", ns.as_str(), &name);
+    increment_pod_generation_if_spec_changed(&mut obj.body, &spec_before);
+
     let new_rv = state
         .store
         .put(&key, obj.to_bytes(), expected_revision)
@@ -475,6 +489,8 @@ pub async fn patch_pod<S: Store>(
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    let spec_before = current_obj.body["spec"].clone();
+
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
@@ -490,6 +506,8 @@ pub async fn patch_pod<S: Store>(
             super::json_patch::apply_json_patch(&mut current_obj.body, &patch)?;
         }
     }
+
+    increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
     let post_patch_meta: ObjectMeta =
@@ -1561,6 +1579,33 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     }
 }
 
+/// Set `metadata.generation = 1` on a newly created pod if absent or null.
+/// Preserves the caller-supplied value when it is already set.
+///
+/// Kubernetes conformance tests require generation=1 on every newly created pod.
+/// Without this, controllers that gate on observedGeneration == generation will
+/// never progress because generation stays at null.
+pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
+    if pod["metadata"]["generation"].is_null() {
+        pod["metadata"]["generation"] = serde_json::json!(1i64);
+    }
+}
+
+/// Increment `metadata.generation` by 1 when the pod spec has changed.
+///
+/// Called after PATCH and PUT operations. Kubernetes increments generation on
+/// every spec change so that controllers and status reporters can detect when
+/// spec has advanced past what they last reconciled (via observedGeneration).
+pub fn increment_pod_generation_if_spec_changed(
+    pod: &mut serde_json::Value,
+    spec_before: &serde_json::Value,
+) {
+    if pod["spec"] != *spec_before {
+        let current = pod["metadata"]["generation"].as_i64().unwrap_or(1);
+        pod["metadata"]["generation"] = serde_json::json!(current + 1);
+    }
+}
+
 /// Inject the projected service-account token volume into a pod, mirroring
 /// what the real Kubernetes ServiceAccount admission plugin does.
 ///
@@ -2156,6 +2201,128 @@ mod create_defaults_tests {
         assert_eq!(
             probe["failureThreshold"], 3,
             "livenessProbe.failureThreshold must be preserved"
+        );
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    /// create_pod must set metadata.generation=1 when the caller does not supply one.
+    ///
+    /// Controllers and scheduler use generation/observedGeneration to detect spec changes.
+    /// A missing generation means a controller can never know if it has reconciled the
+    /// latest spec — it would either loop forever or never act.
+    #[test]
+    fn initialize_sets_generation_to_1_when_absent() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        initialize_pod_generation(&mut pod);
+        assert_eq!(
+            pod["metadata"]["generation"],
+            serde_json::json!(1i64),
+            "generation must be initialized to 1 on create — absent generation means \
+             controllers relying on observedGeneration will never see spec changes"
+        );
+    }
+
+    /// create_pod must preserve a caller-supplied generation value.
+    ///
+    /// Some controllers pre-set generation (e.g. when reconstructing objects);
+    /// overriding it would break their bookkeeping.
+    #[test]
+    fn initialize_preserves_caller_supplied_generation() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "generation": 5i64},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+        initialize_pod_generation(&mut pod);
+        assert_eq!(
+            pod["metadata"]["generation"],
+            serde_json::json!(5i64),
+            "a caller-supplied generation must not be overridden on create"
+        );
+    }
+
+    /// PATCH that changes spec must increment generation.
+    ///
+    /// A spec change that does not bump generation is invisible to controllers
+    /// watching generation; they would never re-reconcile the updated spec.
+    #[test]
+    fn increment_on_spec_change() {
+        let spec_before =
+            serde_json::json!({"containers": [{"name": "app", "image": "nginx:1.0"}]});
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "generation": 1i64},
+            "spec": {"containers": [{"name": "app", "image": "nginx:2.0"}]}
+        });
+        increment_pod_generation_if_spec_changed(&mut pod, &spec_before);
+        assert_eq!(
+            pod["metadata"]["generation"],
+            serde_json::json!(2i64),
+            "generation must increment when spec changes — controllers use \
+             generation/observedGeneration to detect new work; no increment means stale reconcile"
+        );
+    }
+
+    /// PATCH that does not change spec must NOT increment generation.
+    ///
+    /// A metadata-only patch (labels, annotations) must leave generation unchanged
+    /// so controllers do not re-reconcile when nothing in spec changed.
+    #[test]
+    fn no_increment_when_spec_unchanged() {
+        let spec = serde_json::json!({"containers": [{"name": "app", "image": "nginx:1.0"}]});
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "generation": 1i64, "labels": {}},
+            "spec": spec.clone()
+        });
+        increment_pod_generation_if_spec_changed(&mut pod, &spec);
+        assert_eq!(
+            pod["metadata"]["generation"],
+            serde_json::json!(1i64),
+            "generation must NOT increment for metadata-only patches — spurious increments \
+             would cause controllers to re-reconcile unchanged pods"
+        );
+    }
+
+    /// Sequential spec changes must increment generation monotonically.
+    ///
+    /// A pod updated twice (generation 1 → 2 → 3) must track both changes.
+    /// If the counter resets or skips, observedGeneration comparisons break.
+    #[test]
+    fn generation_increments_monotonically_across_multiple_patches() {
+        let spec_v1 = serde_json::json!({"containers": [{"name": "app", "image": "nginx:1.0"}]});
+        let spec_v2 = serde_json::json!({"containers": [{"name": "app", "image": "nginx:2.0"}]});
+        let spec_v3 = serde_json::json!({"containers": [{"name": "app", "image": "nginx:3.0"}]});
+
+        let mut pod = serde_json::json!({
+            "metadata": {"generation": 1i64},
+            "spec": spec_v2.clone()
+        });
+
+        // First spec change: 1 -> 2
+        increment_pod_generation_if_spec_changed(&mut pod, &spec_v1);
+        assert_eq!(pod["metadata"]["generation"], serde_json::json!(2i64));
+
+        // Second spec change: 2 -> 3
+        pod["spec"] = spec_v3.clone();
+        increment_pod_generation_if_spec_changed(&mut pod, &spec_v2);
+        assert_eq!(
+            pod["metadata"]["generation"],
+            serde_json::json!(3i64),
+            "generation must increment monotonically — generation=3 after two spec changes; \
+             a reset or skip would break observedGeneration tracking in controllers"
         );
     }
 }
