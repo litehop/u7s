@@ -5267,6 +5267,87 @@ mod tests {
         );
     }
 
+    /// Regression test (mayor-bdsj): GET on a stored namespaced object must return
+    /// metadata.resourceVersion that is non-empty and non-zero.
+    ///
+    /// Why this matters: KCM's root CA publisher controller reads kube-root-ca.crt
+    /// via GET, then issues a PUT with the resourceVersion it got back as a
+    /// precondition. If GET returns resourceVersion="" or "0", the PUT fails with
+    /// "resource version mismatch (expected N, current 0)" and the controller loops
+    /// forever.  The store's put_sync stamps every write with a global counter (>=1)
+    /// via stamp_resource_version; if that stamping were removed or zeroed, this
+    /// test would fail.
+    #[tokio::test]
+    async fn get_namespaced_resource_returns_non_zero_resource_version() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "kube-root-ca.crt", "namespace": "default" },
+            "data": { "ca.crt": "CERT-DATA" }
+        });
+
+        // Create the ConfigMap — store assigns revision >= 1 and stamps it
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ConfigMap POST must succeed; got: {e:?}"));
+
+        // GET it back and verify resourceVersion is propagated from the store
+        let get_resp = get_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+                "kube-root-ca.crt".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ConfigMap GET must succeed; got: {e:?}"))
+        .into_response();
+
+        let body = to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let rv = v["metadata"]["resourceVersion"].as_str().unwrap_or("");
+        assert!(
+            !rv.is_empty(),
+            "GET response must include metadata.resourceVersion — an absent field causes KCM's \
+             root CA publisher to treat resourceVersion as 0 and loop forever on PUT \
+             precondition failures (mayor-bdsj)"
+        );
+        assert_ne!(
+            rv, "0",
+            "GET response must not return metadata.resourceVersion=\"0\" — store must stamp the \
+             actual revision (>= 1); returning 0 makes KCM's PUT fail with revision mismatch \
+             (mayor-bdsj: root CA publisher loops on 'expected N, current 0')"
+        );
+        let rv_int: u64 = rv.parse().unwrap_or_else(|_| {
+            panic!("metadata.resourceVersion must be a decimal integer string; got: {rv:?}")
+        });
+        assert!(
+            rv_int > 0,
+            "metadata.resourceVersion must be > 0 after first write; got: {rv_int} \
+             (mayor-bdsj: store counter starts at 1)"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Regression tests: selector defaulting for Deployment/RS/StatefulSet (mayor-2fja)
     // ---------------------------------------------------------------------------
