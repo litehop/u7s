@@ -724,6 +724,33 @@ async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
         Err(e) => return Err(anyhow::anyhow!("seed Service kube-system/kube-dns: {e}")),
     }
 
+    // default/kubernetes Endpoints — controllers (e.g. endpoint controller, admission webhooks)
+    // watch this object to locate the apiserver. Without it they log errors and may fail to start.
+    let ep_key = keys::object_key("endpoints", "default", "kubernetes");
+    let ep_body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": {
+            "name": "kubernetes",
+            "namespace": "default",
+            "uid": "00000000-0000-0000-0000-000000000022",
+            "creationTimestamp": "2024-01-01T00:00:00Z",
+            "labels": { "endpointslice.kubernetes.io/skip-mirror": "true" }
+        },
+        "subsets": [{
+            "addresses": [{ "ip": "127.0.0.1" }],
+            "ports": [{ "name": "https", "port": 443, "protocol": "TCP" }]
+        }]
+    });
+    match store
+        .put(&ep_key, Bytes::from(ep_body.to_string()), Some(0))
+        .await
+    {
+        Ok(_) => tracing::info!("seeded Endpoints: default/kubernetes"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(anyhow::anyhow!("seed Endpoints default/kubernetes: {e}")),
+    }
+
     Ok(())
 }
 
@@ -1359,6 +1386,63 @@ mod tests {
         assert!(
             dns_obj.is_some(),
             "Service kube-system/kube-dns must still exist"
+        );
+    }
+
+    /// seed_services must also create the 'kubernetes' Endpoints object in the default namespace.
+    ///
+    /// Controllers such as the endpoint controller and some admission webhooks watch this
+    /// object to locate the apiserver IP/port. Without it they log errors on startup and
+    /// may refuse to start. The corresponding Service (default/kubernetes) alone is not enough
+    /// because older controllers resolve the apiserver address via Endpoints, not EndpointSlices.
+    #[tokio::test]
+    async fn seed_services_creates_kubernetes_endpoints() {
+        let store = make_store();
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
+        seed_services(&store).await.expect("seed must not fail");
+
+        let ep_key = keys::object_key("endpoints", "default", "kubernetes");
+        let ep_obj = store.get(&ep_key).await.expect("get must not fail");
+        assert!(
+            ep_obj.is_some(),
+            "Endpoints default/kubernetes must exist after seeding — \
+             controllers watch this object to locate the apiserver; \
+             without it they log errors and may fail to start"
+        );
+        let ep: serde_json::Value =
+            serde_json::from_slice(&ep_obj.unwrap().value).expect("valid json");
+        assert_eq!(ep["kind"].as_str(), Some("Endpoints"));
+        assert_eq!(ep["metadata"]["name"].as_str(), Some("kubernetes"));
+        assert_eq!(ep["metadata"]["namespace"].as_str(), Some("default"));
+        let subsets = ep["subsets"].as_array().expect("subsets must be an array");
+        assert!(
+            !subsets.is_empty(),
+            "Endpoints must have at least one subset"
+        );
+        let addresses = subsets[0]["addresses"]
+            .as_array()
+            .expect("addresses must be an array");
+        assert!(
+            !addresses.is_empty(),
+            "subset must have at least one address"
+        );
+        let ip = addresses[0]["ip"].as_str().unwrap_or("");
+        assert!(!ip.is_empty(), "endpoint address must have a non-empty IP");
+        let ports = subsets[0]["ports"]
+            .as_array()
+            .expect("ports must be an array");
+        assert!(!ports.is_empty(), "subset must have at least one port");
+        assert_eq!(
+            ports[0]["port"].as_u64(),
+            Some(443),
+            "kubernetes Endpoints must expose port 443 — apiserver HTTPS port"
+        );
+        assert_eq!(
+            ports[0]["protocol"].as_str(),
+            Some("TCP"),
+            "kubernetes Endpoints port must be TCP"
         );
     }
 
