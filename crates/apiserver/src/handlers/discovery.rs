@@ -837,8 +837,10 @@ pub async fn openapi_v3() -> Json<serde_json::Value> {
 mod tests {
     use super::*;
     use axum::extract::State;
+    use axum::{body::Body, http::Request, routing::get, Router};
     use bytes::Bytes;
     use std::sync::Arc;
+    use tower::ServiceExt;
     use u7s_store::SqliteStore;
 
     use crate::handlers::crd::create_crd;
@@ -1493,6 +1495,77 @@ mod tests {
         assert!(
             val.get("paths").is_some(),
             "/openapi/v3 must contain a \"paths\" key so kubectl can fall back to /openapi/v2"
+        );
+    }
+
+    // HTTP-level: GET /openapi/v2 must return 200 with Swagger 2.0 JSON.
+    // This verifies the route is wired — the unit test above does not catch
+    // a route being removed from the router.
+    #[tokio::test]
+    async fn openapi_v2_route_returns_200_with_swagger_field() {
+        let app = Router::new().route("/openapi/v2", get(openapi_v2));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/openapi/v2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /openapi/v2 must return 200 — kubectl fails with \
+             'failed to download openapi: unknown' if the route is absent or returns an error"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value =
+            serde_json::from_slice(&body).expect("/openapi/v2 body must be valid JSON");
+        assert_eq!(
+            val.get("swagger").and_then(|v| v.as_str()),
+            Some("2.0"),
+            "/openapi/v2 JSON must contain \"swagger\": \"2.0\" — kubectl \
+             rejects the schema if the swagger version field is absent"
+        );
+        assert!(
+            val.get("paths").is_some(),
+            "/openapi/v2 JSON must contain a \"paths\" key"
+        );
+    }
+
+    // HTTP-level: GET /openapi/v3 must return 200 with a "paths" key.
+    // This verifies the route is wired — kubectl 1.28+ calls /openapi/v3
+    // first and falls back to /openapi/v2 only if it gets a valid response.
+    #[tokio::test]
+    async fn openapi_v3_route_returns_200_with_paths_key() {
+        let app = Router::new().route("/openapi/v3", get(openapi_v3));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/openapi/v3")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /openapi/v3 must return 200 — kubectl 1.28+ probes this \
+             before falling back to /openapi/v2"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value =
+            serde_json::from_slice(&body).expect("/openapi/v3 body must be valid JSON");
+        assert!(
+            val.get("paths").is_some(),
+            "/openapi/v3 JSON must contain a \"paths\" key so kubectl falls back to /openapi/v2 \
+             rather than erroring out"
         );
     }
 
