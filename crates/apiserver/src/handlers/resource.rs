@@ -262,6 +262,17 @@ pub async fn create_resource<S: Store>(
                 .await
                 .map_err(|e| store_err(e, &name, &meta.kind))?
         }
+        Err(StoreError::AlreadyExists { .. }) => {
+            let stored = state
+                .store
+                .get(&key)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+            let existing: serde_json::Value = serde_json::from_slice(&stored.value)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            return Ok((StatusCode::CONFLICT, Json(existing)).into_response());
+        }
         Err(e) => return Err(store_err(e, &name, &meta.kind)),
     };
 
@@ -926,6 +937,17 @@ pub async fn create_namespaced_resource<S: Store>(
                 .put(&key, obj.to_bytes(), None)
                 .await
                 .map_err(|e| store_err(e, &name, &meta.kind))?
+        }
+        Err(StoreError::AlreadyExists { .. }) => {
+            let stored = state
+                .store
+                .get(&key)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found(&name, &meta.kind))?;
+            let existing: serde_json::Value = serde_json::from_slice(&stored.value)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            return Ok((StatusCode::CONFLICT, Json(existing)).into_response());
         }
         Err(e) => return Err(store_err(e, &name, &meta.kind)),
     };
@@ -3067,12 +3089,15 @@ mod tests {
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
         )
-        .await;
+        .await
+        .unwrap_or_else(|e| panic!("duplicate create must not hard-error; got: {e:?}"))
+        .into_response();
 
-        match result {
-            Err(err) => assert_eq!(err.0, axum::http::StatusCode::CONFLICT),
-            Ok(_) => panic!("duplicate create must return 409 Conflict"),
-        }
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CONFLICT,
+            "duplicate create must return 409 Conflict with existing object body"
+        );
     }
 
     /// list_resource with labelSelector filters to matching items only.
@@ -3801,16 +3826,15 @@ mod tests {
             json_headers(),
             body,
         )
-        .await;
+        .await
+        .unwrap_or_else(|e| panic!("duplicate namespaced create must not hard-error; got: {e:?}"))
+        .into_response();
 
-        match result {
-            Err(err) => assert_eq!(
-                err.0,
-                axum::http::StatusCode::CONFLICT,
-                "duplicate namespaced create must return 409 Conflict"
-            ),
-            Ok(_) => panic!("duplicate create_namespaced_resource must return 409"),
-        }
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CONFLICT,
+            "duplicate namespaced create must return 409 Conflict with existing object body"
+        );
     }
 
     /// strategic_merge_patch merges arrays by name key (not replaces).
@@ -4719,6 +4743,168 @@ mod tests {
             StatusCode::CREATED,
             "valid ClusterRole body must produce 201 Created — \
              kubectl create always sends this shape and must not get 400"
+        );
+    }
+
+    /// POST conflict on a namespaced resource must return 409 with the existing object body.
+    ///
+    /// KCM's token publisher POSTs kube-root-ca.crt on every namespace reconcile. When the
+    /// ConfigMap already exists, KCM reads the 409 body to extract the current resourceVersion
+    /// and retries as a PUT. Without the existing object in the body, KCM gets resourceVersion=0
+    /// and loops forever between AlreadyExists and revision-mismatch errors.
+    #[tokio::test]
+    async fn post_conflict_namespaced_returns_existing_object_with_resource_version() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "kube-root-ca.crt", "namespace": "default" },
+            "data": { "ca.crt": "CERT" }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&cm).unwrap());
+
+        let first = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+            )),
+            json_headers(),
+            body.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("first POST must succeed; got: {e:?}"))
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_obj: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let created_rv = first_obj["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("first POST response must include resourceVersion")
+            .to_string();
+
+        let second = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "configmaps".into(),
+            )),
+            json_headers(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("second POST must not hard-error; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            second.status(),
+            StatusCode::CONFLICT,
+            "duplicate POST must return 409 Conflict so KCM can extract resourceVersion"
+        );
+
+        let conflict_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let conflict_obj: serde_json::Value = serde_json::from_slice(&conflict_body).unwrap();
+
+        let conflict_rv = conflict_obj["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("409 body must include metadata.resourceVersion so KCM can retry as PUT");
+
+        assert_eq!(
+            conflict_rv, created_rv,
+            "409 body resourceVersion must match the version assigned at creation — \
+             KCM uses this to form the subsequent PUT and breaks the conflict loop"
+        );
+    }
+
+    /// POST conflict on a cluster-scoped resource must return 409 with the existing object body.
+    ///
+    /// Same as the namespaced case: the 409 body must contain the existing object so callers
+    /// can extract resourceVersion for a follow-up PUT.
+    #[tokio::test]
+    async fn post_conflict_cluster_scoped_returns_existing_object_with_resource_version() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let sc = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "StorageClass",
+            "metadata": { "name": "standard" },
+            "provisioner": "kubernetes.io/no-provisioner",
+            "volumeBindingMode": "WaitForFirstConsumer"
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&sc).unwrap());
+
+        let first = create_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "test".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+            json_headers(),
+            body.clone(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("first POST must succeed; got: {e:?}"))
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_obj: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        let created_rv = first_obj["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("first POST response must include resourceVersion")
+            .to_string();
+
+        let second = create_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "storageclasses".into(),
+            )),
+            Extension(crate::auth::UserInfo {
+                username: "test".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+            json_headers(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("second POST must not hard-error; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            second.status(),
+            StatusCode::CONFLICT,
+            "duplicate cluster-scoped POST must return 409 Conflict"
+        );
+
+        let conflict_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let conflict_obj: serde_json::Value = serde_json::from_slice(&conflict_body).unwrap();
+
+        let conflict_rv = conflict_obj["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("409 body must include metadata.resourceVersion");
+
+        assert_eq!(
+            conflict_rv, created_rv,
+            "409 body resourceVersion must match the version assigned at creation"
         );
     }
 }
