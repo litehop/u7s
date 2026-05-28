@@ -64,7 +64,14 @@ pub struct ApiResourceList {
 }
 
 static CORE_VERBS: &[&str] = &[
-    "create", "delete", "get", "list", "patch", "update", "watch",
+    "create",
+    "delete",
+    "deletecollection",
+    "get",
+    "list",
+    "patch",
+    "update",
+    "watch",
 ];
 static PODS_SHORT_NAMES: &[&str] = &["po"];
 static NODES_SHORT_NAMES: &[&str] = &["no"];
@@ -800,6 +807,38 @@ mod tests {
         assert!(
             names.contains(&"replicationcontrollers"),
             "replicationcontrollers must be in /api/v1 — legacy but required for API conformance"
+        );
+    }
+
+    /// Core v1 resources must advertise "deletecollection" in their verbs list.
+    ///
+    /// The KCM namespace controller reads the API discovery and only calls
+    /// deleteCollection on resources that include "deletecollection" in verbs.
+    /// If the verb is missing, services linger after namespace deletion and the
+    /// "kubernetes" finalizer is never removed, blocking namespace cleanup forever.
+    #[test]
+    fn core_resources_advertise_deletecollection_verb() {
+        let list = ApiResourceList::v1();
+        let services = list
+            .resources
+            .iter()
+            .find(|r| r.name == "services")
+            .expect("services must be in /api/v1");
+        assert!(
+            services.verbs.contains(&"deletecollection"),
+            "services must advertise 'deletecollection' — without it the KCM \
+             namespace controller skips deleteCollection and services linger \
+             after namespace deletion"
+        );
+        let configmaps = list
+            .resources
+            .iter()
+            .find(|r| r.name == "configmaps")
+            .expect("configmaps must be in /api/v1");
+        assert!(
+            configmaps.verbs.contains(&"deletecollection"),
+            "configmaps must advertise 'deletecollection' — namespace cleanup \
+             requires deleteCollection for all namespaced resource types"
         );
     }
 

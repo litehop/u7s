@@ -633,6 +633,8 @@ where
         let parsed = parse_path(&path);
         let verb = if req.method() == axum::http::Method::GET {
             get_verb(parsed.name.as_deref(), req.uri().query())
+        } else if req.method() == axum::http::Method::DELETE && parsed.name.is_none() {
+            "deletecollection"
         } else {
             method_to_verb(req.method())
         };
@@ -1400,5 +1402,68 @@ mod tests {
             }
             AuthnResult::BadToken => panic!("expected anonymous"),
         }
+    }
+
+    /// DELETE on a namespaced collection must use the "deletecollection" RBAC verb.
+    ///
+    /// The KCM namespace controller calls DELETE on collection endpoints to clean up
+    /// child resources.  If the verb is "delete" instead of "deletecollection", a
+    /// role that only grants "deletecollection" (the correct Kubernetes RBAC verb for
+    /// this operation) would deny the request, leaving services alive after namespace
+    /// deletion and blocking the kubernetes finalizer forever.
+    #[test]
+    fn delete_on_collection_path_uses_deletecollection_verb() {
+        let idx = RbacIndex::new();
+
+        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/ns-cleanup";
+        let role_val = serde_json::json!({
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["services"],
+                "verbs": ["deletecollection"]
+            }]
+        });
+        idx.apply_object(role_key, &role_val);
+
+        let binding_key =
+            "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/ns-cleanup-binding";
+        let binding_val = serde_json::json!({
+            "subjects": [{"kind": "ServiceAccount", "name": "namespace-controller",
+                          "namespace": "kube-system"}],
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "ClusterRole", "name": "ns-cleanup"}
+        });
+        idx.apply_object(binding_key, &binding_val);
+
+        let parsed = parse_path("/api/v1/namespaces/test-ns/services");
+        assert!(
+            parsed.name.is_none(),
+            "collection path must have no resource name"
+        );
+
+        let verb = if parsed.name.is_none() {
+            "deletecollection"
+        } else {
+            "delete"
+        };
+
+        let allowed = idx.is_allowed(&AuthzRequest {
+            username: "system:serviceaccount:kube-system:namespace-controller",
+            groups: &[],
+            verb,
+            api_group: &parsed.api_group,
+            resource: &parsed.resource,
+            subresource: &parsed.subresource,
+            namespace: parsed.namespace.as_deref(),
+            name: parsed.name.as_deref(),
+            non_resource_url: None,
+        });
+
+        assert!(
+            allowed,
+            "DELETE on collection path must use 'deletecollection' verb so that \
+             the namespace controller's RBAC grants apply — using 'delete' instead \
+             would block namespace cleanup"
+        );
     }
 }
