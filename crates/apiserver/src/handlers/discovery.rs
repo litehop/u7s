@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -60,38 +60,8 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("storage.k8s.io", "v1"),
 ];
 
-/// Returns true if the Accept header requests the AggregatedDiscovery format.
-/// The conformance tests send `Accept: application/json;g=apidiscovery.k8s.io;v=v2beta1`.
-fn wants_aggregated_discovery(headers: &HeaderMap) -> bool {
-    headers.get_all(axum::http::header::ACCEPT).iter().any(|v| {
-        v.to_str()
-            .map(|s| s.contains("apidiscovery.k8s.io"))
-            .unwrap_or(false)
-    })
-}
-
-pub async fn api_group_list<S: Store>(
-    State(state): State<AppState<S>>,
-    headers: HeaderMap,
-) -> Response {
-    if wants_aggregated_discovery(&headers) {
-        let list = build_aggregated_discovery(&state).await;
-        // The response Content-Type must be the aggregated-discovery media type so
-        // kubectl knows the server understood the request and returned the merged
-        // APIGroupDiscoveryList.  Without this header, kubectl 1.27+ falls back to
-        // the legacy discovery path and tries to decode the body as APIGroupList —
-        // producing an empty resource mapper that makes every `kubectl apply` fail
-        // with "no matches for kind".
-        return (
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "application/json;g=apidiscovery.k8s.io;v=v2beta1",
-            )],
-            Json(list),
-        )
-            .into_response();
-    }
-    Json(api_group_list_inner(&state).await).into_response()
+pub async fn api_group_list<S: Store>(State(state): State<AppState<S>>) -> Json<APIGroupList> {
+    Json(api_group_list_inner(&state).await)
 }
 
 pub(crate) async fn api_group_list_inner<S: Store>(state: &AppState<S>) -> APIGroupList {
@@ -2208,36 +2178,46 @@ mod tests {
         );
     }
 
-    // GET /apis with the AggregatedDiscovery Accept header must return an APIGroupDiscoveryList
-    // containing both the core group ("") with v1 resources and the apps group with v1 resources.
-    // Without this, the 4 AggregatedDiscovery conformance tests fail because the server returns
-    // a plain APIGroupList instead of the merged APIGroupDiscoveryList the test expects.
+    // GET /apis must always return a plain APIGroupList — /apis is the legacy discovery
+    // endpoint used by kubectl and all Kubernetes clients. Aggregated discovery is only
+    // served from /discovery/v2, which clients probe separately. Returning an
+    // APIGroupDiscoveryList from /apis breaks clients that expect APIGroupList.
     #[tokio::test]
-    async fn aggregated_discovery_accept_header_returns_api_group_discovery_list() {
+    async fn apis_returns_api_group_list() {
         let state = make_state();
-        let resp = api_group_list(State(state), {
-            let mut h = axum::http::HeaderMap::new();
-            h.insert(
-                axum::http::header::ACCEPT,
-                axum::http::HeaderValue::from_static(
-                    "application/json;g=apidiscovery.k8s.io;v=v2beta1",
-                ),
-            );
-            h
-        })
-        .await;
+        let Json(list) = api_group_list(State(state)).await;
 
         assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "GET /apis with AggregatedDiscovery Accept must return 200"
+            list.kind, "APIGroupList",
+            "GET /apis must return kind=APIGroupList — all kubectl versions expect this format"
         );
+        assert!(
+            !list.groups.is_empty(),
+            "APIGroupList must contain at least one group"
+        );
+    }
 
-        // kubectl 1.27+ uses the response Content-Type to decide whether the server
-        // understood aggregated discovery.  Without this specific media type, kubectl
-        // falls back to the legacy APIGroupList path and tries to decode our
-        // APIGroupDiscoveryList body as APIGroupList — the resource mapper ends up
-        // empty and every `kubectl apply` fails with "no matches for kind".
+    // GET /discovery/v2 must return an APIGroupDiscoveryList with correct Content-Type,
+    // core group resources, and apps/v1 resources. Conformance tests use this dedicated
+    // endpoint rather than Accept-header negotiation on /apis.
+    #[tokio::test]
+    async fn discovery_v2_returns_aggregated_discovery_list_with_correct_content_type() {
+        let app = Router::new()
+            .route(
+                "/discovery/v2",
+                get(aggregated_discovery_v2::<u7s_store::SqliteStore>),
+            )
+            .with_state(make_state());
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/discovery/v2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
         let ct = resp
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -2245,98 +2225,47 @@ mod tests {
             .unwrap_or("");
         assert_eq!(
             ct, "application/json;g=apidiscovery.k8s.io;v=v2beta1",
-            "aggregated discovery response must carry Content-Type \
-             'application/json;g=apidiscovery.k8s.io;v=v2beta1' so kubectl \
-             uses the aggregated code path instead of falling back to APIGroupList"
+            "/discovery/v2 must carry Content-Type 'application/json;g=apidiscovery.k8s.io;v=v2beta1' \
+             so conformance tests recognise it as aggregated discovery"
         );
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let val: serde_json::Value =
-            serde_json::from_slice(&body).expect("AggregatedDiscovery response must be valid JSON");
-
-        assert_eq!(
-            val["kind"], "APIGroupDiscoveryList",
-            "kind must be APIGroupDiscoveryList — conformance tests check this field"
-        );
-        assert_eq!(
-            val["apiVersion"], "apidiscovery.k8s.io/v2beta1",
-            "apiVersion must be apidiscovery.k8s.io/v2beta1"
-        );
-        assert!(
-            val["metadata"]["resourceVersion"].as_str().is_some(),
-            "resourceVersion must be present in metadata for ETag caching"
-        );
-
-        let items = val["items"].as_array().expect("items must be an array");
-        assert!(
-            !items.is_empty(),
-            "APIGroupDiscoveryList must have at least one item"
-        );
-
-        // The core group must appear as an item with name="" and v1 resources.
-        let core = items.iter().find(|i| i["metadata"]["name"] == "");
-        assert!(
-            core.is_some(),
-            "core group (name='') must appear in APIGroupDiscoveryList — \
-             conformance tests probe core/v1 pods, services etc. via aggregated discovery"
-        );
-        let core_versions = core.unwrap()["versions"].as_array().unwrap();
-        assert!(
-            core_versions.iter().any(|v| v["version"] == "v1"),
-            "core group must list v1 in its versions"
-        );
-        let core_v1 = core_versions.iter().find(|v| v["version"] == "v1").unwrap();
-        let core_resources = core_v1["resources"].as_array().unwrap();
-        let core_resource_names: Vec<&str> = core_resources
-            .iter()
-            .filter_map(|r| r["resource"].as_str())
-            .collect();
-        assert!(
-            core_resource_names.contains(&"pods"),
-            "core/v1 must include pods in aggregated discovery; got: {core_resource_names:?}"
-        );
-
-        // The apps group must appear with v1 and include deployments.
-        let apps = items.iter().find(|i| i["metadata"]["name"] == "apps");
-        assert!(
-            apps.is_some(),
-            "apps group must appear in APIGroupDiscoveryList — \
-             conformance tests probe apps/v1 deployments via aggregated discovery"
-        );
-        let apps_versions = apps.unwrap()["versions"].as_array().unwrap();
-        let apps_v1 = apps_versions.iter().find(|v| v["version"] == "v1").unwrap();
-        let apps_resources = apps_v1["resources"].as_array().unwrap();
-        let apps_resource_names: Vec<&str> = apps_resources
-            .iter()
-            .filter_map(|r| r["resource"].as_str())
-            .collect();
-        assert!(
-            apps_resource_names.contains(&"deployments"),
-            "apps/v1 must include deployments in aggregated discovery; got: {apps_resource_names:?}"
-        );
-    }
-
-    // GET /apis without the AggregatedDiscovery Accept header must return a plain APIGroupList,
-    // not an APIGroupDiscoveryList. kubectl and legacy clients depend on the old format
-    // when they do not request aggregated discovery.
-    #[tokio::test]
-    async fn apis_without_aggregated_accept_returns_api_group_list() {
-        let state = make_state();
-        let resp = api_group_list(State(state), axum::http::HeaderMap::new()).await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(
-            val["kind"], "APIGroupList",
-            "GET /apis without aggregated Accept must return kind=APIGroupList — \
-             legacy kubectl clients break if they receive an unexpected kind"
+        assert_eq!(val["kind"], "APIGroupDiscoveryList");
+        assert_eq!(val["apiVersion"], "apidiscovery.k8s.io/v2beta1");
+        assert!(val["metadata"]["resourceVersion"].as_str().is_some());
+
+        let items = val["items"].as_array().expect("items must be an array");
+
+        let core = items.iter().find(|i| i["metadata"]["name"] == "");
+        assert!(core.is_some(), "core group must appear in /discovery/v2");
+        let core_resources = core.unwrap()["versions"][0]["resources"]
+            .as_array()
+            .unwrap();
+        let core_names: Vec<&str> = core_resources
+            .iter()
+            .filter_map(|r| r["resource"].as_str())
+            .collect();
+        assert!(
+            core_names.contains(&"pods"),
+            "core/v1 must include pods; got: {core_names:?}"
+        );
+
+        let apps = items.iter().find(|i| i["metadata"]["name"] == "apps");
+        assert!(apps.is_some(), "apps group must appear in /discovery/v2");
+        let apps_resources = apps.unwrap()["versions"][0]["resources"]
+            .as_array()
+            .unwrap();
+        let apps_names: Vec<&str> = apps_resources
+            .iter()
+            .filter_map(|r| r["resource"].as_str())
+            .collect();
+        assert!(
+            apps_names.contains(&"deployments"),
+            "apps/v1 must include deployments; got: {apps_names:?}"
         );
     }
 
