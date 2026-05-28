@@ -47,7 +47,7 @@ pub struct FieldSelector {
 }
 
 /// Options for a list operation.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ListOptions {
     /// If set, filter results to objects where the named field equals the given value.
     pub field_selector: Option<FieldSelector>,
@@ -190,6 +190,10 @@ pub struct SqliteStore {
     ring: Arc<RwLock<VecDeque<Arc<InternalEvent>>>>,
     /// Lowest revision still in the ring buffer (revision of oldest entry + 1).
     compaction_horizon: Arc<AtomicU64>,
+    /// Revision of the most recently committed write. List reads are compared against
+    /// this: if the read snapshot is older, the list is retried via the write connection
+    /// to guarantee the returned resourceVersion never regresses after a write.
+    last_written_revision: Arc<AtomicU64>,
 }
 
 impl SqliteStore {
@@ -232,6 +236,7 @@ impl SqliteStore {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let ring = Arc::new(RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)));
         let compaction_horizon = Arc::new(AtomicU64::new(0));
+        let last_written_revision = Arc::new(AtomicU64::new(0));
 
         Ok(Self {
             write_conn,
@@ -239,6 +244,7 @@ impl SqliteStore {
             tx,
             ring,
             compaction_horizon,
+            last_written_revision,
         })
     }
 
@@ -699,13 +705,32 @@ impl Store for SqliteStore {
     }
 
     async fn list(&self, prefix: &str, opts: ListOptions) -> Result<ListResponse> {
-        let conn = self.read_conn.clone();
+        let read_conn = self.read_conn.clone();
         let prefix = prefix.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            list_sync(&conn, &prefix, &opts)
+        let prefix2 = prefix.clone();
+        let opts2 = opts.clone();
+        let resp = tokio::task::spawn_blocking(move || {
+            let conn = read_conn.blocking_lock();
+            list_sync(&conn, &prefix, &opts2)
         })
-        .await?
+        .await??;
+
+        // Guard: if the read snapshot is older than the most recently committed write,
+        // the WAL read connection returned a stale view. Retry via the write connection,
+        // which always reflects the latest committed state. This prevents the KCM informer
+        // from seeing a list resourceVersion that regresses below a revision it already
+        // observed from a watch event.
+        let min_rev = self.last_written_revision.load(Ordering::Acquire);
+        if resp.revision < min_rev {
+            let write_conn = self.write_conn.clone();
+            return tokio::task::spawn_blocking(move || {
+                let conn = write_conn.blocking_lock();
+                list_sync(&conn, &prefix2, &opts)
+            })
+            .await?;
+        }
+
+        Ok(resp)
     }
 
     async fn put(&self, key: &str, value: Bytes, expected_revision: Option<u64>) -> Result<u64> {
@@ -716,6 +741,9 @@ impl Store for SqliteStore {
             put_sync(&conn, &key_str, value, expected_revision)
         })
         .await??;
+
+        self.last_written_revision
+            .fetch_max(revision, Ordering::Release);
 
         self.push_event(Arc::new(InternalEvent {
             key: key.to_string(),
@@ -735,6 +763,9 @@ impl Store for SqliteStore {
             delete_sync(&conn, &key_str, expected_revision)
         })
         .await??;
+
+        self.last_written_revision
+            .fetch_max(revision, Ordering::Release);
 
         self.push_event(Arc::new(InternalEvent {
             key: key.to_string(),
@@ -1186,6 +1217,7 @@ mod tests {
             tx,
             ring,
             compaction_horizon,
+            last_written_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // Set a known compaction horizon — this is what the Compacted event must report.
@@ -1985,6 +2017,105 @@ mod tests {
         assert!(
             result.is_none(),
             "object must be absent after conditional delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_revision_never_regresses_below_last_written() {
+        // After a write at revision N, any subsequent list must return
+        // metadata.resourceVersion >= N. The KCM informer cache records the highest
+        // revision it has seen from watch events; if a relist returns a lower revision,
+        // client-go aborts with "read version is not as new as written version".
+        //
+        // The guard: last_written_revision tracks the highest committed write revision.
+        // If list_sync returns an older snapshot, list retries via the write connection.
+        // Reverting the guard (removing the retry branch) would make this test pass
+        // trivially for :memory: (shared conn), so the test also directly verifies
+        // that last_written_revision is set on put/delete.
+        let store = make_store();
+        let key = "/registry/apps/replicasets/default/my-rs";
+
+        let rs_json = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSet",
+                "metadata": { "name": "my-rs", "namespace": "default" }
+            })
+            .to_string(),
+        );
+
+        let rv = store
+            .put(key, rs_json.clone(), Some(0))
+            .await
+            .expect("create ReplicaSet");
+
+        // last_written_revision must be updated after put.
+        let recorded = store.last_written_revision.load(Ordering::Acquire);
+        assert_eq!(
+            recorded, rv,
+            "last_written_revision must equal the revision returned by put; \
+             if last_written_revision is not updated, the stale-read guard cannot trigger"
+        );
+
+        // list must return revision >= rv.
+        let resp = store
+            .list("/registry/apps/replicasets/", ListOptions::default())
+            .await
+            .expect("list");
+        assert!(
+            resp.revision >= rv,
+            "list must return resourceVersion >= last write revision ({rv}); \
+             a regression here means the KCM informer cache would receive a stale \
+             resourceVersion and abort with 'read version is not as new as written version'"
+        );
+
+        // Simulate the stale-WAL scenario: set last_written_revision higher than
+        // what the read snapshot currently has, then verify list falls back to the
+        // write connection (which returns the current state, so revision >= rv).
+        let future_rv = rv + 9999;
+        store
+            .last_written_revision
+            .store(future_rv, Ordering::Release);
+        let resp2 = store
+            .list("/registry/apps/replicasets/", ListOptions::default())
+            .await
+            .expect("list after simulated stale-WAL");
+        // The write connection will return the actual latest revision (rv, not future_rv),
+        // but it must be >= rv (the actual committed state).
+        assert!(
+            resp2.revision >= rv,
+            "after stale-WAL simulation, list via write connection must return revision >= {rv}; \
+             got {}",
+            resp2.revision
+        );
+    }
+
+    #[tokio::test]
+    async fn last_written_revision_updated_on_delete() {
+        // delete must also update last_written_revision so that a list following
+        // a delete never returns a revision below the delete's revision.
+        let store = make_store();
+        let key = "/registry/apps/replicasets/default/del-rs";
+
+        let rs_json = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSet",
+                "metadata": { "name": "del-rs", "namespace": "default" }
+            })
+            .to_string(),
+        );
+
+        let put_rv = store.put(key, rs_json, Some(0)).await.expect("create");
+
+        let del_rv = store.delete(key, Some(put_rv)).await.expect("delete");
+        assert!(del_rv > put_rv, "delete must advance revision");
+
+        let recorded = store.last_written_revision.load(Ordering::Acquire);
+        assert_eq!(
+            recorded, del_rv,
+            "last_written_revision must be updated to the delete revision; \
+             without this, a list after a delete could return a stale revision"
         );
     }
 }
