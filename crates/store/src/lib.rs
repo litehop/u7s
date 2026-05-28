@@ -206,7 +206,9 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS objects (
                 key      TEXT    NOT NULL PRIMARY KEY,
                 value    BLOB    NOT NULL,
-                revision INTEGER NOT NULL
+                revision INTEGER NOT NULL,
+                ns       TEXT,
+                obj_name TEXT
             ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS meta (
@@ -219,6 +221,9 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_pods_nodename
             ON objects (json_extract(value, '$.spec.nodeName'))
             WHERE key LIKE '/registry/pods/%';
+
+            CREATE INDEX IF NOT EXISTS idx_ns ON objects(ns) WHERE ns IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_name ON objects(obj_name);
         ",
         )?;
 
@@ -368,11 +373,26 @@ fn put_sync(
     // 6. Stamp metadata.resourceVersion in the JSON value.
     let stamped_value = stamp_resource_version(&value, new_revision)?;
 
-    // 7. Upsert the object.
+    // 7. Extract ns and obj_name for indexed columns.
+    let (ns, obj_name) = {
+        let obj: serde_json::Value = serde_json::from_slice(&stamped_value)?;
+        let ns = obj["metadata"]["namespace"].as_str().map(str::to_owned);
+        let obj_name = obj["metadata"]["name"].as_str().map(str::to_owned);
+        (ns, obj_name)
+    };
+
+    // 8. Upsert the object.
     conn.execute(
-        "INSERT INTO objects (key, value, revision) VALUES (?1, ?2, ?3)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, revision = excluded.revision",
-        params![key, stamped_value.as_ref(), new_revision as i64],
+        "INSERT INTO objects (key, value, revision, ns, obj_name) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, revision = excluded.revision,
+         ns = excluded.ns, obj_name = excluded.obj_name",
+        params![
+            key,
+            stamped_value.as_ref(),
+            new_revision as i64,
+            ns,
+            obj_name
+        ],
     )?;
 
     conn.execute_batch("COMMIT")?;
@@ -481,18 +501,84 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
     // When a field selector is present, collect all matching rows then paginate in memory,
     // because in-memory filtering may discard rows between the cursor and the limit boundary.
     let (items, continue_key) = match &opts.field_selector {
-        // Fast-path: metadata.name=<value> — compute the exact key and do a single lookup.
-        // The prefix already encodes resource and namespace (namespaced) or just resource
-        // (cluster-scoped), so appending the name gives the full key without a scan.
+        // SQL index fast-path: metadata.name=<value> — uses idx_name index.
         Some(FieldSelector {
             field,
             value,
             negated: false,
         }) if field == "metadata.name" => {
-            let exact_key = format!("{}{}", prefix, value);
-            let item = get_sync(conn, &exact_key)?;
-            let items = item.into_iter().collect::<Vec<_>>();
-            (items, None)
+            let raw = if upper.is_empty() {
+                if ck.is_empty() {
+                    query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND obj_name = ?2 ORDER BY key ASC",
+                        &[&prefix, value as &dyn rusqlite::ToSql],
+                    )?
+                } else {
+                    query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND obj_name = ?2 AND key > ?3 ORDER BY key ASC",
+                        &[&prefix, value as &dyn rusqlite::ToSql, &ck],
+                    )?
+                }
+            } else if ck.is_empty() {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 ORDER BY key ASC",
+                    &[&prefix, &upper, value as &dyn rusqlite::ToSql],
+                )?
+            } else {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 AND key > ?4 ORDER BY key ASC",
+                    &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck],
+                )?
+            };
+            paginate_in_memory(raw, opts.limit)
+        }
+
+        // SQL index fast-path: metadata.namespace=<value> — uses idx_ns index.
+        Some(FieldSelector {
+            field,
+            value,
+            negated: false,
+        }) if field == "metadata.namespace" => {
+            let raw = if upper.is_empty() {
+                if ck.is_empty() {
+                    query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND ns = ?2 ORDER BY key ASC",
+                        &[&prefix, value as &dyn rusqlite::ToSql],
+                    )?
+                } else {
+                    query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND ns = ?2 AND key > ?3 ORDER BY key ASC",
+                        &[&prefix, value as &dyn rusqlite::ToSql, &ck],
+                    )?
+                }
+            } else if ck.is_empty() {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key >= ?1 AND key < ?2 AND ns = ?3 ORDER BY key ASC",
+                    &[&prefix, &upper, value as &dyn rusqlite::ToSql],
+                )?
+            } else {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key >= ?1 AND key < ?2 AND ns = ?3 AND key > ?4 ORDER BY key ASC",
+                    &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck],
+                )?
+            };
+            paginate_in_memory(raw, opts.limit)
         }
 
         // Indexed fast-path: spec.nodeName on pods — uses the partial index.
@@ -1208,10 +1294,12 @@ mod tests {
             use rusqlite::Connection;
             let conn = Connection::open(":memory:").unwrap();
             conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, revision INTEGER NOT NULL) WITHOUT ROWID;
+                "CREATE TABLE IF NOT EXISTS objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID;
                  CREATE TABLE IF NOT EXISTS meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);
                  INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
-                 CREATE INDEX IF NOT EXISTS idx_pods_nodename ON objects (json_extract(value, '$.spec.nodeName')) WHERE key LIKE '/registry/pods/%';",
+                 CREATE INDEX IF NOT EXISTS idx_pods_nodename ON objects (json_extract(value, '$.spec.nodeName')) WHERE key LIKE '/registry/pods/%';
+                 CREATE INDEX IF NOT EXISTS idx_ns ON objects(ns) WHERE ns IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_name ON objects(obj_name);",
             ).unwrap();
             conn
         };
@@ -1374,8 +1462,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_field_selector_fallback() {
-        // Verifies the in-memory filter path for non-indexed fields.
-        // metadata.namespace is not indexed; the code must fall back to a full scan + filter.
+        // Verifies that metadata.namespace field selector returns only objects in that namespace.
+        // metadata.namespace now uses the SQL idx_ns index fast-path.
         let store = make_store();
 
         store
@@ -2231,6 +2319,223 @@ mod tests {
             "after stale-WAL simulation, list via write connection must return revision >= {rv}; \
              got {}",
             resp2.revision
+        );
+    }
+
+    #[tokio::test]
+    async fn list_by_namespace_uses_index() {
+        // metadata.namespace field selector must return only objects in the requested namespace.
+        // The query is pushed down to SQL using the idx_ns index on the ns column, avoiding
+        // full-table scans and per-object JSON deserialization. If the SQL path is removed
+        // and reverted to in-memory filtering, this test still passes for correctness but
+        // the performance contract is broken.
+        let store = make_store();
+
+        store
+            .put(
+                "/registry/pods/ns-a/pod-1",
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Pod",
+                        "metadata": { "name": "pod-1", "namespace": "ns-a" },
+                        "spec": { "containers": [] }
+                    })
+                    .to_string(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("create pod-1 in ns-a");
+        store
+            .put(
+                "/registry/pods/ns-a/pod-2",
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Pod",
+                        "metadata": { "name": "pod-2", "namespace": "ns-a" },
+                        "spec": { "containers": [] }
+                    })
+                    .to_string(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("create pod-2 in ns-a");
+        store
+            .put(
+                "/registry/pods/ns-b/pod-3",
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Pod",
+                        "metadata": { "name": "pod-3", "namespace": "ns-b" },
+                        "spec": { "containers": [] }
+                    })
+                    .to_string(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("create pod-3 in ns-b");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "metadata.namespace".to_string(),
+                value: "ns-a".to_string(),
+                negated: false,
+            }),
+            ..Default::default()
+        };
+        let resp = store.list("/registry/pods/", opts).await.expect("list");
+
+        assert_eq!(
+            resp.items.len(),
+            2,
+            "metadata.namespace selector must return exactly the 2 pods in ns-a; \
+             pod-3 in ns-b must be excluded"
+        );
+        let keys: Vec<&str> = resp.items.iter().map(|o| o.key.as_str()).collect();
+        assert!(
+            keys.contains(&"/registry/pods/ns-a/pod-1"),
+            "pod-1 in ns-a must be included"
+        );
+        assert!(
+            keys.contains(&"/registry/pods/ns-a/pod-2"),
+            "pod-2 in ns-a must be included"
+        );
+        assert!(
+            !keys.contains(&"/registry/pods/ns-b/pod-3"),
+            "pod-3 in ns-b must be excluded by the namespace selector"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_by_name_uses_index() {
+        // metadata.name field selector must return only the object(s) with the matching name.
+        // The query is pushed down to SQL using the idx_name index on the obj_name column.
+        // Without the SQL index path, a full range scan + per-object JSON parse is required,
+        // which is O(n) in the number of objects rather than O(log n).
+        let store = make_store();
+
+        store
+            .put(
+                "/registry/configmaps/default/alpha",
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "ConfigMap",
+                        "metadata": { "name": "alpha", "namespace": "default" },
+                        "data": {}
+                    })
+                    .to_string(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("create alpha configmap");
+        store
+            .put(
+                "/registry/configmaps/default/beta",
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "ConfigMap",
+                        "metadata": { "name": "beta", "namespace": "default" },
+                        "data": {}
+                    })
+                    .to_string(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("create beta configmap");
+        store
+            .put(
+                "/registry/configmaps/other/alpha",
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "ConfigMap",
+                        "metadata": { "name": "alpha", "namespace": "other" },
+                        "data": {}
+                    })
+                    .to_string(),
+                ),
+                Some(0),
+            )
+            .await
+            .expect("create alpha configmap in other namespace");
+
+        let opts = ListOptions {
+            field_selector: Some(FieldSelector {
+                field: "metadata.name".to_string(),
+                value: "alpha".to_string(),
+                negated: false,
+            }),
+            ..Default::default()
+        };
+        let resp = store
+            .list("/registry/configmaps/default/", opts)
+            .await
+            .expect("list");
+
+        assert_eq!(
+            resp.items.len(),
+            1,
+            "metadata.name selector scoped to /default/ prefix must return exactly 1 object; \
+             beta and alpha-in-other-ns must be excluded"
+        );
+        assert_eq!(
+            resp.items[0].key, "/registry/configmaps/default/alpha",
+            "only the alpha configmap in the default namespace must be returned"
+        );
+    }
+
+    #[test]
+    fn explain_query_plan_shows_index_for_ns_and_name() {
+        // Verifies that SQLite uses the idx_ns and idx_name indexes for field selector queries,
+        // not a full table scan. If the indexes are dropped or the WHERE clause changes to use
+        // json_extract, EXPLAIN QUERY PLAN would show "SCAN objects" instead of "SEARCH objects".
+        // This test would fail if the indexes were removed or the SQL path reverted to a full scan.
+        let store = SqliteStore::new(":memory:").expect("open in-memory db");
+        let conn = store.write_conn.blocking_lock();
+
+        let plan_ns: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN \
+                     SELECT key, value, revision FROM objects \
+                     WHERE key >= '/registry/pods/' AND key < '/registry/pods0' AND ns = 'default' \
+                     ORDER BY key ASC",
+                )
+                .expect("prepare ns plan");
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .expect("query")
+                .map(|r| r.expect("row"))
+                .collect()
+        };
+
+        let plan_ns_str = plan_ns.join(" ");
+        assert!(
+            plan_ns_str.to_lowercase().contains("search"),
+            "EXPLAIN QUERY PLAN for ns= must show SEARCH (index usage), got: {plan_ns_str}"
+        );
+
+        let plan_name: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN \
+                     SELECT key, value, revision FROM objects \
+                     WHERE key >= '/registry/pods/' AND key < '/registry/pods0' AND obj_name = 'nginx' \
+                     ORDER BY key ASC",
+                )
+                .expect("prepare name plan");
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .expect("query")
+                .map(|r| r.expect("row"))
+                .collect()
+        };
+
+        let plan_name_str = plan_name.join(" ");
+        assert!(
+            plan_name_str.to_lowercase().contains("search"),
+            "EXPLAIN QUERY PLAN for obj_name= must show SEARCH (index usage), got: {plan_name_str}"
         );
     }
 
