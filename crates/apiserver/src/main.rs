@@ -327,6 +327,13 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::pods::replace_pod_status)
                 .patch(handlers::pods::patch_pod_status),
         )
+        // Pods — resize subresource (in-place resource update, GA k8s 1.33+)
+        // Must be before the generic catch-all so axum doesn't interpret "resize" as a pod name.
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/resize",
+            axum::routing::patch(handlers::pods::patch_pod_resize)
+                .put(handlers::pods::patch_pod_resize),
+        )
         // Pods — log subresource (kubelet proxy): must be before generic catch-all
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/log",

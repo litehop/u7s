@@ -1055,6 +1055,79 @@ pub async fn patch_pod_status<S: Store>(
 }
 
 // ---------------------------------------------------------------------------
+// Resize subresource — PATCH/PUT /api/v1/namespaces/:ns/pods/:name/resize
+// ---------------------------------------------------------------------------
+
+/// Merge incoming container resources onto the stored pod (match by container name),
+/// then set status.resize = "Proposed".
+///
+/// Only spec.containers[].resources is updated; all other fields are preserved.
+/// This is the pure logic extracted for testability.
+pub fn apply_resize_patch(
+    stored: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> serde_json::Value {
+    let mut result = stored.clone();
+    if let Some(incoming_containers) = incoming["spec"]["containers"].as_array() {
+        if let Some(stored_containers) = result["spec"]["containers"].as_array_mut() {
+            for stored_container in stored_containers.iter_mut() {
+                let stored_name = stored_container["name"].as_str().unwrap_or("");
+                if let Some(incoming_container) = incoming_containers
+                    .iter()
+                    .find(|c| c["name"].as_str().unwrap_or("") == stored_name)
+                {
+                    if !incoming_container["resources"].is_null() {
+                        stored_container["resources"] = incoming_container["resources"].clone();
+                    }
+                }
+            }
+        }
+    }
+    result["status"]["resize"] = serde_json::json!("Proposed");
+    result
+}
+
+pub async fn patch_pod_resize<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns, &state).await?;
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let body = extract_body(&body, ct);
+    let incoming: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    let mut current_obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    current_obj.body = apply_resize_patch(&current_obj.body, &incoming);
+
+    let expected_rv = parse_resource_version(current_obj.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current_obj.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, &name))?;
+
+    current_obj.set_resource_version(new_rv);
+
+    Ok(Json(current_obj.body))
+}
+
+// ---------------------------------------------------------------------------
 // Binding subresource — POST /api/v1/namespaces/:ns/pods/:name/binding
 // ---------------------------------------------------------------------------
 
@@ -4245,6 +4318,292 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // patch_pod_resize (PATCH + PUT /resize)
+    // -----------------------------------------------------------------------
+
+    /// PATCH /resize with updated container resources must update the stored pod's resources
+    /// and set status.resize = "Proposed".
+    ///
+    /// This is the core in-place resource update (VPA GA in k8s 1.33+) flow. If resources
+    /// are not updated or status.resize is not "Proposed", conformance tests for in-place
+    /// pod resize fail and the feature is not usable.
+    #[tokio::test]
+    async fn patch_pod_resize_updates_resources_and_sets_proposed() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        // Seed a pod with CPU limit 100m.
+        let key = "/registry/pods/default/resize-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "resize-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {
+                        "limits": {"cpu": "100m"},
+                        "requests": {"cpu": "100m"}
+                    }
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                patch(patch_pod_resize).put(patch_pod_resize),
+            )
+            .with_state(state);
+
+        // PATCH /resize with updated CPU limit 200m.
+        let resize_body = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "200m"},
+                        "requests": {"cpu": "200m"}
+                    }
+                }]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/resize-pod/resize")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&resize_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PATCH /resize must return 200 — conformance tests require this"
+        );
+
+        // Verify store: resources updated and status.resize = "Proposed".
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["spec"]["containers"][0]["resources"]["limits"]["cpu"], "200m",
+            "container resources must be updated to 200m after /resize PATCH — \
+             if this fails the in-place resize feature is not working (mayor-sor9)"
+        );
+        assert_eq!(
+            v["status"]["resize"], "Proposed",
+            "status.resize must be set to 'Proposed' after /resize PATCH — \
+             conformance tests assert this field to verify the resize was acknowledged"
+        );
+    }
+
+    /// PUT /resize must behave identically to PATCH /resize.
+    #[tokio::test]
+    async fn put_pod_resize_updates_resources_and_sets_proposed() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/resize-pod2";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "resize-pod2", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}}}]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                patch(patch_pod_resize).put(patch_pod_resize),
+            )
+            .with_state(state);
+
+        let resize_body = serde_json::json!({
+            "spec": {"containers": [{"name": "app",
+                "resources": {"limits": {"cpu": "500m"}}}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/resize-pod2/resize")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&resize_body))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "PUT /resize must return 200");
+
+        let stored = store.get(key).await.unwrap().expect("pod must exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["containers"][0]["resources"]["limits"]["cpu"], "500m",
+            "PUT /resize must update container resources"
+        );
+        assert_eq!(
+            v["status"]["resize"], "Proposed",
+            "PUT /resize must set status.resize=Proposed"
+        );
+    }
+
+    /// PATCH /resize on a missing pod must return 404.
+    #[tokio::test]
+    async fn patch_pod_resize_missing_pod_returns_404() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                patch(patch_pod_resize),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/nonexistent/resize")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"spec":{"containers":[]}}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PATCH /resize on non-existent pod must return 404"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure-logic tests for apply_resize_patch
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    /// apply_resize_patch merges container resources by name and sets status.resize = "Proposed".
+    ///
+    /// This is the primary in-place resize contract: if the container resources are not updated
+    /// or status.resize is not set, the conformance test for pod resize fails.
+    #[test]
+    fn apply_resize_patch_updates_resources_and_sets_proposed() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "my-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {"limits": {"cpu": "200m"}, "requests": {"cpu": "200m"}}
+                }]
+            }
+        });
+
+        let result = apply_resize_patch(&stored, &incoming);
+
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["limits"]["cpu"], "200m",
+            "container resources must be updated to 200m — \
+             if this fails the in-place resize feature is broken (mayor-sor9)"
+        );
+        assert_eq!(
+            result["status"]["resize"], "Proposed",
+            "status.resize must be set to 'Proposed' — conformance tests assert this field"
+        );
+        // Unchanged fields must survive.
+        assert_eq!(
+            result["spec"]["containers"][0]["image"], "nginx",
+            "container image must be preserved after resize patch"
+        );
+        assert_eq!(
+            result["status"]["phase"], "Running",
+            "status.phase must be preserved after resize patch"
+        );
+    }
+
+    /// apply_resize_patch only updates the container matching by name; other containers are unchanged.
+    #[test]
+    fn apply_resize_patch_only_updates_matching_container() {
+        let stored = serde_json::json!({
+            "spec": {
+                "containers": [
+                    {"name": "app", "resources": {"limits": {"cpu": "100m"}}},
+                    {"name": "sidecar", "resources": {"limits": {"cpu": "50m"}}}
+                ]
+            },
+            "status": {}
+        });
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "resources": {"limits": {"cpu": "300m"}}}]
+            }
+        });
+
+        let result = apply_resize_patch(&stored, &incoming);
+
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["limits"]["cpu"], "300m",
+            "named container resources must be updated"
+        );
+        assert_eq!(
+            result["spec"]["containers"][1]["resources"]["limits"]["cpu"], "50m",
+            "sidecar container must be unchanged — resize only targets named containers"
+        );
+    }
+
+    /// apply_resize_patch with no matching container name leaves all containers unchanged.
+    #[test]
+    fn apply_resize_patch_no_match_leaves_containers_unchanged() {
+        let stored = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "resources": {"limits": {"cpu": "100m"}}}]
+            },
+            "status": {}
+        });
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "nonexistent", "resources": {"limits": {"cpu": "999m"}}}]
+            }
+        });
+
+        let result = apply_resize_patch(&stored, &incoming);
+
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["limits"]["cpu"], "100m",
+            "unmatched container resources must be unchanged"
+        );
+        // status.resize is still set even if no container matched.
+        assert_eq!(result["status"]["resize"], "Proposed");
     }
 }
 
