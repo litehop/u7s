@@ -841,4 +841,159 @@ mod tests {
         assert_eq!(json["metadata"]["name"], "widgets.example.com");
         assert_eq!(json["spec"]["group"], "example.com");
     }
+
+    /// test_storageclass_create_kubectl_wire_format
+    ///
+    /// kubectl create storageclass fast-ssd --provisioner=kubernetes.io/no-provisioner sends:
+    ///   Content-Type: application/vnd.kubernetes.protobuf
+    ///   Body: magic + Unknown{ TypeMeta{storage.k8s.io/v1/StorageClass}, raw=proto(StorageClass), contentType="" (absent) }
+    ///
+    /// extract_body must produce valid JSON from the proto-encoded body. Previously,
+    /// decode_core_proto_by_kind returned None for "StorageClass" because no decoder was registered.
+    /// extract_body then returned the original proto bytes, Object::from_bytes failed with
+    /// "invalid JSON: expected value at line 1 column 1", and the apiserver returned HTTP 400
+    /// causing e2e StorageClasses lifecycle tests to fail.
+    ///
+    /// This test fails if the StorageClass decoder is removed from decode_core_proto_by_kind.
+    #[test]
+    fn test_storageclass_create_kubectl_wire_format() {
+        // Build ObjectMeta { name: "fast-ssd" }
+        let obj_meta = build_object_meta(b"fast-ssd", None);
+
+        // StorageClass { metadata (field 1) = ObjectMeta }
+        let storageclass_proto = encode_ld(1, &obj_meta);
+
+        // kubectl sends with empty contentType (absent field 4) — native proto encoding
+        let body = build_kubectl_proto_body(
+            b"storage.k8s.io/v1",
+            b"StorageClass",
+            &storageclass_proto,
+            None,
+        );
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+
+        // The key assertion: response must be non-empty valid JSON.
+        // If the StorageClass decoder is removed, extract_body returns the raw proto bytes,
+        // serde_json::from_slice fails with "expected value at line 1 column 1", and the
+        // handler returns HTTP 400 instead of HTTP 201.
+        assert!(
+            !decoded.is_empty(),
+            "extract_body must NOT return empty bytes for proto-encoded StorageClass — \
+             empty bytes cause Object::from_bytes to fail with 'invalid JSON: expected value \
+             at line 1 column 1', making the apiserver return HTTP 400 instead of 201"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect(
+            "extract_body must produce valid JSON for proto-encoded StorageClass — \
+             before the fix, decode_core_proto_by_kind returned None for 'StorageClass', \
+             extract_body returned raw proto bytes, and the handler returned HTTP 400 \
+             'invalid JSON: expected value at line 1 column 1'",
+        );
+
+        assert_eq!(
+            json["kind"], "StorageClass",
+            "kind must be StorageClass so the handler routes and stores the object correctly"
+        );
+        assert_eq!(json["apiVersion"], "storage.k8s.io/v1");
+        assert_eq!(
+            json["metadata"]["name"], "fast-ssd",
+            "name must survive proto decode — used for store key and uniqueness check"
+        );
+    }
+
+    /// test_resourcequota_create_kubectl_wire_format
+    ///
+    /// kubectl create quota compute-quota --hard=pods=10 sends proto-encoded ResourceQuota.
+    /// Without a decoder, the server returns HTTP 400 causing e2e ResourceQuota tests to fail.
+    ///
+    /// This test fails if the ResourceQuota decoder is removed from decode_core_proto_by_kind.
+    #[test]
+    fn test_resourcequota_create_kubectl_wire_format() {
+        // Build ObjectMeta { name: "compute-quota", namespace: "default" }
+        let obj_meta = build_object_meta(b"compute-quota", Some(b"default"));
+
+        // ResourceQuota { metadata (field 1) = ObjectMeta }
+        let resourcequota_proto = encode_ld(1, &obj_meta);
+
+        let body = build_kubectl_proto_body(b"v1", b"ResourceQuota", &resourcequota_proto, None);
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+
+        assert!(
+            !decoded.is_empty(),
+            "extract_body must NOT return empty bytes for proto-encoded ResourceQuota"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect(
+            "extract_body must produce valid JSON for proto-encoded ResourceQuota — \
+             without the decoder, proto creates return HTTP 400 'invalid JSON'",
+        );
+
+        assert_eq!(json["kind"], "ResourceQuota");
+        assert_eq!(json["apiVersion"], "v1");
+        assert_eq!(json["metadata"]["name"], "compute-quota");
+        assert_eq!(json["metadata"]["namespace"], "default");
+    }
+
+    /// test_limitrange_create_kubectl_wire_format
+    ///
+    /// kubectl create limitrange limits sends proto-encoded LimitRange.
+    /// Without a decoder, the server returns HTTP 400 causing e2e LimitRange tests to fail.
+    ///
+    /// This test fails if the LimitRange decoder is removed from decode_core_proto_by_kind.
+    #[test]
+    fn test_limitrange_create_kubectl_wire_format() {
+        let obj_meta = build_object_meta(b"limits", Some(b"default"));
+        let limitrange_proto = encode_ld(1, &obj_meta);
+        let body = build_kubectl_proto_body(b"v1", b"LimitRange", &limitrange_proto, None);
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+
+        assert!(
+            !decoded.is_empty(),
+            "extract_body must NOT return empty bytes for proto-encoded LimitRange"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&decoded)
+            .expect("extract_body must produce valid JSON for proto-encoded LimitRange");
+
+        assert_eq!(json["kind"], "LimitRange");
+        assert_eq!(json["apiVersion"], "v1");
+        assert_eq!(json["metadata"]["name"], "limits");
+    }
+
+    /// test_poddisruptionbudget_create_kubectl_wire_format
+    ///
+    /// kubectl create pdb my-pdb sends proto-encoded PodDisruptionBudget.
+    /// Without a decoder, the server returns HTTP 400 causing e2e DisruptionController tests to fail.
+    ///
+    /// This test fails if the PodDisruptionBudget decoder is removed from decode_core_proto_by_kind.
+    #[test]
+    fn test_poddisruptionbudget_create_kubectl_wire_format() {
+        let obj_meta = build_object_meta(b"my-pdb", Some(b"default"));
+        let pdb_proto = encode_ld(1, &obj_meta);
+        let body = build_kubectl_proto_body(b"policy/v1", b"PodDisruptionBudget", &pdb_proto, None);
+        let bytes = Bytes::from(body);
+
+        let decoded = extract_body(&bytes, "application/vnd.kubernetes.protobuf");
+
+        assert!(
+            !decoded.is_empty(),
+            "extract_body must NOT return empty bytes for proto-encoded PodDisruptionBudget"
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&decoded).expect(
+            "extract_body must produce valid JSON for proto-encoded PodDisruptionBudget — \
+             without the decoder, proto creates return HTTP 400, causing DisruptionController \
+             e2e tests to fail",
+        );
+
+        assert_eq!(json["kind"], "PodDisruptionBudget");
+        assert_eq!(json["apiVersion"], "policy/v1");
+        assert_eq!(json["metadata"]["name"], "my-pdb");
+    }
 }
