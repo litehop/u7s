@@ -10,6 +10,15 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("apps", "deployments") = (group, plural) {
         default_deployment(obj);
     }
+    if let ("apps", "replicasets") = (group, plural) {
+        default_replicaset(obj);
+    }
+    if let ("apps", "statefulsets") = (group, plural) {
+        default_statefulset(obj);
+    }
+    if let ("apps", "daemonsets") = (group, plural) {
+        default_daemonset(obj);
+    }
     if let ("", "services") = (group, plural) {
         default_service(obj);
     }
@@ -161,7 +170,102 @@ pub fn default_service_ip_fields(obj: &mut serde_json::Value) {
     }
 }
 
+/// Validate a resource after defaults have been applied. Returns an error string
+/// suitable for a 400 Bad Request if required fields are missing.
+///
+/// Must be called after `apply_defaults` so that fields defaultable from other
+/// fields (e.g. spec.selector from template labels) have already been filled in.
+pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> Result<(), String> {
+    if let ("apps", "deployments") = (group, plural) {
+        validate_deployment(obj)?;
+    }
+    if let ("apps", "replicasets") = (group, plural) {
+        validate_selector(obj, "ReplicaSet")?;
+    }
+    if let ("apps", "statefulsets") = (group, plural) {
+        validate_selector(obj, "StatefulSet")?;
+    }
+    Ok(())
+}
+
+fn validate_deployment(obj: &serde_json::Value) -> Result<(), String> {
+    if obj["spec"]["selector"].is_null() {
+        return Err(
+            "Deployment.spec.selector is required and could not be defaulted \
+             (spec.template.metadata.labels is also missing)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_selector(obj: &serde_json::Value, kind: &str) -> Result<(), String> {
+    if obj["spec"]["selector"].is_null() {
+        return Err(format!("{kind}.spec.selector is required"));
+    }
+    Ok(())
+}
+
+fn default_replicaset(obj: &mut serde_json::Value) {
+    if obj["spec"]["replicas"].is_null() {
+        obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
+    }
+}
+
+fn default_statefulset(obj: &mut serde_json::Value) {
+    if obj["spec"]["replicas"].is_null() {
+        obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
+    }
+    if obj["spec"]["podManagementPolicy"].is_null() {
+        obj["spec"]["podManagementPolicy"] = serde_json::Value::String("OrderedReady".into());
+    }
+    if obj["spec"]["updateStrategy"]["type"].is_null() {
+        if !obj["spec"]["updateStrategy"].is_object() {
+            obj["spec"]["updateStrategy"] = serde_json::json!({});
+        }
+        obj["spec"]["updateStrategy"]["type"] = serde_json::Value::String("RollingUpdate".into());
+    }
+    if obj["spec"]["revisionHistoryLimit"].is_null() {
+        obj["spec"]["revisionHistoryLimit"] = serde_json::Value::Number(10.into());
+    }
+}
+
+fn default_daemonset(obj: &mut serde_json::Value) {
+    if obj["spec"]["updateStrategy"]["type"].is_null() {
+        if !obj["spec"]["updateStrategy"].is_object() {
+            obj["spec"]["updateStrategy"] = serde_json::json!({});
+        }
+        obj["spec"]["updateStrategy"]["type"] = serde_json::Value::String("RollingUpdate".into());
+    }
+    if obj["spec"]["updateStrategy"]["type"].as_str() == Some("RollingUpdate") {
+        if !obj["spec"]["updateStrategy"]["rollingUpdate"].is_object() {
+            obj["spec"]["updateStrategy"]["rollingUpdate"] = serde_json::json!({});
+        }
+        if obj["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"].is_null() {
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"] =
+                serde_json::Value::Number(1.into());
+        }
+        if obj["spec"]["updateStrategy"]["rollingUpdate"]["maxSurge"].is_null() {
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxSurge"] =
+                serde_json::Value::Number(0.into());
+        }
+    }
+    if obj["spec"]["revisionHistoryLimit"].is_null() {
+        obj["spec"]["revisionHistoryLimit"] = serde_json::Value::Number(10.into());
+    }
+}
+
 fn default_deployment(obj: &mut serde_json::Value) {
+    // spec.selector defaults to matchLabels from spec.template.metadata.labels.
+    // Upstream kube-apiserver rejects Deployments without spec.selector; u7s stores
+    // them as-is, so the KCM deployment-controller hits a nil selector and panics.
+    if obj["spec"]["selector"].is_null() {
+        let labels = obj["spec"]["template"]["metadata"]["labels"].clone();
+        if labels.is_object() {
+            obj["spec"]["selector"] = serde_json::json!({ "matchLabels": labels });
+        }
+    }
+
     // spec.replicas defaults to 1
     if obj["spec"]["replicas"].is_null() {
         obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
@@ -282,6 +386,136 @@ mod tests {
         assert!(
             obj["spec"]["strategy"]["rollingUpdate"].is_null(),
             "rollingUpdate must not be added when strategy is Recreate"
+        );
+    }
+
+    /// Deployment without spec.selector must have it defaulted from template labels.
+    ///
+    /// Upstream kube-apiserver rejects Deployments without spec.selector; u7s doesn't
+    /// validate this. The KCM deployment-controller calls CloneSelectorAndAddLabel on
+    /// spec.selector and panics with a nil-pointer dereference, killing the entire KCM
+    /// process (including the serviceaccount-controller). This causes all new namespaces
+    /// to never get a default ServiceAccount, breaking sonobuoy job tests.
+    #[test]
+    fn deployment_without_selector_gets_default_from_template_labels() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "test", "version": "v1" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "test", "version": "v1" } }),
+            "spec.selector must be defaulted from template labels — nil selector panics the KCM deployment-controller"
+        );
+    }
+
+    /// A Deployment with neither spec.selector nor template labels must be rejected.
+    ///
+    /// Upstream kube-apiserver returns 422 for this case. Without rejection, u7s stores
+    /// the object, KCM reads it, CloneSelectorAndAddLabel(nil) panics, and the entire
+    /// KCM process dies — taking the serviceaccount-controller with it.
+    #[test]
+    fn deployment_without_selector_or_labels_rejected() {
+        let obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "bad", "namespace": "test" },
+            "spec": {
+                "template": { "spec": { "containers": [] } }
+            }
+        });
+
+        let result = validate_resource("apps", "deployments", &obj);
+        assert!(
+            result.is_err(),
+            "Deployment with no selector and no template labels must be rejected — \
+             nil selector panics KCM deployment-controller"
+        );
+        assert!(
+            result.unwrap_err().contains("spec.selector"),
+            "error message must mention spec.selector"
+        );
+    }
+
+    /// A Deployment with an explicit spec.selector must pass validation.
+    #[test]
+    fn deployment_with_valid_selector_passes_validation() {
+        let obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "ok", "namespace": "test" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": { "spec": { "containers": [] } }
+            }
+        });
+
+        assert!(
+            validate_resource("apps", "deployments", &obj).is_ok(),
+            "Deployment with explicit spec.selector must pass validation"
+        );
+    }
+
+    /// apply_defaults + validate_resource must succeed for Deployments with template labels.
+    ///
+    /// Verifies the full write-path pipeline: selector is defaulted from template labels,
+    /// then validation confirms the selector is present.
+    #[test]
+    fn deployment_selector_defaulted_then_passes_validation() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "app": "test" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+        assert!(
+            validate_resource("apps", "deployments", &obj).is_ok(),
+            "Deployment with template labels must pass validation after selector is defaulted"
+        );
+    }
+
+    /// Existing spec.selector must not be overwritten.
+    ///
+    /// A Deployment may use a selector that's a strict subset of the template labels.
+    /// Overwriting it would break the controller's ability to identify owned ReplicaSets.
+    #[test]
+    fn deployment_existing_selector_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "my-app" } },
+                "template": {
+                    "metadata": { "labels": { "app": "my-app", "extra": "label" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "app": "my-app" } }),
+            "existing spec.selector must not be overwritten — changing it breaks ReplicaSet ownership"
         );
     }
 
@@ -513,6 +747,185 @@ mod tests {
         assert_eq!(
             obj["eventTime"], "2017-09-20T13:49:16.999999Z",
             "existing sub-second precision must not be overwritten"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // ReplicaSet defaults
+    // ---------------------------------------------------------------------------
+
+    /// A ReplicaSet with no spec.replicas must have it defaulted to 1.
+    ///
+    /// KCM's replicaset-controller dereferences *rs.Spec.Replicas unconditionally.
+    /// Nil causes a nil-pointer panic that kills the entire KCM process.
+    #[test]
+    fn replicaset_replicas_defaults_to_1() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {}
+            }
+        });
+
+        apply_defaults("apps", "replicasets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["replicas"],
+            serde_json::Value::Number(1.into()),
+            "spec.replicas must default to 1 — nil replicas panics KCM replicaset-controller"
+        );
+    }
+
+    /// Existing spec.replicas on a ReplicaSet must not be overwritten.
+    #[test]
+    fn replicaset_existing_replicas_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": { "replicas": 3 }
+        });
+
+        apply_defaults("apps", "replicasets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["replicas"],
+            serde_json::Value::Number(3.into()),
+            "existing spec.replicas must not be overwritten"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // StatefulSet defaults
+    // ---------------------------------------------------------------------------
+
+    /// A StatefulSet with no spec fields must have all four defaults applied.
+    ///
+    /// KCM's statefulset-controller dereferences *ss.Spec.Replicas and indexes
+    /// UpdateStrategy fields without nil checks.
+    #[test]
+    fn statefulset_defaults_applied() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {}
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["replicas"],
+            serde_json::Value::Number(1.into()),
+            "spec.replicas must default to 1"
+        );
+        assert_eq!(
+            obj["spec"]["podManagementPolicy"], "OrderedReady",
+            "spec.podManagementPolicy must default to OrderedReady"
+        );
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["type"], "RollingUpdate",
+            "spec.updateStrategy.type must default to RollingUpdate"
+        );
+        assert_eq!(
+            obj["spec"]["revisionHistoryLimit"],
+            serde_json::Value::Number(10.into()),
+            "spec.revisionHistoryLimit must default to 10"
+        );
+    }
+
+    /// Existing StatefulSet fields must not be overwritten.
+    #[test]
+    fn statefulset_existing_values_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "replicas": 5,
+                "podManagementPolicy": "Parallel",
+                "updateStrategy": { "type": "OnDelete" },
+                "revisionHistoryLimit": 3
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+
+        assert_eq!(obj["spec"]["replicas"], serde_json::Value::Number(5.into()));
+        assert_eq!(obj["spec"]["podManagementPolicy"], "Parallel");
+        assert_eq!(obj["spec"]["updateStrategy"]["type"], "OnDelete");
+        assert_eq!(
+            obj["spec"]["revisionHistoryLimit"],
+            serde_json::Value::Number(3.into())
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // DaemonSet defaults
+    // ---------------------------------------------------------------------------
+
+    /// A DaemonSet with no updateStrategy must have type, maxUnavailable, and maxSurge defaulted.
+    #[test]
+    fn daemonset_defaults_applied() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {}
+        });
+
+        apply_defaults("apps", "daemonsets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["type"], "RollingUpdate",
+            "spec.updateStrategy.type must default to RollingUpdate"
+        );
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxUnavailable"],
+            serde_json::Value::Number(1.into()),
+            "rollingUpdate.maxUnavailable must default to 1"
+        );
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["maxSurge"],
+            serde_json::Value::Number(0.into()),
+            "rollingUpdate.maxSurge must default to 0"
+        );
+        assert_eq!(
+            obj["spec"]["revisionHistoryLimit"],
+            serde_json::Value::Number(10.into()),
+            "spec.revisionHistoryLimit must default to 10"
+        );
+    }
+
+    /// Existing DaemonSet updateStrategy must not be overwritten.
+    #[test]
+    fn daemonset_existing_values_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "updateStrategy": { "type": "OnDelete" },
+                "revisionHistoryLimit": 5
+            }
+        });
+
+        apply_defaults("apps", "daemonsets", &mut obj);
+
+        assert_eq!(obj["spec"]["updateStrategy"]["type"], "OnDelete");
+        assert!(
+            obj["spec"]["updateStrategy"]["rollingUpdate"].is_null(),
+            "rollingUpdate must not be injected for OnDelete strategy"
+        );
+        assert_eq!(
+            obj["spec"]["revisionHistoryLimit"],
+            serde_json::Value::Number(5.into())
         );
     }
 

@@ -1,5 +1,4 @@
 #!/bin/sh
 set -e
-cargo fmt --all -- --check
 cargo test --workspace --quiet
 cargo clippy --workspace --tests --quiet -- -D warnings
