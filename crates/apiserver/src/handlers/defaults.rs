@@ -25,6 +25,25 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "events") = (group, plural) {
         normalize_event_timestamps(obj);
     }
+    if let ("", "persistentvolumeclaims") = (group, plural) {
+        default_pvc(obj);
+    }
+}
+
+/// Set status.phase to "Pending" for a newly created PersistentVolumeClaim.
+///
+/// The real kube-apiserver initializes PVC status.phase to "Pending" at create time.
+/// Without this, controllers and conformance tests that check `phase == "Pending"` before
+/// the volume is bound will fail — they expect the field to be present immediately.
+///
+/// Idempotent: if status.phase is already set it is not overwritten.
+fn default_pvc(obj: &mut serde_json::Value) {
+    if obj["status"]["phase"].is_null() {
+        if !obj["status"].is_object() {
+            obj["status"] = serde_json::json!({});
+        }
+        obj["status"]["phase"] = serde_json::Value::String("Pending".to_string());
+    }
 }
 
 /// Apply all Service defaults in the correct order.
@@ -1340,6 +1359,64 @@ mod tests {
         assert!(
             obj["spec"]["clusterIP"].is_null(),
             "ExternalName service must not have clusterIP set by defaults"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: PVC status.phase defaulting (mayor-hyyu)
+    // ---------------------------------------------------------------------------
+
+    /// A PVC created without status.phase must have it initialized to "Pending".
+    ///
+    /// The real kube-apiserver initializes PVC status.phase to "Pending" on create.
+    /// Without this default, controllers and conformance tests that check
+    /// `phase == "Pending"` before binding will fail — they expect the field immediately
+    /// after create. If this test fails after reverting the fix, phase will be absent
+    /// and those controller checks will fail.
+    #[test]
+    fn pvc_status_phase_defaults_to_pending() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "my-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            }
+        });
+
+        apply_defaults("", "persistentvolumeclaims", &mut obj);
+
+        assert_eq!(
+            obj["status"]["phase"], "Pending",
+            "status.phase must be initialized to Pending on create — \
+             controllers that check phase == Pending before binding will fail if absent"
+        );
+    }
+
+    /// A PVC whose status.phase is already set must not have it overwritten.
+    ///
+    /// apply_defaults must be idempotent: a Bound PVC that goes through the write
+    /// path again (e.g. on update) must not have its phase reset to Pending.
+    #[test]
+    fn pvc_existing_status_phase_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "my-pvc", "namespace": "default" },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            },
+            "status": { "phase": "Bound" }
+        });
+
+        apply_defaults("", "persistentvolumeclaims", &mut obj);
+
+        assert_eq!(
+            obj["status"]["phase"], "Bound",
+            "existing status.phase must not be overwritten — resetting Bound to Pending \
+             would break controllers that track binding state"
         );
     }
 
