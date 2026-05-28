@@ -1858,6 +1858,28 @@ pub fn decode_lease_proto(data: &[u8]) -> Option<serde_json::Value> {
                 serde_json::Value::Number(serde_json::Number::from(spec.lease_duration_seconds)),
             );
         }
+        if let Some(t) = spec.acquire_time {
+            if t.seconds != 0 {
+                let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
+                    t.seconds as u64,
+                ));
+                spec_map.insert("acquireTime".to_string(), serde_json::Value::String(ts));
+            }
+        }
+        if let Some(t) = spec.renew_time {
+            if t.seconds != 0 {
+                let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
+                    t.seconds as u64,
+                ));
+                spec_map.insert("renewTime".to_string(), serde_json::Value::String(ts));
+            }
+        }
+        if spec.lease_transitions != 0 {
+            spec_map.insert(
+                "leaseTransitions".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(spec.lease_transitions)),
+            );
+        }
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
         }
@@ -4046,6 +4068,66 @@ mod tests {
 
         assert_eq!(result["kind"], "Lease");
         assert_eq!(result["metadata"]["name"], "test-node");
+    }
+
+    /// decode_lease_proto must preserve acquireTime, renewTime, and leaseTransitions.
+    /// The kubelet and KCM use these fields for leader election and heartbeat tracking.
+    /// If they are dropped on create/PUT, controllers see the lease as never acquired,
+    /// which breaks node lifecycle management and leader election.
+    #[test]
+    fn decode_lease_proto_preserves_acquire_renew_and_transitions() {
+        // Build: Lease {
+        //   metadata: ObjectMeta { name: "kcm-leader", namespace: "kube-system" },
+        //   spec: LeaseSpec {
+        //     holderIdentity: "kcm",
+        //     leaseDurationSeconds: 15,
+        //     acquireTime: MicroTime { seconds: 1704067200 },  // field 3
+        //     renewTime:   MicroTime { seconds: 1704067215 },  // field 4
+        //     leaseTransitions: 3,                             // field 5
+        //   }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"kcm-leader");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"kube-system"));
+
+        // holderIdentity (field 1, wire 2)
+        let mut lease_spec = encode_length_delimited(1, b"kcm");
+        // leaseDurationSeconds (field 2, wire 0): tag=0x10, value=15
+        lease_spec.push(0x10);
+        lease_spec.push(0x0F);
+        // acquireTime (field 3, wire 2 = length-delimited message)
+        //   MicroTime { field 1 (seconds, varint) = 1704067200 }
+        let mut acquire_time_msg = encode_varint(1 << 3); // field 1, wire 0
+        acquire_time_msg.extend_from_slice(&encode_varint(1_704_067_200u64));
+        lease_spec.extend_from_slice(&encode_length_delimited(3, &acquire_time_msg));
+        // renewTime (field 4, wire 2)
+        //   MicroTime { seconds = 1704067215 }
+        let mut renew_time_msg = encode_varint(1 << 3); // field 1, wire 0
+        renew_time_msg.extend_from_slice(&encode_varint(1_704_067_215u64));
+        lease_spec.extend_from_slice(&encode_length_delimited(4, &renew_time_msg));
+        // leaseTransitions (field 5, wire 0): tag = (5<<3)|0 = 0x28, value = 3
+        lease_spec.push(0x28);
+        lease_spec.push(0x03);
+
+        let mut lease_proto = encode_length_delimited(1, &obj_meta);
+        lease_proto.extend_from_slice(&encode_length_delimited(2, &lease_spec));
+
+        let result = decode_lease_proto(&lease_proto).expect("must decode Lease proto");
+
+        assert_eq!(
+            result["spec"]["acquireTime"], "2024-01-01T00:00:00.000000Z",
+            "acquireTime must be preserved; dropping it causes KCM to treat the lease \
+             as never acquired and re-elect unnecessarily"
+        );
+        assert_eq!(
+            result["spec"]["renewTime"], "2024-01-01T00:00:15.000000Z",
+            "renewTime must be preserved; dropping it causes the kubelet heartbeat \
+             interval to appear as zero, triggering false node-not-ready conditions"
+        );
+        assert_eq!(
+            result["spec"]["leaseTransitions"], 3,
+            "leaseTransitions must be preserved; dropping it makes leader election \
+             metrics report zero transitions and hides controller restart storms"
+        );
     }
 
     // ---------------------------------------------------------------------------
