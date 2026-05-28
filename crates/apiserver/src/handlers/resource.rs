@@ -4995,4 +4995,105 @@ mod tests {
             "409 body resourceVersion must match the version assigned at creation"
         );
     }
+
+    /// POST create handlers must always return a non-empty metadata.uid even when the
+    /// client supplies uid:"" (empty string). KCM's token controller parses the UID as a
+    /// typed field; an empty UID causes it to log an error and skip the ServiceAccount,
+    /// which means the SA never gets a token and workloads in that namespace cannot
+    /// authenticate with the API server.
+    #[tokio::test]
+    async fn create_namespaced_resource_always_sets_non_empty_uid() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let sa = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {
+                "name": "default",
+                "namespace": "default",
+                "uid": ""
+            }
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "serviceaccounts".to_string(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&sa).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("POST ServiceAccount must succeed; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let uid = v["metadata"]["uid"].as_str().unwrap_or("");
+        assert!(
+            !uid.is_empty(),
+            "POST response must contain a non-empty metadata.uid; \
+             KCM token controller rejects ServiceAccounts with empty uid"
+        );
+        assert!(
+            uuid::Uuid::parse_str(uid).is_ok(),
+            "metadata.uid must be a valid UUID; got: {uid}"
+        );
+    }
+
+    /// Same guarantee for cluster-scoped POST: metadata.uid must be non-empty
+    /// even if the client supplies uid:"".
+    #[tokio::test]
+    async fn create_resource_always_sets_non_empty_uid() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {
+                "name": "uid-test-node",
+                "uid": ""
+            }
+        });
+
+        let result = create_resource(
+            axum::extract::State(state),
+            axum::extract::Path(("".to_string(), "v1".to_string(), "nodes".to_string())),
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("POST Node must succeed; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let uid = v["metadata"]["uid"].as_str().unwrap_or("");
+        assert!(
+            !uid.is_empty(),
+            "cluster-scoped POST response must contain a non-empty metadata.uid"
+        );
+        assert!(
+            uuid::Uuid::parse_str(uid).is_ok(),
+            "metadata.uid must be a valid UUID; got: {uid}"
+        );
+    }
 }

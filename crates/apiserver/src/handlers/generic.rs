@@ -399,10 +399,15 @@ pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value>
 
 pub(crate) fn stamp_metadata(obj: &mut Object) {
     let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
-    if meta.uid.is_none() {
+    if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
         obj.body["metadata"]["uid"] = serde_json::Value::String(uuid::Uuid::new_v4().to_string());
     }
-    if meta.creation_timestamp.is_none() {
+    if meta
+        .creation_timestamp
+        .as_deref()
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
         obj.body["metadata"]["creationTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
     }
 }
@@ -1021,6 +1026,32 @@ mod tests {
             obj.body["metadata"]["uid"].as_str().unwrap(),
             "my-custom-uid",
             "server must not overwrite a client-supplied uid"
+        );
+    }
+
+    #[test]
+    fn stamp_metadata_overwrites_empty_string_uid() {
+        // KCM's token controller logs an error when a ServiceAccount has uid="".
+        // stamp_metadata must replace an empty-string uid with a generated UUID,
+        // treating "" the same as absent. Without this fix, uid:"" passes through
+        // is_none() → false and KCM receives an object with an unparseable empty UID.
+        let mut obj = Object::from_bytes(&bytes::Bytes::from(
+            serde_json::json!({
+                "metadata": { "name": "default", "uid": "" }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+        stamp_metadata(&mut obj);
+        let uid = obj.body["metadata"]["uid"].as_str().unwrap_or("");
+        assert!(
+            !uid.is_empty(),
+            "uid must be replaced when the client sends an empty string; \
+             KCM token controller rejects ServiceAccounts with uid=\"\""
+        );
+        assert!(
+            uuid::Uuid::parse_str(uid).is_ok(),
+            "uid must be a valid UUID v4; got: {uid}"
         );
     }
 
