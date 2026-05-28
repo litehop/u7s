@@ -153,21 +153,44 @@ fn parse_container_limit_items(lr: &Value) -> Vec<LimitItem> {
 
 /// Inject default requests/limits into a single container's resources field.
 /// Modifies `container` in-place.
+///
+/// serde_json's chained mutable indexing panics when an intermediate value is
+/// neither null nor an object (e.g. a string or array). We guard each sub-field
+/// explicitly so that malformed or unexpected container bodies never crash the
+/// admission plugin.
 pub fn inject_defaults(container: &mut Value, items: &[LimitItem]) {
+    // Ensure container["resources"] is an object (never a scalar or array).
+    // If it is already an object we leave it untouched; if it is null or
+    // absent we initialise it to an empty object so the chained assignments
+    // below are safe.
+    if !container["resources"].is_object() {
+        container["resources"] = Value::Object(Default::default());
+    }
+
     for item in items {
         // Inject default limit
-        for (resource, &val) in &item.default_limit {
-            if container["resources"]["limits"][resource].is_null() {
-                // Convert millivalue back to a canonical quantity string.
-                let qty = millivalue_to_quantity(val, resource);
-                container["resources"]["limits"][resource] = Value::String(qty);
+        if !item.default_limit.is_empty() {
+            if !container["resources"]["limits"].is_object() {
+                container["resources"]["limits"] = Value::Object(Default::default());
+            }
+            for (resource, &val) in &item.default_limit {
+                if container["resources"]["limits"][resource].is_null() {
+                    // Convert millivalue back to a canonical quantity string.
+                    let qty = millivalue_to_quantity(val, resource);
+                    container["resources"]["limits"][resource] = Value::String(qty);
+                }
             }
         }
         // Inject default request
-        for (resource, &val) in &item.default_request {
-            if container["resources"]["requests"][resource].is_null() {
-                let qty = millivalue_to_quantity(val, resource);
-                container["resources"]["requests"][resource] = Value::String(qty);
+        if !item.default_request.is_empty() {
+            if !container["resources"]["requests"].is_object() {
+                container["resources"]["requests"] = Value::Object(Default::default());
+            }
+            for (resource, &val) in &item.default_request {
+                if container["resources"]["requests"][resource].is_null() {
+                    let qty = millivalue_to_quantity(val, resource);
+                    container["resources"]["requests"][resource] = Value::String(qty);
+                }
             }
         }
     }
@@ -613,5 +636,140 @@ mod tests {
         let result = apply_limit_ranges(&state, svc.clone(), "default", "services").await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap_or_else(|_| panic!("noop must succeed")), svc);
+    }
+
+    // -- regression: inject_defaults must never panic on unexpected container shapes --
+
+    /// inject_defaults must not panic when container.resources is absent.
+    ///
+    /// Before the defensive guard was added, the serde_json chained mutable-index
+    /// path (container["resources"]["limits"][resource] = ...) would panic if any
+    /// intermediate node was not a null or object.  A container without a resources
+    /// field (very common: most containers in conformance tests omit it) must
+    /// receive the LimitRange defaults without crashing the server.
+    #[test]
+    fn inject_defaults_no_panic_when_resources_absent() {
+        let mut container = json!({ "name": "app", "image": "nginx" }); // no "resources" key
+        let items = vec![LimitItem {
+            min: Default::default(),
+            max: Default::default(),
+            default_request: [("cpu".to_string(), 100.0)].into_iter().collect(),
+            default_limit: [("cpu".to_string(), 500.0)].into_iter().collect(),
+        }];
+        // Must not panic; must inject defaults.
+        inject_defaults(&mut container, &items);
+        assert_eq!(
+            container["resources"]["limits"]["cpu"],
+            json!("500m"),
+            "default CPU limit must be injected into container without resources key — \
+             panic here would crash the server on every LimitRange default-injection"
+        );
+        assert_eq!(
+            container["resources"]["requests"]["cpu"],
+            json!("100m"),
+            "default CPU request must be injected"
+        );
+    }
+
+    /// inject_defaults must not panic when container.resources is null.
+    ///
+    /// Some clients (e.g. strategic-merge-patch) can set resources to null explicitly.
+    /// The defensive guard must convert null to an object before attempting injection.
+    #[test]
+    fn inject_defaults_no_panic_when_resources_null() {
+        let mut container = json!({ "name": "app", "resources": null });
+        let items = vec![LimitItem {
+            min: Default::default(),
+            max: Default::default(),
+            default_request: Default::default(),
+            default_limit: [("memory".to_string(), 128.0 * 1024.0 * 1024.0 * 1000.0)]
+                .into_iter()
+                .collect(),
+        }];
+        // Must not panic; null resources must be treated as an empty object.
+        inject_defaults(&mut container, &items);
+        assert_eq!(
+            container["resources"]["limits"]["memory"],
+            json!("128Mi"),
+            "default memory limit must be injected when resources is explicitly null — \
+             without the guard this panics via serde_json index_or_insert on null"
+        );
+    }
+
+    /// Full integration: LimitRange in store → Pod with no resources → defaults injected.
+    ///
+    /// This is the end-to-end path for the conformance test
+    /// "should create a LimitRange with defaults and ensure pod has those defaults applied".
+    /// If apply_limit_ranges panics, the server crashes; if it silently skips injection,
+    /// the conformance test fails with a nil-pointer in the Go test framework.
+    #[tokio::test]
+    async fn apply_limit_ranges_injects_defaults_into_pod_with_no_resources() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // LimitRange with CPU and memory defaults (matches what the conformance test creates).
+        let lr = json!({
+            "apiVersion": "v1",
+            "kind": "LimitRange",
+            "metadata": { "name": "limits", "namespace": "test-ns" },
+            "spec": { "limits": [{
+                "type": "Container",
+                "default": { "cpu": "500m", "memory": "128Mi" },
+                "defaultRequest": { "cpu": "100m", "memory": "64Mi" }
+            }] }
+        });
+        store
+            .put(
+                "/registry/limitranges/test-ns/limits",
+                bytes::Bytes::from(serde_json::to_vec(&lr).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Pod with no resources field on its container (the common conformance-test pattern).
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "test-pod", "namespace": "test-ns" },
+            "spec": {
+                "containers": [{ "name": "app", "image": "nginx" }]
+            }
+        });
+
+        let result = apply_limit_ranges(&state, pod, "test-ns", "pods")
+            .await
+            .expect(
+                "apply_limit_ranges must not return an error for a pod with no resource requests",
+            );
+
+        // CPU defaults from LimitRange must be injected.
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["limits"]["cpu"],
+            json!("500m"),
+            "LimitRange default CPU limit (500m) must be injected into pod container — \
+             this is what the conformance test 'should create a LimitRange with defaults' checks"
+        );
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["requests"]["cpu"],
+            json!("100m"),
+            "LimitRange default CPU request (100m) must be injected"
+        );
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["limits"]["memory"],
+            json!("128Mi"),
+            "LimitRange default memory limit (128Mi) must be injected"
+        );
+        assert_eq!(
+            result["spec"]["containers"][0]["resources"]["requests"]["memory"],
+            json!("64Mi"),
+            "LimitRange default memory request (64Mi) must be injected"
+        );
     }
 }
