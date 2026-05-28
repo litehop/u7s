@@ -1,27 +1,24 @@
 # Dashboard
-2026-05-28T02:10 (session closed)
-Session: closed — start new session after sonobuoy run completes
+2026-05-28T(session-open)
+Resume: `bd ready` → 3 beads; serial worker dispatch in progress
 
 ## What needs the operator now
 
-Start a sonobuoy run to gauge current conformance state.
-Next session: triage results and file new beads.
+Nothing blocking. Serial worker chain running — see In-flight below.
 
 ## In-flight
 
-None.
+| Worker | Bead | What | Status |
+|--------|------|------|--------|
+| a142e257 | mayor-uvcp | DaemonSet pods fail — focused e2e + fix or close-as-fixed | running |
+
+Queue (dispatching serially — shared cluster):
+1. mayor-2cwk — projected ConfigMap volume updates
+2. mayor-4ath — liveness probe restarts
 
 ## Open PRs
 
 None.
-
-## Remaining beads (need VM / sonobuoy)
-
-| Bead | What | Priority |
-|------|------|----------|
-| mayor-uvcp | DaemonSet pods fail — recheck after #297 | P2 |
-| mayor-2cwk | Projected ConfigMap volumes — kubelet runtime | P2 |
-| mayor-4ath | Liveness probe restarts — kubelet runtime | P2 |
 
 ## Deferred
 
