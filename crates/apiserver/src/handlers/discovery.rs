@@ -55,6 +55,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("node.k8s.io", "v1"),
     ("policy", "v1"),
     ("rbac.authorization.k8s.io", "v1"),
+    ("resource.k8s.io", "v1alpha3"),
     ("scheduling.k8s.io", "v1"),
     ("storage.k8s.io", "v1"),
 ];
@@ -174,6 +175,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("node.k8s.io", "v1") => Some(node_v1_resources()),
         ("policy", "v1") => Some(policy_v1_resources()),
         ("rbac.authorization.k8s.io", "v1") => Some(rbac_v1_resources()),
+        ("resource.k8s.io", "v1alpha3") => Some(resource_v1alpha3_resources()),
         ("scheduling.k8s.io", "v1") => Some(scheduling_v1_resources()),
         ("storage.k8s.io", "v1") => Some(storage_v1_resources()),
         _ => None,
@@ -407,6 +409,45 @@ fn rbac_v1_resources() -> serde_json::Value {
                 "singularName": "rolebinding",
                 "namespaced": true,
                 "kind": "RoleBinding",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn resource_v1alpha3_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "resource.k8s.io/v1alpha3",
+        "resources": [
+            {
+                "name": "deviceclasses",
+                "singularName": "deviceclass",
+                "namespaced": false,
+                "kind": "DeviceClass",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "resourceclaims",
+                "singularName": "resourceclaim",
+                "namespaced": true,
+                "kind": "ResourceClaim",
+                "shortNames": ["rc"],
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "resourceclaimtemplates",
+                "singularName": "resourceclaimtemplate",
+                "namespaced": true,
+                "kind": "ResourceClaimTemplate",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "resourceslices",
+                "singularName": "resourceslice",
+                "namespaced": false,
+                "kind": "ResourceSlice",
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -1765,6 +1806,68 @@ mod tests {
             names.contains(&"tokenreviews"),
             "tokenreviews must be in authentication.k8s.io/v1 — \
              the endpoint already exists and must be discoverable; got: {names:?}"
+        );
+    }
+
+    // resource.k8s.io must appear in /apis — Dynamic Resource Allocation (DRA) uses this
+    // group for ResourceClaim, ResourceClaimTemplate, ResourceSlice, and DeviceClass.
+    // kubectl and admission webhooks depend on this group being discoverable; without it,
+    // `kubectl get resourceclaims` returns "the server doesn't have a resource type".
+    #[tokio::test]
+    async fn resource_group_appears_in_api_group_list() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"resource.k8s.io"),
+            "resource.k8s.io must appear in /apis — DRA requires ResourceClaim, \
+             ResourceClaimTemplate, ResourceSlice, and DeviceClass to be discoverable; got: {names:?}"
+        );
+    }
+
+    // resource.k8s.io/v1alpha3 must include all four DRA resource types — ResourceClaim,
+    // ResourceClaimTemplate, ResourceSlice, and DeviceClass are the core DRA objects.
+    // Missing any of them causes `kubectl get resourceclaims` or scheduler DRA plugins
+    // to fail at startup with "resource not found".
+    #[tokio::test]
+    async fn resource_v1alpha3_resources_list() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("resource.k8s.io".to_string(), "v1alpha3".to_string())),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /apis/resource.k8s.io/v1alpha3 must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"resourceclaims"),
+            "resourceclaims must be in resource.k8s.io/v1alpha3 — core DRA type; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"resourceclaimtemplates"),
+            "resourceclaimtemplates must be in resource.k8s.io/v1alpha3 — core DRA type; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"resourceslices"),
+            "resourceslices must be in resource.k8s.io/v1alpha3 — DRA node plugin reporting; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"deviceclasses"),
+            "deviceclasses must be in resource.k8s.io/v1alpha3 — DRA device class; got: {names:?}"
         );
     }
 
