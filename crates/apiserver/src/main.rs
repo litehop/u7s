@@ -2931,4 +2931,92 @@ mod tests {
             "stored object kind must be ClusterRole"
         );
     }
+
+    /// DELETE /api/v1/persistentvolumes/{name} must not return 405 MethodNotAllowed.
+    ///
+    /// PersistentVolumes are cluster-scoped (no namespace). The CSI conformance test
+    /// creates a PV and then deletes it via DELETE /api/v1/persistentvolumes/{name}.
+    /// Without the DELETE verb registered on the cluster-scoped named-resource route,
+    /// axum returns 405 and the conformance test fails.
+    ///
+    /// This test fails (405) if the .delete(core_delete_resource) call is removed from
+    /// the /api/v1/{resource}/{name} route in build_router.
+    #[tokio::test]
+    async fn persistent_volume_delete_returns_non_405() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        let admin = auth::UserInfo {
+            username: "admin".to_string(),
+            uid: String::new(),
+            groups: vec!["system:masters".to_string()],
+        };
+
+        // Create a PersistentVolume so the DELETE has something to act on.
+        let pv_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": { "name": "test-pv" },
+            "spec": {
+                "capacity": { "storage": "1Gi" },
+                "accessModes": ["ReadWriteOnce"],
+                "hostPath": { "path": "/tmp/pv" }
+            }
+        });
+        let mut create_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/persistentvolumes")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(pv_body.to_string()))
+            .expect("POST request must build");
+        create_req.extensions_mut().insert(admin.clone());
+        let create_resp = router
+            .call(create_req)
+            .await
+            .expect("router must not error on POST");
+        assert_eq!(
+            create_resp.status(),
+            StatusCode::CREATED,
+            "PersistentVolume POST must return 201 before we can test DELETE"
+        );
+        // Drain body to reclaim connection.
+        let _ = to_bytes(create_resp.into_body(), 4096).await;
+
+        // DELETE the PersistentVolume — must not return 405 MethodNotAllowed.
+        // Before the fix: build_router omitted .delete() on /api/v1/{resource}/{name},
+        // causing axum to return 405 because the path matched but DELETE was unregistered.
+        let mut delete_req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/v1/persistentvolumes/test-pv")
+            .body(axum::body::Body::empty())
+            .expect("DELETE request must build");
+        delete_req.extensions_mut().insert(admin);
+        let delete_resp = router
+            .call(delete_req)
+            .await
+            .expect("router must not error on DELETE");
+        let delete_status = delete_resp.status();
+        assert_ne!(
+            delete_status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "DELETE /api/v1/persistentvolumes/test-pv must not return 405 — \
+             the CSI conformance test deletes PVs after the lifecycle test and \
+             a 405 here means the route is not registered"
+        );
+        assert!(
+            delete_status.is_success(),
+            "DELETE /api/v1/persistentvolumes/test-pv must succeed (2xx), got {delete_status}"
+        );
+    }
 }
