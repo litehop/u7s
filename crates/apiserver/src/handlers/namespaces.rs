@@ -12,14 +12,15 @@ use crate::{
     auth::UserInfo,
     handlers::{
         generic::apply_delete_policy,
-        json_patch::{apply_json_patch, detect_patch_type, PatchType},
+        json_patch::{apply_json_patch, detect_patch_type, PatchQuery, PatchType},
+        resource::{do_patch, PatchConfig},
     },
     keys::{cluster_list_prefix, cluster_object_key},
     proto,
     state::AppState,
     status::Status,
-    types::{NamespacePhase, NamespaceStatus, Object, ObjectMeta},
-    util::{extract_body, parse_resource_version, utc_now_rfc3339},
+    types::{NamespacePhase, NamespaceStatus, Object, ObjectMeta, ResourceMeta},
+    util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
 /// Validate a namespace name: lowercase alphanumeric + hyphens, 1–63 chars.
@@ -328,19 +329,45 @@ pub async fn replace_namespace<S: Store>(
 pub async fn patch_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    Query(patch_query): Query<PatchQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let ct = content_type(&headers);
 
-    if !content_type.contains("application/merge-patch+json")
-        && !content_type.contains("application/strategic-merge-patch+json")
+    if ct.contains("application/apply-patch+yaml") {
+        let ns_meta = ResourceMeta {
+            kind: "Namespace".to_string(),
+            #[cfg(test)]
+            namespaced: false,
+            has_status_subresource: true,
+            create_or_update: false,
+        };
+        let key = cluster_object_key("namespaces", &name);
+        return do_patch(
+            &state,
+            PatchConfig {
+                key: &key,
+                meta: &ns_meta,
+                group: "",
+                version: "v1",
+                plural: "namespaces",
+                ns: None,
+                name: &name,
+                is_ssa: true,
+                field_manager: patch_query.field_manager.as_deref(),
+                patch_type: PatchType::StrategicMerge,
+                body,
+            },
+        )
+        .await;
+    }
+
+    if !ct.contains("application/merge-patch+json")
+        && !ct.contains("application/strategic-merge-patch+json")
     {
         return Err(Status::unsupported_media_type(format!(
-            "unsupported media type '{content_type}'; use application/merge-patch+json"
+            "unsupported media type '{ct}'; use application/merge-patch+json"
         )));
     }
 
@@ -990,6 +1017,7 @@ mod tests {
             patch_namespace(
                 State(state.clone()),
                 Path("patch-ns".to_string()),
+                axum::extract::Query(PatchQuery::default()),
                 headers,
                 patch_body,
             )
@@ -1418,6 +1446,7 @@ mod tests {
         let result = patch_namespace(
             State(state.clone()),
             Path("any-ns".to_string()),
+            axum::extract::Query(PatchQuery::default()),
             headers,
             patch_body,
         )
@@ -1448,6 +1477,7 @@ mod tests {
         let result = patch_namespace(
             State(state.clone()),
             Path("no-such-ns".to_string()),
+            axum::extract::Query(PatchQuery::default()),
             headers,
             patch_body,
         )
@@ -1645,6 +1675,7 @@ mod tests {
             patch_namespace(
                 State(state.clone()),
                 Path("drain-ns".to_string()),
+                axum::extract::Query(PatchQuery::default()),
                 headers,
                 patch_body,
             )
@@ -2202,6 +2233,160 @@ mod tests {
         assert_eq!(
             body["metadata"]["name"], "status-patch-ns",
             "metadata must be unchanged after PATCH /status"
+        );
+    }
+
+    // SSA PATCH on Namespace must return a non-empty JSON body with the full object.
+    //
+    // Before the fix, patch_namespace rejected apply-patch+yaml with 415 Unsupported
+    // Media Type. The e2e test received an empty body and failed with
+    // "invalid JSON: expected value at line 1 column 1".
+    // This test would fail on revert: reverting the fix causes the handler to return
+    // 415 rather than the updated object.
+    #[tokio::test]
+    async fn ssa_patch_namespace_returns_non_empty_json_body() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("ssa-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "ssa-ns",
+                "finalizers": ["kubernetes"]
+            }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let result = patch_namespace(
+            State(state.clone()),
+            Path("ssa-ns".to_string()),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("e2e-test".to_string()),
+                _field_validation: None,
+            }),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "SSA PATCH on Namespace must not return an error (got {:?}); \
+                 before the fix this returned 415 Unsupported Media Type causing \
+                 the e2e test to receive an empty body",
+                e.0
+            )
+        })
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            StatusCode::OK,
+            "SSA PATCH on existing Namespace must return 200"
+        );
+
+        let body_bytes = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            !body_bytes.is_empty(),
+            "SSA PATCH response body must not be empty — an empty body causes \
+             'invalid JSON: expected value at line 1 column 1' in e2e tests"
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("SSA PATCH response must be valid JSON");
+        assert_eq!(
+            v["metadata"]["name"], "ssa-ns",
+            "SSA PATCH response must contain the full Namespace object"
+        );
+    }
+
+    // SSA PATCH on Namespace with ?fieldManager= must set metadata.managedFields.
+    //
+    // Before the fix, patch_namespace rejected apply-patch+yaml so managedFields
+    // was never populated. The e2e test "apply changes to status" checks for
+    // 'metadata.managedFields' in the response; without it the test fails with
+    // "patched object should have the applied annotation".
+    // This test would fail on revert: the handler returns 415 and managedFields
+    // is absent from any response body.
+    #[tokio::test]
+    async fn ssa_patch_namespace_sets_managed_fields_for_field_manager() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("mf-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "mf-ns" }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/apply-patch+yaml".parse().unwrap(),
+        );
+
+        let result = patch_namespace(
+            State(state.clone()),
+            Path("mf-ns".to_string()),
+            axum::extract::Query(PatchQuery {
+                field_manager: Some("kubectl-apply".to_string()),
+                _field_validation: None,
+            }),
+            ssa_headers,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SSA PATCH must succeed, got {:?}", e.0))
+        .into_response();
+
+        let body_bytes = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let mf = &v["metadata"]["managedFields"];
+        assert!(
+            mf.is_array(),
+            "SSA PATCH response must include metadata.managedFields; \
+             the e2e test 'apply changes to status' checks for the applied annotation. \
+             Without managedFields the test fails with \
+             'patched object should have the applied annotation'"
+        );
+        assert_eq!(
+            mf[0]["manager"], "kubectl-apply",
+            "managedFields[0].manager must equal the ?fieldManager query parameter"
+        );
+        assert_eq!(
+            mf[0]["operation"], "Apply",
+            "managedFields[0].operation must be 'Apply' for SSA requests"
         );
     }
 }
