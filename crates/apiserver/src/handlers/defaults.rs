@@ -129,19 +129,30 @@ fn default_node_ports(obj: &mut serde_json::Value) {
 
 /// Normalize Event timestamp fields to include microsecond precision.
 ///
-/// client-go's MicroTime codec (used for `eventTime`) and some Event field
-/// parsers require fractional seconds: `2017-09-20T13:49:16.000000Z`.
+/// client-go's MicroTime codec (used for `eventTime` and `series.lastObservedTime`)
+/// and some Event field parsers require fractional seconds:
+/// `2017-09-20T13:49:16.000000Z`.
 /// Without the `.000000` suffix, client-go raises:
 ///   `parsing time "…Z" as "…000000Z07:00": cannot parse "Z" as ".000000"`.
 ///
-/// This function normalizes `lastTimestamp`, `firstTimestamp`, and `eventTime`
-/// in-place by appending `.000000` to any second-precision RFC3339 string.
+/// This function normalizes `lastTimestamp`, `firstTimestamp`, `eventTime`, and
+/// `series.lastObservedTime` in-place by appending `.000000` to any
+/// second-precision RFC3339 string.
+///
+/// `series.lastObservedTime` must be normalized here because the Kubernetes
+/// Event controller patches it via merge-patch; if stored without microsecond
+/// precision, client-go sees it as a zero MicroTime on re-read, causing event
+/// deduplication to break (every occurrence appears as a new event).
 pub fn normalize_event_timestamps(obj: &mut serde_json::Value) {
     for field in &["lastTimestamp", "firstTimestamp", "eventTime"] {
         if let Some(s) = obj[field].as_str() {
             let normalized = crate::util::normalize_rfc3339_to_micro(s);
             obj[*field] = serde_json::Value::String(normalized);
         }
+    }
+    if let Some(s) = obj["series"]["lastObservedTime"].as_str() {
+        let normalized = crate::util::normalize_rfc3339_to_micro(s);
+        obj["series"]["lastObservedTime"] = serde_json::Value::String(normalized);
     }
 }
 
@@ -1131,6 +1142,63 @@ mod tests {
         assert_eq!(
             obj["spec"]["revisionHistoryLimit"],
             serde_json::Value::Number(5.into())
+        );
+    }
+
+    /// series.lastObservedTime without microseconds must be normalized.
+    ///
+    /// The Kubernetes Event controller PATCHes series.lastObservedTime via merge-patch.
+    /// If the timestamp is stored without microsecond precision (e.g. "2024-01-01T00:00:01Z"),
+    /// client-go's MicroTime codec fails to parse it on re-read with
+    ///   "cannot parse Z as .000000"
+    /// and treats it as a zero MicroTime.  This makes every event occurrence appear as a
+    /// new event (deduplication breaks) — exactly what core_events.go:144 detects.
+    #[test]
+    fn event_series_last_observed_time_normalized_to_microsecond_precision() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "series": {
+                "count": 5,
+                "lastObservedTime": "2024-01-01T00:00:01Z"
+            }
+        });
+
+        apply_defaults("", "events", &mut obj);
+
+        assert_eq!(
+            obj["series"]["lastObservedTime"], "2024-01-01T00:00:01.000000Z",
+            "series.lastObservedTime must have .000000 suffix so client-go MicroTime \
+             can parse it; without this the Event controller sees a zero lastObservedTime \
+             and treats every occurrence as a new event (deduplication breaks)"
+        );
+        assert_eq!(
+            obj["series"]["count"], 5,
+            "series.count must be unchanged by timestamp normalization"
+        );
+    }
+
+    /// series.lastObservedTime with microsecond precision must not be modified.
+    ///
+    /// Idempotent: already-precise values must survive repeated apply_defaults calls.
+    #[test]
+    fn event_series_last_observed_time_already_precise_is_unchanged() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "series": {
+                "count": 3,
+                "lastObservedTime": "2024-01-01T00:00:01.123456Z"
+            }
+        });
+
+        apply_defaults("", "events", &mut obj);
+
+        assert_eq!(
+            obj["series"]["lastObservedTime"], "2024-01-01T00:00:01.123456Z",
+            "already-precise series.lastObservedTime must not be overwritten"
         );
     }
 
