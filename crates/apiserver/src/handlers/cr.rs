@@ -471,6 +471,7 @@ pub async fn list_cr<S: Store>(
                 as_partial_object_metadata: pom,
                 group: group.clone(),
                 plural: plural.clone(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -799,6 +800,7 @@ pub async fn list_cr_namespaced<S: Store>(
                 as_partial_object_metadata: pom,
                 group: group.clone(),
                 plural: plural.clone(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -1349,6 +1351,7 @@ mod tests {
             continue_token: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
+            timeout_seconds: None,
         }
     }
 
@@ -2006,6 +2009,7 @@ mod tests {
             continue_token: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
+            timeout_seconds: None,
         }
     }
 

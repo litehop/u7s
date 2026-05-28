@@ -125,6 +125,7 @@ pub async fn list_csr<S: Store>(
                 as_partial_object_metadata: false,
                 group: GROUP.to_string(),
                 plural: PLURAL.to_string(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -714,6 +715,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             axum::Extension(user),
         )

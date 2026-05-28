@@ -33,6 +33,9 @@ pub struct CollectionQuery {
     /// bookmarks are suppressed (except the sendInitialEvents end-of-list BOOKMARK).
     #[serde(rename = "allowWatchBookmarks")]
     pub allow_watch_bookmarks: Option<bool>,
+    /// Server-side timeout for watch streams in seconds. See CollectionQuery::timeout_seconds.
+    #[serde(rename = "timeoutSeconds")]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Extract a store-level FieldSelector from a raw field selector string.
@@ -188,6 +191,7 @@ pub async fn list_pods<S: Store>(
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "pods".into(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -684,6 +688,7 @@ mod watch_tests {
             field_selector: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
+            timeout_seconds: None,
         };
         assert!(q.watch == Some(true));
         assert_eq!(q.resource_version, Some(42));
@@ -699,6 +704,7 @@ mod watch_tests {
             field_selector: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
+            timeout_seconds: None,
         };
         assert_eq!(q.watch, None);
         assert_eq!(q.resource_version, None);

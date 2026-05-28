@@ -103,6 +103,7 @@ pub async fn list_resource<S: Store>(
                 as_partial_object_metadata: pom,
                 group: group.clone(),
                 plural: plural.clone(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -760,6 +761,7 @@ pub async fn list_namespaced_resource<S: Store>(
                 as_partial_object_metadata: pom,
                 group: group.clone(),
                 plural: plural.clone(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -1692,6 +1694,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             axum::http::HeaderMap::new(),
             Extension(crate::auth::UserInfo {
@@ -2194,6 +2197,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             axum::http::HeaderMap::new(),
             axum::Extension(crate::auth::UserInfo {
@@ -2531,6 +2535,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
         )
         .await;
@@ -3151,6 +3156,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             axum::http::HeaderMap::new(),
             Extension(crate::auth::UserInfo {
@@ -3936,6 +3942,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             pom_accept_headers(),
             axum::Extension(crate::auth::UserInfo {
@@ -4031,6 +4038,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: Some(true),
                 allow_watch_bookmarks: Some(true),
+                timeout_seconds: None,
             }),
             pom_accept_headers(),
             axum::Extension(crate::auth::UserInfo {
@@ -4655,6 +4663,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
         )
         .await
@@ -4816,6 +4825,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
         )
         .await
@@ -5162,6 +5172,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "configmaps".into(),
+                timeout_seconds: None,
             },
         )
         .await
