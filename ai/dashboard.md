@@ -1,20 +1,19 @@
 # Dashboard
 2026-05-28T(session-open)
-Resume: `bd ready` → 3 beads; serial worker dispatch in progress
+Resume: `bd ready` → 2 beads remaining; serial worker chain in progress
 
 ## What needs the operator now
 
-Nothing blocking. Serial worker chain running — see In-flight below.
+Nothing blocking.
 
 ## In-flight
 
 | Worker | Bead | What | Status |
 |--------|------|------|--------|
-| a142e257 | mayor-uvcp | DaemonSet pods fail — focused e2e + fix or close-as-fixed | running |
+| a0198287 | mayor-2cwk | Projected ConfigMap volume updates not reflected | running |
 
 Queue (dispatching serially — shared cluster):
-1. mayor-2cwk — projected ConfigMap volume updates
-2. mayor-4ath — liveness probe restarts
+1. mayor-4ath — liveness probe restarts
 
 ## Open PRs
 
@@ -46,6 +45,12 @@ None.
 | #298 ✓ | hmac 0.13 / sha2 0.11 fix | mayor-ao32 |
 | #297 ✓ | Register 9 missing API resources | mayor-g9m9 + 8 |
 | #296 ✓ | Remove empty flowcontrol group; add tokenreviews | mayor-4wdh, mayor-2ptq |
+
+## Closed this session
+
+| Bead | Resolution |
+|------|-----------|
+| mayor-uvcp | Already fixed by #297 (controllerrevisions registration) |
 
 ## Stance
 Pre-alpha/greenfield — break freely, no backward compat, correctness first. Mayor merges on green CI immediately (CLEAN = merge, no branch manipulation).
