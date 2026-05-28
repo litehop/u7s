@@ -5818,4 +5818,129 @@ mod tests {
             "Status.reason must be 'Expired' for invalid-signature tokens"
         );
     }
+
+    /// Regression test (mayor-quqc): PATCHing Event series.lastObservedTime must persist and
+    /// be normalized to microsecond precision on GET.
+    ///
+    /// The Kubernetes Event controller uses merge-patch to update series.count and
+    /// series.lastObservedTime on repeated events.  If series.lastObservedTime is stored
+    /// without microsecond precision (e.g. "2024-01-01T00:00:01Z"), client-go's MicroTime
+    /// codec raises "cannot parse Z as .000000" and treats it as zero — making every
+    /// occurrence appear as a new event and breaking deduplication (core_events.go:144).
+    ///
+    /// This test fails if normalize_event_timestamps stops normalizing series.lastObservedTime,
+    /// or if do_patch stops persisting the series field.
+    #[tokio::test]
+    async fn event_patch_series_last_observed_time_persists_and_is_normalized() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // 1. Seed an Event with series.lastObservedTime at original time (second precision).
+        let event = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {
+                "name": "my-pod.series-event",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "involvedObject": {
+                "kind": "Pod",
+                "name": "my-pod",
+                "namespace": "default"
+            },
+            "reason": "BackOff",
+            "message": "Back-off restarting failed container",
+            "series": {
+                "count": 1,
+                "lastObservedTime": "2024-01-01T00:00:00Z"
+            }
+        });
+        store
+            .put(
+                "/registry/events/default/my-pod.series-event",
+                bytes::Bytes::from(serde_json::to_vec(&event).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed Event");
+
+        // 2. PATCH with updated series.lastObservedTime (second precision, as some clients send).
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({
+            "metadata": {"creationTimestamp": null},
+            "series": {
+                "count": 2,
+                "lastObservedTime": "2024-01-01T00:00:01Z"
+            }
+        });
+
+        let patch_result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "events".to_string(),
+                "my-pod.series-event".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Event PATCH must succeed; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            patch_result.status(),
+            axum::http::StatusCode::OK,
+            "Event PATCH must return 200 OK"
+        );
+
+        // 3. GET the Event and verify series.lastObservedTime is updated AND normalized.
+        let get_result = get_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "events".to_string(),
+                "my-pod.series-event".to_string(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Event GET must succeed; got: {e:?}"))
+        .into_response();
+
+        let body = to_bytes(get_result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["series"]["count"], 2,
+            "series.count must be updated by the PATCH to 2; \
+             if this fails the merge-patch is not being applied"
+        );
+        assert_eq!(
+            v["series"]["lastObservedTime"], "2024-01-01T00:00:01.000000Z",
+            "series.lastObservedTime must be updated to the patched value AND normalized \
+             to microsecond precision; client-go MicroTime rejects bare RFC3339 without \
+             '.000000' — causing every event occurrence to appear new (deduplication breaks)"
+        );
+    }
 }
