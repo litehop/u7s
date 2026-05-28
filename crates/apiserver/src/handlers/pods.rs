@@ -3341,6 +3341,89 @@ mod handler_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// PATCH /status must persist the new phase to the store and the response body.
+    ///
+    /// Regression test for mayor-fbp7: the handler accepted the PATCH without error
+    /// but reported 0 changed fields — meaning the stored object was not mutated.
+    ///
+    /// This test fails if patch_pod_status is a no-op: if it returns 200 but leaves
+    /// the stored object unchanged, the GET from the store will still show "Pending"
+    /// and the assertion below will catch the regression.
+    #[tokio::test]
+    async fn patch_pod_status_persists_phase_change_to_store() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        // Seed a pod with phase "Pending" and a Ready=True condition.
+        seed_pod(
+            &store,
+            "default",
+            "lifecycle-pod",
+            serde_json::json!({
+                "status": {
+                    "phase": "Pending",
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        // Kubelet reports the pod is now Running and conditions updated.
+        // This is the exact scenario the e2e lifecycle test exercises.
+        let patch_body = serde_json::json!({
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "False"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/lifecycle-pod/status")
+            .header(
+                header::CONTENT_TYPE,
+                "application/strategic-merge-patch+json",
+            )
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PATCH /status must return 200"
+        );
+
+        // Read the pod back from the store — not from the response — to verify
+        // the changes were actually persisted (not just echoed in the response body).
+        let key = "/registry/pods/default/lifecycle-pod";
+        let stored = store.get(key).await.unwrap().expect("pod must still exist");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["status"]["phase"], "Running",
+            "phase must be updated to Running in the store — \
+             if this fails the PATCH is a no-op (mayor-fbp7 regression): \
+             kubelet cannot advance pod lifecycle and pods stay Pending forever"
+        );
+        assert_eq!(
+            v["status"]["conditions"][0]["status"], "False",
+            "Ready condition must be updated to False in the store — \
+             if this fails the status subresource PATCH is discarding changes"
+        );
+        // spec must not be touched by a status PATCH
+        assert_eq!(
+            v["spec"]["containers"][0]["name"], "app",
+            "spec.containers must be unchanged after a status-only PATCH"
+        );
+    }
+
     /// PATCH /status with an unsupported content-type must return 415.
     #[tokio::test]
     async fn patch_pod_status_unsupported_content_type_returns_415() {
