@@ -760,6 +760,24 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("CertificateSigningRequest", false, true),
     );
 
+    // resource.k8s.io/v1 — Dynamic Resource Allocation (DRA), GA since k8s 1.32
+    m.insert(
+        rk("resource.k8s.io", "v1", "deviceclasses"),
+        rm("DeviceClass", false, true),
+    );
+    m.insert(
+        rk("resource.k8s.io", "v1", "resourceclaims"),
+        rm("ResourceClaim", true, true),
+    );
+    m.insert(
+        rk("resource.k8s.io", "v1", "resourceclaimtemplates"),
+        rm("ResourceClaimTemplate", true, false),
+    );
+    m.insert(
+        rk("resource.k8s.io", "v1", "resourceslices"),
+        rm("ResourceSlice", false, false),
+    );
+
     m
 }
 
@@ -1330,6 +1348,58 @@ mod tests {
             .expect("servicecidrs must be in build_registry");
         assert!(!meta.namespaced, "ServiceCIDR is cluster-scoped");
         assert_eq!(meta.kind, "ServiceCIDR");
+    }
+
+    /// DRA types must be registered under resource.k8s.io/v1 (GA since k8s 1.32).
+    /// Without these entries, GET/LIST on /apis/resource.k8s.io/v1/{resource} returns 404,
+    /// breaking the DRA scheduler plugin and `kubectl get resourceclaims`.
+    #[test]
+    fn dra_types_registered_in_resource_v1() {
+        let registry = build_registry();
+
+        let dc_key = rk("resource.k8s.io", "v1", "deviceclasses");
+        let dc_meta = registry
+            .get(&dc_key)
+            .expect("deviceclasses must be in build_registry under resource.k8s.io/v1");
+        assert!(!dc_meta.namespaced, "DeviceClass is cluster-scoped");
+        assert!(
+            dc_meta.has_status_subresource,
+            "DeviceClass has a status subresource"
+        );
+        assert_eq!(dc_meta.kind, "DeviceClass");
+
+        let rc_key = rk("resource.k8s.io", "v1", "resourceclaims");
+        let rc_meta = registry
+            .get(&rc_key)
+            .expect("resourceclaims must be in build_registry under resource.k8s.io/v1");
+        assert!(rc_meta.namespaced, "ResourceClaim is namespaced");
+        assert!(
+            rc_meta.has_status_subresource,
+            "ResourceClaim has a status subresource"
+        );
+        assert_eq!(rc_meta.kind, "ResourceClaim");
+
+        let rct_key = rk("resource.k8s.io", "v1", "resourceclaimtemplates");
+        let rct_meta = registry
+            .get(&rct_key)
+            .expect("resourceclaimtemplates must be in build_registry under resource.k8s.io/v1");
+        assert!(rct_meta.namespaced, "ResourceClaimTemplate is namespaced");
+        assert!(
+            !rct_meta.has_status_subresource,
+            "ResourceClaimTemplate has no status subresource"
+        );
+        assert_eq!(rct_meta.kind, "ResourceClaimTemplate");
+
+        let rs_key = rk("resource.k8s.io", "v1", "resourceslices");
+        let rs_meta = registry
+            .get(&rs_key)
+            .expect("resourceslices must be in build_registry under resource.k8s.io/v1");
+        assert!(!rs_meta.namespaced, "ResourceSlice is cluster-scoped");
+        assert!(
+            !rs_meta.has_status_subresource,
+            "ResourceSlice has no status subresource"
+        );
+        assert_eq!(rs_meta.kind, "ResourceSlice");
     }
 
     /// VolumeAttributesClass must be registered as cluster-scoped in storage.k8s.io/v1.
