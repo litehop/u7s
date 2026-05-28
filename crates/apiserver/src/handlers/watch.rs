@@ -250,10 +250,15 @@ pub(crate) struct WatchConfig {
     pub as_partial_object_metadata: bool,
     pub group: String,
     pub plural: String,
+    /// Client-requested watch stream lifetime in seconds. When Some(n), the server closes
+    /// the stream after n seconds. When None, a default of 5 minutes (300s) is used.
+    /// Watches must not be subject to a shorter general request timeout — only this value
+    /// controls when the server closes the stream.
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Stream watch events for a given store prefix in NDJSON format.
-/// Mirrors watch_pods in pods.rs with a 60s bookmark heartbeat and 5min max duration.
+/// Sends a 60s bookmark heartbeat and closes after cfg.timeout_seconds (default 5 min).
 ///
 /// When `cfg.initial_items` is Some, those items are emitted as ADDED events first
 /// (implementing the Kubernetes 1.27+ sendInitialEvents protocol), followed by a
@@ -279,6 +284,7 @@ pub(crate) async fn watch_generic<S: Store>(
         as_partial_object_metadata,
         group,
         plural,
+        timeout_seconds,
     } = cfg;
     // Enforce per-client watch concurrency limit. Try to acquire a permit from
     // this user's semaphore. If the semaphore is exhausted (client already has
@@ -335,7 +341,11 @@ pub(crate) async fn watch_generic<S: Store>(
         let mut bookmark_tick = interval(Duration::from_secs(60));
         bookmark_tick.tick().await; // skip initial immediate tick
 
-        let mut max_duration = pin!(sleep(Duration::from_secs(5 * 60)));
+        // Use the client-requested timeout, defaulting to 5 minutes when absent.
+        // Watches must never be subject to a shorter general request timeout —
+        // the client's timeoutSeconds is the only server-side close trigger.
+        let stream_timeout_secs = timeout_seconds.unwrap_or(5 * 60);
+        let mut max_duration = pin!(sleep(Duration::from_secs(stream_timeout_secs)));
         let mut last_rv: u64 = from_revision;
 
         // sendInitialEvents: emit existing objects as ADDED, then BOOKMARK.
@@ -714,6 +724,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
+                timeout_seconds: None,
             },
         )
         .await;
@@ -766,6 +777,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
+                timeout_seconds: None,
             },
         )
         .await;
@@ -815,6 +827,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
+                timeout_seconds: None,
             },
         )
         .await;
@@ -893,6 +906,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
+                timeout_seconds: None,
             },
         )
         .await;
@@ -997,6 +1011,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
+                timeout_seconds: None,
             },
         )
         .await;
@@ -1094,6 +1109,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
+                timeout_seconds: None,
             },
         )
         .await
@@ -1173,6 +1189,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
+                timeout_seconds: None,
             },
         )
         .await
@@ -1253,6 +1270,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
+                timeout_seconds: None,
             },
         )
         .await
@@ -1645,6 +1663,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
+                timeout_seconds: None,
             },
         )
         .await
@@ -1734,6 +1753,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "services".into(),
+                timeout_seconds: None,
             },
         )
         .await
@@ -1760,6 +1780,75 @@ mod tests {
             added["object"]["spec"]["clusterIPs"],
             serde_json::json!(["10.96.1.1"]),
             "watch ADDED event must carry clusterIPs default"
+        );
+    }
+
+    /// Regression test for mayor-guqc: timeout_seconds controls the server-side watch stream
+    /// lifetime. When `timeout_seconds: Some(1)`, the stream must close within ~2 seconds.
+    ///
+    /// Without the fix, timeout_seconds was ignored and the server defaulted to 5 minutes (300s).
+    /// This test fails on revert: `to_bytes` would block for 300s and the outer `timeout`
+    /// would expire, causing the assertion `completed` to be false.
+    ///
+    /// The practical impact: Kubernetes informers send `timeoutSeconds=<n>` (typically 300-600s)
+    /// to control watch stream lifetime. If ignored, the server closes based only on the
+    /// internal default, which may be shorter (causing "context canceled" on every watch).
+    #[tokio::test]
+    async fn watch_generic_timeout_seconds_closes_stream_at_requested_duration() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use tokio::time::{timeout, Duration};
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Request a 1-second watch stream. The stream generator will break out of its loop
+        // after max_duration fires (1s), closing the body. Without the fix, timeout_seconds
+        // is ignored and the stream default is 300s — to_bytes would not return within 2s.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "configmaps".into(),
+                timeout_seconds: Some(1), // request 1-second stream lifetime
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch_generic must succeed with timeout_seconds=1"));
+
+        // Collect body with a 3-second outer timeout. If timeout_seconds is honoured, the
+        // stream closes after ~1s and to_bytes returns Ok. If timeout_seconds is ignored
+        // (300s default), to_bytes blocks until the outer timeout expires → Err(elapsed).
+        let completed = timeout(
+            Duration::from_secs(3),
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .is_ok();
+
+        assert!(
+            completed,
+            "watch stream with timeout_seconds=1 must close within 3s; \
+             if it does not, timeout_seconds is being ignored and the server uses a longer \
+             default — Kubernetes informers that set timeoutSeconds will get streams that \
+             close at the wrong time (mayor-guqc)"
         );
     }
 }

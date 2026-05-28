@@ -82,6 +82,7 @@ pub async fn list_namespaces<S: Store>(
                 as_partial_object_metadata: false,
                 group: "".to_string(),
                 plural: "namespaces".to_string(),
+                timeout_seconds: query.timeout_seconds,
             },
         )
         .await;
@@ -736,6 +737,7 @@ mod tests {
             continue_token: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
+            timeout_seconds: None,
         };
 
         let resp = match list_namespaces(
@@ -1187,6 +1189,7 @@ mod tests {
             continue_token: None,
             send_initial_events: Some(true),
             allow_watch_bookmarks: Some(true),
+            timeout_seconds: None,
         };
 
         let resp = match list_namespaces(
@@ -1265,6 +1268,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: None,
                 allow_watch_bookmarks: None,
+                timeout_seconds: None,
             }),
             Extension(crate::auth::UserInfo {
                 username: "test-user".into(),
