@@ -1,50 +1,54 @@
 # Dashboard
-2026-05-27T18:30 (session active)
-Session: active — `claude --continue` in /Users/balint.erdos/u7s
+2026-05-28T02:10 (session closed)
+Session: closed — start new session after sonobuoy run completes
 
 ## What needs the operator now
 
-Sonobuoy run in progress. Awaiting results.
+Start a sonobuoy run to gauge current conformance state.
+Next session: triage results and file new beads.
 
 ## In-flight
 
-- Sonobuoy conformance run (operator-initiated)
+None.
 
 ## Open PRs
 
 None.
 
-## Open beads
+## Remaining beads (need VM / sonobuoy)
 
-None — all beads from this session closed.
+| Bead | What | Priority |
+|------|------|----------|
+| mayor-uvcp | DaemonSet pods fail — recheck after #297 | P2 |
+| mayor-2cwk | Projected ConfigMap volumes — kubelet runtime | P2 |
+| mayor-4ath | Liveness probe restarts — kubelet runtime | P2 |
 
-## Recent merges (this session)
-
-| PR | What | Beads |
-|----|------|-------|
-| #282 ✓ | Continue token expiry → 410 Gone | mayor-sg53 |
-| #283 ✓ | Register 5 missing API groups (scheduling, events, storage, networking, admissionregistration) | mayor-yjt3, mayor-8tij, mayor-d7uo, mayor-zcx7, mayor-r2q5 |
-| #284 ✓ | Service Type defaulting, NodePort allocation, ExternalName ClusterIP | mayor-51ji, mayor-bdum |
-| #285 ✓ | Event timestamps → microsecond precision | mayor-y2zv |
-| #286 ✓ | too-many-arguments refactor | mayor-6miy |
-| #287 ✓ | sonobuoy retrieve: fix WebSocket splice mutex deadlock (EOF root cause) | mayor-m41q |
-| #288 ✓ | Correct PodSpec proto field numbers (root cause of ~175 pod failures) | mayor-fsb6, mayor-2ym1 |
-| #289 ✓ | Kind consistency in proto JSON fallback; bounded splice channels; token TTL 60s; EventSeries.lastObservedTime precision | mayor-ep6w, mayor-bklb, mayor-0hw8, mayor-ojvd |
-| #290 ✓ | Proto envelope 16 MiB size limit (OOM protection) | mayor-g6wq |
-| #291 ✓ | Remove unwrap() panics from codec/handler paths | mayor-5arq |
-| #292 ✓ | HMAC-SHA256 signing for continue tokens | mayor-73s6 |
-| direct ✓ | Auto-build u7s-scheduler if binary not found | — |
-
-## Deferred beads
+## Deferred
 
 | Bead | What | Priority |
 |------|------|----------|
 | mayor-xxds | PodScheduled condition missing | P2 |
 | mayor-b72p | Worker isolation infra | P2 |
-| mayor-1rt1 | lima-start.sh KCM documentation | P1 (deferred) |
-| mayor-52wo | embed upstream OpenAPI v2 spec | P2 |
+| mayor-1rt1 | lima-start.sh KCM docs | P1 (deferred) |
+| mayor-52wo | Embed upstream OpenAPI v2 spec | P2 |
 | mayor-j7to | Argo CD RBAC seed | P2 |
 | mayor-rvkq | CRD CEL validation | P3 |
 
+## Recent merges (this session)
+
+| PR | What | Beads |
+|----|------|-------|
+| #306 ✓ | perf(store): composite (ns, obj_name) index replacing separate indexes | mayor-ohuz |
+| #305 ✓ | perf(store): ns/obj_name columns + SQL index pushdown | mayor-2soq |
+| #304 ✓ | Always set metadata.uid on create | mayor-1oa9 |
+| #303 ✓ | deletecollection verb in discovery + RBAC | mayor-b7jq |
+| #302 ✓ | Stale-read floor via write-connection retry | mayor-mnnt |
+| #301 ✓ | SSA PATCH returns full object + managedFields | mayor-jy6p |
+| #300 ✓ | 409 Conflict returns existing object | mayor-d5tr |
+| #299 ✓ | metadata.name field selector fast-path | mayor-my1f |
+| #298 ✓ | hmac 0.13 / sha2 0.11 fix | mayor-ao32 |
+| #297 ✓ | Register 9 missing API resources | mayor-g9m9 + 8 |
+| #296 ✓ | Remove empty flowcontrol group; add tokenreviews | mayor-4wdh, mayor-2ptq |
+
 ## Stance
-Pre-alpha/greenfield — break freely, no backward compat, correctness first, kubectl-compatible API, minimal deps. Mayor merges on green CI automatically.
+Pre-alpha/greenfield — break freely, no backward compat, correctness first. Mayor merges on green CI immediately (CLEAN = merge, no branch manipulation).
