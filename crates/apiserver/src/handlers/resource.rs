@@ -25,8 +25,8 @@ use super::generic::{
     stamp_metadata, store_err, validate_name, CollectionQuery, RBAC_GROUP,
 };
 use super::json_patch::{
-    apply_json_patch, detect_patch_type, inject_managed_fields, strip_managed_fields, PatchQuery,
-    PatchType,
+    apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
+    strip_managed_fields, CreateQuery, PatchQuery, PatchType,
 };
 use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
@@ -207,6 +207,7 @@ pub async fn get_resource<S: Store>(
 pub async fn create_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
+    Query(create_query): Query<CreateQuery>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
@@ -228,6 +229,14 @@ pub async fn create_resource<S: Store>(
 
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // Field validation: detect unknown fields per ?fieldValidation= query param.
+    let warn_header = apply_field_validation(
+        &obj.body,
+        create_query.field_validation.as_deref(),
+        &group,
+        &plural,
+    )?;
 
     // Escalation prevention: before persisting a ClusterRoleBinding, verify the
     // caller already holds all rules of the referenced ClusterRole. This prevents
@@ -282,7 +291,11 @@ pub async fn create_resource<S: Store>(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
-    Ok((StatusCode::CREATED, Json(obj.body)).into_response())
+    let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
+    if let Some(hv) = warn_header {
+        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+    }
+    Ok(resp)
 }
 
 pub async fn replace_resource<S: Store>(
@@ -870,6 +883,7 @@ pub async fn get_namespaced_resource<S: Store>(
 pub async fn create_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    Query(create_query): Query<CreateQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -891,6 +905,14 @@ pub async fn create_namespaced_resource<S: Store>(
 
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    // Field validation: detect unknown fields per ?fieldValidation= query param.
+    let warn_header = apply_field_validation(
+        &obj.body,
+        create_query.field_validation.as_deref(),
+        &group,
+        &plural,
+    )?;
 
     let name = resolve_name(&mut obj)?;
 
@@ -959,7 +981,11 @@ pub async fn create_namespaced_resource<S: Store>(
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
-    Ok((StatusCode::CREATED, Json(obj.body)).into_response())
+    let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
+    if let Some(hv) = warn_header {
+        resp.headers_mut().insert(axum::http::header::WARNING, hv);
+    }
+    Ok(resp)
 }
 
 pub async fn replace_namespaced_resource<S: Store>(
@@ -2247,6 +2273,7 @@ mod tests {
                 "kube-node-lease".into(),
                 "leases".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
         )
@@ -2415,6 +2442,7 @@ mod tests {
                 version.to_string(),
                 "clusterroles".to_string(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             admin_user.clone(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&cr).unwrap()),
@@ -2425,6 +2453,7 @@ mod tests {
         create_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((group.to_string(), version.to_string(), plural.to_string())),
+            axum::extract::Query(CreateQuery::default()),
             admin_user,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&crb).unwrap()),
@@ -3077,6 +3106,7 @@ mod tests {
         match create_resource(
             State(state.clone()),
             Path(("".into(), "v1".into(), "nodes".into())),
+            axum::extract::Query(CreateQuery::default()),
             admin.clone(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
@@ -3090,6 +3120,7 @@ mod tests {
         let result = create_resource(
             State(state),
             Path(("".into(), "v1".into(), "nodes".into())),
+            axum::extract::Query(CreateQuery::default()),
             admin,
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
@@ -3543,6 +3574,7 @@ mod tests {
         let result = create_resource(
             State(state),
             Path(("custom.example.com".into(), "v1".into(), "widgets".into())),
+            axum::extract::Query(CreateQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -3652,6 +3684,7 @@ mod tests {
                 "default".into(),
                 "widgets".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
         )
@@ -3812,6 +3845,7 @@ mod tests {
                 "kube-node-lease".into(),
                 "leases".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             body.clone(),
         )
@@ -3829,6 +3863,7 @@ mod tests {
                 "kube-node-lease".into(),
                 "leases".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             body,
         )
@@ -4123,6 +4158,7 @@ mod tests {
         let result = create_resource(
             State(state),
             Path(("".into(), "v1".into(), "nodes".into())),
+            axum::extract::Query(CreateQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -4239,6 +4275,7 @@ mod tests {
                 "kube-node-lease".into(),
                 "leases".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from("not json at all"),
         )
@@ -4490,6 +4527,7 @@ mod tests {
         let create_result = create_namespaced_resource(
             State(state.clone()),
             Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
         )
@@ -4554,6 +4592,7 @@ mod tests {
         let _ = create_namespaced_resource(
             State(state.clone()),
             Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
         )
@@ -4630,6 +4669,7 @@ mod tests {
             let _ = create_namespaced_resource(
                 State(state.clone()),
                 Path(("".into(), "v1".into(), "default".into(), "services".into())),
+                axum::extract::Query(CreateQuery::default()),
                 json_headers(),
                 bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
             )
@@ -4733,6 +4773,7 @@ mod tests {
                 "v1".into(),
                 "clusterroles".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "kubectl".into(),
                 uid: String::new(),
@@ -4789,6 +4830,7 @@ mod tests {
                     "test-ns".into(),
                     "leases".into(),
                 )),
+                axum::extract::Query(CreateQuery::default()),
                 json_headers(),
                 bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
             )
@@ -4873,6 +4915,7 @@ mod tests {
                 "default".into(),
                 "configmaps".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             body.clone(),
         )
@@ -4895,6 +4938,7 @@ mod tests {
                 "default".into(),
                 "configmaps".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             body,
         )
@@ -4949,6 +4993,7 @@ mod tests {
                 "v1".into(),
                 "storageclasses".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "test".into(),
                 uid: String::new(),
@@ -4975,6 +5020,7 @@ mod tests {
                 "v1".into(),
                 "storageclasses".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "test".into(),
                 uid: String::new(),
@@ -5036,6 +5082,7 @@ mod tests {
                 "default".to_string(),
                 "serviceaccounts".to_string(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&sa).unwrap()),
         )
@@ -5112,6 +5159,7 @@ mod tests {
                     "default".to_string(),
                     "configmaps".to_string(),
                 )),
+                axum::extract::Query(CreateQuery::default()),
                 json_headers(),
                 bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
             )
@@ -5240,6 +5288,7 @@ mod tests {
         let result = create_resource(
             axum::extract::State(state),
             axum::extract::Path(("".to_string(), "v1".to_string(), "nodes".to_string())),
+            axum::extract::Query(CreateQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -5301,6 +5350,7 @@ mod tests {
                 "default".into(),
                 "configmaps".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
         )
@@ -5388,6 +5438,7 @@ mod tests {
                 "default".into(),
                 "deployments".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
         )
@@ -5446,6 +5497,7 @@ mod tests {
                 "default".into(),
                 "replicasets".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
         )
@@ -5503,6 +5555,7 @@ mod tests {
                 "default".into(),
                 "statefulsets".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&ss).unwrap()),
         )
@@ -5568,6 +5621,7 @@ mod tests {
                 "default".into(),
                 "replicasets".into(),
             )),
+            axum::extract::Query(CreateQuery::default()),
             json_headers(),
             body_bytes,
         )
@@ -5942,5 +5996,220 @@ mod tests {
              to microsecond precision; client-go MicroTime rejects bare RFC3339 without \
              '.000000' — causing every event occurrence to appear new (deduplication breaks)"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: fieldValidation=Strict/Warn/Ignore (mayor-7exg)
+    // ---------------------------------------------------------------------------
+
+    /// POST with an unknown top-level field and ?fieldValidation=Strict must return
+    /// 422 UnprocessableEntity with a well-formed Kubernetes Status body.
+    ///
+    /// The conformance tests PANICKED because the server previously ignored
+    /// fieldValidation=Strict and returned 201 with the object body. The test client
+    /// expected a 422 Status body and crashed trying to parse a ConfigMap as a Status.
+    ///
+    /// This test fails if apply_field_validation no longer rejects unknown fields in
+    /// Strict mode — the conformance tests would panic again.
+    #[tokio::test]
+    async fn create_namespaced_resource_strict_rejects_unknown_field() {
+        let state = make_state();
+
+        // ConfigMap with an unknown top-level field — "unknownField" is not in the
+        // known schema for configmaps.
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "strict-test", "namespace": "default" },
+            "data": { "key": "value" },
+            "unknownField": "this-should-be-rejected"
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(CreateQuery {
+                field_validation: Some("Strict".to_string()),
+                ..Default::default()
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => {
+                assert_eq!(
+                    err.0,
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "fieldValidation=Strict must produce 422 UnprocessableEntity — \
+                     the conformance test client parses the response as a Status object; \
+                     a non-422 response causes a panic in the Go client"
+                );
+                assert_eq!(
+                    err.1.reason, "Invalid",
+                    "Status.reason must be 'Invalid' for field validation errors"
+                );
+                assert!(
+                    err.1.message.contains("unknownField"),
+                    "Status.message must name the unknown field; got: {}",
+                    err.1.message
+                );
+            }
+            Ok(_) => panic!(
+                "POST with unknown field + fieldValidation=Strict must return 422; \
+                 the conformance test panics when it gets a 201 object body instead of a 422 Status"
+            ),
+        }
+    }
+
+    /// POST with an unknown top-level field and ?fieldValidation=Ignore must return 201.
+    ///
+    /// Ignore (the default) silently strips/tolerates unknown fields — existing behavior.
+    #[tokio::test]
+    async fn create_namespaced_resource_ignore_accepts_unknown_field() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "ignore-test", "namespace": "default" },
+            "data": { "key": "value" },
+            "unknownField": "this-should-be-ignored"
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(CreateQuery {
+                field_validation: Some("Ignore".to_string()),
+                ..Default::default()
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Ignore mode must accept unknown fields; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "fieldValidation=Ignore must return 201 — unknown fields are silently tolerated"
+        );
+    }
+
+    /// POST with an unknown top-level field and ?fieldValidation=Warn must return 201
+    /// with a Warning response header listing the unknown field.
+    #[tokio::test]
+    async fn create_namespaced_resource_warn_returns_warning_header() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "warn-test", "namespace": "default" },
+            "data": { "key": "value" },
+            "unknownField": "trigger-warning"
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(CreateQuery {
+                field_validation: Some("Warn".to_string()),
+                ..Default::default()
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Warn mode must accept unknown fields; got: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "fieldValidation=Warn must return 201 — the object is stored despite warnings"
+        );
+        assert!(
+            result.headers().contains_key(axum::http::header::WARNING),
+            "fieldValidation=Warn must add a Warning response header listing the unknown field"
+        );
+    }
+
+    /// POST with an unknown metadata field and ?fieldValidation=Strict must return 422.
+    ///
+    /// Corresponds to the conformance test "detect unknown metadata fields of a typed object".
+    #[tokio::test]
+    async fn create_namespaced_resource_strict_rejects_unknown_metadata_field() {
+        let state = make_state();
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "meta-strict-test",
+                "namespace": "default",
+                "unknownMetaField": "should-be-rejected"
+            },
+            "data": {}
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(CreateQuery {
+                field_validation: Some("Strict".to_string()),
+                ..Default::default()
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => {
+                assert_eq!(
+                    err.0,
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "unknown metadata field with Strict must produce 422"
+                );
+                assert!(
+                    err.1.message.contains("unknownMetaField"),
+                    "Status.message must name the unknown metadata field; got: {}",
+                    err.1.message
+                );
+            }
+            Ok(_) => panic!(
+                "POST with unknown metadata field + fieldValidation=Strict must return 422; \
+                 the conformance test 'detect unknown metadata fields' panics when it gets \
+                 a 201 object body instead of a 422 Status"
+            ),
+        }
     }
 }
