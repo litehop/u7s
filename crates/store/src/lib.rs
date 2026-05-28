@@ -222,7 +222,7 @@ impl SqliteStore {
             ON objects (json_extract(value, '$.spec.nodeName'))
             WHERE key LIKE '/registry/pods/%';
 
-            CREATE INDEX IF NOT EXISTS idx_ns ON objects(ns) WHERE ns IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_ns_name ON objects(ns, obj_name) WHERE ns IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_name ON objects(obj_name);
         ",
         )?;
@@ -1298,7 +1298,7 @@ mod tests {
                  CREATE TABLE IF NOT EXISTS meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);
                  INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
                  CREATE INDEX IF NOT EXISTS idx_pods_nodename ON objects (json_extract(value, '$.spec.nodeName')) WHERE key LIKE '/registry/pods/%';
-                 CREATE INDEX IF NOT EXISTS idx_ns ON objects(ns) WHERE ns IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_ns_name ON objects(ns, obj_name) WHERE ns IS NOT NULL;
                  CREATE INDEX IF NOT EXISTS idx_name ON objects(obj_name);",
             ).unwrap();
             conn
@@ -2489,34 +2489,39 @@ mod tests {
 
     #[test]
     fn explain_query_plan_shows_index_for_ns_and_name() {
-        // Verifies that SQLite uses the idx_ns and idx_name indexes for field selector queries,
-        // not a full table scan. If the indexes are dropped or the WHERE clause changes to use
-        // json_extract, EXPLAIN QUERY PLAN would show "SCAN objects" instead of "SEARCH objects".
-        // This test would fail if the indexes were removed or the SQL path reverted to a full scan.
+        // Verifies that SQLite uses the composite idx_ns_name index for ns+name queries and
+        // idx_name for name-only queries — neither must fall back to a full table scan.
+        // SQLite uses at most one index per table per query; the composite index covers both
+        // ns-only and ns+name cases. If idx_ns_name is replaced with separate indexes,
+        // the ns+name query would use only one of them and lose selectivity.
+        // This test fails if the indexes are dropped or the composite is split back into two.
         let store = SqliteStore::new(":memory:").expect("open in-memory db");
         let conn = store.write_conn.blocking_lock();
 
-        let plan_ns: Vec<String> = {
+        // ns + obj_name query: must use the composite idx_ns_name index.
+        let plan_ns_name: Vec<String> = {
             let mut stmt = conn
                 .prepare(
                     "EXPLAIN QUERY PLAN \
                      SELECT key, value, revision FROM objects \
-                     WHERE key >= '/registry/pods/' AND key < '/registry/pods0' AND ns = 'default' \
+                     WHERE key >= '/registry/pods/' AND key < '/registry/pods0' \
+                     AND ns = 'default' AND obj_name = 'nginx' \
                      ORDER BY key ASC",
                 )
-                .expect("prepare ns plan");
+                .expect("prepare ns+name plan");
             stmt.query_map([], |r| r.get::<_, String>(3))
                 .expect("query")
                 .map(|r| r.expect("row"))
                 .collect()
         };
 
-        let plan_ns_str = plan_ns.join(" ");
+        let plan_ns_name_str = plan_ns_name.join(" ");
         assert!(
-            plan_ns_str.to_lowercase().contains("search"),
-            "EXPLAIN QUERY PLAN for ns= must show SEARCH (index usage), got: {plan_ns_str}"
+            plan_ns_name_str.to_lowercase().contains("idx_ns_name"),
+            "EXPLAIN QUERY PLAN for ns+name must use idx_ns_name (composite index), got: {plan_ns_name_str}"
         );
 
+        // name-only query (cluster-scoped): must use the idx_name index.
         let plan_name: Vec<String> = {
             let mut stmt = conn
                 .prepare(
