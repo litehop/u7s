@@ -76,7 +76,20 @@ pub async fn api_group_list<S: Store>(
 ) -> Response {
     if wants_aggregated_discovery(&headers) {
         let list = build_aggregated_discovery(&state).await;
-        return Json(list).into_response();
+        // The response Content-Type must be the aggregated-discovery media type so
+        // kubectl knows the server understood the request and returned the merged
+        // APIGroupDiscoveryList.  Without this header, kubectl 1.27+ falls back to
+        // the legacy discovery path and tries to decode the body as APIGroupList —
+        // producing an empty resource mapper that makes every `kubectl apply` fail
+        // with "no matches for kind".
+        return (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json;g=apidiscovery.k8s.io;v=v2beta1",
+            )],
+            Json(list),
+        )
+            .into_response();
     }
     Json(api_group_list_inner(&state).await).into_response()
 }
@@ -311,10 +324,15 @@ fn api_v1_resource_list_value() -> serde_json::Value {
 }
 
 /// Handler for `GET /discovery/v2` — always returns the aggregated discovery list.
-pub async fn aggregated_discovery_v2<S: Store>(
-    State(state): State<AppState<S>>,
-) -> Json<serde_json::Value> {
-    Json(build_aggregated_discovery(&state).await)
+pub async fn aggregated_discovery_v2<S: Store>(State(state): State<AppState<S>>) -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json;g=apidiscovery.k8s.io;v=v2beta1",
+        )],
+        Json(build_aggregated_discovery(&state).await),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2169,6 +2187,23 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "GET /apis with AggregatedDiscovery Accept must return 200"
+        );
+
+        // kubectl 1.27+ uses the response Content-Type to decide whether the server
+        // understood aggregated discovery.  Without this specific media type, kubectl
+        // falls back to the legacy APIGroupList path and tries to decode our
+        // APIGroupDiscoveryList body as APIGroupList — the resource mapper ends up
+        // empty and every `kubectl apply` fails with "no matches for kind".
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            ct, "application/json;g=apidiscovery.k8s.io;v=v2beta1",
+            "aggregated discovery response must carry Content-Type \
+             'application/json;g=apidiscovery.k8s.io;v=v2beta1' so kubectl \
+             uses the aggregated code path instead of falling back to APIGroupList"
         );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
