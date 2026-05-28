@@ -55,6 +55,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("node.k8s.io", "v1"),
     ("policy", "v1"),
     ("rbac.authorization.k8s.io", "v1"),
+    ("resource.k8s.io", "v1alpha3"),
     ("scheduling.k8s.io", "v1"),
     ("storage.k8s.io", "v1"),
 ];
@@ -174,6 +175,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("node.k8s.io", "v1") => Some(node_v1_resources()),
         ("policy", "v1") => Some(policy_v1_resources()),
         ("rbac.authorization.k8s.io", "v1") => Some(rbac_v1_resources()),
+        ("resource.k8s.io", "v1alpha3") => Some(resource_v1alpha3_resources()),
         ("scheduling.k8s.io", "v1") => Some(scheduling_v1_resources()),
         ("storage.k8s.io", "v1") => Some(storage_v1_resources()),
         _ => None,
@@ -407,6 +409,45 @@ fn rbac_v1_resources() -> serde_json::Value {
                 "singularName": "rolebinding",
                 "namespaced": true,
                 "kind": "RoleBinding",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn resource_v1alpha3_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "resource.k8s.io/v1alpha3",
+        "resources": [
+            {
+                "name": "deviceclasses",
+                "singularName": "deviceclass",
+                "namespaced": false,
+                "kind": "DeviceClass",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "resourceclaims",
+                "singularName": "resourceclaim",
+                "namespaced": true,
+                "kind": "ResourceClaim",
+                "shortNames": ["rc"],
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "resourceclaimtemplates",
+                "singularName": "resourceclaimtemplate",
+                "namespaced": true,
+                "kind": "ResourceClaimTemplate",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "resourceslices",
+                "singularName": "resourceslice",
+                "namespaced": false,
+                "kind": "ResourceSlice",
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
@@ -837,8 +878,10 @@ pub async fn openapi_v3() -> Json<serde_json::Value> {
 mod tests {
     use super::*;
     use axum::extract::State;
+    use axum::{body::Body, http::Request, routing::get, Router};
     use bytes::Bytes;
     use std::sync::Arc;
+    use tower::ServiceExt;
     use u7s_store::SqliteStore;
 
     use crate::handlers::crd::create_crd;
@@ -1496,6 +1539,77 @@ mod tests {
         );
     }
 
+    // HTTP-level: GET /openapi/v2 must return 200 with Swagger 2.0 JSON.
+    // This verifies the route is wired — the unit test above does not catch
+    // a route being removed from the router.
+    #[tokio::test]
+    async fn openapi_v2_route_returns_200_with_swagger_field() {
+        let app = Router::new().route("/openapi/v2", get(openapi_v2));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/openapi/v2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /openapi/v2 must return 200 — kubectl fails with \
+             'failed to download openapi: unknown' if the route is absent or returns an error"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value =
+            serde_json::from_slice(&body).expect("/openapi/v2 body must be valid JSON");
+        assert_eq!(
+            val.get("swagger").and_then(|v| v.as_str()),
+            Some("2.0"),
+            "/openapi/v2 JSON must contain \"swagger\": \"2.0\" — kubectl \
+             rejects the schema if the swagger version field is absent"
+        );
+        assert!(
+            val.get("paths").is_some(),
+            "/openapi/v2 JSON must contain a \"paths\" key"
+        );
+    }
+
+    // HTTP-level: GET /openapi/v3 must return 200 with a "paths" key.
+    // This verifies the route is wired — kubectl 1.28+ calls /openapi/v3
+    // first and falls back to /openapi/v2 only if it gets a valid response.
+    #[tokio::test]
+    async fn openapi_v3_route_returns_200_with_paths_key() {
+        let app = Router::new().route("/openapi/v3", get(openapi_v3));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/openapi/v3")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "GET /openapi/v3 must return 200 — kubectl 1.28+ probes this \
+             before falling back to /openapi/v2"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value =
+            serde_json::from_slice(&body).expect("/openapi/v3 body must be valid JSON");
+        assert!(
+            val.get("paths").is_some(),
+            "/openapi/v3 JSON must contain a \"paths\" key so kubectl falls back to /openapi/v2 \
+             rather than erroring out"
+        );
+    }
+
     // scheduling.k8s.io must appear in /apis — kube-scheduler reads PriorityClasses
     // at startup to assign pod scheduling priority. Without this group, scheduling
     // conformance tests fail with "resource not found".
@@ -1765,6 +1879,68 @@ mod tests {
             names.contains(&"tokenreviews"),
             "tokenreviews must be in authentication.k8s.io/v1 — \
              the endpoint already exists and must be discoverable; got: {names:?}"
+        );
+    }
+
+    // resource.k8s.io must appear in /apis — Dynamic Resource Allocation (DRA) uses this
+    // group for ResourceClaim, ResourceClaimTemplate, ResourceSlice, and DeviceClass.
+    // kubectl and admission webhooks depend on this group being discoverable; without it,
+    // `kubectl get resourceclaims` returns "the server doesn't have a resource type".
+    #[tokio::test]
+    async fn resource_group_appears_in_api_group_list() {
+        let state = make_state();
+        let Json(list) = api_group_list(State(state)).await;
+        let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
+        assert!(
+            names.contains(&"resource.k8s.io"),
+            "resource.k8s.io must appear in /apis — DRA requires ResourceClaim, \
+             ResourceClaimTemplate, ResourceSlice, and DeviceClass to be discoverable; got: {names:?}"
+        );
+    }
+
+    // resource.k8s.io/v1alpha3 must include all four DRA resource types — ResourceClaim,
+    // ResourceClaimTemplate, ResourceSlice, and DeviceClass are the core DRA objects.
+    // Missing any of them causes `kubectl get resourceclaims` or scheduler DRA plugins
+    // to fail at startup with "resource not found".
+    #[tokio::test]
+    async fn resource_v1alpha3_resources_list() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("resource.k8s.io".to_string(), "v1alpha3".to_string())),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /apis/resource.k8s.io/v1alpha3 must return 200"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"resourceclaims"),
+            "resourceclaims must be in resource.k8s.io/v1alpha3 — core DRA type; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"resourceclaimtemplates"),
+            "resourceclaimtemplates must be in resource.k8s.io/v1alpha3 — core DRA type; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"resourceslices"),
+            "resourceslices must be in resource.k8s.io/v1alpha3 — DRA node plugin reporting; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"deviceclasses"),
+            "deviceclasses must be in resource.k8s.io/v1alpha3 — DRA device class; got: {names:?}"
         );
     }
 

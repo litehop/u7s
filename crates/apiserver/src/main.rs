@@ -554,8 +554,12 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
             { "apiGroups": [""], "resources": ["pods/status"],  "verbs": ["get","update","patch"] },
             { "apiGroups": [""], "resources": ["pods/log"],     "verbs": ["get"] },
             { "apiGroups": [""], "resources": ["events"],       "verbs": ["create","patch","update"] },
-            { "apiGroups": [""], "resources": ["configmaps"],   "verbs": ["get","list","watch"] },
-            { "apiGroups": [""], "resources": ["secrets"],      "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["configmaps"],          "verbs": ["get","list","watch"] },
+            { "apiGroups": [""], "resources": ["secrets"],             "verbs": ["get","list","watch"] },
+            // Kubelet calls TokenRequest to project SA tokens into pods (projected volumes).
+            // Without this rule the kubelet's POST to serviceaccounts/{name}/token returns 403
+            // and containers never get an SA token, breaking in-cluster API calls.
+            { "apiGroups": [""], "resources": ["serviceaccounts/token"], "verbs": ["create"] },
             { "apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csinodes"], "verbs": ["get","list","watch","create","update","patch"] },
             { "apiGroups": ["storage.k8s.io"], "resources": ["csidrivers"], "verbs": ["get","list","watch"] },
@@ -722,6 +726,33 @@ async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
         Ok(_) => tracing::info!("seeded Service: kube-system/kube-dns"),
         Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
         Err(e) => return Err(anyhow::anyhow!("seed Service kube-system/kube-dns: {e}")),
+    }
+
+    // default/kubernetes Endpoints — controllers (e.g. endpoint controller, admission webhooks)
+    // watch this object to locate the apiserver. Without it they log errors and may fail to start.
+    let ep_key = keys::object_key("endpoints", "default", "kubernetes");
+    let ep_body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": {
+            "name": "kubernetes",
+            "namespace": "default",
+            "uid": "00000000-0000-0000-0000-000000000022",
+            "creationTimestamp": "2024-01-01T00:00:00Z",
+            "labels": { "endpointslice.kubernetes.io/skip-mirror": "true" }
+        },
+        "subsets": [{
+            "addresses": [{ "ip": "127.0.0.1" }],
+            "ports": [{ "name": "https", "port": 443, "protocol": "TCP" }]
+        }]
+    });
+    match store
+        .put(&ep_key, Bytes::from(ep_body.to_string()), Some(0))
+        .await
+    {
+        Ok(_) => tracing::info!("seeded Endpoints: default/kubernetes"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(anyhow::anyhow!("seed Endpoints default/kubernetes: {e}")),
     }
 
     Ok(())
@@ -1240,6 +1271,28 @@ mod tests {
              kubelet webhook authenticator calls back to the apiserver"
         );
 
+        // Regression test for mayor-7vbe: kubelet must be allowed to POST
+        // /api/v1/namespaces/{ns}/serviceaccounts/{name}/token (TokenRequest subresource).
+        // Without this rule the projected SA token volume never gets populated —
+        // the kubelet's POST returns 403 and containers never receive an SA token,
+        // breaking all in-cluster API calls.
+        let sa_token_create = rbac::AuthzRequest {
+            username: "system:node:my-node",
+            groups: &groups,
+            verb: "create",
+            api_group: "",
+            resource: "serviceaccounts",
+            subresource: "token",
+            namespace: Some("default"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&sa_token_create),
+            "system:nodes must be allowed to create serviceaccounts/token — \
+             kubelet needs this to project SA tokens into pod volumes (mayor-7vbe)"
+        );
+
         // A user NOT in system:nodes must be denied — the binding is group-specific.
         let other_groups = vec!["system:authenticated".to_owned()];
         let pod_read_other = rbac::AuthzRequest {
@@ -1359,6 +1412,63 @@ mod tests {
         assert!(
             dns_obj.is_some(),
             "Service kube-system/kube-dns must still exist"
+        );
+    }
+
+    /// seed_services must also create the 'kubernetes' Endpoints object in the default namespace.
+    ///
+    /// Controllers such as the endpoint controller and some admission webhooks watch this
+    /// object to locate the apiserver IP/port. Without it they log errors on startup and
+    /// may refuse to start. The corresponding Service (default/kubernetes) alone is not enough
+    /// because older controllers resolve the apiserver address via Endpoints, not EndpointSlices.
+    #[tokio::test]
+    async fn seed_services_creates_kubernetes_endpoints() {
+        let store = make_store();
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
+        seed_services(&store).await.expect("seed must not fail");
+
+        let ep_key = keys::object_key("endpoints", "default", "kubernetes");
+        let ep_obj = store.get(&ep_key).await.expect("get must not fail");
+        assert!(
+            ep_obj.is_some(),
+            "Endpoints default/kubernetes must exist after seeding — \
+             controllers watch this object to locate the apiserver; \
+             without it they log errors and may fail to start"
+        );
+        let ep: serde_json::Value =
+            serde_json::from_slice(&ep_obj.unwrap().value).expect("valid json");
+        assert_eq!(ep["kind"].as_str(), Some("Endpoints"));
+        assert_eq!(ep["metadata"]["name"].as_str(), Some("kubernetes"));
+        assert_eq!(ep["metadata"]["namespace"].as_str(), Some("default"));
+        let subsets = ep["subsets"].as_array().expect("subsets must be an array");
+        assert!(
+            !subsets.is_empty(),
+            "Endpoints must have at least one subset"
+        );
+        let addresses = subsets[0]["addresses"]
+            .as_array()
+            .expect("addresses must be an array");
+        assert!(
+            !addresses.is_empty(),
+            "subset must have at least one address"
+        );
+        let ip = addresses[0]["ip"].as_str().unwrap_or("");
+        assert!(!ip.is_empty(), "endpoint address must have a non-empty IP");
+        let ports = subsets[0]["ports"]
+            .as_array()
+            .expect("ports must be an array");
+        assert!(!ports.is_empty(), "subset must have at least one port");
+        assert_eq!(
+            ports[0]["port"].as_u64(),
+            Some(443),
+            "kubernetes Endpoints must expose port 443 — apiserver HTTPS port"
+        );
+        assert_eq!(
+            ports[0]["protocol"].as_str(),
+            Some("TCP"),
+            "kubernetes Endpoints port must be TCP"
         );
     }
 
@@ -2819,6 +2929,94 @@ mod tests {
             stored_val["kind"].as_str(),
             Some("ClusterRole"),
             "stored object kind must be ClusterRole"
+        );
+    }
+
+    /// DELETE /api/v1/persistentvolumes/{name} must not return 405 MethodNotAllowed.
+    ///
+    /// PersistentVolumes are cluster-scoped (no namespace). The CSI conformance test
+    /// creates a PV and then deletes it via DELETE /api/v1/persistentvolumes/{name}.
+    /// Without the DELETE verb registered on the cluster-scoped named-resource route,
+    /// axum returns 405 and the conformance test fails.
+    ///
+    /// This test fails (405) if the .delete(core_delete_resource) call is removed from
+    /// the /api/v1/{resource}/{name} route in build_router.
+    #[tokio::test]
+    async fn persistent_volume_delete_returns_non_405() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        let admin = auth::UserInfo {
+            username: "admin".to_string(),
+            uid: String::new(),
+            groups: vec!["system:masters".to_string()],
+        };
+
+        // Create a PersistentVolume so the DELETE has something to act on.
+        let pv_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": { "name": "test-pv" },
+            "spec": {
+                "capacity": { "storage": "1Gi" },
+                "accessModes": ["ReadWriteOnce"],
+                "hostPath": { "path": "/tmp/pv" }
+            }
+        });
+        let mut create_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/persistentvolumes")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(pv_body.to_string()))
+            .expect("POST request must build");
+        create_req.extensions_mut().insert(admin.clone());
+        let create_resp = router
+            .call(create_req)
+            .await
+            .expect("router must not error on POST");
+        assert_eq!(
+            create_resp.status(),
+            StatusCode::CREATED,
+            "PersistentVolume POST must return 201 before we can test DELETE"
+        );
+        // Drain body to reclaim connection.
+        let _ = to_bytes(create_resp.into_body(), 4096).await;
+
+        // DELETE the PersistentVolume — must not return 405 MethodNotAllowed.
+        // Before the fix: build_router omitted .delete() on /api/v1/{resource}/{name},
+        // causing axum to return 405 because the path matched but DELETE was unregistered.
+        let mut delete_req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/v1/persistentvolumes/test-pv")
+            .body(axum::body::Body::empty())
+            .expect("DELETE request must build");
+        delete_req.extensions_mut().insert(admin);
+        let delete_resp = router
+            .call(delete_req)
+            .await
+            .expect("router must not error on DELETE");
+        let delete_status = delete_resp.status();
+        assert_ne!(
+            delete_status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "DELETE /api/v1/persistentvolumes/test-pv must not return 405 — \
+             the CSI conformance test deletes PVs after the lifecycle test and \
+             a 405 here means the route is not registered"
+        );
+        assert!(
+            delete_status.is_success(),
+            "DELETE /api/v1/persistentvolumes/test-pv must succeed (2xx), got {delete_status}"
         );
     }
 }

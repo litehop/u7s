@@ -416,10 +416,8 @@ pub(crate) async fn watch_generic<S: Store>(
                             // Deleted events always pass through so clients can clean up.
                             // Bookmark and Compacted are handled above.
                             if let WatchEvent::Added(obj) | WatchEvent::Modified(obj) = &event {
-                                let event_type = match &event {
-                                    WatchEvent::Added(_) => "ADDED",
-                                    _ => "MODIFIED",
-                                };
+                                let is_modified = matches!(&event, WatchEvent::Modified(_));
+                                let event_type = if is_modified { "MODIFIED" } else { "ADDED" };
                                 if let Ok(s) = std::str::from_utf8(&obj.value) {
                                     let mut parsed: serde_json::Value =
                                         serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
@@ -435,6 +433,40 @@ pub(crate) async fn watch_generic<S: Store>(
                                         let line = format!(
                                             "{{\"type\":\"{event_type}\",\"object\":{}}}\n",
                                             serde_json::to_string(&emit).unwrap_or_default()
+                                        );
+                                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
+                                    } else if is_modified {
+                                        // The object no longer matches the selector after this
+                                        // MODIFIED update. Emit a synthetic DELETED so watchers
+                                        // remove it from their cache. Without this, informers
+                                        // with a labelSelector would never learn that a previously-
+                                        // matching object exited their watch scope.
+                                        let name = parsed["metadata"]["name"].as_str().unwrap_or("");
+                                        let ns = parsed["metadata"]["namespace"].as_str().unwrap_or("");
+                                        let rv = obj.revision.to_string();
+                                        let tombstone = if ns.is_empty() {
+                                            serde_json::json!({
+                                                "apiVersion": api_version,
+                                                "kind": kind,
+                                                "metadata": {
+                                                    "name": name,
+                                                    "resourceVersion": rv
+                                                }
+                                            })
+                                        } else {
+                                            serde_json::json!({
+                                                "apiVersion": api_version,
+                                                "kind": kind,
+                                                "metadata": {
+                                                    "name": name,
+                                                    "namespace": ns,
+                                                    "resourceVersion": rv
+                                                }
+                                            })
+                                        };
+                                        let line = format!(
+                                            "{{\"type\":\"DELETED\",\"object\":{}}}\n",
+                                            serde_json::to_string(&tombstone).unwrap_or_default()
                                         );
                                         yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
                                     }
@@ -1291,6 +1323,134 @@ mod tests {
         assert_eq!(
             added_count, 0,
             "non-matching ADDED event must be suppressed by label selector; got lines {:?}",
+            lines
+        );
+    }
+
+    /// Regression test for mayor-dymy (bug 2): when a MODIFIED event changes the object's
+    /// labels so it no longer matches the watch selector, the server must emit a synthetic
+    /// DELETED event, not drop the event silently.
+    ///
+    /// Without this fix, informers watching with a labelSelector would never learn that a
+    /// previously-matching object exited scope (labels changed), causing stale cache entries
+    /// and spurious reconciliations that act on objects no longer in scope.
+    ///
+    /// This test would fail on revert: without the synthetic DELETED, `deleted_count` is 0.
+    #[tokio::test]
+    async fn watch_generic_modified_event_losing_selector_match_emits_synthetic_deleted() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Create object with matching label "app=frontend".
+        let obj_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-scope-exit",
+                "namespace": "default",
+                "labels": { "app": "frontend" }
+            }
+        });
+        let rv1 = store
+            .put(
+                "/registry/configmaps/default/cm-scope-exit",
+                bytes::Bytes::from(serde_json::to_vec(&obj_v1).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        // Update the object, removing the matching label (app=backend now).
+        // This is a MODIFIED event whose new state no longer matches "app=frontend".
+        let obj_v2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-scope-exit",
+                "namespace": "default",
+                "labels": { "app": "backend" }
+            }
+        });
+        store
+            .put(
+                "/registry/configmaps/default/cm-scope-exit",
+                bytes::Bytes::from(serde_json::to_vec(&obj_v2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Watch with "app=frontend". Ring buffer has ADDED (matches) then MODIFIED (no match).
+        // The MODIFIED must produce a synthetic DELETED, not silence.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: Some("app=frontend".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
+
+        let lines = read_watch_body_with_timeout(resp).await;
+
+        // Expect: ADDED (v1 matches) + DELETED (synthetic, v2 lost match).
+        let added_count = lines.iter().filter(|v| v["type"] == "ADDED").count();
+        assert_eq!(
+            added_count, 1,
+            "initial ADDED (matching object) must appear in stream; got {:?}",
+            lines
+        );
+
+        let deleted_count = lines.iter().filter(|v| v["type"] == "DELETED").count();
+        assert_eq!(
+            deleted_count, 1,
+            "MODIFIED event that removes matching label must emit a synthetic DELETED; \
+             without it informers never learn the object left scope and keep stale cache \
+             entries (mayor-dymy regression): got {:?}",
+            lines
+        );
+
+        // The synthetic DELETED must identify the correct object.
+        let deleted_ev = lines.iter().find(|v| v["type"] == "DELETED").unwrap();
+        assert_eq!(
+            deleted_ev["object"]["metadata"]["name"], "cm-scope-exit",
+            "synthetic DELETED must carry the object name; got {:?}",
+            deleted_ev
+        );
+        assert_eq!(
+            deleted_ev["object"]["metadata"]["namespace"], "default",
+            "synthetic DELETED must carry the object namespace; got {:?}",
+            deleted_ev
+        );
+
+        // No MODIFIED events should appear — the object lost scope.
+        let modified_count = lines.iter().filter(|v| v["type"] == "MODIFIED").count();
+        assert_eq!(
+            modified_count, 0,
+            "MODIFIED that exits scope must not appear as MODIFIED in stream; got {:?}",
             lines
         );
     }
