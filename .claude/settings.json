@@ -4,7 +4,8 @@
     "allow": [
       "Bash(bd *)",
       "Bash(cargo *)",
-      "Bash(gh *)",
+      "Bash(gh pr *)",
+      "Bash(gh run *)",
       "Bash(git *)",
       "Bash(jq *)",
       "Bash(kubectl *)",
