@@ -1,62 +1,63 @@
 # Dashboard
-2026-05-28T03:10
-Resume: `bd ready` → 21 beads open; 5 P1 claimed, awaiting dispatch
+2026-05-29T00:30 — PR #330 CI re-running after /apis regression fix; 3 ready beads; 2 operator decisions pending
+
+Resume: merge #330 on green → dispatch dacc; decide pzkt + mixv
 
 ## What needs the operator now
 
-Nothing — ready to dispatch P1 workers. Previous kubelet decision resolved (no bead filed).
+| Bead | Decision needed | Mayor recommendation |
+|------|----------------|---------------------|
+| **mayor-pzkt** | ClusterIP allocator: real dual-stack CIDR manager vs incrementing stub? | **Real allocator** — u7s is natively dual-stack (IPv4+IPv6 pools required) |
+| **mayor-mixv** | WebSocket exec/attach: operator confirmed WebSocket-only. Dispatch worker? | **Yes — dispatch now** |
 
-## In-flight
+## In-flight PRs
 
-5 P1 beads claimed, workers not yet dispatched (prior attempt used `isolation="worktree"` — fixed in dispatch-prompt-template.md commit 20ac195; must pre-create worktrees manually):
+| PR | Bead | What | CI |
+|----|------|------|----|
+| #330 | mayor-pv8p | fix: AggregatedDiscovery /discovery/v2 + /apis regression fix | 8 checks pending |
 
-| Bead | What |
-|------|------|
-| mayor-f93h | ConfigMap POST returns 409 instead of 201 |
-| mayor-bdsj | GET returns resourceVersion=0 for stored objects |
-| mayor-guqc | Watch streams close prematurely (~1s) |
-| mayor-2fja | Missing selector defaulting for Deployment/RS/StatefulSet |
-| mayor-0hxr | POST returns empty body on 400 |
+## Open worktrees
+- mayor-pv8p (PR #330 open — merge watcher active)
 
-## Open PRs
+## Ready to dispatch
 
-None.
+| Bead | What | Blocked on |
+|------|------|-----------|
+| mayor-dacc | Remove --validate=false from smoke/perf CI | PR #330 merge first |
+| mayor-mixv | Pod exec/attach WebSocket proxy apiserver→kubelet | Operator go-ahead |
+| mayor-pzkt | Service ClusterIP dual-stack allocator | Operator decision on real vs stub |
 
 ## Deferred
 
 | Bead | What | Priority |
 |------|------|----------|
-| mayor-xxds | PodScheduled condition missing | P2 |
-| mayor-b72p | Worker isolation infra | P2 |
-| mayor-1rt1 | lima-start.sh KCM docs | P1 (deferred) |
+| mayor-b72p | Worker isolation infra (operator decision: option 3 recommended) | P2 |
 | mayor-52wo | Embed upstream OpenAPI v2 spec | P2 |
-| mayor-j7to | Argo CD RBAC seed | P2 |
+| mayor-j7to | Argo CD RBAC seed (depends on SA token projection) | P2 |
 | mayor-rvkq | CRD CEL validation | P3 |
 
 ## Recent merges (this session)
 
-| PR | What | Beads |
-|----|------|-------|
-| #307 ✓ | test(watch): ConfigMap PATCH emits MODIFIED watch event | mayor-2cwk |
-| #306 ✓ | perf(store): composite (ns, obj_name) index | mayor-ohuz |
-| #305 ✓ | perf(store): ns/obj_name columns + SQL index pushdown | mayor-2soq |
-| #304 ✓ | Always set metadata.uid on create | mayor-1oa9 |
-| #303 ✓ | deletecollection verb in discovery + RBAC | mayor-b7jq |
-| #302 ✓ | Stale-read floor via write-connection retry | mayor-mnnt |
-| #301 ✓ | SSA PATCH returns full object + managedFields | mayor-jy6p |
-| #300 ✓ | 409 Conflict returns existing object | mayor-d5tr |
-| #299 ✓ | metadata.name field selector fast-path | mayor-my1f |
-| #298 ✓ | hmac 0.13 / sha2 0.11 fix | mayor-ao32 |
-| #297 ✓ | Register 9 missing API resources | mayor-g9m9 + 8 |
-| #296 ✓ | Remove empty flowcontrol group; add tokenreviews | mayor-4wdh, mayor-2ptq |
-
-## Closed this session
-
-| Bead | Resolution |
-|------|-----------|
-| mayor-uvcp | Already fixed by #297 (controllerrevisions registration) |
-| mayor-2cwk | Bug in upstream kubelet volume syncer, not apiserver. Test in #307. |
-| mayor-4ath | Bug in upstream kubelet probe runner, not apiserver. Tests in #308. |
+| PR | What | Bead |
+|----|------|------|
+| #336 ✓ | fix: LimitRange panic (is_object guards + proto spec decode) | mayor-1dhj |
+| #335 ✓ | fix: fieldValidation=Strict returns 422 Status body | mayor-7exg |
+| #334 ✓ | fix: PodScheduled=False on create, True on bind | mayor-xxds |
+| #333 ✓ | fix: lima-start.sh starts KCM alongside kubelet | mayor-1rt1 |
+| #332 ✓ | fix: AdmissionWebhook bootstrap deadlock prevention | mayor-d1fb |
+| #331 ✓ | fix: EndpointSlice + EndpointSliceMirroring controllers in KCM | mayor-do5i |
+| #329 ✓ | fix: openapi_v2 dynamic CRD definitions; CRD status conditions | mayor-8ssu |
+| #328 ✓ | fix: pod resize subresource PATCH+PUT | mayor-sor9 |
+| #327 ✓ | fix: register DRA resource.k8s.io/v1 types | mayor-ixyf |
+| #326 ✓ | fix: Pod metadata.generation initialized and incremented | mayor-0zki |
+| #325 ✓ | fix: Event PATCH normalizes series.lastObservedTime | mayor-quqc |
 
 ## Stance
 Pre-alpha/greenfield — break freely, no backward compat, correctness first. Mayor merges on green CI immediately.
+
+## Protocol notes
+- Use `subagent_type="worker"` in every editing Agent dispatch — default lacks permissionMode:auto
+- Include permission line in every prompt: "You have full permission to use all tools…"
+- Step 0: `git -C <worktree>` not `cd <worktree>` (cd not in Bash allowlist)
+- Pre-create worktrees manually; never use `isolation: "worktree"` in Agent dispatches
+- Worker must test against a running server (not just cargo test) for any HTTP-level behavior change

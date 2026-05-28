@@ -118,9 +118,7 @@ restarts. **Stack is feature-complete and ready to run.**
 - SA projected volume injection OR Argo CD pods explicitly mounting token Secret
 
 ### Known gaps to address
-- **Pod exec/attach:** WebSocket proxy apiserver→kubelet. Decision logged in memory
-  (`networking-websocket-decision-2026-05-22`): WebSocket-only, no SPDY.
-  Proxy-through decision is still open (operator to decide full proxy vs stub-first).
+- **Pod exec/attach:** WebSocket proxy apiserver→kubelet. WebSocket-only, no SPDY (k8s 1.34+ dropped SPDY). Full proxy-through dispatched as mayor-mixv.
 - **Namespace controller:** finalizer-based deletion for proper namespace GC
   (Argo CD garbage collection relies on it).
 - **Argo CD RBAC seeding** (mayor-j7to): seed argocd-application-controller SA +
@@ -153,5 +151,5 @@ restarts. **Stack is feature-complete and ready to run.**
 | Container runtime | CRI-O + crun | `docs/decisions/crio-over-containerd.md` |
 | Scheduler | External kube-scheduler (Phase 3/4); custom bin-spread planned (Phase 4+) | `docs/decisions/custom-bin-spread-scheduler.md` |
 | CRD validation | boon crate (full openAPIV3Schema) | `docs/decisions/boon-for-crd-schema-validation.md` |
-| Networking | WebSocket-only exec/attach/portforward (no SPDY) | memory: networking-websocket-decision-2026-05-22 |
+| Networking | WebSocket-only exec/attach/portforward (no SPDY) | operator confirmed 2026-05-28; k8s 1.34+ dropped SPDY |
 | TLS | aws-lc-rs (P-256 ECDSA) — known arm64/Lima compat issue; workaround: use CI | memory: local-lima-arm64-environment |
