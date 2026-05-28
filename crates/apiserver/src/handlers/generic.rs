@@ -274,7 +274,7 @@ fn unix_now() -> u64 {
 /// namespace's store prefix (cross-namespace pagination forgery).
 fn encode_continue(key: &str, signing_key: &[u8; 32]) -> String {
     use base64::Engine;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let payload = serde_json::json!({"k": key, "t": unix_now()}).to_string();
@@ -301,7 +301,7 @@ pub(crate) fn decode_continue(
     signing_key: &[u8; 32],
 ) -> Result<String, crate::status::StatusError> {
     use base64::Engine;
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -834,7 +834,7 @@ mod tests {
         // Build a properly signed token with the old timestamp so TTL check triggers,
         // not the signature check.
         use base64::Engine;
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let payload_b64 = b64.encode(payload.as_bytes());
