@@ -984,7 +984,6 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{
-        body::to_bytes,
         http::{Request, StatusCode},
         routing::get,
         Router,
