@@ -184,7 +184,7 @@ jobs:
           kubectl create namespace default || true
           kubectl create configmap bench-config --from-literal=key=value --namespace default || true
           for i in $(seq 1 50); do
-            kubectl create --validate=false -f - <<EOF
+            kubectl create -f - <<EOF
           apiVersion: apps/v1
           kind: Deployment
           metadata:
