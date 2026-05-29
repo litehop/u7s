@@ -746,6 +746,20 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("PriorityClass", false, false),
     );
 
+    // flowcontrol.apiserver.k8s.io/v1 — cluster-scoped, both resources have status subresources
+    m.insert(
+        rk("flowcontrol.apiserver.k8s.io", "v1", "flowschemas"),
+        rm("FlowSchema", false, true),
+    );
+    m.insert(
+        rk(
+            "flowcontrol.apiserver.k8s.io",
+            "v1",
+            "prioritylevelconfigurations",
+        ),
+        rm("PriorityLevelConfiguration", false, true),
+    );
+
     // node.k8s.io/v1 — cluster-scoped
     // kubelet lists runtimeclasses on startup; serve as empty collection to stop the error loop.
     m.insert(

@@ -23,6 +23,5 @@ A sonobuoy e2e run has already been captured. The results are in `temp/e2e/` —
 ## Rules that matter most here
 
 - Reference `crates/apiserver/proto/` for proto field numbers — don't guess; download missing files from GitHub into that folder if needed
-- `BTreeMap<String, Quantity>` for resource maps (same pattern as LimitRange) — don't use raw `Value` maps for fields the apiserver reasons about
 - Prefer `jq` over python for JSON in shell
 - Use `--kubeconfig temp/u7s/kubeconfig` not `KUBECONFIG=`

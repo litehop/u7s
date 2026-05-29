@@ -122,6 +122,7 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("coordination.k8s.io", "v1"),
     ("discovery.k8s.io", "v1"),
     ("events.k8s.io", "v1"),
+    ("flowcontrol.apiserver.k8s.io", "v1"),
     ("gateway.networking.k8s.io", "v1"),
     ("networking.k8s.io", "v1"),
     ("node.k8s.io", "v1"),
@@ -486,6 +487,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
         ("coordination.k8s.io", "v1") => Some(coordination_v1_resources()),
         ("discovery.k8s.io", "v1") => Some(discovery_v1_resources()),
         ("events.k8s.io", "v1") => Some(events_v1_resources()),
+        ("flowcontrol.apiserver.k8s.io", "v1") => Some(flowcontrol_v1_resources()),
         ("gateway.networking.k8s.io", "v1") => Some(gateway_networking_v1_resources()),
         ("gateway.networking.k8s.io", "v1beta1") => Some(gateway_networking_v1beta1_resources()),
         ("networking.k8s.io", "v1") => Some(networking_v1_resources()),
@@ -1159,6 +1161,46 @@ fn events_v1_resources() -> serde_json::Value {
                 "kind": "Event",
                 "shortNames": ["ev"],
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
+
+fn flowcontrol_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "resources": [
+            {
+                "name": "flowschemas",
+                "singularName": "flowschema",
+                "namespaced": false,
+                "kind": "FlowSchema",
+                "shortNames": ["fs"],
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "flowschemas/status",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "FlowSchema",
+                "verbs": ["get", "patch", "update"]
+            },
+            {
+                "name": "prioritylevelconfigurations",
+                "singularName": "prioritylevelconfiguration",
+                "namespaced": false,
+                "kind": "PriorityLevelConfiguration",
+                "shortNames": ["plc"],
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "prioritylevelconfigurations/status",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "PriorityLevelConfiguration",
+                "verbs": ["get", "patch", "update"]
             }
         ]
     })
@@ -2322,26 +2364,26 @@ mod tests {
         );
     }
 
-    // flowcontrol.apiserver.k8s.io must NOT appear in /apis — no u7s handlers exist for
-    // flowcontrol resources. client-go treats a group with zero resources as an error
-    // ("received empty response"), which causes KCM's namespace controller to refuse
-    // finalizing any namespace, blocking ALL namespace deletion.
+    // flowcontrol.apiserver.k8s.io must appear in /apis — the API priority and fairness
+    // conformance test requires the group to be discoverable. Without this entry, kubectl
+    // and client-go cannot find FlowSchema or PriorityLevelConfiguration resources.
     #[tokio::test]
-    async fn flowcontrol_group_absent_from_api_group_list() {
+    async fn flowcontrol_group_present_in_api_group_list() {
         let state = make_state();
         let list = api_group_list_inner(&state).await;
         let names: Vec<&str> = list.groups.iter().map(|g| g.name.as_str()).collect();
         assert!(
-            !names.contains(&"flowcontrol.apiserver.k8s.io"),
-            "flowcontrol.apiserver.k8s.io must not appear in /apis — advertising a group \
-             with zero resources causes client-go discovery errors and blocks namespace deletion; got: {names:?}"
+            names.contains(&"flowcontrol.apiserver.k8s.io"),
+            "flowcontrol.apiserver.k8s.io must appear in /apis — the API priority and \
+             fairness conformance test requires this group; got: {names:?}"
         );
     }
 
-    // flowcontrol.apiserver.k8s.io/v1 must return 404 — the group is not served.
-    // client-go must not attempt to list flowcontrol resources and get an empty response.
+    // flowcontrol.apiserver.k8s.io/v1 must return 200 with flowschemas and
+    // prioritylevelconfigurations — client-go lists these resources during discovery.
+    // An empty or missing resource list causes namespace deletion to stall.
     #[tokio::test]
-    async fn flowcontrol_v1_resources_returns_404() {
+    async fn flowcontrol_v1_resources_returns_200_with_resources() {
         let state = make_state();
         let resp = api_group_resources(
             State(state),
@@ -2351,9 +2393,31 @@ mod tests {
 
         assert_eq!(
             resp.status(),
-            StatusCode::NOT_FOUND,
-            "GET /apis/flowcontrol.apiserver.k8s.io/v1 must return 404 — \
-             the group is not served and must not be reachable"
+            StatusCode::OK,
+            "GET /apis/flowcontrol.apiserver.k8s.io/v1 must return 200 — \
+             the group is now served with flowschemas and prioritylevelconfigurations"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let empty = vec![];
+        let resource_names: Vec<&str> = val["resources"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|r| r["name"].as_str())
+            .collect();
+        assert!(
+            resource_names.contains(&"flowschemas"),
+            "flowcontrol.apiserver.k8s.io/v1 must include flowschemas — \
+             API priority and fairness conformance test creates FlowSchema objects; got: {resource_names:?}"
+        );
+        assert!(
+            resource_names.contains(&"prioritylevelconfigurations"),
+            "flowcontrol.apiserver.k8s.io/v1 must include prioritylevelconfigurations — \
+             API priority and fairness conformance test creates PriorityLevelConfiguration objects; got: {resource_names:?}"
         );
     }
 
