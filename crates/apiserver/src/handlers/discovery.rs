@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -26,8 +26,80 @@ pub async fn version() -> Json<serde_json::Value> {
     }))
 }
 
-pub async fn api_versions<S: Store>(State(state): State<AppState<S>>) -> Json<APIVersions> {
-    Json(APIVersions::v1(state.server_address.clone()))
+/// Parse the Accept header and return the aggregated discovery version if requested.
+///
+/// Returns `Some("v2")` or `Some("v2beta1")` if the header contains a media type with
+/// `g=apidiscovery.k8s.io`, `as=APIGroupDiscoveryList`, and a supported `v=` parameter.
+/// Returns `None` for plain `application/json` or any other Accept value.
+///
+/// client-go sends:
+///   `application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList,
+///    application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList,
+///    application/json`
+/// and validates the response Content-Type header, not the body's apiVersion field.
+fn parse_aggregated_accept(accept: &str) -> Option<&'static str> {
+    for media_type in accept.split(',') {
+        let params: Vec<&str> = media_type.split(';').map(str::trim).collect();
+        // base must be application/json
+        if params.first().map(|s| *s) != Some("application/json") {
+            continue;
+        }
+        let has_group = params.iter().any(|p| *p == "g=apidiscovery.k8s.io");
+        let has_kind = params.iter().any(|p| *p == "as=APIGroupDiscoveryList");
+        if !has_group || !has_kind {
+            continue;
+        }
+        if params.iter().any(|p| *p == "v=v2") {
+            return Some("v2");
+        }
+        if params.iter().any(|p| *p == "v=v2beta1") {
+            return Some("v2beta1");
+        }
+    }
+    None
+}
+
+fn aggregated_content_type(version: &str) -> String {
+    format!("application/json;g=apidiscovery.k8s.io;v={version};as=APIGroupDiscoveryList")
+}
+
+pub async fn api_versions<S: Store>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+) -> Response {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(version) = parse_aggregated_accept(accept) {
+        // /api returns only the core group (name="") in the aggregated discovery list.
+        // client-go's GroupsAndMaybeResources() handles /api and /apis separately;
+        // include_core=true here, and /apis uses include_core=false to avoid duplicates.
+        let body = build_aggregated_discovery(&state, version, true).await;
+        let items = body["items"].as_array().cloned().unwrap_or_default();
+        let resource_version = body["metadata"]["resourceVersion"].clone();
+        let core_only = items
+            .into_iter()
+            .filter(|i| i["metadata"]["name"] == "")
+            .collect::<Vec<_>>();
+        let core_body = serde_json::json!({
+            "kind": "APIGroupDiscoveryList",
+            "apiVersion": format!("apidiscovery.k8s.io/{version}"),
+            "metadata": { "resourceVersion": resource_version },
+            "items": core_only
+        });
+        return (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                aggregated_content_type(version),
+            )],
+            Json(core_body),
+        )
+            .into_response();
+    }
+
+    Json(APIVersions::v1(state.server_address.clone())).into_response()
 }
 
 pub async fn api_v1_resources() -> Json<ApiResourceList> {
@@ -41,6 +113,7 @@ pub async fn api_v1_resources() -> Json<ApiResourceList> {
 const STATIC_GROUPS: &[(&str, &str)] = &[
     ("admissionregistration.k8s.io", "v1"),
     ("apiextensions.k8s.io", "v1"),
+    ("apiregistration.k8s.io", "v1"),
     ("apps", "v1"),
     ("authentication.k8s.io", "v1"),
     ("authorization.k8s.io", "v1"),
@@ -60,8 +133,31 @@ const STATIC_GROUPS: &[(&str, &str)] = &[
     ("storage.k8s.io", "v1"),
 ];
 
-pub async fn api_group_list<S: Store>(State(state): State<AppState<S>>) -> Json<APIGroupList> {
-    Json(api_group_list_inner(&state).await)
+pub async fn api_group_list<S: Store>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+) -> Response {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(version) = parse_aggregated_accept(accept) {
+        // /apis returns only non-core groups (include_core=false).
+        // The core group is returned by /api; client-go merges both separately.
+        // Including core here would cause duplicate kind registrations (Namespace, Pod, etc.).
+        let body = build_aggregated_discovery(&state, version, false).await;
+        return (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                aggregated_content_type(version),
+            )],
+            Json(body),
+        )
+            .into_response();
+    }
+
+    Json(api_group_list_inner(&state).await).into_response()
 }
 
 pub(crate) async fn api_group_list_inner<S: Store>(state: &AppState<S>) -> APIGroupList {
@@ -163,23 +259,39 @@ fn make_group(name: &str, preferred: &str, served: &[&str]) -> APIGroup {
 /// This is the GA AggregatedDiscovery format (k8s 1.27+). The conformance tests
 /// send `Accept: application/json;g=apidiscovery.k8s.io;v=v2beta1` and expect
 /// this response.
-pub(crate) async fn build_aggregated_discovery<S: Store>(state: &AppState<S>) -> serde_json::Value {
+/// Build an `APIGroupDiscoveryList`.
+///
+/// When `include_core` is true, the core group (name="", v1 resources) is included as the
+/// first item — this is used by `/discovery/v2` and `/api` with aggregated Accept.
+///
+/// When `include_core` is false, only non-core groups are included — this is used by `/apis`
+/// with aggregated Accept. client-go's GroupsAndMaybeResources() merges /api (core) and /apis
+/// (non-core) separately; including core in /apis causes duplicate Namespace/Pod registrations.
+pub(crate) async fn build_aggregated_discovery<S: Store>(
+    state: &AppState<S>,
+    discovery_version: &str,
+    include_core: bool,
+) -> serde_json::Value {
     // Collect all groups+versions (same logic as api_group_list_inner).
     let group_list = api_group_list_inner(state).await;
 
-    // Build the core group item (group="", apiVersion="v1").
-    let core_resources = api_resources_to_discovery_resources(&api_v1_resource_list_value());
-    let core_item = serde_json::json!({
-        "metadata": { "name": "" },
-        "versions": [{
-            "version": "v1",
-            "resources": core_resources,
-            "freshness": "Current"
-        }]
-    });
+    let mut items: Vec<serde_json::Value> = Vec::new();
+
+    if include_core {
+        // Build the core group item (group="", apiVersion="v1").
+        let core_resources = api_resources_to_discovery_resources(&api_v1_resource_list_value());
+        let core_item = serde_json::json!({
+            "metadata": { "name": "" },
+            "versions": [{
+                "version": "v1",
+                "resources": core_resources,
+                "freshness": "Current"
+            }]
+        });
+        items.push(core_item);
+    }
 
     // Build one item per non-core group.
-    let mut items: Vec<serde_json::Value> = vec![core_item];
     for group in &group_list.groups {
         let mut versions_arr: Vec<serde_json::Value> = Vec::new();
         for gv in &group.versions {
@@ -207,7 +319,7 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(state: &AppState<S>) ->
 
     serde_json::json!({
         "kind": "APIGroupDiscoveryList",
-        "apiVersion": "apidiscovery.k8s.io/v2beta1",
+        "apiVersion": format!("apidiscovery.k8s.io/{discovery_version}"),
         "metadata": { "resourceVersion": resource_version },
         "items": items
     })
@@ -300,7 +412,7 @@ pub async fn aggregated_discovery_v2<S: Store>(State(state): State<AppState<S>>)
             axum::http::header::CONTENT_TYPE,
             "application/json;g=apidiscovery.k8s.io;v=v2beta1",
         )],
-        Json(build_aggregated_discovery(&state).await),
+        Json(build_aggregated_discovery(&state, "v2beta1", true).await),
     )
         .into_response()
 }
@@ -314,6 +426,7 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
     match (group, version) {
         ("admissionregistration.k8s.io", "v1") => Some(admissionregistration_v1_resources()),
         ("apiextensions.k8s.io", "v1") => Some(apiextensions_v1_resources()),
+        ("apiregistration.k8s.io", "v1") => Some(apiregistration_v1_resources()),
         ("apps", "v1") => Some(apps_v1_resources()),
         ("authentication.k8s.io", "v1") => Some(authn_v1_resources()),
         ("authorization.k8s.io", "v1") => Some(authz_v1_resources()),
@@ -403,6 +516,23 @@ pub async fn api_group_resources<S: Store>(
 // ---------------------------------------------------------------------------
 // Static resource lists
 // ---------------------------------------------------------------------------
+
+fn apiregistration_v1_resources() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "APIResourceList",
+        "apiVersion": "v1",
+        "groupVersion": "apiregistration.k8s.io/v1",
+        "resources": [
+            {
+                "name": "apiservices",
+                "singularName": "apiservice",
+                "namespaced": false,
+                "kind": "APIService",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            }
+        ]
+    })
+}
 
 fn apiextensions_v1_resources() -> serde_json::Value {
     serde_json::json!({
@@ -2185,15 +2315,126 @@ mod tests {
     #[tokio::test]
     async fn apis_returns_api_group_list() {
         let state = make_state();
-        let Json(list) = api_group_list(State(state)).await;
+        let resp = api_group_list(State(state), axum::http::HeaderMap::new()).await;
 
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            list.kind, "APIGroupList",
-            "GET /apis must return kind=APIGroupList — all kubectl versions expect this format"
+            val["kind"], "APIGroupList",
+            "GET /apis without aggregated Accept must return kind=APIGroupList — all kubectl versions expect this format"
         );
         assert!(
-            !list.groups.is_empty(),
+            val["groups"]
+                .as_array()
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
             "APIGroupList must contain at least one group"
+        );
+    }
+
+    // GET /apis with the k8s aggregated discovery Accept header must return APIGroupDiscoveryList.
+    //
+    // All 4 AggregatedDiscovery conformance tests hit /apis with this Accept header.
+    // client-go sends both v=v2 and v=v2beta1; the server must respond with the first it supports.
+    // The response Content-Type must match the requested version — client-go uses that header
+    // (not the body's apiVersion field) to decide whether the server understood the request.
+    // If /apis ignores the Accept header and returns APIGroupList, the conformance tests fail
+    // with "Expected admissionregistration.k8s.io/v1 ... to be present".
+    //
+    // IMPORTANT: /api (core) must also negotiate — client-go's GroupsAndMaybeResources() clears
+    // resources to nil if one endpoint returns aggregated and the other doesn't.
+    #[tokio::test]
+    async fn apis_with_aggregated_accept_returns_api_group_discovery_list_v2() {
+        let state = make_state();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList, application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList, application/json",
+            ),
+        );
+        let resp = api_group_list(State(state), headers).await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            ct, "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList",
+            "/apis must return Content-Type matching the requested v=v2 — \
+             client-go checks this header to activate the aggregated discovery parser"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["kind"], "APIGroupDiscoveryList");
+        assert_eq!(val["apiVersion"], "apidiscovery.k8s.io/v2");
+
+        let items = val["items"].as_array().expect("items must be array");
+        assert!(!items.is_empty());
+        assert!(
+            items.iter().any(|i| i["metadata"]["name"] == "admissionregistration.k8s.io"),
+            "admissionregistration.k8s.io must appear — conformance tests assert validatingwebhookconfigurations"
+        );
+    }
+
+    // GET /api with the aggregated discovery Accept must return only the core group item.
+    // client-go's GroupsAndMaybeResources() calls both /api and /apis; if one returns
+    // aggregated and the other doesn't, resources is set to nil and all `kubectl apply`
+    // commands fail with "no matches for kind".
+    #[tokio::test]
+    async fn api_with_aggregated_accept_returns_core_only_discovery_list() {
+        let state = make_state();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList, application/json;g=apidiscovery.k8s.io;v=v2beta1;as=APIGroupDiscoveryList, application/json",
+            ),
+        );
+        let resp = api_versions(State(state), headers).await;
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            ct, "application/json;g=apidiscovery.k8s.io;v=v2;as=APIGroupDiscoveryList",
+            "/api must return Content-Type matching the requested v=v2"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["kind"], "APIGroupDiscoveryList");
+
+        let items = val["items"].as_array().expect("items must be array");
+        assert_eq!(
+            items.len(),
+            1,
+            "only the core group must be returned from /api"
+        );
+        assert_eq!(
+            items[0]["metadata"]["name"], "",
+            "core group has empty name"
+        );
+        // Core group must include pods
+        let resources = items[0]["versions"][0]["resources"].as_array().unwrap();
+        assert!(
+            resources.iter().any(|r| r["resource"] == "pods"),
+            "core/v1 must include pods"
         );
     }
 

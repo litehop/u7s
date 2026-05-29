@@ -2701,12 +2701,153 @@ pub fn decode_poddisruptionbudget_proto(data: &[u8]) -> Option<serde_json::Value
     }))
 }
 
+// --- k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto ---
+
+/// CustomResourceDefinitionNames — names section of a CRD spec.
+#[derive(Clone, PartialEq, Message)]
+struct CrdNames {
+    /// plural (field 1)
+    #[prost(string, tag = "1")]
+    plural: String,
+    /// singular (field 2)
+    #[prost(string, tag = "2")]
+    singular: String,
+    /// shortNames (field 3, repeated)
+    #[prost(string, repeated, tag = "3")]
+    short_names: Vec<String>,
+    /// kind (field 4)
+    #[prost(string, tag = "4")]
+    kind: String,
+    /// listKind (field 5)
+    #[prost(string, tag = "5")]
+    list_kind: String,
+    /// categories (field 6, repeated) — decoded but unused in output
+    #[prost(string, repeated, tag = "6")]
+    categories: Vec<String>,
+}
+
+/// CustomResourceDefinitionVersion — one entry in spec.versions.
+#[derive(Clone, PartialEq, Message)]
+struct CrdVersion {
+    /// name (field 1)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// served (field 2)
+    #[prost(bool, tag = "2")]
+    served: bool,
+    /// storage (field 3)
+    #[prost(bool, tag = "3")]
+    storage: bool,
+    /// schema (field 4, bytes) — complex nested message; skipped
+    #[prost(bytes = "vec", tag = "4")]
+    schema: Vec<u8>,
+    /// subresources (field 5, bytes) — skipped
+    #[prost(bytes = "vec", tag = "5")]
+    subresources: Vec<u8>,
+    /// additionalPrinterColumns (field 6, bytes) — skipped
+    #[prost(bytes = "vec", tag = "6")]
+    additional_printer_columns: Vec<u8>,
+}
+
+/// CustomResourceDefinitionSpec — the spec section of a CRD.
+#[derive(Clone, PartialEq, Message)]
+struct CrdSpec {
+    /// group (field 1)
+    #[prost(string, tag = "1")]
+    group: String,
+    /// names (field 3, message)
+    #[prost(message, tag = "3")]
+    names: Option<CrdNames>,
+    /// scope (field 4)
+    #[prost(string, tag = "4")]
+    scope: String,
+    /// versions (field 7, repeated message)
+    #[prost(message, repeated, tag = "7")]
+    versions: Vec<CrdVersion>,
+    /// preserveUnknownFields (field 10)
+    #[prost(bool, tag = "10")]
+    preserve_unknown_fields: bool,
+}
+
+/// CustomResourceDefinition — top-level CRD object.
+#[derive(Clone, PartialEq, Message)]
+struct Crd {
+    /// metadata (field 1)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2)
+    #[prost(message, tag = "2")]
+    spec: Option<CrdSpec>,
+}
+
+/// Decode a proto-encoded CustomResourceDefinition into a serde_json::Value.
+pub fn decode_crd_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let crd = Crd::decode(data).ok()?;
+    let mut meta = object_meta_to_json(crd.metadata.unwrap_or_default());
+    // CrdMetadata.creation_timestamp is String (not Option<String>), so null fails serde.
+    // Replace the null that object_meta_to_json emits when the timestamp is zero.
+    if meta["creationTimestamp"].is_null() {
+        meta["creationTimestamp"] = serde_json::Value::String(String::new());
+    }
+
+    let spec = crd.spec.unwrap_or_default();
+    let names = spec.names.unwrap_or_default();
+
+    let versions: Vec<serde_json::Value> = spec
+        .versions
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "name": v.name,
+                "served": v.served,
+                "storage": v.storage
+            })
+        })
+        .collect();
+
+    let mut names_val = serde_json::json!({
+        "plural": names.plural,
+        "singular": names.singular,
+        "kind": names.kind
+    });
+    if !names.short_names.is_empty() {
+        names_val["shortNames"] = serde_json::Value::Array(
+            names
+                .short_names
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
+    }
+    if !names.list_kind.is_empty() {
+        names_val["listKind"] = serde_json::Value::String(names.list_kind);
+    }
+
+    let mut spec_val = serde_json::json!({
+        "group": spec.group,
+        "names": names_val,
+        "scope": spec.scope,
+        "versions": versions
+    });
+    if spec.preserve_unknown_fields {
+        spec_val["preserveUnknownFields"] = serde_json::Value::Bool(true);
+    }
+
+    Some(serde_json::json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": meta,
+        "spec": spec_val
+    }))
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
 /// known types; `None` for unknown kinds or malformed input.
 pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::Value> {
     match kind {
+        "CustomResourceDefinition" => decode_crd_proto(raw),
         "Namespace" => decode_namespace_proto(raw),
         "ConfigMap" => decode_configmap_proto(raw),
         "Pod" => decode_pod_proto(raw),
@@ -5748,5 +5889,113 @@ mod tests {
             result["spec"]["limits"][0]["defaultRequest"]["cpu"], "100m",
             "spec.limits[0].defaultRequest.cpu must be decoded"
         );
+    }
+
+    /// decode_core_proto_by_kind must dispatch CustomResourceDefinition to a decoder that
+    /// returns valid JSON with the spec fields populated.
+    ///
+    /// The AggregatedDiscovery conformance test creates CRDs via client-go's apiextensions
+    /// client which sends Content-Type: application/vnd.kubernetes.protobuf. Without this
+    /// decoder, extract_body returns raw proto bytes to parse_crd, which fails with
+    /// "expected value at line 1 column 1" (HTTP 422), causing tests 2 and 4 to fail.
+    #[test]
+    fn decode_crd_proto_extracts_metadata_and_spec() {
+        // Build: CustomResourceDefinition {
+        //   metadata: { name: "testcrds.example.io" }
+        //   spec: {
+        //     group: "example.io"          (field 1)
+        //     names: {                     (field 3)
+        //       plural: "testcrds"         (field 1)
+        //       singular: "testcrd"        (field 2)
+        //       kind: "TestCrd"            (field 4)
+        //     }
+        //     scope: "Namespaced"          (field 4)
+        //     versions: [{                 (field 7)
+        //       name: "v1"                (field 1)
+        //       served: true              (field 2)
+        //       storage: true             (field 3)
+        //     }]
+        //   }
+        // }
+
+        // metadata.name
+        let meta_name = encode_length_delimited(1, b"testcrds.example.io");
+        let meta = encode_length_delimited(1, &meta_name); // field 1 = metadata
+
+        // spec.names
+        let names_plural = encode_length_delimited(1, b"testcrds");
+        let names_singular = encode_length_delimited(2, b"testcrd");
+        let names_kind = encode_length_delimited(4, b"TestCrd");
+        let mut names_bytes = Vec::new();
+        names_bytes.extend_from_slice(&names_plural);
+        names_bytes.extend_from_slice(&names_singular);
+        names_bytes.extend_from_slice(&names_kind);
+
+        // spec.versions[0]
+        let ver_name = encode_length_delimited(1, b"v1");
+        let ver_served = {
+            let mut v = encode_varint(2 << 3); // field 2, wire type 0
+            v.extend_from_slice(&encode_varint(1)); // true
+            v
+        };
+        let ver_storage = {
+            let mut v = encode_varint(3 << 3); // field 3, wire type 0
+            v.extend_from_slice(&encode_varint(1)); // true
+            v
+        };
+        let mut ver_bytes = Vec::new();
+        ver_bytes.extend_from_slice(&ver_name);
+        ver_bytes.extend_from_slice(&ver_served);
+        ver_bytes.extend_from_slice(&ver_storage);
+
+        // spec
+        let spec_group = encode_length_delimited(1, b"example.io");
+        let spec_names = encode_length_delimited(3, &names_bytes);
+        let spec_scope = encode_length_delimited(4, b"Namespaced");
+        let spec_versions = encode_length_delimited(7, &ver_bytes);
+        let mut spec_bytes = Vec::new();
+        spec_bytes.extend_from_slice(&spec_group);
+        spec_bytes.extend_from_slice(&spec_names);
+        spec_bytes.extend_from_slice(&spec_scope);
+        spec_bytes.extend_from_slice(&spec_versions);
+        let spec = encode_length_delimited(2, &spec_bytes); // field 2 = spec
+
+        let mut proto = Vec::new();
+        proto.extend_from_slice(&meta);
+        proto.extend_from_slice(&spec);
+
+        let result = decode_core_proto_by_kind("CustomResourceDefinition", &proto).expect(
+            "CustomResourceDefinition must decode via decode_core_proto_by_kind — \
+             without this decoder, AggregatedDiscovery conformance tests 2 and 4 fail \
+             with 422 'expected value at line 1 column 1' when creating CRDs via proto",
+        );
+
+        assert_eq!(result["kind"], "CustomResourceDefinition");
+        assert_eq!(result["apiVersion"], "apiextensions.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "testcrds.example.io",
+            "metadata.name must survive proto decode"
+        );
+        assert_eq!(
+            result["spec"]["group"], "example.io",
+            "spec.group must be decoded"
+        );
+        assert_eq!(
+            result["spec"]["names"]["plural"], "testcrds",
+            "spec.names.plural must be decoded"
+        );
+        assert_eq!(
+            result["spec"]["names"]["kind"], "TestCrd",
+            "spec.names.kind must be decoded"
+        );
+        assert_eq!(
+            result["spec"]["scope"], "Namespaced",
+            "spec.scope must be decoded"
+        );
+        let versions = result["spec"]["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 1, "one version expected");
+        assert_eq!(versions[0]["name"], "v1");
+        assert_eq!(versions[0]["served"], true);
+        assert_eq!(versions[0]["storage"], true);
     }
 }
