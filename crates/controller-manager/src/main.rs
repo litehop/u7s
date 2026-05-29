@@ -795,8 +795,8 @@ async fn add_kubernetes_finalizer(client: &HyperApiClient, name: &str) -> anyhow
         return Ok(());
     };
 
-    // Build the new finalizers list, adding "kubernetes" if not already present.
-    let existing: Vec<String> = ns["metadata"]["finalizers"]
+    // Namespace finalizers live in spec.finalizers, not metadata.finalizers.
+    let existing: Vec<String> = ns["spec"]["finalizers"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -811,7 +811,10 @@ async fn add_kubernetes_finalizer(client: &HyperApiClient, name: &str) -> anyhow
 
     let mut new_finalizers = existing;
     new_finalizers.push("kubernetes".to_owned());
-    ns["metadata"]["finalizers"] = serde_json::to_value(&new_finalizers)?;
+    if ns["spec"].is_null() || ns.get("spec").is_none() {
+        ns["spec"] = serde_json::json!({});
+    }
+    ns["spec"]["finalizers"] = serde_json::to_value(&new_finalizers)?;
 
     replace_namespace(client, name, &ns).await?;
     info!("namespace {name}: 'kubernetes' finalizer added");
@@ -914,7 +917,8 @@ async fn drain_namespace(client: &HyperApiClient, namespace: &str) -> anyhow::Re
         return Ok(());
     };
 
-    let new_finalizers: Vec<String> = ns["metadata"]["finalizers"]
+    // Namespace finalizers live in spec.finalizers, not metadata.finalizers.
+    let new_finalizers: Vec<String> = ns["spec"]["finalizers"]
         .as_array()
         .cloned()
         .unwrap_or_default()
@@ -923,8 +927,10 @@ async fn drain_namespace(client: &HyperApiClient, namespace: &str) -> anyhow::Re
         .filter(|f| f != "kubernetes")
         .collect();
 
-    ns["metadata"]["finalizers"] = serde_json::to_value(&new_finalizers)?;
-    // Also clear null so merge-patch semantics work: set to empty array.
+    if ns["spec"].is_null() || ns.get("spec").is_none() {
+        ns["spec"] = serde_json::json!({});
+    }
+    ns["spec"]["finalizers"] = serde_json::to_value(&new_finalizers)?;
 
     replace_namespace(client, namespace, &ns).await?;
     info!("namespace {namespace}: 'kubernetes' finalizer removed, hard-delete triggered");

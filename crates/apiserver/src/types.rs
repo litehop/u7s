@@ -445,6 +445,20 @@ pub struct NamespaceStatus {
     pub rest: serde_json::Value,
 }
 
+/// Typed spec for a Namespace object. In Kubernetes, namespace finalizers live
+/// in `spec.finalizers`, not `metadata.finalizers`. The upstream KCM namespace
+/// controller reads `spec.finalizers` to decide whether to drain a namespace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NamespaceSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalizers: Option<Vec<String>>,
+    /// All other spec fields preserved opaquely.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub rest: serde_json::Value,
+}
+
 // ---------------------------------------------------------------------------
 // CertificateSigningRequest typed fields
 // ---------------------------------------------------------------------------

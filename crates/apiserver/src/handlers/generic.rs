@@ -8,7 +8,7 @@ use crate::{
     rbac::user_holds_all_rules,
     state::AppState,
     status::Status,
-    types::{Object, ObjectMeta, ResourceKey},
+    types::{NamespaceSpec, Object, ObjectMeta, ResourceKey},
     util::{store_err_to_status, utc_now_rfc3339},
 };
 
@@ -385,17 +385,25 @@ pub(crate) fn build_list_response(
 /// Check finalizers for delete: if non-empty, set deletionTimestamp and return modified object.
 /// Returns `None` if hard-delete should proceed, `Some(obj)` if soft-delete was applied.
 pub(crate) fn apply_delete_policy(obj: &mut Object) -> Option<serde_json::Value> {
-    let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+    let is_namespace = obj.body["kind"].as_str() == Some("Namespace");
 
-    let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+    // Namespace finalizers live in spec.finalizers; all other resources use metadata.finalizers.
+    let has_finalizers = if is_namespace {
+        let spec: NamespaceSpec =
+            serde_json::from_value(obj.body["spec"].clone()).unwrap_or_default();
+        spec.finalizers.as_ref().is_some_and(|f| !f.is_empty())
+    } else {
+        let meta: ObjectMeta =
+            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        meta.finalizers.as_ref().is_some_and(|f| !f.is_empty())
+    };
 
     if has_finalizers {
         // Soft delete: stamp deletionTimestamp.
         obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
         // The upstream KCM namespace controller watches for status.phase == "Terminating"
-        // to trigger finalizer removal. Without this field the namespace hangs forever
-        // because KCM never begins the drain cycle (mayor-qyfg).
-        if obj.body["kind"].as_str() == Some("Namespace") {
+        // to trigger finalizer removal.
+        if is_namespace {
             obj.body["status"]["phase"] = serde_json::Value::String("Terminating".to_string());
         }
         Some(obj.body.clone())
@@ -2046,16 +2054,25 @@ mod apply_delete_policy_tests {
     fn make_obj(kind: &str, finalizers: &[&str]) -> Object {
         let finalizer_json: Vec<serde_json::Value> =
             finalizers.iter().map(|f| serde_json::json!(f)).collect();
-        Object {
-            body: serde_json::json!({
+        // Namespace finalizers live in spec.finalizers; all other resources use metadata.finalizers.
+        let body = if kind == "Namespace" {
+            serde_json::json!({
+                "kind": kind,
+                "apiVersion": "v1",
+                "metadata": { "name": "test" },
+                "spec": { "finalizers": finalizer_json }
+            })
+        } else {
+            serde_json::json!({
                 "kind": kind,
                 "apiVersion": "v1",
                 "metadata": {
                     "name": "test",
                     "finalizers": finalizer_json
                 }
-            }),
-        }
+            })
+        };
+        Object { body }
     }
 
     /// A Namespace with finalizers must have status.phase == "Terminating" after soft-delete.

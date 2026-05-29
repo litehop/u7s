@@ -17,9 +17,14 @@ use serde_json::Value;
 #[derive(Debug, Default, Deserialize)]
 pub struct NsMeta {
     pub name: Option<String>,
-    pub finalizers: Option<Vec<String>>,
     #[serde(rename = "deletionTimestamp")]
     pub deletion_timestamp: Option<String>,
+}
+
+/// Namespace finalizers live in spec.finalizers, not metadata.finalizers.
+#[derive(Debug, Default, Deserialize)]
+pub struct NsSpec {
+    pub finalizers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -30,6 +35,7 @@ pub struct NsStatus {
 #[derive(Debug, Default, Deserialize)]
 pub struct NsObject {
     pub metadata: NsMeta,
+    pub spec: Option<NsSpec>,
     pub status: Option<NsStatus>,
 }
 
@@ -96,9 +102,9 @@ pub fn parse_ns_event(event: &Value) -> NsAction {
         "ADDED" => {
             let has_k8s_finalizer = watch_event
                 .object
-                .metadata
-                .finalizers
-                .as_deref()
+                .spec
+                .as_ref()
+                .and_then(|s| s.finalizers.as_deref())
                 .unwrap_or(&[])
                 .iter()
                 .any(|f| f == "kubernetes");
@@ -133,9 +139,9 @@ pub fn parse_ns_event(event: &Value) -> NsAction {
             let deletion_ts_set = watch_event.object.metadata.deletion_timestamp.is_some();
             let has_k8s_finalizer = watch_event
                 .object
-                .metadata
-                .finalizers
-                .as_deref()
+                .spec
+                .as_ref()
+                .and_then(|s| s.finalizers.as_deref())
                 .unwrap_or(&[])
                 .iter()
                 .any(|f| f == "kubernetes");
@@ -203,10 +209,8 @@ mod tests {
         serde_json::json!({
             "type": "ADDED",
             "object": {
-                "metadata": {
-                    "name": name,
-                    "finalizers": finalizers
-                },
+                "metadata": { "name": name },
+                "spec": { "finalizers": finalizers },
                 "status": { "phase": "Active" }
             }
         })
@@ -218,9 +222,9 @@ mod tests {
             "object": {
                 "metadata": {
                     "name": name,
-                    "finalizers": finalizers,
                     "deletionTimestamp": "2024-01-02T00:00:00Z"
                 },
+                "spec": { "finalizers": finalizers },
                 "status": { "phase": "Terminating" }
             }
         })
@@ -257,9 +261,9 @@ mod tests {
             "object": {
                 "metadata": {
                     "name": "stuck-ns",
-                    "finalizers": ["kubernetes"],
                     "deletionTimestamp": "2024-01-02T00:00:00Z"
                 },
+                "spec": { "finalizers": ["kubernetes"] },
                 "status": { "phase": "Terminating" }
             }
         });
@@ -280,9 +284,9 @@ mod tests {
             "object": {
                 "metadata": {
                     "name": "ns",
-                    "finalizers": ["kubernetes"],
                     "deletionTimestamp": "2024-01-02T00:00:00Z"
                 },
+                "spec": { "finalizers": ["kubernetes"] },
                 "status": { "phase": "Active" }
             }
         });
@@ -300,9 +304,9 @@ mod tests {
             "object": {
                 "metadata": {
                     "name": "ns",
-                    "finalizers": [],
                     "deletionTimestamp": "2024-01-02T00:00:00Z"
                 },
+                "spec": { "finalizers": [] },
                 "status": { "phase": "Terminating" }
             }
         });

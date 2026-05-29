@@ -19,7 +19,7 @@ use crate::{
     proto,
     state::AppState,
     status::Status,
-    types::{NamespacePhase, NamespaceStatus, Object, ObjectMeta, ResourceMeta},
+    types::{NamespacePhase, NamespaceSpec, NamespaceStatus, Object, ObjectMeta, ResourceMeta},
     util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
@@ -189,24 +189,28 @@ pub async fn create_namespace<S: Store>(
         .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
     }
 
-    // Stamp the "kubernetes" finalizer at creation time.
+    // Stamp the "kubernetes" finalizer into spec.finalizers at creation time.
     //
-    // Without this, the finalizer is added asynchronously by the namespace controller
-    // after watching the ADDED event. This creates a race: if the namespace is deleted
-    // before the controller processes the ADDED event (e.g. the ring buffer evicts it,
-    // or the controller is not running), the namespace has no finalizer and
-    // delete_namespace hard-deletes it immediately — skipping resource drain entirely.
-    // Stamping it here ensures every namespace always goes through the drain lifecycle.
+    // Kubernetes namespace finalizers live in spec.finalizers, not metadata.finalizers.
+    // The upstream KCM namespace controller reads spec.finalizers to decide whether to
+    // drain a namespace before hard-deleting it. Stamping at creation (rather than
+    // relying on an async controller ADDED event) ensures every namespace always goes
+    // through the drain lifecycle even if the controller is behind.
     {
-        let existing = obj.body["metadata"]["finalizers"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let has_k8s = existing.iter().any(|v| v.as_str() == Some("kubernetes"));
+        let mut spec: NamespaceSpec =
+            serde_json::from_value(obj.body["spec"].clone()).unwrap_or_default();
+        let has_k8s = spec
+            .finalizers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|f| f == "kubernetes");
         if !has_k8s {
-            let mut new_finalizers = existing;
-            new_finalizers.push(serde_json::Value::String("kubernetes".to_owned()));
-            obj.body["metadata"]["finalizers"] = serde_json::Value::Array(new_finalizers);
+            spec.finalizers
+                .get_or_insert_with(Vec::new)
+                .push("kubernetes".to_owned());
+            obj.body["spec"] = serde_json::to_value(spec)
+                .map_err(|e| Status::internal(format!("failed to serialize NamespaceSpec: {e}")))?;
         }
     }
 
@@ -296,11 +300,13 @@ pub async fn replace_namespace<S: Store>(
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
-    // Post-replace: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+    // Post-replace: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let replace_meta: ObjectMeta =
         serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
     let deletion_ts_set = replace_meta.deletion_timestamp.is_some();
-    let finalizers_empty = replace_meta
+    let replace_spec: NamespaceSpec =
+        serde_json::from_value(obj.body["spec"].clone()).unwrap_or_default();
+    let finalizers_empty = replace_spec
         .finalizers
         .as_deref()
         .map(|f| f.is_empty())
@@ -388,11 +394,13 @@ pub async fn patch_namespace<S: Store>(
 
     crate::patch::merge_patch(&mut current.body, &patch);
 
-    // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+    // Post-patch: if deletionTimestamp is set and spec.finalizers are empty, hard-delete.
     let current_meta: ObjectMeta =
         serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
     let deletion_ts_set = current_meta.deletion_timestamp.is_some();
-    let finalizers_empty = current_meta
+    let patch_spec: NamespaceSpec =
+        serde_json::from_value(current.body["spec"].clone()).unwrap_or_default();
+    let finalizers_empty = patch_spec
         .finalizers
         .as_deref()
         .map(|f| f.is_empty())
@@ -458,18 +466,20 @@ pub async fn finalize_namespace<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    // Update only the finalizers field (stored in metadata.finalizers).
-    current.body["metadata"]["finalizers"] = new_finalizers;
-    // Keep spec.finalizers in sync so the response body is consistent.
-    if current.body.get("spec").is_some() {
-        current.body["spec"]["finalizers"] = current.body["metadata"]["finalizers"].clone();
+    // Namespace finalizers live in spec.finalizers (not metadata.finalizers).
+    // Ensure spec exists before writing.
+    if current.body.get("spec").is_none() || current.body["spec"].is_null() {
+        current.body["spec"] = serde_json::json!({});
     }
+    current.body["spec"]["finalizers"] = new_finalizers;
 
-    // Check: if deletionTimestamp is set and finalizers are now empty → hard-delete.
+    // Check: if deletionTimestamp is set and spec.finalizers are now empty → hard-delete.
     let current_meta: ObjectMeta =
         serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
     let deletion_ts_set = current_meta.deletion_timestamp.is_some();
-    let finalizers_empty = current_meta
+    let current_spec: NamespaceSpec =
+        serde_json::from_value(current.body["spec"].clone()).unwrap_or_default();
+    let finalizers_empty = current_spec
         .finalizers
         .as_deref()
         .map(|f| f.is_empty())
@@ -865,12 +875,12 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&stored.value).expect("stored value must be valid JSON");
 
-        let finalizers = body["metadata"]["finalizers"]
-            .as_array()
-            .expect("metadata.finalizers must be an array");
+        let finalizers = body["spec"]["finalizers"].as_array().expect(
+            "spec.finalizers must be an array — namespace finalizers live in spec, not metadata",
+        );
         assert!(
             finalizers.iter().any(|v| v.as_str() == Some("kubernetes")),
-            "create_namespace must stamp metadata.finalizers=[\"kubernetes\"] so that \
+            "create_namespace must stamp spec.finalizers=[\"kubernetes\"] so that \
              delete_namespace soft-deletes instead of hard-deleting, ensuring the KCM \
              can drain child resources before the namespace is removed. \
              Without this, the namespace hard-deletes immediately, orphaning resources. \
@@ -1525,10 +1535,8 @@ mod tests {
             serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Namespace",
-                "metadata": {
-                    "name": name,
-                    "finalizers": finalizers
-                }
+                "metadata": { "name": name },
+                "spec": { "finalizers": finalizers }
             })
             .to_string(),
         )
@@ -1582,10 +1590,11 @@ mod tests {
             "deletionTimestamp must be set after soft-delete"
         );
         assert!(
-            body["metadata"]["finalizers"]
+            body["spec"]["finalizers"]
                 .as_array()
                 .is_some_and(|f| !f.is_empty()),
-            "finalizers must remain present until the controller removes them"
+            "spec.finalizers must remain present until the controller removes them — \
+             namespace finalizers live in spec, not metadata"
         );
     }
 
@@ -1797,8 +1806,9 @@ mod tests {
         );
 
         // Remove the finalizer via merge-patch — this must trigger a hard-delete.
+        // Namespace finalizers live in spec.finalizers, not metadata.finalizers.
         let patch_body =
-            Bytes::from(serde_json::json!({ "metadata": { "finalizers": [] } }).to_string());
+            Bytes::from(serde_json::json!({ "spec": { "finalizers": [] } }).to_string());
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::CONTENT_TYPE,
@@ -2030,9 +2040,9 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&stored.value).expect("parse stored namespace");
 
-        let finalizers = body["metadata"]["finalizers"]
+        let finalizers = body["spec"]["finalizers"]
             .as_array()
-            .expect("metadata.finalizers must be an array");
+            .expect("spec.finalizers must be an array — namespace finalizers live in spec");
         assert_eq!(
             finalizers.len(),
             1,
@@ -2123,7 +2133,8 @@ mod tests {
             serde_json::from_slice(&stored.value).expect("parse stored");
 
         // Remove the finalizer from the body and PUT — this must trigger hard-delete.
-        ns["metadata"]["finalizers"] = serde_json::json!([]);
+        // Namespace finalizers live in spec.finalizers, not metadata.finalizers.
+        ns["spec"]["finalizers"] = serde_json::json!([]);
 
         let replace_body = Bytes::from(ns.to_string());
 

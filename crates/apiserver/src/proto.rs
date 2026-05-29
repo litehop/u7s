@@ -1387,11 +1387,22 @@ fn object_meta_to_json(meta: ObjectMeta) -> serde_json::Value {
 pub fn decode_namespace_proto(data: &[u8]) -> Option<serde_json::Value> {
     let ns = Namespace::decode(data).ok()?;
     let meta = object_meta_to_json(ns.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut obj = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Namespace",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = ns.spec {
+        if !spec.finalizers.is_empty() {
+            let fins: Vec<serde_json::Value> = spec
+                .finalizers
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect();
+            obj["spec"] = serde_json::json!({ "finalizers": fins });
+        }
+    }
+    Some(obj)
 }
 
 /// Decode a proto-encoded ConfigMap object into a `serde_json::Value`.
