@@ -91,6 +91,7 @@ jobs:
             --ca-cert "$TMPDIR/ca.crt" \
             --token-auth-file "$TMPDIR/token-auth.csv" \
             --advertise-address https://127.0.0.1:6443 \
+            --service-cluster-ip-range "10.96.0.0/12" \
             >"$TMPDIR/server.log" 2>&1 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
           for i in $(seq 1 30); do
