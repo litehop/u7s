@@ -1612,6 +1612,60 @@ mod tests {
             .expect("second seed must not fail");
     }
 
+    /// GET /openapi/v2 and /openapi/v3 must return 200 (not 403) without credentials.
+    ///
+    /// Conformance tests poll these endpoints after creating a CRD to wait for the CRD
+    /// schema to appear. The test client sends unauthenticated requests (no Bearer token,
+    /// no client cert). If auth is required, anonymous users get 403 Forbidden and the
+    /// test times out with "failed to wait for OpenAPI spec validating condition: unexpected
+    /// response: 403". kube-apiserver serves these endpoints to unauthenticated callers.
+    ///
+    /// This test fails if the auth exemption for /openapi/v2 and /openapi/v3 is removed.
+    #[tokio::test]
+    async fn openapi_endpoints_return_200_without_credentials() {
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Build router with AuthLayer — this is the same stack as production.
+        // Without the auth exemption for /openapi/v*, the anonymous request would
+        // produce 403 Forbidden because system:anonymous has no RBAC grants.
+        let app = build_router(state.clone()).layer(AuthLayer::new(
+            std::sync::Arc::clone(&state.rbac_index),
+            (*state.token_map).clone(),
+            state.sa_decoding_key.clone(),
+        ));
+
+        for path in ["/openapi/v2", "/openapi/v3"] {
+            // No Authorization header — anonymous request, like the conformance test client.
+            let req = Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .expect("request build must not fail");
+            let resp = app
+                .clone()
+                .oneshot(req)
+                .await
+                .expect("router must not error");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{path} must return 200 OK for unauthenticated requests — \
+                 conformance tests poll this without credentials after CRD creation; \
+                 403 causes 'failed to wait for OpenAPI spec validating condition: \
+                 unexpected response: 403'"
+            );
+        }
+    }
+
     /// Health endpoints must return 200 OK with body "ok".
     ///
     /// kube-controller-manager polls /healthz before it considers the apiserver

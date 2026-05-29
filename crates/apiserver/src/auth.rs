@@ -372,7 +372,15 @@ fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
 fn is_exempt(path: &str) -> bool {
     matches!(
         path,
-        "/healthz" | "/readyz" | "/livez" | "/api" | "/apis" | "/version" | "/discovery/v2"
+        "/healthz"
+            | "/readyz"
+            | "/livez"
+            | "/api"
+            | "/apis"
+            | "/version"
+            | "/discovery/v2"
+            | "/openapi/v2"
+            | "/openapi/v3"
     )
 }
 
@@ -988,6 +996,27 @@ mod tests {
         // Non-exempt paths must not be skipped.
         assert!(!is_exempt("/api/v1/pods"));
         assert!(!is_exempt("/apis/apps/v1/deployments"));
+    }
+
+    /// /openapi/v2 and /openapi/v3 must be exempt from auth.
+    ///
+    /// Conformance tests poll these endpoints after creating a CRD to wait for
+    /// the CRD schema to appear. The test client sends requests without credentials,
+    /// so any auth requirement causes 403 Forbidden and the test times out waiting
+    /// for a schema that the client can never see. kube-apiserver serves these
+    /// endpoints without requiring auth.
+    #[test]
+    fn openapi_endpoints_are_exempt_from_auth() {
+        assert!(
+            is_exempt("/openapi/v2"),
+            "/openapi/v2 must be auth-exempt — conformance tests poll it without credentials \
+             to detect when a CRD schema is published; a 403 causes the test to time out"
+        );
+        assert!(
+            is_exempt("/openapi/v3"),
+            "/openapi/v3 must be auth-exempt — conformance tests poll it without credentials \
+             to detect when a CRD schema is published; a 403 causes the test to time out"
+        );
     }
 
     // --- load_token_file() ---
