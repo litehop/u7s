@@ -180,9 +180,19 @@ struct PodTemplate {
     // for routing/storage. The template is preserved as an empty object in the output JSON.
 }
 
-/// Container — minimal decode: name (field 1) and image (field 2).
-/// All other Container fields are ignored (ports, env, volumeMounts, probes, etc.)
-/// because we only need name+image to produce a valid stored Pod JSON.
+/// ResourceRequirements — k8s.io/api/core/v1/generated.proto
+/// limits (field 1) and requests (field 2) are both map<string, Quantity>.
+#[derive(Clone, PartialEq, Message)]
+struct ResourceRequirements {
+    /// limits (field 1, map<string, Quantity>)
+    #[prost(btree_map = "string, message", tag = "1")]
+    limits: std::collections::BTreeMap<String, Quantity>,
+    /// requests (field 2, map<string, Quantity>)
+    #[prost(btree_map = "string, message", tag = "2")]
+    requests: std::collections::BTreeMap<String, Quantity>,
+}
+
+/// Container — k8s.io/api/core/v1/generated.proto
 #[derive(Clone, PartialEq, Message)]
 struct Container {
     /// name (field 1, string)
@@ -197,12 +207,15 @@ struct Container {
     /// args (field 4, repeated string)
     #[prost(string, repeated, tag = "4")]
     args: Vec<String>,
-    /// imagePullPolicy (field 15, string)
-    #[prost(string, tag = "15")]
-    image_pull_policy: String,
+    /// resources (field 8, message ResourceRequirements)
+    #[prost(message, tag = "8")]
+    resources: Option<ResourceRequirements>,
     /// terminationMessagePath (field 14, string)
     #[prost(string, tag = "14")]
     termination_message_path: String,
+    /// imagePullPolicy (field 15, string)
+    #[prost(string, tag = "15")]
+    image_pull_policy: String,
     /// terminationMessagePolicy (field 21, string)
     #[prost(string, tag = "21")]
     termination_message_policy: String,
@@ -1489,6 +1502,22 @@ pub fn decode_pod_proto(data: &[u8]) -> Option<serde_json::Value> {
                         c.args.into_iter().map(serde_json::Value::String).collect(),
                     ),
                 );
+            }
+            if let Some(res) = c.resources {
+                let mut res_map = serde_json::Map::new();
+                if !res.limits.is_empty() {
+                    res_map.insert(
+                        "limits".to_string(),
+                        limitrange_quantity_map_to_json(res.limits),
+                    );
+                }
+                if !res.requests.is_empty() {
+                    res_map.insert(
+                        "requests".to_string(),
+                        limitrange_quantity_map_to_json(res.requests),
+                    );
+                }
+                cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
             }
             serde_json::Value::Object(cm)
         })

@@ -280,6 +280,10 @@ pub async fn create_pod<S: Store>(
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
+    // LimitRange: inject defaults then validate min/max bounds.
+    obj.body =
+        crate::limit_range::apply_limit_ranges(&state, obj.body, ns.as_str(), "pods").await?;
+
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state
         .store

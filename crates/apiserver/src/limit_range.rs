@@ -167,21 +167,51 @@ pub fn inject_defaults(container: &mut Value, items: &[LimitItem]) {
         container["resources"] = Value::Object(Default::default());
     }
 
+    // Collect the set of resources that already have an explicit limit before
+    // any LimitRange defaults are injected. These are the only ones eligible
+    // for limit-to-request inheritance (step 2 below). LimitRange-injected
+    // limits must NOT propagate to requests — defaultRequest takes precedence.
+    let explicit_limit_resources: std::collections::BTreeSet<String> = container["resources"]
+        ["limits"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+
     for item in items {
-        // Inject default limit
+        // Step 1: Inject default limits (from LimitRange `default`).
         if !item.default_limit.is_empty() {
             if !container["resources"]["limits"].is_object() {
                 container["resources"]["limits"] = Value::Object(Default::default());
             }
             for (resource, &val) in &item.default_limit {
                 if container["resources"]["limits"][resource].is_null() {
-                    // Convert millivalue back to a canonical quantity string.
                     let qty = millivalue_to_quantity(val, resource);
                     container["resources"]["limits"][resource] = Value::String(qty);
                 }
             }
         }
-        // Inject default request
+
+        // Step 2: For resources where the container had an explicit limit before
+        // LimitRange injection but no request, inherit request = explicit limit.
+        // This matches kube-apiserver: an explicit limit with no request means
+        // request = limit. LimitRange-injected limits are excluded here;
+        // defaultRequest (step 3) handles those.
+        if !explicit_limit_resources.is_empty() {
+            if !container["resources"]["requests"].is_object() {
+                container["resources"]["requests"] = Value::Object(Default::default());
+            }
+            for resource in &explicit_limit_resources {
+                if container["resources"]["requests"][resource].is_null() {
+                    let limit_val = container["resources"]["limits"][resource].clone();
+                    if !limit_val.is_null() {
+                        container["resources"]["requests"][resource] = limit_val;
+                    }
+                }
+            }
+        }
+
+        // Step 3: Inject default requests (from LimitRange `defaultRequest`) only
+        // for resources still absent after the limit-inheritance step above.
         if !item.default_request.is_empty() {
             if !container["resources"]["requests"].is_object() {
                 container["resources"]["requests"] = Value::Object(Default::default());
@@ -770,6 +800,68 @@ mod tests {
             result["spec"]["containers"][0]["resources"]["requests"]["memory"],
             json!("64Mi"),
             "LimitRange default memory request (64Mi) must be injected"
+        );
+    }
+
+    /// When a container sets an explicit limit but no request, the request must
+    /// inherit from the explicit limit rather than from the LimitRange defaultRequest.
+    ///
+    /// This is the conformance test scenario for "pod with partial resources":
+    /// the pod sets limits.cpu = 300m but omits requests.cpu entirely. With a
+    /// LimitRange defaultRequest.cpu = 100m, the conformance test expects
+    /// requests.cpu = 300m (limit-inheritance wins over defaultRequest).
+    #[test]
+    fn inject_defaults_explicit_limit_inherited_by_request() {
+        let mut container = json!({
+            "name": "pause",
+            "resources": {
+                "limits": { "cpu": "300m" },
+                "requests": { "memory": "150Mi" }
+            }
+        });
+        let items = vec![LimitItem {
+            min: Default::default(),
+            max: Default::default(),
+            default_request: [("cpu".to_string(), 100.0)].into_iter().collect(), // defaultRequest.cpu = 100m
+            default_limit: [("cpu".to_string(), 500.0)].into_iter().collect(), // default.cpu = 500m
+        }];
+        inject_defaults(&mut container, &items);
+        assert_eq!(
+            container["resources"]["requests"]["cpu"],
+            json!("300m"),
+            "explicit limit.cpu=300m must be inherited by requests.cpu — \
+             LimitRange defaultRequest (100m) must not overwrite an explicit limit inheritance"
+        );
+        assert_eq!(
+            container["resources"]["limits"]["cpu"],
+            json!("300m"),
+            "explicit limit.cpu=300m must be preserved"
+        );
+    }
+
+    /// When a container has no resources at all, defaultRequest applies (not limit inheritance).
+    /// Revert inject_defaults to not call the limit-inheritance step → this test will fail
+    /// because requests.cpu will be 500m (limit default) instead of 100m (defaultRequest).
+    #[test]
+    fn inject_defaults_no_resources_uses_default_request_not_limit() {
+        let mut container = json!({ "name": "app" });
+        let items = vec![LimitItem {
+            min: Default::default(),
+            max: Default::default(),
+            default_request: [("cpu".to_string(), 100.0)].into_iter().collect(), // defaultRequest.cpu = 100m
+            default_limit: [("cpu".to_string(), 500.0)].into_iter().collect(), // default.cpu = 500m
+        }];
+        inject_defaults(&mut container, &items);
+        assert_eq!(
+            container["resources"]["requests"]["cpu"],
+            json!("100m"),
+            "defaultRequest.cpu (100m) must be used when no explicit limit is set — \
+             limit-inheritance must not apply to LimitRange-injected defaults"
+        );
+        assert_eq!(
+            container["resources"]["limits"]["cpu"],
+            json!("500m"),
+            "LimitRange default.cpu (500m) must be injected as the limit"
         );
     }
 }
