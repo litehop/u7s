@@ -4736,6 +4736,233 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
+    // ClusterIP auto-allocation regression tests (mayor-pzkt)
+    //
+    // These tests verify that POST /api/v1/namespaces/{ns}/services with an
+    // allocator configured returns a Service with .spec.clusterIP populated.
+    // If maybe_allocate_cluster_ip is removed or broken, all four tests fail.
+    // ---------------------------------------------------------------------------
+
+    fn make_state_with_cidr_for_resource_tests(
+        cidr: &str,
+    ) -> crate::state::AppState<u7s_store::SqliteStore> {
+        use crate::state::{AppStateConfig, ServiceIpAllocator};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let alloc = ServiceIpAllocator::from_cidr(cidr).expect("valid CIDR");
+        crate::state::AppState::new_with_config(AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: Some(alloc),
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            continue_token_key: None,
+        })
+    }
+
+    /// POST of a ClusterIP Service must return a response with spec.clusterIP set to
+    /// an address within the configured CIDR.
+    ///
+    /// Without maybe_allocate_cluster_ip, spec.clusterIP is never populated — the
+    /// field comes back empty and DNS/kube-proxy cannot program service routing.
+    #[tokio::test]
+    async fn allocate_assigns_ip_from_cidr() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::net::Ipv4Addr;
+        use std::str::FromStr;
+
+        let state = make_state_with_cidr_for_resource_tests("10.96.0.0/12");
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "auto-ip-svc", "namespace": "default" },
+            "spec": { "type": "ClusterIP", "ports": [{ "port": 80 }] }
+        });
+
+        let resp = create_namespaced_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Service create must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let cluster_ip = v["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
+        assert!(
+            !cluster_ip.is_empty() && cluster_ip != "None",
+            "spec.clusterIP must be populated after create — empty clusterIP breaks kube-proxy and DNS"
+        );
+
+        // Must be a valid IPv4 address within 10.96.0.0/12.
+        let ip = Ipv4Addr::from_str(&cluster_ip).unwrap_or_else(|_| {
+            panic!("spec.clusterIP must be a valid IPv4 address, got {cluster_ip}")
+        });
+        let base = u32::from(Ipv4Addr::new(10, 96, 0, 0));
+        let mask: u32 = !((1u32 << (32 - 12)) - 1);
+        assert_eq!(
+            u32::from(ip) & mask,
+            base & mask,
+            "allocated clusterIP {ip} must be within 10.96.0.0/12"
+        );
+    }
+
+    /// Creating 10 ClusterIP Services must produce 10 distinct clusterIPs.
+    ///
+    /// Duplicate clusterIPs mis-route traffic: two services sharing one IP means
+    /// only one can be reached via kube-proxy iptables rules.
+    #[tokio::test]
+    async fn allocate_no_duplicates() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::collections::HashSet;
+
+        // /24 has 254 usable IPs — enough for 10 services without exhaustion.
+        let state = make_state_with_cidr_for_resource_tests("10.0.0.0/24");
+
+        let mut ips: HashSet<String> = HashSet::new();
+        for i in 0..10u32 {
+            let svc = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": { "name": format!("svc-{i}"), "namespace": "default" },
+                "spec": { "type": "ClusterIP", "ports": [{ "port": 80 }] }
+            });
+            let resp = create_namespaced_resource(
+                State(state.clone()),
+                Path(("".into(), "v1".into(), "default".into(), "services".into())),
+                axum::extract::Query(CreateQuery::default()),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("Service {i} create must succeed: {e:?}"))
+            .into_response();
+
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let ip = v["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
+            assert!(
+                !ip.is_empty() && ip != "None",
+                "Service {i} must get a clusterIP — empty means allocation is broken"
+            );
+            assert!(
+                ips.insert(ip.clone()),
+                "clusterIP {ip} for Service {i} duplicates an earlier allocation — \
+                 duplicate IPs mis-route traffic"
+            );
+        }
+
+        assert_eq!(
+            ips.len(),
+            10,
+            "10 Services must produce 10 distinct clusterIPs"
+        );
+    }
+
+    /// A headless Service (clusterIP: None) must NOT have a clusterIP auto-allocated.
+    ///
+    /// Headless services have no cluster IP; they return all Pod IPs directly via DNS.
+    /// Auto-allocating an IP for them would break DNS round-robin and confuse kube-proxy.
+    #[tokio::test]
+    async fn headless_service_skips_allocation() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state_with_cidr_for_resource_tests("10.0.0.0/24");
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "headless", "namespace": "default" },
+            "spec": { "clusterIP": "None", "ports": [{ "port": 80 }] }
+        });
+
+        let resp = create_namespaced_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("headless Service create must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["spec"]["clusterIP"].as_str(),
+            Some("None"),
+            "headless Service must retain clusterIP=None — overwriting it with an allocated IP \
+             would break DNS round-robin by making the service behave like a normal ClusterIP service"
+        );
+    }
+
+    /// A Service with a pre-set spec.clusterIP must keep that IP (static allocation).
+    ///
+    /// When a user explicitly sets spec.clusterIP (e.g. to pin a well-known address),
+    /// the auto-allocator must not overwrite it with a different IP. Overwriting would
+    /// break any in-cluster code that has the old IP hard-coded.
+    #[tokio::test]
+    async fn static_clusterip_is_respected() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state_with_cidr_for_resource_tests("10.0.0.0/24");
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "static-ip-svc", "namespace": "default" },
+            "spec": { "clusterIP": "10.0.0.99", "ports": [{ "port": 80 }] }
+        });
+
+        let resp = create_namespaced_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Service with static clusterIP must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["spec"]["clusterIP"].as_str(),
+            Some("10.0.0.99"),
+            "static clusterIP 10.0.0.99 must be preserved — \
+             overwriting a user-specified clusterIP would break any code that has that IP hard-coded"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
     // fieldValidation query param regression (mayor-hww0)
     // ---------------------------------------------------------------------------
 
