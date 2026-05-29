@@ -178,15 +178,6 @@ fi
 echo ""
 echo "Success! Node registered:"
 kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes
-
-# Start kube-controller-manager inside the VM.
-# Without KCM, kube-root-ca.crt is never published to namespaces and every
-# pod stays Pending.  Run 04-start-kcm.sh here so standalone use of this
-# script works the same as the full conformance run-all.sh sequence.
-echo ""
-echo "Starting kube-controller-manager..."
-bash "$(dirname "$0")/04-start-kcm.sh"
-
 echo ""
 echo "Run kubectl commands with:"
 echo "  export KUBECONFIG=$KUBECONFIG_PATH"
