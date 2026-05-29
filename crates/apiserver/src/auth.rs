@@ -372,7 +372,7 @@ fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
 fn is_exempt(path: &str) -> bool {
     matches!(
         path,
-        "/healthz" | "/readyz" | "/livez" | "/api" | "/apis" | "/version"
+        "/healthz" | "/readyz" | "/livez" | "/api" | "/apis" | "/version" | "/discovery/v2"
     )
 }
 
