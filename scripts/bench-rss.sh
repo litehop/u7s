@@ -28,6 +28,7 @@ echo "$BENCH_TOKEN,bench-admin,uid0,system:masters" > "$TMPDIR/token-auth.csv"
     --sa-pub "$TMPDIR/sa.pub" \
     --token-auth-file "$TMPDIR/token-auth.csv" \
     --advertise-address https://127.0.0.1:6443 \
+    --service-cluster-ip-range "10.96.0.0/12" \
     >"$TMPDIR/server.log" 2>&1 &
 SERVER_PID=$!
 
