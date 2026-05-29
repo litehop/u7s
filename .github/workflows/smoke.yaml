@@ -156,7 +156,7 @@ jobs:
           # kubectl smoke job does not run kcm.  Without removing the finalizer the
           # namespace stays in Terminating indefinitely and no DELETED event fires.
           kubectl patch namespace watch-test \
-            -p '{"metadata":{"finalizers":[]}}' --type=merge
+            -p '{"spec":{"finalizers":[]}}' --type=merge
           # Delete namespace — should trigger a DELETED event.
           kubectl delete namespace watch-test
 
