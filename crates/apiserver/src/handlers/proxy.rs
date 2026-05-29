@@ -6,7 +6,8 @@
 /// /attach: WebSocket proxy — upgrades the inbound kubectl connection (v5.channel.k8s.io)
 ///          and opens a matching WebSocket to the kubelet, then splices them.
 ///
-/// /exec: return 501 Not Implemented.
+/// /exec: WebSocket proxy — upgrades the inbound kubectl connection (v4.channel.k8s.io)
+///        and opens a matching WebSocket to the kubelet exec endpoint, then splices them.
 /// /portforward: fully implemented as a WebSocket proxy.
 use axum::{
     body::Body,
@@ -14,8 +15,7 @@ use axum::{
         ws::{WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use serde::Deserialize;
 
@@ -508,13 +508,211 @@ async fn run_attach_proxy(inbound: WebSocket, target: AttachTarget) -> anyhow::R
 }
 
 // ---------------------------------------------------------------------------
-// 501 stubs
+// /exec — WebSocket proxy to kubelet exec endpoint
 // ---------------------------------------------------------------------------
 
-/// exec requires SPDY 3.1 or WebSocket upgrade — not yet implemented.
-/// Returns 501 so kubectl gets a clear error instead of 404.
-pub async fn pod_exec(Path((_ns, _name)): Path<(String, String)>) -> impl IntoResponse {
-    not_implemented("exec")
+/// Query parameters for /exec — only `container` is needed to build the URL path.
+///
+/// `command` and the stream flags (stdin/stdout/stderr/tty) are forwarded verbatim
+/// as the raw query string to kubelet. We do NOT parse them with serde because
+/// `command` is multi-valued (`?command=ls&command=-la`) and serde_urlencoded
+/// (used by axum's Query extractor) does not support repeated keys for Vec<String>.
+#[derive(Deserialize)]
+pub struct ExecQuery {
+    pub container: Option<String>,
+}
+
+/// Exec subprotocol for the kubelet-side connection.
+///
+/// Use v4.channel.k8s.io — the baseline exec subprotocol that kubelet supports.
+/// This is what the Kubernetes apiserver uses when connecting to kubelet for exec.
+const EXEC_KUBELET_SUBPROTOCOL: &str = "v4.channel.k8s.io";
+
+/// Exec subprotocols accepted from kubectl.
+///
+/// kubectl sends `Sec-WebSocket-Protocol: v5.channel.k8s.io` by default for exec.
+/// We accept both v5 and v4 so kubectl can negotiate successfully. The protocol
+/// framing for stdin/stdout/stderr is identical in both; v5 adds an optional
+/// resize channel that kubectl won't use without a TTY.
+const EXEC_KUBECTL_PROTOCOLS: &[&str] = &["v4.channel.k8s.io", "v5.channel.k8s.io"];
+
+/// Resolved kubelet exec target — returned by the pure lookup helper so the
+/// handler can be tested without a real WebSocket upgrade.
+pub struct ExecTarget {
+    pub kubelet_ws_url: String,
+    pub node_ip: String,
+    pub tls_config: std::sync::Arc<rustls::ClientConfig>,
+}
+
+/// Pure lookup: pod → node → node_ip → kubelet WS URL + TLS config for exec.
+///
+/// `raw_query` is the verbatim query string from the inbound request (e.g.
+/// `command=echo&command=hello&stdin=1&stdout=1`). It is forwarded as-is to
+/// kubelet — we do not re-parse or re-encode it. Only `container` is extracted
+/// from it (via the already-parsed `query`) to build the URL path segment.
+///
+/// Extracted from `pod_exec` so the error paths (404, 400, 500) can be tested
+/// without going through the WebSocket upgrade machinery.
+pub async fn resolve_exec_target<S: Store>(
+    state: &AppState<S>,
+    raw_ns: &str,
+    pod_name: &str,
+    container_override: Option<&str>,
+    raw_query: &str,
+) -> Result<ExecTarget, crate::status::StatusError> {
+    // Look up the pod.
+    let pod_key = object_key("pods", raw_ns, pod_name);
+    let stored = state
+        .store
+        .get(&pod_key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
+
+    let pod: serde_json::Value = serde_json::from_slice(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
+
+    let node_name = pod["spec"]["nodeName"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Status::bad_request(format!(
+                "pod \"{pod_name}\" is not yet scheduled (spec.nodeName is empty)"
+            ))
+        })?;
+
+    let node_key = cluster_object_key("nodes", node_name);
+    let node_stored = state
+        .store
+        .get(&node_key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(node_name, "Node"))?;
+
+    let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
+
+    let node_ip = resolve_kubelet_address(
+        &node,
+        state
+            .kubelet_preferred_address
+            .as_deref()
+            .map(|s| s.as_str()),
+    )
+    .ok_or_else(|| {
+        Status::internal(format!(
+            "node \"{node_name}\" has no usable address in status.addresses"
+        ))
+    })?;
+
+    // Determine container (first container if unspecified).
+    let container = match container_override {
+        Some(c) if !c.is_empty() => c.to_owned(),
+        _ => pod["spec"]["containers"][0]["name"]
+            .as_str()
+            .unwrap_or("default")
+            .to_owned(),
+    };
+
+    // Build kubelet exec URL.
+    //   Kubelet exec endpoint: wss://<node-ip>:10250/exec/<ns>/<pod>/<container>?<raw_query>
+    //   The raw query string is forwarded verbatim — it already contains
+    //   command= (possibly repeated), stdin=, stdout=, stderr=, tty=.
+    let kubelet_ws_url = if raw_query.is_empty() {
+        format!("wss://{node_ip}:10250/exec/{raw_ns}/{pod_name}/{container}")
+    } else {
+        format!("wss://{node_ip}:10250/exec/{raw_ns}/{pod_name}/{container}?{raw_query}")
+    };
+
+    let tls_config = build_kubelet_tls_config(
+        state
+            .kubelet_client_identity_pem
+            .as_deref()
+            .map(|v| v.as_slice()),
+    )
+    .map_err(|e| Status::internal(format!("failed to build kubelet TLS config: {e}")))?;
+
+    Ok(ExecTarget {
+        kubelet_ws_url,
+        node_ip,
+        tls_config,
+    })
+}
+
+/// /exec — proxy kubectl's WebSocket exec session to the kubelet.
+///
+/// Flow:
+///   1. Extract raw query string from the URI (contains multi-valued command= params).
+///   2. Look up pod → node → node_ip (via resolve_exec_target).
+///   3. Upgrade inbound request to WebSocket (kubectl side), subprotocol v4.channel.k8s.io.
+///   4. Open outbound WebSocket to kubelet exec endpoint with the same subprotocol.
+///   5. Splice the two connections bidirectionally via BiStream trait.
+///
+/// The v4 channel protocol multiplexes stdin/stdout/stderr/resize over a single
+/// WebSocket using a 1-byte channel prefix per message. The splice passes bytes
+/// through unchanged — kubelet handles the mux.
+pub async fn pod_exec<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns, pod_name)): Path<(String, String)>,
+    Query(query): Query<ExecQuery>,
+    uri: axum::http::Uri,
+    ws: WebSocketUpgrade,
+) -> Result<Response, crate::status::StatusError> {
+    let raw_query = uri.query().unwrap_or("").to_owned();
+    let target = resolve_exec_target(
+        &state,
+        &raw_ns,
+        &pod_name,
+        query.container.as_deref(),
+        &raw_query,
+    )
+    .await?;
+
+    let resp = ws
+        .protocols(EXEC_KUBECTL_PROTOCOLS.iter().copied())
+        .on_upgrade(move |inbound: WebSocket| async move {
+            if let Err(e) = run_exec_proxy(inbound, target).await {
+                tracing::warn!("exec proxy error: {e}");
+            }
+        });
+
+    Ok(resp)
+}
+
+/// Open outbound WebSocket to kubelet exec endpoint and splice with inbound kubectl WebSocket.
+async fn run_exec_proxy(inbound: WebSocket, target: ExecTarget) -> anyhow::Result<()> {
+    use rustls::pki_types::ServerName;
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
+    use tokio_tungstenite::{client_async_with_config, tungstenite::client::IntoClientRequest};
+
+    let ExecTarget {
+        kubelet_ws_url,
+        node_ip,
+        tls_config,
+    } = target;
+
+    // Resolve node_ip → TCP stream.
+    let addr = format!("{node_ip}:10250");
+    let tcp = TcpStream::connect(&addr).await?;
+
+    // TLS handshake.
+    let connector = TlsConnector::from(tls_config);
+    let server_name = ServerName::try_from(node_ip.clone())
+        .map_err(|_| anyhow::anyhow!("invalid server name: {node_ip}"))?;
+    let tls_stream = connector.connect(server_name, tcp).await?;
+
+    // WebSocket handshake over the TLS stream.
+    let mut request = kubelet_ws_url.into_client_request()?;
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        EXEC_KUBELET_SUBPROTOCOL.parse().unwrap(),
+    );
+    let (outbound_ws, _resp) = client_async_with_config(request, tls_stream, None).await?;
+
+    // Splice the two WebSocket connections bidirectionally.
+    splice(AxumWs(inbound), TungsteniteWs(outbound_ws)).await;
+    Ok(())
 }
 
 /// Query parameters for portforward: only `ports` is required.
@@ -776,20 +974,6 @@ pub async fn node_proxy<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))
 }
 
-fn not_implemented(subresource: &str) -> Response {
-    let body = serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Failure",
-        "message": format!(
-            "{subresource} not yet implemented: requires SPDY/WebSocket upgrade"
-        ),
-        "reason": "NotImplemented",
-        "code": 501
-    });
-    (StatusCode::NOT_IMPLEMENTED, axum::Json(body)).into_response()
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -800,7 +984,6 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{
-        body::to_bytes,
         http::{Request, StatusCode},
         routing::get,
         Router,
@@ -983,40 +1166,146 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pod_exec: 501 Not Implemented
+    // pod_exec: resolve_exec_target pure-function tests
+    //
+    // resolve_exec_target contains all error-path logic (404, 400, 500).
+    // We test it directly rather than through the router because the axum
+    // WebSocketUpgrade extractor rejects non-WS requests before the handler
+    // runs — making it impossible to reach the error paths via the router.
     // -----------------------------------------------------------------------
 
-    /// /exec must return 501 Not Implemented (not 404).
+    /// /exec must return 404 when the pod does not exist.
     ///
-    /// kubectl exec fails with a confusing "command not found" error when it
-    /// receives 404. A 501 clearly signals that the feature is unimplemented
-    /// rather than that the resource does not exist.
+    /// Without this guard, a request for a non-existent pod would proceed to the
+    /// WebSocket upgrade and then fail with a confusing connection error rather
+    /// than a clear 404.
     #[tokio::test]
-    async fn pod_exec_returns_501() {
+    async fn pod_exec_missing_pod_returns_404() {
         let state = make_state();
-        let mut router = make_router(state);
+        match resolve_exec_target(
+            &state,
+            "default",
+            "ghost",
+            None,
+            "command=echo&command=hello&stdout=1&stderr=1",
+        )
+        .await
+        {
+            Ok(_) => panic!("expected error for missing pod"),
+            Err(e) => assert_eq!(
+                e.0,
+                StatusCode::NOT_FOUND,
+                "/exec on a non-existent pod must produce 404 — \
+                 a missing pod should not proceed to WebSocket upgrade"
+            ),
+        };
+    }
 
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/namespaces/default/pods/mypod/exec")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = router.call(req).await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_IMPLEMENTED,
-            "/exec must return 501 Not Implemented — SPDY upgrade is not yet supported"
-        );
+    /// /exec must return 400 when the pod exists but is not yet scheduled.
+    ///
+    /// An unscheduled pod has no kubelet — returning 400 tells the caller
+    /// that the pod is pending rather than producing a confusing connect error.
+    #[tokio::test]
+    async fn pod_exec_unscheduled_pod_returns_400() {
+        let state = make_state();
 
-        // Response body must include a clear message.
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).expect("response must be JSON");
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pending", "namespace": "default", "resourceVersion": "1"},
+            "spec": { "containers": [{"name": "app", "image": "busybox"}] }
+            // no nodeName
+        });
+        let key = crate::keys::object_key("pods", "default", "pending");
+        state
+            .store
+            .put(&key, bytes::Bytes::from(pod.to_string()), Some(0))
+            .await
+            .expect("seed pod");
+
+        match resolve_exec_target(&state, "default", "pending", None, "command=echo&stdout=1").await
+        {
+            Ok(_) => panic!("expected error for unscheduled pod"),
+            Err(e) => assert_eq!(
+                e.0,
+                StatusCode::BAD_REQUEST,
+                "/exec on an unscheduled pod must produce 400 — \
+                 there is no kubelet to run the command until spec.nodeName is set"
+            ),
+        };
+    }
+
+    /// resolve_exec_target builds correct kubelet URL for a scheduled pod.
+    ///
+    /// The URL format is what kubelet expects: wss://<ip>:10250/exec/<ns>/<pod>/<container>
+    /// with multi-valued command params. An incorrect URL silently connects to the
+    /// wrong endpoint or fails opaquely, so this must be verified.
+    #[tokio::test]
+    async fn resolve_exec_target_builds_correct_kubelet_url() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "ns1", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "ns1", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let raw_query = "container=app&command=echo&command=hello&stdin=1&stdout=1&stderr=1";
+        let target = resolve_exec_target(&state, "ns1", "mypod", Some("app"), raw_query)
+            .await
+            .expect("resolve must succeed for scheduled pod");
+
+        assert_eq!(target.node_ip, "10.0.0.1");
         assert!(
-            v["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("not yet implemented"),
-            "501 body must explain that exec is not yet implemented"
+            target
+                .kubelet_ws_url
+                .starts_with("wss://10.0.0.1:10250/exec/ns1/mypod/app"),
+            "kubelet exec URL must use wss scheme, port 10250, /exec/<ns>/<pod>/<container>: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            target.kubelet_ws_url.contains("command=echo"),
+            "kubelet exec URL must include command=echo: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            target.kubelet_ws_url.contains("command=hello"),
+            "kubelet exec URL must include command=hello for multi-arg commands: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            target.kubelet_ws_url.contains("stdin=1"),
+            "kubelet exec URL must include stdin=1: {}",
+            target.kubelet_ws_url
         );
     }
 
