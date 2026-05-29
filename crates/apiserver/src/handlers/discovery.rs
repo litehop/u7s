@@ -40,19 +40,18 @@ pub async fn version() -> Json<serde_json::Value> {
 fn parse_aggregated_accept(accept: &str) -> Option<&'static str> {
     for media_type in accept.split(',') {
         let params: Vec<&str> = media_type.split(';').map(str::trim).collect();
-        // base must be application/json
-        if params.first().map(|s| *s) != Some("application/json") {
+        if params.first().copied() != Some("application/json") {
             continue;
         }
-        let has_group = params.iter().any(|p| *p == "g=apidiscovery.k8s.io");
-        let has_kind = params.iter().any(|p| *p == "as=APIGroupDiscoveryList");
-        if !has_group || !has_kind {
+        if !params.contains(&"g=apidiscovery.k8s.io")
+            || !params.contains(&"as=APIGroupDiscoveryList")
+        {
             continue;
         }
-        if params.iter().any(|p| *p == "v=v2") {
+        if params.contains(&"v=v2") {
             return Some("v2");
         }
-        if params.iter().any(|p| *p == "v=v2beta1") {
+        if params.contains(&"v=v2beta1") {
             return Some("v2beta1");
         }
     }
@@ -300,7 +299,8 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
             {
                 api_resources_to_discovery_resources(&rl)
             } else {
-                serde_json::Value::Array(vec![])
+                // Dynamic group (CRD-backed): look up resources from the store.
+                crd_group_resources(state, group.name.as_str(), gv.version.as_str()).await
             };
             versions_arr.push(serde_json::json!({
                 "version": gv.version,
@@ -323,6 +323,55 @@ pub(crate) async fn build_aggregated_discovery<S: Store>(
         "metadata": { "resourceVersion": resource_version },
         "items": items
     })
+}
+
+/// Look up CRD-backed resources for a group/version from the store and return discovery entries.
+async fn crd_group_resources<S: Store>(
+    state: &AppState<S>,
+    group: &str,
+    version: &str,
+) -> serde_json::Value {
+    let Ok(resp) = state
+        .store
+        .list(
+            "/registry/apiextensions.k8s.io/customresourcedefinitions/",
+            ListOptions::default(),
+        )
+        .await
+    else {
+        return serde_json::Value::Array(vec![]);
+    };
+
+    let resources: Vec<serde_json::Value> = resp
+        .items
+        .iter()
+        .filter_map(|obj| serde_json::from_slice::<CustomResourceDefinition>(&obj.value).ok())
+        .filter(|crd| {
+            crd.spec.group == group && crd.spec.versions.iter().any(|v| v.name == version && v.served)
+        })
+        .map(|crd| {
+            let scope = if crd.spec.scope == "Namespaced" {
+                "Namespaced"
+            } else {
+                "Cluster"
+            };
+            let mut entry = serde_json::json!({
+                "resource": crd.spec.names.plural,
+                "responseKind": { "kind": crd.spec.names.kind },
+                "scope": scope,
+                "singularResource": crd.spec.names.singular,
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            });
+            if !crd.spec.names.short_names.is_empty() {
+                entry["shortNames"] = serde_json::Value::Array(
+                    crd.spec.names.short_names.iter().cloned().map(serde_json::Value::String).collect(),
+                );
+            }
+            entry
+        })
+        .collect();
+
+    serde_json::Value::Array(resources)
 }
 
 /// Convert an `APIResourceList` JSON value into the `APIGroupDiscovery` resource entry array.
