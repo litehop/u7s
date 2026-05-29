@@ -3036,4 +3036,334 @@ mod tests {
             "DELETE /api/v1/persistentvolumes/test-pv must succeed (2xx), got {delete_status}"
         );
     }
+
+    /// POST /api/v1/namespaces/default/secrets with a JSON body must return 201 Created.
+    ///
+    /// Regression test for mayor-l6u0: Secret creates returned HTTP 400
+    /// "invalid JSON: expected value at line 1 column 1".  The conformance suite
+    /// (webhook.go:1075 BeforeEach, secrets.go) creates Secrets via client-go which
+    /// sends proto-encoded bodies.  This test verifies the JSON path also works — a
+    /// broken JSON path means the server cannot accept Secrets from any client.
+    ///
+    /// Failing case: if the resource is not in the registry, create_namespaced_resource
+    /// delegates to the CR handler, which falls through to 404.  If the proto decoder
+    /// returns None, extract_body returns raw proto bytes and Object::from_bytes fails
+    /// with "invalid JSON".  Both would break all ~31 webhook and secret-volume
+    /// conformance tests that depend on Secret creation.
+    #[tokio::test]
+    async fn secret_create_json_returns_201() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "sample-webhook-secret", "namespace": "default" },
+            "type": "Opaque",
+            "data": { "key": "dmFsdWU=" }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/secrets")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request build must not fail");
+
+        let resp = router.call(req).await.expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "POST /api/v1/namespaces/default/secrets must return 201 — \
+             before the fix, Secret was not in the registry or the decode path was broken, \
+             causing HTTP 400 'invalid JSON' which breaks all ~31 webhook conformance tests \
+             that create sample-webhook-secret in BeforeEach"
+        );
+
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp_body).expect("response must be JSON");
+        assert_eq!(v["kind"], "Secret");
+        assert_eq!(v["metadata"]["name"], "sample-webhook-secret");
+    }
+
+    /// POST /apis/batch/v1/namespaces/default/jobs with a JSON body must return 201 Created.
+    ///
+    /// Regression test for mayor-np42: batch/v1 Job creates returned HTTP 400
+    /// "invalid JSON: expected value at line 1 column 1".  The conformance suite
+    /// (job.go:502, job.go:621) creates Jobs via client-go which sends proto-encoded bodies.
+    /// This test verifies the JSON path works — a broken JSON path means the server cannot
+    /// accept Jobs from any client and all 6 Job/CronJob conformance tests fail immediately.
+    #[tokio::test]
+    async fn job_create_json_via_router_returns_201() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "ci-job", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{ "name": "test", "image": "busybox" }],
+                        "restartPolicy": "Never"
+                    }
+                }
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/apis/batch/v1/namespaces/default/jobs")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request build must not fail");
+
+        let resp = router.call(req).await.expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "POST /apis/batch/v1/namespaces/default/jobs must return 201 — \
+             before the fix, batch/v1 Job was not in the registry or the decode path was \
+             broken, causing HTTP 400 'invalid JSON' which breaks all Job conformance tests"
+        );
+
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp_body).expect("response must be JSON");
+        assert_eq!(v["kind"], "Job");
+        assert_eq!(v["metadata"]["name"], "ci-job");
+    }
+
+    /// POST /api/v1/namespaces/default/secrets with a proto-encoded body must return 201.
+    ///
+    /// Regression test for mayor-l6u0: the conformance client sends Secrets with
+    /// Content-Type: application/vnd.kubernetes.protobuf.  If decode_secret_proto returns
+    /// None for any reason, extract_body falls back to returning the raw proto bytes, and
+    /// Object::from_bytes fails with "invalid JSON: expected value at line 1 column 1".
+    ///
+    /// This test fails if:
+    ///   - decode_secret_proto is removed from decode_core_proto_by_kind
+    ///   - Secret::decode fails for a valid proto-encoded secret
+    ///   - The proto envelope is not recognised (magic check fails)
+    #[tokio::test]
+    async fn secret_create_proto_returns_201() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        // Build proto-encoded Secret.
+        // Helpers (identical to those in util::tests — kept local to avoid test coupling).
+        fn encode_varint(mut v: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+            out
+        }
+        fn encode_ld(field: u64, payload: &[u8]) -> Vec<u8> {
+            let tag = (field << 3) | 2;
+            let mut out = encode_varint(tag);
+            out.extend_from_slice(&encode_varint(payload.len() as u64));
+            out.extend_from_slice(payload);
+            out
+        }
+
+        // ObjectMeta { name: "proto-secret", namespace: "default", creationTimestamp: Time{} }
+        let mut obj_meta = encode_ld(1, b"proto-secret");
+        obj_meta.extend_from_slice(&encode_ld(3, b"default"));
+        obj_meta.extend_from_slice(&encode_ld(8, &[])); // empty Time{}
+
+        // Secret { metadata (field 1), type (field 4) }
+        let mut secret_proto = encode_ld(1, &obj_meta);
+        secret_proto.extend_from_slice(&encode_ld(4, b"Opaque"));
+
+        // k8s Unknown envelope
+        const MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
+        let mut type_meta = encode_ld(1, b"v1");
+        type_meta.extend_from_slice(&encode_ld(2, b"Secret"));
+        let mut unknown = encode_ld(1, &type_meta);
+        unknown.extend_from_slice(&encode_ld(2, &secret_proto));
+        let mut proto_body = MAGIC.to_vec();
+        proto_body.extend_from_slice(&unknown);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/secrets")
+            .header("content-type", "application/vnd.kubernetes.protobuf")
+            .body(axum::body::Body::from(proto_body))
+            .expect("request build must not fail");
+
+        let resp = router.call(req).await.expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "POST /api/v1/namespaces/default/secrets with proto body must return 201 — \
+             the conformance client sends Secrets as proto; if decode_secret_proto returns None \
+             extract_body returns raw proto bytes causing 'invalid JSON: expected value at \
+             line 1 column 1', breaking all ~31 webhook/secret-volume conformance tests"
+        );
+
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp_body).expect("response must be JSON");
+        assert_eq!(v["kind"], "Secret", "response kind must be Secret");
+        assert_eq!(v["metadata"]["name"], "proto-secret");
+    }
+
+    /// POST /apis/batch/v1/namespaces/default/cronjobs with a proto-encoded body must return 201.
+    ///
+    /// Regression test for mayor-np42: the conformance client (cronjob.go:106) creates CronJobs
+    /// with Content-Type: application/vnd.kubernetes.protobuf.  If decode_cronjob_proto returns
+    /// None, extract_body returns raw proto bytes and Object::from_bytes fails with
+    /// "invalid JSON: expected value at line 1 column 1".
+    ///
+    /// This test fails if:
+    ///   - decode_cronjob_proto is removed from decode_core_proto_by_kind
+    ///   - CronJob::decode fails for a suspended CronJob proto (the exact conformance scenario)
+    ///   - The batch/v1 group is not in the resource registry
+    #[tokio::test]
+    async fn cronjob_create_proto_suspended_returns_201() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        fn encode_varint(mut v: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+            out
+        }
+        fn encode_ld(field: u64, payload: &[u8]) -> Vec<u8> {
+            let tag = (field << 3) | 2;
+            let mut out = encode_varint(tag);
+            out.extend_from_slice(&encode_varint(payload.len() as u64));
+            out.extend_from_slice(payload);
+            out
+        }
+        fn encode_varint_field(field: u64, value: u64) -> Vec<u8> {
+            let tag = field << 3; // wire type 0
+            let mut out = encode_varint(tag);
+            out.extend_from_slice(&encode_varint(value));
+            out
+        }
+
+        // ObjectMeta { name: "test-suspended-cj", namespace: "default" }
+        let mut obj_meta = encode_ld(1, b"test-suspended-cj");
+        obj_meta.extend_from_slice(&encode_ld(3, b"default"));
+        obj_meta.extend_from_slice(&encode_ld(8, &[])); // creationTimestamp
+
+        // JobSpec { backoffLimit: 6 (field 6, wire type 0 = varint) }
+        let job_spec = encode_varint_field(6, 6); // backoffLimit = 6
+
+        // JobTemplateSpec sub-message bytes: field 2 = spec (JobSpec)
+        // jt_bytes IS the complete sub-message content for JobTemplateSpec
+        let jt_bytes = encode_ld(2, &job_spec); // field 2 of JobTemplateSpec = spec = job_spec
+
+        // CronJobSpec { schedule (1), concurrencyPolicy (3), suspend=true (4), jobTemplate (5) }
+        let mut cj_spec = encode_ld(1, b"*/5 * * * *"); // schedule
+        cj_spec.extend_from_slice(&encode_ld(3, b"Allow")); // concurrencyPolicy
+        cj_spec.extend_from_slice(&encode_varint_field(4, 1)); // suspend = true (field 4, wire type 0)
+        cj_spec.extend_from_slice(&encode_ld(5, &jt_bytes)); // jobTemplate field 5 = JobTemplateSpec
+
+        // CronJob { metadata (1), spec (2) }
+        let mut cj_proto = encode_ld(1, &obj_meta);
+        cj_proto.extend_from_slice(&encode_ld(2, &cj_spec));
+
+        // k8s Unknown envelope
+        const MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
+        let mut type_meta = encode_ld(1, b"batch/v1");
+        type_meta.extend_from_slice(&encode_ld(2, b"CronJob"));
+        let mut unknown = encode_ld(1, &type_meta);
+        unknown.extend_from_slice(&encode_ld(2, &cj_proto));
+        let mut proto_body = MAGIC.to_vec();
+        proto_body.extend_from_slice(&unknown);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/apis/batch/v1/namespaces/default/cronjobs")
+            .header("content-type", "application/vnd.kubernetes.protobuf")
+            .body(axum::body::Body::from(proto_body))
+            .expect("request build must not fail");
+
+        let resp = router.call(req).await.expect("router must not error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "POST /apis/batch/v1/namespaces/default/cronjobs with proto body (suspend=true) \
+             must return 201 — the conformance client at cronjob.go:106 creates a suspended \
+             CronJob via proto; if decode_cronjob_proto returns None for this input, \
+             extract_body returns raw proto bytes causing HTTP 400 'invalid JSON'"
+        );
+
+        let resp_body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&resp_body).expect("response must be JSON");
+        assert_eq!(v["kind"], "CronJob", "response kind must be CronJob");
+        assert_eq!(v["metadata"]["name"], "test-suspended-cj");
+        assert_eq!(
+            v["spec"]["schedule"], "*/5 * * * *",
+            "schedule must survive proto decode"
+        );
+        assert_eq!(
+            v["spec"]["suspend"], true,
+            "suspend=true must survive proto decode — this is the exact conformance scenario"
+        );
+    }
 }
