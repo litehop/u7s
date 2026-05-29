@@ -45,12 +45,14 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-SONOBUOY_ARGS="run --mode=non-disruptive-conformance --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
+SONOBUOY_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
 if [ -n "$FOCUS" ]; then
   SONOBUOY_ARGS="$SONOBUOY_ARGS --e2e-focus=$FOCUS"
+else
+  SONOBUOY_ARGS="$SONOBUOY_ARGS --mode=non-disruptive-conformance"
 fi
 
-echo "Running sonobuoy inside $VM_NAME (mode=non-disruptive-conformance)..."
+echo "Running sonobuoy inside $VM_NAME..."
 # shellcheck disable=SC2086
 limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_ARGS
 
