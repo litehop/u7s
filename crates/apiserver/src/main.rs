@@ -910,8 +910,13 @@ async fn serve_tls(
                     Ok::<_, std::convert::Infallible>(app.call(req).await.unwrap())
                 }
             });
+            // with_upgrades() is required for HTTP/1.1 WebSocket upgrades (exec/attach/portforward).
+            // Without it, hyper sends the 101 Switching Protocols response but never hands the
+            // connection off to the upgrade handler — the on_upgrade callback never runs, the
+            // splice never starts, and kubectl times out with "unexpected output from server".
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
+                .with_upgrades()
                 .await
             {
                 tracing::debug!("connection error: {e}");
@@ -3567,5 +3572,123 @@ mod tests {
             "response must have kind=APIGroup — clients use this to discover the preferred version"
         );
         assert_eq!(val["name"], "flowcontrol.apiserver.k8s.io");
+    }
+
+    // -----------------------------------------------------------------------
+    // serve_connection with_upgrades regression test
+    //
+    // Without with_upgrades(), hyper's HTTP/1.1 server sends the 101 Switching
+    // Protocols response but never hands the connection off to the upgrade
+    // handler. The on_upgrade callback never runs, the WebSocket splice never
+    // starts, and kubectl times out with "unexpected output from server".
+    //
+    // This test fails if with_upgrades() is removed from serve_connection:
+    // the WebSocket client sends a message and expects to read it back, but
+    // without with_upgrades() the echo handler never runs — the recv() blocks
+    // and the timeout fires.
+    // -----------------------------------------------------------------------
+
+    /// serve_connection().with_upgrades() must allow WebSocket upgrade handlers to run.
+    ///
+    /// This is the regression test for the exec "unexpected output from server" bug.
+    /// When with_upgrades() was absent from serve_connection(), hyper sent 101 but
+    /// never drove the upgrade — the on_upgrade closure never ran, the splice was
+    /// never started, and kubectl timed out at 60s with no output.
+    ///
+    /// This test MUST fail if with_upgrades() is removed: the WebSocket client will
+    /// connect (101 received) but recv() will block indefinitely because the echo
+    /// handler never runs, causing the 2-second timeout to fire.
+    #[tokio::test]
+    async fn serve_connection_with_upgrades_allows_websocket_handler_to_run() {
+        use axum::{
+            extract::ws::{WebSocket, WebSocketUpgrade},
+            routing::get,
+            Router,
+        };
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest as _};
+
+        // Build an axum router with a single WebSocket echo endpoint.
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async {
+                ws.on_upgrade(|mut socket: WebSocket| async move {
+                    // Echo one message back and close.
+                    if let Some(Ok(msg)) = socket.recv().await {
+                        let _ = socket.send(msg).await;
+                    }
+                })
+            }),
+        );
+
+        // Bind a real TCP listener on a random port.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn the server using our serve_connection pattern WITH with_upgrades().
+        // This mirrors what serve_tls() does (minus TLS) and is the exact code path
+        // that had the missing with_upgrades() bug.
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let io = hyper_util::rt::TokioIo::new(tcp);
+            let service = hyper::service::service_fn(move |req| {
+                let mut app = app.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        tower_service::Service::call(&mut app, req).await.unwrap(),
+                    )
+                }
+            });
+            // with_upgrades() is the fix — removing it causes this test to fail
+            // because the on_upgrade closure never runs and the client recv() blocks.
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await;
+        });
+
+        // Connect a WebSocket client and exchange one message.
+        let url = format!("ws://{addr}/ws");
+        let request = url.into_client_request().unwrap();
+        let (mut ws, _) = connect_async(request)
+            .await
+            .expect("WebSocket connect must succeed");
+
+        let payload = b"hello from websocket";
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+            payload.to_vec().into(),
+        ))
+        .await
+        .expect("send must succeed");
+
+        // The echo handler must reply within 2 seconds.
+        // Without with_upgrades(), the handler never runs and this times out.
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect(
+                "WebSocket reply must arrive within 2s — if it times out, \
+                 with_upgrades() is missing from serve_connection() and the \
+                 on_upgrade callback never runs",
+            )
+            .expect("stream must not end without a reply")
+            .expect("WebSocket recv must not error");
+
+        match reply {
+            tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                assert_eq!(
+                    b.as_ref(),
+                    payload,
+                    "echoed bytes must match sent bytes — \
+                     a mismatch means the upgrade handler ran but data was corrupted"
+                );
+            }
+            other => {
+                panic!(
+                    "expected Binary frame with echo, got {other:?} — \
+                     the WebSocket upgrade handler must echo the sent message"
+                );
+            }
+        }
     }
 }
