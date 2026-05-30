@@ -8,6 +8,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use u7s_store::{ListOptions, Store, StoreError};
 
+use crate::handlers::json_patch::{apply_json_patch, detect_patch_type, PatchType};
 use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
@@ -475,6 +476,75 @@ pub async fn delete_crd<S: Store>(
     })))
 }
 
+pub async fn patch_crd<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let patch_type = detect_patch_type(&headers)?;
+
+    let key = store_key(&name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, KIND))?;
+
+    let mut current: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::unprocessable_entity(format!("invalid patch: {e}")))?;
+
+    match patch_type {
+        PatchType::Merge | PatchType::StrategicMerge => {
+            crate::patch::merge_patch(&mut current, &patch);
+        }
+        PatchType::Json => {
+            apply_json_patch(&mut current, &patch)?;
+        }
+    }
+
+    // Validate that the patched value is still a valid CRD shape.
+    let mut crd: CustomResourceDefinition = serde_json::from_value(current).map_err(|e| {
+        Status::unprocessable_entity(format!(
+            "patched object is not a valid CustomResourceDefinition: {e}"
+        ))
+    })?;
+
+    // Preserve server-assigned type meta.
+    crd.api_version = API_VERSION.to_string();
+    crd.kind = KIND.to_string();
+
+    // Admission webhook pipeline (mutating then validating).
+    {
+        let admission_ctx = AdmissionContext {
+            group: "apiextensions.k8s.io",
+            version: "v1",
+            resource: "customresourcedefinitions",
+            name: &name,
+            namespace: None,
+            operation: "UPDATE",
+        };
+        let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
+        let mutated = run_mutating_webhooks(&state, obj_val, &admission_ctx).await?;
+        run_validating_webhooks(&state, &mutated, &admission_ctx).await?;
+        crd = serde_json::from_value(mutated)
+            .map_err(|e| Status::internal(format!("admission mutated CRD is invalid: {e}")))?;
+    }
+
+    let rv = state
+        .store
+        .put(&key, to_bytes(&crd)?, None)
+        .await
+        .map_err(|e| store_err_crd(e, &name))?;
+
+    crd.metadata.resource_version = rv.to_string();
+    Ok(Json(crd))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -840,6 +910,125 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("chunked"),
             "watch response must use chunked transfer encoding"
+        );
+    }
+
+    // -- patch_crd: merge-patch support for schema defaults --
+
+    /// PATCH /apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name} must apply a
+    /// merge patch and return 200 with the updated CRD.
+    ///
+    /// The conformance test "custom resource defaulting for requests and from storage works"
+    /// patches a CRD to set x-kubernetes-default in its schema.  Before this fix the server
+    /// returned 405 Method Not Allowed because no PATCH handler was registered, causing the
+    /// test to fail with "the server does not allow this method on the requested resource".
+    #[tokio::test]
+    async fn patch_crd_merge_patch_adds_schema_default() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let name = "applications.argoproj.io";
+
+        // Create CRD first.
+        create_crd(
+            State(state.clone()),
+            HeaderMap::new(),
+            minimal_crd_bytes(name),
+        )
+        .await
+        .expect("create must succeed");
+
+        // Build a merge patch that sets a schema default inside spec.versions[0].schema.
+        let patch = serde_json::json!({
+            "spec": {
+                "versions": [{
+                    "name": "v1alpha1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "properties": {
+                                        "a": {
+                                            "type": "string",
+                                            "default": "A"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let result = patch_crd(
+            State(state.clone()),
+            Path(name.to_string()),
+            headers,
+            patch_bytes,
+        )
+        .await
+        .expect("PATCH must succeed — 405 Method Not Allowed means the route is missing")
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            StatusCode::OK,
+            "PATCH CRD must return 200 OK — conformance test patches schema defaults and expects 200"
+        );
+
+        // Verify the default is present in the response body.
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["a"]["default"],
+            "A",
+            "patched schema default must be present in the response — this is what the conformance \
+             test reads after patching the CRD"
+        );
+    }
+
+    /// PATCH on a missing CRD must return 404, not 500.
+    #[tokio::test]
+    async fn patch_crd_missing_returns_404() {
+        let patch = serde_json::json!({"spec": {}});
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let state = make_state();
+        let err = match patch_crd(
+            State(state),
+            Path("missing.example.com".to_string()),
+            headers,
+            patch_bytes,
+        )
+        .await
+        {
+            Ok(_) => panic!("expected 404 error"),
+            Err(e) => e,
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 404,
+            "PATCH on missing CRD must return 404 NotFound"
         );
     }
 
