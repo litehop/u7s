@@ -571,6 +571,13 @@ pub(crate) async fn do_patch<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    // Capture spec before patch for generation tracking on workload resources.
+    let spec_before_patch = if super::defaults::is_workload_resource(group, plural) {
+        Some(current.body["spec"].clone())
+    } else {
+        None
+    };
+
     let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
@@ -599,6 +606,13 @@ pub(crate) async fn do_patch<S: Store>(
     super::defaults::apply_defaults(group, plural, &mut current.body);
     super::defaults::validate_resource(group, plural, &current.body)
         .map_err(Status::unprocessable_entity)?;
+
+    if let Some(ref spec_before) = spec_before_patch {
+        super::defaults::increment_workload_generation_if_spec_changed(
+            &mut current.body,
+            spec_before,
+        );
+    }
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
     let current_meta: ObjectMeta =
@@ -1036,6 +1050,24 @@ pub async fn replace_namespaced_resource<S: Store>(
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
+    let key = group_object_key(&group, &plural, Some(&ns), &name);
+
+    // Capture spec before defaults/admission so we can increment generation on change.
+    let spec_before_replace = if super::defaults::is_workload_resource(&group, &plural) {
+        state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .and_then(|stored| {
+                serde_json::from_slice::<serde_json::Value>(&stored.value)
+                    .ok()
+                    .map(|v| v["spec"].clone())
+            })
+    } else {
+        None
+    };
+
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -1052,7 +1084,10 @@ pub async fn replace_namespaced_resource<S: Store>(
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
-    let key = group_object_key(&group, &plural, Some(&ns), &name);
+    if let Some(ref spec_before) = spec_before_replace {
+        super::defaults::increment_workload_generation_if_spec_changed(&mut obj.body, spec_before);
+    }
+
     let new_rv = state
         .store
         .put(&key, obj.to_bytes(), expected_revision)
