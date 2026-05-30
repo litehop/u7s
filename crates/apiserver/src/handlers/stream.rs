@@ -64,7 +64,12 @@ impl BiStreamReader for AxumWsReader {
                 Ok(axum::extract::ws::Message::Text(t)) => {
                     return Some(bytes::Bytes::copy_from_slice(t.as_bytes()))
                 }
-                Ok(_) => continue,
+                // Axum's WebSocket layer handles Ping/Pong automatically at the
+                // transport level regardless of split() — these are safe to skip.
+                Ok(axum::extract::ws::Message::Ping(_)) => continue,
+                Ok(axum::extract::ws::Message::Pong(_)) => continue,
+                // Close frame signals the peer has finished — terminate recv cleanly.
+                Ok(axum::extract::ws::Message::Close(_)) => return None,
                 Err(_) => return None,
             }
         }
@@ -128,7 +133,18 @@ where
             match self.0.next().await? {
                 Ok(Message::Binary(b)) => return Some(bytes::Bytes::from(b.to_vec())),
                 Ok(Message::Text(t)) => return Some(bytes::Bytes::copy_from_slice(t.as_bytes())),
-                Ok(_) => continue,
+                // After split(), tungstenite does NOT auto-respond to Pings — the
+                // sink is in a separate struct (TungsteniteWsWriter) with no channel
+                // back here. We accept dropped pings for now (Option A). The kubelet
+                // tolerates a few missed pings before closing; exec sessions are
+                // short-lived enough that this is safe.
+                Ok(Message::Ping(_)) => continue,
+                Ok(Message::Pong(_)) => continue,
+                // Close frame signals the peer has finished — return None so the
+                // splice loop terminates instead of blocking forever on the next recv.
+                Ok(Message::Close(_)) => return None,
+                // Raw frames are internal tungstenite detail; skip them.
+                Ok(Message::Frame(_)) => continue,
                 Err(_) => return None,
             }
         }
@@ -477,6 +493,109 @@ mod tests {
             vec![Bytes::from("a"), Bytes::from("b")],
             "send() must append messages to the outgoing buffer in order"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TungsteniteWsReader::recv — Close frame regression tests
+    // -----------------------------------------------------------------------
+    //
+    // These tests use an in-memory WebSocket pair (tokio::io::duplex) so that
+    // the real TungsteniteWsReader code runs with real tungstenite messages.
+    // They MUST fail if Ok(Message::Close(_)) is changed back to Ok(_) =>
+    // continue, because recv() would then loop forever instead of returning None.
+
+    /// Create an in-memory WebSocket pair using tokio::io::duplex.
+    ///
+    /// Returns (server_ws, client_ws) where server_ws is the accepting side
+    /// and client_ws is the connecting side.
+    async fn make_ws_pair() -> (
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (server_io, client_io) = tokio::io::duplex(65536);
+        let server_fut = tokio_tungstenite::accept_async(server_io);
+        let client_fut = tokio_tungstenite::client_async(
+            "ws://localhost/".into_client_request().unwrap(),
+            client_io,
+        );
+        let (server_result, client_result) = tokio::join!(server_fut, client_fut);
+        (server_result.unwrap(), client_result.unwrap().0)
+    }
+
+    /// TungsteniteWsReader::recv must return None when a Close frame arrives.
+    ///
+    /// Without this fix, Ok(Message::Close(_)) was matched by Ok(_) => continue,
+    /// causing recv() to loop forever. This causes exec sessions to hang until
+    /// they time out with "unexpected output from server".
+    ///
+    /// This test fails if Close handling is reverted to Ok(_) => continue
+    /// because recv() would block inside the test until the timeout fires.
+    #[tokio::test]
+    async fn tungstenite_recv_returns_none_on_close_frame() {
+        use futures_util::SinkExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (mut server_ws, client_ws) = make_ws_pair().await;
+
+        let ws = TungsteniteWs(client_ws);
+        let (mut reader, _writer) = ws.split();
+
+        // Server sends a Close frame — client's recv() must return None.
+        let send_close = tokio::spawn(async move {
+            server_ws.send(Message::Close(None)).await.ok();
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), reader.recv())
+            .await
+            .expect(
+                "recv() must return None on Close frame within 2 seconds — \
+             if it times out, Close is still being swallowed by Ok(_) => continue",
+            );
+
+        assert_eq!(
+            result, None,
+            "recv() must return None when a Close frame is received — \
+             returning Some would corrupt the splice loop's shutdown logic"
+        );
+
+        let _ = send_close.await;
+    }
+
+    /// TungsteniteWsReader::recv must return data frames when the connection is healthy.
+    ///
+    /// Guards that Binary frame handling remains intact — a regression here would
+    /// break all exec and port-forward data transfer.
+    #[tokio::test]
+    async fn tungstenite_recv_returns_data_on_binary_frame() {
+        use futures_util::SinkExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (mut server_ws, client_ws) = make_ws_pair().await;
+
+        let ws = TungsteniteWs(client_ws);
+        let (mut reader, _writer) = ws.split();
+
+        // Server sends a Binary frame — client recv() must return its payload.
+        let send = tokio::spawn(async move {
+            server_ws
+                .send(Message::Binary(b"hello"[..].to_vec().into()))
+                .await
+                .ok();
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), reader.recv())
+            .await
+            .expect("recv() must return Some(data) for a Binary frame");
+
+        assert_eq!(
+            result,
+            Some(bytes::Bytes::from("hello")),
+            "recv() must return the Binary frame payload — \
+             if None is returned, exec/port-forward data would be silently dropped"
+        );
+
+        let _ = send.await;
     }
 
     /// Regression: splice must not deadlock when one direction has many more
