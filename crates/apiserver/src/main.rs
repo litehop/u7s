@@ -114,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(SqliteStore::new(&args.db)?);
     seed_namespaces(&store).await?;
     seed_rbac(&store).await?;
+    seed_flowcontrol(&store).await?;
     seed_services(&store).await?;
     seed_serviceaccounts(&store).await?;
     seed_coredns(&store).await?;
@@ -866,6 +867,570 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seed the default API Priority and Fairness resources.
+///
+/// A real kube-apiserver seeds these via its `priority-and-fairness-config-consumer`
+/// post-start hook. We don't have that hook, so we seed them at startup instead.
+/// Without these defaults, the APF conformance test times out waiting for the state
+/// to converge (FlowSchema .status.conditions[Ready] never becomes True without the
+/// PriorityLevelConfiguration it references existing).
+async fn seed_flowcontrol(store: &SqliteStore) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    const GROUP: &str = "flowcontrol.apiserver.k8s.io";
+    const TS: &str = "2024-01-01T00:00:00Z";
+
+    // Seed 8 default PriorityLevelConfigurations.
+    // Uses unconditional put (None version) so the canonical values are
+    // always written on startup, just like seed_rbac does for ClusterRoles.
+
+    // exempt — system:masters requests bypass all queuing
+    let key = keys::group_object_key(GROUP, "prioritylevelconfigurations", None, "exempt");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": { "name": "exempt", "uid": "00000000-0000-0000-0000-000000000100",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": { "type": "Exempt", "exempt": {} },
+        "status": { "conditions": [{ "type": "Ready", "status": "True",
+                                      "lastTransitionTime": TS,
+                                      "reason": "Found",
+                                      "message": "This PriorityLevelConfiguration is ensured." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed PriorityLevelConfiguration exempt: {e}"))?;
+    tracing::info!("seeded PriorityLevelConfiguration: exempt");
+
+    // catch-all — last-resort bucket for unclassified requests
+    let key = keys::group_object_key(GROUP, "prioritylevelconfigurations", None, "catch-all");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": { "name": "catch-all", "uid": "00000000-0000-0000-0000-000000000101",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": { "type": "Limited", "limited": {
+            "nominalConcurrencyShares": 5,
+            "limitResponse": { "type": "Queue",
+                "queuing": { "queues": 128, "handSize": 6, "queueLengthLimit": 50 } }
+        } },
+        "status": { "conditions": [{ "type": "Ready", "status": "True",
+                                      "lastTransitionTime": TS,
+                                      "reason": "Found",
+                                      "message": "This PriorityLevelConfiguration is ensured." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed PriorityLevelConfiguration catch-all: {e}"))?;
+    tracing::info!("seeded PriorityLevelConfiguration: catch-all");
+
+    // system — for kube-system service accounts
+    let key = keys::group_object_key(GROUP, "prioritylevelconfigurations", None, "system");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": { "name": "system", "uid": "00000000-0000-0000-0000-000000000102",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": { "type": "Limited", "limited": {
+            "nominalConcurrencyShares": 30,
+            "limitResponse": { "type": "Queue",
+                "queuing": { "queues": 64, "handSize": 6, "queueLengthLimit": 50 } }
+        } },
+        "status": { "conditions": [{ "type": "Ready", "status": "True",
+                                      "lastTransitionTime": TS,
+                                      "reason": "Found",
+                                      "message": "This PriorityLevelConfiguration is ensured." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed PriorityLevelConfiguration system: {e}"))?;
+    tracing::info!("seeded PriorityLevelConfiguration: system");
+
+    // leader-election — for controller leader elections
+    let key = keys::group_object_key(
+        GROUP,
+        "prioritylevelconfigurations",
+        None,
+        "leader-election",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": { "name": "leader-election", "uid": "00000000-0000-0000-0000-000000000103",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": { "type": "Limited", "limited": {
+            "nominalConcurrencyShares": 10,
+            "limitResponse": { "type": "Queue",
+                "queuing": { "queues": 16, "handSize": 4, "queueLengthLimit": 50 } }
+        } },
+        "status": { "conditions": [{ "type": "Ready", "status": "True",
+                                      "lastTransitionTime": TS,
+                                      "reason": "Found",
+                                      "message": "This PriorityLevelConfiguration is ensured." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed PriorityLevelConfiguration leader-election: {e}"))?;
+    tracing::info!("seeded PriorityLevelConfiguration: leader-election");
+
+    // workload-high — for high-priority workload controllers
+    let key = keys::group_object_key(GROUP, "prioritylevelconfigurations", None, "workload-high");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": { "name": "workload-high", "uid": "00000000-0000-0000-0000-000000000104",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": { "type": "Limited", "limited": {
+            "nominalConcurrencyShares": 40,
+            "limitResponse": { "type": "Queue",
+                "queuing": { "queues": 128, "handSize": 6, "queueLengthLimit": 50 } }
+        } },
+        "status": { "conditions": [{ "type": "Ready", "status": "True",
+                                      "lastTransitionTime": TS,
+                                      "reason": "Found",
+                                      "message": "This PriorityLevelConfiguration is ensured." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed PriorityLevelConfiguration workload-high: {e}"))?;
+    tracing::info!("seeded PriorityLevelConfiguration: workload-high");
+
+    // workload-low — for low-priority workload controllers
+    let key = keys::group_object_key(GROUP, "prioritylevelconfigurations", None, "workload-low");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": { "name": "workload-low", "uid": "00000000-0000-0000-0000-000000000105",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": { "type": "Limited", "limited": {
+            "nominalConcurrencyShares": 100,
+            "limitResponse": { "type": "Queue",
+                "queuing": { "queues": 128, "handSize": 6, "queueLengthLimit": 50 } }
+        } },
+        "status": { "conditions": [{ "type": "Ready", "status": "True",
+                                      "lastTransitionTime": TS,
+                                      "reason": "Found",
+                                      "message": "This PriorityLevelConfiguration is ensured." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed PriorityLevelConfiguration workload-low: {e}"))?;
+    tracing::info!("seeded PriorityLevelConfiguration: workload-low");
+
+    // global-default — catch-most bucket for authenticated requests
+    let key = keys::group_object_key(GROUP, "prioritylevelconfigurations", None, "global-default");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": { "name": "global-default", "uid": "00000000-0000-0000-0000-000000000106",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": { "type": "Limited", "limited": {
+            "nominalConcurrencyShares": 20,
+            "limitResponse": { "type": "Queue",
+                "queuing": { "queues": 128, "handSize": 6, "queueLengthLimit": 50 } }
+        } },
+        "status": { "conditions": [{ "type": "Ready", "status": "True",
+                                      "lastTransitionTime": TS,
+                                      "reason": "Found",
+                                      "message": "This PriorityLevelConfiguration is ensured." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed PriorityLevelConfiguration global-default: {e}"))?;
+    tracing::info!("seeded PriorityLevelConfiguration: global-default");
+
+    // node-high — for node-critical requests (node status, kubelet heartbeat)
+    let key = keys::group_object_key(GROUP, "prioritylevelconfigurations", None, "node-high");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": { "name": "node-high", "uid": "00000000-0000-0000-0000-000000000107",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": { "type": "Limited", "limited": {
+            "nominalConcurrencyShares": 40,
+            "limitResponse": { "type": "Queue",
+                "queuing": { "queues": 64, "handSize": 6, "queueLengthLimit": 50 } }
+        } },
+        "status": { "conditions": [{ "type": "Ready", "status": "True",
+                                      "lastTransitionTime": TS,
+                                      "reason": "Found",
+                                      "message": "This PriorityLevelConfiguration is ensured." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed PriorityLevelConfiguration node-high: {e}"))?;
+    tracing::info!("seeded PriorityLevelConfiguration: node-high");
+
+    // Seed 13 default FlowSchemas.
+    // Each references a PriorityLevelConfiguration by name.
+
+    // exempt — for system:masters; no queuing at all
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "exempt");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "exempt", "uid": "00000000-0000-0000-0000-000000000200",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 1,
+            "priorityLevelConfiguration": { "name": "exempt" },
+            "rules": [{ "subjects": [{ "kind": "Group", "group": { "name": "system:masters" } }],
+                        "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"] }],
+                        "nonResourceRules": [{ "verbs": ["*"], "nonResourceURLs": ["*"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema exempt: {e}"))?;
+    tracing::info!("seeded FlowSchema: exempt");
+
+    // probes — for unauthenticated health check probes
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "probes");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "probes", "uid": "00000000-0000-0000-0000-000000000201",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 2,
+            "priorityLevelConfiguration": { "name": "exempt" },
+            "rules": [{ "subjects": [{ "kind": "Group", "group": { "name": "system:unauthenticated" } }],
+                        "nonResourceRules": [{ "verbs": ["get"],
+                                               "nonResourceURLs": ["/healthz", "/readyz", "/livez"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema probes: {e}"))?;
+    tracing::info!("seeded FlowSchema: probes");
+
+    // system-leader-election — for kcm/scheduler leader elections
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "system-leader-election");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "system-leader-election", "uid": "00000000-0000-0000-0000-000000000202",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 100,
+            "priorityLevelConfiguration": { "name": "leader-election" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "ServiceAccount",
+                                       "serviceAccount": { "name": "*", "namespace": "kube-system" } }],
+                        "resourceRules": [{ "verbs": ["get", "create", "update"],
+                                            "apiGroups": ["coordination.k8s.io"],
+                                            "resources": ["leases"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema system-leader-election: {e}"))?;
+    tracing::info!("seeded FlowSchema: system-leader-election");
+
+    // endpoint-controller — endpoints/endpointslice controllers
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "endpoint-controller");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "endpoint-controller", "uid": "00000000-0000-0000-0000-000000000203",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 150,
+            "priorityLevelConfiguration": { "name": "workload-high" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [
+                            { "kind": "ServiceAccount", "serviceAccount": { "name": "endpoint-controller", "namespace": "kube-system" } },
+                            { "kind": "ServiceAccount", "serviceAccount": { "name": "endpointslice-controller", "namespace": "kube-system" } },
+                            { "kind": "ServiceAccount", "serviceAccount": { "name": "endpointslicemirroring-controller", "namespace": "kube-system" } }
+                        ],
+                        "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema endpoint-controller: {e}"))?;
+    tracing::info!("seeded FlowSchema: endpoint-controller");
+
+    // workload-leader-election — for workload-level leader elections
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "workload-leader-election");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "workload-leader-election", "uid": "00000000-0000-0000-0000-000000000204",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 200,
+            "priorityLevelConfiguration": { "name": "leader-election" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "ServiceAccount",
+                                       "serviceAccount": { "name": "*", "namespace": "kube-system" } }],
+                        "resourceRules": [{ "verbs": ["get", "create", "update"],
+                                            "apiGroups": ["coordination.k8s.io"],
+                                            "resources": ["leases"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema workload-leader-election: {e}"))?;
+    tracing::info!("seeded FlowSchema: workload-leader-election");
+
+    // system-node-high — high-priority node requests (heartbeat, status updates)
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "system-node-high");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "system-node-high", "uid": "00000000-0000-0000-0000-000000000205",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 400,
+            "priorityLevelConfiguration": { "name": "node-high" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "Group", "group": { "name": "system:nodes" } }],
+                        "resourceRules": [
+                            { "verbs": ["get", "create", "update", "patch"],
+                              "apiGroups": [""], "resources": ["nodes", "nodes/status"] },
+                            { "verbs": ["get", "create", "update", "patch"],
+                              "apiGroups": ["coordination.k8s.io"], "resources": ["leases"] }
+                        ] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema system-node-high: {e}"))?;
+    tracing::info!("seeded FlowSchema: system-node-high");
+
+    // system-nodes — general node requests
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "system-nodes");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "system-nodes", "uid": "00000000-0000-0000-0000-000000000206",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 500,
+            "priorityLevelConfiguration": { "name": "system" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "Group", "group": { "name": "system:nodes" } }],
+                        "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema system-nodes: {e}"))?;
+    tracing::info!("seeded FlowSchema: system-nodes");
+
+    // kube-controller-manager — KCM requests
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "kube-controller-manager");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "kube-controller-manager", "uid": "00000000-0000-0000-0000-000000000207",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 800,
+            "priorityLevelConfiguration": { "name": "workload-high" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "User", "user": { "name": "system:kube-controller-manager" } }],
+                        "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"] }],
+                        "nonResourceRules": [{ "verbs": ["*"], "nonResourceURLs": ["*"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema kube-controller-manager: {e}"))?;
+    tracing::info!("seeded FlowSchema: kube-controller-manager");
+
+    // kube-scheduler — scheduler requests
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "kube-scheduler");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "kube-scheduler", "uid": "00000000-0000-0000-0000-000000000208",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 800,
+            "priorityLevelConfiguration": { "name": "workload-high" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "User", "user": { "name": "system:kube-scheduler" } }],
+                        "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"] }],
+                        "nonResourceRules": [{ "verbs": ["*"], "nonResourceURLs": ["*"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema kube-scheduler: {e}"))?;
+    tracing::info!("seeded FlowSchema: kube-scheduler");
+
+    // kube-system-service-accounts — all service accounts in kube-system
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "kube-system-service-accounts");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "kube-system-service-accounts", "uid": "00000000-0000-0000-0000-000000000209",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 900,
+            "priorityLevelConfiguration": { "name": "workload-high" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "ServiceAccount",
+                                       "serviceAccount": { "name": "*", "namespace": "kube-system" } }],
+                        "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"] }],
+                        "nonResourceRules": [{ "verbs": ["*"], "nonResourceURLs": ["*"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema kube-system-service-accounts: {e}"))?;
+    tracing::info!("seeded FlowSchema: kube-system-service-accounts");
+
+    // service-accounts — all service accounts in all namespaces
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "service-accounts");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "service-accounts", "uid": "00000000-0000-0000-0000-000000000210",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 9000,
+            "priorityLevelConfiguration": { "name": "workload-low" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "Group", "group": { "name": "system:serviceaccounts" } }],
+                        "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"] }],
+                        "nonResourceRules": [{ "verbs": ["*"], "nonResourceURLs": ["*"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema service-accounts: {e}"))?;
+    tracing::info!("seeded FlowSchema: service-accounts");
+
+    // global-default — catch-most for authenticated users
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "global-default");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "global-default", "uid": "00000000-0000-0000-0000-000000000211",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 9900,
+            "priorityLevelConfiguration": { "name": "global-default" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "Group", "group": { "name": "system:authenticated" } }],
+                        "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"] }],
+                        "nonResourceRules": [{ "verbs": ["*"], "nonResourceURLs": ["*"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema global-default: {e}"))?;
+    tracing::info!("seeded FlowSchema: global-default");
+
+    // catch-all — last resort for unauthenticated or unmatched requests
+    let key = keys::group_object_key(GROUP, "flowschemas", None, "catch-all");
+    let body = serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": { "name": "catch-all", "uid": "00000000-0000-0000-0000-000000000212",
+                       "creationTimestamp": TS,
+                       "annotations": { "apf.kubernetes.io/autoupdate-spec": "true" } },
+        "spec": {
+            "matchingPrecedence": 10000,
+            "priorityLevelConfiguration": { "name": "catch-all" },
+            "distinguisherMethod": { "type": "ByUser" },
+            "rules": [{ "subjects": [{ "kind": "Group", "group": { "name": "system:unauthenticated" } }],
+                        "resourceRules": [{ "verbs": ["*"], "apiGroups": ["*"], "resources": ["*"] }],
+                        "nonResourceRules": [{ "verbs": ["*"], "nonResourceURLs": ["*"] }] }]
+        },
+        "status": { "conditions": [{ "type": "Dangling", "status": "False",
+                                      "lastTransitionTime": TS, "reason": "Found",
+                                      "message": "This FlowSchema references a valid PriorityLevelConfiguration." }] }
+    });
+    store
+        .put(&key, Bytes::from(body.to_string()), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed FlowSchema catch-all: {e}"))?;
+    tracing::info!("seeded FlowSchema: catch-all");
+
+    Ok(())
+}
+
 async fn serve_tls(
     listener: TcpListener,
     app: Router,
@@ -1117,6 +1682,111 @@ mod tests {
         let store = make_store();
         seed_rbac(&store).await.expect("first seed must not fail");
         seed_rbac(&store).await.expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn seed_flowcontrol_creates_required_default_objects() {
+        // The APF conformance test expects default FlowSchemas and PriorityLevelConfigurations
+        // to exist on startup. Without them the test times out waiting for FlowSchema status
+        // conditions to converge (they reference PLCs that must exist).
+        const GROUP: &str = "flowcontrol.apiserver.k8s.io";
+
+        let store = make_store();
+        seed_flowcontrol(&store).await.expect("seed must not fail");
+
+        // All 8 default PriorityLevelConfigurations must exist.
+        for name in [
+            "exempt",
+            "catch-all",
+            "system",
+            "leader-election",
+            "workload-high",
+            "workload-low",
+            "global-default",
+            "node-high",
+        ] {
+            let key = keys::group_object_key(GROUP, "prioritylevelconfigurations", None, name);
+            let obj = store.get(&key).await.expect("get must not fail");
+            assert!(
+                obj.is_some(),
+                "PriorityLevelConfiguration '{name}' must exist — APF FlowSchemas reference it"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&obj.unwrap().value).expect("valid json");
+            assert_eq!(
+                parsed["kind"].as_str(),
+                Some("PriorityLevelConfiguration"),
+                "PriorityLevelConfiguration '{name}' must have correct kind"
+            );
+            assert_eq!(
+                parsed["metadata"]["name"].as_str(),
+                Some(name),
+                "PriorityLevelConfiguration must have correct name"
+            );
+        }
+
+        // All 13 default FlowSchemas must exist.
+        for name in [
+            "exempt",
+            "probes",
+            "system-leader-election",
+            "endpoint-controller",
+            "workload-leader-election",
+            "system-node-high",
+            "system-nodes",
+            "kube-controller-manager",
+            "kube-scheduler",
+            "kube-system-service-accounts",
+            "service-accounts",
+            "global-default",
+            "catch-all",
+        ] {
+            let key = keys::group_object_key(GROUP, "flowschemas", None, name);
+            let obj = store.get(&key).await.expect("get must not fail");
+            assert!(
+                obj.is_some(),
+                "FlowSchema '{name}' must exist — APF conformance test lists and checks these"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&obj.unwrap().value).expect("valid json");
+            assert_eq!(
+                parsed["kind"].as_str(),
+                Some("FlowSchema"),
+                "FlowSchema '{name}' must have correct kind"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_flowcontrol_exempt_plc_has_correct_type() {
+        // The 'exempt' PriorityLevelConfiguration must have type=Exempt (not Limited).
+        // system:masters requests must bypass all queuing; if type=Limited they get queued
+        // and the apiserver may deadlock during bootstrap when it needs its own RBAC calls.
+        const GROUP: &str = "flowcontrol.apiserver.k8s.io";
+
+        let store = make_store();
+        seed_flowcontrol(&store).await.expect("seed must not fail");
+
+        let key = keys::group_object_key(GROUP, "prioritylevelconfigurations", None, "exempt");
+        let obj = store.get(&key).await.expect("get must not fail").unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&obj.value).expect("valid json");
+        assert_eq!(
+            parsed["spec"]["type"].as_str(),
+            Some("Exempt"),
+            "exempt PriorityLevelConfiguration must have type=Exempt so system:masters requests bypass queuing"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_flowcontrol_is_idempotent() {
+        // Unconditional puts must not fail on a second call.
+        let store = make_store();
+        seed_flowcontrol(&store)
+            .await
+            .expect("first seed must not fail");
+        seed_flowcontrol(&store)
+            .await
+            .expect("second seed must not fail");
     }
 
     #[tokio::test]
