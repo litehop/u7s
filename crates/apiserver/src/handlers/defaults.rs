@@ -28,6 +28,58 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "persistentvolumeclaims") = (group, plural) {
         default_pvc(obj);
     }
+
+    if is_workload_resource(group, plural) {
+        initialize_workload_generation(obj);
+    }
+}
+
+/// Returns true when the group/plural pair is a workload resource that KCM
+/// reconciles via metadata.generation.
+///
+/// Used to gate generation initialisation and increment so we don't accidentally
+/// set generation on non-workload resources (e.g. Services) where it's unused.
+pub fn is_workload_resource(group: &str, plural: &str) -> bool {
+    matches!(
+        (group, plural),
+        ("apps", "deployments")
+            | ("apps", "replicasets")
+            | ("apps", "statefulsets")
+            | ("apps", "daemonsets")
+            | ("batch", "jobs")
+            | ("batch", "cronjobs")
+    )
+}
+
+/// Set `metadata.generation = 1` on a newly created workload object if absent or null.
+///
+/// KCM's deployment controller reads metadata.generation to decide whether to
+/// reconcile: if generation is null the controller skips the object entirely,
+/// meaning no ReplicaSet is ever created and no pods are ever scheduled.
+///
+/// Called from apply_defaults so it runs at both create and update time.
+/// The idempotency check (`is_null`) means:
+///   • create: generation is absent → set to 1
+///   • update: generation already ≥ 1 → leave unchanged (increment is separate)
+pub fn initialize_workload_generation(obj: &mut serde_json::Value) {
+    if obj["metadata"]["generation"].is_null() {
+        obj["metadata"]["generation"] = serde_json::json!(1i64);
+    }
+}
+
+/// Increment `metadata.generation` by 1 when the workload spec has changed.
+///
+/// Called after PUT and PATCH operations on workload resources. KCM tracks
+/// observedGeneration vs generation to detect pending changes; without this
+/// increment the controller can't tell that a spec update hasn't been reconciled.
+pub fn increment_workload_generation_if_spec_changed(
+    obj: &mut serde_json::Value,
+    spec_before: &serde_json::Value,
+) {
+    if obj["spec"] != *spec_before {
+        let current = obj["metadata"]["generation"].as_i64().unwrap_or(1);
+        obj["metadata"]["generation"] = serde_json::json!(current + 1);
+    }
 }
 
 /// Set status.phase to "Pending" for a newly created PersistentVolumeClaim.
@@ -1508,6 +1560,169 @@ mod tests {
         assert_eq!(
             obj["spec"]["type"], "ExternalName",
             "spec.type=ExternalName must not be overwritten to ClusterIP"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: workload metadata.generation initialisation (mayor-u0vp)
+    // ---------------------------------------------------------------------------
+
+    /// A newly created Deployment must have metadata.generation=1 set by apply_defaults.
+    ///
+    /// KCM's deployment controller reads metadata.generation to decide whether to
+    /// reconcile. If generation is null the controller skips the Deployment entirely,
+    /// meaning no ReplicaSet is ever created and no pods are ever scheduled.
+    /// Removing the initialize_workload_generation call from apply_defaults must make
+    /// this test fail, proving it is a true regression guard.
+    #[test]
+    fn deployment_create_sets_generation_1() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test-dep", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {
+                    "metadata": { "labels": { "app": "test" } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 1,
+            "metadata.generation must be 1 on create — KCM skips Deployments with null generation, \
+             causing ReplicaSets and pods to never be created"
+        );
+    }
+
+    /// metadata.generation must not be overwritten when already set on a Deployment.
+    ///
+    /// apply_defaults runs at both create and update time. A Deployment that already
+    /// has generation=3 (after spec changes) must not be reset to 1 on each defaults pass.
+    #[test]
+    fn deployment_existing_generation_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test-dep", "namespace": "default", "generation": 3 },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {
+                    "metadata": { "labels": { "app": "test" } },
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 3,
+            "existing metadata.generation must not be overwritten — resetting a running \
+             Deployment's generation would confuse KCM's observedGeneration tracking"
+        );
+    }
+
+    /// StatefulSet, ReplicaSet, DaemonSet, Job, and CronJob must also get generation=1.
+    ///
+    /// All workload resources managed by KCM use generation for reconciliation gating.
+    /// Missing generation on any of these causes the same skip-reconcile bug as Deployments.
+    #[test]
+    fn all_workload_kinds_get_generation_1() {
+        let cases = [
+            ("apps", "statefulsets"),
+            ("apps", "replicasets"),
+            ("apps", "daemonsets"),
+            ("batch", "jobs"),
+            ("batch", "cronjobs"),
+        ];
+
+        for (group, plural) in cases {
+            let mut obj = serde_json::json!({
+                "metadata": { "name": "test", "namespace": "default" },
+                "spec": {}
+            });
+
+            apply_defaults(group, plural, &mut obj);
+
+            assert_eq!(
+                obj["metadata"]["generation"], 1,
+                "metadata.generation must be 1 after apply_defaults for {group}/{plural} — \
+                 KCM skips workload resources with null generation"
+            );
+        }
+    }
+
+    /// Non-workload resources must NOT have metadata.generation set by apply_defaults.
+    ///
+    /// Generation is a workload-controller concept; setting it on Services or PVCs
+    /// would be a spurious field that could confuse controllers.
+    #[test]
+    fn non_workload_resources_do_not_get_generation() {
+        let cases = [
+            ("", "services"),
+            ("", "persistentvolumeclaims"),
+            ("", "events"),
+        ];
+
+        for (group, plural) in cases {
+            let mut obj = serde_json::json!({
+                "metadata": { "name": "test", "namespace": "default" },
+                "spec": {}
+            });
+
+            apply_defaults(group, plural, &mut obj);
+
+            assert!(
+                obj["metadata"]["generation"].is_null(),
+                "metadata.generation must not be set for {group}/{plural} — \
+                 generation is only meaningful for workload resources reconciled by KCM"
+            );
+        }
+    }
+
+    /// increment_workload_generation_if_spec_changed must bump generation when spec changes.
+    ///
+    /// KCM tracks observedGeneration vs generation to detect spec updates that need
+    /// reconciliation. Without increment, KCM can't tell a spec change happened.
+    #[test]
+    fn workload_generation_incremented_on_spec_change() {
+        let spec_before = serde_json::json!({ "replicas": 1 });
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "test", "generation": 1 },
+            "spec": { "replicas": 3 }
+        });
+
+        increment_workload_generation_if_spec_changed(&mut obj, &spec_before);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 2,
+            "generation must increment from 1 to 2 when spec changes — KCM uses \
+             generation vs observedGeneration to detect pending reconciliation"
+        );
+    }
+
+    /// increment_workload_generation_if_spec_changed must not change generation when spec is unchanged.
+    ///
+    /// A metadata-only patch (e.g. adding a label) must not increment generation.
+    /// Unnecessary increments would cause spurious KCM reconcile loops.
+    #[test]
+    fn workload_generation_not_incremented_on_unchanged_spec() {
+        let spec = serde_json::json!({ "replicas": 1 });
+        let mut obj = serde_json::json!({
+            "metadata": { "name": "test", "generation": 1 },
+            "spec": { "replicas": 1 }
+        });
+
+        increment_workload_generation_if_spec_changed(&mut obj, &spec);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 1,
+            "generation must not increment when spec is unchanged — spurious increments \
+             cause unnecessary KCM reconcile loops"
         );
     }
 }
