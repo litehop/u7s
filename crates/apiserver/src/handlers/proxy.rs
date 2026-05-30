@@ -22,7 +22,7 @@ use serde::Deserialize;
 use u7s_store::Store;
 
 use crate::{
-    handlers::stream::{splice, AxumWs, TungsteniteWs},
+    handlers::stream::{splice, AxumWs, BiStream, BiStreamReader, BiStreamWriter, TungsteniteWs},
     keys::{cluster_object_key, object_key},
     state::AppState,
     status::Status,
@@ -726,8 +726,40 @@ pub async fn pod_exec<S: Store>(
     Ok(resp)
 }
 
-/// Open outbound WebSocket to kubelet exec endpoint and splice with inbound kubectl WebSocket.
+/// Channel byte values used by the exec subprotocol (v4.channel.k8s.io).
+///
+/// Kubelet sends a status/close message on channel 3 (error channel) when the
+/// command exits. The real kube-apiserver absorbs this frame and never forwards
+/// it to kubectl. We must do the same: the conformance test reads the first WS
+/// message and asserts it is channel 1 (stdout); if channel 3 arrives first the
+/// test fails with "Got message from server that didn't start with channel 1".
+///
+/// Channel 4 is the error channel in the v5 subprotocol; also filtered for safety.
+const EXEC_STATUS_CHANNELS: &[u8] = &[3, 4];
+
+/// Is this a kubelet status/close frame that must not be forwarded to kubectl?
+///
+/// Returns true if `data` is non-empty and its first byte is a channel number
+/// that carries only status information (not stdout/stderr data). These frames
+/// are absorbed by the real kube-apiserver and must not reach the kubectl client.
+///
+/// This function is `pub(crate)` so the regression test can call it directly
+/// without going through a real WebSocket connection.
+pub(crate) fn is_exec_status_frame(data: &bytes::Bytes) -> bool {
+    data.first()
+        .is_some_and(|ch| EXEC_STATUS_CHANNELS.contains(ch))
+}
+
+/// Open outbound WebSocket to kubelet exec endpoint and relay to inbound kubectl WebSocket.
+///
+/// Unlike `splice`, this relay filters out kubelet status frames (channel 3/4) in the
+/// kubelet→kubectl direction. Kubelet sends a `{"status":"Success"}` message on channel 3
+/// when the command exits. The real kube-apiserver absorbs this frame; we must do the
+/// same because the conformance test asserts the first received frame is channel 1 (stdout).
+///
+/// The kubectl→kubelet direction is relayed unchanged.
 async fn run_exec_proxy(inbound: WebSocket, target: ExecTarget) -> anyhow::Result<()> {
+    use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
     let connector = tokio_tungstenite::Connector::Rustls(target.tls_config);
@@ -750,8 +782,61 @@ async fn run_exec_proxy(inbound: WebSocket, target: ExecTarget) -> anyhow::Resul
             .await
             .map_err(|e| anyhow::anyhow!("kubelet exec connect failed: {e}"))?;
 
-    // Splice the two WebSocket connections bidirectionally.
-    splice(AxumWs(inbound), TungsteniteWs(outbound_ws)).await;
+    // Split both streams into independent read/write halves.
+    let (mut kubectl_r, mut kubectl_w) = AxumWs(inbound).split();
+    let (mut kubelet_r, mut kubelet_w) = TungsteniteWs(outbound_ws).split();
+
+    let (kubectl_to_kubelet_tx, mut kubectl_to_kubelet_rx) = mpsc::channel::<bytes::Bytes>(256);
+    let (kubelet_to_kubectl_tx, mut kubelet_to_kubectl_rx) = mpsc::channel::<bytes::Bytes>(256);
+
+    // kubectl→kubelet: forward all frames unchanged.
+    let read_kubectl = tokio::spawn(async move {
+        while let Some(data) = kubectl_r.recv().await {
+            if kubectl_to_kubelet_tx.send(data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // kubelet→kubectl: filter out status frames (channel 3/4) before forwarding.
+    let read_kubelet = tokio::spawn(async move {
+        while let Some(data) = kubelet_r.recv().await {
+            if is_exec_status_frame(&data) {
+                // Absorb kubelet status/close frames — do not forward to kubectl.
+                // The real kube-apiserver does the same. Forwarding these causes the
+                // conformance test to fail: "Got message from server that didn't start
+                // with channel 1 (STDOUT)".
+                tracing::debug!(
+                    channel = data.first().copied().unwrap_or(0),
+                    "absorbing kubelet exec status frame (not forwarded to kubectl)"
+                );
+                continue;
+            }
+            if kubelet_to_kubectl_tx.send(data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let write_kubelet = tokio::spawn(async move {
+        while let Some(data) = kubectl_to_kubelet_rx.recv().await {
+            if kubelet_w.send(data).await.is_err() {
+                break;
+            }
+        }
+        kubelet_w.close().await;
+    });
+
+    let write_kubectl = tokio::spawn(async move {
+        while let Some(data) = kubelet_to_kubectl_rx.recv().await {
+            if kubectl_w.send(data).await.is_err() {
+                break;
+            }
+        }
+        kubectl_w.close().await;
+    });
+
+    let _ = tokio::join!(read_kubectl, read_kubelet, write_kubectl, write_kubelet);
     Ok(())
 }
 
@@ -2157,6 +2242,88 @@ mod tests {
             "kubelet_ws_url must embed node IP so connect_async_tls_with_config \
              can dial without a separate node_ip field: {}",
             target.kubelet_ws_url
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // exec proxy: kubelet status frame filtering
+    //
+    // The real kube-apiserver absorbs kubelet status/close frames (channel 3 in
+    // v4.channel.k8s.io, channel 4 in v5) and never forwards them to kubectl.
+    // Without this filter the conformance test fails:
+    //   "Got message from server that didn't start with channel 1 (STDOUT)"
+    // because the status message arrives before the stdout data.
+    // -----------------------------------------------------------------------
+
+    /// is_exec_status_frame must return true for channel 3 (v4 error/status channel).
+    ///
+    /// Kubelet sends {"status":"Success"} on channel 3 when the command exits cleanly.
+    /// If this frame reaches kubectl, the conformance test fails because it expects
+    /// the first frame to be channel 1 (stdout). This test fails if the filter is removed.
+    #[test]
+    fn exec_status_frame_channel_3_is_filtered() {
+        // Channel 3 + {"status":"Success"} — exactly what kubelet sends on exec exit.
+        let frame = bytes::Bytes::from(b"\x03{\"status\":\"Success\"}".to_vec());
+        assert!(
+            is_exec_status_frame(&frame),
+            "channel 3 frame must be filtered out — forwarding it to kubectl causes \
+             the conformance test to fail with 'Got message from server that didn't \
+             start with channel 1 (STDOUT)'"
+        );
+    }
+
+    /// is_exec_status_frame must return true for channel 4 (v5 error channel).
+    ///
+    /// Channel 4 is the error channel in the v5.channel.k8s.io subprotocol.
+    /// Filtering it prevents the same class of test failure when kubelet uses v5.
+    #[test]
+    fn exec_status_frame_channel_4_is_filtered() {
+        let frame = bytes::Bytes::from(b"\x04{\"status\":\"Success\"}".to_vec());
+        assert!(
+            is_exec_status_frame(&frame),
+            "channel 4 frame must be filtered — it is the v5 error channel and must \
+             not reach kubectl"
+        );
+    }
+
+    /// is_exec_status_frame must return false for channel 1 (stdout).
+    ///
+    /// Channel 1 carries the command's stdout output. Filtering it would cause all
+    /// exec output to be silently dropped — kubectl would hang with no response.
+    /// This test fails if the filter accidentally matches stdout frames.
+    #[test]
+    fn exec_status_frame_channel_1_stdout_passes_through() {
+        let frame = bytes::Bytes::from(b"\x01hello\n".to_vec());
+        assert!(
+            !is_exec_status_frame(&frame),
+            "channel 1 (stdout) must NOT be filtered — filtering stdout would cause \
+             all exec output to be silently dropped, hanging kubectl"
+        );
+    }
+
+    /// is_exec_status_frame must return false for channel 2 (stderr).
+    ///
+    /// Channel 2 carries stderr output. Filtering it would discard all error messages
+    /// from the remote command, breaking kubectl exec for commands that write to stderr.
+    #[test]
+    fn exec_status_frame_channel_2_stderr_passes_through() {
+        let frame = bytes::Bytes::from(b"\x02error output\n".to_vec());
+        assert!(
+            !is_exec_status_frame(&frame),
+            "channel 2 (stderr) must NOT be filtered — filtering stderr would discard \
+             all error output from the remote command"
+        );
+    }
+
+    /// is_exec_status_frame must return false for an empty frame.
+    ///
+    /// An empty frame has no channel byte — filtering it would be wrong.
+    #[test]
+    fn exec_status_frame_empty_passes_through() {
+        let frame = bytes::Bytes::new();
+        assert!(
+            !is_exec_status_frame(&frame),
+            "empty frame must not be filtered — there is no channel byte to inspect"
         );
     }
 }
