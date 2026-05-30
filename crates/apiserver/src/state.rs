@@ -649,6 +649,9 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("ServiceCIDR", false, true),
     );
 
+    // events.k8s.io/v1
+    m.insert(rk("events.k8s.io", "v1", "events"), rm_cou("Event", true));
+
     // admissionregistration.k8s.io/v1
     m.insert(
         rk(
