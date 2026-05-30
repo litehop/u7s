@@ -2011,4 +2011,87 @@ mod tests {
              close at the wrong time (mayor-guqc)"
         );
     }
+
+    /// Regression test for mayor-bg80: a watch opened with from_revision=N (the revision at
+    /// which an object was created) must NOT deliver a spurious ADDED event for that object.
+    ///
+    /// The Kubernetes conformance test "should observe add, update, and delete watch notifications
+    /// on configmaps" lists configmaps (getting rv=N), then opens a watch at rv=N. Any existing
+    /// configmap (e.g. kube-root-ca.crt created at rv≤N) must not appear as an ADDED event.
+    /// A spurious ADDED causes the test to fail with "Unexpected watch notification observed".
+    ///
+    /// This test fails if the ring buffer filter changes from strict `>` to inclusive `>=`,
+    /// or if the from_revision is not forwarded correctly to the store's watch() call.
+    #[tokio::test]
+    async fn watch_generic_no_spurious_added_for_object_created_before_watch_rv() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Create an object that exists BEFORE the watch is opened.
+        // This simulates kube-root-ca.crt or any other pre-existing configmap.
+        let pre_existing = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "kube-root-ca.crt",
+                "namespace": "default"
+            }
+        });
+        let create_rv = store
+            .put(
+                "/registry/configmaps/default/kube-root-ca.crt",
+                bytes::Bytes::from(serde_json::to_vec(&pre_existing).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create pre-existing configmap");
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Open watch at from_revision=create_rv. This simulates a client that listed
+        // configmaps (getting rv=create_rv) and then opens a watch at that rv, expecting
+        // to see only NEW events — not the ADDED for the pre-existing object.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: create_rv,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "configmaps".into(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch_generic must succeed"));
+
+        // The stream must block — no immediate ADDED for the pre-existing configmap.
+        // Any ADDED event here is spurious and represents the bug.
+        let lines = read_watch_body_with_timeout(resp).await;
+        let added_count = lines.iter().filter(|v| v["type"] == "ADDED").count();
+        assert_eq!(
+            added_count, 0,
+            "watch at from_revision=N must not emit ADDED for objects created at revision ≤N; \
+             a spurious ADDED breaks the conformance test \
+             'should observe add, update, and delete watch notifications on configmaps' \
+             (mayor-bg80). Got lines: {:?}",
+            lines
+        );
+    }
 }

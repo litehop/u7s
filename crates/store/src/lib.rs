@@ -2654,4 +2654,102 @@ mod tests {
              without this, a list after a delete could return a stale revision"
         );
     }
+
+    /// Regression test for mayor-bg80: a watch opened at rv=N must NOT replay the ADDED event
+    /// for an object that was created at exactly revision N.
+    ///
+    /// The Kubernetes conformance test "should observe add, update, and delete watch notifications
+    /// on configmaps" lists first (getting rv=N) then opens a watch at rv=N. If an object was
+    /// created at rv=N and the watch replays it as ADDED, the test fails with
+    /// "Unexpected watch notification observed: {ADDED &ConfigMap{...}}".
+    ///
+    /// This test FAILS if the ring buffer filter changes from `e.revision > from_revision`
+    /// to `e.revision >= from_revision` — a "≥" would replay the create at revision N even
+    /// though the watcher opened at rv=N (meaning "I already know about events up to N").
+    #[tokio::test]
+    async fn watch_from_rv_n_does_not_replay_object_created_at_rv_n() {
+        let store = make_store();
+        let prefix = "/registry/configmaps/default/";
+        let key = "/registry/configmaps/default/kube-root-ca.crt";
+
+        // Create the object. Its ADDED event goes into the ring buffer at revision N.
+        let create_rv = store
+            .put(key, pod_json("kube-root-ca.crt"), Some(0))
+            .await
+            .expect("create");
+
+        // Open a watch at rv=create_rv. The Kubernetes protocol says:
+        // "watch from after revision N — I already know about events up to N".
+        // The ring buffer must NOT replay the ADDED event for the object just created.
+        let stream = store
+            .watch(prefix, create_rv)
+            .await
+            .expect("watch from create_rv");
+        let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
+
+        // The stream must block waiting for new events — no immediate ADDED for the
+        // pre-existing object. We use a short timeout; any event that arrives is a bug.
+        let spurious = next_event(&mut stream).await;
+        assert!(
+            spurious.is_none(),
+            "watch at rv=N must not replay the ADDED event for an object created at rv=N; \
+             received spurious event: {:?}. \
+             This breaks the conformance test 'should observe add, update, and delete watch \
+             notifications on configmaps' which lists at rv=N then opens a watch at rv=N and \
+             expects ONLY new events (mayor-bg80)",
+            spurious
+        );
+    }
+
+    /// Complementary to the above: an object created BEFORE the watch rv is correctly excluded,
+    /// while a new object created AFTER the watch rv is correctly included as ADDED.
+    ///
+    /// This test verifies the boundary condition: the filter `e.revision > from_revision` is
+    /// strict (>) not inclusive (>=), so from_revision=N excludes events at revision N.
+    #[tokio::test]
+    async fn watch_from_rv_n_sees_new_objects_created_after_rv_n() {
+        let store = make_store();
+        let prefix = "/registry/configmaps/default/";
+        let pre_key = "/registry/configmaps/default/pre-existing";
+        let new_key = "/registry/configmaps/default/new-object";
+
+        // Create pre-existing object at rv=N.
+        let create_rv = store
+            .put(pre_key, pod_json("pre-existing"), Some(0))
+            .await
+            .expect("create pre-existing");
+
+        // Open watch at rv=create_rv. Pre-existing object must NOT appear.
+        let stream = store
+            .watch(prefix, create_rv)
+            .await
+            .expect("watch from create_rv");
+        let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
+
+        // Create a new object AFTER the watch is open.
+        let new_rv = store
+            .put(new_key, pod_json("new-object"), Some(0))
+            .await
+            .expect("create new object");
+
+        // Only the new object's ADDED event (revision > create_rv) must appear.
+        let ev = next_event(&mut stream)
+            .await
+            .expect("new object must emit ADDED");
+        assert!(
+            matches!(&ev, WatchEvent::Added(obj) if obj.key == new_key && obj.revision == new_rv),
+            "watch at rv=N must receive ADDED for new object (rv={new_rv} > from_rv={create_rv}); \
+             got: {:?}",
+            ev
+        );
+
+        // No further events — pre-existing object's ADDED must not appear.
+        let extra = next_event(&mut stream).await;
+        assert!(
+            extra.is_none(),
+            "no extra events expected; pre-existing object ADDED must be filtered out; \
+             got: {:?}",
+            extra
+        );
+    }
 }
