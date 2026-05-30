@@ -4823,6 +4823,21 @@ mod tests {
                 .unwrap(),
         );
 
+        // Use timeout_seconds=1 so the stream closes after 1s, allowing to_bytes to return
+        // with the ring-buffer events. The stream stays open (correct behavior per mayor-8tiu
+        // fix: _store_keepalive keeps the store alive), so we need a bounded timeout.
+        let query_with_timeout = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: Some(1),
+        };
+
         let resp = match list_cr(
             State(state.clone()),
             Path((
@@ -4831,7 +4846,7 @@ mod tests {
                 "widgets".to_string(),
             )),
             accept_headers,
-            watch_query(),
+            query_with_timeout,
             "test-user".to_string(),
         )
         .await
@@ -4849,17 +4864,16 @@ mod tests {
             "watch response must use chunked encoding"
         );
 
-        // Drop the test's AppState clone so the broadcast sender (tx) inside SqliteStore
-        // is released. The watch stream's receiver then gets Err(Closed) after draining
-        // the ring buffer, and the stream terminates cleanly — allowing to_bytes to return.
-        drop(state);
-
-        // Read all events. The ring buffer replays the pre-existing widget as ADDED,
-        // then the stream closes because tx was dropped above.
+        // Read all events until the stream closes (timeout_seconds=1) or the 3-second guard.
+        // The ring buffer replays the pre-existing widget as ADDED before the live-event wait.
         let body = resp.into_body();
-        let bytes = axum::body::to_bytes(body, usize::MAX)
-            .await
-            .expect("watch stream must drain cleanly after store is dropped");
+        let bytes = tokio::time::timeout(
+            tokio::time::Duration::from_secs(3),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .unwrap_or(Ok(bytes::Bytes::new()))
+        .unwrap_or_default();
 
         let text = std::str::from_utf8(&bytes).unwrap_or("");
         let events: Vec<serde_json::Value> = text
