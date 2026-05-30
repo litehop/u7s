@@ -6439,4 +6439,67 @@ mod tests {
             ),
         }
     }
+
+    // -- events.k8s.io/v1 registration --
+
+    /// POST to /apis/events.k8s.io/v1/namespaces/default/events must return 201.
+    ///
+    /// Without the registry entry for ("events.k8s.io", "v1", "events"), the lookup
+    /// in create_namespaced_resource returns a 404 StatusError before any store access.
+    /// Sonobuoy conformance test "Events API should ensure that an event can be fetched,
+    /// patched, deleted, and listed" fails with 'Resource "events.k8s.io/v1/events" not found'.
+    /// This test fails if the registry entry is removed from state.rs.
+    #[tokio::test]
+    async fn events_k8s_io_v1_post_returns_201() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let event = serde_json::json!({
+            "apiVersion": "events.k8s.io/v1",
+            "kind": "Event",
+            "metadata": { "name": "test-event", "namespace": "default" },
+            "eventTime": "2026-05-30T00:00:00.000000Z",
+            "action": "Started",
+            "reason": "TestReason",
+            "regarding": {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "name": "test-pod",
+                "namespace": "default"
+            },
+            "reportingController": "test-controller",
+            "reportingInstance": "test-instance",
+            "type": "Normal"
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "events.k8s.io".into(),
+                "v1".into(),
+                "default".into(),
+                "events".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&event).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "POST events.k8s.io/v1 Event must return 201, not error {:?}; \
+             events.k8s.io/v1 must be registered in build_registry()",
+                e.0
+            )
+        })
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "POST events.k8s.io/v1 Event must return 201; \
+             if this fails the events.k8s.io/v1 registry entry was removed from state.rs"
+        );
+    }
 }
