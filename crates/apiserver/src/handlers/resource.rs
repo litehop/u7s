@@ -291,6 +291,7 @@ pub async fn create_resource<S: Store>(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
+    inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
     if let Some(hv) = warn_header {
         resp.headers_mut().insert(axum::http::header::WARNING, hv);
@@ -981,6 +982,7 @@ pub async fn create_namespaced_resource<S: Store>(
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
+    inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
     if let Some(hv) = warn_header {
         resp.headers_mut().insert(axum::http::header::WARNING, hv);
@@ -1382,6 +1384,22 @@ async fn maybe_allocate_cluster_ip<S: Store>(
 
 fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
     format!("/apis/{group}/{version}/{plural}/{name}")
+}
+
+/// Inject `kind` and `apiVersion` into an object response body.
+///
+/// The Kubernetes API contract requires every response object to include TypeMeta
+/// (kind + apiVersion). Clients (kubectl, client-go, conformance tests) assert
+/// these fields are non-empty on every create/get/update response. Without this,
+/// client-go reports "Object Kind is missing" and the operation fails.
+fn inject_type_meta(body: &mut serde_json::Value, group: &str, version: &str, kind: &str) {
+    let api_version = if group.is_empty() {
+        version.to_string()
+    } else {
+        format!("{group}/{version}")
+    };
+    body["kind"] = serde_json::Value::String(kind.to_string());
+    body["apiVersion"] = serde_json::Value::String(api_version);
 }
 
 fn rbac_namespaced_key(group: &str, version: &str, ns: &str, plural: &str, name: &str) -> String {
@@ -6438,5 +6456,81 @@ mod tests {
                  a 201 object body instead of a 422 Status"
             ),
         }
+    }
+
+    // -- Regression: ResourceSlice create response must include kind and apiVersion (mayor-lf0w) --
+
+    /// The Kubernetes API contract requires every response object to include TypeMeta
+    /// (kind + apiVersion). client-go (and the DRA conformance test) call create and then
+    /// assert the returned object has a non-empty Kind. Without inject_type_meta, objects
+    /// whose client bodies omit kind/apiVersion (as client-go sometimes does) would be
+    /// returned without TypeMeta, causing the conformance error:
+    ///   "Object Kind is missing in {\"metadata\":{...},\"spec\":{...}}"
+    ///
+    /// This test sends a body without kind/apiVersion (matching client-go behaviour) to
+    /// verify the server always injects them. Removing inject_type_meta must make this fail.
+    #[tokio::test]
+    async fn create_resource_slice_response_has_type_meta() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // Intentionally omit kind and apiVersion — matching what client-go does when it
+        // serialises a struct whose TypeMeta fields are zero-valued.
+        let body = serde_json::json!({
+            "metadata": {
+                "name": "test-node-slice"
+            },
+            "spec": {
+                "driver": "test.csi.k8s.io",
+                "pool": {
+                    "name": "test-pool",
+                    "generation": 0,
+                    "resourceSliceCount": 1
+                },
+                "nodeName": "test-node",
+                "devices": []
+            }
+        });
+
+        let result = create_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "resource.k8s.io".to_string(),
+                "v1".to_string(),
+                "resourceslices".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            Extension(crate::auth::UserInfo {
+                username: "system:masters".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+            }),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("ResourceSlice create must succeed"))
+        .into_response();
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::CREATED,
+            "ResourceSlice create must return 201"
+        );
+
+        let body_bytes = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(
+            v["kind"], "ResourceSlice",
+            "response must have kind=ResourceSlice — client-go asserts this and returns \
+             'Object Kind is missing' when absent (DRA conformance test mayor-lf0w)"
+        );
+        assert_eq!(
+            v["apiVersion"], "resource.k8s.io/v1",
+            "response must have apiVersion=resource.k8s.io/v1 — required by Kubernetes API contract"
+        );
     }
 }
