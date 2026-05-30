@@ -1133,6 +1133,90 @@ pub async fn patch_pod_resize<S: Store>(
 }
 
 // ---------------------------------------------------------------------------
+// EphemeralContainers subresource — PATCH /api/v1/namespaces/:ns/pods/:name/ephemeralcontainers
+// ---------------------------------------------------------------------------
+
+/// Merge `spec.ephemeralContainers` from `patch` into `stored`.
+///
+/// Kubernetes semantics: ephemeral containers may be added but never removed.
+/// We append containers from the patch whose name does not already exist in the
+/// stored list, leaving existing containers untouched.
+///
+/// Extracted as a pure function for testability — the async handler cannot be
+/// tested without a live store.
+pub fn apply_ephemeral_containers_patch(
+    stored: &serde_json::Value,
+    patch: &serde_json::Value,
+) -> serde_json::Value {
+    let mut result = stored.clone();
+
+    let patch_containers = match patch["spec"]["ephemeralContainers"].as_array() {
+        Some(a) => a.clone(),
+        None => return result,
+    };
+
+    let existing: Vec<serde_json::Value> = result["spec"]["ephemeralContainers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let existing_names: std::collections::HashSet<String> = existing
+        .iter()
+        .filter_map(|c| c["name"].as_str().map(|s| s.to_owned()))
+        .collect();
+
+    let mut merged = existing;
+    for c in &patch_containers {
+        if !existing_names.contains(c["name"].as_str().unwrap_or("")) {
+            merged.push(c.clone());
+        }
+    }
+
+    result["spec"]["ephemeralContainers"] = serde_json::json!(merged);
+    result
+}
+
+pub async fn patch_ephemeral_containers<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns, &state).await?;
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let body = extract_body(&body, ct);
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    let mut current_obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &patch);
+
+    let expected_rv = parse_resource_version(current_obj.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current_obj.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, &name))?;
+
+    current_obj.set_resource_version(new_rv);
+
+    Ok(Json(current_obj.body))
+}
+
+// ---------------------------------------------------------------------------
 // Binding subresource — POST /api/v1/namespaces/:ns/pods/:name/binding
 // ---------------------------------------------------------------------------
 
@@ -5074,6 +5158,297 @@ mod resize_tests {
         );
         // status.resize is still set even if no container matched.
         assert_eq!(result["status"]["resize"], "Proposed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EphemeralContainers pure-logic tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod ephemeral_containers_tests {
+    use super::*;
+
+    /// apply_ephemeral_containers_patch appends a new ephemeral container.
+    ///
+    /// This is the primary sonobuoy ephemeral-container flow: a PATCH body
+    /// `{"spec":{"ephemeralContainers":[{"name":"debugger","image":"busybox"}]}}`
+    /// must add the container to the pod. If the container is not appended,
+    /// `kubectl debug` and the sonobuoy conformance test fail with 404.
+    #[test]
+    fn apply_ephemeral_patch_appends_new_container() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "target", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        let patch = serde_json::json!({
+            "spec": {
+                "ephemeralContainers": [{"name": "debugger", "image": "busybox"}]
+            }
+        });
+
+        let result = apply_ephemeral_containers_patch(&stored, &patch);
+
+        let ecs = result["spec"]["ephemeralContainers"]
+            .as_array()
+            .expect("ephemeralContainers must be an array");
+        assert_eq!(
+            ecs.len(),
+            1,
+            "one ephemeral container must be present after PATCH"
+        );
+        assert_eq!(
+            ecs[0]["name"], "debugger",
+            "the new ephemeral container must appear in spec.ephemeralContainers — \
+             without this, kubectl debug and sonobuoy ephemeral-container tests fail"
+        );
+        // Existing spec must be untouched.
+        assert_eq!(
+            result["spec"]["containers"][0]["name"], "app",
+            "regular containers must not be disturbed by ephemeral container patch"
+        );
+    }
+
+    /// apply_ephemeral_containers_patch does not remove existing ephemeral containers.
+    ///
+    /// Kubernetes semantics: ephemeral containers are immutable once added.
+    /// Sending a PATCH with only new containers must not remove pre-existing ones.
+    #[test]
+    fn apply_ephemeral_patch_preserves_existing_containers() {
+        let stored = serde_json::json!({
+            "spec": {
+                "ephemeralContainers": [{"name": "first", "image": "busybox"}]
+            }
+        });
+        let patch = serde_json::json!({
+            "spec": {
+                "ephemeralContainers": [{"name": "second", "image": "alpine"}]
+            }
+        });
+
+        let result = apply_ephemeral_containers_patch(&stored, &patch);
+
+        let ecs = result["spec"]["ephemeralContainers"]
+            .as_array()
+            .expect("ephemeralContainers must be an array");
+        assert_eq!(
+            ecs.len(),
+            2,
+            "both the existing and the new ephemeral container must be present — \
+             ephemeral containers cannot be removed once added (Kubernetes immutability contract)"
+        );
+        let names: Vec<&str> = ecs.iter().filter_map(|c| c["name"].as_str()).collect();
+        assert!(
+            names.contains(&"first"),
+            "pre-existing ephemeral container 'first' must not be removed"
+        );
+        assert!(
+            names.contains(&"second"),
+            "newly patched ephemeral container 'second' must be present"
+        );
+    }
+
+    /// apply_ephemeral_containers_patch is idempotent: re-patching the same container
+    /// by name must not duplicate it.
+    #[test]
+    fn apply_ephemeral_patch_skips_duplicate_name() {
+        let stored = serde_json::json!({
+            "spec": {
+                "ephemeralContainers": [{"name": "debugger", "image": "busybox:old"}]
+            }
+        });
+        let patch = serde_json::json!({
+            "spec": {
+                "ephemeralContainers": [{"name": "debugger", "image": "busybox:new"}]
+            }
+        });
+
+        let result = apply_ephemeral_containers_patch(&stored, &patch);
+
+        let ecs = result["spec"]["ephemeralContainers"]
+            .as_array()
+            .expect("ephemeralContainers must be an array");
+        assert_eq!(
+            ecs.len(),
+            1,
+            "duplicate container name must not be appended — idempotent re-PATCH must not duplicate"
+        );
+    }
+
+    /// apply_ephemeral_containers_patch with no ephemeralContainers in the patch is a no-op.
+    #[test]
+    fn apply_ephemeral_patch_no_spec_key_is_noop() {
+        let stored = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        let patch = serde_json::json!({"metadata": {"labels": {"foo": "bar"}}});
+
+        let result = apply_ephemeral_containers_patch(&stored, &patch);
+
+        assert!(
+            result["spec"]["ephemeralContainers"].is_null()
+                || result["spec"]["ephemeralContainers"]
+                    .as_array()
+                    .is_none_or(|a| a.is_empty()),
+            "a patch without spec.ephemeralContainers must leave the field absent"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Integration test: PATCH /ephemeralcontainers route
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod ephemeral_containers_route_tests {
+    use std::sync::Arc;
+
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        routing::patch,
+        Router,
+    };
+    use bytes::Bytes;
+    use tower::ServiceExt;
+    use u7s_store::{SqliteStore, Store};
+
+    use super::*;
+    use crate::state::AppState;
+
+    fn make_state() -> (AppState, Arc<SqliteStore>) {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        (state, store)
+    }
+
+    async fn seed_namespace(store: &Arc<SqliteStore>, ns: &str) {
+        let key = format!("/registry/namespaces/{ns}");
+        let val = serde_json::json!({"kind": "Namespace", "metadata": {"name": ns}});
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .expect("seed namespace");
+    }
+
+    fn json_body(v: &serde_json::Value) -> Body {
+        Body::from(Bytes::from(serde_json::to_vec(v).unwrap()))
+    }
+
+    /// PATCH /ephemeralcontainers must return 200 and include the new ephemeral container
+    /// in spec.ephemeralContainers of the response body.
+    ///
+    /// This is the primary sonobuoy conformance case: the test patches an ephemeral container
+    /// onto a running pod and expects 200 with the updated spec. Without this route the
+    /// server returns 404 ("the server could not find the requested resource") and the
+    /// conformance test fails with "Failed to patch ephemeral containers in pod".
+    #[tokio::test]
+    async fn patch_ephemeral_containers_returns_200_with_new_container() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/ephemeral-target";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "ephemeral-target", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
+                patch(patch_ephemeral_containers),
+            )
+            .with_state(state);
+
+        let patch_body = serde_json::json!({
+            "spec": {
+                "ephemeralContainers": [{"name": "debugger", "image": "busybox"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/ephemeral-target/ephemeralcontainers")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PATCH /ephemeralcontainers must return 200 — without this route the server \
+             returns 404 and kubectl debug / sonobuoy ephemeral-container conformance tests fail"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let ecs = v["spec"]["ephemeralContainers"]
+            .as_array()
+            .expect("response must contain spec.ephemeralContainers");
+        assert_eq!(
+            ecs.len(),
+            1,
+            "one ephemeral container must be in the response"
+        );
+        assert_eq!(
+            ecs[0]["name"], "debugger",
+            "the new ephemeral container must appear in the response spec.ephemeralContainers"
+        );
+    }
+
+    /// PATCH /ephemeralcontainers on a missing pod must return 404.
+    #[tokio::test]
+    async fn patch_ephemeral_containers_missing_pod_returns_404() {
+        let (state, _store) = make_state();
+        seed_namespace(&_store, "default").await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
+                patch(patch_ephemeral_containers),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/nonexistent/ephemeralcontainers")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"spec":{"ephemeralContainers":[{"name":"d","image":"busybox"}]}}"#,
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PATCH /ephemeralcontainers on nonexistent pod must return 404"
+        );
     }
 }
 
