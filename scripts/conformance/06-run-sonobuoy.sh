@@ -45,16 +45,16 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-SONOBUOY_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
-if [ -n "$FOCUS" ]; then
-  SONOBUOY_ARGS="$SONOBUOY_ARGS --e2e-focus=$FOCUS"
-else
-  SONOBUOY_ARGS="$SONOBUOY_ARGS --mode=non-disruptive-conformance"
-fi
+SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
 
 echo "Running sonobuoy inside $VM_NAME..."
-# shellcheck disable=SC2086
-limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_ARGS
+if [ -n "$FOCUS" ]; then
+  # shellcheck disable=SC2086
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "--e2e-focus=$FOCUS"
+else
+  # shellcheck disable=SC2086
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=non-disruptive-conformance
+fi
 
 echo "Retrieving results..."
 # sonobuoy retrieve uses port-forward which produces an EOF against u7s.
