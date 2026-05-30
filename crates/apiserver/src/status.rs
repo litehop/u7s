@@ -13,6 +13,13 @@ pub struct Status {
     pub message: String,
     pub reason: &'static str,
     pub code: u16,
+    /// Optional metadata attached to the Status response.
+    ///
+    /// Used to carry `metadata.continue` in 410 Expired responses so clients
+    /// can restart pagination from the beginning without a separate list call.
+    /// Boxed to keep the `Status` struct small and avoid `clippy::result_large_err`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Box<serde_json::Value>>,
 }
 
 pub struct StatusError(pub StatusCode, pub Status);
@@ -40,6 +47,7 @@ impl Status {
                 message: format!("{kind} \"{name}\" not found"),
                 reason: "NotFound",
                 code: 404,
+                metadata: None,
             },
         )
     }
@@ -54,6 +62,7 @@ impl Status {
                 message: format!("{kind} \"{name}\" already exists"),
                 reason: "AlreadyExists",
                 code: 409,
+                metadata: None,
             },
         )
     }
@@ -68,6 +77,7 @@ impl Status {
                 message,
                 reason: "Conflict",
                 code: 409,
+                metadata: None,
             },
         )
     }
@@ -82,6 +92,7 @@ impl Status {
                 message,
                 reason: "BadRequest",
                 code: 400,
+                metadata: None,
             },
         )
     }
@@ -96,6 +107,7 @@ impl Status {
                 message,
                 reason: "UnsupportedMediaType",
                 code: 415,
+                metadata: None,
             },
         )
     }
@@ -110,6 +122,7 @@ impl Status {
                 message,
                 reason: "Invalid",
                 code: 422,
+                metadata: None,
             },
         )
     }
@@ -124,6 +137,25 @@ impl Status {
                 message,
                 reason: "Expired",
                 code: 410,
+                metadata: None,
+            },
+        )
+    }
+
+    /// Build a 410 Gone / Expired error that includes a new continue token in
+    /// `metadata.continue`.  Clients (client-go) use this token to restart the
+    /// paginated list from the beginning without issuing an additional request.
+    pub fn expired_with_continue(message: String, continue_token: String) -> StatusError {
+        StatusError(
+            StatusCode::GONE,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "Expired",
+                code: 410,
+                metadata: Some(Box::new(serde_json::json!({ "continue": continue_token }))),
             },
         )
     }
@@ -138,6 +170,7 @@ impl Status {
                 message,
                 reason: "InternalError",
                 code: 500,
+                metadata: None,
             },
         )
     }
@@ -152,6 +185,7 @@ impl Status {
                 message,
                 reason: "TooManyRequests",
                 code: 429,
+                metadata: None,
             },
         )
     }
@@ -166,6 +200,7 @@ impl Status {
                 message,
                 reason: "Forbidden",
                 code: 403,
+                metadata: None,
             },
         )
     }
@@ -180,6 +215,7 @@ impl Status {
                 message,
                 reason: "ServiceUnavailable",
                 code: 503,
+                metadata: None,
             },
         )
     }

@@ -523,6 +523,7 @@ fn unauthorized_response() -> Response<Body> {
         message: "Unauthorized".to_owned(),
         reason: "Unauthorized",
         code: 401,
+        metadata: None,
     };
     let body = serde_json::to_vec(&status).unwrap_or_default();
     Response::builder()
@@ -540,6 +541,7 @@ fn forbidden_response(user: &str, verb: &str, resource: &str) -> Response<Body> 
         message: format!("{user} is not allowed to {verb} {resource}"),
         reason: "Forbidden",
         code: 403,
+        metadata: None,
     };
     let body = serde_json::to_vec(&status).unwrap_or_default();
     Response::builder()

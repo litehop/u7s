@@ -961,6 +961,7 @@ pub async fn node_proxy<S: Store>(
                     message: format!("kubelet unreachable: {e}"),
                     reason: "BadGateway",
                     code: 502,
+                    metadata: None,
                 },
             )
         })?;

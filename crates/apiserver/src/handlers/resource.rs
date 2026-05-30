@@ -6118,6 +6118,93 @@ mod tests {
         );
     }
 
+    /// Regression test (mayor-9ejz): expired continue token must include `metadata.continue`
+    /// in the 410 response so clients can restart pagination from the beginning.
+    ///
+    /// Kubernetes conformance test chunking.go:202 (step 3 → 4):
+    /// 1. List page 1, save continue token.
+    /// 2. Wait for token TTL (60 s) to elapse.
+    /// 3. Use expired token → expect 410 with `metadata.continue`.
+    /// 4. Use the new token to fetch page 2.
+    ///
+    /// Without `metadata.continue` in the 410 body, step 4 cannot proceed and the
+    /// conformance test fails.  This test MUST FAIL if the fix is reverted.
+    #[tokio::test]
+    async fn expired_continue_token_410_response_contains_metadata_continue() {
+        use axum::extract::{Path, Query, State};
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let signing_key: [u8; 32] = *b"test-signing-key-32-bytes-padded";
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            continue_token_key: Some(signing_key),
+        });
+
+        // Forge a valid-signature token with Unix epoch timestamp so it is always expired.
+        let expired_token = build_signed_token(
+            "/registry/podtemplates/default/pt-0",
+            &signing_key,
+            0, // Unix epoch — older than CONTINUE_TOKEN_TTL_SECS (60s) by ~55 years
+        );
+
+        let result = list_namespaced_resource(
+            State(state),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "podtemplates".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: Some(40),
+                continue_token: Some(expired_token),
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            axum::http::HeaderMap::new(),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await;
+
+        let err = result.expect_err("expired continue token must return 410, not 200");
+        assert_eq!(err.0, axum::http::StatusCode::GONE);
+
+        // The 410 body must include metadata.continue with a fresh token so the client
+        // can restart pagination.  Without this, the conformance test cannot proceed to
+        // page 2 after the token TTL expires.
+        let meta = err.1.metadata.as_ref().expect(
+            "expired-token 410 must include metadata.continue; \
+             Kubernetes chunking conformance (chunking.go:202) reads this to restart pagination",
+        );
+        let cont = meta["continue"]
+            .as_str()
+            .expect("metadata.continue must be a non-null string");
+        assert!(
+            !cont.is_empty(),
+            "metadata.continue in the 410 response must be a non-empty token"
+        );
+    }
+
     /// Regression test (mayor-quqc): PATCHing Event series.lastObservedTime must persist and
     /// be normalized to microsecond precision on GET.
     ///
