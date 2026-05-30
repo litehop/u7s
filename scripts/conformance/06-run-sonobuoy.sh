@@ -9,10 +9,12 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 VM_NAME="lima-node"
 FOCUS="${SONOBUOY_FOCUS:-}"
+UNPACK=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --focus) FOCUS="$2"; shift 2 ;;
+    --no-unpack) UNPACK=0; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -91,3 +93,32 @@ OUTFILE="$REPO/temp/e2e/${TIMESTAMP}-${FOCUS_SLUG}.tar.gz"
 mkdir -p "$REPO/temp/e2e"
 limactl copy "${VM_NAME}:/tmp/sonobuoy-results.tar.gz" "$OUTFILE"
 echo "Results: $OUTFILE"
+
+if [ "$UNPACK" -eq 1 ]; then
+  UNPACK_DIR="${OUTFILE%.tar.gz}"
+  mkdir -p "$UNPACK_DIR"
+  tar xzf "$OUTFILE" -C "$UNPACK_DIR"
+  JUNIT="$UNPACK_DIR/plugins/e2e/results/global/junit_01.xml"
+  if [ -f "$JUNIT" ]; then
+    # Extract totals from the testsuites element.
+    TESTS=$(grep -o 'tests="[0-9]*"' "$JUNIT" | head -1 | grep -o '[0-9]*')
+    FAILURES=$(grep -o 'failures="[0-9]*"' "$JUNIT" | head -1 | grep -o '[0-9]*')
+    SKIPPED=$(grep -o 'skipped="[0-9]*"' "$JUNIT" | head -1 | grep -o '[0-9]*')
+    RAN=$(( TESTS - ${SKIPPED:-0} ))
+    echo ""
+    echo "=== Results summary ==="
+    echo "  Ran:    $RAN"
+    echo "  Passed: $(( RAN - ${FAILURES:-0} ))"
+    echo "  Failed: ${FAILURES:-0}"
+    if [ "${FAILURES:-0}" -gt 0 ]; then
+      echo ""
+      echo "  Failing tests:"
+      grep 'status="failed"' "$JUNIT" \
+        | grep -o 'name="[^"]*"' \
+        | sed 's/name="//;s/"$//' \
+        | grep -v "BeforeSuite\|AfterSuite\|ReportBefore\|ReportAfter\|Synchronized" \
+        | sed 's/^/    /'
+    fi
+    echo "  Unpacked: $UNPACK_DIR"
+  fi
+fi
