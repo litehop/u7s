@@ -330,12 +330,28 @@ pub(crate) async fn watch_generic<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
+    // Keep the store alive for the entire watch stream lifetime.
+    //
+    // The broadcast sender (`tx`) lives inside the store. If the store's `Arc` reference count
+    // drops to zero while the stream body is being consumed, `tx` is dropped and the broadcast
+    // receivers immediately get `RecvError::Closed`, causing the watch stream to close instead
+    // of staying open for future events. This most visibly affects the namespace watch
+    // (GET /api/v1/namespaces?watch=true): when the ring buffer is empty for the namespace prefix
+    // and the caller holds no other store reference (common in tests and possible under request
+    // routing where the handler-local `state` is the only live clone), the stream closes before
+    // the client receives any data.
+    let _store_keepalive = std::sync::Arc::clone(&state.store);
+
     let label_selector = label_selector.unwrap_or_default();
     let field_selector = field_selector.unwrap_or_default();
     let chunk_stream = async_stream::stream! {
         use futures_core::Stream;
         use std::pin::pin;
         use tokio::time::{Duration, interval, sleep};
+
+        // Hold the store Arc for the duration of the stream so the broadcast sender
+        // is never dropped while we are waiting for live events.
+        let _store_keepalive = _store_keepalive;
 
         let mut event_stream = pin!(event_stream);
         let mut bookmark_tick = interval(Duration::from_secs(60));
@@ -1057,23 +1073,27 @@ mod tests {
     // -- watch_generic label/field selector filtering (mayor-gkif) --
 
     /// Helper: read from a watch_generic Response body with a timeout, returning parsed NDJSON lines.
-    /// Used to consume ring-buffer events which are emitted synchronously at stream start.
+    ///
+    /// Waits up to 3 seconds for the body to close, then parses all collected NDJSON lines.
+    /// All watch_generic calls in these tests must use `timeout_seconds: Some(1)` so the
+    /// stream closes after 1 second, allowing `to_bytes` to return the collected bytes.
+    ///
+    /// The 3-second timeout guards against tests hanging indefinitely if the stream never closes.
     async fn read_watch_body_with_timeout(
         resp: axum::response::Response,
     ) -> Vec<serde_json::Value> {
         use tokio::time::{timeout, Duration};
 
         let body = resp.into_body();
-        // Use a short timeout: ring-buffer events are emitted immediately; live events block.
         let result = timeout(
-            Duration::from_millis(200),
+            Duration::from_secs(3),
             axum::body::to_bytes(body, usize::MAX),
         )
         .await;
 
         let bytes = match result {
             Ok(Ok(b)) => b,
-            // Timeout or error: use whatever was collected so far (empty).
+            // Timeout (stream still open after 3s) or error: return empty.
             _ => return vec![],
         };
 
@@ -1141,7 +1161,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can collect bytes
             },
         )
         .await
@@ -1221,7 +1241,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can return
             },
         )
         .await
@@ -1302,7 +1322,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can return
             },
         )
         .await
@@ -1408,7 +1428,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can return
             },
         )
         .await
@@ -1823,7 +1843,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "".into(),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can return
             },
         )
         .await
@@ -1913,7 +1933,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "services".into(),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can return
             },
         )
         .await
@@ -2075,7 +2095,7 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "configmaps".into(),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s so read_watch_body_with_timeout can return
             },
         )
         .await

@@ -4091,7 +4091,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: Some(true),
                 allow_watch_bookmarks: Some(true),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s so to_bytes can return with collected data
             }),
             pom_accept_headers(),
             axum::Extension(crate::auth::UserInfo {
@@ -4105,11 +4105,12 @@ mod tests {
 
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
-        // Read the stream with a short timeout — initial events are emitted synchronously.
+        // Read until stream closes (timeout_seconds=1) or the 3-second guard fires.
+        // Initial events are emitted synchronously before the live-event wait.
         use tokio::time::{timeout, Duration};
         let body = resp.into_body();
         let bytes = timeout(
-            Duration::from_millis(300),
+            Duration::from_secs(3),
             axum::body::to_bytes(body, usize::MAX),
         )
         .await
