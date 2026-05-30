@@ -1175,25 +1175,99 @@ struct Job {
 
 // --- k8s.io/api/apps/v1/generated.proto ---
 
-/// StatefulSet — k8s.io/api/apps/v1/generated.proto
-/// Source: k8s.io/api/apps/v1/generated.proto message StatefulSet
-/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
-/// Only metadata is decoded; spec is deeply nested and not needed for routing.
+/// LabelSelector — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
+/// Source: apimachinery-meta-v1-generated.proto message LabelSelector
+/// Only matchLabels decoded; matchExpressions (field 2) not needed for selector defaulting.
 #[derive(Clone, PartialEq, Message)]
-struct StatefulSet {
+struct AppsLabelSelector {
+    /// matchLabels (field 1, map<string,string>)
+    #[prost(btree_map = "string, string", tag = "1")]
+    match_labels: ::prost::alloc::collections::BTreeMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
+
+/// PodTemplateSpec (apps context) — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message PodTemplateSpec
+/// Only metadata decoded; spec (field 2, PodSpec) is deeply nested and not needed.
+#[derive(Clone, PartialEq, Message)]
+struct AppsPodTemplateSpec {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
 }
 
+/// DeploymentSpec — k8s.io/api/apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message DeploymentSpec
+/// Only selector and template decoded; other fields not needed for selector defaulting.
+#[derive(Clone, PartialEq, Message)]
+struct DeploymentSpec {
+    /// replicas (field 1, int32) — skipped
+    #[prost(int32, tag = "1")]
+    replicas: i32,
+    /// selector (field 2, message LabelSelector)
+    #[prost(message, tag = "2")]
+    selector: Option<AppsLabelSelector>,
+    /// template (field 3, message PodTemplateSpec)
+    #[prost(message, tag = "3")]
+    template: Option<AppsPodTemplateSpec>,
+}
+
+/// StatefulSetSpec — k8s.io/api/apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message StatefulSetSpec
+/// Only selector and template decoded; other fields not needed for selector defaulting.
+#[derive(Clone, PartialEq, Message)]
+struct StatefulSetSpec {
+    /// replicas (field 1, int32) — skipped
+    #[prost(int32, tag = "1")]
+    replicas: i32,
+    /// selector (field 2, message LabelSelector)
+    #[prost(message, tag = "2")]
+    selector: Option<AppsLabelSelector>,
+    /// template (field 3, message PodTemplateSpec)
+    #[prost(message, tag = "3")]
+    template: Option<AppsPodTemplateSpec>,
+}
+
+/// ReplicaSetSpec — k8s.io/api/apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message ReplicaSetSpec
+/// Only selector and template decoded; other fields not needed for selector defaulting.
+#[derive(Clone, PartialEq, Message)]
+struct ReplicaSetSpec {
+    /// replicas (field 1, int32) — skipped
+    #[prost(int32, tag = "1")]
+    replicas: i32,
+    /// selector (field 2, message LabelSelector)
+    #[prost(message, tag = "2")]
+    selector: Option<AppsLabelSelector>,
+    /// template (field 3, message PodTemplateSpec)
+    #[prost(message, tag = "3")]
+    template: Option<AppsPodTemplateSpec>,
+}
+
+/// StatefulSet — k8s.io/api/apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message StatefulSet
+#[derive(Clone, PartialEq, Message)]
+struct StatefulSet {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message StatefulSetSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<StatefulSetSpec>,
+}
+
 /// Deployment — k8s.io/api/apps/v1/generated.proto
-/// Source: k8s.io/api/apps/v1/generated.proto message Deployment
-/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
+/// Source: api-apps-v1-generated.proto message Deployment
 #[derive(Clone, PartialEq, Message)]
 struct Deployment {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message DeploymentSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<DeploymentSpec>,
 }
 
 /// DaemonSet — k8s.io/api/apps/v1/generated.proto
@@ -1207,13 +1281,15 @@ struct DaemonSet {
 }
 
 /// ReplicaSet — k8s.io/api/apps/v1/generated.proto
-/// Source: k8s.io/api/apps/v1/generated.proto message ReplicaSet
-/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
+/// Source: api-apps-v1-generated.proto message ReplicaSet
 #[derive(Clone, PartialEq, Message)]
 struct ReplicaSet {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message ReplicaSetSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<ReplicaSetSpec>,
 }
 
 /// ServiceAccount — k8s.io/api/core/v1/generated.proto
@@ -2667,26 +2743,85 @@ pub fn decode_job_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
+/// Convert an `AppsLabelSelector` to the JSON form used in Kubernetes API objects.
+fn apps_label_selector_to_json(sel: AppsLabelSelector) -> serde_json::Value {
+    let mut m = serde_json::json!({});
+    if !sel.match_labels.is_empty() {
+        let labels: serde_json::Map<String, serde_json::Value> = sel
+            .match_labels
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        m["matchLabels"] = serde_json::Value::Object(labels);
+    }
+    m
+}
+
+/// Convert an apps-context `DeploymentSpec` / `StatefulSetSpec` / `ReplicaSetSpec`
+/// into the minimal JSON needed for selector defaulting.
+///
+/// Returns `None` when neither selector nor template labels are present (omit spec from output).
+fn apps_spec_to_json(
+    selector: Option<AppsLabelSelector>,
+    template: Option<AppsPodTemplateSpec>,
+) -> Option<serde_json::Value> {
+    let mut spec = serde_json::json!({});
+    let mut non_empty = false;
+
+    if let Some(sel) = selector {
+        if !sel.match_labels.is_empty() {
+            spec["selector"] = apps_label_selector_to_json(sel);
+            non_empty = true;
+        }
+    }
+
+    if let Some(tmpl) = template {
+        if let Some(meta) = tmpl.metadata {
+            let tmpl_meta = object_meta_to_json(meta);
+            spec["template"] = serde_json::json!({ "metadata": tmpl_meta });
+            non_empty = true;
+        }
+    }
+
+    if non_empty {
+        Some(spec)
+    } else {
+        None
+    }
+}
+
 /// Decode a proto-encoded StatefulSet object into a `serde_json::Value`.
 pub fn decode_statefulset_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = StatefulSet::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut out = serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = obj.spec {
+        if let Some(spec_json) = apps_spec_to_json(spec.selector, spec.template) {
+            out["spec"] = spec_json;
+        }
+    }
+    Some(out)
 }
 
 /// Decode a proto-encoded Deployment object into a `serde_json::Value`.
 pub fn decode_deployment_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = Deployment::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut out = serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = obj.spec {
+        if let Some(spec_json) = apps_spec_to_json(spec.selector, spec.template) {
+            out["spec"] = spec_json;
+        }
+    }
+    Some(out)
 }
 
 /// Decode a proto-encoded DaemonSet object into a `serde_json::Value`.
@@ -2704,11 +2839,17 @@ pub fn decode_daemonset_proto(data: &[u8]) -> Option<serde_json::Value> {
 pub fn decode_replicaset_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = ReplicaSet::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut out = serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "ReplicaSet",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = obj.spec {
+        if let Some(spec_json) = apps_spec_to_json(spec.selector, spec.template) {
+            out["spec"] = spec_json;
+        }
+    }
+    Some(out)
 }
 
 /// Decode a proto-encoded ServiceAccount object into a `serde_json::Value`.
@@ -5876,6 +6017,120 @@ mod tests {
             "apiVersion must be apps/v1"
         );
         assert_eq!(result["metadata"]["name"], "my-rs");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests — apps/v1 spec decoding (selector defaulting requires
+    // spec.template.metadata.labels to be present in the decoded JSON)
+    // ---------------------------------------------------------------------------
+
+    /// Decoding a Deployment proto with spec.template.metadata.labels must produce
+    /// spec.template.metadata.labels in the JSON output.
+    ///
+    /// Without spec field decoding in the Deployment prost struct, the decoded JSON has
+    /// no `spec` key, causing selector defaulting to fail with 422
+    /// 'spec.selector is required and could not be defaulted'.
+    #[test]
+    fn decode_deployment_proto_includes_spec_template_labels() {
+        // Encode: matchLabels map entry: key="app", value="test"
+        let mut label_entry = encode_length_delimited(1, b"app"); // key
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"test")); // value
+
+        // LabelSelector { matchLabels: {"app": "test"} }  — field 1 is map<string,string>
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+
+        // ObjectMeta { labels: {"app": "test"} }  — field 11 is map<string,string>
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+
+        // PodTemplateSpec { metadata: tmpl_meta }  — field 1
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+
+        // DeploymentSpec { selector: field 2, template: field 3 }
+        let mut spec_bytes = encode_length_delimited(2, &selector_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        // Deployment { metadata: field 1, spec: field 2 }
+        let name_bytes = encode_length_delimited(1, b"my-deploy");
+        let meta_bytes = name_bytes;
+        let mut proto = encode_length_delimited(1, &meta_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("Deployment", &proto).expect(
+            "Deployment with spec must decode successfully — \
+             without spec decoding, proto POST returns 422 because labels are absent",
+        );
+
+        assert_eq!(
+            result["spec"]["template"]["metadata"]["labels"]["app"], "test",
+            "spec.template.metadata.labels must be present for selector defaulting; \
+             without it the apiserver returns 422 'spec.selector is required and could not be defaulted'"
+        );
+        assert_eq!(
+            result["spec"]["selector"]["matchLabels"]["app"], "test",
+            "spec.selector.matchLabels must be present in decoded JSON"
+        );
+    }
+
+    /// Decoding a StatefulSet proto with spec.template.metadata.labels must include
+    /// spec.template.metadata.labels in the JSON output.
+    ///
+    /// Without spec field decoding, proto POST of a StatefulSet fails with 422.
+    #[test]
+    fn decode_statefulset_proto_includes_spec_template_labels() {
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"myapp"));
+
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+
+        let mut spec_bytes = encode_length_delimited(2, &selector_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-sts");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("StatefulSet", &proto).expect(
+            "StatefulSet with spec must decode successfully — \
+             without spec decoding, proto POST returns 422 because labels are absent",
+        );
+
+        assert_eq!(
+            result["spec"]["template"]["metadata"]["labels"]["app"], "myapp",
+            "spec.template.metadata.labels must be present for selector defaulting"
+        );
+    }
+
+    /// Decoding a ReplicaSet proto with spec.template.metadata.labels must include
+    /// spec.template.metadata.labels in the JSON output.
+    ///
+    /// Without spec field decoding, proto POST of a ReplicaSet fails with 422.
+    #[test]
+    fn decode_replicaset_proto_includes_spec_template_labels() {
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"myrs"));
+
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+
+        let mut spec_bytes = encode_length_delimited(2, &selector_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-rs");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("ReplicaSet", &proto).expect(
+            "ReplicaSet with spec must decode successfully — \
+             without spec decoding, proto POST returns 422 because labels are absent",
+        );
+
+        assert_eq!(
+            result["spec"]["template"]["metadata"]["labels"]["app"], "myrs",
+            "spec.template.metadata.labels must be present for selector defaulting"
+        );
     }
 
     // ---------------------------------------------------------------------------
