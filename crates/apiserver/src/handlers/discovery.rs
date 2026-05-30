@@ -501,6 +501,41 @@ fn static_group_resources(group: &str, version: &str) -> Option<serde_json::Valu
     }
 }
 
+/// Handler for `GET /apis/{group}` — returns the APIGroup object for the named group.
+///
+/// Kubernetes clients use this to discover preferred versions for a specific group.
+/// Without this endpoint, GET /apis/flowcontrol.apiserver.k8s.io returns 404 even
+/// though the group appears in GET /apis (APIGroupList).
+pub async fn api_group<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(group): Path<String>,
+) -> Response {
+    let list = api_group_list_inner(&state).await;
+    if let Some(g) = list.groups.into_iter().find(|g| g.name == group) {
+        Json(serde_json::json!({
+            "kind": "APIGroup",
+            "apiVersion": "v1",
+            "name": g.name,
+            "versions": g.versions,
+            "preferredVersion": g.preferred_version
+        }))
+        .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "kind": "Status",
+                "apiVersion": "v1",
+                "status": "Failure",
+                "message": format!("the server could not find the requested resource ({})", group),
+                "reason": "NotFound",
+                "code": 404
+            })),
+        )
+            .into_response()
+    }
+}
+
 pub async fn api_group_resources<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version)): Path<(String, String)>,
@@ -2361,6 +2396,60 @@ mod tests {
         assert!(
             names.contains(&"deviceclasses"),
             "deviceclasses must be in resource.k8s.io/v1 — DRA device class (GA since k8s 1.32); got: {names:?}"
+        );
+    }
+
+    // GET /apis/flowcontrol.apiserver.k8s.io must return 200 with kind=APIGroup and the group
+    // name. Without the /apis/{group} route, the API priority and fairness conformance test
+    // fails: it GETs the group endpoint after discovering it in /apis, and 404 causes the test
+    // to abort with "expected flowcontrol API group".
+    #[tokio::test]
+    async fn flowcontrol_api_group_endpoint_returns_200() {
+        let state = make_state();
+        let resp = api_group(
+            State(state),
+            Path("flowcontrol.apiserver.k8s.io".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /apis/flowcontrol.apiserver.k8s.io must return 200 — \
+             the conformance test GETs this endpoint after discovering the group in /apis; \
+             404 causes the test to abort"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            val["kind"], "APIGroup",
+            "response must have kind=APIGroup — clients use this to determine preferred version"
+        );
+        assert_eq!(
+            val["name"], "flowcontrol.apiserver.k8s.io",
+            "APIGroup name must match the requested group"
+        );
+        assert!(
+            val["preferredVersion"]["version"].as_str().is_some(),
+            "preferredVersion.version must be present"
+        );
+    }
+
+    // GET /apis/<unknown-group> must return 404 — clients that request a non-existent group
+    // must get a proper NotFound response, not a panic or 200 with empty body.
+    #[tokio::test]
+    async fn unknown_api_group_endpoint_returns_404() {
+        let state = make_state();
+        let resp = api_group(State(state), Path("no-such-group.example.io".to_string())).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET /apis/<unknown-group> must return 404 — \
+             the group does not exist and the client must get a clear error"
         );
     }
 

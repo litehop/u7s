@@ -271,6 +271,7 @@ fn build_router(state: AppState) -> Router {
         )
         // Non-core group discovery
         .route("/apis", get(handlers::discovery::api_group_list))
+        .route("/apis/{group}", get(handlers::discovery::api_group))
         .route(
             "/apis/{group}/{version}",
             get(handlers::discovery::api_group_resources),
@@ -1910,6 +1911,93 @@ mod tests {
         );
     }
 
+    /// POST /apis/flowcontrol.apiserver.k8s.io/v1/flowschemas with a proto body must return 201.
+    ///
+    /// The API priority and fairness conformance test sends FlowSchema with
+    /// Content-Type: application/vnd.kubernetes.protobuf. Before the fix,
+    /// decode_core_proto_by_kind returned None for "FlowSchema", extract_body returned raw
+    /// proto bytes, and the handler returned HTTP 400 "invalid JSON: expected value at line 1
+    /// column 1". This test fails if the FlowSchema proto decoder is removed.
+    #[tokio::test]
+    async fn flowschema_create_via_proto_returns_201() {
+        use std::sync::Arc;
+
+        fn encode_varint(mut v: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+            out
+        }
+        fn encode_ld(field_number: u64, payload: &[u8]) -> Vec<u8> {
+            let tag = (field_number << 3) | 2;
+            let mut out = encode_varint(tag);
+            out.extend_from_slice(&encode_varint(payload.len() as u64));
+            out.extend_from_slice(payload);
+            out
+        }
+
+        // Build: FlowSchema { metadata: ObjectMeta { name: "catch-all" } }
+        let meta_bytes = encode_ld(1, b"catch-all"); // ObjectMeta.name (field 1)
+        let flowschema_proto = encode_ld(1, &meta_bytes); // FlowSchema.metadata (field 1)
+
+        // Build the k8s proto envelope: magic + Unknown{TypeMeta, raw, no contentType}
+        const MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
+        let mut type_meta = encode_ld(1, b"flowcontrol.apiserver.k8s.io/v1"); // TypeMeta.apiVersion
+        type_meta.extend_from_slice(&encode_ld(2, b"FlowSchema")); // TypeMeta.kind
+        let mut unknown = encode_ld(1, &type_meta); // Unknown.TypeMeta (field 1)
+        unknown.extend_from_slice(&encode_ld(2, &flowschema_proto)); // Unknown.raw (field 2)
+        let mut proto_body = MAGIC.to_vec();
+        proto_body.extend_from_slice(&unknown);
+
+        let store = Arc::new(make_store());
+        let state = state::AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/vnd.kubernetes.protobuf"),
+        );
+
+        let create_result = handlers::resource::create_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "flowcontrol.apiserver.k8s.io".to_string(),
+                "v1".to_string(),
+                "flowschemas".to_string(),
+            )),
+            axum::extract::Query(handlers::json_patch::CreateQuery::default()),
+            axum::Extension(auth::UserInfo {
+                username: "admin".into(),
+                uid: "".into(),
+                groups: vec!["system:masters".into()],
+            }),
+            headers,
+            bytes::Bytes::from(proto_body),
+        )
+        .await;
+
+        assert!(
+            create_result.is_ok(),
+            "POST /apis/flowcontrol.apiserver.k8s.io/v1/flowschemas with proto body must \
+             return 201 — before the fix, decode_core_proto_by_kind returned None for \
+             'FlowSchema', extract_body returned raw proto bytes, and the handler returned \
+             HTTP 400 'invalid JSON: expected value at line 1 column 1'"
+        );
+    }
+
     /// Verifies that POST /apis/gateway.networking.k8s.io/v1/namespaces/default/gateways
     /// creates a Gateway and GET retrieves it.
     ///
@@ -3419,5 +3507,58 @@ mod tests {
             v["spec"]["suspend"], true,
             "suspend=true must survive proto decode — this is the exact conformance scenario"
         );
+    }
+
+    /// GET /apis/flowcontrol.apiserver.k8s.io must return 200 with kind=APIGroup.
+    ///
+    /// The API priority and fairness conformance test discovers the group via GET /apis,
+    /// then probes GET /apis/flowcontrol.apiserver.k8s.io. Before the fix, no route existed
+    /// for /apis/{group} and the request returned 404, causing the conformance test to fail
+    /// with "expected flowcontrol API group". This test fails if the /apis/{group} route is removed.
+    #[tokio::test]
+    async fn get_flowcontrol_api_group_route_returns_200() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/apis/flowcontrol.apiserver.k8s.io")
+            .body(axum::body::Body::empty())
+            .expect("request must build");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "test".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
+        let resp = router.call(req).await.expect("router must not error");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /apis/flowcontrol.apiserver.k8s.io must return 200 — \
+             the conformance test probes this endpoint after discovering the group in /apis; \
+             404 causes the API priority and fairness test to abort"
+        );
+
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let val: serde_json::Value = serde_json::from_slice(&body).expect("response must be JSON");
+        assert_eq!(
+            val["kind"], "APIGroup",
+            "response must have kind=APIGroup — clients use this to discover the preferred version"
+        );
+        assert_eq!(val["name"], "flowcontrol.apiserver.k8s.io");
     }
 }

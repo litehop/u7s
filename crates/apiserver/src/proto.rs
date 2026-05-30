@@ -2870,6 +2870,55 @@ pub fn decode_crd_proto(data: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
+// --- k8s.io/api/flowcontrol/v1/generated.proto ---
+
+/// FlowSchema — k8s.io/api/flowcontrol/v1/generated.proto
+/// Only the metadata field is decoded; the spec is opaque to u7s.
+#[derive(Clone, PartialEq, Message)]
+struct FlowSchema {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// PriorityLevelConfiguration — k8s.io/api/flowcontrol/v1/generated.proto
+/// Only the metadata field is decoded; the spec is opaque to u7s.
+#[derive(Clone, PartialEq, Message)]
+struct PriorityLevelConfiguration {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// Decode a proto-encoded FlowSchema into a serde_json::Value.
+///
+/// The conformance test POSTs FlowSchema with Content-Type: application/vnd.kubernetes.protobuf.
+/// Without this decoder, decode_core_proto_by_kind returns None, extract_body returns raw proto
+/// bytes, and the handler returns 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_flowschema_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = FlowSchema::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "FlowSchema",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded PriorityLevelConfiguration into a serde_json::Value.
+///
+/// The conformance test POSTs PriorityLevelConfiguration with Content-Type:
+/// application/vnd.kubernetes.protobuf. Without this decoder, the handler returns 400.
+pub fn decode_prioritylevelconfiguration_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = PriorityLevelConfiguration::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+        "kind": "PriorityLevelConfiguration",
+        "metadata": meta
+    }))
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -2911,6 +2960,8 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "ResourceQuota" => decode_resourcequota_proto(raw),
         "LimitRange" => decode_limitrange_proto(raw),
         "PodDisruptionBudget" => decode_poddisruptionbudget_proto(raw),
+        "FlowSchema" => decode_flowschema_proto(raw),
+        "PriorityLevelConfiguration" => decode_prioritylevelconfiguration_proto(raw),
         _ => None,
     }
 }
@@ -6026,5 +6077,49 @@ mod tests {
         assert_eq!(versions[0]["name"], "v1");
         assert_eq!(versions[0]["served"], true);
         assert_eq!(versions[0]["storage"], true);
+    }
+
+    /// decode_core_proto_by_kind must dispatch FlowSchema to a decoder that returns valid JSON.
+    ///
+    /// The API priority and fairness conformance test POSTs FlowSchema with
+    /// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder,
+    /// decode_core_proto_by_kind returns None, extract_body returns raw proto bytes, and
+    /// the handler returns 400 "invalid JSON: expected value at line 1 column 1",
+    /// failing the conformance test with "unexpected HTTP status code 400".
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_flowschema() {
+        // FlowSchema { metadata: ObjectMeta { name: "catch-all" } }
+        let meta_bytes = encode_length_delimited(1, b"catch-all");
+        let proto = encode_length_delimited(1, &meta_bytes);
+
+        let result = decode_core_proto_by_kind("FlowSchema", &proto).expect(
+            "FlowSchema must decode via decode_core_proto_by_kind — without this, POST \
+             flowschemas with proto body returns 400, failing API priority and fairness conformance",
+        );
+
+        assert_eq!(result["kind"], "FlowSchema");
+        assert_eq!(result["apiVersion"], "flowcontrol.apiserver.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "catch-all");
+    }
+
+    /// decode_core_proto_by_kind must dispatch PriorityLevelConfiguration to a decoder.
+    ///
+    /// The API priority and fairness conformance test POSTs PriorityLevelConfiguration with
+    /// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder, the handler
+    /// returns 400, failing the conformance test.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_prioritylevelconfiguration() {
+        // PriorityLevelConfiguration { metadata: ObjectMeta { name: "workload-low" } }
+        let meta_bytes = encode_length_delimited(1, b"workload-low");
+        let proto = encode_length_delimited(1, &meta_bytes);
+
+        let result = decode_core_proto_by_kind("PriorityLevelConfiguration", &proto).expect(
+            "PriorityLevelConfiguration must decode via decode_core_proto_by_kind — without this, \
+             POST prioritylevelconfigurations with proto body returns 400",
+        );
+
+        assert_eq!(result["kind"], "PriorityLevelConfiguration");
+        assert_eq!(result["apiVersion"], "flowcontrol.apiserver.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "workload-low");
     }
 }
