@@ -266,6 +266,7 @@ pub async fn create_pod<S: Store>(
 
     apply_pod_create_defaults(&mut obj.body);
     initialize_pod_generation(&mut obj.body);
+    apply_automount_sa_token_default(&state, &mut obj.body, ns.as_str()).await;
     inject_sa_token_volume(&mut obj.body, &name);
 
     // Admission webhook pipeline (mutating then validating).
@@ -1714,6 +1715,55 @@ pub fn increment_pod_generation_if_spec_changed(
         let current = pod["metadata"]["generation"].as_i64().unwrap_or(1);
         pod["metadata"]["generation"] = serde_json::json!(current + 1);
     }
+}
+
+/// Resolve and write `spec.automountServiceAccountToken` on a pod before create.
+///
+/// Real kube-apiserver's ServiceAccount admission plugin resolves the effective
+/// automount value as follows:
+/// 1. If the pod already has the field set (true or false), leave it — pod wins.
+/// 2. If the pod has a serviceAccountName, look up the SA; if the SA sets the
+///    field to false, inherit that value (token will be suppressed).
+/// 3. Otherwise default to true (the kube-apiserver default).
+///
+/// Without this, a pod that omits `spec.automountServiceAccountToken` always gets
+/// the token injected, even if the ServiceAccount opts out with
+/// `automountServiceAccountToken: false`. That breaks the conformance test
+/// "ServiceAccounts should allow opting out of API token automount".
+///
+/// This function writes the resolved boolean into `pod["spec"]["automountServiceAccountToken"]`
+/// so that `inject_sa_token_volume` can make a deterministic decision.
+pub async fn apply_automount_sa_token_default<S: Store>(
+    state: &AppState<S>,
+    pod: &mut serde_json::Value,
+    namespace: &str,
+) {
+    // 1. Pod already has the field set — nothing to do.
+    if !pod["spec"]["automountServiceAccountToken"].is_null() {
+        return;
+    }
+
+    // 2. Look up the SA if serviceAccountName is present.
+    let sa_name = pod["spec"]["serviceAccountName"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    if !sa_name.is_empty() {
+        let sa_key = object_key("serviceaccounts", namespace, &sa_name);
+        if let Ok(Some(stored)) = state.store.get(&sa_key).await {
+            if let Ok(sa) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                // SA explicitly sets automountServiceAccountToken=false: inherit it.
+                // ServiceAccount stores this as a top-level field, not under spec.
+                if sa["automountServiceAccountToken"] == serde_json::Value::Bool(false) {
+                    pod["spec"]["automountServiceAccountToken"] = serde_json::Value::Bool(false);
+                    return;
+                }
+            }
+        }
+    }
+
+    // 3. Default to true.
+    pod["spec"]["automountServiceAccountToken"] = serde_json::Value::Bool(true);
 }
 
 /// Inject the projected service-account token volume into a pod, mirroring
@@ -3543,6 +3593,152 @@ mod handler_tests {
             serde_json::json!("ClusterFirst"),
             "dnsPolicy must be defaulted to ClusterFirst when absent at creation time — \
              real kube-apiserver always stamps this field; the kubelet rejects empty string"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // automountServiceAccountToken defaulting (mayor-vfe2)
+    // -----------------------------------------------------------------------
+
+    /// A pod created without spec.automountServiceAccountToken must have it
+    /// defaulted to true in the stored/returned object.
+    ///
+    /// Real kube-apiserver writes the resolved boolean into the stored pod so
+    /// controllers and the kubelet always see a concrete value.  Without this,
+    /// the field is absent after create and SA-level opting-out never works.
+    ///
+    /// This test fails if apply_automount_sa_token_default is removed or if it
+    /// stops writing true when no SA sets the field to false.
+    #[tokio::test]
+    async fn create_pod_automount_defaults_to_true_when_absent() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "no-automount-pod", "namespace": "default"},
+            "spec": {
+                "serviceAccountName": "default",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/no-automount-pod")
+            .await
+            .unwrap()
+            .expect("pod must be in store");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["automountServiceAccountToken"],
+            serde_json::json!(true),
+            "spec.automountServiceAccountToken must be defaulted to true when absent — \
+             without this, SA-level opt-out cannot be inherited (conformance test \
+             'ServiceAccounts should allow opting out of API token automount' fails)"
+        );
+    }
+
+    /// A pod created with serviceAccountName pointing to a SA that has
+    /// automountServiceAccountToken=false must NOT get the SA token volume injected.
+    ///
+    /// Conformance test 'ServiceAccounts should allow opting out of API token automount'
+    /// creates a SA with automountServiceAccountToken=false, creates a pod referencing
+    /// that SA (without a pod-level field), and expects the token NOT to be mounted.
+    /// Without SA inheritance, the pod omits the field and inject_sa_token_volume
+    /// injects the token anyway — the conformance test times out.
+    ///
+    /// This test fails if apply_automount_sa_token_default stops reading the SA's field.
+    #[tokio::test]
+    async fn create_pod_inherits_automount_false_from_service_account() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        // Seed a ServiceAccount with automountServiceAccountToken=false.
+        let sa_key = "/registry/serviceaccounts/default/no-token-sa";
+        let sa = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": "no-token-sa", "namespace": "default"},
+            "automountServiceAccountToken": false
+        });
+        store
+            .put(
+                sa_key,
+                bytes::Bytes::from(serde_json::to_vec(&sa).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed SA");
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "opt-out-pod", "namespace": "default"},
+            "spec": {
+                "serviceAccountName": "no-token-sa",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/opt-out-pod")
+            .await
+            .unwrap()
+            .expect("pod must be in store");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["spec"]["automountServiceAccountToken"],
+            serde_json::json!(false),
+            "spec.automountServiceAccountToken must be false when inherited from SA — \
+             SA opted out; pod must not get token"
+        );
+        assert!(
+            v["spec"]["volumes"].is_null()
+                || v["spec"]["volumes"]
+                    .as_array()
+                    .map(|vols| {
+                        vols.iter().all(|vol| {
+                            vol["name"]
+                                .as_str()
+                                .map(|n| !n.starts_with("kube-api-access-"))
+                                .unwrap_or(true)
+                        })
+                    })
+                    .unwrap_or(true),
+            "no kube-api-access-* volume must be injected when SA has \
+             automountServiceAccountToken=false — conformance test \
+             'ServiceAccounts should allow opting out of API token automount' \
+             checks that no token file appears in the pod"
         );
     }
 
