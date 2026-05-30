@@ -3367,9 +3367,10 @@ mod tests {
         obj_meta.extend_from_slice(&encode_ld(3, b"default"));
         obj_meta.extend_from_slice(&encode_ld(8, &[])); // empty Time{}
 
-        // Secret { metadata (field 1), type (field 4) }
+        // Secret { metadata (field 1), type (field 3) }
+        // type is wire field 3 per the official k8s proto definition.
         let mut secret_proto = encode_ld(1, &obj_meta);
-        secret_proto.extend_from_slice(&encode_ld(4, b"Opaque"));
+        secret_proto.extend_from_slice(&encode_ld(3, b"Opaque"));
 
         // k8s Unknown envelope
         const MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];

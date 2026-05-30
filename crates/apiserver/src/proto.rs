@@ -354,6 +354,12 @@ struct Service {
 }
 
 /// Secret — k8s.io/api/core/v1/generated.proto
+/// Field numbers match the official proto exactly:
+///   field 1 = metadata (message ObjectMeta)
+///   field 2 = data (map<string,bytes>)
+///   field 3 = type (string)        ← NOTE: type=3, stringData=4 (not the reverse)
+///   field 4 = stringData (map<string,string>)
+///   field 5 = immutable (bool)
 #[derive(Clone, PartialEq, Message)]
 struct Secret {
     /// metadata (field 1, message ObjectMeta)
@@ -362,12 +368,12 @@ struct Secret {
     /// data (field 2, map<string,bytes>)
     #[prost(map = "string, bytes", tag = "2")]
     data: std::collections::HashMap<String, Vec<u8>>,
-    /// stringData (field 3, map<string,string>)
-    #[prost(map = "string, string", tag = "3")]
-    string_data: std::collections::HashMap<String, String>,
-    /// type (field 4, string)
-    #[prost(string, tag = "4")]
+    /// type (field 3, string) — wire field 3, not 4
+    #[prost(string, tag = "3")]
     r#type: String,
+    /// stringData (field 4, map<string,string>) — wire field 4, not 3
+    #[prost(map = "string, string", tag = "4")]
+    string_data: std::collections::HashMap<String, String>,
     /// immutable (field 5, bool)
     #[prost(bool, tag = "5")]
     immutable: bool,
@@ -5405,8 +5411,8 @@ mod tests {
         data_entry.extend_from_slice(&encode_length_delimited(2, b"secret-value"));
 
         let mut secret_proto = encode_length_delimited(1, &obj_meta);
-        secret_proto.extend_from_slice(&encode_length_delimited(2, &data_entry)); // data
-        secret_proto.extend_from_slice(&encode_length_delimited(4, b"Opaque")); // type
+        secret_proto.extend_from_slice(&encode_length_delimited(2, &data_entry)); // data (field 2)
+        secret_proto.extend_from_slice(&encode_length_delimited(3, b"Opaque")); // type (field 3)
 
         let result = decode_core_proto_by_kind("Secret", &secret_proto).expect(
             "Secret must decode via decode_core_proto_by_kind — conformance suite creates \
@@ -5424,6 +5430,64 @@ mod tests {
         assert_eq!(
             result["data"]["key"], expected_b64,
             "Secret data values must be base64-encoded so kubectl can decode them"
+        );
+    }
+
+    /// Regression: Secret.type must be decoded from wire field 3, not field 4.
+    ///
+    /// The official k8s proto definition (api-core-v1-generated.proto) places:
+    ///   field 2 = data (map<string,bytes>)
+    ///   field 3 = type (string)           ← type IS field 3
+    ///   field 4 = stringData (map<string,string>)
+    ///
+    /// Previously the Rust Secret struct had these two fields swapped (type=4, stringData=3),
+    /// causing Secret::decode() to fail with a wire-type error when client-go sent `type` at
+    /// field 3.  decode_secret_proto returned None, extract_body fell back to raw proto bytes,
+    /// and the handler returned 400 "invalid JSON: expected value at line 1 column 1".
+    ///
+    /// This test uses the correct field layout (type at wire field 3) and verifies that the
+    /// full envelope → extract_body → JSON round-trip succeeds.  Reverting the field-number
+    /// fix causes Secret::decode() to misparse the type string as a map, returning None.
+    #[test]
+    fn secret_type_at_wire_field_3_decodes_correctly() {
+        // Encode ObjectMeta{name="sample-webhook-secret", namespace="default"}
+        let mut obj_meta = encode_length_delimited(1, b"sample-webhook-secret");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        // Encode the Secret raw proto:
+        //   field 1 = metadata
+        //   field 3 = type (string "Opaque") — official wire field number
+        let mut secret_proto = encode_length_delimited(1, &obj_meta);
+        secret_proto.extend_from_slice(&encode_length_delimited(3, b"Opaque")); // type at field 3
+
+        // Wrap in k8s Unknown envelope: magic + TypeMeta(v1/Secret) + raw(secret_proto)
+        let mut type_meta = encode_length_delimited(1, b"v1"); // apiVersion
+        type_meta.extend_from_slice(&encode_length_delimited(2, b"Secret")); // kind
+
+        let mut envelope = encode_length_delimited(1, &type_meta); // TypeMeta
+        envelope.extend_from_slice(&encode_length_delimited(2, &secret_proto)); // raw
+
+        let mut body = K8S_PROTO_MAGIC.to_vec();
+        body.extend_from_slice(&envelope);
+
+        let env = decode_k8s_proto_envelope(&body)
+            .expect("envelope must decode — magic + Unknown are well-formed");
+        assert_eq!(env.kind, "Secret");
+
+        let result = decode_core_proto_by_kind(&env.kind, &env.raw).expect(
+            "Secret with type at wire field 3 must decode — reverting the field-number fix \
+             causes Secret::decode() to misparse 'Opaque' as a map and return None, \
+             which makes extract_body return raw proto bytes and the handler return 400",
+        );
+
+        assert_eq!(result["kind"], "Secret");
+        assert_eq!(result["apiVersion"], "v1");
+        assert_eq!(result["metadata"]["name"], "sample-webhook-secret");
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert_eq!(
+            result["type"], "Opaque",
+            "type must be 'Opaque' — if the field tags are swapped, \
+             'Opaque' is decoded as stringData (map) and the type field is empty"
         );
     }
 
