@@ -35,7 +35,7 @@ const MAX_PROTO_ENVELOPE_BYTES: usize = 16 * 1024 * 1024;
 // --- k8s.io/apimachinery/pkg/runtime/generated.proto ---
 
 /// TypeMeta — embedded in Unknown field 1.
-/// k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
+/// Source: apimachinery-runtime-generated.proto message TypeMeta
 #[derive(Clone, PartialEq, Message)]
 struct TypeMeta {
     /// apiVersion (field 1, string)
@@ -47,7 +47,7 @@ struct TypeMeta {
 }
 
 /// Unknown — the k8s protobuf envelope.
-/// k8s.io/apimachinery/pkg/runtime/generated.proto
+/// Source: apimachinery-runtime-generated.proto message Unknown
 #[derive(Clone, PartialEq, Message)]
 struct Unknown {
     /// typeMeta (field 1, message)
@@ -67,7 +67,7 @@ struct Unknown {
 // --- k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto ---
 
 /// Time wrapper message (field 1 = int64 seconds since epoch).
-/// Used for creationTimestamp, deletionTimestamp etc.
+/// Source: apimachinery-meta-v1-generated.proto message Time
 #[derive(Clone, PartialEq, Message)]
 struct Time {
     /// seconds (field 1, int64)
@@ -79,6 +79,7 @@ struct Time {
 }
 
 /// MicroTime — same as Time but microsecond precision.
+/// Source: apimachinery-meta-v1-generated.proto message MicroTime
 #[derive(Clone, PartialEq, Message)]
 struct MicroTime {
     #[prost(int64, tag = "1")]
@@ -88,7 +89,7 @@ struct MicroTime {
 }
 
 /// ObjectMeta — common metadata for all Kubernetes objects.
-/// k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
+/// Source: apimachinery-meta-v1-generated.proto message ObjectMeta
 #[derive(Clone, PartialEq, Message)]
 struct ObjectMeta {
     /// name (field 1, string)
@@ -138,6 +139,7 @@ struct ObjectMeta {
 // --- k8s.io/api/core/v1/generated.proto ---
 
 /// NamespaceSpec (field 1=finalizers repeated string)
+/// Source: api-core-v1-generated.proto message NamespaceSpec
 #[derive(Clone, PartialEq, Message)]
 struct NamespaceSpec {
     #[prost(string, repeated, tag = "1")]
@@ -145,6 +147,7 @@ struct NamespaceSpec {
 }
 
 /// NamespaceStatus (field 1=phase string, field 2=conditions repeated bytes)
+/// Source: api-core-v1-generated.proto message NamespaceStatus
 #[derive(Clone, PartialEq, Message)]
 struct NamespaceStatus {
     #[prost(string, tag = "1")]
@@ -154,6 +157,7 @@ struct NamespaceStatus {
 }
 
 /// Namespace — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message Namespace
 #[derive(Clone, PartialEq, Message)]
 struct Namespace {
     /// metadata (field 1, message ObjectMeta)
@@ -168,6 +172,7 @@ struct Namespace {
 }
 
 /// PodTemplate — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message PodTemplate
 /// Only metadata (field 1) is decoded; template (field 2, PodTemplateSpec) is skipped.
 /// The chunking conformance test creates PodTemplates via proto; we only need name/namespace
 /// to return 201 and allow the test to proceed past the Create phase without panicking.
@@ -181,6 +186,7 @@ struct PodTemplate {
 }
 
 /// ResourceRequirements — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ResourceRequirements
 /// limits (field 1) and requests (field 2) are both map<string, Quantity>.
 #[derive(Clone, PartialEq, Message)]
 struct ResourceRequirements {
@@ -193,6 +199,7 @@ struct ResourceRequirements {
 }
 
 /// Container — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message Container
 #[derive(Clone, PartialEq, Message)]
 struct Container {
     /// name (field 1, string)
@@ -210,18 +217,19 @@ struct Container {
     /// resources (field 8, message ResourceRequirements)
     #[prost(message, tag = "8")]
     resources: Option<ResourceRequirements>,
-    /// terminationMessagePath (field 14, string)
-    #[prost(string, tag = "14")]
+    /// terminationMessagePath (field 13, string)
+    #[prost(string, tag = "13")]
     termination_message_path: String,
-    /// imagePullPolicy (field 15, string)
-    #[prost(string, tag = "15")]
+    /// imagePullPolicy (field 14, string)
+    #[prost(string, tag = "14")]
     image_pull_policy: String,
-    /// terminationMessagePolicy (field 21, string)
-    #[prost(string, tag = "21")]
+    /// terminationMessagePolicy (field 20, string)
+    #[prost(string, tag = "20")]
     termination_message_policy: String,
 }
 
 /// PodSpec — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message PodSpec
 /// Field numbers match the official proto exactly:
 ///   field 1  = volumes (skipped — not needed for routing)
 ///   field 2  = containers (repeated Container)
@@ -251,6 +259,7 @@ struct PodSpec {
 }
 
 /// Pod — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message Pod
 #[derive(Clone, PartialEq, Message)]
 struct Pod {
     /// metadata (field 1, message ObjectMeta)
@@ -265,6 +274,7 @@ struct Pod {
 }
 
 /// ConfigMap — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ConfigMap
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMap {
     /// metadata (field 1, message ObjectMeta)
@@ -282,6 +292,7 @@ struct ConfigMap {
 }
 
 /// ServicePort — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ServicePort
 #[derive(Clone, PartialEq, Message)]
 struct ServicePort {
     /// name (field 1, string)
@@ -305,6 +316,7 @@ struct ServicePort {
 }
 
 /// ServiceSpec — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ServiceSpec
 #[derive(Clone, PartialEq, Message)]
 struct ServiceSpec {
     /// ports (field 1, repeated ServicePort)
@@ -331,15 +343,16 @@ struct ServiceSpec {
     /// externalTrafficPolicy (field 11, string)
     #[prost(string, tag = "11")]
     external_traffic_policy: String,
-    /// ipFamilyPolicy (field 21, string)
-    #[prost(string, tag = "21")]
+    /// ipFamilyPolicy (field 17, string)
+    #[prost(string, tag = "17")]
     ip_family_policy: String,
-    /// internalTrafficPolicy (field 24, string)
-    #[prost(string, tag = "24")]
+    /// internalTrafficPolicy (field 22, string)
+    #[prost(string, tag = "22")]
     internal_traffic_policy: String,
 }
 
 /// Service — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message Service
 #[derive(Clone, PartialEq, Message)]
 struct Service {
     /// metadata (field 1, message ObjectMeta)
@@ -354,6 +367,7 @@ struct Service {
 }
 
 /// Secret — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message Secret
 /// Field numbers match the official proto exactly:
 ///   field 1 = metadata (message ObjectMeta)
 ///   field 2 = data (map<string,bytes>)
@@ -380,6 +394,7 @@ struct Secret {
 }
 
 /// ReplicationControllerSpec — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ReplicationControllerSpec
 #[derive(Clone, PartialEq, Message)]
 struct ReplicationControllerSpec {
     /// replicas (field 1, int32)
@@ -394,6 +409,7 @@ struct ReplicationControllerSpec {
 }
 
 /// ReplicationController — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ReplicationController
 #[derive(Clone, PartialEq, Message)]
 struct ReplicationController {
     /// metadata (field 1, message ObjectMeta)
@@ -408,29 +424,31 @@ struct ReplicationController {
 }
 
 /// PersistentVolumeSpec — k8s.io/api/core/v1/generated.proto (key fields only)
+/// Source: api-core-v1-generated.proto message PersistentVolumeSpec
 #[derive(Clone, PartialEq, Message)]
 struct PersistentVolumeSpec {
     /// capacity (field 1, map<string,Quantity>) — decoded as raw bytes (Quantity is complex)
     #[prost(bytes = "vec", tag = "1")]
     capacity: Vec<u8>,
-    /// accessModes (field 6, repeated string)
-    #[prost(string, repeated, tag = "6")]
+    /// accessModes (field 3, repeated string)
+    #[prost(string, repeated, tag = "3")]
     access_modes: Vec<String>,
-    /// claimRef (field 33, message ObjectReference) — decoded as raw bytes
-    #[prost(bytes = "vec", tag = "33")]
+    /// claimRef (field 4, message ObjectReference) — decoded as raw bytes
+    #[prost(bytes = "vec", tag = "4")]
     claim_ref: Vec<u8>,
-    /// persistentVolumeReclaimPolicy (field 26, string)
-    #[prost(string, tag = "26")]
+    /// persistentVolumeReclaimPolicy (field 5, string)
+    #[prost(string, tag = "5")]
     persistent_volume_reclaim_policy: String,
-    /// storageClassName (field 29, string)
-    #[prost(string, tag = "29")]
+    /// storageClassName (field 6, string)
+    #[prost(string, tag = "6")]
     storage_class_name: String,
-    /// volumeMode (field 31, string)
-    #[prost(string, tag = "31")]
+    /// volumeMode (field 8, string)
+    #[prost(string, tag = "8")]
     volume_mode: String,
 }
 
 /// PersistentVolume — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message PersistentVolume
 #[derive(Clone, PartialEq, Message)]
 struct PersistentVolume {
     /// metadata (field 1, message ObjectMeta)
@@ -445,6 +463,7 @@ struct PersistentVolume {
 }
 
 /// NodeSpec — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message NodeSpec
 #[derive(Clone, PartialEq, Message)]
 struct NodeSpec {
     /// podCIDR (field 1, string)
@@ -471,6 +490,7 @@ struct NodeSpec {
 }
 
 /// Node — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message Node
 /// NodeStatus (field 3) is decoded as raw bytes — it contains complex repeated fields
 /// (conditions, addresses, capacity, etc.) that we don't need to read.
 #[derive(Clone, PartialEq, Message)]
@@ -487,6 +507,7 @@ struct Node {
 }
 
 /// ObjectReference — used in Event.involvedObject
+/// Source: api-core-v1-generated.proto message ObjectReference
 #[derive(Clone, PartialEq, Message)]
 struct ObjectReference {
     /// kind (field 1, string)
@@ -513,6 +534,7 @@ struct ObjectReference {
 }
 
 /// EventSource — source component of an Event
+/// Source: api-core-v1-generated.proto message EventSource
 #[derive(Clone, PartialEq, Message)]
 struct EventSource {
     #[prost(string, tag = "1")]
@@ -522,6 +544,7 @@ struct EventSource {
 }
 
 /// EventSeries — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message EventSeries
 #[derive(Clone, PartialEq, Message)]
 struct EventSeries {
     /// count (field 1, int32)
@@ -533,6 +556,7 @@ struct EventSeries {
 }
 
 /// Event — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message Event
 #[derive(Clone, PartialEq, Message)]
 struct Event {
     /// metadata (field 1, message ObjectMeta)
@@ -585,6 +609,8 @@ struct Event {
 // --- k8s.io/api/coordination/v1/generated.proto ---
 
 /// LeaseSpec — k8s.io/api/coordination/v1/generated.proto
+/// Source: k8s.io/api/coordination/v1/generated.proto message LeaseSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct LeaseSpec {
     /// holderIdentity (field 1, string)
@@ -611,6 +637,8 @@ struct LeaseSpec {
 }
 
 /// Lease — k8s.io/api/coordination/v1/generated.proto
+/// Source: k8s.io/api/coordination/v1/generated.proto message Lease
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct Lease {
     /// metadata (field 1, message ObjectMeta)
@@ -624,6 +652,8 @@ struct Lease {
 // --- k8s.io/api/storage/v1/generated.proto ---
 
 /// VolumeNodeResources — used in CSINodeAllocatable
+/// Source: k8s.io/api/storage/v1/generated.proto message VolumeNodeResources
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct VolumeNodeResources {
     /// count (field 1, int32) — maximum number of unique volumes managed by the CSI driver
@@ -632,6 +662,8 @@ struct VolumeNodeResources {
 }
 
 /// CSINodeDriver — k8s.io/api/storage/v1/generated.proto
+/// Source: k8s.io/api/storage/v1/generated.proto message CSINodeDriver
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct CsiNodeDriver {
     /// name (field 1, string)
@@ -649,6 +681,8 @@ struct CsiNodeDriver {
 }
 
 /// CSINodeSpec — k8s.io/api/storage/v1/generated.proto
+/// Source: k8s.io/api/storage/v1/generated.proto message CSINodeSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct CsiNodeSpec {
     /// drivers (field 1, repeated CSINodeDriver)
@@ -657,6 +691,8 @@ struct CsiNodeSpec {
 }
 
 /// CSINode — k8s.io/api/storage/v1/generated.proto
+/// Source: k8s.io/api/storage/v1/generated.proto message CSINode
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct CsiNode {
     /// metadata (field 1, message ObjectMeta)
@@ -668,6 +704,8 @@ struct CsiNode {
 }
 
 /// VolumeAttachmentSource — k8s.io/api/storage/v1/generated.proto
+/// Source: k8s.io/api/storage/v1/generated.proto message VolumeAttachmentSource
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct VolumeAttachmentSource {
     /// persistentVolumeName (field 1, string)
@@ -679,6 +717,8 @@ struct VolumeAttachmentSource {
 }
 
 /// VolumeAttachmentSpec — k8s.io/api/storage/v1/generated.proto
+/// Source: k8s.io/api/storage/v1/generated.proto message VolumeAttachmentSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct VolumeAttachmentSpec {
     /// attacher (field 1, string)
@@ -693,6 +733,8 @@ struct VolumeAttachmentSpec {
 }
 
 /// VolumeAttachment — k8s.io/api/storage/v1/generated.proto
+/// Source: k8s.io/api/storage/v1/generated.proto message VolumeAttachment
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct VolumeAttachment {
     /// metadata (field 1, message ObjectMeta)
@@ -709,6 +751,8 @@ struct VolumeAttachment {
 // --- k8s.io/api/node/v1/generated.proto ---
 
 /// RuntimeClass — k8s.io/api/node/v1/generated.proto
+/// Source: k8s.io/api/node/v1/generated.proto message RuntimeClass
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct RuntimeClass {
     /// metadata (field 1, message ObjectMeta)
@@ -728,6 +772,8 @@ struct RuntimeClass {
 // --- k8s.io/api/authorization/v1/generated.proto ---
 
 /// ResourceAttributes — describes a resource request in SubjectAccessReviewSpec.
+/// Source: k8s.io/api/authorization/v1/generated.proto message ResourceAttributes
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct ResourceAttributes {
     /// namespace (field 1, string)
@@ -754,6 +800,8 @@ struct ResourceAttributes {
 }
 
 /// SubjectAccessReviewSpec — the input to a SubjectAccessReview.
+/// Source: k8s.io/api/authorization/v1/generated.proto message SubjectAccessReviewSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct SubjectAccessReviewSpec {
     /// resourceAttributes (field 1, message ResourceAttributes)
@@ -769,6 +817,8 @@ struct SubjectAccessReviewSpec {
 }
 
 /// SubjectAccessReview — k8s.io/api/authorization/v1/generated.proto
+/// Source: k8s.io/api/authorization/v1/generated.proto message SubjectAccessReview
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct SubjectAccessReviewProto {
     /// metadata (field 1, message ObjectMeta)
@@ -781,6 +831,8 @@ struct SubjectAccessReviewProto {
 }
 
 /// TokenReviewSpec — k8s.io/api/authentication/v1/generated.proto
+/// Source: k8s.io/api/authentication/v1/generated.proto message TokenReviewSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenReviewSpec {
     /// token (field 1, string)
@@ -792,6 +844,8 @@ struct TokenReviewSpec {
 }
 
 /// TokenReview — k8s.io/api/authentication/v1/generated.proto
+/// Source: k8s.io/api/authentication/v1/generated.proto message TokenReview
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenReviewProto {
     /// metadata (field 1, message ObjectMeta)
@@ -806,6 +860,8 @@ struct TokenReviewProto {
 // --- k8s.io/api/authentication/v1/generated.proto ---
 
 /// BoundObjectReference — used in TokenRequestSpec
+/// Source: k8s.io/api/authentication/v1/generated.proto message BoundObjectReference
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct BoundObjectReference {
     /// kind (field 1, string)
@@ -823,6 +879,8 @@ struct BoundObjectReference {
 }
 
 /// TokenRequestSpec — k8s.io/api/authentication/v1/generated.proto
+/// Source: k8s.io/api/authentication/v1/generated.proto message TokenRequestSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenRequestSpec {
     /// audiences (field 1, repeated string)
@@ -837,6 +895,8 @@ struct TokenRequestSpec {
 }
 
 /// TokenRequestStatus — k8s.io/api/authentication/v1/generated.proto
+/// Source: k8s.io/api/authentication/v1/generated.proto message TokenRequestStatus
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenRequestStatus {
     /// token (field 1, string)
@@ -848,6 +908,8 @@ struct TokenRequestStatus {
 }
 
 /// TokenRequest — k8s.io/api/authentication/v1/generated.proto
+/// Source: k8s.io/api/authentication/v1/generated.proto message TokenRequest
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenRequestProto {
     /// metadata (field 1, message ObjectMeta)
@@ -864,6 +926,8 @@ struct TokenRequestProto {
 // --- k8s.io/api/rbac/v1/generated.proto ---
 
 /// PolicyRule — a single RBAC policy rule.
+/// Source: k8s.io/api/rbac/v1/generated.proto message PolicyRule
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct PolicyRule {
     /// verbs (field 1, repeated string)
@@ -884,6 +948,8 @@ struct PolicyRule {
 }
 
 /// Subject — a user, group, or service account in a RoleBinding.
+/// Source: k8s.io/api/rbac/v1/generated.proto message Subject
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct Subject {
     /// kind (field 1, string)
@@ -901,6 +967,8 @@ struct Subject {
 }
 
 /// RoleRef — reference to the role being bound.
+/// Source: k8s.io/api/rbac/v1/generated.proto message RoleRef
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct RoleRef {
     /// apiGroup (field 1, string)
@@ -915,6 +983,8 @@ struct RoleRef {
 }
 
 /// ClusterRole — k8s.io/api/rbac/v1/generated.proto
+/// Source: k8s.io/api/rbac/v1/generated.proto message ClusterRole
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct ClusterRole {
     /// metadata (field 1, message ObjectMeta)
@@ -927,6 +997,8 @@ struct ClusterRole {
 }
 
 /// ClusterRoleBinding — k8s.io/api/rbac/v1/generated.proto
+/// Source: k8s.io/api/rbac/v1/generated.proto message ClusterRoleBinding
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct ClusterRoleBinding {
     /// metadata (field 1, message ObjectMeta)
@@ -941,7 +1013,8 @@ struct ClusterRoleBinding {
 }
 
 /// Role — namespaced, same structure as ClusterRole but namespaced.
-/// k8s.io/api/rbac/v1/generated.proto
+/// Source: k8s.io/api/rbac/v1/generated.proto message Role
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct Role {
     /// metadata (field 1, message ObjectMeta)
@@ -953,7 +1026,8 @@ struct Role {
 }
 
 /// RoleBinding — namespaced.
-/// k8s.io/api/rbac/v1/generated.proto
+/// Source: k8s.io/api/rbac/v1/generated.proto message RoleBinding
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct RoleBinding {
     /// metadata (field 1, message ObjectMeta)
@@ -970,6 +1044,8 @@ struct RoleBinding {
 // --- k8s.io/api/batch/v1/generated.proto ---
 
 /// JobSpec — k8s.io/api/batch/v1/generated.proto
+/// Source: k8s.io/api/batch/v1/generated.proto message JobSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 /// Only scalar/string fields are decoded; template (field 5, PodTemplateSpec) is skipped —
 /// PodSpec is deeply nested and the same strategy as PodTemplate applies.
 #[derive(Clone, PartialEq, Message)]
@@ -1022,6 +1098,8 @@ struct JobSpec {
 }
 
 /// JobTemplateSpec — field 1=ObjectMeta, field 2=JobSpec
+/// Source: k8s.io/api/batch/v1/generated.proto message JobTemplateSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct JobTemplateSpec {
     /// metadata (field 1, message ObjectMeta)
@@ -1033,6 +1111,8 @@ struct JobTemplateSpec {
 }
 
 /// CronJobSpec — k8s.io/api/batch/v1/generated.proto
+/// Source: k8s.io/api/batch/v1/generated.proto message CronJobSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct CronJobSpec {
     /// schedule (field 1, string)
@@ -1062,6 +1142,8 @@ struct CronJobSpec {
 }
 
 /// CronJob — k8s.io/api/batch/v1/generated.proto
+/// Source: k8s.io/api/batch/v1/generated.proto message CronJob
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct CronJob {
     /// metadata (field 1, message ObjectMeta)
@@ -1076,6 +1158,8 @@ struct CronJob {
 }
 
 /// Job — k8s.io/api/batch/v1/generated.proto
+/// Source: k8s.io/api/batch/v1/generated.proto message Job
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct Job {
     /// metadata (field 1, message ObjectMeta)
@@ -1092,6 +1176,8 @@ struct Job {
 // --- k8s.io/api/apps/v1/generated.proto ---
 
 /// StatefulSet — k8s.io/api/apps/v1/generated.proto
+/// Source: k8s.io/api/apps/v1/generated.proto message StatefulSet
+/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 /// Only metadata is decoded; spec is deeply nested and not needed for routing.
 #[derive(Clone, PartialEq, Message)]
 struct StatefulSet {
@@ -1101,6 +1187,8 @@ struct StatefulSet {
 }
 
 /// Deployment — k8s.io/api/apps/v1/generated.proto
+/// Source: k8s.io/api/apps/v1/generated.proto message Deployment
+/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 #[derive(Clone, PartialEq, Message)]
 struct Deployment {
     /// metadata (field 1, message ObjectMeta)
@@ -1109,6 +1197,8 @@ struct Deployment {
 }
 
 /// DaemonSet — k8s.io/api/apps/v1/generated.proto
+/// Source: k8s.io/api/apps/v1/generated.proto message DaemonSet
+/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 #[derive(Clone, PartialEq, Message)]
 struct DaemonSet {
     /// metadata (field 1, message ObjectMeta)
@@ -1117,6 +1207,8 @@ struct DaemonSet {
 }
 
 /// ReplicaSet — k8s.io/api/apps/v1/generated.proto
+/// Source: k8s.io/api/apps/v1/generated.proto message ReplicaSet
+/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 #[derive(Clone, PartialEq, Message)]
 struct ReplicaSet {
     /// metadata (field 1, message ObjectMeta)
@@ -1125,6 +1217,7 @@ struct ReplicaSet {
 }
 
 /// ServiceAccount — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ServiceAccount
 /// secrets (field 2), imagePullSecrets (field 3), automountServiceAccountToken (field 4)
 /// are skipped — not needed for routing.
 #[derive(Clone, PartialEq, Message)]
@@ -1135,6 +1228,7 @@ struct ServiceAccount {
 }
 
 /// PersistentVolumeClaim — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message PersistentVolumeClaim
 #[derive(Clone, PartialEq, Message)]
 struct PersistentVolumeClaim {
     /// metadata (field 1, message ObjectMeta)
@@ -1143,6 +1237,7 @@ struct PersistentVolumeClaim {
 }
 
 /// Endpoints — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message Endpoints
 /// subsets (field 2, repeated EndpointSubset) is skipped — not needed for routing.
 #[derive(Clone, PartialEq, Message)]
 struct Endpoints {
@@ -1154,6 +1249,8 @@ struct Endpoints {
 // --- k8s.io/api/storage/v1/generated.proto ---
 
 /// StorageClass — k8s.io/api/storage/v1/generated.proto
+/// Source: k8s.io/api/storage/v1/generated.proto message StorageClass
+/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 /// spec fields (provisioner, parameters, etc.) are deeply nested; only metadata is decoded.
 #[derive(Clone, PartialEq, Message)]
 struct StorageClass {
@@ -1163,6 +1260,8 @@ struct StorageClass {
 }
 
 /// VolumeAttributesClass — k8s.io/api/storage/v1/generated.proto
+/// Source: k8s.io/api/storage/v1/generated.proto message VolumeAttributesClass
+/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 #[derive(Clone, PartialEq, Message)]
 struct VolumeAttributesClass {
     /// metadata (field 1, message ObjectMeta)
@@ -1173,6 +1272,7 @@ struct VolumeAttributesClass {
 // --- k8s.io/api/core/v1/generated.proto (resource management types) ---
 
 /// ResourceQuota — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ResourceQuota
 /// spec/status fields (hard limits, scopes) are not needed for routing.
 #[derive(Clone, PartialEq, Message)]
 struct ResourceQuota {
@@ -1182,6 +1282,7 @@ struct ResourceQuota {
 }
 
 /// Quantity — k8s.io/apimachinery/pkg/api/resource/generated.proto
+/// Source: apimachinery-resource-generated.proto message Quantity
 ///
 /// Only field 1 (string representation) is decoded; binary/decimal forms are ignored.
 /// This is sufficient for LimitRange admission: we only need the human-readable value
@@ -1194,6 +1295,7 @@ struct Quantity {
 }
 
 /// LimitRangeItem — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message LimitRangeItem
 #[derive(Clone, PartialEq, Message)]
 struct LimitRangeItem {
     /// type (field 1, string) — "Container", "Pod", or "PersistentVolumeClaim"
@@ -1217,6 +1319,7 @@ struct LimitRangeItem {
 }
 
 /// LimitRangeSpec — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message LimitRangeSpec
 #[derive(Clone, PartialEq, Message)]
 struct LimitRangeSpec {
     /// limits (field 1, repeated LimitRangeItem)
@@ -1225,6 +1328,7 @@ struct LimitRangeSpec {
 }
 
 /// LimitRange — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message LimitRange
 #[derive(Clone, PartialEq, Message)]
 struct LimitRange {
     /// metadata (field 1, message ObjectMeta)
@@ -1238,6 +1342,8 @@ struct LimitRange {
 // --- k8s.io/api/policy/v1/generated.proto ---
 
 /// PodDisruptionBudget — k8s.io/api/policy/v1/generated.proto
+/// Source: k8s.io/api/policy/v1/generated.proto message PodDisruptionBudget
+/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 #[derive(Clone, PartialEq, Message)]
 struct PodDisruptionBudget {
     /// metadata (field 1, message ObjectMeta)
@@ -2751,6 +2857,7 @@ pub fn decode_poddisruptionbudget_proto(data: &[u8]) -> Option<serde_json::Value
 // --- k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto ---
 
 /// CustomResourceDefinitionNames — names section of a CRD spec.
+/// Source: apiextensions-v1-generated.proto message CustomResourceDefinitionNames
 #[derive(Clone, PartialEq, Message)]
 struct CrdNames {
     /// plural (field 1)
@@ -2774,6 +2881,7 @@ struct CrdNames {
 }
 
 /// CustomResourceDefinitionVersion — one entry in spec.versions.
+/// Source: apiextensions-v1-generated.proto message CustomResourceDefinitionVersion
 #[derive(Clone, PartialEq, Message)]
 struct CrdVersion {
     /// name (field 1)
@@ -2797,6 +2905,7 @@ struct CrdVersion {
 }
 
 /// CustomResourceDefinitionSpec — the spec section of a CRD.
+/// Source: apiextensions-v1-generated.proto message CustomResourceDefinitionSpec
 #[derive(Clone, PartialEq, Message)]
 struct CrdSpec {
     /// group (field 1)
@@ -2817,6 +2926,7 @@ struct CrdSpec {
 }
 
 /// CustomResourceDefinition — top-level CRD object.
+/// Source: apiextensions-v1-generated.proto message CustomResourceDefinition
 #[derive(Clone, PartialEq, Message)]
 struct Crd {
     /// metadata (field 1)
@@ -2891,6 +3001,8 @@ pub fn decode_crd_proto(data: &[u8]) -> Option<serde_json::Value> {
 // --- k8s.io/api/flowcontrol/v1/generated.proto ---
 
 /// FlowSchema — k8s.io/api/flowcontrol/v1/generated.proto
+/// Source: k8s.io/api/flowcontrol/v1/generated.proto message FlowSchema
+/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 /// Only the metadata field is decoded; the spec is opaque to u7s.
 #[derive(Clone, PartialEq, Message)]
 struct FlowSchema {
@@ -2900,6 +3012,8 @@ struct FlowSchema {
 }
 
 /// PriorityLevelConfiguration — k8s.io/api/flowcontrol/v1/generated.proto
+/// Source: k8s.io/api/flowcontrol/v1/generated.proto message PriorityLevelConfiguration
+/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 /// Only the metadata field is decoded; the spec is opaque to u7s.
 #[derive(Clone, PartialEq, Message)]
 struct PriorityLevelConfiguration {
@@ -3478,10 +3592,10 @@ mod tests {
         let mut obj_meta = encode_length_delimited(1, b"test-pod"); // ObjectMeta.name
         obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
 
-        // Container: field 1=name, field 2=image, field 15=imagePullPolicy
+        // Container: field 1=name, field 2=image, field 14=imagePullPolicy
         let mut container = encode_length_delimited(1, b"myapp"); // name
         container.extend_from_slice(&encode_length_delimited(2, b"myapp:latest")); // image
-        container.extend_from_slice(&encode_length_delimited(15, b"IfNotPresent")); // imagePullPolicy
+        container.extend_from_slice(&encode_length_delimited(14, b"IfNotPresent")); // imagePullPolicy
 
         // PodSpec: field 2 = repeated Container (k8s.io/api/core/v1/generated.proto)
         let pod_spec = encode_length_delimited(2, &container);
@@ -5584,11 +5698,11 @@ mod tests {
         // }
         let obj_meta = encode_length_delimited(1, b"my-pv");
 
-        // PersistentVolumeSpec: field 6=accessModes (repeated string), field 26=reclaimPolicy,
-        // field 29=storageClassName
-        let mut pv_spec = encode_length_delimited(6, b"ReadWriteOnce"); // accessModes[0]
-        pv_spec.extend_from_slice(&encode_length_delimited(26, b"Delete")); // reclaimPolicy
-        pv_spec.extend_from_slice(&encode_length_delimited(29, b"standard")); // storageClassName
+        // PersistentVolumeSpec: field 3=accessModes (repeated string), field 5=reclaimPolicy,
+        // field 6=storageClassName
+        let mut pv_spec = encode_length_delimited(3, b"ReadWriteOnce"); // accessModes[0]
+        pv_spec.extend_from_slice(&encode_length_delimited(5, b"Delete")); // reclaimPolicy
+        pv_spec.extend_from_slice(&encode_length_delimited(6, b"standard")); // storageClassName
 
         let mut pv_proto = encode_length_delimited(1, &obj_meta);
         pv_proto.extend_from_slice(&encode_length_delimited(2, &pv_spec));
@@ -6197,5 +6311,158 @@ mod tests {
         assert_eq!(result["kind"], "PriorityLevelConfiguration");
         assert_eq!(result["apiVersion"], "flowcontrol.apiserver.k8s.io/v1");
         assert_eq!(result["metadata"]["name"], "workload-low");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests — field tag correctness (mayor-52cj)
+    // These tests encode a value at the CORRECT wire tag and verify it appears in
+    // the decoded JSON. If a tag is wrong, prost silently ignores the field and the
+    // asserted JSON key will be absent, causing the test to fail.
+    // ---------------------------------------------------------------------------
+
+    /// Container.imagePullPolicy must be decoded from field 14 (proto canonical tag).
+    /// Fields 13/14/20 were previously off-by-one: terminationMessagePath=14 (should be 13),
+    /// imagePullPolicy=15 (should be 14), terminationMessagePolicy=21 (should be 20).
+    /// A wrong tag causes prost to silently skip the field; the decoded JSON will be missing the
+    /// value, which makes kubectl see empty imagePullPolicy and causes validation failures.
+    #[test]
+    fn container_field_tags_match_upstream_proto() {
+        // Build a minimal Pod with one container that has all three corrected fields set.
+        // Pod: field 1=ObjectMeta, field 2=PodSpec
+        // PodSpec: field 2=containers (repeated Container)
+        // Container: field 1=name, field 13=terminationMessagePath, field 14=imagePullPolicy,
+        //            field 20=terminationMessagePolicy
+        let obj_meta = encode_length_delimited(1, b"tag-test-pod");
+
+        // terminationMessagePath at field 13 (wire type 2, LEN)
+        let term_msg_path = encode_length_delimited(13, b"/dev/termination-log");
+        // imagePullPolicy at field 14 (wire type 2, LEN)
+        let image_pull_policy = encode_length_delimited(14, b"IfNotPresent");
+        // terminationMessagePolicy at field 20 (wire type 2, LEN)
+        let term_msg_policy = encode_length_delimited(20, b"File");
+
+        let mut container = encode_length_delimited(1, b"mycontainer"); // field 1 = name
+        container.extend_from_slice(&term_msg_path);
+        container.extend_from_slice(&image_pull_policy);
+        container.extend_from_slice(&term_msg_policy);
+
+        let podspec_containers = encode_length_delimited(2, &container); // field 2 = containers
+        let pod_proto = {
+            let mut p = encode_length_delimited(1, &obj_meta);
+            p.extend_from_slice(&encode_length_delimited(2, &podspec_containers));
+            p
+        };
+
+        let result = decode_pod_proto(&pod_proto).expect("Pod proto must decode");
+        let containers = result["spec"]["containers"]
+            .as_array()
+            .expect("containers must be present");
+        assert_eq!(containers.len(), 1);
+        assert_eq!(
+            containers[0]["terminationMessagePath"], "/dev/termination-log",
+            "terminationMessagePath must be decoded from field 13; \
+             if this fails the field tag is wrong and kubectl pod creates silently lose this field"
+        );
+        assert_eq!(
+            containers[0]["imagePullPolicy"], "IfNotPresent",
+            "imagePullPolicy must be decoded from field 14; \
+             if this fails the field tag is wrong and pod specs will have no imagePullPolicy"
+        );
+        assert_eq!(
+            containers[0]["terminationMessagePolicy"], "File",
+            "terminationMessagePolicy must be decoded from field 20; \
+             if this fails the field tag is wrong and pod specs will have no terminationMessagePolicy"
+        );
+    }
+
+    /// ServiceSpec.ipFamilyPolicy must be decoded from field 17 and internalTrafficPolicy from
+    /// field 22, not the previously incorrect 21 and 24.
+    /// Wrong tags cause prost to silently ignore these fields; decoded Services will be missing
+    /// ipFamilyPolicy and internalTrafficPolicy, leading to kubectl returning incorrect service specs.
+    #[test]
+    fn servicespec_field_tags_match_upstream_proto() {
+        // Build: Service {
+        //   metadata: { name: "svc-tag-test" },
+        //   spec: {
+        //     clusterIP: "10.0.0.1",    (field 3)
+        //     ipFamilyPolicy: "SingleStack",  (field 17)
+        //     internalTrafficPolicy: "Cluster" (field 22)
+        //   }
+        // }
+        let obj_meta = encode_length_delimited(1, b"svc-tag-test");
+
+        let mut svc_spec = encode_length_delimited(3, b"10.0.0.1"); // clusterIP
+        svc_spec.extend_from_slice(&encode_length_delimited(17, b"SingleStack")); // ipFamilyPolicy
+        svc_spec.extend_from_slice(&encode_length_delimited(22, b"Cluster")); // internalTrafficPolicy
+
+        let mut svc_proto = encode_length_delimited(1, &obj_meta);
+        svc_proto.extend_from_slice(&encode_length_delimited(2, &svc_spec));
+
+        let result = decode_service_proto(&svc_proto).expect("Service proto must decode");
+
+        assert_eq!(
+            result["spec"]["ipFamilyPolicy"], "SingleStack",
+            "ipFamilyPolicy must be decoded from field 17; \
+             previously it was incorrectly tagged as 21, causing it to be silently dropped"
+        );
+        assert_eq!(
+            result["spec"]["internalTrafficPolicy"], "Cluster",
+            "internalTrafficPolicy must be decoded from field 22; \
+             previously it was incorrectly tagged as 24, causing it to be silently dropped"
+        );
+    }
+
+    /// PersistentVolumeSpec field tags must match the upstream proto.
+    /// Previously accessModes=6 (should be 3), claimRef=33 (should be 4),
+    /// persistentVolumeReclaimPolicy=26 (should be 5), storageClassName=29 (should be 6),
+    /// volumeMode=31 (should be 8). All were drastically wrong, so every PV create via proto
+    /// would produce a PV with empty spec fields and incorrect storage policy.
+    #[test]
+    fn persistent_volume_spec_field_tags_match_upstream_proto() {
+        // Build: PersistentVolume {
+        //   metadata: { name: "pv-tag-test" },
+        //   spec: {
+        //     accessModes: ["ReadWriteOnce"],       (field 3, repeated string)
+        //     persistentVolumeReclaimPolicy: "Retain", (field 5, string)
+        //     storageClassName: "standard",         (field 6, string)
+        //     volumeMode: "Filesystem",             (field 8, string)
+        //   }
+        // }
+        let obj_meta = encode_length_delimited(1, b"pv-tag-test");
+
+        let mut pv_spec = encode_length_delimited(3, b"ReadWriteOnce"); // accessModes
+        pv_spec.extend_from_slice(&encode_length_delimited(5, b"Retain")); // persistentVolumeReclaimPolicy
+        pv_spec.extend_from_slice(&encode_length_delimited(6, b"standard")); // storageClassName
+        pv_spec.extend_from_slice(&encode_length_delimited(8, b"Filesystem")); // volumeMode
+
+        let mut pv_proto = encode_length_delimited(1, &obj_meta);
+        pv_proto.extend_from_slice(&encode_length_delimited(2, &pv_spec));
+
+        let result =
+            decode_persistentvolume_proto(&pv_proto).expect("PersistentVolume proto must decode");
+
+        let access_modes = result["spec"]["accessModes"]
+            .as_array()
+            .expect("accessModes must be present as an array");
+        assert!(
+            access_modes.contains(&serde_json::Value::String("ReadWriteOnce".to_string())),
+            "accessModes must be decoded from field 3; \
+             previously tagged as 6, which is storageClassName — caused by transcription error"
+        );
+        assert_eq!(
+            result["spec"]["persistentVolumeReclaimPolicy"], "Retain",
+            "persistentVolumeReclaimPolicy must be decoded from field 5; \
+             previously tagged as 26, so prost would silently ignore it"
+        );
+        assert_eq!(
+            result["spec"]["storageClassName"], "standard",
+            "storageClassName must be decoded from field 6; \
+             previously tagged as 29, so prost would silently ignore it"
+        );
+        assert_eq!(
+            result["spec"]["volumeMode"], "Filesystem",
+            "volumeMode must be decoded from field 8; \
+             previously tagged as 31, so prost would silently ignore it"
+        );
     }
 }
