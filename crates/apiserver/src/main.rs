@@ -418,6 +418,7 @@ fn build_router(state: AppState) -> Router {
             "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}",
             get(handlers::crd::get_crd)
                 .put(handlers::crd::replace_crd)
+                .patch(handlers::crd::patch_crd)
                 .delete(handlers::crd::delete_crd),
         )
         // Authorization reviews (specific paths before generic catch-all)
