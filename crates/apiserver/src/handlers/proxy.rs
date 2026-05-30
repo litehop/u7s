@@ -603,13 +603,70 @@ pub async fn resolve_exec_target<S: Store>(
     };
 
     // Build kubelet exec URL.
-    //   Kubelet exec endpoint: wss://<node-ip>:10250/exec/<ns>/<pod>/<container>?<raw_query>
-    //   The raw query string is forwarded verbatim — it already contains
-    //   command= (possibly repeated), stdin=, stdout=, stderr=, tty=.
-    let kubelet_ws_url = if raw_query.is_empty() {
+    //   Kubelet exec endpoint: wss://<node-ip>:10250/exec/<ns>/<pod>/<container>?<qs>
+    //
+    //   kubectl sends stdin=true/stdout=true/stderr=true (Go bool string encoding).
+    //   Kubelet requires stdin=1/stdout=1/stderr=1 (integer encoding).
+    //   We parse raw_query, normalize the boolean params, and reconstruct the query.
+    //   command= is multi-valued (?command=ls&command=-la) and is preserved as-is.
+    let mut params: Vec<String> = Vec::new();
+    let mut stdin_set = false;
+    let mut stdout_set = false;
+    let mut stderr_set = false;
+    let mut tty_set = false;
+    for pair in raw_query.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "stdin" => {
+                if v == "true" || v == "1" {
+                    stdin_set = true;
+                }
+            }
+            "stdout" => {
+                if v == "true" || v == "1" {
+                    stdout_set = true;
+                }
+            }
+            "stderr" => {
+                if v == "true" || v == "1" {
+                    stderr_set = true;
+                }
+            }
+            "tty" => {
+                if v == "true" || v == "1" {
+                    tty_set = true;
+                }
+            }
+            "command" | "container" => {
+                // command is multi-valued; container is already in the URL path.
+                // Preserve command= entries; skip container= (it's in the path).
+                if k == "command" {
+                    params.push(format!("command={v}"));
+                }
+            }
+            _ => {
+                // Forward any other params verbatim.
+                params.push(pair.to_owned());
+            }
+        }
+    }
+    if stdin_set {
+        params.push("stdin=1".to_owned());
+    }
+    if stdout_set {
+        params.push("stdout=1".to_owned());
+    }
+    if stderr_set {
+        params.push("stderr=1".to_owned());
+    }
+    if tty_set {
+        params.push("tty=1".to_owned());
+    }
+    let qs = params.join("&");
+    let kubelet_ws_url = if qs.is_empty() {
         format!("wss://{node_ip}:10250/exec/{raw_ns}/{pod_name}/{container}")
     } else {
-        format!("wss://{node_ip}:10250/exec/{raw_ns}/{pod_name}/{container}?{raw_query}")
+        format!("wss://{node_ip}:10250/exec/{raw_ns}/{pod_name}/{container}?{qs}")
     };
 
     let tls_config = build_kubelet_tls_config(
@@ -1906,6 +1963,87 @@ mod tests {
     #[test]
     fn attach_target_kubelet_url_contains_node_ip_no_separate_field() {
         let _: fn(AttachTarget) -> String = |t| t.kubelet_ws_url;
+    }
+
+    /// resolve_exec_target must normalize stdin=true/stdout=true to stdin=1/stdout=1.
+    ///
+    /// kubectl sends boolean params as "true" (Go encoding). Kubelet requires "1"
+    /// (integer encoding) — it parses "true" as falsy and returns HTTP 400:
+    /// "you must specify at least 1 of stdin, stdout, stderr".
+    /// This test fails if the normalization is removed from resolve_exec_target.
+    #[tokio::test]
+    async fn resolve_exec_target_normalizes_stdin_true_to_1() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        // kubectl sends boolean params as "true" (Go string encoding).
+        let raw_query = "stdin=true&stdout=true&command=echo";
+        let target = resolve_exec_target(&state, "default", "mypod", Some("app"), raw_query)
+            .await
+            .expect("resolve must succeed for scheduled pod");
+
+        // Kubelet requires "1" not "true" — verify normalization happened.
+        assert!(
+            target.kubelet_ws_url.contains("stdin=1"),
+            "kubelet exec URL must normalize stdin=true to stdin=1; \
+             kubelet parses 'true' as falsy and returns 400: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            target.kubelet_ws_url.contains("stdout=1"),
+            "kubelet exec URL must normalize stdout=true to stdout=1; \
+             kubelet parses 'true' as falsy and returns 400: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            !target.kubelet_ws_url.contains("stdin=true"),
+            "kubelet exec URL must not contain stdin=true — kubelet rejects it: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            !target.kubelet_ws_url.contains("stdout=true"),
+            "kubelet exec URL must not contain stdout=true — kubelet rejects it: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            target.kubelet_ws_url.contains("command=echo"),
+            "kubelet exec URL must preserve command= params: {}",
+            target.kubelet_ws_url
+        );
     }
 
     /// resolve_exec_target must embed the node IP in kubelet_ws_url so that
