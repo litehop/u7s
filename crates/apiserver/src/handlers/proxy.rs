@@ -606,8 +606,8 @@ pub async fn resolve_exec_target<S: Store>(
     //   Kubelet exec endpoint: wss://<node-ip>:10250/exec/<ns>/<pod>/<container>?<qs>
     //
     //   kubectl sends stdin=true/stdout=true/stderr=true (Go bool string encoding).
-    //   Kubelet requires stdin=1/stdout=1/stderr=1 (integer encoding).
-    //   We parse raw_query, normalize the boolean params, and reconstruct the query.
+    //   Kubelet uses different param names: input/output/error (not stdin/stdout/stderr).
+    //   Also normalizes boolean values: true→1. Reconstructs the query for kubelet.
     //   command= is multi-valued (?command=ls&command=-la) and is preserved as-is.
     let mut params: Vec<String> = Vec::new();
     let mut stdin_set = false;
@@ -650,14 +650,17 @@ pub async fn resolve_exec_target<S: Store>(
             }
         }
     }
+    // Kubelet uses different param names than kubectl on the exec endpoint:
+    // kubectl: stdin/stdout/stderr  →  kubelet: input/output/error
+    // (k8s.io/api/core/types.go ExecStdinParam="input", ExecStdoutParam="output", ExecStderrParam="error")
     if stdin_set {
-        params.push("stdin=1".to_owned());
+        params.push("input=1".to_owned());
     }
     if stdout_set {
-        params.push("stdout=1".to_owned());
+        params.push("output=1".to_owned());
     }
     if stderr_set {
-        params.push("stderr=1".to_owned());
+        params.push("error=1".to_owned());
     }
     if tty_set {
         params.push("tty=1".to_owned());
@@ -1340,8 +1343,8 @@ mod tests {
             target.kubelet_ws_url
         );
         assert!(
-            target.kubelet_ws_url.contains("stdin=1"),
-            "kubelet exec URL must include stdin=1: {}",
+            target.kubelet_ws_url.contains("input=1"),
+            "kubelet exec URL must translate stdin to input=1: {}",
             target.kubelet_ws_url
         );
     }
@@ -1965,7 +1968,9 @@ mod tests {
         let _: fn(AttachTarget) -> String = |t| t.kubelet_ws_url;
     }
 
-    /// resolve_exec_target must normalize stdin=true/stdout=true to stdin=1/stdout=1.
+    /// resolve_exec_target must translate kubectl params to kubelet params:
+    /// stdin→input, stdout→output, stderr→error, and normalize true→1.
+    /// Kubelet uses input/output/error (k8s.io/api/core/types.go ExecStdinParam="input").
     ///
     /// kubectl sends boolean params as "true" (Go encoding). Kubelet requires "1"
     /// (integer encoding) — it parses "true" as falsy and returns HTTP 400:
@@ -2010,33 +2015,34 @@ mod tests {
             .await
             .expect("seed node");
 
-        // kubectl sends boolean params as "true" (Go string encoding).
+        // kubectl sends boolean params as "true" (Go string encoding) with kubectl param names.
         let raw_query = "stdin=true&stdout=true&command=echo";
         let target = resolve_exec_target(&state, "default", "mypod", Some("app"), raw_query)
             .await
             .expect("resolve must succeed for scheduled pod");
 
-        // Kubelet requires "1" not "true" — verify normalization happened.
+        // Kubelet uses different param names: input/output/error (not stdin/stdout/stderr).
+        // See k8s.io/api/core/types.go: ExecStdinParam="input", ExecStdoutParam="output".
         assert!(
-            target.kubelet_ws_url.contains("stdin=1"),
-            "kubelet exec URL must normalize stdin=true to stdin=1; \
-             kubelet parses 'true' as falsy and returns 400: {}",
+            target.kubelet_ws_url.contains("input=1"),
+            "kubelet exec URL must translate stdin=true to input=1 — \
+             kubelet uses 'input' not 'stdin' (ExecStdinParam constant): {}",
             target.kubelet_ws_url
         );
         assert!(
-            target.kubelet_ws_url.contains("stdout=1"),
-            "kubelet exec URL must normalize stdout=true to stdout=1; \
-             kubelet parses 'true' as falsy and returns 400: {}",
+            target.kubelet_ws_url.contains("output=1"),
+            "kubelet exec URL must translate stdout=true to output=1 — \
+             kubelet uses 'output' not 'stdout' (ExecStdoutParam constant): {}",
             target.kubelet_ws_url
         );
         assert!(
-            !target.kubelet_ws_url.contains("stdin=true"),
-            "kubelet exec URL must not contain stdin=true — kubelet rejects it: {}",
+            !target.kubelet_ws_url.contains("stdin="),
+            "kubelet exec URL must not contain 'stdin=' — kubelet ignores it and returns 400: {}",
             target.kubelet_ws_url
         );
         assert!(
-            !target.kubelet_ws_url.contains("stdout=true"),
-            "kubelet exec URL must not contain stdout=true — kubelet rejects it: {}",
+            !target.kubelet_ws_url.contains("stdout="),
+            "kubelet exec URL must not contain 'stdout=' — kubelet ignores it and returns 400: {}",
             target.kubelet_ws_url
         );
         assert!(
