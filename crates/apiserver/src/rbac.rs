@@ -112,7 +112,16 @@ impl RbacIndex {
                 inner.roles.insert((ns, name), role.rules);
             }
         } else if key.contains("/rolebindings/") {
-            if let Ok(binding) = serde_json::from_value::<RbacBinding>(value.clone()) {
+            if let Ok(mut binding) = serde_json::from_value::<RbacBinding>(value.clone()) {
+                // Kubernetes stores namespace in metadata.namespace, not as a top-level
+                // field. If the JSON body didn't include a top-level namespace, fall back
+                // to extracting it from the key path
+                // (/apis/rbac.../v1/namespaces/<ns>/rolebindings/<name>).
+                // Without this, namespace_bindings always has namespace=None and the
+                // is_allowed check (which compares binding_ns != req_ns) never matches.
+                if binding.namespace.is_none() {
+                    binding.namespace = extract_namespace(key);
+                }
                 inner.namespace_bindings.retain(|(k, _)| k != key);
                 inner.namespace_bindings.push((key.to_owned(), binding));
             }
@@ -1636,6 +1645,86 @@ mod tests {
         assert!(
             !idx.is_allowed(&r_post),
             "POST /version must be denied — verb mismatch must not be ignored"
+        );
+    }
+
+    // --- Regression: RoleBinding namespace from key path (mayor-k8z4) ---
+
+    #[test]
+    fn rolebinding_namespace_extracted_from_key_when_not_in_json_body() {
+        // When a RoleBinding is stored via apply_object, the namespace is in the key
+        // path (/apis/.../namespaces/<ns>/rolebindings/<name>) but NOT as a top-level
+        // field in the JSON body — Kubernetes stores it in metadata.namespace.
+        // If apply_object fails to extract the namespace from the key, binding.namespace
+        // stays None, and is_allowed never matches it against any request namespace,
+        // causing a SubjectAccessReview for a bound ServiceAccount to return allowed=false.
+        // This is the exact failure mode from the conformance test (mayor-k8z4).
+        let idx = RbacIndex::new();
+
+        // Role in "test-ns" (namespace comes from key path — the helper puts it in the key).
+        let role_key =
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/test-ns/roles/pod-reader".to_owned();
+        let role_val = json!({
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get", "list"]
+            }]
+        });
+        idx.apply_object(&role_key, &role_val);
+
+        // RoleBinding in "test-ns" whose JSON body does NOT have a top-level "namespace"
+        // field — this matches what create_namespaced_resource stores (namespace is in
+        // metadata.namespace, not at the top level).
+        let bind_key =
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/test-ns/rolebindings/sa-binding"
+                .to_owned();
+        let bind_val = json!({
+            "subjects": [{ "kind": "ServiceAccount", "namespace": "test-ns", "name": "my-sa" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": "pod-reader"
+            }
+            // Note: no top-level "namespace" key — matches real stored JSON
+        });
+        idx.apply_object(&bind_key, &bind_val);
+
+        let groups: Vec<String> = vec![
+            "system:serviceaccounts".to_owned(),
+            "system:serviceaccounts:test-ns".to_owned(),
+        ];
+
+        // The SA username as encoded by the Kubernetes TokenReview.
+        let r = req(
+            "system:serviceaccount:test-ns:my-sa",
+            &groups,
+            "get",
+            "pods",
+            "",
+            Some("test-ns"),
+            None,
+        );
+        assert!(
+            idx.is_allowed(&r),
+            "system:serviceaccount:test-ns:my-sa must be allowed via its RoleBinding; \
+             a regression here means apply_object failed to extract the namespace from \
+             the key path and SubjectAccessReview returns allowed=false for bound SAs"
+        );
+
+        // Must be denied in a different namespace — RoleBinding is namespace-scoped.
+        let r_other = req(
+            "system:serviceaccount:test-ns:my-sa",
+            &groups,
+            "get",
+            "pods",
+            "",
+            Some("other-ns"),
+            None,
+        );
+        assert!(
+            !idx.is_allowed(&r_other),
+            "RoleBinding in 'test-ns' must not grant access in 'other-ns'"
         );
     }
 }
