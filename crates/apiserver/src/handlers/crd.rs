@@ -1165,7 +1165,7 @@ mod tests {
             continue_token: None,
             send_initial_events: Some(true),
             allow_watch_bookmarks: Some(true),
-            timeout_seconds: None,
+            timeout_seconds: Some(1), // stream closes after 1s so to_bytes can return with collected data
         });
 
         let resp = list_crds(
@@ -1181,10 +1181,11 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("list_crds with POM Accept must succeed"));
 
-        // Read the watch stream with a short timeout (initial-events BOOKMARK is emitted immediately).
+        // Read until stream closes (timeout_seconds=1) or the 3-second guard fires.
+        // The initial-events BOOKMARK is emitted before any live-event wait.
         let body = resp.into_body();
         let bytes = timeout(
-            Duration::from_millis(500),
+            Duration::from_secs(3),
             axum::body::to_bytes(body, usize::MAX),
         )
         .await

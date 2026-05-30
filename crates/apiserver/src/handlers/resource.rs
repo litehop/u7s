@@ -4091,7 +4091,7 @@ mod tests {
                 continue_token: None,
                 send_initial_events: Some(true),
                 allow_watch_bookmarks: Some(true),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s so to_bytes can return with collected data
             }),
             pom_accept_headers(),
             axum::Extension(crate::auth::UserInfo {
@@ -4105,11 +4105,12 @@ mod tests {
 
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
-        // Read the stream with a short timeout — initial events are emitted synchronously.
+        // Read until stream closes (timeout_seconds=1) or the 3-second guard fires.
+        // Initial events are emitted synchronously before the live-event wait.
         use tokio::time::{timeout, Duration};
         let body = resp.into_body();
         let bytes = timeout(
-            Duration::from_millis(300),
+            Duration::from_secs(3),
             axum::body::to_bytes(body, usize::MAX),
         )
         .await
@@ -5365,8 +5366,8 @@ mod tests {
     /// no MODIFIED event will appear in the stream.
     ///
     /// Test structure: events are pre-seeded into the ring buffer BEFORE opening the watch
-    /// so replay is synchronous.  The state is consumed (not cloned) into watch_generic so
-    /// the broadcast channel closes when the watch is done, terminating the stream body.
+    /// so replay is synchronous. timeout_seconds=1 closes the stream after 1s, allowing
+    /// to_bytes to return with the collected data.
     #[tokio::test]
     async fn configmap_patch_emits_modified_watch_event_with_deleted_key_absent() {
         use axum::body::to_bytes;
@@ -5437,10 +5438,9 @@ mod tests {
             // tmp_state is dropped here; the store Arc count goes back down to 1 (only `store`).
         }
 
-        // 3. Build watch state consuming the store Arc so the broadcast channel closes
-        //    when watch_generic drops its state — allowing to_bytes to complete.
+        // 3. Build watch state from the store Arc.
         let watch_state = crate::state::AppState::new(
-            store, // consumed: no other Arc refs after this
+            store,
             None,
             None,
             std::collections::HashMap::new(),
@@ -5448,8 +5448,10 @@ mod tests {
         );
 
         // 4. Subscribe a WATCH from rv=0 so the ring buffer replays ADDED and MODIFIED.
-        //    watch_state is consumed (not cloned), so when the stream generator drops it
-        //    the broadcast channel closes and the Body terminates.
+        //    timeout_seconds=1 closes the stream after 1s so to_bytes can return with data.
+        //    (Previously this relied on watch_state being the only store Arc so the broadcast
+        //    channel would close when watch_generic dropped it — that shortcut was fixed by
+        //    the mayor-8tiu _store_keepalive fix which keeps the store alive for the stream.)
         let resp = super::watch_generic(
             watch_state,
             super::WatchConfig {
@@ -5465,16 +5467,20 @@ mod tests {
                 as_partial_object_metadata: false,
                 group: "".into(),
                 plural: "configmaps".into(),
-                timeout_seconds: None,
+                timeout_seconds: Some(1), // stream closes after 1s; ring buffer events arrive before that
             },
         )
         .await
         .unwrap_or_else(|_| panic!("watch must succeed"));
 
-        // 5. Collect the body (terminates when broadcast channel closes).
-        let body_bytes = to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap_or_default();
+        // 5. Collect the body (terminates when timeout_seconds=1 fires, or 3s guard).
+        let body_bytes = tokio::time::timeout(
+            tokio::time::Duration::from_secs(3),
+            to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await
+        .unwrap_or(Ok(bytes::Bytes::new()))
+        .unwrap_or_default();
         let text = std::str::from_utf8(&body_bytes).unwrap_or("");
         let lines: Vec<serde_json::Value> = text
             .lines()

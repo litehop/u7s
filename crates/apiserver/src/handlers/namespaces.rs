@@ -1199,7 +1199,7 @@ mod tests {
             continue_token: None,
             send_initial_events: Some(true),
             allow_watch_bookmarks: Some(true),
-            timeout_seconds: None,
+            timeout_seconds: Some(1), // stream closes after 1s so to_bytes can return with collected data
         };
 
         let resp = match list_namespaces(
@@ -1219,10 +1219,11 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Read whatever arrives within a short window; the BOOKMARK must be in the initial burst.
+        // Read until stream closes (timeout_seconds=1) or the 3-second guard fires.
+        // The BOOKMARK must be in the initial burst before any live-event wait.
         let body = resp.into_body();
         let result = timeout(
-            Duration::from_millis(300),
+            Duration::from_secs(3),
             axum::body::to_bytes(body, usize::MAX),
         )
         .await;
@@ -2532,6 +2533,85 @@ mod tests {
         assert_eq!(
             mf[0]["operation"], "Apply",
             "managedFields[0].operation must be 'Apply' for SSA requests"
+        );
+    }
+
+    /// Regression test for mayor-8tiu: `GET /api/v1/namespaces?watch=true` with no
+    /// sendInitialEvents and an empty namespace store must stay open for the requested
+    /// timeoutSeconds, not close immediately with 0 bytes.
+    ///
+    /// The bug: the broadcast sender (`tx`) inside SqliteStore is dropped when `state`
+    /// (the handler-local AppState clone) drops at the end of `list_namespaces`. If
+    /// `state` holds the only `Arc<S>` reference, the store is destroyed, `tx` is dropped,
+    /// and the broadcast receiver immediately gets `RecvError::Closed`, causing the stream
+    /// generator to `return` — yielding `Poll::Ready(None)` — which closes the watch body
+    /// with 0 bytes before `timeoutSeconds` expires.
+    ///
+    /// The fix: `watch_generic` now captures `_store_keepalive = Arc::clone(&state.store)`
+    /// inside the `chunk_stream` closure, keeping the store (and therefore `tx`) alive for
+    /// the entire lifetime of the streaming response body.
+    ///
+    /// Without the fix: body completes in << 1 second (store drops → tx drops → Closed).
+    /// With the fix: body completes after ~1 second (timeoutSeconds=1 fires correctly).
+    ///
+    /// This test fails if `_store_keepalive` is removed from `watch_generic`'s chunk_stream.
+    #[tokio::test]
+    async fn namespace_watch_rv0_no_send_initial_events_stays_open_for_timeout() {
+        use tokio::time::{timeout, Duration, Instant};
+
+        // make_state() creates the store internally — AppState holds the only Arc<S>.
+        // When list_namespaces moves `state` in and drops it, no external reference
+        // remains. Without _store_keepalive in chunk_stream, tx drops and the stream
+        // closes immediately rather than waiting for timeoutSeconds.
+        let state = make_state();
+
+        let query = crate::handlers::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: Some(false), // no bookmarks — body will be empty
+            timeout_seconds: Some(1),           // server closes after 1s
+        };
+
+        let resp = match list_namespaces(
+            State(state),
+            Query(query),
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => panic!("watch must not error"),
+        };
+
+        // `state` has been dropped inside list_namespaces. Without the fix, the store
+        // (and tx) are now destroyed — the broadcast rx returns Closed immediately.
+        // We measure how long it takes to drain the body: if the stream closed immediately
+        // (bug), to_bytes returns in microseconds. If the stream respects timeoutSeconds=1
+        // (fix), to_bytes returns after ~1 second.
+        let t0 = Instant::now();
+        let _ = timeout(
+            Duration::from_secs(3), // outer guard so the test doesn't hang
+            axum::body::to_bytes(resp.into_body(), usize::MAX),
+        )
+        .await;
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed.as_millis() >= 900,
+            "namespace watch with timeoutSeconds=1 must stay open for at least 900ms; \
+             if it closes immediately ({}ms), the broadcast tx was dropped when the handler's \
+             AppState was destroyed — the _store_keepalive fix in watch_generic is needed to \
+             keep the store alive for the stream's lifetime (mayor-8tiu)",
+            elapsed.as_millis()
         );
     }
 }
