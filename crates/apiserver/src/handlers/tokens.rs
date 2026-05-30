@@ -38,6 +38,8 @@ struct TokenRequestSpec {
     expiration_seconds: u64,
     #[serde(default)]
     audiences: Vec<String>,
+    #[serde(default)]
+    bound_object_ref: Option<serde_json::Value>,
 }
 
 fn default_expiration() -> u64 {
@@ -116,6 +118,7 @@ pub async fn create_token<S: Store>(
         TokenRequestSpec {
             expiration_seconds: default_expiration(),
             audiences: vec!["https://kubernetes.default.svc".to_owned()],
+            bound_object_ref: None,
         }
     } else if let Some(env) = decode_k8s_proto_envelope(&body) {
         // Proto path: inner raw is a protobuf-encoded TokenRequest.
@@ -124,6 +127,7 @@ pub async fn create_token<S: Store>(
         TokenRequestSpec {
             expiration_seconds: fields.expiration_seconds.unwrap_or_else(default_expiration),
             audiences: fields.audiences,
+            bound_object_ref: fields.bound_object_ref,
         }
     } else {
         // JSON path: body is plain JSON (older kubectl, direct API calls).
@@ -174,14 +178,20 @@ pub async fn create_token<S: Store>(
     // Include spec.expirationSeconds and spec.audiences in the response so that kubelet's
     // token_manager can read them. Kubelet reads spec.expirationSeconds to schedule token
     // refresh; if absent it logs "Expiration seconds was nil for token request" and falls back.
+    // Echo spec.boundObjectRef from the request so kubelet's DeleteServiceAccountToken can
+    // access BoundObjectRef.UID without a nil-pointer dereference (token_manager.go:139).
     let expiration_timestamp = secs_to_rfc3339(exp);
+    let mut spec_resp = serde_json::json!({
+        "audiences": claims.aud,
+        "expirationSeconds": spec.expiration_seconds
+    });
+    if let Some(bor) = spec.bound_object_ref {
+        spec_resp["boundObjectRef"] = bor;
+    }
     let resp = serde_json::json!({
         "apiVersion": "authentication.k8s.io/v1",
         "kind": "TokenRequest",
-        "spec": {
-            "audiences": claims.aud,
-            "expirationSeconds": spec.expiration_seconds
-        },
+        "spec": spec_resp,
         "status": {
             "token": token,
             "expirationTimestamp": expiration_timestamp
@@ -827,6 +837,107 @@ mod handler_tests {
         assert_eq!(
             claims["aud"][0], "https://kubernetes.default.svc.cluster.local",
             "audience from protobuf body must appear in JWT aud claim"
+        );
+    }
+
+    /// Regression test for mayor-0awf: when a TokenRequest body includes spec.boundObjectRef,
+    /// the response must echo it back in spec.boundObjectRef.
+    ///
+    /// kubelet's DeleteServiceAccountToken (token_manager.go:139) accesses
+    /// tr.Spec.BoundObjectRef.UID for every cached token on pod teardown. If boundObjectRef is
+    /// absent from the response, the cached entry has a nil pointer, causing a panic and
+    /// preventing pod cleanup. The real kube-apiserver always echoes this field back.
+    ///
+    /// This test will fail if the boundObjectRef echo is removed from create_token.
+    #[tokio::test]
+    async fn create_token_echoes_bound_object_ref() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-bor-test").await;
+
+        let req_body = serde_json::json!({
+            "spec": {
+                "audiences": ["https://kubernetes.default.svc"],
+                "expirationSeconds": 3607,
+                "boundObjectRef": {
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "name": "my-pod",
+                    "uid": "pod-uid-abc-123"
+                }
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "token request with boundObjectRef must succeed: status={} message={}",
+                e.0, e.1.message
+            ),
+        };
+
+        // spec.boundObjectRef must be present — without it kubelet panics at token_manager.go:139
+        let bor = &resp_body["spec"]["boundObjectRef"];
+        assert!(
+            bor.is_object(),
+            "spec.boundObjectRef must be present in response to prevent kubelet nil-pointer panic (mayor-0awf)"
+        );
+        assert_eq!(
+            bor["kind"], "Pod",
+            "boundObjectRef.kind must be echoed from request"
+        );
+        assert_eq!(
+            bor["name"], "my-pod",
+            "boundObjectRef.name must be echoed from request"
+        );
+        assert_eq!(
+            bor["uid"], "pod-uid-abc-123",
+            "boundObjectRef.uid must be echoed — kubelet reads this to identify the bound pod"
+        );
+        assert_eq!(
+            bor["apiVersion"], "v1",
+            "boundObjectRef.apiVersion must be echoed from request"
+        );
+    }
+
+    /// When a TokenRequest body omits spec.boundObjectRef, the response must not fabricate one.
+    /// Only echo what the caller sends — do not invent a boundObjectRef when the request omits it.
+    #[tokio::test]
+    async fn create_token_omits_bound_object_ref_when_absent() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-no-bor").await;
+
+        let req_body = serde_json::json!({
+            "spec": {
+                "audiences": ["https://kubernetes.default.svc"],
+                "expirationSeconds": 3607
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "token request without boundObjectRef must succeed: status={}",
+                e.0
+            ),
+        };
+
+        assert!(
+            resp_body["spec"]["boundObjectRef"].is_null(),
+            "spec.boundObjectRef must be absent when not sent in request (must not fabricate)"
         );
     }
 
