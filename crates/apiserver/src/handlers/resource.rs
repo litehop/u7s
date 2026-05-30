@@ -246,7 +246,8 @@ pub async fn create_resource<S: Store>(
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body).map_err(Status::bad_request)?;
+    super::defaults::validate_resource(&group, &plural, &obj.body)
+        .map_err(Status::unprocessable_entity)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -347,7 +348,8 @@ pub async fn replace_resource<S: Store>(
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body).map_err(Status::bad_request)?;
+    super::defaults::validate_resource(&group, &plural, &obj.body)
+        .map_err(Status::unprocessable_entity)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -515,7 +517,7 @@ pub(crate) async fn do_patch<S: Store>(
         stamp_metadata(&mut obj);
         super::defaults::apply_defaults(group, plural, &mut obj.body);
         super::defaults::validate_resource(group, plural, &obj.body)
-            .map_err(Status::bad_request)?;
+            .map_err(Status::unprocessable_entity)?;
         let new_rv = match state.store.put(key, obj.to_bytes(), Some(0)).await {
             Ok(rv) => rv,
             Err(StoreError::AlreadyExists { .. }) => {
@@ -535,7 +537,7 @@ pub(crate) async fn do_patch<S: Store>(
                     .map_err(|e| Status::bad_request(e.to_string()))?;
                 super::defaults::apply_defaults(group, plural, &mut current.body);
                 super::defaults::validate_resource(group, plural, &current.body)
-                    .map_err(Status::bad_request)?;
+                    .map_err(Status::unprocessable_entity)?;
                 if let Some(fm) = field_manager {
                     let api_ver = current.body["apiVersion"]
                         .as_str()
@@ -596,7 +598,7 @@ pub(crate) async fn do_patch<S: Store>(
     }
     super::defaults::apply_defaults(group, plural, &mut current.body);
     super::defaults::validate_resource(group, plural, &current.body)
-        .map_err(Status::bad_request)?;
+        .map_err(Status::unprocessable_entity)?;
 
     // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
     let current_meta: ObjectMeta =
@@ -931,7 +933,8 @@ pub async fn create_namespaced_resource<S: Store>(
     }
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body).map_err(Status::bad_request)?;
+    super::defaults::validate_resource(&group, &plural, &obj.body)
+        .map_err(Status::unprocessable_entity)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -1034,7 +1037,8 @@ pub async fn replace_namespaced_resource<S: Store>(
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
-    super::defaults::validate_resource(&group, &plural, &obj.body).map_err(Status::bad_request)?;
+    super::defaults::validate_resource(&group, &plural, &obj.body)
+        .map_err(Status::unprocessable_entity)?;
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -5827,6 +5831,59 @@ mod tests {
             v["spec"]["selector"],
             serde_json::json!({ "matchLabels": { "app": "my-ss" } }),
             "spec.selector must be populated from spec.template.metadata.labels"
+        );
+    }
+
+    /// POST a Deployment with no spec.selector AND no spec.template.metadata.labels must
+    /// return 422 Unprocessable Entity (not 500, not 400, not 201).
+    ///
+    /// The real kube-apiserver returns 422 for this case.  Without the fix, u7s returned
+    /// 400 (bad_request) instead of 422 (unprocessable_entity), so the AdmissionWebhook
+    /// conformance test's BeforeEach failed to create sample-webhook-deployment with:
+    ///   "Deployment.spec.selector is required and could not be defaulted"
+    ///
+    /// This test FAILS if the validate_resource error is mapped to Status::bad_request
+    /// instead of Status::unprocessable_entity, or if validation is skipped entirely.
+    #[tokio::test]
+    async fn deployment_without_selector_or_labels_returns_422() {
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // No spec.selector, no spec.template.metadata.labels — cannot be defaulted.
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "bad-deploy", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "spec": { "containers": [{ "name": "c", "image": "nginx" }] }
+                }
+            }
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "Deployment with no selector and no template labels must return 422 — \
+             the real kube-apiserver returns 422 Invalid for this case; returning 400 or 500 \
+             breaks the AdmissionWebhook conformance test's BeforeEach (mayor-p807)"
         );
     }
 
