@@ -165,6 +165,7 @@ pub(crate) fn store_err(err: StoreError, name: &str, kind: &str) -> crate::statu
                     message: other.to_string(),
                     reason: "InternalError",
                     code: status.as_u16(),
+                    metadata: None,
                 },
             )
         }
@@ -328,8 +329,13 @@ pub(crate) fn decode_continue(
     mac.update(&payload_bytes);
     // verify_slice uses constant-time comparison.
     mac.verify_slice(&sig_bytes).map_err(|_| {
-        // Return 410 so clients re-list; matches behaviour for expired tokens.
-        Status::expired("continue token signature invalid; re-list from the beginning".to_string())
+        // Return 410 with a fresh start-of-list token so clients can restart pagination.
+        // Kubernetes spec requires metadata.continue in the 410 body.
+        let fresh_token = encode_continue("", signing_key);
+        Status::expired_with_continue(
+            "continue token signature invalid; re-list from the beginning".to_string(),
+            fresh_token,
+        )
     })?;
 
     // Signature valid — parse payload.
@@ -340,10 +346,16 @@ pub(crate) fn decode_continue(
     })?;
     let age = unix_now().saturating_sub(issued_at);
     if age > CONTINUE_TOKEN_TTL_SECS {
-        return Err(Status::expired(format!(
-            "continue token expired: issued {age}s ago (TTL is {CONTINUE_TOKEN_TTL_SECS}s); \
-             re-list from the beginning"
-        )));
+        // Include a fresh start-of-list token so clients can restart pagination from the
+        // beginning without issuing an extra list call (Kubernetes chunking conformance).
+        let fresh_token = encode_continue("", signing_key);
+        return Err(Status::expired_with_continue(
+            format!(
+                "continue token expired: issued {age}s ago (TTL is {CONTINUE_TOKEN_TTL_SECS}s); \
+                 re-list from the beginning"
+            ),
+            fresh_token,
+        ));
     }
     payload["k"]
         .as_str()
@@ -873,6 +885,57 @@ mod tests {
         assert_eq!(
             err.1.reason, "Expired",
             "Status.reason must be 'Expired' so client-go recognises the pagination reset"
+        );
+    }
+
+    #[test]
+    fn expired_continue_token_error_includes_new_continue_token_in_metadata() {
+        // Kubernetes chunking conformance: when a paginated list uses an expired continue
+        // token the 410 response body must include `metadata.continue` with a fresh token
+        // pointing to the start of the list (key == "").  Without this, the client cannot
+        // resume pagination and must re-issue an un-paginated list request.
+        //
+        // This test MUST FAIL if the `Status::expired_with_continue` path is removed or
+        // if the error no longer carries `metadata` — reverting the fix causes the
+        // Kubernetes conformance test (chunking.go:202) to fail: the client discards the
+        // 410 and cannot proceed to page 2.
+        let old_iat = 0u64; // Unix epoch — definitely expired
+        let payload = serde_json::json!({"k": "/registry/podtemplates/default/foo", "t": old_iat})
+            .to_string();
+        use base64::Engine;
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload_b64 = b64.encode(payload.as_bytes());
+        let mut mac = <Hmac<Sha256>>::new_from_slice(TEST_KEY).expect("HMAC accepts any key size");
+        mac.update(payload.as_bytes());
+        let sig = mac.finalize().into_bytes();
+        let stale_token = format!("{payload_b64}.{}", b64.encode(sig));
+
+        let err = decode_continue(&stale_token, TEST_KEY).unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::GONE);
+
+        // metadata.continue must be present — client-go reads this field to restart pagination.
+        let meta = err.1.metadata.as_ref().expect(
+            "expired-token 410 response must include metadata.continue; \
+             without it, client-go cannot restart the paginated list from the beginning \
+             (Kubernetes conformance: chunking.go:202 step 3→4)",
+        );
+        let cont = meta["continue"].as_str().expect(
+            "metadata.continue must be a string, not null; \
+             null would cause client-go to treat the response as a hard error",
+        );
+        assert!(
+            !cont.is_empty(),
+            "metadata.continue must be a non-empty token, not an empty string"
+        );
+
+        // The new token must decode to the empty key (start from beginning).
+        let decoded_key = ok(decode_continue(cont, TEST_KEY));
+        assert_eq!(
+            decoded_key, "",
+            "the new continue token in metadata.continue must point to the start of the list \
+             (empty key), not to the middle of the collection"
         );
     }
 
