@@ -2093,6 +2093,9 @@ pub fn decode_event_proto(data: &[u8]) -> Option<serde_json::Value> {
 pub struct TokenRequestFields {
     pub audiences: Vec<String>,
     pub expiration_seconds: Option<u64>,
+    /// Echo of spec.boundObjectRef from the request, as a JSON value.
+    /// None when the request did not include a boundObjectRef.
+    pub bound_object_ref: Option<serde_json::Value>,
 }
 
 /// Decode the inner raw bytes of a protobuf-encoded TokenRequest.
@@ -2113,9 +2116,18 @@ pub fn decode_token_request(raw: &[u8]) -> Option<TokenRequestFields> {
     } else {
         None
     };
+    let bound_object_ref = spec.bound_object_ref.map(|bor| {
+        serde_json::json!({
+            "apiVersion": bor.api_version,
+            "kind": bor.kind,
+            "name": bor.name,
+            "uid": bor.uid,
+        })
+    });
     Some(TokenRequestFields {
         audiences: spec.audiences,
         expiration_seconds,
+        bound_object_ref,
     })
 }
 
