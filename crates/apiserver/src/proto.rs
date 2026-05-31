@@ -198,6 +198,49 @@ struct ResourceRequirements {
     requests: std::collections::BTreeMap<String, Quantity>,
 }
 
+/// ExecAction — api-core-v1-generated.proto message ExecAction
+/// field 1 = command (repeated string)
+#[derive(Clone, PartialEq, Message)]
+struct LifecycleExecAction {
+    /// command (field 1, repeated string)
+    #[prost(string, repeated, tag = "1")]
+    command: Vec<String>,
+}
+
+/// SleepAction — api-core-v1-generated.proto message SleepAction
+/// field 1 = seconds (int64)
+#[derive(Clone, PartialEq, Message)]
+struct SleepAction {
+    /// seconds (field 1, int64)
+    #[prost(int64, tag = "1")]
+    seconds: i64,
+}
+
+/// LifecycleHandler — api-core-v1-generated.proto message LifecycleHandler
+/// field 1 = exec (ExecAction), field 4 = sleep (SleepAction)
+/// httpGet (field 2) and tcpSocket (field 3) are skipped — not decoded.
+#[derive(Clone, PartialEq, Message)]
+struct LifecycleHandler {
+    /// exec (field 1, message LifecycleExecAction)
+    #[prost(message, tag = "1")]
+    exec: Option<LifecycleExecAction>,
+    /// sleep (field 4, message SleepAction)
+    #[prost(message, tag = "4")]
+    sleep: Option<SleepAction>,
+}
+
+/// Lifecycle — api-core-v1-generated.proto message Lifecycle
+/// field 1 = postStart (LifecycleHandler), field 2 = preStop (LifecycleHandler)
+#[derive(Clone, PartialEq, Message)]
+struct Lifecycle {
+    /// postStart (field 1, message LifecycleHandler)
+    #[prost(message, tag = "1")]
+    post_start: Option<LifecycleHandler>,
+    /// preStop (field 2, message LifecycleHandler)
+    #[prost(message, tag = "2")]
+    pre_stop: Option<LifecycleHandler>,
+}
+
 /// Probe — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Probe
 /// field 1 = handler (ProbeHandler message) — not declared; prost silently drops unknown fields
@@ -258,6 +301,9 @@ struct Container {
     /// startupProbe (field 22, message Probe)
     #[prost(message, tag = "22")]
     startup_probe: Option<Probe>,
+    /// lifecycle (field 12, message Lifecycle)
+    #[prost(message, tag = "12")]
+    lifecycle: Option<Lifecycle>,
 }
 
 /// PodSpec — k8s.io/api/core/v1/generated.proto
@@ -1728,6 +1774,42 @@ fn probe_to_json(p: Probe) -> serde_json::Value {
     serde_json::Value::Object(m)
 }
 
+/// Convert a decoded `LifecycleHandler` into a `serde_json::Value`.
+///
+/// Only exec and sleep are decoded; httpGet and tcpSocket are skipped (not in the prost struct).
+fn lifecycle_handler_to_json(h: LifecycleHandler) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(exec) = h.exec {
+        if !exec.command.is_empty() {
+            m.insert(
+                "exec".to_string(),
+                serde_json::json!({
+                    "command": exec.command
+                }),
+            );
+        }
+    }
+    if let Some(sleep) = h.sleep {
+        m.insert(
+            "sleep".to_string(),
+            serde_json::json!({ "seconds": sleep.seconds }),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Convert a decoded `Lifecycle` struct into a `serde_json::Value`.
+fn lifecycle_to_json(lc: Lifecycle) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if let Some(h) = lc.post_start {
+        m.insert("postStart".to_string(), lifecycle_handler_to_json(h));
+    }
+    if let Some(h) = lc.pre_stop {
+        m.insert("preStop".to_string(), lifecycle_handler_to_json(h));
+    }
+    serde_json::Value::Object(m)
+}
+
 /// Decode a proto-encoded Pod object into a `serde_json::Value`.
 ///
 /// Decodes metadata and spec.containers (name + image). All other PodSpec fields are omitted
@@ -1816,6 +1898,9 @@ pub fn decode_pod_proto(data: &[u8]) -> Option<serde_json::Value> {
             }
             if let Some(p) = c.startup_probe {
                 cm.insert("startupProbe".to_string(), probe_to_json(p));
+            }
+            if let Some(lc) = c.lifecycle {
+                cm.insert("lifecycle".to_string(), lifecycle_to_json(lc));
             }
             serde_json::Value::Object(cm)
         })
@@ -4132,6 +4217,101 @@ mod tests {
         assert!(
             result["spec"]["containers"][0]["startupProbe"].is_null(),
             "startupProbe must not appear when not set in proto"
+        );
+    }
+
+    /// decode_pod_proto must preserve lifecycle.preStop.exec.command in decoded JSON.
+    ///
+    /// When a pod is submitted via protobuf with a preStop exec hook, kubelet reads
+    /// lifecycle.preStop from the stored JSON to execute the hook before killing the container.
+    /// If lifecycle is not decoded, kubelet skips the preStop hook entirely — the pod
+    /// terminates immediately without running the hook, causing conformance test
+    /// 'should call prestop when killing a pod' to time out waiting for the hook's effect.
+    ///
+    /// This test must fail if the Lifecycle struct, LifecycleHandler struct, or the
+    /// lifecycle_to_json call in the container decoder are removed.
+    #[test]
+    fn decode_pod_proto_preserves_prestop_exec_hook() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "app", namespace: "default" },
+        //   spec: PodSpec {
+        //     containers: [Container {
+        //       name: "app", image: "app:v1",
+        //       lifecycle: Lifecycle {   // Container field 12
+        //         preStop: LifecycleHandler {  // Lifecycle field 2
+        //           exec: ExecAction {         // LifecycleHandler field 1
+        //             command: ["sh", "-c", "echo bye"]  // ExecAction field 1
+        //           }
+        //         }
+        //       }
+        //     }]
+        //   }
+        // }
+
+        // Encode ExecAction: repeated string command at field 1 (wire type 2)
+        let mut exec_action = encode_length_delimited(1, b"sh");
+        exec_action.extend_from_slice(&encode_length_delimited(1, b"-c"));
+        exec_action.extend_from_slice(&encode_length_delimited(1, b"echo bye"));
+
+        // Encode LifecycleHandler: exec at field 1 (wire type 2)
+        let handler = encode_length_delimited(1, &exec_action);
+
+        // Encode Lifecycle: preStop at field 2 (wire type 2)
+        let lifecycle = encode_length_delimited(2, &handler);
+
+        // Encode Container: name=field 1, image=field 2, lifecycle=field 12
+        let mut container = encode_length_delimited(1, b"app");
+        container.extend_from_slice(&encode_length_delimited(2, b"app:v1"));
+        container.extend_from_slice(&encode_length_delimited(12, &lifecycle));
+
+        let mut obj_meta = encode_length_delimited(1, b"app");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        let pod_spec = encode_length_delimited(2, &container); // PodSpec.containers = field 2
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed — lifecycle decoding must not break pod decode");
+
+        assert_eq!(result["metadata"]["name"], "app");
+
+        let lifecycle = &result["spec"]["containers"][0]["lifecycle"];
+        assert!(
+            lifecycle.is_object(),
+            "lifecycle must be present in decoded JSON — if missing, kubelet skips the \
+             preStop hook and 'should call prestop when killing a pod' times out"
+        );
+
+        let pre_stop = &lifecycle["preStop"];
+        assert!(
+            pre_stop.is_object(),
+            "lifecycle.preStop must be present — kubelet reads this to run the hook \
+             before container termination; if absent, the hook is never executed"
+        );
+
+        let cmd = pre_stop["exec"]["command"]
+            .as_array()
+            .expect("preStop.exec.command must be an array");
+        assert_eq!(
+            cmd.len(),
+            3,
+            "preStop.exec.command must have 3 elements decoded from proto repeated string"
+        );
+        assert_eq!(
+            cmd[0], "sh",
+            "first command element must be 'sh' — kubelet passes this to exec in the container"
+        );
+        assert_eq!(cmd[1], "-c", "second command element must be '-c'");
+        assert_eq!(
+            cmd[2], "echo bye",
+            "third command element must be 'echo bye'"
+        );
+
+        // Verify postStart is absent when not encoded
+        assert!(
+            lifecycle["postStart"].is_null(),
+            "lifecycle.postStart must not appear when not set in proto"
         );
     }
 
