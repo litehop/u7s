@@ -933,6 +933,21 @@ pub async fn create_namespaced_resource<S: Store>(
 
     let name = resolve_name(&mut obj)?;
 
+    // Capture RS revision propagation info BEFORE ns_meta processing drops ownerReferences.
+    // ObjectMeta serde drops unknown fields (including ownerReferences), so we must extract
+    // what we need from obj.body before it's overwritten.
+    let rs_revision_info: Option<(String, serde_json::Value)> =
+        if group == "apps" && plural == "replicasets" {
+            let revision = obj.body["metadata"]["annotations"]["deployment.kubernetes.io/revision"]
+                .as_str()
+                .filter(|r| !r.is_empty())
+                .map(|r| r.to_string());
+            let owner_refs = obj.body["metadata"]["ownerReferences"].clone();
+            revision.map(|r| (r, owner_refs))
+        } else {
+            None
+        };
+
     let mut ns_meta: ObjectMeta =
         serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
     ns_meta.namespace = Some(ns.clone());
@@ -1000,11 +1015,118 @@ pub async fn create_namespaced_resource<S: Store>(
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+
+    // KCM 1.36 sets deployment.kubernetes.io/revision on the ReplicaSet when creating it,
+    // but does NOT subsequently PATCH the Deployment with the same annotation (it only does
+    // so in updateNewReplicaSetAnnotations, which only runs when the RS revision CHANGES,
+    // but since the RS was just created with revision=1, it never changes on re-sync).
+    // Fix: when an RS is created with this annotation and an ownerReference to a Deployment,
+    // propagate the annotation to the Deployment so KCM sees it on the next LIST/GET.
+    //
+    // NOTE: the ownerReferences captured before ns_meta processing are passed here because
+    // the ns_meta round-trip (ObjectMeta serde) drops ownerReferences from obj.body.
+    if group == "apps" && plural == "replicasets" {
+        propagate_rs_revision_to_deployment(&state, &rs_revision_info, &ns).await;
+    }
+
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
     if let Some(hv) = warn_header {
         resp.headers_mut().insert(axum::http::header::WARNING, hv);
     }
     Ok(resp)
+}
+
+/// When KCM creates a ReplicaSet with `deployment.kubernetes.io/revision` annotation
+/// and an ownerReference to a Deployment (controller=true), propagate that annotation
+/// to the owning Deployment.
+///
+/// KCM's `updateNewReplicaSetAnnotations` only patches the Deployment revision when
+/// `SetNewReplicaSetAnnotations` returns true (i.e., when the RS revision *changes*).
+/// Since the RS is created with the annotation already set, KCM never detects a change
+/// and therefore never patches the Deployment.  Without this propagation the Deployment's
+/// `deployment.kubernetes.io/revision` stays null forever, breaking AdmissionWebhook
+/// conformance tests that assert the annotation is present.
+///
+/// `rs_revision_info` is `Some((revision, owner_refs_json))` extracted BEFORE the
+/// ns_meta ObjectMeta round-trip which drops ownerReferences from the body.
+///
+/// Errors are logged and silently swallowed — the RS creation already succeeded and
+/// the Deployment annotation is a best-effort annotation set by the controller plane.
+async fn propagate_rs_revision_to_deployment<S: Store>(
+    state: &AppState<S>,
+    rs_revision_info: &Option<(String, serde_json::Value)>,
+    ns: &str,
+) {
+    let (revision, owner_refs_json) = match rs_revision_info {
+        Some(info) => (&info.0, &info.1),
+        None => return,
+    };
+
+    // Find the ownerReference to a Deployment with controller=true.
+    let owner_refs = match owner_refs_json.as_array() {
+        Some(refs) => refs,
+        None => return,
+    };
+    let deploy_name = owner_refs
+        .iter()
+        .find(|r| {
+            r["kind"].as_str() == Some("Deployment")
+                && r["controller"].as_bool() == Some(true)
+                && r["apiVersion"].as_str().map(|v| v.starts_with("apps/")) == Some(true)
+        })
+        .and_then(|r| r["name"].as_str())
+        .map(|s| s.to_string());
+    let deploy_name = match deploy_name {
+        Some(n) => n,
+        None => return, // no controlling Deployment ownerRef
+    };
+
+    // Load the Deployment from the store.
+    let deploy_key = group_object_key("apps", "deployments", Some(ns), &deploy_name);
+    let stored = match state.store.get(&deploy_key).await {
+        Ok(Some(s)) => s,
+        _ => return, // Deployment not found or store error
+    };
+    let mut deploy: serde_json::Value = match serde_json::from_slice(&stored.value) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Only update if the annotation is absent or older.
+    let current = deploy["metadata"]["annotations"]["deployment.kubernetes.io/revision"]
+        .as_str()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .unwrap_or(0);
+    let new_rev = revision.parse::<i64>().unwrap_or(0);
+    if new_rev <= current {
+        return; // already up-to-date
+    }
+
+    // Set the annotation on the Deployment.
+    if !deploy["metadata"]["annotations"].is_object() {
+        deploy["metadata"]["annotations"] = serde_json::json!({});
+    }
+    deploy["metadata"]["annotations"]["deployment.kubernetes.io/revision"] =
+        serde_json::Value::String(revision.clone());
+
+    // Store the updated Deployment with CAS to avoid clobbering concurrent spec changes.
+    // If a concurrent writer updated the Deployment between our get and put, this put
+    // is skipped — that's fine: the annotation will be set on the next RS creation or
+    // when the Deployment is next written.
+    let expected_rv = stored.revision;
+    let deploy_bytes = bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap_or_default());
+    if let Err(e) = state
+        .store
+        .put(&deploy_key, deploy_bytes, Some(expected_rv))
+        .await
+    {
+        tracing::debug!(
+            deployment = %deploy_name,
+            ns = %ns,
+            "skipping RS revision annotation propagation (concurrent update): {e}"
+        );
+    }
 }
 
 pub async fn replace_namespaced_resource<S: Store>(
@@ -7017,6 +7139,169 @@ mod tests {
         assert!(
             !sv["metadata"]["creationTimestamp"].is_null(),
             "creationTimestamp must not be removed by the null in the KCM patch body"
+        );
+    }
+
+    // -- Regression: KCM 1.36 RS create propagates revision to Deployment (mayor-tt5j) --
+
+    /// KCM 1.36 sets `deployment.kubernetes.io/revision=1` on the ReplicaSet body before
+    /// POSTing it (in-memory, as part of the creation body), but does NOT subsequently
+    /// PATCH the Deployment with the same annotation.  `updateNewReplicaSetAnnotations`
+    /// only patches the Deployment when `SetNewReplicaSetAnnotations` returns true (i.e.,
+    /// the RS revision CHANGED).  Since the RS was created with revision=1 already set,
+    /// subsequent reconcile loops see no change and never patch the Deployment.
+    ///
+    /// Our fix: when a ReplicaSet is created with `deployment.kubernetes.io/revision` and
+    /// an ownerReference pointing to a Deployment (controller=true), propagate that
+    /// annotation to the Deployment atomically.
+    ///
+    /// This test MUST FAIL if `propagate_rs_revision_to_deployment` is removed, because
+    /// the Deployment's annotation would stay null and the AdmissionWebhook conformance
+    /// test's BeforeEach would time out waiting for `deployment.kubernetes.io/revision=1`.
+    #[tokio::test]
+    async fn rs_create_propagates_revision_annotation_to_owning_deployment() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns = "default";
+        let deploy_name = "my-deployment";
+        let deploy_uid = "abc-deploy-uid";
+
+        // 1. Create the Deployment (no annotations — fresh from kubectl).
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": deploy_name,
+                "namespace": ns,
+                "labels": {"app": "myapp"}
+            },
+            "spec": {
+                "selector": {"matchLabels": {"app": "myapp"}},
+                "replicas": 1,
+                "template": {
+                    "metadata": {"labels": {"app": "myapp"}},
+                    "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+                }
+            }
+        });
+        let mut json_hdrs = axum::http::HeaderMap::new();
+        json_hdrs.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        let _ = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "deployments".to_string(),
+            )),
+            axum::extract::Query(super::super::json_patch::CreateQuery::default()),
+            json_hdrs.clone(),
+            bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Deployment create must succeed: {e:?}"))
+        .into_response();
+
+        // Verify Deployment has no revision annotation yet.
+        let deploy_key = format!("/registry/apps/deployments/{ns}/{deploy_name}");
+        let before = store
+            .get(&deploy_key)
+            .await
+            .unwrap()
+            .expect("Deployment must be stored");
+        let before_val: serde_json::Value = serde_json::from_slice(&before.value).unwrap();
+        assert!(
+            before_val["metadata"]["annotations"]["deployment.kubernetes.io/revision"].is_null(),
+            "Deployment must start with no revision annotation — precondition for the regression test"
+        );
+
+        // Fetch the Deployment UID to construct the ownerReference.
+        let deploy_uid_stored = before_val["metadata"]["uid"]
+            .as_str()
+            .unwrap_or(deploy_uid)
+            .to_string();
+
+        // 2. KCM creates a ReplicaSet with revision=1 annotation and ownerRef pointing to Deployment.
+        //    This is what KCM does in getNewReplicaSet: set revision in memory, then POST the RS.
+        let rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "my-deployment-79d557df97",
+                "namespace": ns,
+                "annotations": {
+                    "deployment.kubernetes.io/revision": "1",
+                    "deployment.kubernetes.io/desired-replicas": "1",
+                    "deployment.kubernetes.io/max-replicas": "2"
+                },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": deploy_name,
+                    "uid": deploy_uid_stored,
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }],
+                "labels": {
+                    "app": "myapp",
+                    "pod-template-hash": "79d557df97"
+                }
+            },
+            "spec": {
+                "selector": {"matchLabels": {"app": "myapp", "pod-template-hash": "79d557df97"}},
+                "replicas": 1,
+                "template": {
+                    "metadata": {"labels": {"app": "myapp", "pod-template-hash": "79d557df97"}},
+                    "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+                }
+            }
+        });
+        let _ = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                ns.to_string(),
+                "replicasets".to_string(),
+            )),
+            axum::extract::Query(super::super::json_patch::CreateQuery::default()),
+            json_hdrs,
+            bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ReplicaSet create must succeed: {e:?}"))
+        .into_response();
+
+        // 3. The Deployment must now have revision=1 propagated by our handler.
+        //    Without propagate_rs_revision_to_deployment, this assertion fails —
+        //    proving the test is a true regression guard.
+        let after = store
+            .get(&deploy_key)
+            .await
+            .unwrap()
+            .expect("Deployment must still be stored after RS creation");
+        let after_val: serde_json::Value = serde_json::from_slice(&after.value).unwrap();
+
+        assert_eq!(
+            after_val["metadata"]["annotations"]["deployment.kubernetes.io/revision"], "1",
+            "Deployment must have deployment.kubernetes.io/revision=1 after KCM creates the RS — \
+             KCM 1.36 sets the annotation on the RS body before POST but never subsequently \
+             PATCHes the Deployment; without our propagation the annotation stays null and \
+             the AdmissionWebhook conformance test BeforeEach times out"
         );
     }
 }
