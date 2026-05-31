@@ -4037,13 +4037,12 @@ mod tests {
         let mut obj_meta = encode_length_delimited(1, b"app");
         obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
 
-        // Encode Probe message: int32 fields use wire type 0 (varint)
-        // tag = (field_number << 3) | wire_type_0
-        let mut readiness_probe = encode_varint((2u64 << 3) | 0); // field 2 = initialDelaySeconds, wire 0
+        // Encode Probe message: int32 fields use wire type 0 (varint), tag = field_number << 3
+        let mut readiness_probe = encode_varint(2u64 << 3); // field 2 = initialDelaySeconds
         readiness_probe.extend_from_slice(&encode_varint(30));
-        readiness_probe.extend_from_slice(&encode_varint((3u64 << 3) | 0)); // field 3 = timeoutSeconds
+        readiness_probe.extend_from_slice(&encode_varint(3u64 << 3)); // field 3 = timeoutSeconds
         readiness_probe.extend_from_slice(&encode_varint(5));
-        readiness_probe.extend_from_slice(&encode_varint((4u64 << 3) | 0)); // field 4 = periodSeconds
+        readiness_probe.extend_from_slice(&encode_varint(4u64 << 3)); // field 4 = periodSeconds
         readiness_probe.extend_from_slice(&encode_varint(10));
 
         // Container field 1=name, 2=image, 11=readinessProbe (length-delimited message)
