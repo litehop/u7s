@@ -6781,4 +6781,159 @@ mod tests {
             "response must have apiVersion=resource.k8s.io/v1 — required by Kubernetes API contract"
         );
     }
+
+    // -- Regression: KCM deployment controller revision annotation (mayor-ufa4) --
+
+    /// KCM annotates the Deployment with `deployment.kubernetes.io/revision=1` after
+    /// creating the initial ReplicaSet. It uses a strategic-merge-patch body that contains
+    /// the new annotation nested inside `metadata.annotations`.
+    ///
+    /// The annotation MUST persist in the stored object. Without it, the AdmissionWebhook
+    /// conformance test's BeforeEach times out waiting for the annotation to appear, causing
+    /// every webhook test to fail.
+    ///
+    /// This test fails if strategic_merge_patch silently drops metadata.annotations when
+    /// the existing Deployment has annotations=null (the initial stored state).
+    #[tokio::test]
+    async fn kcm_deployment_revision_annotation_persists_after_strategic_merge_patch() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Step 1: Create a Deployment (as kubectl or a test framework would).
+        // The Deployment starts with no annotations.
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "sample-webhook-deployment",
+                "namespace": "webhook-test",
+                "labels": {"app": "webhook"}
+            },
+            "spec": {
+                "selector": {"matchLabels": {"app": "webhook"}},
+                "replicas": 1,
+                "template": {
+                    "metadata": {"labels": {"app": "webhook"}},
+                    "spec": {
+                        "containers": [{"name": "webhook", "image": "nginx:latest"}]
+                    }
+                }
+            }
+        });
+        let deploy_bytes = bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap());
+
+        let mut json_hdrs = axum::http::HeaderMap::new();
+        json_hdrs.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let create_result = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "webhook-test".to_string(),
+                "deployments".to_string(),
+            )),
+            axum::extract::Query(super::super::json_patch::CreateQuery::default()),
+            json_hdrs.clone(),
+            deploy_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Deployment create must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            create_result.status(),
+            axum::http::StatusCode::CREATED,
+            "Deployment create must return 201"
+        );
+
+        // Step 2: KCM sends strategic-merge-patch to add revision annotation.
+        // client-go's CreateTwoWayMergePatch includes creationTimestamp:null (zero time).
+        // The Content-Type is application/strategic-merge-patch+json.
+        let revision_patch = serde_json::json!({
+            "metadata": {
+                "annotations": {
+                    "deployment.kubernetes.io/revision": "1"
+                },
+                "creationTimestamp": null
+            }
+        });
+        let patch_bytes = bytes::Bytes::from(serde_json::to_vec(&revision_patch).unwrap());
+
+        let mut smp_hdrs = axum::http::HeaderMap::new();
+        smp_hdrs.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+
+        let patch_result = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "webhook-test".to_string(),
+                "deployments".to_string(),
+                "sample-webhook-deployment".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            smp_hdrs,
+            patch_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Deployment PATCH must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(
+            patch_result.status(),
+            axum::http::StatusCode::OK,
+            "KCM's strategic-merge-patch to add revision annotation must return 200"
+        );
+
+        let patch_body = to_bytes(patch_result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pv: serde_json::Value = serde_json::from_slice(&patch_body).unwrap();
+
+        // Step 3: Verify the annotation appears in the PATCH response.
+        assert_eq!(
+            pv["metadata"]["annotations"]["deployment.kubernetes.io/revision"], "1",
+            "PATCH response must include deployment.kubernetes.io/revision=1 annotation; \
+             without it AdmissionWebhook BeforeEach times out waiting for the annotation"
+        );
+
+        // Step 4: Verify the annotation persists in the stored object.
+        let key = "/registry/apps/deployments/webhook-test/sample-webhook-deployment";
+        let stored = store
+            .get(key)
+            .await
+            .expect("store get must not fail")
+            .expect("Deployment must exist in store");
+        let sv: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            sv["metadata"]["annotations"]["deployment.kubernetes.io/revision"], "1",
+            "deployment.kubernetes.io/revision annotation must be persisted in store; \
+             KCM reads the annotation on subsequent reconcile loops and must find it"
+        );
+
+        // Bonus: creationTimestamp must NOT be removed (the null guard must protect it).
+        assert!(
+            !sv["metadata"]["creationTimestamp"].is_null(),
+            "creationTimestamp must not be removed by the null in the KCM patch body"
+        );
+    }
 }
