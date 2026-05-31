@@ -5922,6 +5922,89 @@ mod tests {
         );
     }
 
+    /// Creating a Deployment must NOT inject SA token volumes or volume defaults into
+    /// spec.template — the stored pod template must be verbatim (no kube-api-access-*
+    /// volumes, no defaultMode stamps).
+    ///
+    /// KCM's deployment controller computes pod-template-hash from the pod template AS
+    /// SUBMITTED and stores the RS with that hash.  If the apiserver mutates spec.template
+    /// (e.g. by running inject_sa_token_volume or apply_pod_create_defaults on the
+    /// Deployment), the hash KCM recomputes from the stored template differs → FindNewReplicaSet
+    /// returns nil → KCM logs "new replicaset is yet to be created" forever.
+    ///
+    /// Correct Kubernetes semantics: Deployments are stored verbatim; pod mutations
+    /// (SA volume injection, defaultMode) happen only when a Pod is actually created by
+    /// the RS controller, not when the workload resource is stored.
+    ///
+    /// This test fails if inject_sa_token_volume or apply_pod_create_defaults is
+    /// ever added to the Deployment create path.
+    #[tokio::test]
+    async fn deployment_pod_template_stored_verbatim_no_sa_volume_injected() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // Deployment with a serviceAccountName — the trigger for SA volume injection.
+        // If the create path ever calls inject_sa_token_volume on Deployments, this
+        // will add a kube-api-access-* projected volume to spec.template.spec.volumes.
+        let deployment = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test-deploy", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {
+                    "metadata": { "labels": { "app": "test" } },
+                    "spec": {
+                        "serviceAccountName": "default",
+                        "containers": [{ "name": "c", "image": "nginx" }]
+                    }
+                }
+            }
+        });
+
+        let result = create_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Deployment POST must return 201, got: {e:?}"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // spec.template.spec.volumes must be null — no kube-api-access-* volume injected.
+        // If this assertion fails, inject_sa_token_volume or apply_pod_create_defaults was
+        // called on the Deployment create path, breaking KCM's pod-template-hash computation.
+        assert!(
+            stored["spec"]["template"]["spec"]["volumes"].is_null(),
+            "Deployment spec.template.spec.volumes must be null after create — \
+             SA token volume must NOT be injected into Deployment templates. \
+             Injecting it causes pod-template-hash mismatch: KCM hashes the submitted \
+             template (no volume), stores RS with that hash, then reads the mutated \
+             stored template (with volume) and computes a different hash → FindNewReplicaSet \
+             returns nil → 'new replicaset is yet to be created' loop"
+        );
+
+        // spec.template.spec.serviceAccountName must be preserved verbatim.
+        assert_eq!(
+            stored["spec"]["template"]["spec"]["serviceAccountName"], "default",
+            "spec.template.spec.serviceAccountName must be stored as submitted"
+        );
+    }
+
     /// POST a ReplicaSet then PUT with the resourceVersion from the POST response must succeed.
     ///
     /// The RS controller (KCM) creates a ReplicaSet via POST, extracts the resourceVersion
