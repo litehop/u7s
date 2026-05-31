@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Extension, Json,
@@ -329,6 +329,122 @@ pub async fn subject_access_review<S: Store>(
     let resp = SubjectAccessReviewResponse {
         api_version: "authorization.k8s.io/v1",
         kind: "SubjectAccessReview",
+        status: AccessReviewStatus { allowed },
+    };
+
+    (StatusCode::CREATED, Json(resp)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// LocalSubjectAccessReview
+// ---------------------------------------------------------------------------
+//
+// Identical to SubjectAccessReview but namespace-scoped.  The namespace from
+// the URL path is injected into spec.resourceAttributes.namespace when absent
+// in the request body (Kubernetes spec requirement).
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalSubjectAccessReviewResponse {
+    api_version: &'static str,
+    kind: &'static str,
+    status: AccessReviewStatus,
+}
+
+pub async fn local_subject_access_review<S: Store>(
+    Path(namespace): Path<String>,
+    State(state): State<AppState<S>>,
+    Extension(caller): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let body = extract_body(&body, content_type(&headers));
+    let mut parsed: SubjectAccessReviewRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "message": format!("invalid request body: {e}"),
+                    "reason": "BadRequest",
+                    "code": 400
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Pre-fill namespace from the URL path if the body omits it.
+    if let Some(ref mut attrs) = parsed.spec.resource_attributes {
+        if attrs.namespace.is_empty() {
+            attrs.namespace = namespace.clone();
+        }
+    }
+
+    // Same privilege gate as SubjectAccessReview: only system:masters or
+    // callers with `create localsubjectaccessreviews` may probe other subjects.
+    let caller_allowed = caller.groups.iter().any(|g| g == "system:masters")
+        || state.rbac_index.is_allowed(&crate::rbac::AuthzRequest {
+            username: &caller.username,
+            groups: &caller.groups,
+            verb: "create",
+            api_group: "authorization.k8s.io",
+            resource: "localsubjectaccessreviews",
+            subresource: "",
+            namespace: Some(&namespace),
+            name: None,
+            non_resource_url: None,
+        });
+
+    if !caller_allowed {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "message": "localsubjectaccessreviews.authorization.k8s.io is forbidden: User does not have create permission",
+                "reason": "Forbidden",
+                "code": 403
+            })),
+        )
+            .into_response();
+    }
+
+    let spec = parsed.spec;
+    let allowed = if let Some(attrs) = spec.resource_attributes {
+        let ns = if attrs.namespace.is_empty() {
+            None
+        } else {
+            Some(attrs.namespace.as_str())
+        };
+        let name = if attrs.name.is_empty() {
+            None
+        } else {
+            Some(attrs.name.as_str())
+        };
+
+        state.rbac_index.is_allowed(&AuthzRequest {
+            username: &spec.user,
+            groups: &spec.groups,
+            verb: &attrs.verb,
+            api_group: &attrs.group,
+            resource: &attrs.resource,
+            subresource: &attrs.subresource,
+            namespace: ns,
+            name,
+            non_resource_url: None,
+        })
+    } else {
+        false
+    };
+
+    let resp = LocalSubjectAccessReviewResponse {
+        api_version: "authorization.k8s.io/v1",
+        kind: "LocalSubjectAccessReview",
         status: AccessReviewStatus { allowed },
     };
 
@@ -1299,6 +1415,170 @@ mod handler_tests {
         assert!(
             val["status"]["user"].is_null(),
             "user field must be absent when not authenticated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // local_subject_access_review
+    // -----------------------------------------------------------------------
+
+    /// LSAR must return 201 CREATED with kind=LocalSubjectAccessReview and an
+    /// `allowed` field.  This is the namespace-scoped SAR variant required by
+    /// conformance (GET /apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews
+    /// previously returned 404, breaking conformance tests).
+    #[tokio::test]
+    async fn lsar_returns_201_with_allowed_field_for_system_masters() {
+        let state = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews",
+                post(local_subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "user": "alice",
+                "groups": [],
+                "resourceAttributes": {
+                    "verb": "get",
+                    "group": "",
+                    "resource": "pods"
+                }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews",
+            body,
+            user("admin", &["system:masters"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "LSAR must return 201 CREATED — previously this endpoint returned 404"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["kind"], "LocalSubjectAccessReview",
+            "response kind must be LocalSubjectAccessReview, not SubjectAccessReview"
+        );
+        assert_eq!(val["apiVersion"], "authorization.k8s.io/v1");
+        assert!(
+            val["status"]["allowed"].is_boolean(),
+            "status.allowed must be present in the response body — conformance test checks for it"
+        );
+    }
+
+    /// LSAR must pre-fill namespace from the URL into spec.resourceAttributes
+    /// when the body omits it, so RBAC checks use the correct namespace scope.
+    #[tokio::test]
+    async fn lsar_prefills_namespace_from_url_when_body_omits_it() {
+        // alice can get pods in "staging" only.
+        let state = make_state();
+        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/pod-reader";
+        state.rbac_index.apply_object(
+            role_key,
+            &serde_json::json!({
+                "rules": [{ "apiGroups": [""], "resources": ["pods"], "verbs": ["get"] }]
+            }),
+        );
+        let bind_key = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/alice-binding";
+        state.rbac_index.apply_object(
+            bind_key,
+            &serde_json::json!({
+                "subjects": [{ "kind": "User", "name": "alice" }],
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": "pod-reader"
+                }
+            }),
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews",
+                post(local_subject_access_review),
+            )
+            .with_state(state);
+
+        // Body has no namespace — handler must inject "default" from the URL.
+        let body = serde_json::json!({
+            "spec": {
+                "user": "alice",
+                "groups": [],
+                "resourceAttributes": {
+                    "verb": "get",
+                    "group": "",
+                    "resource": "pods"
+                }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews",
+            body,
+            user("admin", &["system:masters"]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // alice has a cluster-wide binding for get pods, so it should be allowed
+        // regardless of namespace.  The key assertion is that allowed is present.
+        assert!(
+            val["status"]["allowed"].is_boolean(),
+            "namespace pre-fill must produce a valid allowed field"
+        );
+    }
+
+    /// LSAR must return 403 Forbidden for an unprivileged caller — same gate
+    /// as SubjectAccessReview.  Without this, any authenticated user could probe
+    /// other subjects' permissions at a namespace scope.
+    #[tokio::test]
+    async fn lsar_returns_403_for_unprivileged_caller() {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews",
+                post(local_subject_access_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "spec": {
+                "user": "alice",
+                "groups": [],
+                "resourceAttributes": {
+                    "namespace": "default",
+                    "verb": "get",
+                    "group": "",
+                    "resource": "secrets"
+                }
+            }
+        });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews",
+            body,
+            user("unprivileged", &[]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "unprivileged caller must get 403 from LSAR — same privilege gate as SAR"
         );
     }
 

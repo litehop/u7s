@@ -442,6 +442,10 @@ fn build_router(state: AppState) -> Router {
             post(handlers::authorization::subject_access_review),
         )
         .route(
+            "/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews",
+            post(handlers::authorization::local_subject_access_review),
+        )
+        .route(
             "/apis/authentication.k8s.io/v1/tokenreviews",
             post(handlers::authorization::token_review),
         )
