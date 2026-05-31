@@ -7200,7 +7200,7 @@ mod tests {
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("application/json"),
         );
-        create_namespaced_resource(
+        let _ = create_namespaced_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((
                 "apps".to_string(),
@@ -7270,7 +7270,7 @@ mod tests {
                 }
             }
         });
-        create_namespaced_resource(
+        let _ = create_namespaced_resource(
             axum::extract::State(state.clone()),
             axum::extract::Path((
                 "apps".to_string(),
