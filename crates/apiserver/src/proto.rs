@@ -1268,12 +1268,18 @@ struct AppsLabelSelector {
 
 /// PodTemplateSpec (apps context) — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message PodTemplateSpec
-/// Only metadata decoded; spec (field 2, PodSpec) is deeply nested and not needed.
+/// Decodes metadata (field 1) and spec (field 2, PodSpec).
+/// spec must be decoded so EqualIgnoreHash in KCM's FindNewReplicaSet can match the
+/// Deployment template against the ReplicaSet template — without it spec.template.spec
+/// is null in the stored Deployment JSON and the comparison always fails.
 #[derive(Clone, PartialEq, Message)]
 struct AppsPodTemplateSpec {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message PodSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<PodSpec>,
 }
 
 /// DeploymentSpec — k8s.io/api/apps/v1/generated.proto
@@ -1812,7 +1818,7 @@ fn lifecycle_to_json(lc: Lifecycle) -> serde_json::Value {
 
 /// Decode a proto-encoded Pod object into a `serde_json::Value`.
 ///
-/// Decodes metadata and spec.containers (name + image). All other PodSpec fields are omitted
+/// Decodes metadata and spec (containers + scalar fields). All other PodSpec fields are omitted
 /// because PodSpec is deeply nested — the goal is to produce a valid JSON object that passes
 /// Object::from_bytes validation and can be stored, so CREATE returns 201 instead of 400.
 pub fn decode_pod_proto(data: &[u8]) -> Option<serde_json::Value> {
@@ -1825,111 +1831,7 @@ pub fn decode_pod_proto(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta
     });
 
-    let spec = pod.spec.unwrap_or_default();
-    let containers: Vec<serde_json::Value> = spec
-        .containers
-        .into_iter()
-        .map(|c| {
-            let mut cm = serde_json::Map::new();
-            if !c.name.is_empty() {
-                cm.insert("name".to_string(), serde_json::Value::String(c.name));
-            }
-            if !c.image.is_empty() {
-                cm.insert("image".to_string(), serde_json::Value::String(c.image));
-            }
-            if !c.image_pull_policy.is_empty() {
-                cm.insert(
-                    "imagePullPolicy".to_string(),
-                    serde_json::Value::String(c.image_pull_policy),
-                );
-            }
-            if !c.termination_message_path.is_empty() {
-                cm.insert(
-                    "terminationMessagePath".to_string(),
-                    serde_json::Value::String(c.termination_message_path),
-                );
-            }
-            if !c.termination_message_policy.is_empty() {
-                cm.insert(
-                    "terminationMessagePolicy".to_string(),
-                    serde_json::Value::String(c.termination_message_policy),
-                );
-            }
-            if !c.command.is_empty() {
-                cm.insert(
-                    "command".to_string(),
-                    serde_json::Value::Array(
-                        c.command
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    ),
-                );
-            }
-            if !c.args.is_empty() {
-                cm.insert(
-                    "args".to_string(),
-                    serde_json::Value::Array(
-                        c.args.into_iter().map(serde_json::Value::String).collect(),
-                    ),
-                );
-            }
-            if let Some(res) = c.resources {
-                let mut res_map = serde_json::Map::new();
-                if !res.limits.is_empty() {
-                    res_map.insert(
-                        "limits".to_string(),
-                        limitrange_quantity_map_to_json(res.limits),
-                    );
-                }
-                if !res.requests.is_empty() {
-                    res_map.insert(
-                        "requests".to_string(),
-                        limitrange_quantity_map_to_json(res.requests),
-                    );
-                }
-                cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
-            }
-            if let Some(p) = c.liveness_probe {
-                cm.insert("livenessProbe".to_string(), probe_to_json(p));
-            }
-            if let Some(p) = c.readiness_probe {
-                cm.insert("readinessProbe".to_string(), probe_to_json(p));
-            }
-            if let Some(p) = c.startup_probe {
-                cm.insert("startupProbe".to_string(), probe_to_json(p));
-            }
-            if let Some(lc) = c.lifecycle {
-                cm.insert("lifecycle".to_string(), lifecycle_to_json(lc));
-            }
-            serde_json::Value::Object(cm)
-        })
-        .collect();
-
-    let mut spec_map = serde_json::Map::new();
-    spec_map.insert(
-        "containers".to_string(),
-        serde_json::Value::Array(containers),
-    );
-    if !spec.restart_policy.is_empty() {
-        spec_map.insert(
-            "restartPolicy".to_string(),
-            serde_json::Value::String(spec.restart_policy),
-        );
-    }
-    if !spec.service_account_name.is_empty() {
-        spec_map.insert(
-            "serviceAccountName".to_string(),
-            serde_json::Value::String(spec.service_account_name),
-        );
-    }
-    if !spec.node_name.is_empty() {
-        spec_map.insert(
-            "nodeName".to_string(),
-            serde_json::Value::String(spec.node_name),
-        );
-    }
-    obj["spec"] = serde_json::Value::Object(spec_map);
+    obj["spec"] = pod_spec_to_json(pod.spec.unwrap_or_default());
 
     Some(obj)
 }
@@ -2952,6 +2854,118 @@ fn apps_label_selector_to_json(sel: AppsLabelSelector) -> serde_json::Value {
     m
 }
 
+/// Serialize a decoded `PodSpec` into a JSON map.
+///
+/// Mirrors the container/spec serialization in `decode_pod_proto`, extracted here so
+/// `apps_spec_to_json` can embed the pod spec inside `spec.template.spec` for Deployment,
+/// StatefulSet, ReplicaSet, and DaemonSet without duplicating the logic.
+fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
+    let containers: Vec<serde_json::Value> = spec
+        .containers
+        .into_iter()
+        .map(|c| {
+            let mut cm = serde_json::Map::new();
+            if !c.name.is_empty() {
+                cm.insert("name".to_string(), serde_json::Value::String(c.name));
+            }
+            if !c.image.is_empty() {
+                cm.insert("image".to_string(), serde_json::Value::String(c.image));
+            }
+            if !c.image_pull_policy.is_empty() {
+                cm.insert(
+                    "imagePullPolicy".to_string(),
+                    serde_json::Value::String(c.image_pull_policy),
+                );
+            }
+            if !c.termination_message_path.is_empty() {
+                cm.insert(
+                    "terminationMessagePath".to_string(),
+                    serde_json::Value::String(c.termination_message_path),
+                );
+            }
+            if !c.termination_message_policy.is_empty() {
+                cm.insert(
+                    "terminationMessagePolicy".to_string(),
+                    serde_json::Value::String(c.termination_message_policy),
+                );
+            }
+            if !c.command.is_empty() {
+                cm.insert(
+                    "command".to_string(),
+                    serde_json::Value::Array(
+                        c.command
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+            if !c.args.is_empty() {
+                cm.insert(
+                    "args".to_string(),
+                    serde_json::Value::Array(
+                        c.args.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+            if let Some(res) = c.resources {
+                let mut res_map = serde_json::Map::new();
+                if !res.limits.is_empty() {
+                    res_map.insert(
+                        "limits".to_string(),
+                        limitrange_quantity_map_to_json(res.limits),
+                    );
+                }
+                if !res.requests.is_empty() {
+                    res_map.insert(
+                        "requests".to_string(),
+                        limitrange_quantity_map_to_json(res.requests),
+                    );
+                }
+                cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
+            }
+            if let Some(p) = c.liveness_probe {
+                cm.insert("livenessProbe".to_string(), probe_to_json(p));
+            }
+            if let Some(p) = c.readiness_probe {
+                cm.insert("readinessProbe".to_string(), probe_to_json(p));
+            }
+            if let Some(p) = c.startup_probe {
+                cm.insert("startupProbe".to_string(), probe_to_json(p));
+            }
+            if let Some(lc) = c.lifecycle {
+                cm.insert("lifecycle".to_string(), lifecycle_to_json(lc));
+            }
+            serde_json::Value::Object(cm)
+        })
+        .collect();
+
+    let mut spec_map = serde_json::Map::new();
+    spec_map.insert(
+        "containers".to_string(),
+        serde_json::Value::Array(containers),
+    );
+    if !spec.restart_policy.is_empty() {
+        spec_map.insert(
+            "restartPolicy".to_string(),
+            serde_json::Value::String(spec.restart_policy),
+        );
+    }
+    if !spec.service_account_name.is_empty() {
+        spec_map.insert(
+            "serviceAccountName".to_string(),
+            serde_json::Value::String(spec.service_account_name),
+        );
+    }
+    if !spec.node_name.is_empty() {
+        spec_map.insert(
+            "nodeName".to_string(),
+            serde_json::Value::String(spec.node_name),
+        );
+    }
+    serde_json::Value::Object(spec_map)
+}
+
 /// Convert an apps-context `DeploymentSpec` / `StatefulSetSpec` / `ReplicaSetSpec`
 /// into the minimal JSON needed for selector defaulting.
 ///
@@ -2971,10 +2985,18 @@ fn apps_spec_to_json(
     }
 
     if let Some(tmpl) = template {
+        let mut tmpl_json = serde_json::json!({});
         if let Some(meta) = tmpl.metadata {
             let tmpl_meta = object_meta_to_json(meta);
-            spec["template"] = serde_json::json!({ "metadata": tmpl_meta });
+            tmpl_json["metadata"] = tmpl_meta;
             non_empty = true;
+        }
+        if let Some(pod_spec) = tmpl.spec {
+            tmpl_json["spec"] = pod_spec_to_json(pod_spec);
+            non_empty = true;
+        }
+        if non_empty {
+            spec["template"] = tmpl_json;
         }
     }
 
@@ -6454,6 +6476,75 @@ mod tests {
         assert_eq!(
             result["spec"]["selector"]["matchLabels"]["app"], "test",
             "spec.selector.matchLabels must be present in decoded JSON"
+        );
+    }
+
+    /// Decoding a Deployment proto with spec.template.spec.containers must produce
+    /// spec.template.spec with non-null containers in the JSON output.
+    ///
+    /// KCM's FindNewReplicaSet calls EqualIgnoreHash(RS.spec.template, Deployment.spec.template).
+    /// The RS has real containers; if the Deployment has spec.template.spec=null the comparison
+    /// always fails → FindNewReplicaSet returns nil → the deployment revision annotation is never
+    /// set → AdmissionWebhook conformance test fails (19/20 instead of 20/20).
+    #[test]
+    fn decode_deployment_proto_includes_spec_template_spec_containers() {
+        // Build Container proto: name="nginx", image="nginx:latest"
+        let mut container = encode_length_delimited(1, b"nginx"); // Container.name (field 1)
+        container.extend_from_slice(&encode_length_delimited(2, b"nginx:latest")); // Container.image (field 2)
+
+        // PodSpec { containers: [container] }  — containers = field 2
+        let pod_spec_bytes = encode_length_delimited(2, &container);
+
+        // ObjectMeta { labels: {"app": "nginx"} }
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"nginx"));
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+
+        // PodTemplateSpec { metadata: field 1, spec: field 2 }
+        let mut template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        template_bytes.extend_from_slice(&encode_length_delimited(2, &pod_spec_bytes));
+
+        // LabelSelector { matchLabels: {"app": "nginx"} }
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+
+        // DeploymentSpec { selector: field 2, template: field 3 }
+        let mut spec_bytes = encode_length_delimited(2, &selector_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        // Deployment { metadata: field 1, spec: field 2 }
+        let name_bytes = encode_length_delimited(1, b"nginx-deploy");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("Deployment", &proto).expect(
+            "Deployment with pod spec must decode — without this, proto POST stores null pod spec",
+        );
+
+        assert!(
+            result["spec"]["template"]["spec"].is_object(),
+            "spec.template.spec must be an object, not null — if null, KCM's EqualIgnoreHash \
+             fails to match the Deployment template against the ReplicaSet template, causing \
+             FindNewReplicaSet to return nil and the deployment revision annotation to never be set"
+        );
+
+        let containers = result["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .expect(
+                "spec.template.spec.containers must be an array — without containers in the \
+                 stored Deployment, EqualIgnoreHash always returns false regardless of RS state",
+            );
+        assert_eq!(
+            containers.len(),
+            1,
+            "one container must be decoded from PodTemplateSpec.spec"
+        );
+        assert_eq!(
+            containers[0]["name"], "nginx",
+            "container name must be extracted from PodTemplateSpec.spec.containers"
+        );
+        assert_eq!(
+            containers[0]["image"], "nginx:latest",
+            "container image must be extracted from PodTemplateSpec.spec.containers"
         );
     }
 
