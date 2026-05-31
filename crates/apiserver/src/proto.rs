@@ -198,6 +198,29 @@ struct ResourceRequirements {
     requests: std::collections::BTreeMap<String, Quantity>,
 }
 
+/// Probe — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message Probe
+/// field 1 = handler (ProbeHandler message) — not declared; prost silently drops unknown fields
+/// field 7 = terminationGracePeriodSeconds (int64) — not declared; not needed for timing conformance
+#[derive(Clone, PartialEq, Message)]
+struct Probe {
+    /// initialDelaySeconds (field 2, int32)
+    #[prost(int32, tag = "2")]
+    initial_delay_seconds: i32,
+    /// timeoutSeconds (field 3, int32)
+    #[prost(int32, tag = "3")]
+    timeout_seconds: i32,
+    /// periodSeconds (field 4, int32)
+    #[prost(int32, tag = "4")]
+    period_seconds: i32,
+    /// successThreshold (field 5, int32)
+    #[prost(int32, tag = "5")]
+    success_threshold: i32,
+    /// failureThreshold (field 6, int32)
+    #[prost(int32, tag = "6")]
+    failure_threshold: i32,
+}
+
 /// Container — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Container
 #[derive(Clone, PartialEq, Message)]
@@ -217,6 +240,12 @@ struct Container {
     /// resources (field 8, message ResourceRequirements)
     #[prost(message, tag = "8")]
     resources: Option<ResourceRequirements>,
+    /// livenessProbe (field 10, message Probe)
+    #[prost(message, tag = "10")]
+    liveness_probe: Option<Probe>,
+    /// readinessProbe (field 11, message Probe)
+    #[prost(message, tag = "11")]
+    readiness_probe: Option<Probe>,
     /// terminationMessagePath (field 13, string)
     #[prost(string, tag = "13")]
     termination_message_path: String,
@@ -226,6 +255,9 @@ struct Container {
     /// terminationMessagePolicy (field 20, string)
     #[prost(string, tag = "20")]
     termination_message_policy: String,
+    /// startupProbe (field 22, message Probe)
+    #[prost(message, tag = "22")]
+    startup_probe: Option<Probe>,
 }
 
 /// PodSpec — k8s.io/api/core/v1/generated.proto
@@ -1627,6 +1659,45 @@ pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
+/// Convert a decoded `Probe` struct into a `serde_json::Value`.
+///
+/// Only non-zero timing fields are emitted; zero means "not set" for proto3 scalars.
+/// Handler fields (exec/httpGet/tcpSocket) are omitted — they are not decoded.
+fn probe_to_json(p: Probe) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if p.initial_delay_seconds != 0 {
+        m.insert(
+            "initialDelaySeconds".to_string(),
+            serde_json::Value::Number(p.initial_delay_seconds.into()),
+        );
+    }
+    if p.timeout_seconds != 0 {
+        m.insert(
+            "timeoutSeconds".to_string(),
+            serde_json::Value::Number(p.timeout_seconds.into()),
+        );
+    }
+    if p.period_seconds != 0 {
+        m.insert(
+            "periodSeconds".to_string(),
+            serde_json::Value::Number(p.period_seconds.into()),
+        );
+    }
+    if p.success_threshold != 0 {
+        m.insert(
+            "successThreshold".to_string(),
+            serde_json::Value::Number(p.success_threshold.into()),
+        );
+    }
+    if p.failure_threshold != 0 {
+        m.insert(
+            "failureThreshold".to_string(),
+            serde_json::Value::Number(p.failure_threshold.into()),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 /// Decode a proto-encoded Pod object into a `serde_json::Value`.
 ///
 /// Decodes metadata and spec.containers (name + image). All other PodSpec fields are omitted
@@ -1706,6 +1777,15 @@ pub fn decode_pod_proto(data: &[u8]) -> Option<serde_json::Value> {
                     );
                 }
                 cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
+            }
+            if let Some(p) = c.liveness_probe {
+                cm.insert("livenessProbe".to_string(), probe_to_json(p));
+            }
+            if let Some(p) = c.readiness_probe {
+                cm.insert("readinessProbe".to_string(), probe_to_json(p));
+            }
+            if let Some(p) = c.startup_probe {
+                cm.insert("startupProbe".to_string(), probe_to_json(p));
             }
             serde_json::Value::Object(cm)
         })
@@ -3926,6 +4006,89 @@ mod tests {
         assert_eq!(
             result["spec"]["nodeName"], "node-1",
             "nodeName must be decoded from field 10"
+        );
+    }
+
+    /// decode_pod_proto must preserve readinessProbe.initialDelaySeconds in decoded JSON.
+    ///
+    /// When a pod is created via protobuf (e.g. by kubectl or the conformance suite), kubelet
+    /// reads the probe config from the stored JSON. If readinessProbe is not decoded, kubelet
+    /// receives null and uses default initialDelaySeconds=0 — the probe fires immediately,
+    /// before the container is ready, causing spurious failures.
+    ///
+    /// This test must fail if the Probe struct or its fields are removed from the Container
+    /// decoder: removing probe_to_json or the liveness/readiness/startup_probe fields in the
+    /// map-building loop causes the decoded JSON to have no readinessProbe key.
+    #[test]
+    fn decode_pod_proto_preserves_readiness_probe_initial_delay() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "app", namespace: "default" },
+        //   spec: PodSpec {
+        //     containers: [Container {
+        //       name: "app", image: "app:v1",
+        //       readinessProbe: Probe {   // Container field 11
+        //         initialDelaySeconds: 30,  // Probe field 2, varint
+        //         timeoutSeconds: 5,        // Probe field 3, varint
+        //         periodSeconds: 10,        // Probe field 4, varint
+        //       }
+        //     }]
+        //   }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"app");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        // Encode Probe message: int32 fields use wire type 0 (varint)
+        // tag = (field_number << 3) | wire_type_0
+        let mut readiness_probe = encode_varint((2u64 << 3) | 0); // field 2 = initialDelaySeconds, wire 0
+        readiness_probe.extend_from_slice(&encode_varint(30));
+        readiness_probe.extend_from_slice(&encode_varint((3u64 << 3) | 0)); // field 3 = timeoutSeconds
+        readiness_probe.extend_from_slice(&encode_varint(5));
+        readiness_probe.extend_from_slice(&encode_varint((4u64 << 3) | 0)); // field 4 = periodSeconds
+        readiness_probe.extend_from_slice(&encode_varint(10));
+
+        // Container field 1=name, 2=image, 11=readinessProbe (length-delimited message)
+        let mut container = encode_length_delimited(1, b"app");
+        container.extend_from_slice(&encode_length_delimited(2, b"app:v1"));
+        container.extend_from_slice(&encode_length_delimited(11, &readiness_probe));
+
+        let pod_spec = encode_length_delimited(2, &container); // PodSpec.containers = field 2
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto).expect(
+            "decode_pod_proto must succeed — without probe decoding, kubelet fires probes immediately",
+        );
+
+        assert_eq!(result["metadata"]["name"], "app");
+
+        let probe = &result["spec"]["containers"][0]["readinessProbe"];
+        assert!(
+            probe.is_object(),
+            "readinessProbe must be present in decoded JSON — if missing, kubelet uses \
+             default initialDelaySeconds=0 and fires the probe before the container is ready"
+        );
+        assert_eq!(
+            probe["initialDelaySeconds"], 30,
+            "initialDelaySeconds=30 must survive proto decode — kubelet reads this to delay \
+             the first probe; if 0 or missing, probes fire immediately on container start"
+        );
+        assert_eq!(
+            probe["timeoutSeconds"], 5,
+            "timeoutSeconds must be decoded from Probe field 3"
+        );
+        assert_eq!(
+            probe["periodSeconds"], 10,
+            "periodSeconds must be decoded from Probe field 4"
+        );
+
+        // Verify the other probe types are absent (not spuriously set to empty objects)
+        assert!(
+            result["spec"]["containers"][0]["livenessProbe"].is_null(),
+            "livenessProbe must not appear when not set in proto"
+        );
+        assert!(
+            result["spec"]["containers"][0]["startupProbe"].is_null(),
+            "startupProbe must not appear when not set in proto"
         );
     }
 
