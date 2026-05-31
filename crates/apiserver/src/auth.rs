@@ -627,7 +627,7 @@ where
 
         // 1. Authenticate.
         let peer_cert = req.extensions().get::<PeerCertificate>().cloned();
-        let user = match authenticate(
+        let authenticated_user = match authenticate(
             &req,
             &self.token_map,
             self.sa_decoding_key.as_deref(),
@@ -637,6 +637,89 @@ where
             AuthnResult::BadToken => {
                 return Box::pin(async move { Ok(unauthorized_response()) });
             }
+        };
+
+        // 1a. Impersonation — Kubernetes-style Impersonate-User / Impersonate-Group headers.
+        //
+        // When present, the authenticated user is requesting to act as a different identity.
+        // We must verify that the authenticated user has the `impersonate` verb on the
+        // target resources before substituting the impersonated identity.
+        //
+        // The impersonated groups replace the authenticated user's groups entirely; real
+        // Kubernetes always adds system:authenticated to any impersonated non-system user,
+        // but if the caller explicitly supplies groups we use those verbatim (just like the
+        // real apiserver does when Impersonate-Group headers are provided).
+        let user = if let Some(impersonate_user) = req
+            .headers()
+            .get("Impersonate-User")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned())
+        {
+            // Collect all Impersonate-Group header values (may be repeated).
+            let impersonate_groups: Vec<String> = req
+                .headers()
+                .get_all("Impersonate-Group")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .map(|s| s.to_owned())
+                .collect();
+
+            // Verify the authenticated caller may impersonate this user.
+            if !self.rbac_index.is_allowed(&AuthzRequest {
+                username: &authenticated_user.username,
+                groups: &authenticated_user.groups,
+                verb: "impersonate",
+                api_group: "",
+                resource: "users",
+                subresource: "",
+                namespace: None,
+                name: Some(&impersonate_user),
+                non_resource_url: None,
+            }) {
+                let username = authenticated_user.username.clone();
+                let target = impersonate_user.clone();
+                return Box::pin(async move {
+                    Ok(forbidden_response(&username, "impersonate", &target))
+                });
+            }
+
+            // Verify the authenticated caller may impersonate each requested group.
+            for group in &impersonate_groups {
+                if !self.rbac_index.is_allowed(&AuthzRequest {
+                    username: &authenticated_user.username,
+                    groups: &authenticated_user.groups,
+                    verb: "impersonate",
+                    api_group: "",
+                    resource: "groups",
+                    subresource: "",
+                    namespace: None,
+                    name: Some(group),
+                    non_resource_url: None,
+                }) {
+                    let username = authenticated_user.username.clone();
+                    let target = group.clone();
+                    return Box::pin(async move {
+                        Ok(forbidden_response(&username, "impersonate", &target))
+                    });
+                }
+            }
+
+            // All impersonation checks passed — substitute impersonated identity.
+            // If the caller supplied explicit groups, use them verbatim.
+            // If no groups were provided, add system:authenticated as Kubernetes does.
+            let groups = if impersonate_groups.is_empty() {
+                vec!["system:authenticated".to_owned()]
+            } else {
+                impersonate_groups
+            };
+
+            UserInfo {
+                username: impersonate_user,
+                uid: String::new(),
+                groups,
+            }
+        } else {
+            authenticated_user
         };
 
         // 2. Authorize.
@@ -1495,6 +1578,232 @@ mod tests {
             "DELETE on collection path must use 'deletecollection' verb so that \
              the namespace controller's RBAC grants apply — using 'delete' instead \
              would block namespace cleanup"
+        );
+    }
+
+    // --- Impersonation via Impersonate-User / Impersonate-Group headers ---
+    //
+    // The conformance test (mayor-pya9) creates SA `e2e`, submits SAR for list
+    // configmaps → returns false (correct), then impersonates the SA and actually
+    // lists configmaps.  Before this fix the server ignored impersonation headers
+    // and processed the request as the authenticated caller (cluster-admin), so
+    // the real list succeeded while SAR returned false.  The fix: honor
+    // Impersonate-User and Impersonate-Group, substituting the impersonated
+    // identity for all downstream RBAC checks.
+
+    fn make_rbac_with_impersonator_and_target() -> Arc<RbacIndex> {
+        // alice can impersonate any user (has `impersonate` on `users`).
+        // bob is the target user; he has NO other permissions.
+        // charlie is a group that alice can impersonate.
+        let idx = Arc::new(RbacIndex::new());
+
+        // ClusterRole: impersonator — grants impersonate on users/* and groups/*.
+        let role_key = "/apis/rbac.authorization.k8s.io/v1/clusterroles/impersonator";
+        let role_val = serde_json::json!({
+            "rules": [
+                { "apiGroups": [""], "resources": ["users", "groups"], "verbs": ["impersonate"] }
+            ]
+        });
+        idx.apply_object(role_key, &role_val);
+
+        // Bind alice to the impersonator role.
+        let bind_key = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/alice-impersonator";
+        let bind_val = serde_json::json!({
+            "subjects": [{ "kind": "User", "name": "alice" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "impersonator"
+            }
+        });
+        idx.apply_object(bind_key, &bind_val);
+
+        // ClusterRole: pod-reader — lets bob list pods.
+        let role_key2 = "/apis/rbac.authorization.k8s.io/v1/clusterroles/pod-reader";
+        let role_val2 = serde_json::json!({
+            "rules": [
+                { "apiGroups": [""], "resources": ["pods"], "verbs": ["list"] }
+            ]
+        });
+        idx.apply_object(role_key2, &role_val2);
+
+        // Bind bob to pod-reader.
+        let bind_key2 = "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/bob-pod-reader";
+        let bind_val2 = serde_json::json!({
+            "subjects": [{ "kind": "User", "name": "bob" }],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "pod-reader"
+            }
+        });
+        idx.apply_object(bind_key2, &bind_val2);
+
+        // alice also needs permission to actually make the request to the pods endpoint.
+        // Grant alice list pods so the impersonation authorization check passes for alice
+        // herself (the initial authz check on the real request is performed as the
+        // impersonated user, not alice, so this isn't needed for the impersonation case —
+        // but alice still needs to authenticate and we need the test to not be confused
+        // by alice's own RBAC).
+        // (No additional alice binding needed — impersonation replaces alice's identity.)
+
+        idx
+    }
+
+    /// When `Impersonate-User: bob` is set and alice has the impersonate verb,
+    /// the AuthService must substitute bob's identity for the downstream RBAC
+    /// check and attach bob's UserInfo to request extensions.
+    ///
+    /// Without this, the server ignores impersonation headers and uses alice's
+    /// identity, causing the real request to succeed (if alice is privileged)
+    /// while SAR (which correctly evaluates bob's permissions) returns denied —
+    /// the divergence caught by the SubjectReview conformance test.
+    #[tokio::test]
+    async fn impersonation_substitutes_target_identity_when_caller_has_impersonate_verb() {
+        use axum::{body::Body, http::Request, routing::get, Extension, Router};
+        use tower::ServiceExt;
+
+        let idx = make_rbac_with_impersonator_and_target();
+
+        // alice token.
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "alice-token".to_owned(),
+            UserInfo {
+                username: "alice".to_owned(),
+                uid: "1".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+            },
+        );
+
+        // Handler that extracts the effective UserInfo from request extensions.
+        async fn whoami(Extension(user): Extension<UserInfo>) -> String {
+            user.username
+        }
+
+        // Route that alice is NOT normally allowed to access but bob IS: list pods.
+        // (bob has a ClusterRole binding for list pods; alice has no pod binding.)
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(whoami))
+            .layer(AuthLayer::new(Arc::clone(&idx), token_map, None));
+
+        // Request as alice, impersonating bob.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer alice-token")
+            .header("Impersonate-User", "bob")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "bob can list pods via alice's impersonation; impersonation must substitute \
+             bob's identity for the downstream RBAC check"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body_bytes).unwrap(),
+            "bob",
+            "effective username in extensions must be 'bob', not 'alice' — \
+             impersonation must replace the identity seen by handlers"
+        );
+    }
+
+    /// When `Impersonate-User` is set but the authenticated caller lacks the
+    /// `impersonate` verb, the AuthService must return 403 Forbidden.
+    ///
+    /// Allowing unprivileged callers to impersonate would be a critical
+    /// privilege escalation: any authenticated user could act as cluster-admin.
+    #[tokio::test]
+    async fn impersonation_denied_when_caller_lacks_impersonate_verb() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        // charlie has NO permissions at all.
+        let idx = Arc::new(RbacIndex::new());
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "charlie-token".to_owned(),
+            UserInfo {
+                username: "charlie".to_owned(),
+                uid: "2".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+            },
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(|| async { "ok" }))
+            .layer(AuthLayer::new(Arc::clone(&idx), token_map, None));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer charlie-token")
+            .header("Impersonate-User", "cluster-admin")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "caller without impersonate verb must get 403 — \
+             failing this would allow any authenticated user to escalate to cluster-admin"
+        );
+    }
+
+    /// Without impersonation headers, the AuthService must use the token-authenticated
+    /// identity unchanged — impersonation logic must not bleed into non-impersonating requests.
+    #[tokio::test]
+    async fn no_impersonation_header_uses_token_identity() {
+        use axum::{body::Body, http::Request, routing::get, Extension, Router};
+        use tower::ServiceExt;
+
+        let idx = make_rbac_with_impersonator_and_target();
+        let mut token_map = HashMap::new();
+        token_map.insert(
+            "bob-token".to_owned(),
+            UserInfo {
+                username: "bob".to_owned(),
+                uid: "3".to_owned(),
+                groups: vec!["system:authenticated".to_owned()],
+            },
+        );
+
+        async fn whoami(Extension(user): Extension<UserInfo>) -> String {
+            user.username
+        }
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/default/pods", get(whoami))
+            .layer(AuthLayer::new(Arc::clone(&idx), token_map, None));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods")
+            .header("authorization", "Bearer bob-token")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "bob can list pods directly with his own token — no impersonation involved"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body_bytes).unwrap(),
+            "bob",
+            "identity without impersonation must be the token-authenticated user"
         );
     }
 }
