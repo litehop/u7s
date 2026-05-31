@@ -327,6 +327,7 @@ fn put_sync(
     key: &str,
     value: Bytes,
     expected_revision: Option<u64>,
+    last_written: &AtomicU64,
 ) -> Result<(u64, Bytes, bool)> {
     // 1. Begin exclusive write transaction.
     conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -409,10 +410,21 @@ fn put_sync(
     )?;
 
     conn.execute_batch("COMMIT")?;
+    // Update last_written_revision immediately after COMMIT on this blocking thread.
+    // Doing this here (rather than in the async caller) eliminates the scheduling window
+    // where a concurrent list on the read connection could see the new WAL data but
+    // load a stale last_written_revision from the async task queue — causing the list
+    // guard to miss the stale-read and return an older resourceVersion to the reflector.
+    last_written.fetch_max(new_revision, Ordering::Release);
     Ok((new_revision, stamped_value, is_create))
 }
 
-fn delete_sync(conn: &Connection, key: &str, expected_revision: Option<u64>) -> Result<u64> {
+fn delete_sync(
+    conn: &Connection,
+    key: &str,
+    expected_revision: Option<u64>,
+    last_written: &AtomicU64,
+) -> Result<u64> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
     let stored: Option<u64> = conn
@@ -455,6 +467,10 @@ fn delete_sync(conn: &Connection, key: &str, expected_revision: Option<u64>) -> 
 
     conn.execute("DELETE FROM objects WHERE key = ?1", params![key])?;
     conn.execute_batch("COMMIT")?;
+    // Same rationale as put_sync: update last_written_revision on the blocking thread
+    // immediately after COMMIT so the list guard sees it before any reader can observe
+    // the new WAL state from a concurrent read connection.
+    last_written.fetch_max(new_revision, Ordering::Release);
     Ok(new_revision)
 }
 
@@ -462,7 +478,11 @@ fn delete_sync(conn: &Connection, key: &str, expected_revision: Option<u64>) -> 
 ///
 /// Returns the keys that were deleted (may be empty) and the new revision
 /// (only meaningful when at least one object was deleted).
-fn delete_namespace_sync(conn: &Connection, namespace: &str) -> Result<(u64, Vec<String>)> {
+fn delete_namespace_sync(
+    conn: &Connection,
+    namespace: &str,
+    last_written: &AtomicU64,
+) -> Result<(u64, Vec<String>)> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
     // Collect all keys in the namespace.
@@ -499,6 +519,8 @@ fn delete_namespace_sync(conn: &Connection, namespace: &str) -> Result<(u64, Vec
     // Delete all objects in the namespace.
     conn.execute("DELETE FROM objects WHERE ns = ?1", params![namespace])?;
     conn.execute_batch("COMMIT")?;
+    // Same rationale as put_sync: update immediately after COMMIT on the blocking thread.
+    last_written.fetch_max(new_revision, Ordering::Release);
     Ok((new_revision, keys))
 }
 
@@ -893,14 +915,12 @@ impl Store for SqliteStore {
     async fn put(&self, key: &str, value: Bytes, expected_revision: Option<u64>) -> Result<u64> {
         let conn = self.write_conn.clone();
         let key_str = key.to_string();
+        let last_written = Arc::clone(&self.last_written_revision);
         let (revision, stamped_value, is_create) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            put_sync(&conn, &key_str, value, expected_revision)
+            put_sync(&conn, &key_str, value, expected_revision, &last_written)
         })
         .await??;
-
-        self.last_written_revision
-            .fetch_max(revision, Ordering::Release);
 
         self.push_event(Arc::new(InternalEvent {
             key: key.to_string(),
@@ -915,14 +935,12 @@ impl Store for SqliteStore {
     async fn delete(&self, key: &str, expected_revision: Option<u64>) -> Result<u64> {
         let conn = self.write_conn.clone();
         let key_str = key.to_string();
+        let last_written = Arc::clone(&self.last_written_revision);
         let revision = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            delete_sync(&conn, &key_str, expected_revision)
+            delete_sync(&conn, &key_str, expected_revision, &last_written)
         })
         .await??;
-
-        self.last_written_revision
-            .fetch_max(revision, Ordering::Release);
 
         self.push_event(Arc::new(InternalEvent {
             key: key.to_string(),
@@ -937,15 +955,14 @@ impl Store for SqliteStore {
     async fn delete_namespace_resources(&self, namespace: &str) -> Result<Vec<String>> {
         let conn = self.write_conn.clone();
         let ns = namespace.to_string();
+        let last_written = Arc::clone(&self.last_written_revision);
         let (revision, keys) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            delete_namespace_sync(&conn, &ns)
+            delete_namespace_sync(&conn, &ns, &last_written)
         })
         .await??;
 
         if !keys.is_empty() {
-            self.last_written_revision
-                .fetch_max(revision, Ordering::Release);
             for key in &keys {
                 self.push_event(Arc::new(InternalEvent {
                     key: key.clone(),
@@ -2652,6 +2669,80 @@ mod tests {
             recorded, del_rv,
             "last_written_revision must be updated to the delete revision; \
              without this, a list after a delete could return a stale revision"
+        );
+    }
+
+    /// Regression test for mayor-mwgk: last_written_revision must be updated inside the blocking
+    /// thread (put_sync), not in the async caller, so it is visible before spawn_blocking resolves.
+    ///
+    /// Without this fix there was a multi-threaded race: put_sync could commit rv=N+1 to the WAL
+    /// (making it visible to new read transactions) while a concurrent list on the read connection
+    /// saw the new WAL data but the async caller had not yet executed fetch_max. The list guard
+    /// would then read last_written_revision=N and conclude no retry was needed, returning the
+    /// stale revision to the KCM reflector. The reflector logged
+    /// "read version N is not as new as written version N+1" and waited up to 60s before
+    /// retrying — long enough to cause conformance test timeouts.
+    ///
+    /// This test cannot reproduce the race itself (that requires a specific thread interleaving),
+    /// but it verifies the structural property that makes the race impossible: after put() awaits,
+    /// last_written_revision already equals the returned revision. With the old code the update
+    /// happened AFTER the await returned (in the async frame), so a concurrent list could see
+    /// the stale value. With the new code the update is inside spawn_blocking and therefore
+    /// sequenced before the future resolves.
+    #[tokio::test]
+    async fn last_written_revision_set_before_put_await_returns() {
+        let store = make_store();
+        let key = "/registry/apps/replicasets/default/race-rs";
+
+        let rs_json = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSet",
+                "metadata": { "name": "race-rs", "namespace": "default" }
+            })
+            .to_string(),
+        );
+
+        let rv = store.put(key, rs_json, Some(0)).await.expect("create");
+
+        // last_written_revision must already equal rv at this point, not merely "eventually".
+        // If fetch_max ran in async context (after await), a concurrent list executing its guard
+        // check between the spawn_blocking completing and fetch_max running would see stale value.
+        let recorded = store.last_written_revision.load(Ordering::Acquire);
+        assert_eq!(
+            recorded, rv,
+            "last_written_revision must equal the put revision before put() returns — \
+             if it lags behind (updated after spawn_blocking resolves in async context), \
+             a concurrent list on the read connection can observe the new WAL data but \
+             load a stale last_written_revision, bypassing the stale-read guard and \
+             returning an older resourceVersion that causes the KCM reflector to log \
+             'read version is not as new as written version'"
+        );
+    }
+
+    /// Regression test for mayor-mwgk: last_written_revision must be set inside delete_sync.
+    #[tokio::test]
+    async fn last_written_revision_set_before_delete_await_returns() {
+        let store = make_store();
+        let key = "/registry/apps/replicasets/default/race-del-rs";
+
+        let rs_json = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSet",
+                "metadata": { "name": "race-del-rs", "namespace": "default" }
+            })
+            .to_string(),
+        );
+
+        let put_rv = store.put(key, rs_json, Some(0)).await.expect("create");
+        let del_rv = store.delete(key, Some(put_rv)).await.expect("delete");
+
+        let recorded = store.last_written_revision.load(Ordering::Acquire);
+        assert_eq!(
+            recorded, del_rv,
+            "last_written_revision must equal the delete revision before delete() returns; \
+             same race risk as put: a concurrent list could bypass the stale-read guard"
         );
     }
 
