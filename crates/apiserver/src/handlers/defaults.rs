@@ -32,6 +32,21 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if is_workload_resource(group, plural) {
         initialize_workload_generation(obj);
     }
+
+    // Strip null creationTimestamp from pod template metadata on apps workloads.
+    // KCM's FindNewReplicaSet uses EqualIgnoreHash(RS.spec.template, Deployment.spec.template).
+    // Our JSON serialization of ObjectMeta emits "creationTimestamp: null" but KCM omits this
+    // field when creating the RS — causing EqualIgnoreHash to see different metadata and return
+    // false, so FindNewReplicaSet returns nil and the deployment revision annotation is never set.
+    if matches!(
+        (group, plural),
+        ("apps", "deployments")
+            | ("apps", "replicasets")
+            | ("apps", "statefulsets")
+            | ("apps", "daemonsets")
+    ) {
+        strip_null_template_metadata(obj);
+    }
 }
 
 /// Returns true when the group/plural pair is a workload resource that KCM
@@ -356,6 +371,23 @@ fn default_daemonset(obj: &mut serde_json::Value) {
     }
     if obj["spec"]["revisionHistoryLimit"].is_null() {
         obj["spec"]["revisionHistoryLimit"] = serde_json::Value::Number(10.into());
+    }
+}
+
+/// Remove null-valued fields from `spec.template.metadata` on workload objects.
+///
+/// Our JSON serialization of `ObjectMeta` always emits `"creationTimestamp": null`.
+/// KCM omits this field when creating a ReplicaSet from a Deployment template.
+/// `EqualIgnoreHash` (used by `FindNewReplicaSet`) does a deep equality check on
+/// the pod template: Deployment template has `creationTimestamp: null`, RS template
+/// does not → templates are unequal → `FindNewReplicaSet` returns nil → the
+/// deployment revision annotation is never set and reconciliation stalls.
+///
+/// Only strips keys whose value is `null`; non-null fields are left untouched.
+/// Only operates on `spec.template.metadata`; no other part of the object is changed.
+fn strip_null_template_metadata(obj: &mut serde_json::Value) {
+    if let Some(meta) = obj["spec"]["template"]["metadata"].as_object_mut() {
+        meta.retain(|_, v| !v.is_null());
     }
 }
 
@@ -1723,6 +1755,141 @@ mod tests {
             obj["metadata"]["generation"], 1,
             "generation must not increment when spec is unchanged — spurious increments \
              cause unnecessary KCM reconcile loops"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: null creationTimestamp stripped from pod template metadata
+    // (mayor-48ks)
+    // ---------------------------------------------------------------------------
+
+    /// Deployment pod template metadata must not contain "creationTimestamp: null" after
+    /// apply_defaults.
+    ///
+    /// KCM's FindNewReplicaSet uses EqualIgnoreHash(RS.spec.template, Deployment.spec.template).
+    /// Our JSON serialization of ObjectMeta always emits "creationTimestamp: null", but KCM
+    /// omits this field when creating the RS.  The deep-equality check sees different metadata
+    /// → returns false → FindNewReplicaSet returns nil → deployment revision annotation is
+    /// never set and the Deployment stays permanently unreconciled.
+    ///
+    /// This test MUST FAIL if strip_null_template_metadata is removed from apply_defaults.
+    #[test]
+    fn deployment_template_metadata_null_creation_timestamp_stripped() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {
+                    "metadata": {
+                        "creationTimestamp": null,
+                        "labels": { "app": "test" }
+                    },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert!(
+            obj["spec"]["template"]["metadata"]["creationTimestamp"].is_null(),
+            "creationTimestamp key must be absent from stored template metadata — \
+             its presence (as null) causes KCM's EqualIgnoreHash to see different \
+             metadata between the Deployment and RS templates, making FindNewReplicaSet \
+             return nil and leaving the deployment permanently unreconciled"
+        );
+        // The key must be absent, not merely null-valued.
+        assert!(
+            !obj["spec"]["template"]["metadata"]
+                .as_object()
+                .unwrap()
+                .contains_key("creationTimestamp"),
+            "creationTimestamp must be fully removed from template metadata, not left as null — \
+             serde_json represents absent keys and null values differently; EqualIgnoreHash \
+             treats an absent key as different from a null key"
+        );
+        // Non-null fields must survive.
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"],
+            serde_json::json!({ "app": "test" }),
+            "non-null template metadata fields must not be stripped"
+        );
+    }
+
+    /// ReplicaSet, StatefulSet, and DaemonSet also strip null creationTimestamp.
+    ///
+    /// All four apps workload kinds have pod templates that KCM hashes for ownership
+    /// checks. A null creationTimestamp in any of them causes the same EqualIgnoreHash
+    /// mismatch as in Deployments.
+    #[test]
+    fn all_apps_workloads_strip_null_creation_timestamp_from_template() {
+        let cases = [
+            ("apps", "deployments"),
+            ("apps", "replicasets"),
+            ("apps", "statefulsets"),
+            ("apps", "daemonsets"),
+        ];
+
+        for (group, plural) in cases {
+            let mut obj = serde_json::json!({
+                "metadata": { "name": "test", "namespace": "default" },
+                "spec": {
+                    "selector": { "matchLabels": { "app": "test" } },
+                    "template": {
+                        "metadata": {
+                            "creationTimestamp": null,
+                            "labels": { "app": "test" }
+                        }
+                    }
+                }
+            });
+
+            apply_defaults(group, plural, &mut obj);
+
+            assert!(
+                !obj["spec"]["template"]["metadata"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("creationTimestamp"),
+                "creationTimestamp must be stripped from {group}/{plural} template metadata — \
+                 EqualIgnoreHash mismatch would leave the workload permanently unreconciled"
+            );
+        }
+    }
+
+    /// Template metadata without creationTimestamp must pass through unchanged.
+    ///
+    /// Ensures strip_null_template_metadata is a no-op when the field is absent,
+    /// so existing Deployments that never had null creationTimestamp are unaffected.
+    #[test]
+    fn template_metadata_without_null_creation_timestamp_unchanged() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {
+                    "metadata": { "labels": { "app": "test" } }
+                }
+            }
+        });
+
+        apply_defaults("apps", "deployments", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"],
+            serde_json::json!({ "app": "test" }),
+            "labels must be preserved when no null keys are present"
+        );
+        assert!(
+            !obj["spec"]["template"]["metadata"]
+                .as_object()
+                .unwrap()
+                .contains_key("creationTimestamp"),
+            "creationTimestamp must not appear when it was never in the input"
         );
     }
 }
