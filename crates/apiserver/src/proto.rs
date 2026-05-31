@@ -1302,14 +1302,29 @@ struct Deployment {
     spec: Option<DeploymentSpec>,
 }
 
+/// DaemonSetSpec — k8s.io/api/apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message DaemonSetSpec
+/// Only selector and template decoded; other fields not needed for selector defaulting.
+#[derive(Clone, PartialEq, Message)]
+struct DaemonSetSpec {
+    /// selector (field 1, message LabelSelector)
+    #[prost(message, tag = "1")]
+    selector: Option<AppsLabelSelector>,
+    /// template (field 2, message PodTemplateSpec)
+    #[prost(message, tag = "2")]
+    template: Option<AppsPodTemplateSpec>,
+}
+
 /// DaemonSet — k8s.io/api/apps/v1/generated.proto
-/// Source: k8s.io/api/apps/v1/generated.proto message DaemonSet
-/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
+/// Source: api-apps-v1-generated.proto message DaemonSet
 #[derive(Clone, PartialEq, Message)]
 struct DaemonSet {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message DaemonSetSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<DaemonSetSpec>,
 }
 
 /// ReplicaSet — k8s.io/api/apps/v1/generated.proto
@@ -2923,11 +2938,17 @@ pub fn decode_deployment_proto(data: &[u8]) -> Option<serde_json::Value> {
 pub fn decode_daemonset_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = DaemonSet::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut out = serde_json::json!({
         "apiVersion": "apps/v1",
         "kind": "DaemonSet",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = obj.spec {
+        if let Some(spec_json) = apps_spec_to_json(spec.selector, spec.template) {
+            out["spec"] = spec_json;
+        }
+    }
+    Some(out)
 }
 
 /// Decode a proto-encoded ReplicaSet object into a `serde_json::Value`.
@@ -6315,6 +6336,52 @@ mod tests {
         assert_eq!(
             result["spec"]["template"]["metadata"]["labels"]["app"], "myrs",
             "spec.template.metadata.labels must be present for selector defaulting"
+        );
+    }
+
+    /// Decoding a DaemonSet proto with spec.template.metadata.labels must include
+    /// spec.template.metadata.labels in the JSON output.
+    ///
+    /// Without spec field decoding in the DaemonSet prost struct, applying a DaemonSet via
+    /// kubectl fails with 'proto: cannot parse invalid wire-format data' because the proto body
+    /// cannot be decoded when spec (field 2) is unknown to our struct.
+    #[test]
+    fn decode_daemonset_proto_includes_spec_template_labels() {
+        // Encode: matchLabels map entry: key="app", value="myds"
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"myds"));
+
+        // LabelSelector { matchLabels: {"app": "myds"} }  — field 1 is map<string,string>
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+
+        // ObjectMeta { labels: {"app": "myds"} }  — field 11 is map<string,string>
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+
+        // PodTemplateSpec { metadata: tmpl_meta }  — field 1
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+
+        // DaemonSetSpec { selector: field 1, template: field 2 }
+        let mut spec_bytes = encode_length_delimited(1, &selector_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &template_bytes));
+
+        // DaemonSet { metadata: field 1, spec: field 2 }
+        let name_bytes = encode_length_delimited(1, b"my-ds");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("DaemonSet", &proto).expect(
+            "DaemonSet with spec must decode successfully — \
+             without spec decoding, kubectl apply fails with 'cannot parse invalid wire-format data'",
+        );
+
+        assert_eq!(
+            result["spec"]["template"]["metadata"]["labels"]["app"], "myds",
+            "spec.template.metadata.labels must be present for selector defaulting; \
+             without it the apiserver returns 422 'spec.selector is required and could not be defaulted'"
+        );
+        assert_eq!(
+            result["spec"]["selector"]["matchLabels"]["app"], "myds",
+            "spec.selector.matchLabels must be present in decoded JSON"
         );
     }
 
