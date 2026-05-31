@@ -731,6 +731,13 @@ fn authz_v1_resources() -> serde_json::Value {
         "groupVersion": "authorization.k8s.io/v1",
         "resources": [
             {
+                "name": "localsubjectaccessreviews",
+                "singularName": "localsubjectaccessreview",
+                "namespaced": true,
+                "kind": "LocalSubjectAccessReview",
+                "verbs": ["create"]
+            },
+            {
                 "name": "selfsubjectaccessreviews",
                 "singularName": "selfsubjectaccessreview",
                 "namespaced": false,
@@ -742,6 +749,13 @@ fn authz_v1_resources() -> serde_json::Value {
                 "singularName": "selfsubjectrulesreview",
                 "namespaced": false,
                 "kind": "SelfSubjectRulesReview",
+                "verbs": ["create"]
+            },
+            {
+                "name": "subjectaccessreviews",
+                "singularName": "subjectaccessreview",
+                "namespaced": false,
+                "kind": "SubjectAccessReview",
                 "verbs": ["create"]
             }
         ]
