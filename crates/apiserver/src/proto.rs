@@ -1347,14 +1347,29 @@ struct VolumeAttributesClass {
 
 // --- k8s.io/api/core/v1/generated.proto (resource management types) ---
 
+/// ResourceQuotaSpec — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ResourceQuotaSpec
+///
+/// Only field 1 (hard) is decoded; scopes (field 2) and scopeSelector (field 3) are skipped.
+/// hard is required by the quota controller to enforce limits; without it the controller
+/// sees no limits and skips reconciliation, leaving spec.hard null after create.
+#[derive(Clone, PartialEq, Message)]
+struct ResourceQuotaSpec {
+    /// hard (field 1, map<string, Quantity>) — the desired hard limits per named resource
+    #[prost(btree_map = "string, message", tag = "1")]
+    hard: std::collections::BTreeMap<String, Quantity>,
+}
+
 /// ResourceQuota — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ResourceQuota
-/// spec/status fields (hard limits, scopes) are not needed for routing.
 #[derive(Clone, PartialEq, Message)]
 struct ResourceQuota {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message ResourceQuotaSpec)
+    #[prost(message, optional, tag = "2")]
+    spec: Option<ResourceQuotaSpec>,
 }
 
 /// Quantity — k8s.io/apimachinery/pkg/api/resource/generated.proto
@@ -2917,11 +2932,19 @@ pub fn decode_volumeattributesclass_proto(data: &[u8]) -> Option<serde_json::Val
 pub fn decode_resourcequota_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = ResourceQuota::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "v1",
         "kind": "ResourceQuota",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = obj.spec {
+        if !spec.hard.is_empty() {
+            result["spec"] = serde_json::json!({
+                "hard": limitrange_quantity_map_to_json(spec.hard)
+            });
+        }
+    }
+    Some(result)
 }
 
 /// Decode a proto-encoded LimitRange object into a `serde_json::Value`.
@@ -6302,6 +6325,54 @@ mod tests {
         assert_eq!(result["apiVersion"], "v1");
         assert_eq!(result["metadata"]["name"], "compute-quota");
         assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    /// decode_resourcequota_proto must decode spec.hard so the quota controller can enforce limits.
+    ///
+    /// KCM's quota controller reads spec.hard to determine the limits it must enforce and to
+    /// populate status.used. If spec.hard is null (not decoded), the controller skips
+    /// reconciliation entirely, meaning no quota is enforced and status.used is never updated.
+    /// This test must fail if spec decoding is removed.
+    #[test]
+    fn decode_resourcequota_proto_extracts_spec_hard() {
+        // Build the proto bytes for:
+        //   ResourceQuota {
+        //     metadata: ObjectMeta { name: "compute-quota", namespace: "default" },
+        //     spec: ResourceQuotaSpec {
+        //       hard: {"pods": Quantity{string: "10"}}
+        //     }
+        //   }
+        //
+        // Encode a Quantity{string: "10"} message (field 1 = string).
+        let encode_quantity = |s: &[u8]| -> Vec<u8> { encode_length_delimited(1, s) };
+
+        // Encode a proto map entry: key (field 1) and value message (field 2).
+        let encode_map_entry = |key: &[u8], val_bytes: &[u8]| -> Vec<u8> {
+            let mut entry = encode_length_delimited(1, key);
+            entry.extend_from_slice(&encode_length_delimited(2, val_bytes));
+            entry
+        };
+
+        // ResourceQuotaSpec { hard: {"pods": Quantity{string: "10"}} }  (field 1 = hard map)
+        let pods_entry = encode_map_entry(b"pods", &encode_quantity(b"10"));
+        let spec_bytes = encode_length_delimited(1, &pods_entry);
+
+        // ResourceQuota { metadata, spec }
+        let mut meta_bytes = encode_length_delimited(1, b"compute-quota");
+        meta_bytes.extend_from_slice(&encode_length_delimited(3, b"default"));
+        let mut proto = encode_length_delimited(1, &meta_bytes); // field 1 = metadata
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes)); // field 2 = spec
+
+        let result = decode_core_proto_by_kind("ResourceQuota", &proto)
+            .expect("ResourceQuota with spec.hard must decode successfully");
+
+        assert_eq!(result["kind"], "ResourceQuota");
+        assert_eq!(result["metadata"]["name"], "compute-quota");
+        assert_eq!(
+            result["spec"]["hard"]["pods"], "10",
+            "spec.hard.pods must be decoded — without this the quota controller sees null \
+             spec.hard and skips reconciliation, so no quota is ever enforced"
+        );
     }
 
     /// decode_core_proto_by_kind must dispatch LimitRange to a decoder that returns valid JSON.
