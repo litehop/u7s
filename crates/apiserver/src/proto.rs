@@ -241,12 +241,79 @@ struct Lifecycle {
     pre_stop: Option<LifecycleHandler>,
 }
 
+/// ExecProbeAction — api-core-v1-generated.proto message ExecAction (used inside ProbeHandler)
+/// field 1 = command (repeated string)
+#[derive(Clone, PartialEq, Message)]
+struct ExecProbeAction {
+    /// command (field 1, repeated string)
+    #[prost(string, repeated, tag = "1")]
+    command: Vec<String>,
+}
+
+/// HttpGetProbeAction — api-core-v1-generated.proto message HTTPGetAction
+/// field 1 = path (string), field 3 = host (string), field 4 = scheme (string)
+/// field 2 = port (IntOrString message) — skipped; not decoded as simple int32 is not wire-compatible
+#[derive(Clone, PartialEq, Message)]
+struct HttpGetProbeAction {
+    /// path (field 1, string)
+    #[prost(string, tag = "1")]
+    path: String,
+    /// host (field 3, string)
+    #[prost(string, tag = "3")]
+    host: String,
+    /// scheme (field 4, string)
+    #[prost(string, tag = "4")]
+    scheme: String,
+}
+
+/// TcpSocketProbeAction — api-core-v1-generated.proto message TCPSocketAction
+/// field 2 = host (string); field 1 = port (IntOrString message) — skipped
+#[derive(Clone, PartialEq, Message)]
+struct TcpSocketProbeAction {
+    /// host (field 2, string)
+    #[prost(string, tag = "2")]
+    host: String,
+}
+
+/// GrpcProbeAction — api-core-v1-generated.proto message GRPCAction
+/// field 1 = port (int32), field 2 = service (string)
+#[derive(Clone, PartialEq, Message)]
+struct GrpcProbeAction {
+    /// port (field 1, int32)
+    #[prost(int32, tag = "1")]
+    port: i32,
+    /// service (field 2, string)
+    #[prost(string, tag = "2")]
+    service: String,
+}
+
+/// ProbeHandler — api-core-v1-generated.proto message ProbeHandler
+/// field 1 = exec (ExecAction), field 2 = httpGet (HTTPGetAction),
+/// field 3 = tcpSocket (TCPSocketAction), field 4 = grpc (GRPCAction)
+#[derive(Clone, PartialEq, Message)]
+struct ProbeHandler {
+    /// exec (field 1, message ExecProbeAction)
+    #[prost(message, tag = "1")]
+    exec: Option<ExecProbeAction>,
+    /// httpGet (field 2, message HttpGetProbeAction)
+    #[prost(message, tag = "2")]
+    http_get: Option<HttpGetProbeAction>,
+    /// tcpSocket (field 3, message TcpSocketProbeAction)
+    #[prost(message, tag = "3")]
+    tcp_socket: Option<TcpSocketProbeAction>,
+    /// grpc (field 4, message GrpcProbeAction)
+    #[prost(message, tag = "4")]
+    grpc: Option<GrpcProbeAction>,
+}
+
 /// Probe — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Probe
-/// field 1 = handler (ProbeHandler message) — not declared; prost silently drops unknown fields
-/// field 7 = terminationGracePeriodSeconds (int64) — not declared; not needed for timing conformance
+/// field 7 = terminationGracePeriodSeconds (int64) — not declared; not needed for conformance
 #[derive(Clone, PartialEq, Message)]
 struct Probe {
+    /// handler (field 1, message ProbeHandler) — contains exec/httpGet/tcpSocket/grpc
+    #[prost(message, tag = "1")]
+    handler: Option<ProbeHandler>,
     /// initialDelaySeconds (field 2, int32)
     #[prost(int32, tag = "2")]
     initial_delay_seconds: i32,
@@ -1747,6 +1814,45 @@ pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
 /// Handler fields (exec/httpGet/tcpSocket) are omitted — they are not decoded.
 fn probe_to_json(p: Probe) -> serde_json::Value {
     let mut m = serde_json::Map::new();
+    if let Some(handler) = p.handler {
+        if let Some(exec) = handler.exec {
+            if !exec.command.is_empty() {
+                m.insert(
+                    "exec".to_string(),
+                    serde_json::json!({ "command": exec.command }),
+                );
+            }
+        }
+        if let Some(http_get) = handler.http_get {
+            let mut hg = serde_json::Map::new();
+            if !http_get.path.is_empty() {
+                hg.insert("path".to_string(), serde_json::Value::String(http_get.path));
+            }
+            if !http_get.host.is_empty() {
+                hg.insert("host".to_string(), serde_json::Value::String(http_get.host));
+            }
+            if !http_get.scheme.is_empty() {
+                hg.insert(
+                    "scheme".to_string(),
+                    serde_json::Value::String(http_get.scheme),
+                );
+            }
+            m.insert("httpGet".to_string(), serde_json::Value::Object(hg));
+        }
+        if let Some(tcp) = handler.tcp_socket {
+            let mut ts = serde_json::Map::new();
+            if !tcp.host.is_empty() {
+                ts.insert("host".to_string(), serde_json::Value::String(tcp.host));
+            }
+            m.insert("tcpSocket".to_string(), serde_json::Value::Object(ts));
+        }
+        if let Some(grpc) = handler.grpc {
+            m.insert(
+                "grpc".to_string(),
+                serde_json::json!({ "port": grpc.port, "service": grpc.service }),
+            );
+        }
+    }
     if p.initial_delay_seconds != 0 {
         m.insert(
             "initialDelaySeconds".to_string(),
@@ -4334,6 +4440,84 @@ mod tests {
         assert!(
             lifecycle["postStart"].is_null(),
             "lifecycle.postStart must not appear when not set in proto"
+        );
+    }
+
+    /// decode_pod_proto must preserve readinessProbe.httpGet.path in decoded JSON.
+    ///
+    /// When a pod is submitted via protobuf with an httpGet readiness probe, kubelet reads
+    /// readinessProbe.httpGet.path from the stored JSON to make the HTTP health-check request.
+    /// If the ProbeHandler sub-message is not decoded, the stored probe has no httpGet field —
+    /// kubelet reports "missing probe handler" and marks the container unready forever.
+    ///
+    /// This test must fail if ProbeHandler decoding or probe_to_json's httpGet branch are removed.
+    #[test]
+    fn decode_pod_proto_preserves_readiness_probe_http_get_path() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "web", namespace: "default" },
+        //   spec: PodSpec {
+        //     containers: [Container {
+        //       name: "web", image: "nginx:latest",
+        //       readinessProbe: Probe {      // Container field 11
+        //         handler: ProbeHandler {   // Probe field 1
+        //           httpGet: HTTPGetAction { // ProbeHandler field 2
+        //             path: "/healthz",     // HTTPGetAction field 1 (string)
+        //           }
+        //         },
+        //         initialDelaySeconds: 5,   // Probe field 2
+        //       }
+        //     }]
+        //   }
+        // }
+
+        // Encode HTTPGetAction: path at field 1 (wire type 2, length-delimited string)
+        let http_get_action = encode_length_delimited(1, b"/healthz");
+
+        // Encode ProbeHandler: httpGet at field 2 (wire type 2, length-delimited message)
+        let probe_handler = encode_length_delimited(2, &http_get_action);
+
+        // Encode Probe: handler at field 1, initialDelaySeconds at field 2
+        let mut probe = encode_length_delimited(1, &probe_handler);
+        probe.extend_from_slice(&encode_varint(2u64 << 3)); // field 2 = initialDelaySeconds
+        probe.extend_from_slice(&encode_varint(5));
+
+        // Encode Container: name=field 1, image=field 2, readinessProbe=field 11
+        let mut container = encode_length_delimited(1, b"web");
+        container.extend_from_slice(&encode_length_delimited(2, b"nginx:latest"));
+        container.extend_from_slice(&encode_length_delimited(11, &probe));
+
+        let mut obj_meta = encode_length_delimited(1, b"web");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        let pod_spec = encode_length_delimited(2, &container); // PodSpec.containers = field 2
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto).expect(
+            "decode_pod_proto must succeed — without probe handler decoding, \
+             kubelet reports 'missing probe handler'",
+        );
+
+        assert_eq!(result["metadata"]["name"], "web");
+
+        let probe = &result["spec"]["containers"][0]["readinessProbe"];
+        assert!(
+            probe.is_object(),
+            "readinessProbe must be present in decoded JSON"
+        );
+        assert!(
+            probe["httpGet"].is_object(),
+            "readinessProbe.httpGet must be present — if missing, kubelet reports \
+             'missing probe handler' and marks the container unready forever"
+        );
+        assert_eq!(
+            probe["httpGet"]["path"], "/healthz",
+            "readinessProbe.httpGet.path must be '/healthz' — kubelet uses this path \
+             for the HTTP GET health-check; if absent, the probe target is unknown"
+        );
+        assert_eq!(
+            probe["initialDelaySeconds"], 5,
+            "initialDelaySeconds must still be decoded alongside the handler"
         );
     }
 
