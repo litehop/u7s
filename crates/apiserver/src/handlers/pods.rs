@@ -41,7 +41,7 @@ pub struct CollectionQuery {
 /// Extract a store-level FieldSelector from a raw field selector string.
 /// Picks the first equality (`=`) term that is not a negation (`!=`).
 /// Returns None if no equality term is present or the string is empty.
-fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
+pub fn pod_store_field_selector(sel: &str) -> Option<u7s_store::FieldSelector> {
     sel.split(',').find_map(|term| {
         let term = term.trim();
         if !term.contains("!=") {
