@@ -358,6 +358,59 @@ struct Probe {
     failure_threshold: i32,
 }
 
+/// SecretVolumeSource — api-core-v1-generated.proto message SecretVolumeSource
+/// Only secretName (field 1) is decoded; items/defaultMode/optional are skipped.
+#[derive(Clone, PartialEq, Message)]
+struct SecretVolumeSource {
+    /// secretName (field 1, string) — name of the Secret in the pod's namespace
+    #[prost(string, tag = "1")]
+    secret_name: String,
+}
+
+/// LocalObjectReference — api-core-v1-generated.proto message LocalObjectReference
+/// Used inside ConfigMapVolumeSource (embedded, not a separate JSON field).
+#[derive(Clone, PartialEq, Message)]
+struct LocalObjectReference {
+    /// name (field 1, string) — name of the referent
+    #[prost(string, tag = "1")]
+    name: String,
+}
+
+/// ConfigMapVolumeSource — api-core-v1-generated.proto message ConfigMapVolumeSource
+/// The configMap name is embedded via LocalObjectReference at field 1.
+/// items/defaultMode/optional are skipped.
+#[derive(Clone, PartialEq, Message)]
+struct ConfigMapVolumeSource {
+    /// localObjectReference (field 1, message) — contains the configMap name
+    #[prost(message, tag = "1")]
+    local_object_reference: Option<LocalObjectReference>,
+}
+
+/// VolumeSource — api-core-v1-generated.proto message VolumeSource
+/// Only secret (field 6) and configMap (field 19) are decoded; all other sources are skipped.
+#[derive(Clone, PartialEq, Message)]
+struct VolumeSource {
+    /// secret (field 6, message SecretVolumeSource)
+    #[prost(message, tag = "6")]
+    secret: Option<SecretVolumeSource>,
+    /// configMap (field 19, message ConfigMapVolumeSource)
+    #[prost(message, tag = "19")]
+    config_map: Option<ConfigMapVolumeSource>,
+}
+
+/// Volume — api-core-v1-generated.proto message Volume
+/// Field numbers match api-core-v1-generated.proto exactly:
+///   field 1 = name (string), field 2 = volumeSource (message VolumeSource)
+#[derive(Clone, PartialEq, Message)]
+struct Volume {
+    /// name (field 1, string) — must match volumeMount.name in containers
+    #[prost(string, tag = "1")]
+    name: String,
+    /// volumeSource (field 2, message VolumeSource) — the backing source
+    #[prost(message, tag = "2")]
+    volume_source: Option<VolumeSource>,
+}
+
 /// VolumeMount — api-core-v1-generated.proto message VolumeMount
 /// Field numbers match api-core-v1-generated.proto exactly:
 ///   field 1 = name (string), field 2 = readOnly (bool), field 3 = mountPath (string),
@@ -430,7 +483,7 @@ struct Container {
 /// PodSpec — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message PodSpec
 /// Field numbers match the official proto exactly:
-///   field 1  = volumes (skipped — not needed for routing)
+///   field 1  = volumes (repeated Volume)
 ///   field 2  = containers (repeated Container)
 ///   field 3  = restartPolicy (string)
 ///   field 4  = terminationGracePeriodSeconds (int64, skipped)
@@ -443,6 +496,9 @@ struct Container {
 ///   field 11 = hostNetwork (bool, skipped)
 #[derive(Clone, PartialEq, Message)]
 struct PodSpec {
+    /// volumes (field 1, repeated Volume) — backing volumes for container volumeMounts
+    #[prost(message, repeated, tag = "1")]
+    volumes: Vec<Volume>,
     /// containers (field 2, repeated Container)
     #[prost(message, repeated, tag = "2")]
     containers: Vec<Container>,
@@ -3219,6 +3275,43 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
         .collect();
 
     let mut spec_map = serde_json::Map::new();
+    if !spec.volumes.is_empty() {
+        let volumes_json: Vec<serde_json::Value> = spec
+            .volumes
+            .into_iter()
+            .map(|v| {
+                let mut vm = serde_json::Map::new();
+                if !v.name.is_empty() {
+                    vm.insert("name".to_string(), serde_json::Value::String(v.name));
+                }
+                if let Some(src) = v.volume_source {
+                    if let Some(s) = src.secret {
+                        if !s.secret_name.is_empty() {
+                            vm.insert(
+                                "secret".to_string(),
+                                serde_json::json!({ "secretName": s.secret_name }),
+                            );
+                        }
+                    }
+                    if let Some(cm) = src.config_map {
+                        if let Some(lor) = cm.local_object_reference {
+                            if !lor.name.is_empty() {
+                                vm.insert(
+                                    "configMap".to_string(),
+                                    serde_json::json!({ "name": lor.name }),
+                                );
+                            }
+                        }
+                    }
+                }
+                serde_json::Value::Object(vm)
+            })
+            .collect();
+        spec_map.insert(
+            "volumes".to_string(),
+            serde_json::Value::Array(volumes_json),
+        );
+    }
     spec_map.insert(
         "containers".to_string(),
         serde_json::Value::Array(containers),
@@ -7794,6 +7887,62 @@ mod tests {
         assert_eq!(
             mounts[0]["mountPath"], "/certs",
             "mountPath must be '/certs' — the path inside the container where TLS certs appear"
+        );
+    }
+
+    /// spec.volumes[0].secret.secretName must survive protobuf decode and appear in JSON.
+    ///
+    /// When a Deployment is submitted via protobuf with a secret volume, kubelet receives a pod
+    /// with volumeMounts but no backing volumes — it cannot resolve the secret source and hits
+    /// `context deadline exceeded` after 2 minutes. This test encodes a pod proto with
+    /// spec.volumes[0].secret.secretName="my-secret" and asserts the value is present in the
+    /// decoded JSON. It must fail if the Volume struct, volumes field on PodSpec, VolumeSource,
+    /// SecretVolumeSource, or the volumes serialization block in pod_spec_to_json are removed.
+    #[test]
+    fn spec_volumes_secret_survives_proto_decode() {
+        // Encode proto wire format bottom-up, matching api-core-v1-generated.proto field numbers:
+        //
+        // SecretVolumeSource { secretName (field 1) = "my-secret" }
+        let secret_vol_src = encode_length_delimited(1, b"my-secret");
+
+        // VolumeSource { secret (field 6) = SecretVolumeSource }
+        let volume_source = encode_length_delimited(6, &secret_vol_src);
+
+        // Volume { name (field 1) = "webhook-certs", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"webhook-certs");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1) = [Volume], containers (field 2) = [Container] }
+        let container = encode_length_delimited(1, b"app"); // Container { name (field 1) }
+        let mut podspec = encode_length_delimited(1, &volume); // PodSpec.volumes = field 1
+        podspec.extend_from_slice(&encode_length_delimited(2, &container)); // PodSpec.containers = field 2
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod"); // ObjectMeta { name (field 1) }
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with spec.volumes present");
+
+        let volumes = result["spec"]["volumes"].as_array().expect(
+            "spec.volumes must be present in decoded JSON — if absent, kubelet cannot resolve \
+                 secret volume sources and hits context deadline exceeded after 2 minutes",
+        );
+        assert_eq!(
+            volumes.len(),
+            1,
+            "exactly one volume must be decoded; if Volume struct or PodSpec field tag 1 is wrong \
+             the repeated message is silently dropped"
+        );
+        assert_eq!(
+            volumes[0]["name"], "webhook-certs",
+            "volume.name must be 'webhook-certs' — kubelet matches this against volumeMount.name"
+        );
+        assert_eq!(
+            volumes[0]["secret"]["secretName"], "my-secret",
+            "volumes[0].secret.secretName must be 'my-secret' — kubelet uses this to find the \
+             Secret object; if absent the volume cannot be mounted and the pod stays Pending"
         );
     }
 }
