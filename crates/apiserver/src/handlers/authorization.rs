@@ -1583,6 +1583,113 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Regression: LSAR with Content-Type: application/vnd.kubernetes.protobuf must return 201
+    // -----------------------------------------------------------------------
+
+    /// Build a protobuf varint (LEB128) encoding of v.
+    fn encode_varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out
+    }
+
+    /// Encode a length-delimited protobuf field (wire type 2).
+    fn encode_ld(field: u64, payload: &[u8]) -> Vec<u8> {
+        let tag = (field << 3) | 2;
+        let mut out = encode_varint(tag);
+        out.extend_from_slice(&encode_varint(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Build a minimal k8s proto envelope for LocalSubjectAccessReview.
+    ///
+    /// Wire layout:
+    ///   magic (4 bytes) | Unknown { typeMeta: TypeMeta, raw: SubjectAccessReview }
+    ///
+    /// SubjectAccessReview.spec.user = "alice" (no resourceAttributes → allowed=false).
+    /// contentType field is absent (empty string default) so extract_body routes to
+    /// decode_core_proto_by_kind("LocalSubjectAccessReview", ...) — the path that was broken.
+    fn build_lsar_proto_envelope() -> Vec<u8> {
+        // TypeMeta: field 1 = apiVersion, field 2 = kind
+        let api_version_bytes = "authorization.k8s.io/v1".as_bytes();
+        let kind_bytes = "LocalSubjectAccessReview".as_bytes();
+        let mut type_meta = encode_ld(1, api_version_bytes);
+        type_meta.extend(encode_ld(2, kind_bytes));
+
+        // SubjectAccessReviewSpec: field 3 = user = "alice"
+        let user_bytes = "alice".as_bytes();
+        let spec_bytes = encode_ld(3, user_bytes);
+
+        // SubjectAccessReview: field 2 = spec
+        let sar_raw = encode_ld(2, &spec_bytes);
+
+        // Unknown envelope: field 1 = TypeMeta, field 2 = raw (SubjectAccessReview proto)
+        let mut envelope = encode_ld(1, &type_meta);
+        envelope.extend(encode_ld(2, &sar_raw));
+
+        // Prepend k8s proto magic
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00];
+        body.extend(envelope);
+        body
+    }
+
+    /// Sending a protobuf-encoded LocalSubjectAccessReview body must return 201, not 400.
+    ///
+    /// Before the fix, decode_core_proto_by_kind had no "LocalSubjectAccessReview" entry,
+    /// so extract_body returned raw proto bytes, and serde_json::from_slice failed with
+    /// "expected value at line 1 column 1" → 400 BadRequest. Conformance tests send LSAR
+    /// via protobuf (Content-Type: application/vnd.kubernetes.protobuf) by default.
+    #[tokio::test]
+    async fn lsar_proto_body_returns_201_not_400() {
+        let state = make_state();
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews",
+                post(local_subject_access_review),
+            )
+            .with_state(state);
+
+        let proto_body = build_lsar_proto_envelope();
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/apis/authorization.k8s.io/v1/namespaces/default/localsubjectaccessreviews")
+            .header("content-type", "application/vnd.kubernetes.protobuf")
+            .body(Body::from(proto_body))
+            .unwrap();
+        // Caller in system:masters passes the privilege gate.
+        req.extensions_mut()
+            .insert(user("admin", &["system:masters"]));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "LSAR with protobuf body must return 201 — before fix, missing LocalSubjectAccessReview \
+             in decode_core_proto_by_kind caused extract_body to return raw proto bytes, \
+             causing serde_json::from_slice to fail with 400"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["kind"], "LocalSubjectAccessReview");
+        assert!(
+            val["status"]["allowed"].is_boolean(),
+            "proto-decoded LSAR must produce a valid allowed field"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Regression: Content-Type: application/json must not produce 415
     // -----------------------------------------------------------------------
 
