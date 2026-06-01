@@ -358,6 +358,28 @@ struct Probe {
     failure_threshold: i32,
 }
 
+/// VolumeMount — api-core-v1-generated.proto message VolumeMount
+/// field 1 = name (string), field 2 = mountPath (string), field 3 = readOnly (bool),
+/// field 4 = subPath (string), field 8 = subPathExpr (string)
+#[derive(Clone, PartialEq, Message)]
+struct VolumeMount {
+    /// name (field 1, string) — matches a volume name in spec.volumes
+    #[prost(string, tag = "1")]
+    name: String,
+    /// mountPath (field 2, string) — path inside the container where the volume is mounted
+    #[prost(string, tag = "2")]
+    mount_path: String,
+    /// readOnly (field 3, bool)
+    #[prost(bool, tag = "3")]
+    read_only: bool,
+    /// subPath (field 4, string)
+    #[prost(string, tag = "4")]
+    sub_path: String,
+    /// subPathExpr (field 8, string)
+    #[prost(string, tag = "8")]
+    sub_path_expr: String,
+}
+
 /// Container — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Container
 #[derive(Clone, PartialEq, Message)]
@@ -377,6 +399,9 @@ struct Container {
     /// resources (field 8, message ResourceRequirements)
     #[prost(message, tag = "8")]
     resources: Option<ResourceRequirements>,
+    /// volumeMounts (field 9, repeated VolumeMount)
+    #[prost(message, repeated, tag = "9")]
+    volume_mounts: Vec<VolumeMount>,
     /// livenessProbe (field 10, message Probe)
     #[prost(message, tag = "10")]
     liveness_probe: Option<Probe>,
@@ -3148,6 +3173,44 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
             }
             if let Some(lc) = c.lifecycle {
                 cm.insert("lifecycle".to_string(), lifecycle_to_json(lc));
+            }
+            if !c.volume_mounts.is_empty() {
+                let mounts: Vec<serde_json::Value> = c
+                    .volume_mounts
+                    .into_iter()
+                    .map(|vm| {
+                        let mut m = serde_json::Map::new();
+                        if !vm.name.is_empty() {
+                            m.insert("name".to_string(), serde_json::Value::String(vm.name));
+                        }
+                        if !vm.mount_path.is_empty() {
+                            m.insert(
+                                "mountPath".to_string(),
+                                serde_json::Value::String(vm.mount_path),
+                            );
+                        }
+                        if vm.read_only {
+                            m.insert(
+                                "readOnly".to_string(),
+                                serde_json::Value::Bool(vm.read_only),
+                            );
+                        }
+                        if !vm.sub_path.is_empty() {
+                            m.insert(
+                                "subPath".to_string(),
+                                serde_json::Value::String(vm.sub_path),
+                            );
+                        }
+                        if !vm.sub_path_expr.is_empty() {
+                            m.insert(
+                                "subPathExpr".to_string(),
+                                serde_json::Value::String(vm.sub_path_expr),
+                            );
+                        }
+                        serde_json::Value::Object(m)
+                    })
+                    .collect();
+                cm.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
             }
             serde_json::Value::Object(cm)
         })
@@ -7581,6 +7644,75 @@ mod tests {
             result["spec"]["volumeMode"], "Filesystem",
             "volumeMode must be decoded from field 8; \
              previously tagged as 31, so prost would silently ignore it"
+        );
+    }
+
+    /// decode_pod_proto must preserve container.volumeMounts in decoded JSON.
+    ///
+    /// When a pod/Deployment is submitted via protobuf with volumeMounts (e.g. a secret volume
+    /// mounted at /webhook.local.config/certificates), the kubelet reads volumeMounts from the
+    /// stored container JSON to bind-mount the volume into the container at the given mountPath.
+    /// If volumeMounts is absent from the decoded JSON, the secret IS mounted at the node level
+    /// (MountVolume.SetUp succeeds) but the files never appear inside the container — causing
+    /// AdmissionWebhook tests that read /webhook.local.config/certificates/tls.crt to fail.
+    ///
+    /// This test must fail if VolumeMount struct, volume_mounts field on Container, or the
+    /// volumeMounts serialization block in pod_spec_to_json are removed.
+    #[test]
+    fn decode_pod_proto_preserves_volume_mounts() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "webhook" },
+        //   spec: PodSpec {
+        //     containers: [Container {
+        //       name: "webhook",
+        //       image: "webhook:v1",
+        //       volumeMounts: [           // Container field 9, repeated VolumeMount
+        //         VolumeMount {
+        //           name: "cert",         // VolumeMount field 1
+        //           mountPath: "/certs",  // VolumeMount field 2
+        //         }
+        //       ]
+        //     }]
+        //   }
+        // }
+
+        // Encode VolumeMount: name at field 1, mountPath at field 2
+        let mut volume_mount = encode_length_delimited(1, b"cert");
+        volume_mount.extend_from_slice(&encode_length_delimited(2, b"/certs"));
+
+        // Encode Container: name=field 1, image=field 2, volumeMounts=field 9
+        let mut container = encode_length_delimited(1, b"webhook");
+        container.extend_from_slice(&encode_length_delimited(2, b"webhook:v1"));
+        container.extend_from_slice(&encode_length_delimited(9, &volume_mount));
+
+        let obj_meta = encode_length_delimited(1, b"webhook");
+        let podspec_containers = encode_length_delimited(2, &container); // PodSpec.containers = field 2
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec_containers));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with volumeMounts present");
+
+        let mounts = result["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect(
+                "volumeMounts must be present in decoded JSON — if absent, kubelet cannot \
+                 bind-mount secrets/configmaps into the container and files are invisible inside it",
+            );
+        assert_eq!(
+            mounts.len(),
+            1,
+            "one volumeMount must be decoded; if VolumeMount struct or field tag 9 is wrong \
+             the repeated message is silently dropped"
+        );
+        assert_eq!(
+            mounts[0]["name"], "cert",
+            "volumeMount.name must be 'cert' — used by kubelet to match spec.volumes[].name"
+        );
+        assert_eq!(
+            mounts[0]["mountPath"], "/certs",
+            "volumeMount.mountPath must be '/certs' — this is the path inside the container \
+             where the volume is visible; if wrong, the secret files are not accessible"
         );
     }
 }
