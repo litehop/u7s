@@ -31,7 +31,7 @@ use super::status::{
     get_namespaced_resource_status, get_resource_status, patch_namespaced_resource_status,
     patch_resource_status, put_namespaced_resource_status, put_resource_status,
 };
-use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
+use super::watch::{watch_generic, WatchConfig};
 
 pub async fn core_list_resource<S: Store>(
     State(state): State<AppState<S>>,
@@ -46,9 +46,38 @@ pub async fn core_list_resource<S: Store>(
         let prefix = crate::keys::cluster_list_prefix("pods");
         if query.watch == Some(true) {
             let from_rv = query.resource_version.unwrap_or(0);
-            let initial =
-                fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true))
-                    .await?;
+            // Fetch initial events with field-selector filtering applied.
+            // Without filtering, kubelet (which watches with fieldSelector=spec.nodeName=<node>)
+            // would receive ADDED events for pods on other nodes during the initial snapshot phase.
+            let initial = if query.send_initial_events == Some(true) {
+                use super::pods::{filter_pods_by_field_selector, pod_store_field_selector};
+                let store_fs = query
+                    .field_selector
+                    .as_deref()
+                    .and_then(pod_store_field_selector);
+                let resp = state
+                    .store
+                    .list(
+                        &prefix,
+                        ListOptions {
+                            field_selector: store_fs,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                let mut pods: Vec<serde_json::Value> = resp
+                    .items
+                    .iter()
+                    .filter_map(|o| serde_json::from_slice(&o.value).ok())
+                    .collect();
+                if let Some(ref sel) = query.field_selector {
+                    pods = filter_pods_by_field_selector(pods, sel);
+                }
+                Some((pods, resp.revision))
+            } else {
+                None
+            };
             return watch_generic(
                 state,
                 WatchConfig {
@@ -372,4 +401,99 @@ pub async fn core_patch_namespaced_resource_status<S: Store>(
         body,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::handlers::pods::{filter_pods_by_field_selector, pod_store_field_selector};
+    use std::sync::Arc;
+    use u7s_store::{SqliteStore, Store};
+
+    /// Regression test for mayor-8qcs: the cluster-wide pod watch with sendInitialEvents=true
+    /// and fieldSelector=spec.nodeName=<node> must only return pods assigned to that node in the
+    /// initial ADDED events snapshot.
+    ///
+    /// Without the fix, core_list_resource used fetch_initial_events (no field selector) and
+    /// kubelet received ADDED events for pods on all nodes. Kubelet on lima-node would see pods
+    /// belonging to other nodes in its initial state, and conversely, pods assigned to lima-node
+    /// after the initial snapshot might be missed if the informer assumed it had a full view.
+    ///
+    /// This test fails on revert: if filtering is removed, `lima_count` is 2 (both pods appear)
+    /// instead of 1.
+    #[tokio::test]
+    async fn cluster_wide_pod_watch_initial_items_filtered_by_node_name() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Create two pods in different namespaces: one on lima-node, one on other-node.
+        let lima_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "lima-pod", "namespace": "ns-a"},
+            "spec": {"nodeName": "lima-node", "containers": []}
+        });
+        let other_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "other-pod", "namespace": "ns-b"},
+            "spec": {"nodeName": "other-node", "containers": []}
+        });
+
+        store
+            .put(
+                "/registry/pods/ns-a/lima-pod",
+                bytes::Bytes::from(serde_json::to_vec(&lima_pod).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create lima-pod");
+        store
+            .put(
+                "/registry/pods/ns-b/other-pod",
+                bytes::Bytes::from(serde_json::to_vec(&other_pod).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create other-pod");
+
+        // Replicate the fixed path in core_list_resource: list all pods, filter by nodeName.
+        let field_selector_str = "spec.nodeName=lima-node";
+        let store_fs = pod_store_field_selector(field_selector_str);
+        let prefix = crate::keys::cluster_list_prefix("pods");
+        let resp = store
+            .list(
+                &prefix,
+                u7s_store::ListOptions {
+                    field_selector: store_fs,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list pods");
+
+        let mut pods: Vec<serde_json::Value> = resp
+            .items
+            .iter()
+            .filter_map(|o| serde_json::from_slice(&o.value).ok())
+            .collect();
+        pods = filter_pods_by_field_selector(pods, field_selector_str);
+
+        // Only the pod on lima-node must appear in the initial snapshot.
+        assert_eq!(
+            pods.len(),
+            1,
+            "initial sendInitialEvents snapshot for fieldSelector=spec.nodeName=lima-node \
+             must contain only pods on lima-node; without field-selector filtering, kubelet \
+             receives ADDED events for pods on other nodes (mayor-8qcs regression). \
+             Got: {:?}",
+            pods
+        );
+        assert_eq!(
+            pods[0]["metadata"]["name"], "lima-pod",
+            "the only pod in the initial snapshot must be the one assigned to lima-node"
+        );
+        assert_eq!(
+            pods[0]["spec"]["nodeName"], "lima-node",
+            "pod must have nodeName=lima-node"
+        );
+    }
 }
