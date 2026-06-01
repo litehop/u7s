@@ -47,7 +47,9 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
+# --poll-progress-after=30s prints ginkgo progress every 30s in hanging tests
+# so the e2e.log shows which step is stuck instead of a 300s silent gap.
+SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck --plugin-env=e2e.E2E_EXTRA_ARGS=--poll-progress-after=30s"
 
 echo "Running sonobuoy inside $VM_NAME..."
 if [ -n "$FOCUS" ]; then
