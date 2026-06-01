@@ -3794,6 +3794,58 @@ pub fn decode_prioritylevelconfiguration_proto(data: &[u8]) -> Option<serde_json
     }))
 }
 
+/// ValidatingWebhookConfiguration — k8s.io/api/admissionregistration/v1/generated.proto
+/// Source: k8s.io/api/admissionregistration/v1/generated.proto message ValidatingWebhookConfiguration
+/// Only the metadata field is decoded; the spec is opaque to u7s.
+#[derive(Clone, PartialEq, Message)]
+struct ValidatingWebhookConfiguration {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// MutatingWebhookConfiguration — k8s.io/api/admissionregistration/v1/generated.proto
+/// Source: k8s.io/api/admissionregistration/v1/generated.proto message MutatingWebhookConfiguration
+/// Only the metadata field is decoded; the spec is opaque to u7s.
+#[derive(Clone, PartialEq, Message)]
+struct MutatingWebhookConfiguration {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// Decode a proto-encoded ValidatingWebhookConfiguration into a serde_json::Value.
+///
+/// The admissionwebhook conformance test POSTs ValidatingWebhookConfiguration with
+/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder,
+/// decode_core_proto_by_kind returns None, extract_body returns raw proto bytes, and
+/// the handler returns 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_validatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = ValidatingWebhookConfiguration::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingWebhookConfiguration",
+        "metadata": meta
+    }))
+}
+
+/// Decode a proto-encoded MutatingWebhookConfiguration into a serde_json::Value.
+///
+/// The admissionwebhook conformance test POSTs MutatingWebhookConfiguration with
+/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder,
+/// decode_core_proto_by_kind returns None, extract_body returns raw proto bytes, and
+/// the handler returns 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_mutatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = MutatingWebhookConfiguration::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "MutatingWebhookConfiguration",
+        "metadata": meta
+    }))
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -3838,6 +3890,8 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "PodDisruptionBudget" => decode_poddisruptionbudget_proto(raw),
         "FlowSchema" => decode_flowschema_proto(raw),
         "PriorityLevelConfiguration" => decode_prioritylevelconfiguration_proto(raw),
+        "ValidatingWebhookConfiguration" => decode_validatingwebhookconfiguration_proto(raw),
+        "MutatingWebhookConfiguration" => decode_mutatingwebhookconfiguration_proto(raw),
         _ => None,
     }
 }
@@ -7587,6 +7641,56 @@ mod tests {
         assert_eq!(result["kind"], "PriorityLevelConfiguration");
         assert_eq!(result["apiVersion"], "flowcontrol.apiserver.k8s.io/v1");
         assert_eq!(result["metadata"]["name"], "workload-low");
+    }
+
+    /// decode_core_proto_by_kind must dispatch ValidatingWebhookConfiguration to a decoder that
+    /// returns valid JSON.
+    ///
+    /// The admissionwebhook conformance test POSTs ValidatingWebhookConfiguration with
+    /// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder,
+    /// decode_core_proto_by_kind returns None, extract_body returns raw proto bytes, and
+    /// the handler returns 400 "invalid JSON: expected value at line 1 column 1",
+    /// blocking the conformance test from registering any webhook at all.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_validating_webhook_configuration() {
+        // ValidatingWebhookConfiguration { metadata: ObjectMeta { name: "e2e-test-webhook" } }
+        let meta_bytes = encode_length_delimited(1, b"e2e-test-webhook");
+        let proto = encode_length_delimited(1, &meta_bytes);
+
+        let result = decode_core_proto_by_kind("ValidatingWebhookConfiguration", &proto).expect(
+            "ValidatingWebhookConfiguration must decode via decode_core_proto_by_kind — without \
+             this, POST validatingwebhookconfigurations with proto body returns 400, blocking the \
+             admissionwebhook conformance test",
+        );
+
+        assert_eq!(result["kind"], "ValidatingWebhookConfiguration");
+        assert_eq!(result["apiVersion"], "admissionregistration.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "e2e-test-webhook");
+    }
+
+    /// decode_core_proto_by_kind must dispatch MutatingWebhookConfiguration to a decoder that
+    /// returns valid JSON.
+    ///
+    /// The admissionwebhook conformance test POSTs MutatingWebhookConfiguration with
+    /// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder,
+    /// decode_core_proto_by_kind returns None, extract_body returns raw proto bytes, and
+    /// the handler returns 400 "invalid JSON: expected value at line 1 column 1",
+    /// blocking the conformance test from registering any mutating webhook.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_mutating_webhook_configuration() {
+        // MutatingWebhookConfiguration { metadata: ObjectMeta { name: "e2e-test-mutating" } }
+        let meta_bytes = encode_length_delimited(1, b"e2e-test-mutating");
+        let proto = encode_length_delimited(1, &meta_bytes);
+
+        let result = decode_core_proto_by_kind("MutatingWebhookConfiguration", &proto).expect(
+            "MutatingWebhookConfiguration must decode via decode_core_proto_by_kind — without \
+             this, POST mutatingwebhookconfigurations with proto body returns 400, blocking the \
+             admissionwebhook conformance test",
+        );
+
+        assert_eq!(result["kind"], "MutatingWebhookConfiguration");
+        assert_eq!(result["apiVersion"], "admissionregistration.k8s.io/v1");
+        assert_eq!(result["metadata"]["name"], "e2e-test-mutating");
     }
 
     // ---------------------------------------------------------------------------
