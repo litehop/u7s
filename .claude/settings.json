@@ -12,6 +12,7 @@
       "Bash(limactl *)",
       "Bash(rustc *)",
       "Bash(rustup *)",
+      "Bash(pkill u7s-apiserver)",
       "mcp__lima-node__*",
       "mcp__mcpls__*",
       "mcp__u7s__*"
