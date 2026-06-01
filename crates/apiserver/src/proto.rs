@@ -2793,6 +2793,80 @@ pub fn decode_subject_access_review_proto(data: &[u8]) -> Option<serde_json::Val
     }))
 }
 
+/// Decode a proto-encoded LocalSubjectAccessReview object into a `serde_json::Value`.
+///
+/// LocalSubjectAccessReview has the same wire format as SubjectAccessReview — the only
+/// difference is the kind field in the returned JSON.  When kubectl or a conformance test
+/// POSTs to /apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews with
+/// Content-Type: application/vnd.kubernetes.protobuf, the envelope kind is
+/// "LocalSubjectAccessReview".  Without this decoder, extract_body returns raw proto bytes
+/// and serde_json::from_slice produces "expected value at line 1 column 1" → 400.
+pub fn decode_local_subject_access_review_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let sar = SubjectAccessReviewProto::decode(data).ok()?;
+    let spec = sar.spec.unwrap_or_default();
+
+    let mut spec_map = serde_json::Map::new();
+    if !spec.user.is_empty() {
+        spec_map.insert("user".to_string(), serde_json::Value::String(spec.user));
+    }
+    if !spec.groups.is_empty() {
+        spec_map.insert(
+            "groups".to_string(),
+            serde_json::Value::Array(
+                spec.groups
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(ra) = spec.resource_attributes {
+        let mut ra_map = serde_json::Map::new();
+        if !ra.namespace.is_empty() {
+            ra_map.insert(
+                "namespace".to_string(),
+                serde_json::Value::String(ra.namespace),
+            );
+        }
+        if !ra.verb.is_empty() {
+            ra_map.insert("verb".to_string(), serde_json::Value::String(ra.verb));
+        }
+        if !ra.group.is_empty() {
+            ra_map.insert("group".to_string(), serde_json::Value::String(ra.group));
+        }
+        if !ra.version.is_empty() {
+            ra_map.insert("version".to_string(), serde_json::Value::String(ra.version));
+        }
+        if !ra.resource.is_empty() {
+            ra_map.insert(
+                "resource".to_string(),
+                serde_json::Value::String(ra.resource),
+            );
+        }
+        if !ra.subresource.is_empty() {
+            ra_map.insert(
+                "subresource".to_string(),
+                serde_json::Value::String(ra.subresource),
+            );
+        }
+        if !ra.name.is_empty() {
+            ra_map.insert("name".to_string(), serde_json::Value::String(ra.name));
+        }
+        if !ra_map.is_empty() {
+            spec_map.insert(
+                "resourceAttributes".to_string(),
+                serde_json::Value::Object(ra_map),
+            );
+        }
+    }
+
+    Some(serde_json::json!({
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "LocalSubjectAccessReview",
+        "spec": serde_json::Value::Object(spec_map)
+    }))
+}
+
 /// Decode a proto-encoded TokenReview object into a `serde_json::Value`.
 ///
 /// The kubelet uses Webhook authentication mode, which calls back to
@@ -3586,6 +3660,7 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "Role" => decode_role_proto(raw),
         "RoleBinding" => decode_rolebinding_proto(raw),
         "SubjectAccessReview" => decode_subject_access_review_proto(raw),
+        "LocalSubjectAccessReview" => decode_local_subject_access_review_proto(raw),
         "TokenReview" => decode_token_review_proto(raw),
         "CronJob" => decode_cronjob_proto(raw),
         "Job" => decode_job_proto(raw),
