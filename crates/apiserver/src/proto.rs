@@ -250,14 +250,38 @@ struct ExecProbeAction {
     command: Vec<String>,
 }
 
+/// IntOrString — k8s.io/apimachinery IntOrString
+/// field 1 = type (int64: 0=int, 1=string), field 2 = intVal (int32), field 3 = strVal (string)
+#[derive(Clone, PartialEq, Message)]
+struct IntOrString {
+    #[prost(int64, tag = "1")]
+    r#type: i64,
+    #[prost(int32, tag = "2")]
+    int_val: i32,
+    #[prost(string, tag = "3")]
+    str_val: String,
+}
+
+impl IntOrString {
+    fn to_json(&self) -> serde_json::Value {
+        if self.r#type == 0 {
+            serde_json::Value::Number(self.int_val.into())
+        } else {
+            serde_json::Value::String(self.str_val.clone())
+        }
+    }
+}
+
 /// HttpGetProbeAction — api-core-v1-generated.proto message HTTPGetAction
-/// field 1 = path (string), field 3 = host (string), field 4 = scheme (string)
-/// field 2 = port (IntOrString message) — skipped; not decoded as simple int32 is not wire-compatible
+/// field 1 = path (string), field 2 = port (IntOrString), field 3 = host (string), field 4 = scheme (string)
 #[derive(Clone, PartialEq, Message)]
 struct HttpGetProbeAction {
     /// path (field 1, string)
     #[prost(string, tag = "1")]
     path: String,
+    /// port (field 2, IntOrString message)
+    #[prost(message, tag = "2")]
+    port: Option<IntOrString>,
     /// host (field 3, string)
     #[prost(string, tag = "3")]
     host: String,
@@ -267,9 +291,12 @@ struct HttpGetProbeAction {
 }
 
 /// TcpSocketProbeAction — api-core-v1-generated.proto message TCPSocketAction
-/// field 2 = host (string); field 1 = port (IntOrString message) — skipped
+/// field 1 = port (IntOrString), field 2 = host (string)
 #[derive(Clone, PartialEq, Message)]
 struct TcpSocketProbeAction {
+    /// port (field 1, IntOrString message)
+    #[prost(message, tag = "1")]
+    port: Option<IntOrString>,
     /// host (field 2, string)
     #[prost(string, tag = "2")]
     host: String,
@@ -1828,6 +1855,9 @@ fn probe_to_json(p: Probe) -> serde_json::Value {
             if !http_get.path.is_empty() {
                 hg.insert("path".to_string(), serde_json::Value::String(http_get.path));
             }
+            if let Some(port) = http_get.port {
+                hg.insert("port".to_string(), port.to_json());
+            }
             if !http_get.host.is_empty() {
                 hg.insert("host".to_string(), serde_json::Value::String(http_get.host));
             }
@@ -1841,6 +1871,9 @@ fn probe_to_json(p: Probe) -> serde_json::Value {
         }
         if let Some(tcp) = handler.tcp_socket {
             let mut ts = serde_json::Map::new();
+            if let Some(port) = tcp.port {
+                ts.insert("port".to_string(), port.to_json());
+            }
             if !tcp.host.is_empty() {
                 ts.insert("host".to_string(), serde_json::Value::String(tcp.host));
             }
