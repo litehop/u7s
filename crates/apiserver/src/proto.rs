@@ -359,24 +359,26 @@ struct Probe {
 }
 
 /// VolumeMount — api-core-v1-generated.proto message VolumeMount
-/// field 1 = name (string), field 2 = mountPath (string), field 3 = readOnly (bool),
-/// field 4 = subPath (string), field 8 = subPathExpr (string)
+/// Field numbers match api-core-v1-generated.proto exactly:
+///   field 1 = name (string), field 2 = readOnly (bool), field 3 = mountPath (string),
+///   field 4 = subPath (string), field 5 = mountPropagation (string, skipped),
+///   field 6 = subPathExpr (string), field 7 = recursiveReadOnly (string, skipped)
 #[derive(Clone, PartialEq, Message)]
 struct VolumeMount {
     /// name (field 1, string) — matches a volume name in spec.volumes
     #[prost(string, tag = "1")]
     name: String,
-    /// mountPath (field 2, string) — path inside the container where the volume is mounted
-    #[prost(string, tag = "2")]
-    mount_path: String,
-    /// readOnly (field 3, bool)
-    #[prost(bool, tag = "3")]
+    /// readOnly (field 2, bool)
+    #[prost(bool, tag = "2")]
     read_only: bool,
+    /// mountPath (field 3, string) — path inside the container where the volume is mounted
+    #[prost(string, tag = "3")]
+    mount_path: String,
     /// subPath (field 4, string)
     #[prost(string, tag = "4")]
     sub_path: String,
-    /// subPathExpr (field 8, string)
-    #[prost(string, tag = "8")]
+    /// subPathExpr (field 6, string)
+    #[prost(string, tag = "6")]
     sub_path_expr: String,
 }
 
@@ -7669,16 +7671,16 @@ mod tests {
         //       volumeMounts: [           // Container field 9, repeated VolumeMount
         //         VolumeMount {
         //           name: "cert",         // VolumeMount field 1
-        //           mountPath: "/certs",  // VolumeMount field 2
+        //           mountPath: "/certs",  // VolumeMount field 3 (proto canonical)
         //         }
         //       ]
         //     }]
         //   }
         // }
 
-        // Encode VolumeMount: name at field 1, mountPath at field 2
+        // Encode VolumeMount: name at field 1, mountPath at field 3 (proto canonical)
         let mut volume_mount = encode_length_delimited(1, b"cert");
-        volume_mount.extend_from_slice(&encode_length_delimited(2, b"/certs"));
+        volume_mount.extend_from_slice(&encode_length_delimited(3, b"/certs"));
 
         // Encode Container: name=field 1, image=field 2, volumeMounts=field 9
         let mut container = encode_length_delimited(1, b"webhook");
@@ -7713,6 +7715,85 @@ mod tests {
             mounts[0]["mountPath"], "/certs",
             "volumeMount.mountPath must be '/certs' — this is the path inside the container \
              where the volume is visible; if wrong, the secret files are not accessible"
+        );
+    }
+
+    /// decode_deployment_proto must not return None when a container's VolumeMount has readOnly=true.
+    ///
+    /// The AdmissionWebhook conformance test creates a Deployment whose container mounts a TLS
+    /// secret as readOnly. In the wire format, VolumeMount.readOnly is field 2 (varint/bool).
+    /// Before the fix, VolumeMount.mountPath was incorrectly declared at field 2 (string/LEN),
+    /// causing a wire-type mismatch when prost saw a varint at field 2 — decode returned None,
+    /// and the apiserver returned 400 "invalid JSON", blocking the conformance test.
+    ///
+    /// This test must fail if VolumeMount.readOnly is declared at the wrong field tag (not 2),
+    /// or if VolumeMount.mountPath is declared at field 2 instead of field 3.
+    #[test]
+    fn decode_deployment_proto_volume_mount_read_only_does_not_fail_decode() {
+        // Encode VolumeMount: name="certs" (field 1), readOnly=true (field 2, varint), mountPath="/certs" (field 3)
+        // field 2 tag for varint = (2 << 3) | 0 = 16
+        let mut volume_mount = encode_length_delimited(1, b"certs");
+        volume_mount.extend_from_slice(&encode_varint(16)); // field 2 tag, wire type 0 (varint)
+        volume_mount.extend_from_slice(&encode_varint(1)); // bool true
+        volume_mount.extend_from_slice(&encode_length_delimited(3, b"/certs")); // mountPath at field 3
+
+        // Encode Container: name=field 1, image=field 2, volumeMounts=field 9
+        let mut container = encode_length_delimited(1, b"webhook");
+        container.extend_from_slice(&encode_length_delimited(
+            2,
+            b"registry.k8s.io/e2e-test-images/agnhost:2.63.0",
+        ));
+        container.extend_from_slice(&encode_length_delimited(9, &volume_mount));
+
+        // Encode PodSpec: containers at field 2
+        let podspec = encode_length_delimited(2, &container);
+
+        // Encode PodTemplateSpec: metadata at field 1, spec at field 2
+        let meta_name_bytes = encode_length_delimited(1, b"webhook-pod"); // ObjectMeta.name
+        let tmpl_meta = encode_length_delimited(1, &meta_name_bytes); // PodTemplateSpec.metadata
+        let mut tmpl = tmpl_meta;
+        tmpl.extend_from_slice(&encode_length_delimited(2, &podspec)); // PodTemplateSpec.spec
+
+        // LabelSelector { matchLabels: {"app": "webhook"} } — selector at DeploymentSpec field 2
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"webhook"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+
+        // Encode DeploymentSpec: selector at field 2, template at field 3
+        let mut dep_spec = encode_length_delimited(2, &selector_bytes);
+        dep_spec.extend_from_slice(&encode_length_delimited(3, &tmpl));
+
+        // Encode Deployment: metadata at field 1, spec at field 2
+        let meta_name = encode_length_delimited(1, b"webhook");
+        let mut deployment_proto = encode_length_delimited(1, &meta_name);
+        deployment_proto.extend_from_slice(&encode_length_delimited(2, &dep_spec));
+
+        let result = decode_deployment_proto(&deployment_proto);
+        assert!(
+            result.is_some(),
+            "decode_deployment_proto must succeed when a VolumeMount has readOnly=true (field 2, \
+             varint); before the fix, VolumeMount.mountPath was at field 2 causing a wire-type \
+             mismatch that made decode return None and the apiserver return 400"
+        );
+        let val = result.unwrap();
+        assert_eq!(val["kind"], "Deployment", "decoded kind must be Deployment");
+        let containers = &val["spec"]["template"]["spec"]["containers"];
+        assert!(
+            containers.is_array(),
+            "containers must be present after decode with readOnly volumeMount"
+        );
+        let mounts = &containers[0]["volumeMounts"];
+        assert!(
+            mounts.is_array() && mounts.as_array().unwrap().len() == 1,
+            "one volumeMount must survive decode; readOnly=true at field 2 must not cause drop"
+        );
+        assert_eq!(
+            mounts[0]["readOnly"], true,
+            "readOnly must be true in decoded JSON — used by kubelet to bind-mount the volume read-only"
+        );
+        assert_eq!(
+            mounts[0]["mountPath"], "/certs",
+            "mountPath must be '/certs' — the path inside the container where TLS certs appear"
         );
     }
 }
