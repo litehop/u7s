@@ -118,6 +118,27 @@ if [ "$UNPACK" -eq 1 ]; then
         | sed 's/name="//;s/"$//' \
         | grep -v "BeforeSuite\|AfterSuite\|ReportBefore\|ReportAfter\|Synchronized" \
         | sed 's/^/    /'
+
+      # Capture container logs from failed pods — they persist on the VM even after deletion.
+      E2E_LOG="$UNPACK_DIR/plugins/e2e/results/global/e2e.log"
+      if [ -f "$E2E_LOG" ]; then
+        echo ""
+        echo "  Pod logs from failed test namespaces:"
+        # Extract namespaces that appeared in failure context
+        FAIL_NAMESPACES=$(grep -oE 'namespace "[a-z0-9-]+"' "$E2E_LOG" | \
+          awk '{print $2}' | tr -d '"' | sort -u | grep -v "^$\|^default$\|^kube-system$\|^sonobuoy$" | head -5)
+        for NS in $FAIL_NAMESPACES; do
+          POD_LOG_DIRS=$(limactl shell "$VM_NAME" sudo ls "/var/log/pods/" 2>/dev/null | grep "^${NS}_" | head -3)
+          for POD_DIR in $POD_LOG_DIRS; do
+            echo "    --- /var/log/pods/${POD_DIR} ---"
+            limactl shell "$VM_NAME" sudo sh -c \
+              "ls /var/log/pods/${POD_DIR}/ 2>/dev/null | while read container; do
+                 echo \"      [container: \$container]\";
+                 cat /var/log/pods/${POD_DIR}/\$container/*.log 2>/dev/null | tail -20 | sed 's/^/        /';
+               done"
+          done
+        done
+      fi
     fi
     echo "  Unpacked: $UNPACK_DIR"
   fi
