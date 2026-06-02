@@ -2074,6 +2074,29 @@ pub fn decode_podtemplate_proto(data: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
+/// Decode a proto-encoded IntOrString (k8s.io/apimachinery/pkg/util/intstr) from raw bytes.
+/// Field 1 (varint) = integer value; field 2 (length-delimited) = string value.
+/// Returns None if the bytes are empty or malformed.
+fn decode_int_or_string(bytes: &[u8]) -> Option<serde_json::Value> {
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct IntOrString {
+        #[prost(int32, tag = "1")]
+        int_val: i32,
+        #[prost(string, tag = "2")]
+        str_val: String,
+    }
+    let ios = IntOrString::decode(bytes).ok()?;
+    if ios.int_val != 0 {
+        Some(serde_json::Value::Number(serde_json::Number::from(
+            ios.int_val,
+        )))
+    } else if !ios.str_val.is_empty() {
+        Some(serde_json::Value::String(ios.str_val))
+    } else {
+        None
+    }
+}
+
 /// Decode a proto-encoded Service object into a `serde_json::Value`.
 pub fn decode_service_proto(data: &[u8]) -> Option<serde_json::Value> {
     let svc = Service::decode(data).ok()?;
@@ -2165,6 +2188,11 @@ pub fn decode_service_proto(data: &[u8]) -> Option<serde_json::Value> {
                         "port".to_string(),
                         serde_json::Value::Number(serde_json::Number::from(p.port)),
                     );
+                }
+                if !p.target_port.is_empty() {
+                    if let Some(tv) = decode_int_or_string(&p.target_port) {
+                        pm.insert("targetPort".to_string(), tv);
+                    }
                 }
                 if p.node_port != 0 {
                     pm.insert(
@@ -6700,6 +6728,41 @@ mod tests {
         assert_eq!(ports[0]["name"], "http");
         assert_eq!(ports[0]["protocol"], "TCP");
         assert_eq!(ports[0]["port"], 80);
+    }
+
+    /// decode_service_proto must preserve targetPort from the proto-encoded IntOrString.
+    /// Without this, admission webhook_url() falls back to svc_port and tunnels to the
+    /// wrong container port, causing connection refused in the konnectivity tunnel.
+    #[test]
+    fn decode_service_proto_preserves_target_port() {
+        // ServicePort with port=8443 and targetPort=8444 (integer IntOrString).
+        // IntOrString encoding: field 1 (varint) = 8444 = 0x80 0xC1 0x00 (LEB128: 8444 = 0x20FC → 0xFC 0x40 → varint 0xFC 0x40).
+        // 8444 in LEB128: 8444 = 0b10000011111111100 → split to 7-bit groups: 0100001 1111100 → bytes: 0xFC|0x80 = 0xFC, 0x41 = 0x41
+        // Actually: 8444 = 0x20FC. LEB128: low 7 bits = 0x7C | 0x80 = 0xFC (more), remaining = 0x41.
+        let int_or_string_8444: Vec<u8> = vec![0x08, 0xFC, 0x41]; // field 1, varint 8444
+
+        let mut port = encode_length_delimited(2, b"TCP");
+        port.extend_from_slice(&encode_varint(3u64 << 3)); // field 3 tag (port, varint)
+        port.extend_from_slice(&encode_varint(8443));
+        port.extend_from_slice(&encode_length_delimited(4, &int_or_string_8444));
+
+        let mut svc_spec = encode_length_delimited(1, &port);
+        svc_spec.extend_from_slice(&encode_length_delimited(4, b"ClusterIP"));
+
+        let mut obj_meta = encode_length_delimited(1, b"webhook-svc");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"test-ns"));
+
+        let mut svc_proto = encode_length_delimited(1, &obj_meta);
+        svc_proto.extend_from_slice(&encode_length_delimited(2, &svc_spec));
+
+        let result = decode_service_proto(&svc_proto).expect("Service with targetPort must decode");
+        let ports = result["spec"]["ports"].as_array().expect("ports array");
+        assert_eq!(ports[0]["port"], 8443, "port must be 8443");
+        assert_eq!(
+            ports[0]["targetPort"], 8444,
+            "targetPort must be preserved from IntOrString proto encoding — without this, \
+             webhook_url() tunnels to wrong container port"
+        );
     }
 
     /// decode_service_proto must handle a headless Service (clusterIP="None").
