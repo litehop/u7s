@@ -58,6 +58,14 @@ else
   limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=non-disruptive-conformance
 fi
 
+# Evacuate pod logs immediately — before namespace GC removes them.
+# sonobuoy --wait returns after the e2e binary exits but before namespace teardown,
+# so /var/log/pods/ still has the container logs at this point.
+echo "Evacuating pod logs from VM..."
+limactl shell "$VM_NAME" sudo tar -czf /tmp/pod-logs-evacuation.tar.gz /var/log/pods/ 2>/dev/null || true
+limactl copy "${VM_NAME}:/tmp/pod-logs-evacuation.tar.gz" /tmp/pod-logs-evacuation.tar.gz 2>/dev/null || true
+limactl shell "$VM_NAME" sudo rm -f /tmp/pod-logs-evacuation.tar.gz 2>/dev/null || true
+
 echo "Retrieving results..."
 # sonobuoy retrieve uses port-forward which produces an EOF against u7s.
 # Instead, locate the tarball from pod logs + kubelet emptyDir on the VM.
@@ -119,23 +127,25 @@ if [ "$UNPACK" -eq 1 ]; then
         | grep -v "BeforeSuite\|AfterSuite\|ReportBefore\|ReportAfter\|Synchronized" \
         | sed 's/^/    /'
 
-      # Capture container logs from failed pods — they persist on the VM even after deletion.
+      # Print container logs from the evacuated tarball (copied before namespace GC).
       E2E_LOG="$UNPACK_DIR/plugins/e2e/results/global/e2e.log"
-      if [ -f "$E2E_LOG" ]; then
+      if [ -f "$E2E_LOG" ] && [ -f /tmp/pod-logs-evacuation.tar.gz ]; then
+        POD_LOGS_DIR="$UNPACK_DIR/pod-logs"
+        mkdir -p "$POD_LOGS_DIR"
+        tar -xzf /tmp/pod-logs-evacuation.tar.gz -C "$POD_LOGS_DIR" 2>/dev/null || true
+
         echo ""
         echo "  Pod logs from failed test namespaces:"
-        # Extract namespaces that appeared in failure context
         FAIL_NAMESPACES=$(grep -oE 'namespace "[a-z0-9-]+"' "$E2E_LOG" | \
           awk '{print $2}' | tr -d '"' | sort -u | grep -v "^$\|^default$\|^kube-system$\|^sonobuoy$" | head -5)
         for NS in $FAIL_NAMESPACES; do
-          POD_LOG_DIRS=$(limactl shell "$VM_NAME" sudo ls "/var/log/pods/" 2>/dev/null | grep "^${NS}_" | head -3)
-          for POD_DIR in $POD_LOG_DIRS; do
-            echo "    --- /var/log/pods/${POD_DIR} ---"
-            limactl shell "$VM_NAME" sudo sh -c \
-              "ls /var/log/pods/${POD_DIR}/ 2>/dev/null | while read container; do
-                 echo \"      [container: \$container]\";
-                 cat /var/log/pods/${POD_DIR}/\$container/*.log 2>/dev/null | tail -20 | sed 's/^/        /';
-               done"
+          find "$POD_LOGS_DIR/var/log/pods" -maxdepth 1 -type d -name "${NS}_*" 2>/dev/null | head -3 | while read -r POD_DIR; do
+            echo "    --- ${POD_DIR##*/} ---"
+            find "$POD_DIR" -name "*.log" | sort | while read -r LOG_FILE; do
+              CONTAINER=$(basename "$(dirname "$LOG_FILE")")
+              echo "      [container: $CONTAINER]"
+              tail -30 "$LOG_FILE" | sed 's/^/        /'
+            done
           done
         done
       fi

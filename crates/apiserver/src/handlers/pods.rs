@@ -1003,12 +1003,56 @@ pub fn apply_status_patch(
     let mut result = stored.clone();
     if let Some(patch_status) = patch.get("status") {
         if result["status"].is_object() && patch_status.is_object() {
-            crate::patch::merge_patch(&mut result["status"], patch_status);
+            // Merge fields individually so we can handle arrays with strategic merge keys.
+            if let Some(patch_obj) = patch_status.as_object() {
+                for (key, val) in patch_obj {
+                    if key == "conditions" {
+                        // Strategic merge by .type — patch conditions override stored ones by type,
+                        // but stored conditions not present in the patch are preserved.
+                        // Fields within a matched condition are merged; missing fields in the
+                        // patch leave existing stored fields intact.
+                        merge_conditions(&mut result["status"]["conditions"], val);
+                    } else {
+                        crate::patch::merge_patch(&mut result["status"][key], val);
+                    }
+                }
+            }
         } else {
             result["status"] = patch_status.clone();
         }
     }
     result
+}
+
+/// Merge a patch conditions array into stored conditions, keyed by `type`.
+/// Fields present in the patch condition update the stored condition; fields absent
+/// in the patch are left as-is in the stored condition.
+fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_json::Value) {
+    let Some(patch_arr) = patch_conditions.as_array() else {
+        return;
+    };
+    if !stored.is_array() {
+        *stored = patch_conditions.clone();
+        return;
+    }
+    let stored_arr = stored.as_array_mut().unwrap();
+    for patch_cond in patch_arr {
+        let Some(cond_type) = patch_cond["type"].as_str() else {
+            continue;
+        };
+        if let Some(existing) = stored_arr.iter_mut().find(|c| c["type"] == cond_type) {
+            // Merge patch fields into the existing condition, skipping null values.
+            if let Some(patch_obj) = patch_cond.as_object() {
+                for (k, v) in patch_obj {
+                    if !v.is_null() {
+                        existing[k] = v.clone();
+                    }
+                }
+            }
+        } else {
+            stored_arr.push(patch_cond.clone());
+        }
+    }
 }
 
 pub async fn patch_pod_status<S: Store>(
@@ -1464,6 +1508,59 @@ mod status_tests {
         assert_eq!(
             result["spec"]["containers"][0]["livenessProbe"]["exec"]["command"][0], "/bin/false",
             "spec.containers[].livenessProbe must be untouched by status PATCH"
+        );
+    }
+
+    /// Kubelet sends partial conditions (type + observedGeneration only, no status field).
+    /// Strategic merge by type must preserve the existing status value, not replace it with null.
+    /// Without this, endpoints-controller sees Ready condition with null status → treats pod as
+    /// not-ready → never populates Endpoints.subsets → webhook service never gets endpoints →
+    /// AdmissionWebhook conformance test times out waiting for endpoint count=1.
+    #[test]
+    fn patch_pod_status_partial_conditions_preserve_ready_status() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "resourceVersion": "1"},
+            "spec": {},
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-02T00:00:01Z"},
+                    {"type": "ContainersReady", "status": "True"},
+                    {"type": "PodScheduled", "status": "True"}
+                ]
+            }
+        });
+        // Kubelet periodic sync: partial update with type + observedGeneration, no status field.
+        let patch = serde_json::json!({
+            "status": {
+                "conditions": [
+                    {"observedGeneration": 1, "type": "Ready"},
+                    {"observedGeneration": 1, "type": "ContainersReady"},
+                    {"observedGeneration": 1, "type": "PodScheduled"}
+                ]
+            }
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+        let conditions = result["status"]["conditions"]
+            .as_array()
+            .expect("conditions array");
+        let ready = conditions
+            .iter()
+            .find(|c| c["type"] == "Ready")
+            .expect("Ready condition");
+        assert_eq!(
+            ready["status"], "True",
+            "Ready status must survive a partial kubelet conditions patch — without this, \
+             endpoints-controller sees no-status=not-ready and never populates Endpoints"
+        );
+        assert_eq!(
+            ready["observedGeneration"], 1,
+            "observedGeneration from patch must be merged in"
+        );
+        assert_eq!(
+            ready["lastTransitionTime"], "2026-06-02T00:00:01Z",
+            "lastTransitionTime absent from patch must be preserved from stored value"
         );
     }
 

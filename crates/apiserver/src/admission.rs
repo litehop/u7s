@@ -254,41 +254,68 @@ async fn webhook_url<S: Store>(
     }
 
     if let Some(svc_ref) = &config.service {
-        let key = format!(
-            "/registry/services/{}/{}", // core/v1 Service: /registry/services/<ns>/<name>
-            svc_ref.namespace, svc_ref.name
-        );
-        let obj = state.store.get(&key).await.map_err(|e| {
+        // u7s has no kube-proxy, so clusterIP is unreachable. Resolve to the first
+        // ready pod IP from the Endpoints object, and map service port → target port
+        // via the Service spec.
+        let ep_key = format!("/registry/endpoints/{}/{}", svc_ref.namespace, svc_ref.name);
+        let ep_obj = state.store.get(&ep_key).await.map_err(|e| {
             format!(
-                "store error looking up service {}/{}: {e}",
+                "store error looking up endpoints {}/{}: {e}",
                 svc_ref.namespace, svc_ref.name
             )
         })?;
 
-        let svc = match obj {
-            Some(o) => o,
-            None => {
-                return Err(format!(
-                    "webhook \"{webhook_name}\": service {}/{} not found",
+        let ep_val = ep_obj
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.value).ok())
+            .ok_or_else(|| {
+                format!(
+                    "webhook \"{webhook_name}\": no ready endpoints for service {}/{}",
                     svc_ref.namespace, svc_ref.name
-                ));
-            }
-        };
+                )
+            })?;
 
-        let val: serde_json::Value = serde_json::from_slice(&svc.value)
-            .map_err(|e| format!("webhook \"{webhook_name}\": failed to parse service: {e}"))?;
+        let pod_ip = ep_val["subsets"]
+            .as_array()
+            .and_then(|subsets| subsets.first())
+            .and_then(|s| s["addresses"].as_array())
+            .and_then(|addrs| addrs.first())
+            .and_then(|a| a["ip"].as_str().map(str::to_string))
+            .ok_or_else(|| {
+                format!(
+                    "webhook \"{webhook_name}\": no ready endpoints for service {}/{}",
+                    svc_ref.namespace, svc_ref.name
+                )
+            })?;
 
-        let cluster_ip = val["spec"]["clusterIP"].as_str().ok_or_else(|| {
-            format!(
-                "webhook \"{webhook_name}\": service {}/{} has no clusterIP",
-                svc_ref.namespace, svc_ref.name
-            )
-        })?;
+        let svc_port = svc_ref.port.unwrap_or(443);
 
-        let port = svc_ref.port.unwrap_or(443);
+        // Look up the Service to resolve service port → target port.
+        let svc_key = format!("/registry/services/{}/{}", svc_ref.namespace, svc_ref.name);
+        let target_port = state
+            .store
+            .get(&svc_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.value).ok())
+            .and_then(|v| {
+                v["spec"]["ports"].as_array().and_then(|ports| {
+                    ports
+                        .iter()
+                        .find(|p| p["port"].as_i64() == Some(svc_port as i64))
+                        .and_then(|p| {
+                            // targetPort can be a number or a string (named port)
+                            p["targetPort"]
+                                .as_i64()
+                                .map(|n| n as u16)
+                                .or_else(|| p["targetPort"].as_str().and_then(|s| s.parse().ok()))
+                        })
+                })
+            })
+            .unwrap_or(svc_port);
+
         let path = svc_ref.path.as_deref().unwrap_or("/");
-
-        return Ok(format!("https://{cluster_ip}:{port}{path}"));
+        return Ok(format!("https://{pod_ip}:{target_port}{path}"));
     }
 
     Err(format!(
@@ -451,8 +478,9 @@ async fn call_webhook(
         .ok()?;
 
     let bytes = resp.bytes().await.ok()?;
-    let review_resp: AdmissionReview = serde_json::from_slice(&bytes).ok()?;
-    review_resp.response
+    serde_json::from_slice::<AdmissionReview>(&bytes)
+        .ok()?
+        .response
 }
 
 /// Apply a JSON Patch (base64-encoded) from a mutating webhook to the object.
