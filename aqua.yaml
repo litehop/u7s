@@ -6,3 +6,4 @@ registries:
     ref: v4.513.1
 packages:
   - name: kubernetes/kubernetes/kubectl@v1.36.1
+  - name: golang/go@go1.26.3
