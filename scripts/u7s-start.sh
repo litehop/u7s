@@ -38,6 +38,9 @@ if [ ! -f "$BINARY" ]; then
   exit 1
 fi
 
+KONNECTIVITY_OUT=$("$REPO/scripts/download-konnectivity.sh")
+SERVER_BIN=$(echo "$KONNECTIVITY_OUT" | grep '^server=' | cut -d= -f2)
+
 if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
     echo "WARNING: port $PORT already in use — reusing existing apiserver instance" >&2
@@ -57,6 +60,57 @@ fi
 
 mkdir -p "$WORKDIR"
 
+if [ "$RESET" -eq 1 ] || [ ! -f "$WORKDIR/egress-selector-configuration.yaml" ]; then
+  cat > "$WORKDIR/egress-selector-configuration.yaml" <<EGRESS_EOF
+apiVersion: apiserver.k8s.io/v1beta1
+kind: EgressSelectorConfiguration
+egressSelections:
+- name: cluster
+  connection:
+    proxyProtocol: GRPC
+    transport:
+      uds:
+        udsName: $WORKDIR/konnectivity.sock
+EGRESS_EOF
+fi
+
+if [ -f "$WORKDIR/ca.crt" ]; then
+  openssl x509 -inform DER -in "$WORKDIR/ca.crt" -out "$WORKDIR/ca.pem"
+
+  pkill -f konnectivity-server || true
+  rm -f "$WORKDIR/konnectivity.sock"
+
+  "$SERVER_BIN" \
+    --logtostderr=true \
+    --log-file-max-size=0 \
+    --cluster-cert="$WORKDIR/ca.pem" \
+    --cluster-key="$WORKDIR/ca.key" \
+    --server-cert="$WORKDIR/ca.pem" \
+    --server-key="$WORKDIR/ca.key" \
+    --server-ca-cert="$WORKDIR/ca.pem" \
+    --mode=grpc \
+    --server-port=0 \
+    --agent-port=8132 \
+    --admin-port=8133 \
+    --health-port=8134 \
+    --agent-namespace=kube-system \
+    --agent-service-account=konnectivity-agent \
+    --kubeconfig="$WORKDIR/kubeconfig" \
+    --authentication-audience=system:konnectivity-server \
+    --uds-name="$WORKDIR/konnectivity.sock" \
+    >> "$WORKDIR/konnectivity-server.log" 2>&1 &
+  disown $!
+
+  for i in $(seq 1 10); do
+    [ -S "$WORKDIR/konnectivity.sock" ] && break
+    sleep 1
+  done
+  if [ ! -S "$WORKDIR/konnectivity.sock" ]; then
+    echo "error: konnectivity-server did not create UDS socket within 10s — see $WORKDIR/konnectivity-server.log" >&2
+    exit 1
+  fi
+fi
+
 if [ "$BACKGROUND" -eq 1 ]; then
   LOG="$WORKDIR/apiserver.log"
   echo "Starting u7s-apiserver (logs: $LOG) ..."
@@ -69,6 +123,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "127.0.0.1" \
     --service-cluster-ip-range "10.96.0.0/12" \
+    --egress-selector-config-file "$WORKDIR/egress-selector-configuration.yaml" \
     > "$LOG" 2>&1 &
   SERVER_PID=$!
   disown "$SERVER_PID"
@@ -83,6 +138,7 @@ else
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "127.0.0.1" \
     --service-cluster-ip-range "10.96.0.0/12" \
+    --egress-selector-config-file "$WORKDIR/egress-selector-configuration.yaml" \
     &
   # No --advertise-address: server cert already includes localhost, 127.0.0.1,
   # and host.lima.internal unconditionally (see crates/apiserver/src/tls.rs).
