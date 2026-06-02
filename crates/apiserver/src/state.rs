@@ -249,7 +249,7 @@ impl<S: Store> AppState<S> {
         }
 
         if let Some(addr) = konnectivity_proxy_addr {
-            let proxy_url = format!("http://{addr}");
+            let proxy_url = format!("https://{addr}");
             match reqwest::Proxy::all(&proxy_url) {
                 Ok(proxy) => {
                     builder = builder.proxy(proxy);
