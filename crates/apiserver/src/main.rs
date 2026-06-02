@@ -94,6 +94,12 @@ struct Args {
     /// the node's InternalIP is not directly reachable from the apiserver.
     #[arg(long)]
     kubelet_preferred_address: Option<String>,
+
+    /// Address of a konnectivity-server HTTP CONNECT proxy used to route admission webhook
+    /// calls through the tunnel so that pod IPs inside the Lima VM are reachable from the
+    /// Mac host. Format: "host:port" (e.g. "127.0.0.1:8135"). Omit to disable proxying.
+    #[arg(long)]
+    konnectivity_proxy_addr: Option<String>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -220,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         kubelet_client_identity_pem: Some(kubelet_client_identity_pem),
         kubelet_preferred_address: args.kubelet_preferred_address,
         continue_token_key: None, // fresh random key generated at startup
+        konnectivity_proxy_addr: args.konnectivity_proxy_addr,
     });
 
     // 10a. Populate RBAC index from persisted objects before serving.
@@ -4751,6 +4758,7 @@ mod tests {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: None,
+            konnectivity_proxy_addr: None,
         })
     }
 

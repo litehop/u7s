@@ -4836,6 +4836,7 @@ mod tests {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: None,
+            konnectivity_proxy_addr: None,
         });
 
         // Create two Services — allocation attaches a sentinel for each IP.
@@ -4944,6 +4945,7 @@ mod tests {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: None,
+            konnectivity_proxy_addr: None,
         })
     }
 
@@ -6288,6 +6290,7 @@ mod tests {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: Some(signing_key),
+            konnectivity_proxy_addr: None,
         });
 
         // Forge a properly signed token whose `t` (issued-at) is Unix epoch 0 — always expired.
@@ -6368,6 +6371,7 @@ mod tests {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: Some(signing_key),
+            konnectivity_proxy_addr: None,
         });
 
         // Token signed with a DIFFERENT key — HMAC verification fails.
@@ -6452,6 +6456,7 @@ mod tests {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: Some(signing_key),
+            konnectivity_proxy_addr: None,
         });
 
         // Forge a valid-signature token with Unix epoch timestamp so it is always expired.

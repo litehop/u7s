@@ -140,6 +140,10 @@ pub struct AppStateConfig<S> {
     /// 32-byte HMAC-SHA256 signing key for continue tokens.
     /// Pass `None` to generate a fresh random key.
     pub continue_token_key: Option<[u8; 32]>,
+    /// Address of an HTTP CONNECT proxy used to forward admission webhook calls through
+    /// konnectivity so that pod IPs inside the VM are reachable from the Mac host.
+    /// Format: "host:port" (e.g. "127.0.0.1:8135"). None disables the proxy.
+    pub konnectivity_proxy_addr: Option<String>,
 }
 
 // Manual Clone so we don't impose S: Clone (Arc<S> is always Clone).
@@ -186,6 +190,7 @@ impl<S: Store> AppState<S> {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: None,
+            konnectivity_proxy_addr: None,
         })
     }
 
@@ -198,12 +203,18 @@ impl<S: Store> AppState<S> {
     /// When `webhook_identity_pem` is `Some`, the client presents an mTLS client
     /// certificate so webhook servers can verify they are talking to the apiserver.
     ///
-    /// Both are `None` in tests, in which case the client falls back to a plain client
-    /// with a 10-second timeout and no CA pinning — acceptable for unit tests that never
-    /// make real HTTPS connections.
+    /// When `konnectivity_proxy_addr` is `Some`, all requests are sent through an HTTP
+    /// CONNECT proxy at that address. This is how the Mac-side apiserver reaches pod IPs
+    /// inside the Lima VM: konnectivity-server (http-connect mode) listens on a local TCP
+    /// port and the konnectivity-agent in the VM forwards the tunnel to the pod.
+    ///
+    /// Both CA and identity are `None` in tests, in which case the client falls back to a
+    /// plain client with a 10-second timeout and no CA pinning — acceptable for unit tests
+    /// that never make real HTTPS connections.
     fn build_webhook_client(
         cluster_ca_der: Option<&[u8]>,
         webhook_identity_pem: Option<&[u8]>,
+        konnectivity_proxy_addr: Option<&str>,
     ) -> reqwest::Client {
         let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
 
@@ -237,6 +248,21 @@ impl<S: Store> AppState<S> {
             }
         }
 
+        if let Some(addr) = konnectivity_proxy_addr {
+            let proxy_url = format!("http://{addr}");
+            match reqwest::Proxy::all(&proxy_url) {
+                Ok(proxy) => {
+                    builder = builder.proxy(proxy);
+                    tracing::info!("webhook client: routing through konnectivity proxy at {addr}");
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "webhook client: failed to build konnectivity proxy for {addr}: {e}; proceeding without proxy"
+                    );
+                }
+            }
+        }
+
         builder.build().expect("webhook HTTP client must build")
     }
 
@@ -250,6 +276,7 @@ impl<S: Store> AppState<S> {
         let webhook_client = Self::build_webhook_client(
             cfg.cluster_ca_der.as_deref(),
             cfg.webhook_identity_pem.as_deref(),
+            cfg.konnectivity_proxy_addr.as_deref(),
         );
         // If no key is supplied, generate a fresh random 32-byte key from the OS CSPRNG.
         // uuid::Uuid::new_v4() uses getrandom internally — two UUIDs give 32 bytes.
@@ -1064,7 +1091,7 @@ mod tests {
         let ca_der = cert.cert.der().to_vec();
 
         // Must not panic — if CA DER is valid, client construction succeeds.
-        let _client = AppState::<SqliteStore>::build_webhook_client(Some(&ca_der), None);
+        let _client = AppState::<SqliteStore>::build_webhook_client(Some(&ca_der), None, None);
     }
 
     /// build_webhook_client succeeds with no CA and no identity (test path).
@@ -1074,7 +1101,19 @@ mod tests {
     /// after the security fix is applied.
     #[test]
     fn build_webhook_client_succeeds_with_no_ca_no_identity() {
-        let _client = AppState::<SqliteStore>::build_webhook_client(None, None);
+        let _client = AppState::<SqliteStore>::build_webhook_client(None, None, None);
+    }
+
+    /// build_webhook_client succeeds with a konnectivity proxy addr configured.
+    ///
+    /// When the apiserver runs on the Mac host and webhook pods run inside a Lima VM,
+    /// the Mac cannot reach pod IPs directly. The proxy routes webhook HTTPS CONNECT
+    /// tunnels through konnectivity-server so 10.85.0.x pod IPs become reachable.
+    /// If this panics, all webhook calls fail when the proxy is configured.
+    #[test]
+    fn build_webhook_client_succeeds_with_konnectivity_proxy_addr() {
+        let _client =
+            AppState::<SqliteStore>::build_webhook_client(None, None, Some("127.0.0.1:8135"));
     }
 
     /// build_webhook_client succeeds when given a valid PEM identity (cert + key).
@@ -1118,8 +1157,11 @@ mod tests {
         identity_pem.extend_from_slice(leaf_key.serialize_pem().as_bytes());
 
         // Must succeed: valid CA DER + valid identity PEM.
-        let _client =
-            AppState::<SqliteStore>::build_webhook_client(Some(&ca_cert_der), Some(&identity_pem));
+        let _client = AppState::<SqliteStore>::build_webhook_client(
+            Some(&ca_cert_der),
+            Some(&identity_pem),
+            None,
+        );
     }
 
     /// Inline PEM encoder for test use — mirrors tls::pem_encode.
@@ -1155,6 +1197,7 @@ mod tests {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: None,
+            konnectivity_proxy_addr: None,
         })
     }
 

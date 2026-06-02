@@ -1593,6 +1593,7 @@ mod tests {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: None,
+            konnectivity_proxy_addr: None,
         });
 
         let pod = serde_json::json!({
@@ -1788,6 +1789,7 @@ mod tests {
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
             continue_token_key: None,
+            konnectivity_proxy_addr: None,
         });
 
         let pod = serde_json::json!({

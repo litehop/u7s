@@ -480,6 +480,7 @@ mod tests {
             advertise_address: advertise_address.map(str::to_owned),
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            konnectivity_proxy_addr: None,
         }
     }
 
@@ -617,6 +618,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            konnectivity_proxy_addr: None,
         };
 
         // First call: generates and writes CA files.
@@ -746,6 +748,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            konnectivity_proxy_addr: None,
         };
 
         let tls = generate_tls(&args).expect("generate_tls must succeed");
@@ -842,6 +845,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            konnectivity_proxy_addr: None,
         };
         let result = generate_tls(&args);
         assert!(
@@ -889,6 +893,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            konnectivity_proxy_addr: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
         let server_url = "https://127.0.0.1:6443";
@@ -954,6 +959,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            konnectivity_proxy_addr: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
         write_kubeconfig(&kubeconfig_path.to_string_lossy(), &tls, &args)
@@ -993,6 +999,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            konnectivity_proxy_addr: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
 
