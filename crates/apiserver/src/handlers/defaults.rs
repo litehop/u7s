@@ -142,9 +142,6 @@ fn default_service(obj: &mut serde_json::Value) {
         default_node_ports(obj);
     }
 
-    // Default targetPort to port when absent — matches Kubernetes API server behavior.
-    // Without this, admission webhook_url() falls back to the service port, which may
-    // differ from the container's actual listening port.
     if let Some(ports) = obj["spec"]["ports"].as_array_mut() {
         for port_entry in ports.iter_mut() {
             if port_entry["targetPort"].is_null() {
@@ -1872,10 +1869,6 @@ mod tests {
             );
         }
     }
-
-    // ---------------------------------------------------------------------------
-    // Regression tests: Service targetPort defaulting (mayor-qmac)
-    // ---------------------------------------------------------------------------
 
     /// Service port without targetPort must default targetPort to equal port.
     /// Without this, admission webhook_url() falls back to svc_port and may tunnel
