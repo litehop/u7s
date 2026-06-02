@@ -122,6 +122,45 @@ else
   echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:6443 (OUTPUT + PREROUTING)"
 fi
 
+# Restart konnectivity-agent in the VM so it reconnects to the (re)started server.
+WORKDIR="$(dirname "$KUBECONFIG_PATH")"
+AGENT_CERT_KEY="$WORKDIR/konnectivity-agent.key"
+AGENT_CERT_CRT="$WORKDIR/konnectivity-agent.crt"
+if [ -f "$AGENT_CERT_KEY" ] && [ -f "$AGENT_CERT_CRT" ]; then
+  KONNECTIVITY_BINS=$(bash "$(dirname "$0")/download-konnectivity.sh" 2>/dev/null)
+  AGENT_BIN=$(echo "$KONNECTIVITY_BINS" | grep '^agent=' | cut -d= -f2)
+  if [ -n "$AGENT_BIN" ] && [ -f "$AGENT_BIN" ]; then
+    limactl copy "$AGENT_BIN" "${VM_NAME}:/tmp/konnectivity-agent"
+    limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent /usr/local/bin/konnectivity-agent
+    limactl shell "$VM_NAME" sudo chmod +x /usr/local/bin/konnectivity-agent
+    if [ -f "$WORKDIR/ca.pem" ]; then
+      limactl copy "$WORKDIR/ca.pem" "${VM_NAME}:/tmp/konnectivity-ca.crt"
+      limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-ca.crt /etc/konnectivity-ca.crt
+      limactl shell "$VM_NAME" sudo chmod 644 /etc/konnectivity-ca.crt
+    fi
+    limactl copy "$AGENT_CERT_CRT" "${VM_NAME}:/tmp/konnectivity-agent.crt"
+    limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.crt /etc/konnectivity-agent.crt
+    limactl shell "$VM_NAME" sudo chmod 644 /etc/konnectivity-agent.crt
+    limactl copy "$AGENT_CERT_KEY" "${VM_NAME}:/tmp/konnectivity-agent.key"
+    limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.key /etc/konnectivity-agent.key
+    limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent.key
+    limactl shell "$VM_NAME" sudo pkill -f konnectivity-agent || true
+    limactl shell "$VM_NAME" sudo bash -c 'nohup /usr/local/bin/konnectivity-agent \
+      --logtostderr=true \
+      --proxy-server-host=host.lima.internal \
+      --proxy-server-port=8132 \
+      --ca-cert=/etc/konnectivity-ca.crt \
+      --agent-cert=/etc/konnectivity-agent.crt \
+      --agent-key=/etc/konnectivity-agent.key \
+      --kubeconfig=/etc/kubelet-kubeconfig \
+      --agent-identifiers=default-route=true \
+      --sync-interval=5s \
+      --sync-interval-cap=30s \
+      > /tmp/konnectivity-agent.log 2>&1 &'
+    echo "konnectivity-agent restarted in VM (logs: /tmp/konnectivity-agent.log)"
+  fi
+fi
+
 # Wait for the node to re-register.
 echo "Waiting for lima-node to register (up to 60s)..."
 FOUND=0
