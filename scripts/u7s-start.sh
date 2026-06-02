@@ -65,13 +65,36 @@ KONNECTIVITY_PROXY_PORT=8135
 if [ -f "$WORKDIR/ca.crt" ]; then
   openssl x509 -inform DER -in "$WORKDIR/ca.crt" -out "$WORKDIR/ca.pem"
 
+  if [ "$RESET" -eq 1 ] || [ ! -f "$WORKDIR/konnectivity-server.crt" ]; then
+    openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/konnectivity-server.key"
+    openssl req -new -key "$WORKDIR/konnectivity-server.key" \
+      -subj "/CN=konnectivity-server" \
+      -sha256 \
+      -out "$WORKDIR/konnectivity-server.csr"
+    cat > "$WORKDIR/konnectivity-server-ext.cnf" <<'EXTEOF'
+[v3_req]
+subjectAltName = IP:127.0.0.1,DNS:host.lima.internal,DNS:localhost
+EXTEOF
+    openssl x509 -req -in "$WORKDIR/konnectivity-server.csr" \
+      -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
+      -CAserial "$WORKDIR/ca.srl" \
+      -days 365 -sha256 \
+      -extfile "$WORKDIR/konnectivity-server-ext.cnf" \
+      -extensions v3_req \
+      -out "$WORKDIR/konnectivity-server.crt"
+    rm -f "$WORKDIR/konnectivity-server.csr"
+  fi
+
   pkill -f konnectivity-server || true
 
   "$SERVER_BIN" \
     --logtostderr=true \
     --log-file-max-size=0 \
-    --cluster-cert="$WORKDIR/ca.pem" \
-    --cluster-key="$WORKDIR/ca.key" \
+    --cluster-cert="$WORKDIR/konnectivity-server.crt" \
+    --cluster-key="$WORKDIR/konnectivity-server.key" \
+    --server-ca-cert="$WORKDIR/ca.pem" \
+    --server-cert="$WORKDIR/konnectivity-server.crt" \
+    --server-key="$WORKDIR/konnectivity-server.key" \
     --mode=http-connect \
     --server-port=$KONNECTIVITY_PROXY_PORT \
     --agent-port=8132 \

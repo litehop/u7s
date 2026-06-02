@@ -464,6 +464,8 @@ pub struct TokenReviewRequest {
 struct TokenReviewSpec {
     #[serde(default)]
     token: String,
+    #[serde(default)]
+    audiences: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -512,8 +514,12 @@ pub async fn token_review<S: Store>(
         }
     };
     let token = req.spec.token;
-    let user_info =
-        crate::auth::authenticate_token(&token, &state.token_map, state.sa_decoding_key.as_deref());
+    let user_info = crate::auth::authenticate_token_with_audiences(
+        &token,
+        &state.token_map,
+        state.sa_decoding_key.as_deref(),
+        &req.spec.audiences,
+    );
 
     let status = match user_info {
         Some(u) => TokenReviewStatus {
@@ -774,7 +780,7 @@ mod tests {
     fn test_authenticate_token_static_map_match() {
         // A token present in the static map must resolve to the correct UserInfo.
         // This is the primary use-case for TokenReview with --token-auth-file.
-        use crate::auth::{authenticate_token, UserInfo};
+        use crate::auth::{authenticate_token_with_audiences, UserInfo};
         use std::collections::HashMap;
 
         let mut map = HashMap::new();
@@ -787,7 +793,7 @@ mod tests {
             },
         );
 
-        let result = authenticate_token("argocd-token", &map, None);
+        let result = authenticate_token_with_audiences("argocd-token", &map, None, &[]);
         let user = result.expect("known token must resolve to a user");
         assert_eq!(user.username, "argocd-admin");
         assert!(user.groups.contains(&"system:authenticated".to_owned()));
@@ -797,11 +803,11 @@ mod tests {
     fn test_authenticate_token_unknown_returns_none() {
         // An unrecognized token must return None — TokenReview will respond with
         // authenticated: false. A bad token must NEVER return a user.
-        use crate::auth::authenticate_token;
+        use crate::auth::authenticate_token_with_audiences;
         use std::collections::HashMap;
 
         let map = HashMap::new();
-        let result = authenticate_token("unknown-token", &map, None);
+        let result = authenticate_token_with_audiences("unknown-token", &map, None, &[]);
         assert!(result.is_none(), "unrecognized token must not authenticate");
     }
 

@@ -4199,11 +4199,13 @@ mod tests {
         // 5. Authenticate the minted token via the auth middleware path.
         //    This verifies the full round-trip: the JWT the handler mints can be
         //    verified by the same decoding key used in production.
-        let user =
-            auth::authenticate_token(token, &std::collections::HashMap::new(), Some(&dec_key))
-                .expect(
-                    "minted SA token must authenticate successfully — round-trip broken if None",
-                );
+        let user = auth::authenticate_token_with_audiences(
+            token,
+            &std::collections::HashMap::new(),
+            Some(&dec_key),
+            &[],
+        )
+        .expect("minted SA token must authenticate successfully — round-trip broken if None");
 
         // Username must be the service account identity.
         assert_eq!(
