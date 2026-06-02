@@ -1,51 +1,38 @@
 # Dashboard
-2026-05-30T~22:15 — No open PRs; no workers; dispatch queue empty; rebuild needed
+2026-06-02T~17:00 — Phase 3 PR #395 in CI (6 checks pending); ready to merge when green
 
-Resume: rebuild → sonobuoy → triage new failures → dispatch
+## Konnectivity sub-project status
 
-## What needs the operator now
+| Bead | Title | Status |
+|------|-------|--------|
+| mayor-s1bs | Binary download script | ✅ merged #393 |
+| mayor-0iwa | Mac-side server startup | ✅ merged #394 |
+| mayor-0yoa | Lima VM agent startup | ⏳ PR #395 — 6 CI checks pending |
+| mayor-6m1q | 20/20 confirm + debug log strip | 🔜 waiting on #395 |
 
-**Rebuild + sonobuoy.** All pending fixes are on main (ae34275). The dispatch queue is exhausted for apiserver work — remaining beads are all node/KCM-side and won't yield new fixes without sonobuoy data.
+## PR #395 — waiting for CI
+- `feat(konnectivity): start konnectivity-agent in lima VM`
+- MCP-verified: agent process confirmed running in VM, dialing `host.lima.internal:8132`
+- Agent retrying (expected — server side was not yet up when tested)
+- 6 checks still pending; no failures
 
-```bash
-cargo build --release -p u7s-apiserver
-scripts/u7s-start.sh --background
-```
+## Sonobuoy scorecard
 
-Then run focus groups:
-1. `SONOBUOY_FOCUS='should support remote command execution over websockets'` — exec (#360+#363)
-2. `SONOBUOY_FOCUS='FlowSchema'` — APF defaults (#362)
-3. `SONOBUOY_FOCUS='AdmissionWebhook.*deny pod and configmap'` — Secret proto (#361)
-4. `SONOBUOY_FOCUS='SubjectReview.*SubjectReview API operations'` — RBAC (#358)
-
-## In-flight workers
-
-_None._
+| Group | Result |
+|-------|--------|
+| AggregatedDiscovery | ✅ 4/4 |
+| LimitRange | ✅ 2/2 |
+| Exec WebSocket | ✅ 1/1 |
+| SubjectAccessReview | ✅ 20/20 |
+| ResourceQuota | ❌ needs retest |
+| AdmissionWebhook | 🟡 19/20 — konnectivity fix in progress |
+| FlowSchema | ❌ APF gap |
 
 ## Open PRs
+- #395 — konnectivity agent in VM — ⏳ CI pending (0 failures)
 
-_None. Main at ae34275._
+## Next action
+Merge #395 when green → dispatch mayor-6m1q (sonobuoy 20/20 + strip debug logs)
 
-## Fixes on main since last rebuild (ae34275)
-
-| PR | What |
-|----|------|
-| #365 | chore: 9 upstream proto files added |
-| #364 | fix: Container/ServiceSpec/PVSpec proto field tags corrected |
-| #363 | fix: exec/attach use connect_async_tls_with_config (kubelet 400 fixed) |
-| #362 | feat: seed default FlowSchemas + PriorityLevelConfigurations |
-| #361 | fix: Secret type/stringData proto tags swapped |
-| #360 | fix: with_upgrades() — exec/attach/portforward now actually run |
-
-## Ready beads (all node/KCM-side — need sonobuoy to scope next work)
-
-| Bead | What |
-|------|------|
-| mayor-dss4 | ResourceQuota not enforcing (KCM) |
-| mayor-wqom | PreStop hook (kubelet) |
-| mayor-7ppb | readiness probe delay (kubelet) |
-| mayor-ve9f | DaemonSet scheduling (kubelet) |
-| mayor-3y8r | ClusterDNS not configured (kubelet) |
-
-## Stance
-Pre-alpha/greenfield — break freely, correctness first. Mayor merges on green CI immediately.
+## Main at
+`4281260` — feat(konnectivity): start server on Mac side (#394)
