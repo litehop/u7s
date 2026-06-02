@@ -85,9 +85,6 @@ if [ -f "$WORKDIR/ca.crt" ]; then
     --log-file-max-size=0 \
     --cluster-cert="$WORKDIR/ca.pem" \
     --cluster-key="$WORKDIR/ca.key" \
-    --server-cert="$WORKDIR/ca.pem" \
-    --server-key="$WORKDIR/ca.key" \
-    --server-ca-cert="$WORKDIR/ca.pem" \
     --mode=grpc \
     --server-port=0 \
     --agent-port=8132 \
@@ -123,7 +120,6 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "127.0.0.1" \
     --service-cluster-ip-range "10.96.0.0/12" \
-    --egress-selector-config-file "$WORKDIR/egress-selector-configuration.yaml" \
     > "$LOG" 2>&1 &
   SERVER_PID=$!
   disown "$SERVER_PID"
@@ -138,7 +134,6 @@ else
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "127.0.0.1" \
     --service-cluster-ip-range "10.96.0.0/12" \
-    --egress-selector-config-file "$WORKDIR/egress-selector-configuration.yaml" \
     &
   # No --advertise-address: server cert already includes localhost, 127.0.0.1,
   # and host.lima.internal unconditionally (see crates/apiserver/src/tls.rs).
