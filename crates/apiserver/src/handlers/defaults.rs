@@ -142,6 +142,17 @@ fn default_service(obj: &mut serde_json::Value) {
         default_node_ports(obj);
     }
 
+    if let Some(ports) = obj["spec"]["ports"].as_array_mut() {
+        for port_entry in ports.iter_mut() {
+            if port_entry["targetPort"].is_null() {
+                if let Some(port_num) = port_entry["port"].as_i64() {
+                    port_entry["targetPort"] =
+                        serde_json::Value::Number(serde_json::Number::from(port_num));
+                }
+            }
+        }
+    }
+
     // 3. ExternalName services must not have ClusterIP-family fields.
     if svc_type == "ExternalName" {
         return;
@@ -1857,6 +1868,49 @@ mod tests {
                  EqualIgnoreHash mismatch would leave the workload permanently unreconciled"
             );
         }
+    }
+
+    /// Service port without targetPort must default targetPort to equal port.
+    /// Without this, admission webhook_url() falls back to svc_port and may tunnel
+    /// to the wrong container port, causing connection refused.
+    #[test]
+    fn service_port_defaults_target_port_when_absent() {
+        let mut svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "my-svc"},
+            "spec": {
+                "type": "ClusterIP",
+                "ports": [{"port": 8443, "protocol": "TCP"}]
+            }
+        });
+        default_service(&mut svc);
+        assert_eq!(
+            svc["spec"]["ports"][0]["targetPort"], 8443,
+            "targetPort must default to port when absent — without this, \
+             admission webhook_url() tunnels to the wrong container port"
+        );
+    }
+
+    /// An explicit targetPort must not be overwritten by defaulting.
+    ///
+    /// Service ports that explicitly map port 8443 to container port 8444 must
+    /// retain the targetPort=8444 value; overwriting it would route traffic to
+    /// the wrong container port.
+    #[test]
+    fn service_port_explicit_target_port_preserved() {
+        let mut svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "my-svc"},
+            "spec": {
+                "type": "ClusterIP",
+                "ports": [{"port": 8443, "targetPort": 8444, "protocol": "TCP"}]
+            }
+        });
+        default_service(&mut svc);
+        assert_eq!(
+            svc["spec"]["ports"][0]["targetPort"], 8444,
+            "explicit targetPort must not be overwritten by defaulting"
+        );
     }
 
     /// Template metadata without creationTimestamp must pass through unchanged.
