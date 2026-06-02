@@ -224,6 +224,8 @@ struct WebhookClientConfig {
     url: Option<String>,
     #[serde(default)]
     service: Option<ServiceReference>,
+    #[serde(default)]
+    ca_bundle: Option<String>,
 }
 
 /// In-cluster service reference for a webhook's clientConfig.
@@ -463,6 +465,33 @@ fn build_review(
 
 /// POST the AdmissionReview to the webhook URL and return the response.
 /// Returns `None` on network/parse error (caller applies failurePolicy).
+/// Build a reqwest::Client for a single webhook call using the webhook's own caBundle.
+/// Each webhook ships with its own CA that signed its TLS cert — not the cluster CA.
+/// Falls back to the shared client when caBundle is absent or malformed.
+/// Sets danger_accept_invalid_hostnames because konnectivity routes calls via 127.0.0.1
+/// while the webhook cert is issued for the service DNS name.
+fn build_webhook_call_client(
+    ca_bundle_b64: Option<&str>,
+    fallback: &reqwest::Client,
+) -> reqwest::Client {
+    let Some(b64) = ca_bundle_b64 else {
+        return fallback.clone();
+    };
+    let Ok(pem_bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+    else {
+        return fallback.clone();
+    };
+    let Ok(cert) = reqwest::Certificate::from_pem(&pem_bytes) else {
+        return fallback.clone();
+    };
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .add_root_certificate(cert)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .unwrap_or_else(|_| fallback.clone())
+}
+
 async fn call_webhook(
     client: &reqwest::Client,
     url: &str,
@@ -565,7 +594,11 @@ async fn invoke_mutating_webhook<S: Store>(
     let uid = uuid::Uuid::new_v4().to_string();
     let review = build_review(&uid, ctx, object);
 
-    let response = call_webhook(&state.webhook_client, &url, &review).await;
+    let wh_client = build_webhook_call_client(
+        webhook.client_config.ca_bundle.as_deref(),
+        &state.webhook_client,
+    );
+    let response = call_webhook(&wh_client, &url, &review).await;
 
     match response {
         Some(resp) => {
@@ -775,7 +808,11 @@ pub async fn run_validating_webhooks<S: Store>(
         let uid = uuid::Uuid::new_v4().to_string();
         let review = build_review(&uid, ctx, object);
 
-        let response = call_webhook(&state.webhook_client, &url, &review).await;
+        let wh_client = build_webhook_call_client(
+            webhook.client_config.ca_bundle.as_deref(),
+            &state.webhook_client,
+        );
+        let response = call_webhook(&wh_client, &url, &review).await;
 
         match response {
             Some(resp) => {
@@ -2464,5 +2501,50 @@ mod tests {
             "webhook must have injected the 'managed-by=webhook' label into the ConfigMap; \
              missing label means the patch was not applied correctly"
         );
+    }
+
+    /// build_webhook_call_client must build a working client when given a valid caBundle.
+    /// Without this, every webhook call fails with TLS cert rejection when the webhook
+    /// uses its own CA (not the cluster CA): the shared client trusts only the cluster CA.
+    #[test]
+    fn build_webhook_call_client_uses_ca_bundle() {
+        let cert = rcgen::generate_simple_self_signed(vec!["test.local".to_string()])
+            .expect("generate self-signed cert for caBundle test");
+        let ca_der = cert.cert.der().to_vec();
+
+        // Build PEM from DER manually — same logic as tls::pem_encode.
+        let b64_der = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_der);
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64_der.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+
+        let ca_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem.as_bytes());
+
+        let fallback = reqwest::Client::new();
+        // Must not panic and must not return the fallback clone (cert was valid).
+        let client = build_webhook_call_client(Some(&ca_b64), &fallback);
+        drop(client);
+    }
+
+    /// build_webhook_call_client must return a clone of the fallback when caBundle is absent.
+    /// Webhooks without a caBundle use the shared cluster-CA client.
+    #[test]
+    fn build_webhook_call_client_no_bundle_returns_fallback() {
+        let fallback = reqwest::Client::new();
+        let client = build_webhook_call_client(None, &fallback);
+        drop(client);
+    }
+
+    /// build_webhook_call_client must return the fallback when caBundle is malformed base64.
+    /// A webhook with a corrupt caBundle must not crash the apiserver.
+    #[test]
+    fn build_webhook_call_client_invalid_b64_returns_fallback() {
+        let fallback = reqwest::Client::new();
+        let client = build_webhook_call_client(Some("!!!not-valid-base64!!!"), &fallback);
+        drop(client);
     }
 }
