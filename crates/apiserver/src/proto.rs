@@ -3794,24 +3794,184 @@ pub fn decode_prioritylevelconfiguration_proto(data: &[u8]) -> Option<serde_json
     }))
 }
 
+/// ServiceReference — k8s.io/api/admissionregistration/v1/generated.proto
+/// field 1=namespace, field 2=name, field 3=path, field 4=port
+#[derive(Clone, PartialEq, Message)]
+struct AdmissionServiceReference {
+    #[prost(string, tag = "1")]
+    namespace: String,
+    #[prost(string, tag = "2")]
+    name: String,
+    #[prost(string, tag = "3")]
+    path: String,
+    #[prost(int32, tag = "4")]
+    port: i32,
+}
+
+/// WebhookClientConfig — k8s.io/api/admissionregistration/v1/generated.proto
+/// field 1=service, field 2=caBundle, field 3=url
+#[derive(Clone, PartialEq, Message)]
+struct WebhookClientConfig {
+    #[prost(message, tag = "1")]
+    service: Option<AdmissionServiceReference>,
+    #[prost(bytes = "vec", tag = "2")]
+    ca_bundle: Vec<u8>,
+    #[prost(string, tag = "3")]
+    url: String,
+}
+
+/// Rule — k8s.io/api/admissionregistration/v1/generated.proto
+/// field 1=apiGroups, field 2=apiVersions, field 3=resources, field 4=scope
+#[derive(Clone, PartialEq, Message)]
+struct AdmissionRule {
+    #[prost(string, repeated, tag = "1")]
+    api_groups: Vec<String>,
+    #[prost(string, repeated, tag = "2")]
+    api_versions: Vec<String>,
+    #[prost(string, repeated, tag = "3")]
+    resources: Vec<String>,
+    #[prost(string, tag = "4")]
+    scope: String,
+}
+
+/// RuleWithOperations — k8s.io/api/admissionregistration/v1/generated.proto
+/// field 1=operations, field 2=rule (embedded Rule message)
+#[derive(Clone, PartialEq, Message)]
+struct AdmissionRuleWithOperations {
+    #[prost(string, repeated, tag = "1")]
+    operations: Vec<String>,
+    #[prost(message, tag = "2")]
+    rule: Option<AdmissionRule>,
+}
+
+/// LabelSelector for admission webhooks — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
+/// field 1=matchLabels (map), field 2=matchExpressions (repeated, ignored here)
+#[derive(Clone, PartialEq, Message)]
+struct AdmissionLabelSelector {
+    #[prost(map = "string, string", tag = "1")]
+    match_labels: std::collections::HashMap<String, String>,
+}
+
+/// ValidatingWebhook — k8s.io/api/admissionregistration/v1/generated.proto
+/// field 1=name, field 2=clientConfig, field 3=rules, field 4=failurePolicy,
+/// field 5=namespaceSelector, field 6=sideEffects, field 7=timeoutSeconds,
+/// field 8=admissionReviewVersions, field 9=matchPolicy, field 10=objectSelector
+#[derive(Clone, PartialEq, Message)]
+struct ValidatingWebhook {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(message, tag = "2")]
+    client_config: Option<WebhookClientConfig>,
+    #[prost(message, repeated, tag = "3")]
+    rules: Vec<AdmissionRuleWithOperations>,
+    #[prost(string, tag = "4")]
+    failure_policy: String,
+    #[prost(message, tag = "5")]
+    namespace_selector: Option<AdmissionLabelSelector>,
+    #[prost(string, tag = "6")]
+    side_effects: String,
+    #[prost(int32, tag = "7")]
+    timeout_seconds: i32,
+    #[prost(string, repeated, tag = "8")]
+    admission_review_versions: Vec<String>,
+    #[prost(string, tag = "9")]
+    match_policy: String,
+    #[prost(message, tag = "10")]
+    object_selector: Option<AdmissionLabelSelector>,
+}
+
 /// ValidatingWebhookConfiguration — k8s.io/api/admissionregistration/v1/generated.proto
-/// Source: k8s.io/api/admissionregistration/v1/generated.proto message ValidatingWebhookConfiguration
-/// Only the metadata field is decoded; the spec is opaque to u7s.
 #[derive(Clone, PartialEq, Message)]
 struct ValidatingWebhookConfiguration {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// webhooks (field 2, repeated ValidatingWebhook)
+    #[prost(message, repeated, tag = "2")]
+    webhooks: Vec<ValidatingWebhook>,
 }
 
 /// MutatingWebhookConfiguration — k8s.io/api/admissionregistration/v1/generated.proto
-/// Source: k8s.io/api/admissionregistration/v1/generated.proto message MutatingWebhookConfiguration
 /// Only the metadata field is decoded; the spec is opaque to u7s.
 #[derive(Clone, PartialEq, Message)]
 struct MutatingWebhookConfiguration {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+}
+
+fn admission_webhook_to_json(w: ValidatingWebhook) -> serde_json::Value {
+    let client_config = w
+        .client_config
+        .map(|cc| {
+            let mut cfg = serde_json::json!({});
+            if !cc.ca_bundle.is_empty() {
+                cfg["caBundle"] = serde_json::Value::String(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &cc.ca_bundle,
+                ));
+            }
+            if let Some(svc) = cc.service {
+                let mut s = serde_json::json!({
+                    "namespace": svc.namespace,
+                    "name": svc.name,
+                });
+                if !svc.path.is_empty() {
+                    s["path"] = serde_json::Value::String(svc.path);
+                }
+                if svc.port != 0 {
+                    s["port"] = serde_json::Value::Number(serde_json::Number::from(svc.port));
+                }
+                cfg["service"] = s;
+            }
+            if !cc.url.is_empty() {
+                cfg["url"] = serde_json::Value::String(cc.url);
+            }
+            cfg
+        })
+        .unwrap_or(serde_json::json!({}));
+
+    let rules: Vec<serde_json::Value> = w
+        .rules
+        .into_iter()
+        .map(|r| {
+            let rule = r.rule.unwrap_or_default();
+            serde_json::json!({
+                "operations": r.operations,
+                "apiGroups": rule.api_groups,
+                "apiVersions": rule.api_versions,
+                "resources": rule.resources,
+                "scope": if rule.scope.is_empty() { "*".to_string() } else { rule.scope },
+            })
+        })
+        .collect();
+
+    let mut entry = serde_json::json!({
+        "name": w.name,
+        "clientConfig": client_config,
+        "rules": rules,
+        "admissionReviewVersions": w.admission_review_versions,
+    });
+    if !w.failure_policy.is_empty() {
+        entry["failurePolicy"] = serde_json::Value::String(w.failure_policy);
+    }
+    if !w.match_policy.is_empty() {
+        entry["matchPolicy"] = serde_json::Value::String(w.match_policy);
+    }
+    if !w.side_effects.is_empty() {
+        entry["sideEffects"] = serde_json::Value::String(w.side_effects);
+    }
+    if w.timeout_seconds != 0 {
+        entry["timeoutSeconds"] =
+            serde_json::Value::Number(serde_json::Number::from(w.timeout_seconds));
+    }
+    if let Some(ns) = w.namespace_selector {
+        entry["namespaceSelector"] = serde_json::json!({ "matchLabels": ns.match_labels });
+    }
+    if let Some(os) = w.object_selector {
+        entry["objectSelector"] = serde_json::json!({ "matchLabels": os.match_labels });
+    }
+    entry
 }
 
 /// Decode a proto-encoded ValidatingWebhookConfiguration into a serde_json::Value.
@@ -3823,10 +3983,16 @@ struct MutatingWebhookConfiguration {
 pub fn decode_validatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = ValidatingWebhookConfiguration::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let webhooks: Vec<serde_json::Value> = obj
+        .webhooks
+        .into_iter()
+        .map(admission_webhook_to_json)
+        .collect();
     Some(serde_json::json!({
         "apiVersion": "admissionregistration.k8s.io/v1",
         "kind": "ValidatingWebhookConfiguration",
-        "metadata": meta
+        "metadata": meta,
+        "webhooks": webhooks,
     }))
 }
 
