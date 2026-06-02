@@ -60,33 +60,20 @@ fi
 
 mkdir -p "$WORKDIR"
 
-if [ "$RESET" -eq 1 ] || [ ! -f "$WORKDIR/egress-selector-configuration.yaml" ]; then
-  cat > "$WORKDIR/egress-selector-configuration.yaml" <<EGRESS_EOF
-apiVersion: apiserver.k8s.io/v1beta1
-kind: EgressSelectorConfiguration
-egressSelections:
-- name: cluster
-  connection:
-    proxyProtocol: GRPC
-    transport:
-      uds:
-        udsName: $WORKDIR/konnectivity.sock
-EGRESS_EOF
-fi
+KONNECTIVITY_PROXY_PORT=8135
 
 if [ -f "$WORKDIR/ca.crt" ]; then
   openssl x509 -inform DER -in "$WORKDIR/ca.crt" -out "$WORKDIR/ca.pem"
 
   pkill -f konnectivity-server || true
-  rm -f "$WORKDIR/konnectivity.sock"
 
   "$SERVER_BIN" \
     --logtostderr=true \
     --log-file-max-size=0 \
     --cluster-cert="$WORKDIR/ca.pem" \
     --cluster-key="$WORKDIR/ca.key" \
-    --mode=grpc \
-    --server-port=0 \
+    --mode=http-connect \
+    --server-port=$KONNECTIVITY_PROXY_PORT \
     --agent-port=8132 \
     --admin-port=8133 \
     --health-port=8134 \
@@ -94,18 +81,22 @@ if [ -f "$WORKDIR/ca.crt" ]; then
     --agent-service-account=konnectivity-agent \
     --kubeconfig="$WORKDIR/kubeconfig" \
     --authentication-audience=system:konnectivity-server \
-    --uds-name="$WORKDIR/konnectivity.sock" \
     >> "$WORKDIR/konnectivity-server.log" 2>&1 &
   disown $!
 
   for i in $(seq 1 10); do
-    [ -S "$WORKDIR/konnectivity.sock" ] && break
+    nc -z 127.0.0.1 $KONNECTIVITY_PROXY_PORT 2>/dev/null && break
     sleep 1
   done
-  if [ ! -S "$WORKDIR/konnectivity.sock" ]; then
-    echo "error: konnectivity-server did not create UDS socket within 10s — see $WORKDIR/konnectivity-server.log" >&2
+  if ! nc -z 127.0.0.1 $KONNECTIVITY_PROXY_PORT 2>/dev/null; then
+    echo "error: konnectivity-server did not open port $KONNECTIVITY_PROXY_PORT within 10s — see $WORKDIR/konnectivity-server.log" >&2
     exit 1
   fi
+fi
+
+PROXY_ARG=""
+if [ -f "$WORKDIR/ca.crt" ]; then
+  PROXY_ARG="--konnectivity-proxy-addr 127.0.0.1:$KONNECTIVITY_PROXY_PORT"
 fi
 
 if [ "$BACKGROUND" -eq 1 ]; then
@@ -120,6 +111,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "127.0.0.1" \
     --service-cluster-ip-range "10.96.0.0/12" \
+    $PROXY_ARG \
     > "$LOG" 2>&1 &
   SERVER_PID=$!
   disown "$SERVER_PID"
@@ -134,6 +126,7 @@ else
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "127.0.0.1" \
     --service-cluster-ip-range "10.96.0.0/12" \
+    $PROXY_ARG \
     &
   # No --advertise-address: server cert already includes localhost, 127.0.0.1,
   # and host.lima.internal unconditionally (see crates/apiserver/src/tls.rs).
