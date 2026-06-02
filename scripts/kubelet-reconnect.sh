@@ -144,6 +144,11 @@ if [ -f "$AGENT_CERT_KEY" ] && [ -f "$AGENT_CERT_CRT" ]; then
     limactl copy "$AGENT_CERT_KEY" "${VM_NAME}:/tmp/konnectivity-agent.key"
     limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.key /etc/konnectivity-agent.key
     limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent.key
+    if [ -f "$WORKDIR/konnectivity-agent.token" ]; then
+      limactl copy "$WORKDIR/konnectivity-agent.token" "${VM_NAME}:/tmp/konnectivity-agent.token"
+      limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.token /etc/konnectivity-agent.token
+      limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent.token
+    fi
     limactl shell "$VM_NAME" sudo pkill -f konnectivity-agent || true
     limactl shell "$VM_NAME" sudo bash -c 'nohup /usr/local/bin/konnectivity-agent \
       --logtostderr=true \
@@ -152,7 +157,8 @@ if [ -f "$AGENT_CERT_KEY" ] && [ -f "$AGENT_CERT_CRT" ]; then
       --ca-cert=/etc/konnectivity-ca.crt \
       --agent-cert=/etc/konnectivity-agent.crt \
       --agent-key=/etc/konnectivity-agent.key \
-      --kubeconfig=/etc/kubelet-kubeconfig \
+      --kubeconfig=/etc/konnectivity-agent-kubeconfig \
+      --service-account-token-path=/etc/konnectivity-agent.token \
       --agent-identifiers=default-route=true \
       --sync-interval=5s \
       --sync-interval-cap=30s \

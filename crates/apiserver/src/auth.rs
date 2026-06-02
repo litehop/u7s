@@ -196,7 +196,7 @@ fn authenticate(
                 }
                 // 2. If a SA decoding key is available, attempt JWT verification.
                 if let Some(key) = sa_decoding_key {
-                    if let Some(user) = try_verify_sa_jwt(token, key) {
+                    if let Some(user) = try_verify_sa_jwt(token, key, &[]) {
                         return AuthnResult::Identified(user);
                     }
                 }
@@ -291,12 +291,16 @@ fn atv_string(value: &x509_cert::der::Any) -> Option<String> {
 
 /// Validate a raw bearer token string against the static map and SA JWT key.
 ///
+/// `audiences` is the list of acceptable token audiences from a TokenReview
+/// spec.audiences field.  When empty, defaults to ["https://kubernetes.default.svc"].
+///
 /// Returns `Some(UserInfo)` if the token is recognized, `None` if it is not.
 /// This is exposed for use by the TokenReview handler.
-pub fn authenticate_token(
+pub fn authenticate_token_with_audiences(
     token: &str,
     token_map: &HashMap<String, UserInfo>,
     sa_decoding_key: Option<&DecodingKey>,
+    audiences: &[String],
 ) -> Option<UserInfo> {
     if let Some(info) = ct_token_lookup(token_map, token) {
         let mut user = info.clone();
@@ -310,7 +314,7 @@ pub fn authenticate_token(
     }
     if let Some(key) = sa_decoding_key {
         // try_verify_sa_jwt already appends system:authenticated.
-        if let Some(user) = try_verify_sa_jwt(token, key) {
+        if let Some(user) = try_verify_sa_jwt(token, key, audiences) {
             return Some(user);
         }
     }
@@ -319,10 +323,17 @@ pub fn authenticate_token(
 
 /// Attempt to decode and verify a bearer token as an RS256 SA JWT.
 /// Returns `Some(UserInfo)` on success, `None` if the token is invalid.
-fn try_verify_sa_jwt(token: &str, key: &DecodingKey) -> Option<UserInfo> {
+/// `audiences` is the list of acceptable audiences; defaults to
+/// ["https://kubernetes.default.svc"] when empty.
+fn try_verify_sa_jwt(token: &str, key: &DecodingKey, audiences: &[String]) -> Option<UserInfo> {
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&["https://kubernetes.default.svc"]);
-    validation.set_audience(&["https://kubernetes.default.svc"]);
+    if audiences.is_empty() {
+        validation.set_audience(&["https://kubernetes.default.svc"]);
+    } else {
+        let refs: Vec<&str> = audiences.iter().map(|s| s.as_str()).collect();
+        validation.set_audience(&refs);
+    }
     // No leeway: reject tokens that are even 1 second past expiry.
     validation.leeway = 0;
 
@@ -1278,6 +1289,56 @@ mod tests {
     }
 
     #[test]
+    fn token_review_custom_audience_accepted() {
+        // A SA JWT with a non-default audience (e.g. system:konnectivity-server)
+        // must be accepted by authenticate_token_with_audiences when that audience
+        // is explicitly requested.  Without this, the konnectivity-server cannot
+        // validate agent tokens via TokenReview, blocking the tunnel connection.
+        let (enc, dec) = test_rsa_keypair();
+        use serde_json::json;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = json!({
+            "iss": "https://kubernetes.default.svc",
+            "sub": "system:serviceaccount:kube-system:konnectivity-agent",
+            "aud": ["system:konnectivity-server"],
+            "iat": now,
+            "exp": now + 3600,
+        });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
+
+        // Must fail with default (https://kubernetes.default.svc) audience.
+        let result_default =
+            authenticate_token_with_audiences(&token, &HashMap::new(), Some(&dec), &[]);
+        assert!(
+            result_default.is_none(),
+            "token with non-default audience must NOT authenticate when no audiences specified"
+        );
+
+        // Must succeed when the correct audience is explicitly requested.
+        let aud = vec!["system:konnectivity-server".to_owned()];
+        let result = authenticate_token_with_audiences(&token, &HashMap::new(), Some(&dec), &aud);
+        let user = result.expect(
+            "token with system:konnectivity-server audience must authenticate \
+             when that audience is explicitly requested via TokenReview spec.audiences — \
+             without this fix, konnectivity-agent SA tokens are always rejected",
+        );
+        assert_eq!(
+            user.username, "system:serviceaccount:kube-system:konnectivity-agent",
+            "username must match the token subject"
+        );
+        assert!(
+            user.groups
+                .contains(&"system:serviceaccounts:kube-system".to_owned()),
+            "namespace group must be present"
+        );
+    }
+
+    #[test]
     fn sa_jwt_with_malformed_sub_is_rejected() {
         // A JWT whose sub is missing the name segment (only 3 colon-separated
         // parts) must be rejected entirely. Before this fix, the missing segment
@@ -1288,7 +1349,7 @@ mod tests {
         let (enc, dec) = test_rsa_keypair();
         // Only three parts — missing the service account name.
         let token = mint_sa_jwt(&enc, "system:serviceaccount:only-three", 3600);
-        let result = try_verify_sa_jwt(&token, &dec);
+        let result = try_verify_sa_jwt(&token, &dec, &[]);
         assert!(
             result.is_none(),
             "JWT with malformed sub (missing name segment) must be rejected, \

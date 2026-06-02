@@ -159,6 +159,49 @@ if [ ! -f "$AGENT_CERT_KEY" ] || [ ! -f "$AGENT_CERT_CRT" ]; then
   rm -f "$AGENT_CERT_CSR"
 fi
 
+# Create konnectivity-agent SA and a dedicated kubeconfig with its token.
+# The server uses TokenReview (--authentication-audience=system:konnectivity-server)
+# so the agent must present a SA token, not just a mTLS cert.
+kubectl --kubeconfig="$KUBECONFIG_PATH" \
+  create serviceaccount konnectivity-agent -n kube-system \
+  --dry-run=client -o yaml | \
+  kubectl --kubeconfig="$KUBECONFIG_PATH" apply -f -
+
+KONNECTIVITY_TOKEN=$(kubectl --kubeconfig="$KUBECONFIG_PATH" \
+  create token konnectivity-agent -n kube-system \
+  --duration=8760h \
+  --audience=system:konnectivity-server)
+
+cat > "$WORKDIR/konnectivity-agent-kubeconfig" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://host.lima.internal:6443
+    certificate-authority-data: $(base64 < "$WORKDIR/ca.pem" | tr -d '\n')
+  name: u7s
+contexts:
+- context:
+    cluster: u7s
+    user: konnectivity-agent
+  name: u7s
+current-context: u7s
+users:
+- name: konnectivity-agent
+  user:
+    token: $KONNECTIVITY_TOKEN
+EOF
+chmod 600 "$WORKDIR/konnectivity-agent-kubeconfig"
+printf '%s' "$KONNECTIVITY_TOKEN" > "$WORKDIR/konnectivity-agent.token"
+chmod 600 "$WORKDIR/konnectivity-agent.token"
+
+limactl copy "$WORKDIR/konnectivity-agent-kubeconfig" "${VM_NAME}:/tmp/konnectivity-agent-kubeconfig"
+limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent-kubeconfig /etc/konnectivity-agent-kubeconfig
+limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent-kubeconfig
+limactl copy "$WORKDIR/konnectivity-agent.token" "${VM_NAME}:/tmp/konnectivity-agent.token"
+limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.token /etc/konnectivity-agent.token
+limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent.token
+
 # Copy agent binary and certs into the VM; start agent dialing back to Mac host.
 KONNECTIVITY_BINS=$(bash "$(dirname "$0")/../download-konnectivity.sh" 2>/dev/null)
 AGENT_BIN=$(echo "$KONNECTIVITY_BINS" | grep '^agent=' | cut -d= -f2)
@@ -185,7 +228,8 @@ else
     --ca-cert=/etc/konnectivity-ca.crt \
     --agent-cert=/etc/konnectivity-agent.crt \
     --agent-key=/etc/konnectivity-agent.key \
-    --kubeconfig=/etc/kubelet-kubeconfig \
+    --kubeconfig=/etc/konnectivity-agent-kubeconfig \
+    --service-account-token-path=/etc/konnectivity-agent.token \
     --agent-identifiers=default-route=true \
     --sync-interval=5s \
     --sync-interval-cap=30s \
