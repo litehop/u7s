@@ -498,6 +498,7 @@ fn build_review(
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     resolve: Option<(&str, std::net::SocketAddr)>,
+    proxy_addr: Option<&str>,
     fallback: &reqwest::Client,
 ) -> reqwest::Client {
     let Some(b64) = ca_bundle_b64 else {
@@ -515,6 +516,12 @@ fn build_webhook_call_client(
         .add_root_certificate(cert);
     if let Some((host, addr)) = resolve {
         builder = builder.resolve(host, addr);
+    }
+    if let Some(addr) = proxy_addr {
+        let proxy_url = format!("https://{addr}");
+        if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+            builder = builder.proxy(proxy);
+        }
     }
     builder.build().unwrap_or_else(|_| fallback.clone())
 }
@@ -632,6 +639,7 @@ async fn invoke_mutating_webhook<S: Store>(
     let wh_client = build_webhook_call_client(
         webhook.client_config.ca_bundle.as_deref(),
         resolve,
+        state.konnectivity_proxy_addr.as_deref(),
         &state.webhook_client,
     );
     let response = call_webhook(&wh_client, url, &review).await;
@@ -855,6 +863,7 @@ pub async fn run_validating_webhooks<S: Store>(
         let wh_client = build_webhook_call_client(
             webhook.client_config.ca_bundle.as_deref(),
             resolve,
+            state.konnectivity_proxy_addr.as_deref(),
             &state.webhook_client,
         );
         let response = call_webhook(&wh_client, url, &review).await;
@@ -2571,7 +2580,7 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         // Must not panic and must not return the fallback clone (cert was valid).
-        let client = build_webhook_call_client(Some(&ca_b64), None, &fallback);
+        let client = build_webhook_call_client(Some(&ca_b64), None, None, &fallback);
         drop(client);
     }
 
@@ -2601,8 +2610,35 @@ mod tests {
         let client = build_webhook_call_client(
             Some(&ca_b64),
             Some(("my-webhook.webhook-ns.svc", addr)),
+            None,
             &fallback,
         );
+        drop(client);
+    }
+
+    /// build_webhook_call_client must apply the konnectivity proxy when proxy_addr is set.
+    /// Without this, per-webhook clients built with a custom caBundle bypass konnectivity
+    /// and cannot reach pod IPs (10.85.0.x) from the Mac host — every webhook call fails.
+    #[test]
+    fn build_webhook_call_client_with_proxy_addr_does_not_panic() {
+        let cert = rcgen::generate_simple_self_signed(vec!["test.local".to_string()])
+            .expect("generate self-signed cert for proxy test");
+        let ca_der = cert.cert.der().to_vec();
+        let b64_der = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_der);
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64_der.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+        let ca_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem.as_bytes());
+
+        let fallback = reqwest::Client::new();
+        // Must build successfully and apply the proxy — if this panics, all webhook calls
+        // to pod IPs fail when konnectivity is configured.
+        let client =
+            build_webhook_call_client(Some(&ca_b64), None, Some("127.0.0.1:8135"), &fallback);
         drop(client);
     }
 
@@ -2611,7 +2647,7 @@ mod tests {
     #[test]
     fn build_webhook_call_client_no_bundle_returns_fallback() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(None, None, &fallback);
+        let client = build_webhook_call_client(None, None, None, &fallback);
         drop(client);
     }
 
@@ -2620,7 +2656,8 @@ mod tests {
     #[test]
     fn build_webhook_call_client_invalid_b64_returns_fallback() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(Some("!!!not-valid-base64!!!"), None, &fallback);
+        let client =
+            build_webhook_call_client(Some("!!!not-valid-base64!!!"), None, None, &fallback);
         drop(client);
     }
 }

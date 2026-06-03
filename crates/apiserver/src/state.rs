@@ -116,6 +116,9 @@ pub struct AppState<S = SqliteStore> {
     /// 32-byte HMAC-SHA256 signing key for continue tokens.
     /// Generated fresh at server startup; tokens from a previous run are rejected (410).
     pub continue_token_key: Arc<[u8; 32]>,
+    /// Address of the konnectivity HTTP CONNECT proxy used to reach pod IPs from the Mac host.
+    /// Format: "host:port" (e.g. "127.0.0.1:8135"). None when konnectivity is not configured.
+    pub konnectivity_proxy_addr: Option<String>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -164,6 +167,7 @@ impl<S> Clone for AppState<S> {
             kubelet_preferred_address: self.kubelet_preferred_address.clone(),
             service_ip_allocator: self.service_ip_allocator.clone(),
             continue_token_key: self.continue_token_key.clone(),
+            konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
         }
     }
 }
@@ -303,6 +307,7 @@ impl<S: Store> AppState<S> {
             kubelet_preferred_address: cfg.kubelet_preferred_address.map(Arc::new),
             service_ip_allocator: cfg.service_ip_allocator.map(Arc::new),
             continue_token_key: Arc::new(continue_token_key),
+            konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,
         }
     }
 
