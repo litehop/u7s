@@ -93,7 +93,7 @@ if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${VM_NAME}$"; then
   fi
 else
   echo "Provisioning VM '$VM_NAME' (first run, takes ~5 min)..."
-  limactl start --name="$VM_NAME" "$LIMA_YAML"
+  limactl start --tty=false --name="$VM_NAME" "$LIMA_YAML"
 fi
 
 # Rewrite server address from 127.0.0.1 to host.lima.internal for in-VM use.
@@ -148,94 +148,78 @@ if [ ! -f "$WORKDIR/ca.pem" ]; then
   openssl x509 -in "$WORKDIR/ca.crt" -inform DER -out "$WORKDIR/ca.pem" -outform PEM
 fi
 if [ ! -f "$AGENT_CERT_KEY" ] || [ ! -f "$AGENT_CERT_CRT" ]; then
-  openssl genpkey -algorithm ed25519 -out "$AGENT_CERT_KEY"
+  openssl ecparam -genkey -name prime256v1 -noout -out "$AGENT_CERT_KEY"
   openssl req -new -key "$AGENT_CERT_KEY" \
-    -subj "/CN=konnectivity-agent" \
+    -subj "/CN=konnectivity-agent" -sha256 \
     -out "$AGENT_CERT_CSR"
   openssl x509 -req -in "$AGENT_CERT_CSR" \
     -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
-    -CAcreateserial -days 365 \
+    -CAcreateserial -CAserial "$WORKDIR/ca.srl" \
+    -days 365 -sha256 \
     -out "$AGENT_CERT_CRT"
   rm -f "$AGENT_CERT_CSR"
 fi
 
-# Create konnectivity-agent SA and a dedicated kubeconfig with its token.
-# The server uses TokenReview (--authentication-audience=system:konnectivity-server)
-# so the agent must present a SA token, not just a mTLS cert.
-kubectl --kubeconfig="$KUBECONFIG_PATH" \
-  create serviceaccount konnectivity-agent -n kube-system \
+# Create cert Secret for konnectivity-agent pod so the pod can mount the mTLS certs
+# without copying binaries or tokens into the VM host filesystem.
+kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent-certs \
+  --from-file=ca.crt="$WORKDIR/ca.pem" \
+  --from-file=tls.crt="$WORKDIR/konnectivity-agent.crt" \
+  --from-file=tls.key="$WORKDIR/konnectivity-agent.key" \
+  -n kube-system \
   --dry-run=client -o yaml | \
-  kubectl --kubeconfig="$KUBECONFIG_PATH" apply -f -
+  kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f -
 
-KONNECTIVITY_TOKEN=$(kubectl --kubeconfig="$KUBECONFIG_PATH" \
-  create token konnectivity-agent -n kube-system \
-  --duration=8760h \
-  --audience=system:konnectivity-server)
+# Resolve the Mac host IP so the agent pod can reach the konnectivity-server.
+# CoreDNS inside the pod does not know host.lima.internal; inject it as a hostAlias.
+LIMA_HOST_IP=$(limactl shell "$VM_NAME" getent hosts host.lima.internal 2>/dev/null | awk '{print $1}')
+LIMA_HOST_IP="${LIMA_HOST_IP:-192.168.5.2}"
 
-cat > "$WORKDIR/konnectivity-agent-kubeconfig" <<EOF
+# Run the agent as a Pod in kube-system so it uses CoreDNS: service DNS names like
+# e2e-test-webhook.webhook-N.svc resolve correctly inside the pod network.
+# hostAliases injects host.lima.internal so the pod can dial the Mac-side server.
+kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f - <<PODEOF
 apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://host.lima.internal:6443
-    certificate-authority-data: $(base64 < "$WORKDIR/ca.pem" | tr -d '\n')
-  name: u7s
-contexts:
-- context:
-    cluster: u7s
-    user: konnectivity-agent
-  name: u7s
-current-context: u7s
-users:
-- name: konnectivity-agent
-  user:
-    token: $KONNECTIVITY_TOKEN
-EOF
-chmod 600 "$WORKDIR/konnectivity-agent-kubeconfig"
-printf '%s' "$KONNECTIVITY_TOKEN" > "$WORKDIR/konnectivity-agent.token"
-chmod 600 "$WORKDIR/konnectivity-agent.token"
+kind: Pod
+metadata:
+  name: konnectivity-agent
+  namespace: kube-system
+  labels:
+    app: konnectivity-agent
+spec:
+  nodeName: lima-node
+  hostNetwork: false
+  restartPolicy: Always
+  hostAliases:
+  - ip: "$LIMA_HOST_IP"
+    hostnames:
+    - host.lima.internal
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: konnectivity-agent
+    image: registry.k8s.io/kas-network-proxy/proxy-agent:v0.35.0
+    args:
+    - --logtostderr=true
+    - --proxy-server-host=host.lima.internal
+    - --proxy-server-port=8132
+    - --ca-cert=/certs/ca.crt
+    - --agent-cert=/certs/tls.crt
+    - --agent-key=/certs/tls.key
+    - --agent-identifiers=default-route=true
+    - --sync-interval=5s
+    - --sync-interval-cap=30s
+    volumeMounts:
+    - name: certs
+      mountPath: /certs
+      readOnly: true
+  volumes:
+  - name: certs
+    secret:
+      secretName: konnectivity-agent-certs
+PODEOF
 
-limactl copy "$WORKDIR/konnectivity-agent-kubeconfig" "${VM_NAME}:/tmp/konnectivity-agent-kubeconfig"
-limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent-kubeconfig /etc/konnectivity-agent-kubeconfig
-limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent-kubeconfig
-limactl copy "$WORKDIR/konnectivity-agent.token" "${VM_NAME}:/tmp/konnectivity-agent.token"
-limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.token /etc/konnectivity-agent.token
-limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent.token
-
-# Copy agent binary and certs into the VM; start agent dialing back to Mac host.
-KONNECTIVITY_BINS=$(bash "$(dirname "$0")/../download-konnectivity.sh" 2>/dev/null)
-AGENT_BIN=$(echo "$KONNECTIVITY_BINS" | grep '^agent=' | cut -d= -f2)
-if [ -z "$AGENT_BIN" ] || [ ! -f "$AGENT_BIN" ]; then
-  echo "WARNING: konnectivity-agent binary not found — skipping agent start" >&2
-else
-  limactl copy "$AGENT_BIN" "${VM_NAME}:/tmp/konnectivity-agent"
-  limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent /usr/local/bin/konnectivity-agent
-  limactl shell "$VM_NAME" sudo chmod +x /usr/local/bin/konnectivity-agent
-  limactl copy "$WORKDIR/ca.pem" "${VM_NAME}:/tmp/konnectivity-ca.crt"
-  limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-ca.crt /etc/konnectivity-ca.crt
-  limactl shell "$VM_NAME" sudo chmod 644 /etc/konnectivity-ca.crt
-  limactl copy "$AGENT_CERT_CRT" "${VM_NAME}:/tmp/konnectivity-agent.crt"
-  limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.crt /etc/konnectivity-agent.crt
-  limactl shell "$VM_NAME" sudo chmod 644 /etc/konnectivity-agent.crt
-  limactl copy "$AGENT_CERT_KEY" "${VM_NAME}:/tmp/konnectivity-agent.key"
-  limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.key /etc/konnectivity-agent.key
-  limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent.key
-  limactl shell "$VM_NAME" sudo pkill -f konnectivity-agent || true
-  limactl shell "$VM_NAME" sudo bash -c 'nohup /usr/local/bin/konnectivity-agent \
-    --logtostderr=true \
-    --proxy-server-host=host.lima.internal \
-    --proxy-server-port=8132 \
-    --ca-cert=/etc/konnectivity-ca.crt \
-    --agent-cert=/etc/konnectivity-agent.crt \
-    --agent-key=/etc/konnectivity-agent.key \
-    --kubeconfig=/etc/konnectivity-agent-kubeconfig \
-    --service-account-token-path=/etc/konnectivity-agent.token \
-    --agent-identifiers=default-route=true \
-    --sync-interval=5s \
-    --sync-interval-cap=30s \
-    > /tmp/konnectivity-agent.log 2>&1 &'
-  echo "konnectivity-agent started in VM (logs: /tmp/konnectivity-agent.log)"
-fi
+echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnectivity-agent)"
 
 # Route kubernetes ClusterIP (10.96.0.1:443) to the host apiserver inside the VM.
 # Pods use in-cluster config (KUBERNETES_SERVICE_HOST=10.96.0.1) to reach the apiserver.
