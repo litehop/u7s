@@ -41,6 +41,10 @@ fi
 KONNECTIVITY_OUT=$("$REPO/scripts/download-konnectivity.sh")
 SERVER_BIN=$(echo "$KONNECTIVITY_OUT" | grep '^server=' | cut -d= -f2)
 
+# Always kill any stale konnectivity-server so a --reset doesn't leave one
+# running with cert paths that no longer exist in the wiped WORKDIR.
+pkill -f konnectivity-server 2>/dev/null || true
+
 APISERVER_RUNNING=0
 if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
