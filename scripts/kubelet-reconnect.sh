@@ -122,49 +122,20 @@ else
   echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:6443 (OUTPUT + PREROUTING)"
 fi
 
-# Restart konnectivity-agent in the VM so it reconnects to the (re)started server.
+# Refresh cert Secret and restart the konnectivity-agent pod so it reconnects with
+# new certs to the (re)started server.  The pod runs in kube-system with CoreDNS
+# access; deleting it causes Kubernetes to restart it with the updated Secret.
 WORKDIR="$(dirname "$KUBECONFIG_PATH")"
-AGENT_CERT_KEY="$WORKDIR/konnectivity-agent.key"
-AGENT_CERT_CRT="$WORKDIR/konnectivity-agent.crt"
-if [ -f "$AGENT_CERT_KEY" ] && [ -f "$AGENT_CERT_CRT" ]; then
-  KONNECTIVITY_BINS=$(bash "$(dirname "$0")/download-konnectivity.sh" 2>/dev/null)
-  AGENT_BIN=$(echo "$KONNECTIVITY_BINS" | grep '^agent=' | cut -d= -f2)
-  if [ -n "$AGENT_BIN" ] && [ -f "$AGENT_BIN" ]; then
-    limactl copy "$AGENT_BIN" "${VM_NAME}:/tmp/konnectivity-agent"
-    limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent /usr/local/bin/konnectivity-agent
-    limactl shell "$VM_NAME" sudo chmod +x /usr/local/bin/konnectivity-agent
-    if [ -f "$WORKDIR/ca.pem" ]; then
-      limactl copy "$WORKDIR/ca.pem" "${VM_NAME}:/tmp/konnectivity-ca.crt"
-      limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-ca.crt /etc/konnectivity-ca.crt
-      limactl shell "$VM_NAME" sudo chmod 644 /etc/konnectivity-ca.crt
-    fi
-    limactl copy "$AGENT_CERT_CRT" "${VM_NAME}:/tmp/konnectivity-agent.crt"
-    limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.crt /etc/konnectivity-agent.crt
-    limactl shell "$VM_NAME" sudo chmod 644 /etc/konnectivity-agent.crt
-    limactl copy "$AGENT_CERT_KEY" "${VM_NAME}:/tmp/konnectivity-agent.key"
-    limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.key /etc/konnectivity-agent.key
-    limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent.key
-    if [ -f "$WORKDIR/konnectivity-agent.token" ]; then
-      limactl copy "$WORKDIR/konnectivity-agent.token" "${VM_NAME}:/tmp/konnectivity-agent.token"
-      limactl shell "$VM_NAME" sudo cp /tmp/konnectivity-agent.token /etc/konnectivity-agent.token
-      limactl shell "$VM_NAME" sudo chmod 600 /etc/konnectivity-agent.token
-    fi
-    limactl shell "$VM_NAME" sudo pkill -f konnectivity-agent || true
-    limactl shell "$VM_NAME" sudo bash -c 'nohup /usr/local/bin/konnectivity-agent \
-      --logtostderr=true \
-      --proxy-server-host=host.lima.internal \
-      --proxy-server-port=8132 \
-      --ca-cert=/etc/konnectivity-ca.crt \
-      --agent-cert=/etc/konnectivity-agent.crt \
-      --agent-key=/etc/konnectivity-agent.key \
-      --kubeconfig=/etc/konnectivity-agent-kubeconfig \
-      --service-account-token-path=/etc/konnectivity-agent.token \
-      --agent-identifiers=default-route=true \
-      --sync-interval=5s \
-      --sync-interval-cap=30s \
-      > /tmp/konnectivity-agent.log 2>&1 &'
-    echo "konnectivity-agent restarted in VM (logs: /tmp/konnectivity-agent.log)"
-  fi
+if [ -f "$WORKDIR/konnectivity-agent.crt" ] && [ -f "$WORKDIR/ca.pem" ]; then
+  kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent-certs \
+    --from-file=ca.crt="$WORKDIR/ca.pem" \
+    --from-file=tls.crt="$WORKDIR/konnectivity-agent.crt" \
+    --from-file=tls.key="$WORKDIR/konnectivity-agent.key" \
+    -n kube-system \
+    --dry-run=client -o yaml | \
+    kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f -
+  kubectl --kubeconfig="$KUBECONFIG_PATH" delete pod konnectivity-agent -n kube-system --ignore-not-found
+  echo "konnectivity-agent pod will restart with fresh certs"
 fi
 
 # Wait for the node to re-register.
