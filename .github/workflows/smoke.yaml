@@ -48,7 +48,15 @@ jobs:
       - name: Make binary executable
         run: chmod +x target/release/u7s-apiserver
 
+      - name: Cache kubectl ${{ matrix.k8s }}
+        id: cache-kubectl
+        uses: actions/cache@v5
+        with:
+          path: /usr/bin/kubectl
+          key: kubectl-${{ matrix.k8s }}-${{ runner.arch }}
+
       - name: Install kubectl ${{ matrix.k8s }}
+        if: steps.cache-kubectl.outputs.cache-hit != 'true'
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
@@ -270,7 +278,15 @@ jobs:
       - name: Make binary executable
         run: chmod +x target/release/u7s-apiserver
 
+      - name: Cache cri-o ${{ matrix.k8s }}
+        id: cache-crio
+        uses: actions/cache@v5
+        with:
+          path: /usr/bin/crio
+          key: crio-${{ matrix.k8s }}-${{ runner.arch }}
+
       - name: Install cri-o and crun
+        if: steps.cache-crio.outputs.cache-hit != 'true'
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
@@ -315,7 +331,17 @@ jobs:
           CNIEOF
           sudo systemctl enable --now crio
 
+      - name: Cache kubelet and kubectl ${{ matrix.k8s }}
+        id: cache-kubelet
+        uses: actions/cache@v5
+        with:
+          path: |
+            /usr/bin/kubelet
+            /usr/bin/kubectl
+          key: kubelet-kubectl-${{ matrix.k8s }}-${{ runner.arch }}
+
       - name: Install kubelet and kubectl ${{ matrix.k8s }}
+        if: steps.cache-kubelet.outputs.cache-hit != 'true'
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
@@ -602,7 +628,15 @@ jobs:
       - name: Make binary executable
         run: chmod +x target/release/u7s-apiserver
 
+      - name: Cache kubectl ${{ matrix.k8s }}
+        id: cache-kubectl
+        uses: actions/cache@v5
+        with:
+          path: /usr/bin/kubectl
+          key: kubectl-${{ matrix.k8s }}-${{ runner.arch }}
+
       - name: Install kubectl ${{ matrix.k8s }}
+        if: steps.cache-kubectl.outputs.cache-hit != 'true'
         env:
           K8S_VERSION: ${{ matrix.k8s }}
         run: |
