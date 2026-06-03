@@ -50,7 +50,7 @@ jobs:
 
       - name: Cache kubectl ${{ matrix.k8s }}
         id: cache-kubectl
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: /usr/bin/kubectl
           key: kubectl-${{ matrix.k8s }}-${{ runner.arch }}
@@ -280,7 +280,7 @@ jobs:
 
       - name: Cache cri-o ${{ matrix.k8s }}
         id: cache-crio
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: /usr/bin/crio
           key: crio-${{ matrix.k8s }}-${{ runner.arch }}
@@ -333,7 +333,7 @@ jobs:
 
       - name: Cache kubelet and kubectl ${{ matrix.k8s }}
         id: cache-kubelet
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             /usr/bin/kubelet
@@ -630,7 +630,7 @@ jobs:
 
       - name: Cache kubectl ${{ matrix.k8s }}
         id: cache-kubectl
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: /usr/bin/kubectl
           key: kubectl-${{ matrix.k8s }}-${{ runner.arch }}
