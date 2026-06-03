@@ -3876,12 +3876,26 @@ struct AdmissionRuleWithOperations {
     rule: Option<AdmissionRule>,
 }
 
+/// LabelSelectorRequirement — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
+/// field 1=key, field 2=operator, field 3=values (repeated string)
+#[derive(Clone, PartialEq, Message)]
+struct AdmissionLabelSelectorRequirement {
+    #[prost(string, tag = "1")]
+    key: String,
+    #[prost(string, tag = "2")]
+    operator: String,
+    #[prost(string, repeated, tag = "3")]
+    values: Vec<String>,
+}
+
 /// LabelSelector for admission webhooks — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
-/// field 1=matchLabels (map), field 2=matchExpressions (repeated, ignored here)
+/// field 1=matchLabels (map), field 2=matchExpressions (repeated LabelSelectorRequirement)
 #[derive(Clone, PartialEq, Message)]
 struct AdmissionLabelSelector {
     #[prost(map = "string, string", tag = "1")]
     match_labels: std::collections::HashMap<String, String>,
+    #[prost(message, repeated, tag = "2")]
+    match_expressions: Vec<AdmissionLabelSelectorRequirement>,
 }
 
 /// ValidatingWebhook — k8s.io/api/admissionregistration/v1/generated.proto
@@ -3930,6 +3944,38 @@ struct MutatingWebhookConfiguration {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+}
+
+/// Convert an AdmissionLabelSelector (which may include matchExpressions) to JSON.
+///
+/// Both matchLabels and matchExpressions must be preserved so that namespaceSelector
+/// evaluation in the admission pipeline correctly handles complex selectors like
+/// `matchExpressions: [{key: skip-webhook-admission, operator: DoesNotExist}]`.
+fn label_selector_to_json(sel: AdmissionLabelSelector) -> serde_json::Value {
+    let mut obj = serde_json::json!({});
+    if !sel.match_labels.is_empty() {
+        let labels: serde_json::Map<String, serde_json::Value> = sel
+            .match_labels
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        obj["matchLabels"] = serde_json::Value::Object(labels);
+    }
+    if !sel.match_expressions.is_empty() {
+        let exprs: Vec<serde_json::Value> = sel
+            .match_expressions
+            .into_iter()
+            .map(|req| {
+                serde_json::json!({
+                    "key": req.key,
+                    "operator": req.operator,
+                    "values": req.values,
+                })
+            })
+            .collect();
+        obj["matchExpressions"] = serde_json::Value::Array(exprs);
+    }
+    obj
 }
 
 fn admission_webhook_to_json(w: ValidatingWebhook) -> serde_json::Value {
@@ -3998,10 +4044,10 @@ fn admission_webhook_to_json(w: ValidatingWebhook) -> serde_json::Value {
             serde_json::Value::Number(serde_json::Number::from(w.timeout_seconds));
     }
     if let Some(ns) = w.namespace_selector {
-        entry["namespaceSelector"] = serde_json::json!({ "matchLabels": ns.match_labels });
+        entry["namespaceSelector"] = label_selector_to_json(ns);
     }
     if let Some(os) = w.object_selector {
-        entry["objectSelector"] = serde_json::json!({ "matchLabels": os.match_labels });
+        entry["objectSelector"] = label_selector_to_json(os);
     }
     entry
 }

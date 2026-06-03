@@ -233,6 +233,24 @@ pub async fn create_namespace<S: Store>(
         }
     }
 
+    // Inject the kubernetes.io/metadata.name label required for namespaceSelector evaluation.
+    // Kubernetes stamps this label automatically on every namespace at creation time so that
+    // admission webhook namespaceSelectors using matchExpressions on this label work correctly
+    // (e.g. to exempt specific namespaces from a webhook). Without it, selectors like
+    // `key: kubernetes.io/metadata.name, operator: NotIn, values: [kube-system]` would have
+    // no label to match against and every namespace would appear to be in scope.
+    {
+        let labels = obj.body["metadata"]["labels"].clone();
+        let mut labels_map = match labels {
+            serde_json::Value::Object(m) => m,
+            _ => serde_json::Map::new(),
+        };
+        labels_map
+            .entry("kubernetes.io/metadata.name")
+            .or_insert_with(|| serde_json::Value::String(name.clone()));
+        obj.body["metadata"]["labels"] = serde_json::Value::Object(labels_map);
+    }
+
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
         group: "",
@@ -886,6 +904,106 @@ mod tests {
              Without this, the namespace hard-deletes immediately, orphaning resources. \
              Got finalizers: {:?}",
             finalizers
+        );
+    }
+
+    /// create_namespace must stamp kubernetes.io/metadata.name on every namespace.
+    ///
+    /// This label is required for admission webhook namespaceSelector evaluation. Webhooks
+    /// use matchExpressions like `{key: kubernetes.io/metadata.name, operator: NotIn,
+    /// values: ["kube-system"]}` to exclude specific namespaces. Without this label the
+    /// expression has nothing to match — `has_key` is false, `NotIn` returns `true`, and
+    /// the webhook fires for ALL namespaces regardless of their intended exemption.
+    #[tokio::test]
+    async fn create_namespace_stamps_kubernetes_metadata_name_label() {
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::http::HeaderMap::new(),
+                namespace_body("label-test-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "label-test-ns",
+            ))
+            .await
+            .expect("store get must not error")
+            .expect("namespace must exist in store");
+        let body: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored value must be valid JSON");
+
+        assert_eq!(
+            body["metadata"]["labels"]["kubernetes.io/metadata.name"],
+            serde_json::Value::String("label-test-ns".into()),
+            "create_namespace must stamp kubernetes.io/metadata.name label so admission webhook \
+             namespaceSelector matchExpressions (e.g. NotIn, DoesNotExist) can evaluate \
+             correctly against this namespace; without it, exemption-based selectors fail"
+        );
+    }
+
+    /// create_namespace must preserve user-supplied labels AND inject kubernetes.io/metadata.name.
+    ///
+    /// If the user supplies labels (e.g. a CI label or exemption marker), those must survive
+    /// the metadata.name injection. A bug here would silently drop user labels or incorrectly
+    /// overwrite them with just the metadata.name label, breaking namespace selectors that
+    /// rely on user-supplied labels.
+    #[tokio::test]
+    async fn create_namespace_preserves_existing_labels_when_injecting_metadata_name() {
+        let state = make_state();
+        let body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "labeled-ns",
+                    "labels": {
+                        "myapp": "true",
+                        "env": "test"
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body,)
+                .await
+                .is_ok(),
+            "create with existing labels must succeed"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "labeled-ns"))
+            .await
+            .expect("store get must not error")
+            .expect("namespace must exist in store");
+        let body: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored value must be valid JSON");
+
+        assert_eq!(
+            body["metadata"]["labels"]["kubernetes.io/metadata.name"],
+            serde_json::Value::String("labeled-ns".into()),
+            "kubernetes.io/metadata.name must be injected"
+        );
+        assert_eq!(
+            body["metadata"]["labels"]["myapp"],
+            serde_json::Value::String("true".into()),
+            "user-supplied labels must be preserved when metadata.name is injected"
+        );
+        assert_eq!(
+            body["metadata"]["labels"]["env"],
+            serde_json::Value::String("test".into()),
+            "all user-supplied labels must survive metadata.name injection"
         );
     }
 
