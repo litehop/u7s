@@ -996,6 +996,12 @@ fn accepts_patch_content_type(ct: &str) -> bool {
 ///
 /// Fields outside `.status` in the patch body (e.g. `.spec`) are ignored — the status
 /// subresource cannot modify spec. This is the Kubernetes API contract for status subresources.
+///
+/// For array fields with registered strategic-merge keys (conditions, podIPs,
+/// containerStatuses, etc.) the patch is applied using strategic-merge semantics so
+/// that `$patch:delete` directives remove matching items rather than being stored
+/// literally.  Storing them literally causes the kubelet to detect phantom array
+/// changes on every reconcile and continuously recreate the pod sandbox.
 pub fn apply_status_patch(
     stored: &serde_json::Value,
     patch: &serde_json::Value,
@@ -1012,6 +1018,22 @@ pub fn apply_status_patch(
                         // Fields within a matched condition are merged; missing fields in the
                         // patch leave existing stored fields intact.
                         merge_conditions(&mut result["status"]["conditions"], val);
+                    } else if val.is_array() {
+                        // For array fields, use strategic-merge-patch so that $patch:delete
+                        // directives are applied by merge key rather than stored literally.
+                        // Wrap the field in a one-key object so strategic_merge_patch can
+                        // resolve the merge key via the field name as the path root.
+                        let wrapper_patch = serde_json::json!({ key: val });
+                        let mut wrapper_target =
+                            serde_json::json!({ key: result["status"][key].clone() });
+                        // Ignore errors — unknown $patch directives fall through to merge_patch.
+                        if crate::patch::strategic_merge_patch(&mut wrapper_target, &wrapper_patch)
+                            .is_ok()
+                        {
+                            result["status"][key] = wrapper_target[key].clone();
+                        } else {
+                            crate::patch::merge_patch(&mut result["status"][key], val);
+                        }
                     } else {
                         crate::patch::merge_patch(&mut result["status"][key], val);
                     }
