@@ -61,11 +61,16 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p u7s-apiserver
 
+      - name: Add ~/bin to PATH
+        run: |
+          mkdir -p ~/bin
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
       - name: Cache kubectl 1.36.1
         id: cache-kubectl
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: /usr/bin/kubectl
+          path: ~/bin/kubectl
           key: kubectl-1.36.1-${{ runner.arch }}
 
       - name: Install kubectl 1.36.1
@@ -81,6 +86,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --allow-downgrades "kubectl=$K8S_VERSION-*"
           sudo apt-mark hold kubectl
+          mkdir -p ~/bin
+          cp /usr/bin/kubectl ~/bin/kubectl
 
       - name: Start apiserver
         env:
