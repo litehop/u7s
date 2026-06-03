@@ -119,6 +119,10 @@ pub struct AppState<S = SqliteStore> {
     /// Address of the konnectivity HTTP CONNECT proxy used to reach pod IPs from the Mac host.
     /// Format: "host:port" (e.g. "127.0.0.1:8135"). None when konnectivity is not configured.
     pub konnectivity_proxy_addr: Option<String>,
+    /// Concatenated PEM (cert + key) used as the mTLS client cert when calling admission webhooks.
+    /// Stored here so the per-webhook reqwest::Client can present the same identity as the shared
+    /// webhook_client when talking to the konnectivity proxy (which requires mTLS).
+    pub webhook_identity_pem: Option<Arc<Vec<u8>>>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -168,6 +172,7 @@ impl<S> Clone for AppState<S> {
             service_ip_allocator: self.service_ip_allocator.clone(),
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
+            webhook_identity_pem: self.webhook_identity_pem.clone(),
         }
     }
 }
@@ -308,6 +313,7 @@ impl<S: Store> AppState<S> {
             service_ip_allocator: cfg.service_ip_allocator.map(Arc::new),
             continue_token_key: Arc::new(continue_token_key),
             konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,
+            webhook_identity_pem: cfg.webhook_identity_pem.map(Arc::new),
         }
     }
 

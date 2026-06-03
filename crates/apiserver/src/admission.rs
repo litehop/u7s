@@ -499,6 +499,8 @@ fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     resolve: Option<(&str, std::net::SocketAddr)>,
     proxy_addr: Option<&str>,
+    cluster_ca_der: Option<&[u8]>,
+    webhook_identity_pem: Option<&[u8]>,
     fallback: &reqwest::Client,
 ) -> reqwest::Client {
     let Some(b64) = ca_bundle_b64 else {
@@ -514,8 +516,19 @@ fn build_webhook_call_client(
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .add_root_certificate(cert);
+    // Also trust the cluster CA so the konnectivity proxy TLS cert is verified.
+    if let Some(der) = cluster_ca_der {
+        if let Ok(cluster_cert) = reqwest::Certificate::from_der(der) {
+            builder = builder.add_root_certificate(cluster_cert);
+        }
+    }
     if let Some((host, addr)) = resolve {
         builder = builder.resolve(host, addr);
+    }
+    if let Some(pem) = webhook_identity_pem {
+        if let Ok(identity) = reqwest::Identity::from_pem(pem) {
+            builder = builder.identity(identity);
+        }
     }
     if let Some(addr) = proxy_addr {
         let proxy_url = format!("https://{addr}");
@@ -640,6 +653,8 @@ async fn invoke_mutating_webhook<S: Store>(
         webhook.client_config.ca_bundle.as_deref(),
         resolve,
         state.konnectivity_proxy_addr.as_deref(),
+        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
         &state.webhook_client,
     );
     let response = call_webhook(&wh_client, url, &review).await;
@@ -864,6 +879,8 @@ pub async fn run_validating_webhooks<S: Store>(
             webhook.client_config.ca_bundle.as_deref(),
             resolve,
             state.konnectivity_proxy_addr.as_deref(),
+            state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
             &state.webhook_client,
         );
         let response = call_webhook(&wh_client, url, &review).await;
@@ -2580,7 +2597,7 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         // Must not panic and must not return the fallback clone (cert was valid).
-        let client = build_webhook_call_client(Some(&ca_b64), None, None, &fallback);
+        let client = build_webhook_call_client(Some(&ca_b64), None, None, None, None, &fallback);
         drop(client);
     }
 
@@ -2611,6 +2628,8 @@ mod tests {
             Some(&ca_b64),
             Some(("my-webhook.webhook-ns.svc", addr)),
             None,
+            None,
+            None,
             &fallback,
         );
         drop(client);
@@ -2637,8 +2656,14 @@ mod tests {
         let fallback = reqwest::Client::new();
         // Must build successfully and apply the proxy — if this panics, all webhook calls
         // to pod IPs fail when konnectivity is configured.
-        let client =
-            build_webhook_call_client(Some(&ca_b64), None, Some("127.0.0.1:8135"), &fallback);
+        let client = build_webhook_call_client(
+            Some(&ca_b64),
+            None,
+            Some("127.0.0.1:8135"),
+            None,
+            None,
+            &fallback,
+        );
         drop(client);
     }
 
@@ -2647,7 +2672,7 @@ mod tests {
     #[test]
     fn build_webhook_call_client_no_bundle_returns_fallback() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(None, None, None, &fallback);
+        let client = build_webhook_call_client(None, None, None, None, None, &fallback);
         drop(client);
     }
 
@@ -2656,8 +2681,14 @@ mod tests {
     #[test]
     fn build_webhook_call_client_invalid_b64_returns_fallback() {
         let fallback = reqwest::Client::new();
-        let client =
-            build_webhook_call_client(Some("!!!not-valid-base64!!!"), None, None, &fallback);
+        let client = build_webhook_call_client(
+            Some("!!!not-valid-base64!!!"),
+            None,
+            None,
+            None,
+            None,
+            &fallback,
+        );
         drop(client);
     }
 }
