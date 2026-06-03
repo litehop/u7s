@@ -41,16 +41,17 @@ fi
 KONNECTIVITY_OUT=$("$REPO/scripts/download-konnectivity.sh")
 SERVER_BIN=$(echo "$KONNECTIVITY_OUT" | grep '^server=' | cut -d= -f2)
 
+APISERVER_RUNNING=0
 if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
     echo "WARNING: port $PORT already in use — reusing existing apiserver instance" >&2
-    echo "KUBECONFIG=$WORKDIR/kubeconfig"
-    exit 0
+    APISERVER_RUNNING=1
+  else
+    echo "error: port $PORT is already in use." >&2
+    echo "If u7s is already running, set KUBECONFIG=$WORKDIR/kubeconfig and use it." >&2
+    echo "To start fresh: scripts/u7s-start.sh --reset  (rotates CA, re-join kubelet needed)" >&2
+    exit 1
   fi
-  echo "error: port $PORT is already in use." >&2
-  echo "If u7s is already running, set KUBECONFIG=$WORKDIR/kubeconfig and use it." >&2
-  echo "To start fresh: scripts/u7s-start.sh --reset  (rotates CA, re-join kubelet needed)" >&2
-  exit 1
 fi
 
 if [ "$RESET" -eq 1 ]; then
@@ -100,10 +101,6 @@ EXTEOF
     --agent-port=8132 \
     --admin-port=8133 \
     --health-port=8134 \
-    --agent-namespace=kube-system \
-    --agent-service-account=konnectivity-agent \
-    --kubeconfig="$WORKDIR/kubeconfig" \
-    --authentication-audience=system:konnectivity-server \
     >> "$WORKDIR/konnectivity-server.log" 2>&1 &
   disown $!
 
@@ -122,7 +119,9 @@ if [ -f "$WORKDIR/ca.crt" ]; then
   PROXY_ARG="--konnectivity-proxy-addr 127.0.0.1:$KONNECTIVITY_PROXY_PORT"
 fi
 
-if [ "$BACKGROUND" -eq 1 ]; then
+if [ "$APISERVER_RUNNING" -eq 1 ]; then
+  echo "KUBECONFIG=$WORKDIR/kubeconfig"
+elif [ "$BACKGROUND" -eq 1 ]; then
   LOG="$WORKDIR/apiserver.log"
   echo "Starting u7s-apiserver (logs: $LOG) ..."
   "$BINARY" \
@@ -156,50 +155,52 @@ else
   SERVER_PID=$!
 fi
 
-echo "Waiting for server to accept connections ..."
-for i in $(seq 1 10); do
-  if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
-    break
-  fi
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+if [ "$APISERVER_RUNNING" -eq 0 ]; then
+  echo "Waiting for server to accept connections ..."
+  for i in $(seq 1 10); do
+    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+      break
+    fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      if [ "$BACKGROUND" -eq 1 ]; then
+        echo "error: u7s-apiserver exited immediately — see $LOG" >&2
+        tail -20 "$LOG" >&2
+      else
+        echo "error: u7s-apiserver exited immediately — check logs above" >&2
+      fi
+      exit 1
+    fi
+    sleep 1
+  done
+
+  if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
     if [ "$BACKGROUND" -eq 1 ]; then
-      echo "error: u7s-apiserver exited immediately — see $LOG" >&2
+      echo "error: server did not open port $PORT within 10s — see $LOG" >&2
       tail -20 "$LOG" >&2
     else
-      echo "error: u7s-apiserver exited immediately — check logs above" >&2
+      echo "error: server did not open port $PORT within 10s" >&2
     fi
+    kill "$SERVER_PID" 2>/dev/null || true
     exit 1
   fi
-  sleep 1
-done
 
-if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
-    echo "error: server did not open port $PORT within 10s — see $LOG" >&2
-    tail -20 "$LOG" >&2
+    echo "u7s-apiserver running (PID $SERVER_PID, logs: $LOG)"
+    echo "KUBECONFIG=$WORKDIR/kubeconfig"
   else
-    echo "error: server did not open port $PORT within 10s" >&2
+    echo ""
+    echo "u7s is running (PID $SERVER_PID)"
+    echo ""
+    echo "  export KUBECONFIG=$WORKDIR/kubeconfig"
+    echo ""
+    echo "Next steps:"
+    echo "  First run (VM not provisioned): scripts/conformance/lima-start.sh"
+    echo "  Subsequent runs (VM exists):    scripts/kubelet-reconnect.sh"
+    echo "  kubectl get nodes"
+    echo ""
+    echo "u7s logs are going to stdout/stderr of this process."
+    echo "Press Ctrl-C to stop."
+    echo ""
+    wait "$SERVER_PID"
   fi
-  kill "$SERVER_PID" 2>/dev/null || true
-  exit 1
-fi
-
-if [ "$BACKGROUND" -eq 1 ]; then
-  echo "u7s-apiserver running (PID $SERVER_PID, logs: $LOG)"
-  echo "KUBECONFIG=$WORKDIR/kubeconfig"
-else
-  echo ""
-  echo "u7s is running (PID $SERVER_PID)"
-  echo ""
-  echo "  export KUBECONFIG=$WORKDIR/kubeconfig"
-  echo ""
-  echo "Next steps:"
-  echo "  First run (VM not provisioned): scripts/conformance/lima-start.sh"
-  echo "  Subsequent runs (VM exists):    scripts/kubelet-reconnect.sh"
-  echo "  kubectl get nodes"
-  echo ""
-  echo "u7s logs are going to stdout/stderr of this process."
-  echo "Press Ctrl-C to stop."
-  echo ""
-  wait "$SERVER_PID"
 fi
