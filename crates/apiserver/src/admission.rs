@@ -240,19 +240,35 @@ struct ServiceReference {
     path: Option<String>,
 }
 
-/// Resolve a webhook's clientConfig to a URL string.
+/// Describes the connection target for a webhook call.
 ///
-/// If `clientConfig.url` is set, returns it directly.
-/// If `clientConfig.service` is set, looks up the Service object from the store by
-/// namespace+name and builds `https://<clusterIP>:<port><path>`.
-/// Returns an error if the service reference is set but the Service is not found.
+/// `DirectUrl` is used when `clientConfig.url` is set directly.
+/// `ServiceResolved` is used when `clientConfig.service` is set: the URL uses the
+/// service DNS name for correct SNI, and `resolve_addr` statically maps that name
+/// to the pod IP obtained from Endpoints — no DNS query is issued.
+enum WebhookTarget {
+    DirectUrl(String),
+    ServiceResolved {
+        url: String,
+        resolve_host: String,
+        resolve_addr: std::net::SocketAddr,
+    },
+}
+
+/// Resolve a webhook's clientConfig to a `WebhookTarget`.
+///
+/// If `clientConfig.url` is set, returns `DirectUrl`.
+/// If `clientConfig.service` is set, looks up the Endpoints for the service to get
+/// the pod IP, looks up the Service to resolve service port → target port, and
+/// returns `ServiceResolved` with a URL using the service DNS name (for correct SNI).
+/// Returns an error if the service reference is set but no endpoints are found.
 async fn webhook_url<S: Store>(
     state: &AppState<S>,
     config: &WebhookClientConfig,
     webhook_name: &str,
-) -> Result<String, String> {
+) -> Result<WebhookTarget, String> {
     if let Some(url) = &config.url {
-        return Ok(url.clone());
+        return Ok(WebhookTarget::DirectUrl(url.clone()));
     }
 
     if let Some(svc_ref) = &config.service {
@@ -317,7 +333,16 @@ async fn webhook_url<S: Store>(
             .unwrap_or(svc_port);
 
         let path = svc_ref.path.as_deref().unwrap_or("/");
-        return Ok(format!("https://{pod_ip}:{target_port}{path}"));
+        let resolve_host = format!("{}.{}.svc", svc_ref.name, svc_ref.namespace);
+        let url = format!("https://{resolve_host}:{target_port}{path}");
+        let resolve_addr = format!("{pod_ip}:{target_port}")
+            .parse()
+            .map_err(|e| format!("webhook \"{webhook_name}\": invalid pod addr: {e}"))?;
+        return Ok(WebhookTarget::ServiceResolved {
+            url,
+            resolve_host,
+            resolve_addr,
+        });
     }
 
     Err(format!(
@@ -468,10 +493,11 @@ fn build_review(
 /// Build a reqwest::Client for a single webhook call using the webhook's own caBundle.
 /// Each webhook ships with its own CA that signed its TLS cert — not the cluster CA.
 /// Falls back to the shared client when caBundle is absent or malformed.
-/// Sets danger_accept_invalid_hostnames because konnectivity routes calls via 127.0.0.1
-/// while the webhook cert is issued for the service DNS name.
+/// When `resolve` is provided, the client uses a static host→addr mapping so that
+/// SNI uses the service DNS name (for cert verification) while traffic goes to the pod IP.
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
+    resolve: Option<(&str, std::net::SocketAddr)>,
     fallback: &reqwest::Client,
 ) -> reqwest::Client {
     let Some(b64) = ca_bundle_b64 else {
@@ -484,12 +510,13 @@ fn build_webhook_call_client(
     let Ok(cert) = reqwest::Certificate::from_pem(&pem_bytes) else {
         return fallback.clone();
     };
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .add_root_certificate(cert)
-        .danger_accept_invalid_hostnames(true)
-        .build()
-        .unwrap_or_else(|_| fallback.clone())
+        .add_root_certificate(cert);
+    if let Some((host, addr)) = resolve {
+        builder = builder.resolve(host, addr);
+    }
+    builder.build().unwrap_or_else(|_| fallback.clone())
 }
 
 async fn call_webhook(
@@ -573,8 +600,8 @@ async fn invoke_mutating_webhook<S: Store>(
         }
     }
 
-    let url = match webhook_url(state, &webhook.client_config, &webhook.name).await {
-        Ok(u) => u,
+    let target = match webhook_url(state, &webhook.client_config, &webhook.name).await {
+        Ok(t) => t,
         Err(e) => {
             if webhook.failure_policy == "Ignore" {
                 tracing::warn!(
@@ -590,15 +617,24 @@ async fn invoke_mutating_webhook<S: Store>(
             }
         }
     };
+    let (url, resolve) = match &target {
+        WebhookTarget::DirectUrl(u) => (u.as_str(), None),
+        WebhookTarget::ServiceResolved {
+            url,
+            resolve_host,
+            resolve_addr,
+        } => (url.as_str(), Some((resolve_host.as_str(), *resolve_addr))),
+    };
 
     let uid = uuid::Uuid::new_v4().to_string();
     let review = build_review(&uid, ctx, object);
 
     let wh_client = build_webhook_call_client(
         webhook.client_config.ca_bundle.as_deref(),
+        resolve,
         &state.webhook_client,
     );
-    let response = call_webhook(&wh_client, &url, &review).await;
+    let response = call_webhook(&wh_client, url, &review).await;
 
     match response {
         Some(resp) => {
@@ -787,8 +823,8 @@ pub async fn run_validating_webhooks<S: Store>(
             }
         }
 
-        let url = match webhook_url(state, &webhook.client_config, &webhook.name).await {
-            Ok(u) => u,
+        let target = match webhook_url(state, &webhook.client_config, &webhook.name).await {
+            Ok(t) => t,
             Err(e) => {
                 if webhook.failure_policy == "Ignore" {
                     tracing::warn!(
@@ -804,15 +840,24 @@ pub async fn run_validating_webhooks<S: Store>(
                 }
             }
         };
+        let (url, resolve) = match &target {
+            WebhookTarget::DirectUrl(u) => (u.as_str(), None),
+            WebhookTarget::ServiceResolved {
+                url,
+                resolve_host,
+                resolve_addr,
+            } => (url.as_str(), Some((resolve_host.as_str(), *resolve_addr))),
+        };
 
         let uid = uuid::Uuid::new_v4().to_string();
         let review = build_review(&uid, ctx, object);
 
         let wh_client = build_webhook_call_client(
             webhook.client_config.ca_bundle.as_deref(),
+            resolve,
             &state.webhook_client,
         );
-        let response = call_webhook(&wh_client, &url, &review).await;
+        let response = call_webhook(&wh_client, url, &review).await;
 
         match response {
             Some(resp) => {
@@ -2526,7 +2571,38 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         // Must not panic and must not return the fallback clone (cert was valid).
-        let client = build_webhook_call_client(Some(&ca_b64), &fallback);
+        let client = build_webhook_call_client(Some(&ca_b64), None, &fallback);
+        drop(client);
+    }
+
+    /// build_webhook_call_client with resolve installs a static DNS override so the URL
+    /// uses the service DNS name for SNI while traffic goes to the pod IP.
+    /// Without .resolve(), connecting to the service name would require cluster DNS.
+    #[test]
+    fn build_webhook_call_client_with_resolve_does_not_panic() {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["my-webhook.webhook-ns.svc".to_string()])
+                .expect("generate self-signed cert for resolve test");
+        let ca_der = cert.cert.der().to_vec();
+
+        let b64_der = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_der);
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64_der.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+
+        let ca_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem.as_bytes());
+
+        let addr: std::net::SocketAddr = "10.244.0.5:8443".parse().unwrap();
+        let fallback = reqwest::Client::new();
+        let client = build_webhook_call_client(
+            Some(&ca_b64),
+            Some(("my-webhook.webhook-ns.svc", addr)),
+            &fallback,
+        );
         drop(client);
     }
 
@@ -2535,7 +2611,7 @@ mod tests {
     #[test]
     fn build_webhook_call_client_no_bundle_returns_fallback() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(None, &fallback);
+        let client = build_webhook_call_client(None, None, &fallback);
         drop(client);
     }
 
@@ -2544,7 +2620,7 @@ mod tests {
     #[test]
     fn build_webhook_call_client_invalid_b64_returns_fallback() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(Some("!!!not-valid-base64!!!"), &fallback);
+        let client = build_webhook_call_client(Some("!!!not-valid-base64!!!"), None, &fallback);
         drop(client);
     }
 }

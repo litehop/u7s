@@ -2075,18 +2075,22 @@ pub fn decode_podtemplate_proto(data: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// Decode a proto-encoded IntOrString (k8s.io/apimachinery/pkg/util/intstr) from raw bytes.
-/// Field 1 (varint) = integer value; field 2 (length-delimited) = string value.
-/// Returns None if the bytes are empty or malformed.
+/// k8s IntOrString (k8s.io/apimachinery/pkg/util/intstr/generated.proto):
+///   field 1 (int64) = type: 0=Int 1=String
+///   field 2 (int32) = intVal (used when type=0)
+///   field 3 (string) = strVal (used when type=1)
 fn decode_int_or_string(bytes: &[u8]) -> Option<serde_json::Value> {
     #[derive(Clone, PartialEq, prost::Message)]
     struct IntOrString {
-        #[prost(int32, tag = "1")]
+        #[prost(int64, tag = "1")]
+        r#type: i64,
+        #[prost(int32, tag = "2")]
         int_val: i32,
-        #[prost(string, tag = "2")]
+        #[prost(string, tag = "3")]
         str_val: String,
     }
     let ios = IntOrString::decode(bytes).ok()?;
-    if ios.int_val != 0 {
+    if ios.r#type == 0 {
         Some(serde_json::Value::Number(serde_json::Number::from(
             ios.int_val,
         )))
@@ -6736,10 +6740,12 @@ mod tests {
     #[test]
     fn decode_service_proto_preserves_target_port() {
         // ServicePort with port=8443 and targetPort=8444 (integer IntOrString).
-        // IntOrString encoding: field 1 (varint) = 8444 = 0x80 0xC1 0x00 (LEB128: 8444 = 0x20FC → 0xFC 0x40 → varint 0xFC 0x40).
-        // 8444 in LEB128: 8444 = 0b10000011111111100 → split to 7-bit groups: 0100001 1111100 → bytes: 0xFC|0x80 = 0xFC, 0x41 = 0x41
-        // Actually: 8444 = 0x20FC. LEB128: low 7 bits = 0x7C | 0x80 = 0xFC (more), remaining = 0x41.
-        let int_or_string_8444: Vec<u8> = vec![0x08, 0xFC, 0x41]; // field 1, varint 8444
+        // k8s IntOrString proto: field 1 (int64) = type (0=Int), field 2 (int32) = intVal, field 3 (string) = strVal.
+        // Encoding for type=0, intVal=8444:
+        //   field 1 tag+val: 0x08 0x00 (field 1 varint, value 0)
+        //   field 2 tag+val: 0x10 0xFC 0x41 (field 2 varint, value 8444 in LEB128)
+        //   field 3 tag+val: 0x1a 0x00 (field 3 length-delimited, empty string)
+        let int_or_string_8444: Vec<u8> = vec![0x08, 0x00, 0x10, 0xFC, 0x41, 0x1a, 0x00];
 
         let mut port = encode_length_delimited(2, b"TCP");
         port.extend_from_slice(&encode_varint(3u64 << 3)); // field 3 tag (port, varint)
