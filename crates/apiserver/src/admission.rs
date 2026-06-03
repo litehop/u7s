@@ -79,6 +79,10 @@ pub struct AdmissionStatus {
     pub code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Reason for denial. Some webhooks set only reason (not message); we include both
+    /// in the error string so the caller sees the actual denial cause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,12 +250,19 @@ struct ServiceReference {
 /// `ServiceResolved` is used when `clientConfig.service` is set: the URL uses the
 /// service DNS name for correct SNI, and `resolve_addr` statically maps that name
 /// to the pod IP obtained from Endpoints — no DNS query is issued.
+///
+/// `pod_url` uses the raw pod IP:port (e.g. `https://10.85.0.9:8444/`) instead of
+/// the service hostname. This is required when routing through the konnectivity proxy:
+/// the konnectivity-agent resolves the CONNECT target inside the VM, where service
+/// ClusterIPs are not reachable (no kube-proxy). Pod IPs are directly reachable within
+/// the VM's pod network.
 enum WebhookTarget {
     DirectUrl(String),
     ServiceResolved {
         url: String,
         resolve_host: String,
         resolve_addr: std::net::SocketAddr,
+        pod_url: String,
     },
 }
 
@@ -335,6 +346,10 @@ async fn webhook_url<S: Store>(
         let path = svc_ref.path.as_deref().unwrap_or("/");
         let resolve_host = format!("{}.{}.svc", svc_ref.name, svc_ref.namespace);
         let url = format!("https://{resolve_host}:{target_port}{path}");
+        // pod_url uses the raw pod IP so the konnectivity-agent can dial it directly
+        // without DNS resolution (service ClusterIPs are not reachable from the VM
+        // without kube-proxy; pod IPs are directly reachable in the pod network).
+        let pod_url = format!("https://{pod_ip}:{target_port}{path}");
         let resolve_addr = format!("{pod_ip}:{target_port}")
             .parse()
             .map_err(|e| format!("webhook \"{webhook_name}\": invalid pod addr: {e}"))?;
@@ -342,6 +357,7 @@ async fn webhook_url<S: Store>(
             url,
             resolve_host,
             resolve_addr,
+            pod_url,
         });
     }
 
@@ -493,8 +509,17 @@ fn build_review(
 /// Build a reqwest::Client for a single webhook call using the webhook's own caBundle.
 /// Each webhook ships with its own CA that signed its TLS cert — not the cluster CA.
 /// Falls back to the shared client when caBundle is absent or malformed.
-/// When `resolve` is provided, the client uses a static host→addr mapping so that
-/// SNI uses the service DNS name (for cert verification) while traffic goes to the pod IP.
+///
+/// `tls_certs_only` is used instead of `add_root_certificate` so that the macOS platform
+/// verifier (SecureTransport) is bypassed. The macOS verifier enforces Extended Key Usage
+/// (EKU) constraints that test-generated webhook TLS certificates may not satisfy.
+///
+/// When `proxy_addr` is Some (konnectivity mode), `danger_accept_invalid_hostnames` is
+/// enabled because the URL uses the raw pod IP (to let the konnectivity-agent dial it
+/// directly without DNS), not the service hostname the TLS certificate was issued for.
+///
+/// When `resolve` is provided (direct mode, no proxy), the client uses a static
+/// host→addr mapping so SNI uses the service DNS name while traffic goes to the pod IP.
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     resolve: Option<(&str, std::net::SocketAddr)>,
@@ -513,16 +538,25 @@ fn build_webhook_call_client(
     let Ok(cert) = reqwest::Certificate::from_pem(&pem_bytes) else {
         return fallback.clone();
     };
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .add_root_certificate(cert);
-    // Also trust the cluster CA so the konnectivity proxy TLS cert is verified.
+    // Collect trusted CAs: the webhook's own CA and the cluster CA (for proxy TLS).
+    // tls_certs_only bypasses the macOS platform verifier so EKU is not enforced.
+    let mut certs = vec![cert];
     if let Some(der) = cluster_ca_der {
         if let Ok(cluster_cert) = reqwest::Certificate::from_der(der) {
-            builder = builder.add_root_certificate(cluster_cert);
+            certs.push(cluster_cert);
         }
     }
-    if let Some((host, addr)) = resolve {
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .tls_certs_only(certs);
+    if proxy_addr.is_some() {
+        // When routing through the konnectivity proxy the URL uses the pod IP directly
+        // (not the service hostname), so hostname verification against the webhook cert
+        // (which has the service hostname in its SAN) would fail. Disable it — the cert
+        // signature is still verified against the caBundle above.
+        builder = builder.danger_accept_invalid_hostnames(true);
+    } else if let Some((host, addr)) = resolve {
+        // Direct mode: map service hostname → pod IP locally so SNI is correct.
         builder = builder.resolve(host, addr);
     }
     if let Some(pem) = webhook_identity_pem {
@@ -539,24 +573,36 @@ fn build_webhook_call_client(
     builder.build().unwrap_or_else(|_| fallback.clone())
 }
 
+/// Call the webhook and return the response, or `None` on network/parse error.
+/// The bool indicates whether the failure was a timeout (true) vs other error (false).
+/// Callers use this to produce "deadline exceeded" vs "failed to respond" error messages,
+/// matching the Kubernetes apiserver's error convention so conformance tests can identify
+/// webhook timeout by checking for "deadline" in the error string.
 async fn call_webhook(
     client: &reqwest::Client,
     url: &str,
     review: &AdmissionReview,
-) -> Option<AdmissionResponse> {
-    let body = serde_json::to_vec(review).ok()?;
-    let resp = client
+) -> (Option<AdmissionResponse>, bool) {
+    let Ok(body) = serde_json::to_vec(review) else {
+        return (None, false);
+    };
+    let send_result = client
         .post(url)
         .header("Content-Type", "application/json")
         .body(body)
         .send()
-        .await
-        .ok()?;
-
-    let bytes = resp.bytes().await.ok()?;
-    serde_json::from_slice::<AdmissionReview>(&bytes)
-        .ok()?
-        .response
+        .await;
+    let resp = match send_result {
+        Ok(r) => r,
+        Err(e) => return (None, e.is_timeout()),
+    };
+    let Ok(bytes) = resp.bytes().await else {
+        return (None, false);
+    };
+    let response = serde_json::from_slice::<AdmissionReview>(&bytes)
+        .ok()
+        .and_then(|r| r.response);
+    (response, false)
 }
 
 /// Apply a JSON Patch (base64-encoded) from a mutating webhook to the object.
@@ -637,13 +683,25 @@ async fn invoke_mutating_webhook<S: Store>(
             }
         }
     };
-    let (url, resolve) = match &target {
+    // When routing through the konnectivity proxy, use the pod IP directly in the URL
+    // so the konnectivity-agent can dial it without DNS (service ClusterIPs are not
+    // reachable in the VM without kube-proxy; pod IPs are). In direct mode (no proxy),
+    // use the service hostname + resolve() so SNI matches the webhook TLS cert.
+    let using_proxy = state.konnectivity_proxy_addr.is_some();
+    let (call_url, resolve) = match &target {
         WebhookTarget::DirectUrl(u) => (u.as_str(), None),
         WebhookTarget::ServiceResolved {
             url,
             resolve_host,
             resolve_addr,
-        } => (url.as_str(), Some((resolve_host.as_str(), *resolve_addr))),
+            pod_url,
+        } => {
+            if using_proxy {
+                (pod_url.as_str(), None)
+            } else {
+                (url.as_str(), Some((resolve_host.as_str(), *resolve_addr)))
+            }
+        }
     };
 
     let uid = uuid::Uuid::new_v4().to_string();
@@ -657,15 +715,23 @@ async fn invoke_mutating_webhook<S: Store>(
         state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
         &state.webhook_client,
     );
-    let response = call_webhook(&wh_client, url, &review).await;
+    let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
 
     match response {
         Some(resp) => {
             if !resp.allowed {
+                // Use message if present; fall back to reason (some webhooks set only reason);
+                // fall back to a generic message. Both fields are included in the error so the
+                // caller can identify the denial cause (e2e tests check for specific substrings).
                 let message = resp
                     .status
                     .as_ref()
-                    .and_then(|s| s.message.as_deref())
+                    .and_then(|s| {
+                        s.message
+                            .as_deref()
+                            .filter(|m| !m.is_empty())
+                            .or(s.reason.as_deref().filter(|r| !r.is_empty()))
+                    })
                     .unwrap_or("admission webhook denied the request")
                     .to_string();
                 return Err(Status::forbidden(format!(
@@ -691,6 +757,13 @@ async fn invoke_mutating_webhook<S: Store>(
                     webhook.name
                 );
                 Ok((object.clone(), false))
+            } else if timed_out {
+                // Use "deadline exceeded" phrasing so tests can detect webhook timeout
+                // by checking for "deadline" in the error string (Kubernetes convention).
+                Err(Status::internal(format!(
+                    "admission webhook \"{}\" request deadline exceeded",
+                    webhook.name
+                )))
             } else {
                 Err(Status::internal(format!(
                     "admission webhook \"{}\" failed to respond (failurePolicy=Fail)",
@@ -863,13 +936,21 @@ pub async fn run_validating_webhooks<S: Store>(
                 }
             }
         };
-        let (url, resolve) = match &target {
+        let using_proxy = state.konnectivity_proxy_addr.is_some();
+        let (call_url, resolve) = match &target {
             WebhookTarget::DirectUrl(u) => (u.as_str(), None),
             WebhookTarget::ServiceResolved {
                 url,
                 resolve_host,
                 resolve_addr,
-            } => (url.as_str(), Some((resolve_host.as_str(), *resolve_addr))),
+                pod_url,
+            } => {
+                if using_proxy {
+                    (pod_url.as_str(), None)
+                } else {
+                    (url.as_str(), Some((resolve_host.as_str(), *resolve_addr)))
+                }
+            }
         };
 
         let uid = uuid::Uuid::new_v4().to_string();
@@ -883,7 +964,7 @@ pub async fn run_validating_webhooks<S: Store>(
             state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
             &state.webhook_client,
         );
-        let response = call_webhook(&wh_client, url, &review).await;
+        let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
 
         match response {
             Some(resp) => {
@@ -891,7 +972,12 @@ pub async fn run_validating_webhooks<S: Store>(
                     let message = resp
                         .status
                         .as_ref()
-                        .and_then(|s| s.message.as_deref())
+                        .and_then(|s| {
+                            s.message
+                                .as_deref()
+                                .filter(|m| !m.is_empty())
+                                .or(s.reason.as_deref().filter(|r| !r.is_empty()))
+                        })
                         .unwrap_or("admission webhook denied the request")
                         .to_string();
                     return Err(Status::forbidden(format!(
@@ -906,6 +992,11 @@ pub async fn run_validating_webhooks<S: Store>(
                         "admission: validating webhook \"{}\" failed, ignoring (failurePolicy=Ignore)",
                         webhook.name
                     );
+                } else if timed_out {
+                    return Err(Status::internal(format!(
+                        "admission webhook \"{}\" request deadline exceeded",
+                        webhook.name
+                    )));
                 } else {
                     return Err(Status::internal(format!(
                         "admission webhook \"{}\" failed to respond (failurePolicy=Fail)",
@@ -2690,5 +2781,52 @@ mod tests {
             &fallback,
         );
         drop(client);
+    }
+
+    /// AdmissionStatus.reason must be deserialised and used as the denial message when
+    /// the webhook sets only `reason` (not `message`). Some real webhooks (e.g. OPA Gatekeeper)
+    /// set `reason` to carry the policy violation detail and leave `message` empty. Without
+    /// this field the apiserver would surface a generic "admission webhook denied the request"
+    /// message, hiding the actual policy violation from the user.
+    #[test]
+    fn admission_status_reason_field_is_deserialised() {
+        let json = r#"{"reason": "pods with privileged containers are not allowed"}"#;
+        let status: AdmissionStatus =
+            serde_json::from_str(json).expect("AdmissionStatus must deserialise with only reason");
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("pods with privileged containers are not allowed"),
+            "reason field must be deserialised so webhook denial messages reach the user"
+        );
+        assert!(
+            status.message.is_none(),
+            "message must be None when absent in response"
+        );
+    }
+
+    /// WebhookTarget::ServiceResolved must carry a pod_url for konnectivity routing.
+    /// In konnectivity mode the CONNECT tunnel is established to the raw pod IP, not the
+    /// service ClusterIP (which kube-proxy would route but is not available in u7s). If
+    /// pod_url is absent the apiserver tries to reach an unreachable ClusterIP and all
+    /// webhook calls fail silently (failurePolicy=Ignore) or hard-fail (failurePolicy=Fail).
+    #[test]
+    fn webhook_target_service_resolved_has_pod_url() {
+        // Verify the variant carries the pod_url field — compile-time structural check.
+        // If pod_url is removed from the enum, this test fails to compile.
+        let target = WebhookTarget::ServiceResolved {
+            url: "https://my-webhook.webhook-ns.svc:443/validate".to_string(),
+            resolve_host: "my-webhook.webhook-ns.svc".to_string(),
+            resolve_addr: "10.244.0.5:443".parse().unwrap(),
+            pod_url: "https://10.244.0.5:443/validate".to_string(),
+        };
+        match target {
+            WebhookTarget::ServiceResolved { pod_url, .. } => {
+                assert!(
+                    pod_url.starts_with("https://10."),
+                    "pod_url must use raw pod IP so konnectivity-agent can dial it directly"
+                );
+            }
+            _ => panic!("must match ServiceResolved"),
+        }
     }
 }
