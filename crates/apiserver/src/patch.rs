@@ -241,6 +241,25 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // and "status.conditions" when patching the full object.
         path if path == "conditions" || path.ends_with(".conditions") => MergeKeyKind::Key("type"),
 
+        // Pod status arrays — merge key used by kubelet strategic-merge-patch.
+        // "podIPs" is used when the status patch is applied with path root "" (status
+        // subresource handler strips the "status" wrapper before calling SMP).
+        // "status.podIPs" covers the rare case of patching the full object.
+        // Without these entries, $patch:delete directives on podIPs accumulate as literal
+        // objects in the array, causing the kubelet to see phantom podIP changes on every
+        // reconcile and continuously recreate the pod sandbox (sandbox loop).
+        path if path == "podIPs" || path.ends_with(".podIPs") => MergeKeyKind::Key("ip"),
+
+        path if path == "containerStatuses"
+            || path.ends_with(".containerStatuses")
+            || path == "initContainerStatuses"
+            || path.ends_with(".initContainerStatuses")
+            || path == "ephemeralContainerStatuses"
+            || path.ends_with(".ephemeralContainerStatuses") =>
+        {
+            MergeKeyKind::Key("name")
+        }
+
         "rules" | "subjects" => MergeKeyKind::Replace,
 
         _ => MergeKeyKind::Unknown,
@@ -815,6 +834,51 @@ mod tests {
         assert_eq!(
             mem["status"], "False",
             "MemoryPressure status:False must survive a heartbeat-only patch"
+        );
+    }
+
+    /// $patch:delete on podIPs must remove the matching entry, not store the directive literally.
+    ///
+    /// Without this fix, a kubelet status patch that includes $patch:delete to remove a
+    /// stale podIP entry instead appends the directive object to the array.  On the next
+    /// reconcile the kubelet sees a changed podIPs array and continuously recreates the
+    /// pod sandbox, killing kube-proxy and any other hostNetwork pod (sandbox loop).
+    #[test]
+    fn smp_patch_delete_on_pod_ips_removes_entry_not_stores_directive() {
+        let mut target = serde_json::json!({
+            "status": {
+                "podIPs": [
+                    {"ip": "10.0.0.1"},
+                    {"ip": "10.0.0.2"}
+                ]
+            }
+        });
+        // Kubelet sends $patch:delete to remove the stale 10.0.0.1 entry.
+        let patch = serde_json::json!({
+            "status": {
+                "podIPs": [
+                    {"ip": "10.0.0.1", "$patch": "delete"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let pod_ips = target["status"]["podIPs"].as_array().unwrap();
+        assert_eq!(
+            pod_ips.len(),
+            1,
+            "$patch:delete must remove the matching podIP entry — if both entries survive \
+             (or 3 entries are present including the directive object), the kubelet detects \
+             phantom podIP changes on every reconcile and recreates the pod sandbox in a loop"
+        );
+        assert_eq!(
+            pod_ips[0]["ip"], "10.0.0.2",
+            "10.0.0.2 must survive — only the $patch:delete target (10.0.0.1) must be removed"
+        );
+        assert!(
+            pod_ips.iter().all(|e| e.get("$patch").is_none()),
+            "the $patch directive object must not appear as a literal entry in podIPs"
         );
     }
 
