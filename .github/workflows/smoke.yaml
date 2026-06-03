@@ -361,8 +361,11 @@ jobs:
           mkdir -p ~/bin
           cp /usr/bin/kubelet ~/bin/kubelet
           cp /usr/bin/kubectl ~/bin/kubectl
-          # Install containernetworking-plugins after kubelet; use dpkg force-overwrite
-          # to handle file conflicts with the kubernetes-cni package.
+
+      - name: Install containernetworking-plugins
+        run: |
+          # Must run regardless of kubelet cache hit — without CNI plugins /etc/cni/net.d/
+          # stays empty and kubelet reports NetworkPluginNotReady, failing smoke tests.
           sudo apt-get install -y -o Dpkg::Options::="--force-overwrite" containernetworking-plugins
 
       - name: Start apiserver
