@@ -303,6 +303,25 @@ pub fn user_holds_all_rules(
                 }
             }
         }
+        // Verify nonResourceURL permissions are also held by the caller.
+        for url in &rule.non_resource_urls {
+            for verb in &rule.verbs {
+                let req = AuthzRequest {
+                    username,
+                    groups,
+                    verb,
+                    api_group: "",
+                    resource: "",
+                    subresource: "",
+                    namespace: None,
+                    name: None,
+                    non_resource_url: Some(url),
+                };
+                if !rbac.is_allowed(&req) {
+                    return false;
+                }
+            }
+        }
     }
     true
 }
@@ -1203,6 +1222,93 @@ mod tests {
         assert!(
             user_holds_all_rules("admin-user", &groups, &admin_rules, &idx),
             "system:masters members must pass the escalation check via their cluster-admin binding"
+        );
+    }
+
+    #[test]
+    fn user_holds_all_rules_rejects_missing_non_resource_url() {
+        // user_holds_all_rules must return false when the role includes nonResourceURL
+        // permissions the caller does not hold. Without this, any user who can create
+        // ClusterRoleBindings can escalate to /metrics or /healthz access they don't have.
+        let idx = RbacIndex::new();
+
+        // "alice" has only resource-based permissions (get pods) — no nonResourceURL grants.
+        let (alice_role_key, alice_role_val) = make_cluster_role(
+            "alice-role",
+            json!([{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get"]
+            }]),
+        );
+        let (alice_bind_key, alice_bind_val) = make_cluster_binding(
+            "alice-binding",
+            "alice-role",
+            json!([{ "kind": "User", "name": "alice" }]),
+        );
+        idx.apply_object(&alice_role_key, &alice_role_val);
+        idx.apply_object(&alice_bind_key, &alice_bind_val);
+
+        // The role alice wants to bind grants GET /metrics — she does not hold this.
+        let (metrics_role_key, metrics_role_val) = make_cluster_role(
+            "metrics-reader",
+            json!([{
+                "verbs": ["get"],
+                "nonResourceURLs": ["/metrics"]
+            }]),
+        );
+        idx.apply_object(&metrics_role_key, &metrics_role_val);
+
+        let metrics_rules = idx.cluster_role_rules("metrics-reader");
+        let groups: Vec<String> = vec![];
+
+        // Alice lacks GET /metrics — escalation check must reject her.
+        assert!(
+            !user_holds_all_rules("alice", &groups, &metrics_rules, &idx),
+            "alice must fail the escalation check: she does not hold GET /metrics; \
+             without this check she could bind anyone to a role granting /metrics or /healthz"
+        );
+    }
+
+    #[test]
+    fn user_holds_all_rules_accepts_user_who_holds_non_resource_url() {
+        // A user who already holds all nonResourceURL permissions in a role must pass
+        // the escalation check and be allowed to create a binding to that role.
+        let idx = RbacIndex::new();
+
+        // "bob" has GET /metrics via his own binding.
+        let (bob_role_key, bob_role_val) = make_cluster_role(
+            "bob-role",
+            json!([{
+                "verbs": ["get"],
+                "nonResourceURLs": ["/metrics"]
+            }]),
+        );
+        let (bob_bind_key, bob_bind_val) = make_cluster_binding(
+            "bob-binding",
+            "bob-role",
+            json!([{ "kind": "User", "name": "bob" }]),
+        );
+        idx.apply_object(&bob_role_key, &bob_role_val);
+        idx.apply_object(&bob_bind_key, &bob_bind_val);
+
+        // The role to bind also grants GET /metrics.
+        let (metrics_role_key, metrics_role_val) = make_cluster_role(
+            "metrics-reader",
+            json!([{
+                "verbs": ["get"],
+                "nonResourceURLs": ["/metrics"]
+            }]),
+        );
+        idx.apply_object(&metrics_role_key, &metrics_role_val);
+
+        let metrics_rules = idx.cluster_role_rules("metrics-reader");
+        let groups: Vec<String> = vec![];
+
+        // Bob already holds GET /metrics — escalation check must pass.
+        assert!(
+            user_holds_all_rules("bob", &groups, &metrics_rules, &idx),
+            "bob must pass the escalation check: he already holds GET /metrics"
         );
     }
 
