@@ -297,6 +297,10 @@ jobs:
           path: ~/bin/crio
           key: crio-${{ matrix.k8s }}-${{ runner.arch }}
 
+      - name: Restore crio to /usr/bin on cache hit
+        if: steps.cache-crio.outputs.cache-hit == 'true'
+        run: sudo cp ~/bin/crio /usr/bin/crio
+
       - name: Install cri-o and crun
         if: steps.cache-crio.outputs.cache-hit != 'true'
         env:
