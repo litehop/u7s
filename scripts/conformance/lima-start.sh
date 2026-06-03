@@ -221,6 +221,166 @@ PODEOF
 
 echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnectivity-agent)"
 
+# kube-proxy runs as a systemd service inside the VM using the kube-proxy binary from the
+# official container image. This avoids the pod sandbox loop that occurs with hostNetwork
+# pods in u7s (strategic-merge-patch accumulation in podIPs causes the kubelet to
+# continuously recreate the sandbox). The binary uses IPVS mode because the Lima VM's
+# iptables uses nf_tables which lacks the userspace extension library for protocol matching.
+
+# Detect kubelet version to pull the matching kube-proxy binary.
+KUBELET_VERSION=$(limactl shell "$VM_NAME" kubelet --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+KUBELET_VERSION="${KUBELET_VERSION:-1.36.1}"
+
+# Create kube-proxy ServiceAccount and RBAC (needed for the kubeconfig token).
+kubectl --kubeconfig="$KUBECONFIG_PATH" create serviceaccount kube-proxy -n kube-system \
+  --dry-run=client -o yaml | \
+  kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f -
+
+kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f - <<RBACEOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-proxy
+rules:
+- apiGroups: [""]
+  resources: [nodes, services, endpoints]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create, patch, update]
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-proxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-proxy
+subjects:
+- kind: ServiceAccount
+  name: kube-proxy
+  namespace: kube-system
+RBACEOF
+
+# Generate a long-lived token for kube-proxy to authenticate with u7s.
+KUBE_PROXY_TOKEN=$(kubectl --kubeconfig="$KUBECONFIG_PATH" create token kube-proxy \
+  -n kube-system --duration=8760h 2>/dev/null || echo "")
+
+# Write config files to the VM filesystem.
+limactl shell "$VM_NAME" sudo mkdir -p /etc/kube-proxy
+limactl shell "$VM_NAME" sudo bash -c "cat > /etc/kube-proxy/kubeconfig.conf" <<KUBEEOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://host.lima.internal:6443
+    certificate-authority-data: $(base64 < "$WORKDIR/ca.pem" | tr -d '\n')
+  name: default
+contexts:
+- context:
+    cluster: default
+    user: default
+  name: default
+current-context: default
+users:
+- name: default
+  user:
+    token: ${KUBE_PROXY_TOKEN}
+KUBEEOF
+
+limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/kube-proxy/config.conf' <<'CONFEOF'
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: ipvs
+clusterCIDR: 10.85.0.0/16
+clientConnection:
+  kubeconfig: /etc/kube-proxy/kubeconfig.conf
+CONFEOF
+
+# Extract the kube-proxy binary from the container image if not already present.
+# The image is pulled by CRI-O when applying the static pod; we reuse it from the overlay.
+if ! limactl shell "$VM_NAME" test -x /usr/local/bin/kube-proxy 2>/dev/null; then
+  limactl shell "$VM_NAME" sudo bash -c "
+    # Pull image via static pod to populate overlay storage, then copy binary out.
+    OVERLAY=\$(find /var/lib/containers/storage/overlay -name 'kube-proxy' -path '*/usr/local/bin/*' 2>/dev/null | head -1)
+    if [ -n \"\$OVERLAY\" ]; then
+      cp \"\$OVERLAY\" /usr/local/bin/kube-proxy
+      chmod +x /usr/local/bin/kube-proxy
+      echo 'kube-proxy binary installed from overlay'
+    else
+      echo 'WARNING: kube-proxy binary not found in overlay; pull the image first' >&2
+    fi
+  " 2>/dev/null
+fi
+
+# If binary is still missing, write a static pod manifest to force CRI-O to pull the image,
+# wait for the pull, then extract the binary.
+if ! limactl shell "$VM_NAME" test -x /usr/local/bin/kube-proxy 2>/dev/null; then
+  echo "Pulling kube-proxy image via static pod (first run)..."
+  limactl shell "$VM_NAME" sudo bash -c "cat > /tmp/kubelet-pods/kube-proxy-pull.yaml" <<PULLEOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-proxy-pull
+  namespace: kube-system
+spec:
+  nodeName: lima-node
+  hostNetwork: true
+  containers:
+  - name: kube-proxy
+    image: registry.k8s.io/kube-proxy:v${KUBELET_VERSION}
+    command: ["/usr/local/bin/kube-proxy", "--version"]
+PULLEOF
+  # Wait for image pull (up to 120s)
+  for i in $(seq 1 24); do
+    OVERLAY=$(limactl shell "$VM_NAME" sudo bash -c "find /var/lib/containers/storage/overlay -name 'kube-proxy' -path '*/usr/local/bin/*' 2>/dev/null | head -1" 2>/dev/null)
+    if [ -n "$OVERLAY" ]; then
+      limactl shell "$VM_NAME" sudo cp "$OVERLAY" /usr/local/bin/kube-proxy
+      limactl shell "$VM_NAME" sudo chmod +x /usr/local/bin/kube-proxy
+      echo "kube-proxy binary installed"
+      break
+    fi
+    sleep 5
+  done
+  limactl shell "$VM_NAME" sudo rm -f /tmp/kubelet-pods/kube-proxy-pull.yaml
+fi
+
+# Install ipset (required by kube-proxy IPVS mode).
+limactl shell "$VM_NAME" sudo apt-get install -y ipset 2>/dev/null | tail -1 || true
+
+# Load IPVS kernel modules.
+limactl shell "$VM_NAME" sudo bash -c '
+  modprobe ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh 2>/dev/null || true
+' 2>/dev/null
+
+# Write the systemd service unit.
+limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/systemd/system/kube-proxy.service' <<'SVCEOF'
+[Unit]
+Description=Kubernetes Kube Proxy
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/kube-proxy \
+  --config=/etc/kube-proxy/config.conf \
+  --hostname-override=lima-node
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+limactl shell "$VM_NAME" sudo systemctl daemon-reload
+limactl shell "$VM_NAME" sudo systemctl enable kube-proxy 2>/dev/null
+limactl shell "$VM_NAME" sudo systemctl restart kube-proxy
+
+echo "kube-proxy systemd service started (logs: limactl shell lima-node sudo journalctl -u kube-proxy -n 20)"
+
 # Route kubernetes ClusterIP (10.96.0.1:443) to the host apiserver inside the VM.
 # Pods use in-cluster config (KUBERNETES_SERVICE_HOST=10.96.0.1) to reach the apiserver.
 # Without this rule, 10.96.0.1 traffic has no route in the VM and times out.

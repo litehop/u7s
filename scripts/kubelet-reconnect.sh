@@ -138,6 +138,38 @@ if [ -f "$WORKDIR/konnectivity-agent.crt" ] && [ -f "$WORKDIR/ca.pem" ]; then
   echo "konnectivity-agent pod will restart with fresh certs"
 fi
 
+# Restart kube-proxy systemd service with a fresh token so it reconnects to the new apiserver.
+WORKDIR="$(dirname "$KUBECONFIG_PATH")"
+if [ -f "$WORKDIR/ca.pem" ]; then
+  KUBE_PROXY_TOKEN=$(kubectl --kubeconfig="$KUBECONFIG_PATH" create token kube-proxy \
+    -n kube-system --duration=8760h 2>/dev/null || echo "")
+  if [ -n "$KUBE_PROXY_TOKEN" ]; then
+    limactl shell "$VM_NAME" sudo bash -c "cat > /etc/kube-proxy/kubeconfig.conf" <<KUBEEOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://host.lima.internal:6443
+    certificate-authority-data: $(base64 < "$WORKDIR/ca.pem" | tr -d '\n')
+  name: default
+contexts:
+- context:
+    cluster: default
+    user: default
+  name: default
+current-context: default
+users:
+- name: default
+  user:
+    token: ${KUBE_PROXY_TOKEN}
+KUBEEOF
+    limactl shell "$VM_NAME" sudo systemctl restart kube-proxy 2>/dev/null || true
+    echo "kube-proxy restarted with fresh token"
+  else
+    echo "WARNING: could not generate kube-proxy token; service not restarted" >&2
+  fi
+fi
+
 # Wait for the node to re-register.
 echo "Waiting for lima-node to register (up to 60s)..."
 FOUND=0
