@@ -93,7 +93,7 @@ if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${VM_NAME}$"; then
   fi
 else
   echo "Provisioning VM '$VM_NAME' (first run, takes ~5 min)..."
-  limactl start --name="$VM_NAME" "$LIMA_YAML"
+  limactl start --tty=false --name="$VM_NAME" "$LIMA_YAML"
 fi
 
 # Rewrite server address from 127.0.0.1 to host.lima.internal for in-VM use.
@@ -148,13 +148,14 @@ if [ ! -f "$WORKDIR/ca.pem" ]; then
   openssl x509 -in "$WORKDIR/ca.crt" -inform DER -out "$WORKDIR/ca.pem" -outform PEM
 fi
 if [ ! -f "$AGENT_CERT_KEY" ] || [ ! -f "$AGENT_CERT_CRT" ]; then
-  openssl genpkey -algorithm ed25519 -out "$AGENT_CERT_KEY"
+  openssl ecparam -genkey -name prime256v1 -noout -out "$AGENT_CERT_KEY"
   openssl req -new -key "$AGENT_CERT_KEY" \
-    -subj "/CN=konnectivity-agent" \
+    -subj "/CN=konnectivity-agent" -sha256 \
     -out "$AGENT_CERT_CSR"
   openssl x509 -req -in "$AGENT_CERT_CSR" \
     -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
-    -CAcreateserial -days 365 \
+    -CAcreateserial -CAserial "$WORKDIR/ca.srl" \
+    -days 365 -sha256 \
     -out "$AGENT_CERT_CRT"
   rm -f "$AGENT_CERT_CSR"
 fi
@@ -169,12 +170,15 @@ kubectl --kubeconfig="$KUBECONFIG_PATH" create secret generic konnectivity-agent
   --dry-run=client -o yaml | \
   kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f -
 
+# Resolve the Mac host IP so the agent pod can reach the konnectivity-server.
+# CoreDNS inside the pod does not know host.lima.internal; inject it as a hostAlias.
+LIMA_HOST_IP=$(limactl shell "$VM_NAME" getent hosts host.lima.internal 2>/dev/null | awk '{print $1}')
+LIMA_HOST_IP="${LIMA_HOST_IP:-192.168.5.2}"
+
 # Run the agent as a Pod in kube-system so it uses CoreDNS: service DNS names like
 # e2e-test-webhook.webhook-N.svc resolve correctly inside the pod network.
-# The pod connects OUT to host.lima.internal:8132 (agent port on the Mac host);
-# iptables DNAT routes that to the konnectivity-server.  nodeName pins the pod to
-# lima-node so it always runs on the same VM where kubelet is.
-kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f - <<'PODEOF'
+# hostAliases injects host.lima.internal so the pod can dial the Mac-side server.
+kubectl --kubeconfig="$KUBECONFIG_PATH" apply --validate=false -f - <<PODEOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -186,6 +190,10 @@ spec:
   nodeName: lima-node
   hostNetwork: false
   restartPolicy: Always
+  hostAliases:
+  - ip: "$LIMA_HOST_IP"
+    hostnames:
+    - host.lima.internal
   tolerations:
   - operator: Exists
   containers:
