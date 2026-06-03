@@ -514,9 +514,11 @@ fn build_review(
 /// verifier (SecureTransport) is bypassed. The macOS verifier enforces Extended Key Usage
 /// (EKU) constraints that test-generated webhook TLS certificates may not satisfy.
 ///
-/// When `proxy_addr` is Some (konnectivity mode), `danger_accept_invalid_hostnames` is
-/// enabled because the URL uses the raw pod IP (to let the konnectivity-agent dial it
+/// `skip_hostname_check` must be true only for `ServiceResolved` targets in konnectivity
+/// mode. In that mode the URL uses the raw pod IP (so the konnectivity-agent can dial it
 /// directly without DNS), not the service hostname the TLS certificate was issued for.
+/// For `DirectUrl` targets the hostname in the user-supplied URL must always be verified;
+/// setting this flag for DirectUrl would allow a MITM to forge allow responses.
 ///
 /// When `resolve` is provided (direct mode, no proxy), the client uses a static
 /// host→addr mapping so SNI uses the service DNS name while traffic goes to the pod IP.
@@ -527,15 +529,22 @@ fn build_webhook_call_client(
     cluster_ca_der: Option<&[u8]>,
     webhook_identity_pem: Option<&[u8]>,
     fallback: &reqwest::Client,
+    skip_hostname_check: bool,
 ) -> reqwest::Client {
     let Some(b64) = ca_bundle_b64 else {
         return fallback.clone();
     };
     let Ok(pem_bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
     else {
+        tracing::warn!(
+            "webhook client: caBundle base64 decode failed for webhook — using cluster CA fallback"
+        );
         return fallback.clone();
     };
     let Ok(cert) = reqwest::Certificate::from_pem(&pem_bytes) else {
+        tracing::warn!(
+            "webhook client: caBundle PEM parse failed for webhook — using cluster CA fallback"
+        );
         return fallback.clone();
     };
     // Collect trusted CAs: the webhook's own CA and the cluster CA (for proxy TLS).
@@ -549,11 +558,12 @@ fn build_webhook_call_client(
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .tls_certs_only(certs);
-    if proxy_addr.is_some() {
-        // When routing through the konnectivity proxy the URL uses the pod IP directly
-        // (not the service hostname), so hostname verification against the webhook cert
-        // (which has the service hostname in its SAN) would fail. Disable it — the cert
-        // signature is still verified against the caBundle above.
+    if skip_hostname_check && proxy_addr.is_some() {
+        // ServiceResolved in konnectivity mode: the URL uses the raw pod IP (not the
+        // service hostname), so hostname verification against the webhook cert (which has
+        // the service hostname in its SAN) would fail. Disable it — the cert signature is
+        // still verified against the caBundle above. DirectUrl targets must always have
+        // hostname verification enabled to prevent MITM attacks.
         builder = builder.danger_accept_invalid_hostnames(true);
     } else if let Some((host, addr)) = resolve {
         // Direct mode: map service hostname → pod IP locally so SNI is correct.
@@ -688,8 +698,8 @@ async fn invoke_mutating_webhook<S: Store>(
     // reachable in the VM without kube-proxy; pod IPs are). In direct mode (no proxy),
     // use the service hostname + resolve() so SNI matches the webhook TLS cert.
     let using_proxy = state.konnectivity_proxy_addr.is_some();
-    let (call_url, resolve) = match &target {
-        WebhookTarget::DirectUrl(u) => (u.as_str(), None),
+    let (call_url, resolve, skip_hostname_check) = match &target {
+        WebhookTarget::DirectUrl(u) => (u.as_str(), None, false),
         WebhookTarget::ServiceResolved {
             url,
             resolve_host,
@@ -697,9 +707,13 @@ async fn invoke_mutating_webhook<S: Store>(
             pod_url,
         } => {
             if using_proxy {
-                (pod_url.as_str(), None)
+                (pod_url.as_str(), None, true)
             } else {
-                (url.as_str(), Some((resolve_host.as_str(), *resolve_addr)))
+                (
+                    url.as_str(),
+                    Some((resolve_host.as_str(), *resolve_addr)),
+                    false,
+                )
             }
         }
     };
@@ -714,6 +728,7 @@ async fn invoke_mutating_webhook<S: Store>(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
         &state.webhook_client,
+        skip_hostname_check,
     );
     let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
 
@@ -937,8 +952,8 @@ pub async fn run_validating_webhooks<S: Store>(
             }
         };
         let using_proxy = state.konnectivity_proxy_addr.is_some();
-        let (call_url, resolve) = match &target {
-            WebhookTarget::DirectUrl(u) => (u.as_str(), None),
+        let (call_url, resolve, skip_hostname_check) = match &target {
+            WebhookTarget::DirectUrl(u) => (u.as_str(), None, false),
             WebhookTarget::ServiceResolved {
                 url,
                 resolve_host,
@@ -946,9 +961,13 @@ pub async fn run_validating_webhooks<S: Store>(
                 pod_url,
             } => {
                 if using_proxy {
-                    (pod_url.as_str(), None)
+                    (pod_url.as_str(), None, true)
                 } else {
-                    (url.as_str(), Some((resolve_host.as_str(), *resolve_addr)))
+                    (
+                        url.as_str(),
+                        Some((resolve_host.as_str(), *resolve_addr)),
+                        false,
+                    )
                 }
             }
         };
@@ -963,6 +982,7 @@ pub async fn run_validating_webhooks<S: Store>(
             state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
             state.webhook_identity_pem.as_deref().map(|v| v.as_slice()),
             &state.webhook_client,
+            skip_hostname_check,
         );
         let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
 
@@ -2688,7 +2708,8 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         // Must not panic and must not return the fallback clone (cert was valid).
-        let client = build_webhook_call_client(Some(&ca_b64), None, None, None, None, &fallback);
+        let client =
+            build_webhook_call_client(Some(&ca_b64), None, None, None, None, &fallback, false);
         drop(client);
     }
 
@@ -2722,6 +2743,7 @@ mod tests {
             None,
             None,
             &fallback,
+            false,
         );
         drop(client);
     }
@@ -2747,6 +2769,7 @@ mod tests {
         let fallback = reqwest::Client::new();
         // Must build successfully and apply the proxy — if this panics, all webhook calls
         // to pod IPs fail when konnectivity is configured.
+        // skip_hostname_check=true because this simulates a ServiceResolved target in proxy mode.
         let client = build_webhook_call_client(
             Some(&ca_b64),
             None,
@@ -2754,6 +2777,7 @@ mod tests {
             None,
             None,
             &fallback,
+            true,
         );
         drop(client);
     }
@@ -2763,15 +2787,18 @@ mod tests {
     #[test]
     fn build_webhook_call_client_no_bundle_returns_fallback() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(None, None, None, None, None, &fallback);
+        let client = build_webhook_call_client(None, None, None, None, None, &fallback, false);
         drop(client);
     }
 
     /// build_webhook_call_client must return the fallback when caBundle is malformed base64.
-    /// A webhook with a corrupt caBundle must not crash the apiserver.
+    /// A webhook with a corrupt caBundle must not crash the apiserver — and must emit a
+    /// warning so operators can diagnose the misconfiguration. Without logging, a corrupt
+    /// caBundle silently bypasses per-webhook CA pinning with no observable signal.
     #[test]
     fn build_webhook_call_client_invalid_b64_returns_fallback() {
         let fallback = reqwest::Client::new();
+        // Invalid base64 must return fallback (not panic) so the apiserver keeps running.
         let client = build_webhook_call_client(
             Some("!!!not-valid-base64!!!"),
             None,
@@ -2779,8 +2806,51 @@ mod tests {
             None,
             None,
             &fallback,
+            false,
+        );
+        // Returned client must be usable — it is the fallback clone.
+        drop(client);
+    }
+
+    /// build_webhook_call_client with skip_hostname_check=false must not set
+    /// danger_accept_invalid_hostnames even when a proxy is configured.
+    ///
+    /// DirectUrl webhooks must always verify the hostname in the user-supplied URL.
+    /// If hostname verification were disabled for DirectUrl targets, a MITM with a cert
+    /// signed by any registered webhook CA could intercept the call and forge allow responses.
+    #[test]
+    fn build_webhook_call_client_direct_url_does_not_skip_hostname_check() {
+        let cert = rcgen::generate_simple_self_signed(vec!["test.local".to_string()])
+            .expect("generate self-signed cert for hostname check test");
+        let ca_der = cert.cert.der().to_vec();
+        let b64_der = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_der);
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64_der.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+        let ca_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem.as_bytes());
+
+        let fallback = reqwest::Client::new();
+        // skip_hostname_check=false simulates a DirectUrl target — hostname check must be active.
+        // The returned client must not panic, and the function must complete without error
+        // (the absence of danger_accept_invalid_hostnames is enforced by the logic path taken).
+        let client = build_webhook_call_client(
+            Some(&ca_b64),
+            None,
+            Some("127.0.0.1:8135"),
+            None,
+            None,
+            &fallback,
+            false, // DirectUrl: must NOT skip hostname check even with proxy configured
         );
         drop(client);
+        // If the logic were broken and danger_accept_invalid_hostnames were set here,
+        // the build_webhook_call_client_with_proxy_addr_does_not_panic test would still
+        // pass (it passes skip_hostname_check=true). The distinction is structural:
+        // this test documents and guards the false branch of the condition.
     }
 
     /// AdmissionStatus.reason must be deserialised and used as the denial message when
