@@ -9,6 +9,7 @@ use u7s_store::{ListOptions, Store};
 
 use crate::{
     handlers::crd::CustomResourceDefinition,
+    keys::cluster_object_key,
     state::AppState,
     status::Status,
     util::{extract_body, parse_resource_version, utc_now_rfc3339},
@@ -913,6 +914,20 @@ pub async fn create_cr_namespaced<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    // Reject object creation in a Terminating namespace — matches kube-apiserver behaviour:
+    // 403 Forbidden: unable to create new content in namespace <ns> because it is being terminated
+    {
+        let ns_key = cluster_object_key("namespaces", &ns);
+        if let Ok(Some(stored)) = state.store.get(&ns_key).await {
+            if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
+                    return Err(Status::forbidden(format!(
+                        "unable to create new content in namespace {ns} because it is being terminated"
+                    )));
+                }
+            }
+        }
+    }
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
     if !ctx.namespaced {
@@ -5191,6 +5206,84 @@ mod tests {
         assert!(
             err_msg.contains("no name"),
             "error must mention missing service name, got: {err_msg}"
+        );
+    }
+
+    /// POST a namespaced CR to a namespace whose status.phase is "Terminating" must return 403.
+    /// Real kube-apiserver rejects all new object creation in a Terminating namespace;
+    /// without this check our apiserver would allow CRs to be created in dying namespaces,
+    /// breaking the namespace GC lifecycle.
+    #[tokio::test]
+    async fn create_cr_namespaced_rejects_terminating_namespace() {
+        use axum::extract::State;
+        use bytes::Bytes;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Install a namespaced CRD so we have a real resource to try to create.
+        install_namespaced_crd(&state).await;
+
+        // Seed the namespace object with status.phase = "Terminating".
+        let ns_key = "/registry/namespaces/dying-ns";
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "dying-ns" },
+            "status": { "phase": "Terminating" }
+        });
+        store
+            .put(
+                ns_key,
+                Bytes::from(serde_json::to_vec(&ns_obj).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed terminating namespace");
+
+        let result = create_cr_namespaced(
+            State(state),
+            axum::extract::Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "dying-ns".to_string(),
+                "applications".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            app_body("my-app", "dying-ns"),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "POST CR to Terminating namespace must be rejected — namespace GC would leave orphaned CRs otherwise"
+            ),
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 403,
+            "Terminating namespace must return 403 Forbidden"
+        );
+        assert_eq!(json["reason"], "Forbidden");
+        assert!(
+            json["message"].as_str().unwrap_or("").contains("dying-ns"),
+            "error message must name the namespace"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("being terminated"),
+            "error message must say namespace is being terminated"
         );
     }
 }
