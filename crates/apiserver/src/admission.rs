@@ -248,31 +248,24 @@ struct ServiceReference {
 ///
 /// `DirectUrl` is used when `clientConfig.url` is set directly.
 /// `ServiceResolved` is used when `clientConfig.service` is set: the URL uses the
-/// service DNS name for correct SNI, and `resolve_addr` statically maps that name
-/// to the pod IP obtained from Endpoints — no DNS query is issued.
-///
-/// `pod_url` uses the raw pod IP:port (e.g. `https://10.85.0.9:8444/`) instead of
-/// the service hostname. This is required when routing through the konnectivity proxy:
-/// the konnectivity-agent resolves the CONNECT target inside the VM, where service
-/// ClusterIPs are not reachable (no kube-proxy). Pod IPs are directly reachable within
-/// the VM's pod network.
+/// service DNS name (e.g. `https://<svc>.<ns>.svc:<port><path>`) for correct SNI.
+/// With kube-proxy running inside the VM, the konnectivity-agent resolves service DNS
+/// names via CoreDNS and routes to the ClusterIP correctly — no pod-IP substitution needed.
 enum WebhookTarget {
     DirectUrl(String),
-    ServiceResolved {
-        url: String,
-        resolve_host: String,
-        resolve_addr: std::net::SocketAddr,
-        pod_url: String,
-    },
+    ServiceResolved { url: String },
 }
 
 /// Resolve a webhook's clientConfig to a `WebhookTarget`.
 ///
 /// If `clientConfig.url` is set, returns `DirectUrl`.
-/// If `clientConfig.service` is set, looks up the Endpoints for the service to get
-/// the pod IP, looks up the Service to resolve service port → target port, and
-/// returns `ServiceResolved` with a URL using the service DNS name (for correct SNI).
-/// Returns an error if the service reference is set but no endpoints are found.
+/// If `clientConfig.service` is set, looks up the Service to resolve service port →
+/// target port, and returns `ServiceResolved` with a URL using the service DNS name
+/// (e.g. `https://<svc>.<ns>.svc:<port><path>`).
+///
+/// With kube-proxy running inside the VM (PR #406), the konnectivity-agent resolves
+/// service DNS names via CoreDNS and routes to ClusterIPs correctly — no pod-IP
+/// substitution is needed.
 async fn webhook_url<S: Store>(
     state: &AppState<S>,
     config: &WebhookClientConfig,
@@ -283,58 +276,6 @@ async fn webhook_url<S: Store>(
     }
 
     if let Some(svc_ref) = &config.service {
-        // u7s has no kube-proxy, so clusterIP is unreachable. Resolve to the first
-        // ready pod IP from the Endpoints object, and map service port → target port
-        // via the Service spec.
-        let ep_key = format!("/registry/endpoints/{}/{}", svc_ref.namespace, svc_ref.name);
-        let ep_obj = state.store.get(&ep_key).await.map_err(|e| {
-            format!(
-                "store error looking up endpoints {}/{}: {e}",
-                svc_ref.namespace, svc_ref.name
-            )
-        })?;
-
-        let ep_val = ep_obj
-            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.value).ok())
-            .ok_or_else(|| {
-                format!(
-                    "webhook \"{webhook_name}\": no ready endpoints for service {}/{}",
-                    svc_ref.namespace, svc_ref.name
-                )
-            })?;
-
-        // Collect all ready pod IPs across all subsets so we can spread load and
-        // survive individual pod failures. Always picking index 0 pins all admission
-        // calls to one pod; if it fails between Endpoints updates, all webhooks fail.
-        let all_addrs: Vec<String> = ep_val["subsets"]
-            .as_array()
-            .map(|subsets| {
-                subsets
-                    .iter()
-                    .filter_map(|s| s["addresses"].as_array())
-                    .flat_map(|addrs| addrs.iter())
-                    .filter_map(|a| a["ip"].as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if all_addrs.is_empty() {
-            return Err(format!(
-                "webhook \"{webhook_name}\": no ready endpoints for service {}/{}",
-                svc_ref.namespace, svc_ref.name
-            ));
-        }
-
-        // Use system time (nanoseconds) mod N for a cheap random-looking selection.
-        // This avoids adding the `rand` crate while still distributing load across
-        // replicas and avoiding a permanent pin to index 0.
-        let idx = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as usize)
-            % all_addrs.len();
-        let pod_ip = all_addrs[idx].clone();
-
         let svc_port = svc_ref.port.unwrap_or(443);
 
         // Look up the Service to resolve service port → target port.
@@ -363,21 +304,9 @@ async fn webhook_url<S: Store>(
             .unwrap_or(svc_port);
 
         let path = svc_ref.path.as_deref().unwrap_or("/");
-        let resolve_host = format!("{}.{}.svc", svc_ref.name, svc_ref.namespace);
-        let url = format!("https://{resolve_host}:{target_port}{path}");
-        // pod_url uses the raw pod IP so the konnectivity-agent can dial it directly
-        // without DNS resolution (service ClusterIPs are not reachable from the VM
-        // without kube-proxy; pod IPs are directly reachable in the pod network).
-        let pod_url = format!("https://{pod_ip}:{target_port}{path}");
-        let resolve_addr = format!("{pod_ip}:{target_port}")
-            .parse()
-            .map_err(|e| format!("webhook \"{webhook_name}\": invalid pod addr: {e}"))?;
-        return Ok(WebhookTarget::ServiceResolved {
-            url,
-            resolve_host,
-            resolve_addr,
-            pod_url,
-        });
+        let svc_host = format!("{}.{}.svc", svc_ref.name, svc_ref.namespace);
+        let url = format!("https://{svc_host}:{target_port}{path}");
+        return Ok(WebhookTarget::ServiceResolved { url });
     }
 
     Err(format!(
@@ -536,22 +465,16 @@ fn build_review(
 /// verifier (SecureTransport) is bypassed. The macOS verifier enforces Extended Key Usage
 /// (EKU) constraints that test-generated webhook TLS certificates may not satisfy.
 ///
-/// `skip_hostname_check` must be true only for `ServiceResolved` targets in konnectivity
-/// mode. In that mode the URL uses the raw pod IP (so the konnectivity-agent can dial it
-/// directly without DNS), not the service hostname the TLS certificate was issued for.
-/// For `DirectUrl` targets the hostname in the user-supplied URL must always be verified;
-/// setting this flag for DirectUrl would allow a MITM to forge allow responses.
-///
-/// When `resolve` is provided (direct mode, no proxy), the client uses a static
-/// host→addr mapping so SNI uses the service DNS name while traffic goes to the pod IP.
+/// With kube-proxy running inside the VM (PR #406), `ServiceResolved` targets use the
+/// service DNS name directly in the URL. The konnectivity-agent resolves the name via
+/// CoreDNS and routes through kube-proxy to the pod — hostname verification is always
+/// correct and `danger_accept_invalid_hostnames` is no longer needed.
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
-    resolve: Option<(&str, std::net::SocketAddr)>,
     proxy_addr: Option<&str>,
     cluster_ca_der: Option<&[u8]>,
     webhook_identity_pem: Option<&[u8]>,
     fallback: &reqwest::Client,
-    skip_hostname_check: bool,
 ) -> reqwest::Client {
     let Some(b64) = ca_bundle_b64 else {
         return fallback.clone();
@@ -580,17 +503,6 @@ fn build_webhook_call_client(
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .tls_certs_only(certs);
-    if skip_hostname_check && proxy_addr.is_some() {
-        // ServiceResolved in konnectivity mode: the URL uses the raw pod IP (not the
-        // service hostname), so hostname verification against the webhook cert (which has
-        // the service hostname in its SAN) would fail. Disable it — the cert signature is
-        // still verified against the caBundle above. DirectUrl targets must always have
-        // hostname verification enabled to prevent MITM attacks.
-        builder = builder.danger_accept_invalid_hostnames(true);
-    } else if let Some((host, addr)) = resolve {
-        // Direct mode: map service hostname → pod IP locally so SNI is correct.
-        builder = builder.resolve(host, addr);
-    }
     if let Some(pem) = webhook_identity_pem {
         if let Ok(identity) = reqwest::Identity::from_pem(pem) {
             builder = builder.identity(identity);
@@ -715,29 +627,9 @@ async fn invoke_mutating_webhook<S: Store>(
             }
         }
     };
-    // When routing through the konnectivity proxy, use the pod IP directly in the URL
-    // so the konnectivity-agent can dial it without DNS (service ClusterIPs are not
-    // reachable in the VM without kube-proxy; pod IPs are). In direct mode (no proxy),
-    // use the service hostname + resolve() so SNI matches the webhook TLS cert.
-    let using_proxy = state.konnectivity_proxy_addr.is_some();
-    let (call_url, resolve, skip_hostname_check) = match &target {
-        WebhookTarget::DirectUrl(u) => (u.as_str(), None, false),
-        WebhookTarget::ServiceResolved {
-            url,
-            resolve_host,
-            resolve_addr,
-            pod_url,
-        } => {
-            if using_proxy {
-                (pod_url.as_str(), None, true)
-            } else {
-                (
-                    url.as_str(),
-                    Some((resolve_host.as_str(), *resolve_addr)),
-                    false,
-                )
-            }
-        }
+    let call_url = match &target {
+        WebhookTarget::DirectUrl(u) => u.as_str(),
+        WebhookTarget::ServiceResolved { url } => url.as_str(),
     };
 
     let uid = uuid::Uuid::new_v4().to_string();
@@ -756,12 +648,10 @@ async fn invoke_mutating_webhook<S: Store>(
 
     let wh_client = build_webhook_call_client(
         webhook.client_config.ca_bundle.as_deref(),
-        resolve,
         effective_proxy,
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         effective_identity,
         &state.webhook_client,
-        skip_hostname_check,
     );
     let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
 
@@ -984,25 +874,9 @@ pub async fn run_validating_webhooks<S: Store>(
                 }
             }
         };
-        let using_proxy = state.konnectivity_proxy_addr.is_some();
-        let (call_url, resolve, skip_hostname_check) = match &target {
-            WebhookTarget::DirectUrl(u) => (u.as_str(), None, false),
-            WebhookTarget::ServiceResolved {
-                url,
-                resolve_host,
-                resolve_addr,
-                pod_url,
-            } => {
-                if using_proxy {
-                    (pod_url.as_str(), None, true)
-                } else {
-                    (
-                        url.as_str(),
-                        Some((resolve_host.as_str(), *resolve_addr)),
-                        false,
-                    )
-                }
-            }
+        let call_url = match &target {
+            WebhookTarget::DirectUrl(u) => u.as_str(),
+            WebhookTarget::ServiceResolved { url } => url.as_str(),
         };
 
         let uid = uuid::Uuid::new_v4().to_string();
@@ -1021,12 +895,10 @@ pub async fn run_validating_webhooks<S: Store>(
 
         let wh_client = build_webhook_call_client(
             webhook.client_config.ca_bundle.as_deref(),
-            resolve,
             effective_proxy,
             state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
             effective_identity,
             &state.webhook_client,
-            skip_hostname_check,
         );
         let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
 
@@ -2171,12 +2043,13 @@ mod tests {
 
     // -- service-based clientConfig tests --
 
-    /// A webhook configured with clientConfig.service must resolve the Service clusterIP
-    /// and build the correct HTTPS URL. When the Service exists, the webhook is invoked at
-    /// https://<clusterIP>:<port><path>. Since the resolved IP is not actually listening,
+    /// A webhook configured with clientConfig.service must build the correct HTTPS URL
+    /// using the service DNS name (e.g. `https://my-webhook-svc.webhook-ns.svc:8443/mutate`).
+    /// With kube-proxy (PR #406), the konnectivity-agent resolves the service DNS name and
+    /// routes through kube-proxy. Since nothing listens at that address in this unit test,
     /// failurePolicy=Ignore causes the pipeline to succeed.
     #[tokio::test]
-    async fn service_based_client_config_resolves_cluster_ip() {
+    async fn service_based_client_config_builds_service_dns_url() {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         let state = AppState::new(
             store.clone(),
@@ -2186,23 +2059,9 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        // Seed a Service with a clusterIP in the webhook's namespace.
-        let svc = json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {"name": "my-webhook-svc", "namespace": "webhook-ns"},
-            "spec": {"clusterIP": "10.96.0.1"}
-        });
-        store
-            .put(
-                "/registry/services/webhook-ns/my-webhook-svc",
-                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
-                None,
-            )
-            .await
-            .unwrap();
-
         // MutatingWebhookConfiguration with service-based clientConfig.
+        // No Service or Endpoints seeded — webhook_url builds the DNS URL without
+        // looking up endpoints (port defaults to the configured port when no Service found).
         let mwc = json!({
             "apiVersion": "admissionregistration.k8s.io/v1",
             "kind": "MutatingWebhookConfiguration",
@@ -2223,7 +2082,7 @@ mod tests {
                     "resources": ["deployments"],
                     "operations": ["CREATE"]
                 }],
-                "failurePolicy": "Ignore"  // URL resolves but nothing listens; Ignore skips gracefully
+                "failurePolicy": "Ignore"  // URL not reachable in unit test; Ignore skips gracefully
             }]
         });
         store
@@ -2244,12 +2103,13 @@ mod tests {
             namespace: Some("default"),
             operation: "CREATE",
         };
-        // The webhook is invoked (URL resolved to https://10.96.0.1:8443/mutate), fails to
-        // connect, but failurePolicy=Ignore means the pipeline succeeds.
+        // The webhook is invoked at https://my-webhook-svc.webhook-ns.svc:8443/mutate,
+        // fails to connect (no cluster in unit tests), but failurePolicy=Ignore means
+        // the pipeline succeeds.
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
         assert!(
             result.is_ok(),
-            "service-based webhook with failurePolicy=Ignore and unreachable IP must succeed"
+            "service-based webhook with failurePolicy=Ignore must succeed when connection fails"
         );
     }
 
@@ -2547,8 +2407,9 @@ mod tests {
         );
     }
 
-    /// A webhook with clientConfig.service pointing to a non-existent Service must
-    /// apply failurePolicy: Fail returns an error, Ignore skips gracefully.
+    /// A webhook with clientConfig.service and failurePolicy=Fail must return an error
+    /// when the service DNS name is unreachable (connection refused / DNS not resolvable
+    /// in unit test environment).
     #[tokio::test]
     async fn service_based_client_config_missing_service_applies_failure_policy() {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
@@ -2560,7 +2421,7 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        // No Service stored — webhook_url will return an error.
+        // No Service stored — target_port defaults to svc_port; URL is built but unreachable.
         let mwc_fail = json!({
             "apiVersion": "admissionregistration.k8s.io/v1",
             "kind": "MutatingWebhookConfiguration",
@@ -2752,49 +2613,13 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         // Must not panic and must not return the fallback clone (cert was valid).
-        let client =
-            build_webhook_call_client(Some(&ca_b64), None, None, None, None, &fallback, false);
-        drop(client);
-    }
-
-    /// build_webhook_call_client with resolve installs a static DNS override so the URL
-    /// uses the service DNS name for SNI while traffic goes to the pod IP.
-    /// Without .resolve(), connecting to the service name would require cluster DNS.
-    #[test]
-    fn build_webhook_call_client_with_resolve_does_not_panic() {
-        let cert =
-            rcgen::generate_simple_self_signed(vec!["my-webhook.webhook-ns.svc".to_string()])
-                .expect("generate self-signed cert for resolve test");
-        let ca_der = cert.cert.der().to_vec();
-
-        let b64_der = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_der);
-        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
-        for chunk in b64_der.as_bytes().chunks(64) {
-            pem.push_str(std::str::from_utf8(chunk).unwrap());
-            pem.push('\n');
-        }
-        pem.push_str("-----END CERTIFICATE-----\n");
-
-        let ca_b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem.as_bytes());
-
-        let addr: std::net::SocketAddr = "10.244.0.5:8443".parse().unwrap();
-        let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(
-            Some(&ca_b64),
-            Some(("my-webhook.webhook-ns.svc", addr)),
-            None,
-            None,
-            None,
-            &fallback,
-            false,
-        );
+        let client = build_webhook_call_client(Some(&ca_b64), None, None, None, &fallback);
         drop(client);
     }
 
     /// build_webhook_call_client must apply the konnectivity proxy when proxy_addr is set.
     /// Without this, per-webhook clients built with a custom caBundle bypass konnectivity
-    /// and cannot reach pod IPs (10.85.0.x) from the Mac host — every webhook call fails.
+    /// and cannot reach the service ClusterIP from the Mac host — every webhook call fails.
     #[test]
     fn build_webhook_call_client_with_proxy_addr_does_not_panic() {
         let cert = rcgen::generate_simple_self_signed(vec!["test.local".to_string()])
@@ -2812,17 +2637,9 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         // Must build successfully and apply the proxy — if this panics, all webhook calls
-        // to pod IPs fail when konnectivity is configured.
-        // skip_hostname_check=true because this simulates a ServiceResolved target in proxy mode.
-        let client = build_webhook_call_client(
-            Some(&ca_b64),
-            None,
-            Some("127.0.0.1:8135"),
-            None,
-            None,
-            &fallback,
-            true,
-        );
+        // to service DNS names fail when konnectivity is configured.
+        let client =
+            build_webhook_call_client(Some(&ca_b64), Some("127.0.0.1:8135"), None, None, &fallback);
         drop(client);
     }
 
@@ -2831,7 +2648,7 @@ mod tests {
     #[test]
     fn build_webhook_call_client_no_bundle_returns_fallback() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(None, None, None, None, None, &fallback, false);
+        let client = build_webhook_call_client(None, None, None, None, &fallback);
         drop(client);
     }
 
@@ -2843,58 +2660,10 @@ mod tests {
     fn build_webhook_call_client_invalid_b64_returns_fallback() {
         let fallback = reqwest::Client::new();
         // Invalid base64 must return fallback (not panic) so the apiserver keeps running.
-        let client = build_webhook_call_client(
-            Some("!!!not-valid-base64!!!"),
-            None,
-            None,
-            None,
-            None,
-            &fallback,
-            false,
-        );
+        let client =
+            build_webhook_call_client(Some("!!!not-valid-base64!!!"), None, None, None, &fallback);
         // Returned client must be usable — it is the fallback clone.
         drop(client);
-    }
-
-    /// build_webhook_call_client with skip_hostname_check=false must not set
-    /// danger_accept_invalid_hostnames even when a proxy is configured.
-    ///
-    /// DirectUrl webhooks must always verify the hostname in the user-supplied URL.
-    /// If hostname verification were disabled for DirectUrl targets, a MITM with a cert
-    /// signed by any registered webhook CA could intercept the call and forge allow responses.
-    #[test]
-    fn build_webhook_call_client_direct_url_does_not_skip_hostname_check() {
-        let cert = rcgen::generate_simple_self_signed(vec!["test.local".to_string()])
-            .expect("generate self-signed cert for hostname check test");
-        let ca_der = cert.cert.der().to_vec();
-        let b64_der = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_der);
-        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
-        for chunk in b64_der.as_bytes().chunks(64) {
-            pem.push_str(std::str::from_utf8(chunk).unwrap());
-            pem.push('\n');
-        }
-        pem.push_str("-----END CERTIFICATE-----\n");
-        let ca_b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pem.as_bytes());
-
-        let fallback = reqwest::Client::new();
-        // skip_hostname_check=false simulates a DirectUrl target — hostname check must be active.
-        // The returned client must not panic, and the function must complete without error
-        // (the absence of danger_accept_invalid_hostnames is enforced by the logic path taken).
-        let client = build_webhook_call_client(
-            Some(&ca_b64),
-            None,
-            Some("127.0.0.1:8135"),
-            None,
-            None,
-            &fallback,
-            false, // DirectUrl: must NOT skip hostname check even with proxy configured
-        );
-        drop(client);
-        // If the logic were broken and danger_accept_invalid_hostnames were set here,
-        // the build_webhook_call_client_with_proxy_addr_does_not_panic test would still
-        // pass (it passes skip_hostname_check=true). The distinction is structural:
-        // this test documents and guards the false branch of the condition.
     }
 
     /// AdmissionStatus.reason must be deserialised and used as the denial message when
@@ -2918,26 +2687,29 @@ mod tests {
         );
     }
 
-    /// WebhookTarget::ServiceResolved must carry a pod_url for konnectivity routing.
-    /// In konnectivity mode the CONNECT tunnel is established to the raw pod IP, not the
-    /// service ClusterIP (which kube-proxy would route but is not available in u7s). If
-    /// pod_url is absent the apiserver tries to reach an unreachable ClusterIP and all
-    /// webhook calls fail silently (failurePolicy=Ignore) or hard-fail (failurePolicy=Fail).
+    /// WebhookTarget::ServiceResolved must carry the service DNS URL (not a raw pod IP).
+    ///
+    /// With kube-proxy running (PR #406), the konnectivity-agent resolves service DNS names
+    /// via CoreDNS and routes through kube-proxy to the pod. Using the service DNS name
+    /// ensures correct TLS SNI matching against the webhook cert's SAN, and no
+    /// danger_accept_invalid_hostnames workaround is needed.
     #[test]
-    fn webhook_target_service_resolved_has_pod_url() {
-        // Verify the variant carries the pod_url field — compile-time structural check.
-        // If pod_url is removed from the enum, this test fails to compile.
+    fn webhook_target_service_resolved_uses_service_dns_name() {
+        // Verify the variant carries only the service DNS URL — compile-time structural check.
         let target = WebhookTarget::ServiceResolved {
             url: "https://my-webhook.webhook-ns.svc:443/validate".to_string(),
-            resolve_host: "my-webhook.webhook-ns.svc".to_string(),
-            resolve_addr: "10.244.0.5:443".parse().unwrap(),
-            pod_url: "https://10.244.0.5:443/validate".to_string(),
         };
         match target {
-            WebhookTarget::ServiceResolved { pod_url, .. } => {
+            WebhookTarget::ServiceResolved { url } => {
                 assert!(
-                    pod_url.starts_with("https://10."),
-                    "pod_url must use raw pod IP so konnectivity-agent can dial it directly"
+                    url.contains(".svc:"),
+                    "ServiceResolved URL must use service DNS name (not a raw pod IP) \
+                     so TLS SNI matches the webhook cert SAN"
+                );
+                assert!(
+                    !url.contains("10."),
+                    "ServiceResolved URL must not contain a raw pod IP — \
+                     kube-proxy (PR #406) routes via ClusterIP through the konnectivity proxy"
                 );
             }
             _ => panic!("must match ServiceResolved"),
@@ -3055,8 +2827,8 @@ mod tests {
     /// produces a usable client.
     ///
     /// If DirectUrl targets were to receive proxy_addr or webhook_identity_pem:
-    /// - The konnectivity proxy only routes to pod IPs in the VM, so external URLs would
-    ///   fail to connect entirely.
+    /// - The konnectivity proxy only routes to service DNS names inside the VM, so external
+    ///   URLs would fail to connect entirely.
     /// - The apiserver mTLS identity would be leaked to an operator-supplied external host.
     ///
     /// Reverting the fix (always passing state.konnectivity_proxy_addr) would mean
@@ -3070,11 +2842,10 @@ mod tests {
         // Must build successfully with no proxy and no identity pem.
         let client = build_webhook_call_client(
             None, // no caBundle
-            None, // no resolve (DirectUrl)
             None, // effective_proxy = None (the fix)
             None, // cluster_ca_der
             None, // effective_identity = None (the fix)
-            &fallback, false, // skip_hostname_check=false for DirectUrl
+            &fallback,
         );
         // Client is usable — no panic during build.
         drop(client);
