@@ -398,6 +398,17 @@ else
   limactl shell "$VM_NAME" sudo iptables -t nat -A PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443"
   limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
   echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:6443 (OUTPUT + PREROUTING)"
+
+  # Patch the kubernetes EndpointSlice with the host IP so kube-proxy's IPVS rule
+  # routes 10.96.0.1:443 → host (not 127.0.0.1 which is the VM's own loopback).
+  # The apiserver seeds 127.0.0.1 as a safe default; we correct it here once we
+  # know the host gateway IP.
+  echo "Patching kubernetes EndpointSlice with host IP ${HOST_IP}..."
+  kubectl --kubeconfig="$KUBECONFIG_PATH" patch endpointslice kubernetes -n default \
+    --type=json \
+    -p="[{\"op\":\"replace\",\"path\":\"/endpoints/0/addresses/0\",\"value\":\"${HOST_IP}\"}]" \
+    2>/dev/null && echo "EndpointSlice patched: 10.96.0.1:443 → ${HOST_IP}:6443" \
+    || echo "WARNING: EndpointSlice patch failed — kube-proxy IPVS may route incorrectly" >&2
 fi
 
 # Wait for the node to appear.

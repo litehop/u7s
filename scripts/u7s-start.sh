@@ -123,19 +123,7 @@ if [ -f "$WORKDIR/ca.crt" ]; then
   PROXY_ARG="--konnectivity-proxy-addr 127.0.0.1:$KONNECTIVITY_PROXY_PORT"
 fi
 
-# When running alongside a lima VM, pods inside the VM reach the apiserver via the kubernetes
-# ClusterIP (10.96.0.1). kube-proxy programs that route from the EndpointSlice address, which
-# must be routable from inside the VM. host.lima.internal resolves to the host gateway IP
-# (from inside the VM); use it as the advertise address so the seeded EndpointSlice has the
-# right IP for kube-proxy's IPVS rule.
 ADVERTISE_ARG=""
-if command -v limactl &>/dev/null; then
-  LIMA_HOST_IP=$(limactl shell lima-node sudo getent hosts host.lima.internal 2>/dev/null \
-    | grep -v warning | awk '{print $1}')
-  if [ -n "$LIMA_HOST_IP" ]; then
-    ADVERTISE_ARG="--advertise-address https://${LIMA_HOST_IP}:6443"
-  fi
-fi
 
 if [ "$APISERVER_RUNNING" -eq 1 ]; then
   echo "KUBECONFIG=$WORKDIR/kubeconfig"
