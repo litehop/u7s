@@ -445,32 +445,43 @@ pub async fn delete_pod<S: Store>(
 
     let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
     let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+    let already_terminating = meta.deletion_timestamp.is_some();
 
-    if has_finalizers {
-        // Soft delete: stamp deletionTimestamp and write back.
-        obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
-        let expected_rv = parse_resource_version(obj.resource_version())?;
-        let new_rv = state
+    // Real Kubernetes apiserver always soft-deletes pods first (sets deletionTimestamp)
+    // so the kubelet receives a MODIFIED event and gracefully terminates the container via SIGTERM.
+    // Hard-delete only when the pod is already in the Terminating state AND has no finalizers —
+    // this is the path taken when the kubelet calls DELETE a second time after stopping the container.
+    //
+    // Without this: pods are immediately hard-deleted, the kubelet only receives a DELETED event
+    // with a minimal tombstone (no spec), and the container is never sent SIGTERM — it keeps
+    // running indefinitely while the StatefulSet controller waits for the pod to terminate.
+    if already_terminating && !has_finalizers {
+        // Hard-delete: pod is already Terminating and all finalizers are gone.
+        state
             .store
-            .put(&key, obj.to_bytes(), expected_rv)
+            .delete(&key, None)
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
-        obj.set_resource_version(new_rv);
-        return Ok(Json(obj.body));
+
+        return Ok(Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Success",
+            "code": 200
+        })));
     }
 
-    state
+    // Soft-delete: stamp deletionTimestamp so the kubelet knows to gracefully terminate
+    // the container. Applies regardless of whether the pod has finalizers.
+    obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+    let expected_rv = parse_resource_version(obj.resource_version())?;
+    let new_rv = state
         .store
-        .delete(&key, None)
+        .put(&key, obj.to_bytes(), expected_rv)
         .await
         .map_err(|e| store_err_to_status(e, &name))?;
-
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "status": "Success",
-        "code": 200
-    })))
+    obj.set_resource_version(new_rv);
+    Ok(Json(obj.body))
 }
 
 pub async fn patch_pod<S: Store>(
@@ -3988,16 +3999,40 @@ mod handler_tests {
     // delete_pod
     // -----------------------------------------------------------------------
 
-    /// DELETE a pod without finalizers must return 200 with a Status object.
+    /// DELETE a pod without finalizers must soft-delete (stamp deletionTimestamp) on the first
+    /// DELETE call — it must NOT hard-delete immediately.
+    ///
+    /// Real Kubernetes apiserver always soft-deletes pods first so the kubelet receives a MODIFIED
+    /// event with deletionTimestamp set, which triggers graceful container termination via SIGTERM.
+    /// If pods are hard-deleted immediately (bypassing the soft-delete step), the kubelet only
+    /// receives a DELETED tombstone with minimal metadata (no spec), and the container never
+    /// receives SIGTERM — it keeps running indefinitely.
+    ///
+    /// This is the regression test for the StatefulSet AfterEach hang (mayor-859w):
+    /// scale-to-0 stalled for up to 91 minutes because the StatefulSet pod was hard-deleted without
+    /// going through the soft-delete+SIGTERM flow. This test fails on revert: if pods are
+    /// hard-deleted immediately, the pod will be gone from the store and the deletionTimestamp
+    /// assertion will fail.
     #[tokio::test]
-    async fn delete_pod_without_finalizers_returns_200() {
+    async fn delete_pod_without_finalizers_soft_deletes_first() {
         let (state, store) = make_state();
         seed_namespace(&store, "default").await;
-        seed_pod(&store, "default", "to-delete", serde_json::json!({})).await;
+        let key = "/registry/pods/default/to-delete";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "to-delete", "namespace": "default", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
-            .with_state(state);
+            .with_state(state.clone());
 
         let req = Request::builder()
             .method("DELETE")
@@ -4006,7 +4041,76 @@ mod handler_tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK, "soft-delete must return 200");
+
+        // The pod must still exist (soft-deleted, not hard-deleted).
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("pod must still exist after first DELETE — soft-delete must not remove it");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "deletionTimestamp must be stamped on first DELETE even without finalizers — \
+             kubelet uses this signal to send SIGTERM to the container; without it the \
+             container keeps running and the StatefulSet scale-to-0 hangs (mayor-859w)"
+        );
+    }
+
+    /// Second DELETE on a pod that is already Terminating (has deletionTimestamp) and has no
+    /// finalizers must hard-delete it — this is the path taken by the kubelet after it stops
+    /// the container and calls DELETE with gracePeriodSeconds=0.
+    ///
+    /// Without the hard-delete on the second DELETE, the pod would stay in Terminating forever
+    /// since no GC controller removes finalizer-free terminating pods.
+    #[tokio::test]
+    async fn delete_pod_already_terminating_without_finalizers_hard_deletes() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let key = "/registry/pods/default/terminating-pod";
+        // Seed a pod that already has deletionTimestamp set (soft-deleted) with no finalizers.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "terminating-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2026-01-01T00:00:00Z"
+            },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .with_state(state.clone());
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/namespaces/default/pods/terminating-pod")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "hard-delete of already-terminating pod must return 200"
+        );
+
+        // The pod must be gone (hard-deleted).
+        let stored = store.get(key).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "pod with deletionTimestamp and no finalizers must be hard-deleted on second DELETE — \
+             this is the kubelet's graceful termination complete signal (gracePeriodSeconds=0 path)"
+        );
     }
 
     /// DELETE a pod with finalizers must soft-delete: stamp deletionTimestamp, keep object.
