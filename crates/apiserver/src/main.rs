@@ -116,12 +116,28 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // 3. Open store.
+    // 3. Compute advertised server address early — needed for endpoint seeding below.
+    // Identical logic to step 8; kept here so seed_services gets the right IP before TLS init.
+    let server_address_early = match args.advertise_address.as_deref() {
+        Some(addr) => addr.to_owned(),
+        None => {
+            if args.listen.starts_with("0.0.0.0:") {
+                let port = &args.listen["0.0.0.0:".len()..];
+                format!("https://127.0.0.1:{port}")
+            } else {
+                format!("https://{}", args.listen)
+            }
+        }
+    };
+    // Parse "https://HOST:PORT" → (host, port). Fall back to defaults on malformed input.
+    let (apiserver_ip, apiserver_port) = parse_advertise_address(&server_address_early);
+
+    // Open store.
     let store = Arc::new(SqliteStore::new(&args.db)?);
     seed_namespaces(&store).await?;
     seed_rbac(&store).await?;
     seed_flowcontrol(&store).await?;
-    seed_services(&store).await?;
+    seed_services(&store, &apiserver_ip, apiserver_port).await?;
     seed_serviceaccounts(&store).await?;
     seed_coredns(&store).await?;
 
@@ -1793,7 +1809,35 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
+/// Parse "https://HOST:PORT" into (host, port). Returns ("127.0.0.1", 6443) on any parse error.
+fn parse_advertise_address(addr: &str) -> (String, u16) {
+    let without_scheme = addr
+        .strip_prefix("https://")
+        .or_else(|| addr.strip_prefix("http://"))
+        .unwrap_or(addr);
+    // Handle IPv6 bracketed addresses like [::1]:6443.
+    if let Some(bracket_end) = without_scheme.find(']') {
+        let host = without_scheme[1..bracket_end].to_owned();
+        let port = without_scheme
+            .get(bracket_end + 2..)
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(6443);
+        return (host, port);
+    }
+    match without_scheme.rsplit_once(':') {
+        Some((host, port_str)) => {
+            let port = port_str.parse().unwrap_or(6443);
+            (host.to_owned(), port)
+        }
+        None => ("127.0.0.1".to_owned(), 6443),
+    }
+}
+
+async fn seed_services(
+    store: &SqliteStore,
+    apiserver_ip: &str,
+    apiserver_port: u16,
+) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
 
@@ -1872,7 +1916,7 @@ async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
             "labels": { "endpointslice.kubernetes.io/skip-mirror": "true" }
         },
         "subsets": [{
-            "addresses": [{ "ip": "127.0.0.1" }],
+            "addresses": [{ "ip": apiserver_ip }],
             "ports": [{ "name": "https", "port": 443, "protocol": "TCP" }]
         }]
     });
@@ -1883,6 +1927,52 @@ async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
         Ok(_) => tracing::info!("seeded Endpoints: default/kubernetes"),
         Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
         Err(e) => return Err(anyhow::anyhow!("seed Endpoints default/kubernetes: {e}")),
+    }
+
+    // default/kubernetes EndpointSlice — kube-proxy (added in k8s 1.34+) uses EndpointSlices
+    // exclusively. The Endpoints above carry skip-mirror:true so the mirroring controller won't
+    // create a slice; we seed it directly, matching upstream apiserver behaviour where the
+    // apiserver's own reconciler calls EnsureEndpointSliceFromEndpoints on each cycle.
+    // The address here must be routable from inside pods — use the advertised IP, which callers
+    // set to host.lima.internal's IP when running in a lima VM so kube-proxy's IPVS rule
+    // programs 10.96.0.1:443 → <host-ip>:6443 rather than → 127.0.0.1:6443 (the VM loopback).
+    let eps_key = keys::group_object_key(
+        "discovery.k8s.io",
+        "endpointslices",
+        Some("default"),
+        "kubernetes",
+    );
+    let eps_body = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "kubernetes",
+            "namespace": "default",
+            "uid": "00000000-0000-0000-0000-000000000023",
+            "creationTimestamp": "2024-01-01T00:00:00Z",
+            "labels": {
+                "kubernetes.io/service-name": "kubernetes",
+                "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
+            }
+        },
+        "addressType": "IPv4",
+        "endpoints": [{
+            "addresses": [apiserver_ip],
+            "conditions": { "ready": true, "serving": true, "terminating": false }
+        }],
+        "ports": [{ "name": "https", "port": apiserver_port, "protocol": "TCP" }]
+    });
+    match store
+        .put(&eps_key, Bytes::from(eps_body.to_string()), Some(0))
+        .await
+    {
+        Ok(_) => tracing::info!("seeded EndpointSlice: default/kubernetes"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "seed EndpointSlice default/kubernetes: {e}"
+            ))
+        }
     }
 
     Ok(())
@@ -3251,7 +3341,9 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store).await.expect("seed must not fail");
+        seed_services(&store, "127.0.0.1", 6443)
+            .await
+            .expect("seed must not fail");
 
         // Verify default/kubernetes Service.
         let k8s_key = keys::object_key("services", "default", "kubernetes");
@@ -3322,10 +3414,10 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store)
+        seed_services(&store, "127.0.0.1", 6443)
             .await
             .expect("first seed must not fail");
-        seed_services(&store)
+        seed_services(&store, "127.0.0.1", 6443)
             .await
             .expect("second seed must not fail");
 
@@ -3356,7 +3448,9 @@ mod tests {
         seed_namespaces(&store)
             .await
             .expect("namespaces must be seeded first");
-        seed_services(&store).await.expect("seed must not fail");
+        seed_services(&store, "127.0.0.1", 6443)
+            .await
+            .expect("seed must not fail");
 
         let ep_key = keys::object_key("endpoints", "default", "kubernetes");
         let ep_obj = store.get(&ep_key).await.expect("get must not fail");
@@ -3398,6 +3492,79 @@ mod tests {
             ports[0]["protocol"].as_str(),
             Some("TCP"),
             "kubernetes Endpoints port must be TCP"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_services_creates_kubernetes_endpointslice() {
+        // kube-proxy (k8s 1.34+) uses EndpointSlices exclusively. The kubernetes Endpoints carries
+        // skip-mirror:true so the mirroring controller won't create a slice. Without a seeded
+        // EndpointSlice, kube-proxy never programs 10.96.0.1:443 → <apiserver-ip>:6443, so pods
+        // cannot reach the apiserver via ClusterIP — sonobuoy aggregator hangs.
+        // Use a non-default IP to verify the parameter flows through, not a hardcoded fallback.
+        let store = make_store();
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
+        seed_services(&store, "192.168.5.2", 6443)
+            .await
+            .expect("seed must not fail");
+
+        let eps_key = keys::group_object_key(
+            "discovery.k8s.io",
+            "endpointslices",
+            Some("default"),
+            "kubernetes",
+        );
+        let eps_obj = store.get(&eps_key).await.expect("get must not fail");
+        assert!(
+            eps_obj.is_some(),
+            "EndpointSlice default/kubernetes must exist after seeding — \
+             kube-proxy uses EndpointSlices to program ClusterIP iptables rules; \
+             without it pods cannot reach the apiserver at 10.96.0.1:443"
+        );
+        let eps: serde_json::Value =
+            serde_json::from_slice(&eps_obj.unwrap().value).expect("valid json");
+        assert_eq!(
+            eps["addressType"].as_str(),
+            Some("IPv4"),
+            "addressType must be IPv4 — empty or missing addressType causes kube-proxy to log \
+             'EndpointSlice address type not supported' and skip programming the iptables rule"
+        );
+        assert_eq!(
+            eps["metadata"]["labels"]["kubernetes.io/service-name"].as_str(),
+            Some("kubernetes"),
+            "service-name label must match the kubernetes service so kube-proxy associates this slice"
+        );
+        let endpoints = eps["endpoints"]
+            .as_array()
+            .expect("endpoints must be an array");
+        assert!(
+            !endpoints.is_empty(),
+            "EndpointSlice must have at least one endpoint"
+        );
+        let addresses = endpoints[0]["addresses"]
+            .as_array()
+            .expect("addresses must be an array");
+        assert!(
+            !addresses.is_empty(),
+            "endpoint must have at least one address"
+        );
+        assert_eq!(
+            addresses[0].as_str(),
+            Some("192.168.5.2"),
+            "EndpointSlice address must reflect the apiserver_ip parameter — kube-proxy uses \
+             this to program IPVS; wrong IP (e.g. 127.0.0.1) black-holes in-pod apiserver traffic"
+        );
+        let ports = eps["ports"].as_array().expect("ports must be an array");
+        assert!(
+            !ports.is_empty(),
+            "EndpointSlice must have at least one port"
+        );
+        assert_eq!(
+            ports[0]["port"].as_u64(),
+            Some(6443),
+            "EndpointSlice port must be the actual apiserver port, not the service port 443"
         );
     }
 

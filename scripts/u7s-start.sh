@@ -123,6 +123,8 @@ if [ -f "$WORKDIR/ca.crt" ]; then
   PROXY_ARG="--konnectivity-proxy-addr 127.0.0.1:$KONNECTIVITY_PROXY_PORT"
 fi
 
+ADVERTISE_ARG=""
+
 if [ "$APISERVER_RUNNING" -eq 1 ]; then
   echo "KUBECONFIG=$WORKDIR/kubeconfig"
 elif [ "$BACKGROUND" -eq 1 ]; then
@@ -138,6 +140,7 @@ elif [ "$BACKGROUND" -eq 1 ]; then
     --kubelet-preferred-address "127.0.0.1" \
     --service-cluster-ip-range "10.96.0.0/12" \
     $PROXY_ARG \
+    $ADVERTISE_ARG \
     > "$LOG" 2>&1 &
   SERVER_PID=$!
   disown "$SERVER_PID"
@@ -153,9 +156,8 @@ else
     --kubelet-preferred-address "127.0.0.1" \
     --service-cluster-ip-range "10.96.0.0/12" \
     $PROXY_ARG \
+    $ADVERTISE_ARG \
     &
-  # No --advertise-address: server cert already includes localhost, 127.0.0.1,
-  # and host.lima.internal unconditionally (see crates/apiserver/src/tls.rs).
   SERVER_PID=$!
 fi
 
