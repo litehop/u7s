@@ -998,6 +998,10 @@ impl Store for SqliteStore {
 
         let prefix_owned = prefix.to_string();
         let compaction_horizon_arc = Arc::clone(&self.compaction_horizon);
+        // Captured for lag recovery: allows re-subscribing and re-scanning ring buffer
+        // without terminating the stream when the broadcast channel lags transiently.
+        let tx_clone = self.tx.clone();
+        let ring_arc = Arc::clone(&self.ring);
 
         let stream = async_stream::stream! {
             // Yield compacted event if from_revision is before the horizon.
@@ -1020,18 +1024,50 @@ impl Store for SqliteStore {
                         if !event.key.starts_with(&prefix_owned) {
                             continue;
                         }
-                        // Deduplicate: skip if already covered by replay.
+                        // Deduplicate: skip if already covered by replay or a previous live event.
                         if event.revision <= last_replayed {
                             continue;
                         }
+                        last_replayed = event.revision;
                         yield internal_to_watch(&event);
                     }
                     Err(broadcast::error::RecvError::Lagged(_n)) => {
-                        // We lost messages; yield compacted to signal the gap.
-                        // Use the store's compaction horizon — not _n (that's a dropped-message count, not a revision).
+                        // The broadcast channel dropped messages because this receiver was too slow.
+                        // Attempt recovery: re-subscribe (to capture all future events) then
+                        // re-scan the ring buffer for events missed during the lag.  This avoids
+                        // terminating the stream with a 410 error for a transient slow-consumer
+                        // scenario — which forces the client to relist and re-watch, wasting
+                        // another full round-trip and potentially lagging again.
+                        //
+                        // If the ring buffer has also been compacted past last_replayed, we
+                        // fall back to yielding Compacted so the client can relist from a valid
+                        // revision rather than silently skipping events.
+                        rx = tx_clone.subscribe();
+                        let catchup: Vec<Arc<InternalEvent>> = {
+                            let guard = ring_arc.read().expect("ring poisoned");
+                            guard
+                                .iter()
+                                .filter(|e| {
+                                    e.key.starts_with(&prefix_owned) && e.revision > last_replayed
+                                })
+                                .cloned()
+                                .collect()
+                        };
+                        for event in &catchup {
+                            last_replayed = last_replayed.max(event.revision);
+                            yield internal_to_watch(event);
+                        }
+                        // If the ring buffer was also compacted past last_replayed (events lost
+                        // from both broadcast and ring buffer), signal the gap to the consumer.
                         let current_horizon = compaction_horizon_arc.load(Ordering::Relaxed);
-                        yield WatchEvent::Compacted { requested: from_revision, horizon: current_horizon };
-                        return;
+                        if current_horizon > last_replayed {
+                            yield WatchEvent::Compacted {
+                                requested: last_replayed,
+                                horizon: current_horizon,
+                            };
+                            return;
+                        }
+                        // Ring buffer covered the gap; continue watching from last_replayed.
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Sender dropped; stop stream.
@@ -1463,6 +1499,138 @@ mod tests {
             horizon, known_horizon,
             "Compacted horizon must be the store's compaction horizon ({known_horizon}), \
              not the dropped-message count (got {horizon})"
+        );
+    }
+
+    /// Regression test for mayor-v7qi: when the broadcast channel lags (slow consumer),
+    /// the watch stream must NOT terminate with a Compacted error when the ring buffer
+    /// still holds the missed events. Instead it must recover, replay the ring buffer
+    /// catchup, and continue delivering subsequent LIVE broadcast events.
+    ///
+    /// Without the fix: Lagged → Compacted → stream closes → 410 error sent to client →
+    /// client relists and re-watches → may lag again → test stalls for 300s.
+    ///
+    /// With the fix: Lagged → recover via ring buffer → ADDED/MODIFIED events from
+    /// subsequent live writes also arrive → test does not stall.
+    ///
+    /// This test FAILS if the fix is reverted (i.e., if RecvError::Lagged immediately
+    /// yields WatchEvent::Compacted without attempting ring-buffer recovery): the stream
+    /// closes before the live "recovery-pod" event can arrive.
+    #[tokio::test]
+    async fn watch_lagged_recovers_and_delivers_subsequent_live_events() {
+        use std::sync::Arc;
+        use tokio::sync::broadcast;
+        use tokio::time::Duration;
+
+        // Build a store with a tiny broadcast capacity so lag is easy to trigger.
+        let write_conn = {
+            use rusqlite::Connection;
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
+                 CREATE INDEX IF NOT EXISTS idx_pods_nodename ON objects (json_extract(value, '$.spec.nodeName')) WHERE key LIKE '/registry/pods/%';
+                 CREATE INDEX IF NOT EXISTS idx_ns_name ON objects(ns, obj_name) WHERE ns IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_name ON objects(obj_name);",
+            ).unwrap();
+            conn
+        };
+        let write_conn = Arc::new(tokio::sync::Mutex::new(write_conn));
+        let read_conn = Arc::clone(&write_conn);
+
+        // Tiny broadcast capacity: 4 messages. Writing 6 objects causes the subscriber to lag.
+        let (tx, _) = broadcast::channel::<Arc<InternalEvent>>(4);
+        let ring = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
+            RING_CAPACITY + 1,
+        )));
+        let compaction_horizon = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let store = Arc::new(SqliteStore {
+            write_conn,
+            read_conn,
+            tx,
+            ring,
+            compaction_horizon,
+            last_written_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+
+        // Compaction horizon is 0: ring buffer has NOT been compacted.
+        // All written events are available in the ring buffer for recovery.
+
+        // Subscribe a watcher BEFORE writing, so it lags when we flood the channel.
+        let stream = store
+            .watch("/registry/pods/default/", 0)
+            .await
+            .expect("watch");
+        let mut stream: Pin<Box<dyn futures_core::Stream<Item = WatchEvent> + Send>> =
+            Box::pin(stream);
+
+        // Write 6 objects — overflows broadcast channel (capacity=4), causes lag.
+        // All 6 events are also stored in the ring buffer (capacity=1000).
+        for i in 0..6u64 {
+            let key = format!("/registry/pods/default/pod-{i}");
+            store
+                .put(&key, pod_json(&format!("pod-{i}")), Some(0))
+                .await
+                .expect("put");
+        }
+
+        // Spawn a task that writes a "live" pod after a short delay.
+        // This pod arrives via the broadcast channel AFTER the Lagged recovery,
+        // not from the ring buffer (ring buffer is read during recovery, before this write).
+        // Without the recovery fix, the stream terminates before this event can arrive.
+        let store2 = Arc::clone(&store);
+        let live_key = "/registry/pods/default/recovery-pod";
+        tokio::spawn(async move {
+            // Allow time for the stream to process the 6 ring-buffer events and hit the
+            // Lagged error in the broadcast loop before writing the live event.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            store2
+                .put(live_key, pod_json("recovery-pod"), Some(0))
+                .await
+                .expect("put recovery pod");
+        });
+
+        // Consume the stream. With the fix:
+        //   1. 6 ADDED events from ring buffer replay (before Lagged hits)
+        //   2. Lagged hits → recover: re-subscribe + re-scan ring buffer (already delivered, catchup empty)
+        //   3. "recovery-pod" arrives via live broadcast → stream delivers it
+        //
+        // Without the fix:
+        //   1. 6 ADDED events from ring buffer replay
+        //   2. Lagged hits → WatchEvent::Compacted emitted → stream closes
+        //   3. "recovery-pod" never arrives → test panics or fails assertion
+        let mut found_live = false;
+        let mut got_compacted = false;
+        for _ in 0..20 {
+            match next_event(&mut stream).await {
+                Some(WatchEvent::Added(obj)) => {
+                    if obj.key == live_key {
+                        found_live = true;
+                        break;
+                    }
+                }
+                Some(WatchEvent::Compacted { .. }) => {
+                    got_compacted = true;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+
+        assert!(
+            !got_compacted,
+            "watch stream must NOT emit Compacted when ring buffer covers the lag gap; \
+             without the mayor-v7qi fix, RecvError::Lagged immediately yields Compacted, \
+             forcing the client to relist and re-watch (and likely lag again) — \
+             causing conformance tests to stall for 300s waiting for MODIFIED events"
+        );
+        assert!(
+            found_live,
+            "watch stream must deliver the live 'recovery-pod' event after lag recovery; \
+             without the fix the stream closes before this event arrives (mayor-v7qi)"
         );
     }
 
