@@ -128,7 +128,7 @@ if [ -f "$CA_CERT" ]; then
 
   # Get the lima VM IP so it can be included as a SAN (needed if kubelet-preferred-address
   # is not set and the apiserver connects via the VM's InternalIP instead of 127.0.0.1).
-  LIMA_VM_IP=$(limactl shell "$VM_NAME" ip -4 addr show lima0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1)
+  LIMA_VM_IP=$(limactl shell "$VM_NAME" ip -4 addr show lima0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1 || true)
   LIMA_VM_IP="${LIMA_VM_IP:-192.168.5.15}"
 
   if [ ! -f "$KUBELET_TLS_KEY" ] || [ ! -f "$KUBELET_TLS_CRT" ]; then
