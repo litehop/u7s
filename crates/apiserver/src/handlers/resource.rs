@@ -12,7 +12,7 @@ use crate::{limit_range, quota};
 
 use crate::{
     auth::UserInfo,
-    keys::{group_list_prefix, group_object_key},
+    keys::{cluster_object_key, group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
     types::{Object, ObjectMeta},
@@ -905,6 +905,20 @@ pub async fn create_namespaced_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
+    // Reject object creation in a Terminating namespace — matches kube-apiserver behaviour:
+    // 403 Forbidden: unable to create new content in namespace <ns> because it is being terminated
+    {
+        let ns_key = cluster_object_key("namespaces", &ns);
+        if let Ok(Some(stored)) = state.store.get(&ns_key).await {
+            if let Ok(ns_obj) = serde_json::from_slice::<serde_json::Value>(&stored.value) {
+                if ns_obj["status"]["phase"].as_str() == Some("Terminating") {
+                    return Err(Status::forbidden(format!(
+                        "unable to create new content in namespace {ns} because it is being terminated"
+                    )));
+                }
+            }
+        }
+    }
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -7307,6 +7321,88 @@ mod tests {
              KCM 1.36 sets the annotation on the RS body before POST but never subsequently \
              PATCHes the Deployment; without our propagation the annotation stays null and \
              the AdmissionWebhook conformance test BeforeEach times out"
+        );
+    }
+
+    /// POST to a namespace whose status.phase is "Terminating" must return 403 Forbidden.
+    /// Real kube-apiserver rejects all new object creation in a Terminating namespace;
+    /// without this check our apiserver would allow objects to be created in dying namespaces,
+    /// causing orphaned resources and breaking the namespace GC lifecycle.
+    #[tokio::test]
+    async fn create_namespaced_resource_rejects_terminating_namespace() {
+        use axum::extract::State;
+        use bytes::Bytes;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed the namespace object with status.phase = "Terminating".
+        let ns_key = "/registry/namespaces/dying-ns";
+        let ns_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "dying-ns" },
+            "status": { "phase": "Terminating" }
+        });
+        store
+            .put(
+                ns_key,
+                Bytes::from(serde_json::to_vec(&ns_obj).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed terminating namespace");
+
+        let cm = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "test-cm", "namespace": "dying-ns" }
+        });
+
+        let result = create_namespaced_resource(
+            State(state),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "dying-ns".to_string(),
+                "configmaps".to_string(),
+            )),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            json_headers(),
+            Bytes::from(serde_json::to_vec(&cm).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "POST to Terminating namespace must be rejected — namespace GC would leave orphans otherwise"
+            ),
+        };
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 403,
+            "Terminating namespace must return 403 Forbidden"
+        );
+        assert_eq!(json["reason"], "Forbidden");
+        assert!(
+            json["message"].as_str().unwrap_or("").contains("dying-ns"),
+            "error message must name the namespace"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("being terminated"),
+            "error message must say namespace is being terminated"
         );
     }
 }
