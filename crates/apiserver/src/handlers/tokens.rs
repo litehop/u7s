@@ -1,7 +1,15 @@
 // TokenRequest handler — POST /api/v1/namespaces/:ns/serviceaccounts/:name/token
 //
-// Mints a short-lived RS256 JWT for the named ServiceAccount and returns a
-// Kubernetes TokenRequest response (201 Created).
+// Mints an RS256 JWT for the named ServiceAccount and returns a Kubernetes
+// TokenRequest response (201 Created).
+//
+// Safety net for projected-token refresh failures (mayor-tq5y): the JWT lifetime
+// is floored at MIN_JWT_LIFETIME_SECS (24 h) regardless of the requested
+// expirationSeconds.  The response still echoes the *requested* expirationSeconds
+// so that kubelet's token_manager schedules refreshes at the normal interval (≈80%
+// of the requested TTL).  If a refresh call fails (e.g. transient VM network
+// hiccup), the existing JWT stays valid for up to 24 h instead of expiring after
+// the short requested window.
 
 use axum::{
     extract::{Path, State},
@@ -45,6 +53,16 @@ struct TokenRequestSpec {
 fn default_expiration() -> u64 {
     3607
 }
+
+/// Minimum actual JWT lifetime regardless of the requested expirationSeconds.
+///
+/// Kubelet's token_manager schedules token refreshes based on `spec.expirationSeconds`
+/// from the TokenRequest *response* (not the JWT `exp` claim).  By flooring the JWT
+/// lifetime at 24 h we ensure that if kubelet fails to deliver a refresh (transient
+/// network partition, apiserver restart, etc.) the existing JWT remains valid for the
+/// full duration of a typical conformance run without requiring a successful refresh
+/// every ~48 min.
+pub(crate) const MIN_JWT_LIFETIME_SECS: u64 = 86_400; // 24 h
 
 // ---------------------------------------------------------------------------
 // JWT claims
@@ -153,13 +171,27 @@ pub async fn create_token<S: Store>(
         .unwrap_or_default();
 
     // 6. Mint JWT.
+    //
+    // The JWT `exp` is floored at MIN_JWT_LIFETIME_SECS (24 h) as a safety net for
+    // transient refresh failures (mayor-tq5y).  The response still returns the
+    // caller-requested `expirationSeconds` so that kubelet's token_manager schedules
+    // refreshes at the normal short interval.  If a refresh attempt fails, the
+    // existing JWT stays valid for up to 24 h.
     let now = unix_now();
-    let exp = now + spec.expiration_seconds;
+    let jwt_lifetime = spec.expiration_seconds.max(MIN_JWT_LIFETIME_SECS);
+    let jwt_exp = now + jwt_lifetime;
+    tracing::debug!(
+        ns = ns.as_str(),
+        sa = %sa_name,
+        requested_secs = spec.expiration_seconds,
+        jwt_lifetime_secs = jwt_lifetime,
+        "TokenRequest: minting SA JWT"
+    );
     let claims = KubernetesClaims {
         iss: "https://kubernetes.default.svc".to_owned(),
         sub: format!("system:serviceaccount:{}:{}", ns.as_str(), sa_name),
         aud: spec.audiences,
-        exp,
+        exp: jwt_exp,
         iat: now,
         kubernetes_io: KubernetesClaimsExt {
             namespace: ns.as_str().to_owned(),
@@ -180,7 +212,10 @@ pub async fn create_token<S: Store>(
     // refresh; if absent it logs "Expiration seconds was nil for token request" and falls back.
     // Echo spec.boundObjectRef from the request so kubelet's DeleteServiceAccountToken can
     // access BoundObjectRef.UID without a nil-pointer dereference (token_manager.go:139).
-    let expiration_timestamp = secs_to_rfc3339(exp);
+    //
+    // expirationTimestamp uses the requested (short) lifetime so kubelet computes the
+    // correct refresh window.  The JWT itself uses jwt_exp (≥ 24 h) as the safety net.
+    let expiration_timestamp = secs_to_rfc3339(now + spec.expiration_seconds);
     let mut spec_resp = serde_json::json!({
         "audiences": claims.aud,
         "expirationSeconds": spec.expiration_seconds
@@ -1054,6 +1089,86 @@ mod handler_tests {
         assert!(
             parsed.contains('T'),
             "expirationTimestamp must be in RFC3339 format"
+        );
+    }
+
+    /// Regression test for mayor-tq5y: JWT lifetime must be floored at 24 h even when
+    /// a shorter expirationSeconds is requested.
+    ///
+    /// Kubelet schedules token refreshes based on spec.expirationSeconds from the response.
+    /// If a refresh call fails (transient VM network partition, apiserver restart), the pod
+    /// continues using the existing token from the volume.  With a 3607 s JWT the pod would
+    /// get Unauthorized within ~1 h of a failed refresh.  By flooring the JWT exp at 24 h
+    /// the pod stays authenticated for a full conformance run even if kubelet misses every
+    /// single refresh attempt.
+    ///
+    /// This test fails if the floor is removed: exp - iat would equal 3607 instead of ≥ 86400.
+    #[tokio::test]
+    async fn create_token_jwt_lifetime_floored_at_24h() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-tq5y").await;
+
+        // Request the Kubernetes-default projected-volume TTL (what kubelet typically sends).
+        let req_body = serde_json::json!({
+            "spec": {
+                "expirationSeconds": 3607,
+                "audiences": ["https://kubernetes.default.svc"]
+            }
+        });
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::from(serde_json::to_vec(&req_body).unwrap()),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!(
+                "token request must succeed: status={} message={}",
+                e.0, e.1.message
+            ),
+        };
+
+        // The response spec.expirationSeconds must still be the requested 3607 s so that
+        // kubelet schedules refreshes at the normal ~48-min interval.
+        let resp_exp_secs = resp_body["spec"]["expirationSeconds"]
+            .as_u64()
+            .expect("spec.expirationSeconds must be present");
+        assert_eq!(
+            resp_exp_secs, 3607,
+            "spec.expirationSeconds in response must equal the requested value \
+             so kubelet schedules refreshes at the right interval"
+        );
+
+        // The JWT exp must be at least 86400 s (24 h) from iat regardless of the requested
+        // expirationSeconds.  If this fails, reverted MIN_JWT_LIFETIME_SECS means the pod
+        // gets Unauthorized within ~1 h if kubelet fails to refresh (mayor-tq5y).
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("status.token must be present");
+        let claims = decode_jwt_claims(token);
+        let iat = claims["iat"].as_u64().expect("iat must be present");
+        let exp = claims["exp"].as_u64().expect("exp must be present");
+        assert!(
+            exp - iat >= MIN_JWT_LIFETIME_SECS,
+            "JWT lifetime (exp-iat={}) must be >= MIN_JWT_LIFETIME_SECS={} even when \
+             expirationSeconds={} was requested — removing this floor re-exposes mayor-tq5y",
+            exp - iat,
+            MIN_JWT_LIFETIME_SECS,
+            resp_exp_secs
+        );
+
+        // The status.expirationTimestamp must reflect the SHORT requested window (3607 s),
+        // not the longer JWT lifetime, so kubelet computes the correct refresh schedule.
+        // (kubelet uses expirationTimestamp + spec.expirationSeconds to derive the refresh window)
+        let exp_ts = resp_body["status"]["expirationTimestamp"]
+            .as_str()
+            .expect("status.expirationTimestamp must be present");
+        assert!(
+            exp_ts.contains('T') && exp_ts.ends_with('Z'),
+            "expirationTimestamp must be in RFC3339 format, got: {exp_ts}"
         );
     }
 }
