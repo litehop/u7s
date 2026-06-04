@@ -460,25 +460,21 @@ pub(crate) fn check_crb_escalation<S: Store>(
     if group != RBAC_GROUP || plural != CLUSTER_ROLE_BINDINGS {
         return Ok(());
     }
-    // system:masters bypass: sonobuoy creates ClusterRoleBindings before the referenced
-    // ClusterRole exists, which causes the RBAC check below to deny it. Bypassing for
-    // system:masters lets conformance tests run. Undesirable long-term — the privilege
-    // is structural and unauditable (no binding to revoke). Tracked in mayor-system-masters.
-    if user.groups.contains(&"system:masters".to_string()) {
-        return Ok(());
-    }
     let role_ref_name = serde_json::from_value::<crate::rbac::RbacBinding>(body.clone())
         .map(|b| b.role_ref.name)
         .unwrap_or_default();
     let role_rules = state.rbac_index.cluster_role_rules(&role_ref_name);
-    // An empty rule set (role not found) means the user cannot hold all rules
-    // of a non-existent role — deny unless role_rules is truly empty from an
-    // existing role. We check: if role_ref_name is non-empty and rules are
-    // empty, the role does not exist → deny.
-    if !role_ref_name.is_empty() && role_rules.is_empty() {
-        return Err(Status::forbidden(format!(
-            "cannot escalate privileges: ClusterRole \"{role_ref_name}\" not found or has no rules"
-        )));
+    // Kubernetes upstream behaviour: creating a CRB that references a not-yet-existing
+    // ClusterRole is allowed — the binding simply grants nothing until the role is created.
+    // sonobuoy creates CRBs before the referenced ClusterRole is registered; treating
+    // empty rules as "nothing to escalate to" handles this correctly without a hardcoded bypass.
+    if role_rules.is_empty() {
+        tracing::warn!(
+            role = %role_ref_name,
+            user = %user.username,
+            "ClusterRoleBinding references role with no rules (role may not exist yet); allowing — binding grants nothing"
+        );
+        return Ok(());
     }
     if !user_holds_all_rules(&user.username, &user.groups, &role_rules, &state.rbac_index) {
         return Err(Status::forbidden(
@@ -1883,22 +1879,102 @@ mod escalation_tests {
             result.is_ok(),
             "system:masters with cluster-admin binding must pass escalation check via RBAC"
         );
+    }
 
-        // system:masters bypasses escalation unconditionally — even without a binding.
-        let no_binding_state = make_state();
-        no_binding_state
-            .rbac_index
-            .apply_object(admin_role_key, &admin_role);
-        let allowed = super::check_crb_escalation(
+    /// Regression test: removing the hardcoded system:masters bypass must not regress
+    /// other principals. A user who is in system:masters but has NO cluster-admin binding
+    /// in the RBAC index must be denied escalation to cluster-admin.
+    ///
+    /// If the hardcoded bypass is re-introduced, this test passes when it should fail —
+    /// that is the canary.
+    #[test]
+    fn system_masters_without_binding_denied_when_role_has_rules() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        // Seed cluster-admin role with rules — the role EXISTS and has real permissions.
+        let admin_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {"name": "cluster-admin"},
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        state.rbac_index.apply_object(
+            "/apis/rbac.authorization.k8s.io/v1/clusterroles/cluster-admin",
+            &admin_role,
+        );
+        // Intentionally do NOT seed any ClusterRoleBinding for system:masters.
+
+        let masters_user = crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        };
+        let crb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "escalation-attempt"},
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        let result = super::check_crb_escalation(
             "clusterrolebindings",
             group,
-            &admin_user,
+            &masters_user,
             &crb_body,
-            &no_binding_state,
+            &state,
         );
         assert!(
-            allowed.is_ok(),
-            "system:masters bypasses escalation regardless of bindings"
+            result.is_err(),
+            "system:masters without a cluster-admin binding must be denied escalation to cluster-admin; \
+             privilege must flow through RBAC data, not hardcoded group membership"
+        );
+    }
+
+    /// Regression test for sonobuoy compatibility (Option A): a CRB referencing a
+    /// ClusterRole that does not yet exist must be allowed, because the role has no
+    /// rules — the binding grants nothing until the role is created.
+    ///
+    /// This is Kubernetes upstream behaviour. Without this, sonobuoy's RBAC conformance
+    /// tests fail because it creates CRBs before registering the referenced ClusterRole.
+    #[test]
+    fn crb_referencing_nonexistent_role_is_allowed() {
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+
+        // Intentionally do NOT seed "nonexistent-role" in the rbac_index.
+        let plain_user = crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+        };
+        let crb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {"name": "early-binding"},
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "ClusterRole",
+                "name": "nonexistent-role"
+            }
+        });
+        let result = super::check_crb_escalation(
+            "clusterrolebindings",
+            group,
+            &plain_user,
+            &crb_body,
+            &state,
+        );
+        assert!(
+            result.is_ok(),
+            "CRB referencing a not-yet-existing ClusterRole must be allowed; \
+             the role has no rules so there is nothing to escalate to — \
+             this matches Kubernetes upstream behaviour and is required for sonobuoy RBAC conformance"
         );
     }
 
