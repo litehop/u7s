@@ -386,16 +386,201 @@ struct ConfigMapVolumeSource {
     local_object_reference: Option<LocalObjectReference>,
 }
 
+/// EmptyDirVolumeSource — api-core-v1-generated.proto message EmptyDirVolumeSource
+/// medium (field 1, string): "" = node default, "Memory" = tmpfs.
+/// sizeLimit (field 2, bytes/Quantity) is skipped — kubelet defaults to node capacity.
+#[derive(Clone, PartialEq, Message)]
+struct EmptyDirVolumeSource {
+    /// medium (field 1, string)
+    #[prost(string, tag = "1")]
+    medium: String,
+}
+
+/// HostPathVolumeSource — api-core-v1-generated.proto message HostPathVolumeSource
+/// path (field 1, string): host filesystem path to expose.
+/// type (field 2, string): optional HostPathType hint (e.g. "Directory", "File").
+#[derive(Clone, PartialEq, Message)]
+struct HostPathVolumeSource {
+    /// path (field 1, string)
+    #[prost(string, tag = "1")]
+    path: String,
+    /// type (field 2, string)
+    #[prost(string, tag = "2")]
+    r#type: String,
+}
+
+/// PersistentVolumeClaimVolumeSource — api-core-v1-generated.proto
+/// claimName (field 1, string): name of the PVC in the same namespace.
+/// readOnly (field 2, bool): force read-only mount (default false).
+#[derive(Clone, PartialEq, Message)]
+struct PvcVolumeSource {
+    /// claimName (field 1, string)
+    #[prost(string, tag = "1")]
+    claim_name: String,
+    /// readOnly (field 2, bool)
+    #[prost(bool, tag = "2")]
+    read_only: bool,
+}
+
+/// ObjectFieldSelector — api-core-v1-generated.proto message ObjectFieldSelector
+/// Used in DownwardAPIVolumeFile to select a pod-level field.
+#[derive(Clone, PartialEq, Message)]
+struct ObjectFieldSelector {
+    /// apiVersion (field 1, string) — defaults to "v1"
+    #[prost(string, tag = "1")]
+    api_version: String,
+    /// fieldPath (field 2, string) — e.g. "metadata.name", "status.podIP"
+    #[prost(string, tag = "2")]
+    field_path: String,
+}
+
+/// ResourceFieldSelector — api-core-v1-generated.proto message ResourceFieldSelector
+/// Used in DownwardAPIVolumeFile to select a container resource field.
+#[derive(Clone, PartialEq, Message)]
+struct ResourceFieldSelector {
+    /// containerName (field 1, string)
+    #[prost(string, tag = "1")]
+    container_name: String,
+    /// resource (field 2, string) — e.g. "limits.cpu", "requests.memory"
+    #[prost(string, tag = "2")]
+    resource: String,
+    /// divisor (field 3, bytes/Quantity) — skipped, defaults to "1"
+    #[prost(bytes = "vec", tag = "3")]
+    divisor: Vec<u8>,
+}
+
+/// DownwardAPIVolumeFile — api-core-v1-generated.proto message DownwardAPIVolumeFile
+/// One item in a downwardAPI or projected/downwardAPI volume.
+#[derive(Clone, PartialEq, Message)]
+struct DownwardAPIVolumeFile {
+    /// path (field 1, string) — relative path for the projected file
+    #[prost(string, tag = "1")]
+    path: String,
+    /// fieldRef (field 2, message ObjectFieldSelector)
+    #[prost(message, tag = "2")]
+    field_ref: Option<ObjectFieldSelector>,
+    /// resourceFieldRef (field 3, message ResourceFieldSelector)
+    #[prost(message, tag = "3")]
+    resource_field_ref: Option<ResourceFieldSelector>,
+    /// mode (field 4, int32) — optional per-file permission bits
+    #[prost(int32, tag = "4")]
+    mode: i32,
+}
+
+/// DownwardAPIVolumeSource — api-core-v1-generated.proto message DownwardAPIVolumeSource
+/// items (field 1, repeated DownwardAPIVolumeFile): files to project.
+/// defaultMode (field 2, int32): default permission bits for projected files.
+#[derive(Clone, PartialEq, Message)]
+struct DownwardAPIVolumeSource {
+    /// items (field 1, repeated DownwardAPIVolumeFile)
+    #[prost(message, repeated, tag = "1")]
+    items: Vec<DownwardAPIVolumeFile>,
+    /// defaultMode (field 2, int32)
+    #[prost(int32, tag = "2")]
+    default_mode: i32,
+}
+
+/// DownwardAPIProjection — api-core-v1-generated.proto message DownwardAPIProjection
+/// Identical to DownwardAPIVolumeSource but without defaultMode; used inside ProjectedVolumeSource.
+#[derive(Clone, PartialEq, Message)]
+struct DownwardAPIProjection {
+    /// items (field 1, repeated DownwardAPIVolumeFile)
+    #[prost(message, repeated, tag = "1")]
+    items: Vec<DownwardAPIVolumeFile>,
+}
+
+/// ServiceAccountTokenProjection — api-core-v1-generated.proto
+/// Projects a bound service-account token into the volume.
+#[derive(Clone, PartialEq, Message)]
+struct ServiceAccountTokenProjection {
+    /// audience (field 1, string) — intended audience of the token
+    #[prost(string, tag = "1")]
+    audience: String,
+    /// expirationSeconds (field 2, int64) — token lifetime in seconds
+    #[prost(int64, tag = "2")]
+    expiration_seconds: i64,
+    /// path (field 3, string) — path relative to mount point
+    #[prost(string, tag = "3")]
+    path: String,
+}
+
+/// SecretProjection — api-core-v1-generated.proto message SecretProjection
+/// Projects a Secret into a projected volume.
+/// localObjectReference (field 1): provides the secret name via LocalObjectReference.
+#[derive(Clone, PartialEq, Message)]
+struct SecretProjection {
+    /// localObjectReference (field 1, message) — secret name
+    #[prost(message, tag = "1")]
+    local_object_reference: Option<LocalObjectReference>,
+}
+
+/// ConfigMapProjection — api-core-v1-generated.proto message ConfigMapProjection
+/// Projects a ConfigMap into a projected volume.
+/// localObjectReference (field 1): provides the configMap name via LocalObjectReference.
+#[derive(Clone, PartialEq, Message)]
+struct ConfigMapProjection {
+    /// localObjectReference (field 1, message) — configMap name
+    #[prost(message, tag = "1")]
+    local_object_reference: Option<LocalObjectReference>,
+}
+
+/// VolumeProjection — api-core-v1-generated.proto message VolumeProjection
+/// One source within a ProjectedVolumeSource.
+#[derive(Clone, PartialEq, Message)]
+struct VolumeProjectionEntry {
+    /// secret (field 1, message SecretProjection)
+    #[prost(message, tag = "1")]
+    secret: Option<SecretProjection>,
+    /// downwardAPI (field 2, message DownwardAPIProjection)
+    #[prost(message, tag = "2")]
+    downward_api: Option<DownwardAPIProjection>,
+    /// configMap (field 3, message ConfigMapProjection)
+    #[prost(message, tag = "3")]
+    config_map: Option<ConfigMapProjection>,
+    /// serviceAccountToken (field 4, message ServiceAccountTokenProjection)
+    #[prost(message, tag = "4")]
+    service_account_token: Option<ServiceAccountTokenProjection>,
+}
+
+/// ProjectedVolumeSource — api-core-v1-generated.proto message ProjectedVolumeSource
+/// Aggregates multiple volume sources (secret, configMap, downwardAPI, serviceAccountToken)
+/// into a single directory.
+#[derive(Clone, PartialEq, Message)]
+struct ProjectedVolumeSource {
+    /// sources (field 1, repeated VolumeProjection)
+    #[prost(message, repeated, tag = "1")]
+    sources: Vec<VolumeProjectionEntry>,
+    /// defaultMode (field 2, int32) — default permission bits for projected files
+    #[prost(int32, tag = "2")]
+    default_mode: i32,
+}
+
 /// VolumeSource — api-core-v1-generated.proto message VolumeSource
-/// Only secret (field 6) and configMap (field 19) are decoded; all other sources are skipped.
+/// All volume source types used by Kubernetes conformance tests are decoded.
+/// Deprecated/cloud-specific sources (gcePersistentDisk, awsElasticBlockStore, etc.) are skipped.
 #[derive(Clone, PartialEq, Message)]
 struct VolumeSource {
+    /// hostPath (field 1, message HostPathVolumeSource)
+    #[prost(message, tag = "1")]
+    host_path: Option<HostPathVolumeSource>,
+    /// emptyDir (field 2, message EmptyDirVolumeSource)
+    #[prost(message, tag = "2")]
+    empty_dir: Option<EmptyDirVolumeSource>,
     /// secret (field 6, message SecretVolumeSource)
     #[prost(message, tag = "6")]
     secret: Option<SecretVolumeSource>,
+    /// persistentVolumeClaim (field 10, message PersistentVolumeClaimVolumeSource)
+    #[prost(message, tag = "10")]
+    persistent_volume_claim: Option<PvcVolumeSource>,
+    /// downwardAPI (field 16, message DownwardAPIVolumeSource)
+    #[prost(message, tag = "16")]
+    downward_api: Option<DownwardAPIVolumeSource>,
     /// configMap (field 19, message ConfigMapVolumeSource)
     #[prost(message, tag = "19")]
     config_map: Option<ConfigMapVolumeSource>,
+    /// projected (field 26, message ProjectedVolumeSource)
+    #[prost(message, tag = "26")]
+    projected: Option<ProjectedVolumeSource>,
 }
 
 /// Volume — api-core-v1-generated.proto message Volume
@@ -3182,6 +3367,152 @@ fn apps_label_selector_to_json(sel: AppsLabelSelector) -> serde_json::Value {
     m
 }
 
+/// Convert a decoded `DownwardAPIVolumeFile` into a JSON object.
+/// This is used both by DownwardAPIVolumeSource items and DownwardAPIProjection items.
+fn downward_api_volume_file_to_json(f: DownwardAPIVolumeFile) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !f.path.is_empty() {
+        m.insert("path".to_string(), serde_json::Value::String(f.path));
+    }
+    if let Some(fr) = f.field_ref {
+        let mut fr_map = serde_json::Map::new();
+        if !fr.api_version.is_empty() {
+            fr_map.insert(
+                "apiVersion".to_string(),
+                serde_json::Value::String(fr.api_version),
+            );
+        }
+        if !fr.field_path.is_empty() {
+            fr_map.insert(
+                "fieldPath".to_string(),
+                serde_json::Value::String(fr.field_path),
+            );
+        }
+        m.insert("fieldRef".to_string(), serde_json::Value::Object(fr_map));
+    }
+    if let Some(rfr) = f.resource_field_ref {
+        let mut rfr_map = serde_json::Map::new();
+        if !rfr.container_name.is_empty() {
+            rfr_map.insert(
+                "containerName".to_string(),
+                serde_json::Value::String(rfr.container_name),
+            );
+        }
+        if !rfr.resource.is_empty() {
+            rfr_map.insert(
+                "resource".to_string(),
+                serde_json::Value::String(rfr.resource),
+            );
+        }
+        m.insert(
+            "resourceFieldRef".to_string(),
+            serde_json::Value::Object(rfr_map),
+        );
+    }
+    if f.mode != 0 {
+        m.insert("mode".to_string(), serde_json::Value::Number(f.mode.into()));
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Convert decoded DownwardAPIVolumeSource fields into a JSON object.
+/// Called for spec.volumes[].downwardAPI.
+fn downward_api_volume_source_to_json(
+    items: Vec<DownwardAPIVolumeFile>,
+    default_mode: i32,
+) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !items.is_empty() {
+        let items_json: Vec<serde_json::Value> = items
+            .into_iter()
+            .map(downward_api_volume_file_to_json)
+            .collect();
+        m.insert("items".to_string(), serde_json::Value::Array(items_json));
+    }
+    if default_mode != 0 {
+        m.insert(
+            "defaultMode".to_string(),
+            serde_json::Value::Number(default_mode.into()),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Convert a decoded `ProjectedVolumeSource` into a JSON object.
+/// Called for spec.volumes[].projected.
+fn projected_volume_source_to_json(proj: ProjectedVolumeSource) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    if !proj.sources.is_empty() {
+        let sources_json: Vec<serde_json::Value> = proj
+            .sources
+            .into_iter()
+            .map(|src| {
+                let mut sm = serde_json::Map::new();
+                if let Some(s) = src.secret {
+                    if let Some(lor) = s.local_object_reference {
+                        if !lor.name.is_empty() {
+                            sm.insert(
+                                "secret".to_string(),
+                                serde_json::json!({ "name": lor.name }),
+                            );
+                        }
+                    }
+                }
+                if let Some(da) = src.downward_api {
+                    sm.insert(
+                        "downwardAPI".to_string(),
+                        downward_api_volume_source_to_json(da.items, 0),
+                    );
+                }
+                if let Some(cm) = src.config_map {
+                    if let Some(lor) = cm.local_object_reference {
+                        if !lor.name.is_empty() {
+                            sm.insert(
+                                "configMap".to_string(),
+                                serde_json::json!({ "name": lor.name }),
+                            );
+                        }
+                    }
+                }
+                if let Some(sat) = src.service_account_token {
+                    let mut sat_map = serde_json::Map::new();
+                    if !sat.audience.is_empty() {
+                        sat_map.insert(
+                            "audience".to_string(),
+                            serde_json::Value::String(sat.audience),
+                        );
+                    }
+                    if sat.expiration_seconds != 0 {
+                        sat_map.insert(
+                            "expirationSeconds".to_string(),
+                            serde_json::Value::Number(sat.expiration_seconds.into()),
+                        );
+                    }
+                    if !sat.path.is_empty() {
+                        sat_map.insert("path".to_string(), serde_json::Value::String(sat.path));
+                    }
+                    sm.insert(
+                        "serviceAccountToken".to_string(),
+                        serde_json::Value::Object(sat_map),
+                    );
+                }
+                serde_json::Value::Object(sm)
+            })
+            .collect();
+        m.insert(
+            "sources".to_string(),
+            serde_json::Value::Array(sources_json),
+        );
+    }
+    if proj.default_mode != 0 {
+        m.insert(
+            "defaultMode".to_string(),
+            serde_json::Value::Number(proj.default_mode.into()),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
 /// Serialize a decoded `PodSpec` into a JSON map.
 ///
 /// Mirrors the container/spec serialization in `decode_pod_proto`, extracted here so
@@ -3317,6 +3648,28 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
                     vm.insert("name".to_string(), serde_json::Value::String(v.name));
                 }
                 if let Some(src) = v.volume_source {
+                    if let Some(hp) = src.host_path {
+                        let mut hp_map = serde_json::Map::new();
+                        if !hp.path.is_empty() {
+                            hp_map.insert("path".to_string(), serde_json::Value::String(hp.path));
+                        }
+                        if !hp.r#type.is_empty() {
+                            hp_map.insert("type".to_string(), serde_json::Value::String(hp.r#type));
+                        }
+                        vm.insert("hostPath".to_string(), serde_json::Value::Object(hp_map));
+                    }
+                    if let Some(_ed) = src.empty_dir {
+                        // emptyDir presence is sufficient for kubelet to use the plugin;
+                        // medium is included when set (e.g. "Memory" for tmpfs).
+                        let mut ed_map = serde_json::Map::new();
+                        if !_ed.medium.is_empty() {
+                            ed_map.insert(
+                                "medium".to_string(),
+                                serde_json::Value::String(_ed.medium),
+                            );
+                        }
+                        vm.insert("emptyDir".to_string(), serde_json::Value::Object(ed_map));
+                    }
                     if let Some(s) = src.secret {
                         if !s.secret_name.is_empty() {
                             vm.insert(
@@ -3324,6 +3677,29 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
                                 serde_json::json!({ "secretName": s.secret_name }),
                             );
                         }
+                    }
+                    if let Some(pvc) = src.persistent_volume_claim {
+                        if !pvc.claim_name.is_empty() {
+                            let mut pvc_map = serde_json::Map::new();
+                            pvc_map.insert(
+                                "claimName".to_string(),
+                                serde_json::Value::String(pvc.claim_name),
+                            );
+                            if pvc.read_only {
+                                pvc_map
+                                    .insert("readOnly".to_string(), serde_json::Value::Bool(true));
+                            }
+                            vm.insert(
+                                "persistentVolumeClaim".to_string(),
+                                serde_json::Value::Object(pvc_map),
+                            );
+                        }
+                    }
+                    if let Some(da) = src.downward_api {
+                        vm.insert(
+                            "downwardAPI".to_string(),
+                            downward_api_volume_source_to_json(da.items, da.default_mode),
+                        );
                     }
                     if let Some(cm) = src.config_map {
                         if let Some(lor) = cm.local_object_reference {
@@ -3334,6 +3710,12 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
                                 );
                             }
                         }
+                    }
+                    if let Some(proj) = src.projected {
+                        vm.insert(
+                            "projected".to_string(),
+                            projected_volume_source_to_json(proj),
+                        );
                     }
                 }
                 serde_json::Value::Object(vm)
@@ -8328,6 +8710,229 @@ mod tests {
             volumes[0]["secret"]["secretName"], "my-secret",
             "volumes[0].secret.secretName must be 'my-secret' — kubelet uses this to find the \
              Secret object; if absent the volume cannot be mounted and the pod stays Pending"
+        );
+    }
+
+    /// spec.volumes[].emptyDir must survive protobuf decode and appear in decoded JSON.
+    ///
+    /// Without this, 23 conformance tests stall for 300 s each (~130 min total) because kubelet
+    /// logs "no volume plugin matched" — it cannot identify the volume type when the `emptyDir`
+    /// key is absent from the stored JSON. The fix: VolumeSource now decodes emptyDir (field 2).
+    /// This test fails if VolumeSource.empty_dir is removed or the emptyDir serialization block
+    /// in pod_spec_to_json is removed.
+    #[test]
+    fn spec_volumes_empty_dir_survives_proto_decode() {
+        // EmptyDirVolumeSource {} — empty message (no medium, no sizeLimit)
+        let empty_dir_src: Vec<u8> = vec![];
+
+        // VolumeSource { emptyDir (field 2) = EmptyDirVolumeSource {} }
+        let volume_source = encode_length_delimited(2, &empty_dir_src);
+
+        // Volume { name (field 1) = "scratch", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"scratch");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app"); // Container.name
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with an emptyDir volume");
+
+        let volumes = result["spec"]["volumes"].as_array().expect(
+            "spec.volumes must be present — without it kubelet cannot resolve volume plugins",
+        );
+        assert_eq!(
+            volumes.len(),
+            1,
+            "exactly one volume must decode; a missing emptyDir field tag drops the volume"
+        );
+        assert_eq!(
+            volumes[0]["name"], "scratch",
+            "volume.name must be 'scratch' — kubelet matches this to volumeMount.name"
+        );
+        assert!(
+            volumes[0]["emptyDir"].is_object(),
+            "volumes[0].emptyDir must be a JSON object — without this key kubelet logs \
+             'no volume plugin matched' and the pod stalls for 300 s"
+        );
+    }
+
+    /// spec.volumes[].emptyDir with medium="Memory" must preserve the medium field.
+    ///
+    /// Without the medium field, kubelet creates a regular tmpfs instead of a memory-backed
+    /// tmpfs. This test verifies that EmptyDirVolumeSource.medium (field 1, string) is decoded.
+    #[test]
+    fn spec_volumes_empty_dir_with_memory_medium_survives_proto_decode() {
+        // EmptyDirVolumeSource { medium (field 1) = "Memory" }
+        let empty_dir_src = encode_length_delimited(1, b"Memory");
+
+        // VolumeSource { emptyDir (field 2) = EmptyDirVolumeSource }
+        let volume_source = encode_length_delimited(2, &empty_dir_src);
+
+        // Volume { name (field 1) = "mem", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"mem");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with emptyDir medium=Memory");
+
+        let volumes = result["spec"]["volumes"].as_array().unwrap();
+        assert_eq!(
+            volumes[0]["emptyDir"]["medium"], "Memory",
+            "emptyDir.medium must be 'Memory' — kubelet uses this to select tmpfs; \
+             if absent the volume falls back to disk-backed storage"
+        );
+    }
+
+    /// spec.volumes[].downwardAPI must survive protobuf decode with fieldRef items intact.
+    ///
+    /// Without this, Downward API conformance tests stall 300 s each because kubelet receives
+    /// a volume with no type. The fix: VolumeSource now decodes downwardAPI (field 16).
+    /// This test fails if VolumeSource.downward_api is removed or the downwardAPI serialization
+    /// block in pod_spec_to_json / downward_api_volume_source_to_json is removed.
+    #[test]
+    fn spec_volumes_downward_api_survives_proto_decode() {
+        // ObjectFieldSelector { apiVersion (field 1) = "v1", fieldPath (field 2) = "metadata.name" }
+        let mut field_selector = encode_length_delimited(1, b"v1");
+        field_selector.extend_from_slice(&encode_length_delimited(2, b"metadata.name"));
+
+        // DownwardAPIVolumeFile { path (field 1) = "podname", fieldRef (field 2) = ObjectFieldSelector }
+        let mut dav_file = encode_length_delimited(1, b"podname");
+        dav_file.extend_from_slice(&encode_length_delimited(2, &field_selector));
+
+        // DownwardAPIVolumeSource { items (field 1) = [DownwardAPIVolumeFile] }
+        let da_src = encode_length_delimited(1, &dav_file);
+
+        // VolumeSource { downwardAPI (field 16) = DownwardAPIVolumeSource }
+        let volume_source = encode_length_delimited(16, &da_src);
+
+        // Volume { name (field 1) = "podinfo", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"podinfo");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with a downwardAPI volume");
+
+        let volumes = result["spec"]["volumes"].as_array().expect(
+            "spec.volumes must be present — kubelet needs it to resolve downwardAPI volumes",
+        );
+        assert_eq!(volumes.len(), 1, "exactly one volume must decode");
+        assert_eq!(
+            volumes[0]["name"], "podinfo",
+            "volume.name must be 'podinfo'"
+        );
+        assert!(
+            volumes[0]["downwardAPI"].is_object(),
+            "volumes[0].downwardAPI must be a JSON object — without this key kubelet logs \
+             'no volume plugin matched'"
+        );
+        let items = volumes[0]["downwardAPI"]["items"].as_array().expect(
+            "downwardAPI.items must be present — kubelet uses these to project pod fields into files",
+        );
+        assert_eq!(items.len(), 1, "one downwardAPI item must decode");
+        assert_eq!(
+            items[0]["path"], "podname",
+            "item.path must be 'podname' — kubelet writes the pod field value to this filename"
+        );
+        assert_eq!(
+            items[0]["fieldRef"]["fieldPath"], "metadata.name",
+            "fieldRef.fieldPath must be 'metadata.name' — kubelet reads this field from the pod"
+        );
+    }
+
+    /// spec.volumes[].projected with serviceAccountToken must survive protobuf decode.
+    ///
+    /// Without this, Projected volume conformance tests stall 300 s each. The fix: VolumeSource
+    /// now decodes projected (field 26) with full VolumeProjection entries.
+    /// This test fails if VolumeSource.projected is removed or projected_volume_source_to_json
+    /// is removed.
+    #[test]
+    fn spec_volumes_projected_with_service_account_token_survives_proto_decode() {
+        // ServiceAccountTokenProjection { audience (field 1) = "api", expirationSeconds (field 2) = 3600, path (field 3) = "token" }
+        let mut sat = encode_length_delimited(1, b"api");
+        // expirationSeconds = 3600 as varint: field 2, wire type 0
+        let field_tag: u64 = (2 << 3) | 0; // field 2, varint
+        sat.extend_from_slice(&encode_varint(field_tag));
+        sat.extend_from_slice(&encode_varint(3600));
+        sat.extend_from_slice(&encode_length_delimited(3, b"token"));
+
+        // VolumeProjection { serviceAccountToken (field 4) = ServiceAccountTokenProjection }
+        let proj_entry = encode_length_delimited(4, &sat);
+
+        // ProjectedVolumeSource { sources (field 1) = [VolumeProjection] }
+        let proj_src = encode_length_delimited(1, &proj_entry);
+
+        // VolumeSource { projected (field 26) = ProjectedVolumeSource }
+        let volume_source = encode_length_delimited(26, &proj_src);
+
+        // Volume { name (field 1) = "kube-api-access", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"kube-api-access");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with a projected volume");
+
+        let volumes = result["spec"]["volumes"]
+            .as_array()
+            .expect("spec.volumes must be present — kubelet needs it to mount projected volumes");
+        assert_eq!(volumes.len(), 1, "exactly one volume must decode");
+        assert_eq!(
+            volumes[0]["name"], "kube-api-access",
+            "volume.name must be 'kube-api-access'"
+        );
+        assert!(
+            volumes[0]["projected"].is_object(),
+            "volumes[0].projected must be a JSON object — without this key kubelet logs \
+             'no volume plugin matched' and the pod stalls for 300 s"
+        );
+        let sources = volumes[0]["projected"]["sources"].as_array().expect(
+            "projected.sources must be present — kubelet iterates these to mount each projection",
+        );
+        assert_eq!(sources.len(), 1, "one projection source must decode");
+        assert_eq!(
+            sources[0]["serviceAccountToken"]["path"], "token",
+            "serviceAccountToken.path must be 'token' — kubelet writes the token to this path"
+        );
+        assert_eq!(
+            sources[0]["serviceAccountToken"]["expirationSeconds"], 3600,
+            "expirationSeconds must be 3600 — kubelet uses this to schedule token rotation"
         );
     }
 }
