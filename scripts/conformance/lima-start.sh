@@ -117,7 +117,44 @@ if [ -f "$CA_CERT" ]; then
   limactl copy "$CA_PEM" "${VM_NAME}:/tmp/kubelet-ca.crt"
   limactl shell "$VM_NAME" sudo cp /tmp/kubelet-ca.crt /etc/kubelet-ca.crt
   limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-ca.crt
-  # Write --client-ca-file into the kubelet drop-in (idempotent: overwrite each run).
+
+  # Generate a kubelet serving cert signed by the cluster CA so the apiserver can
+  # verify the kubelet's TLS cert on exec/log/attach connections (closes the MITM
+  # vector that existed when AcceptAnyCert was used).
+  CERT_DIR="$(dirname "$KUBECONFIG_PATH")"
+  KUBELET_TLS_KEY="$CERT_DIR/kubelet-serving.key"
+  KUBELET_TLS_CRT="$CERT_DIR/kubelet-serving.crt"
+  KUBELET_TLS_CSR="$CERT_DIR/kubelet-serving.csr"
+
+  # Get the lima VM IP so it can be included as a SAN (needed if kubelet-preferred-address
+  # is not set and the apiserver connects via the VM's InternalIP instead of 127.0.0.1).
+  LIMA_VM_IP=$(limactl shell "$VM_NAME" ip -4 addr show lima0 2>/dev/null | grep -oE 'inet [0-9]+(\.[0-9]+){3}' | awk '{print $2}' | head -1)
+  LIMA_VM_IP="${LIMA_VM_IP:-192.168.5.15}"
+
+  if [ ! -f "$KUBELET_TLS_KEY" ] || [ ! -f "$KUBELET_TLS_CRT" ]; then
+    openssl ecparam -genkey -name prime256v1 -noout -out "$KUBELET_TLS_KEY"
+    openssl req -new -key "$KUBELET_TLS_KEY" \
+      -subj "/CN=lima-node" -sha256 \
+      -out "$KUBELET_TLS_CSR"
+    openssl x509 -req -in "$KUBELET_TLS_CSR" \
+      -CA "$CA_PEM" -CAkey "$CERT_DIR/ca.key" \
+      -CAcreateserial -CAserial "$CERT_DIR/ca.srl" \
+      -days 365 -sha256 \
+      -extfile <(printf 'subjectAltName=IP:127.0.0.1,IP:%s\nextendedKeyUsage=serverAuth\n' "$LIMA_VM_IP") \
+      -out "$KUBELET_TLS_CRT"
+    rm -f "$KUBELET_TLS_CSR"
+    echo "Kubelet serving cert generated (SANs: 127.0.0.1, ${LIMA_VM_IP})."
+  else
+    echo "Kubelet serving cert already exists, reusing."
+  fi
+  limactl copy "$KUBELET_TLS_CRT" "${VM_NAME}:/tmp/kubelet-tls.crt"
+  limactl copy "$KUBELET_TLS_KEY" "${VM_NAME}:/tmp/kubelet-tls.key"
+  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-tls.crt /etc/kubelet-tls.crt
+  limactl shell "$VM_NAME" sudo cp /tmp/kubelet-tls.key /etc/kubelet-tls.key
+  limactl shell "$VM_NAME" sudo chmod 644 /etc/kubelet-tls.crt
+  limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-tls.key
+
+  # Write --client-ca-file and --tls-cert-file into the kubelet drop-in (idempotent: overwrite each run).
   limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
 [Service]
 ExecStart=
@@ -125,11 +162,13 @@ ExecStart=/usr/bin/kubelet \
   --config=/etc/kubelet-config.yaml \
   --kubeconfig=/etc/kubelet-kubeconfig \
   --client-ca-file=/etc/kubelet-ca.crt \
+  --tls-cert-file=/etc/kubelet-tls.crt \
+  --tls-private-key-file=/etc/kubelet-tls.key \
   --hostname-override=lima-node \
   --v=2
 EOF'
   limactl shell "$VM_NAME" sudo systemctl daemon-reload
-  echo "Kubelet client-ca-file configured."
+  echo "Kubelet client-ca-file and TLS serving cert configured."
 else
   echo "WARNING: $CA_CERT not found — kubelet client auth will not work (logs/exec will return 401)" >&2
 fi
