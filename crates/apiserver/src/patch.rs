@@ -98,10 +98,14 @@ fn strategic_merge_patch_at(
                 }
             }
         } else if value.is_object() {
-            let entry = target_obj
-                .entry(key)
-                .or_insert(serde_json::Value::Object(Default::default()));
-            strategic_merge_patch_at(entry, value, &child_path)?;
+            if should_replace_object(&child_path) {
+                target_obj.insert(key.clone(), value.clone());
+            } else {
+                let entry = target_obj
+                    .entry(key)
+                    .or_insert(serde_json::Value::Object(Default::default()));
+                strategic_merge_patch_at(entry, value, &child_path)?;
+            }
         } else {
             target_obj.insert(key.clone(), value.clone());
         }
@@ -264,6 +268,23 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
 
         _ => MergeKeyKind::Unknown,
     }
+}
+
+/// Returns true for object-valued fields that must be replaced wholesale rather than
+/// deep-merged. ContainerStatus.state is a discriminated union (exactly one of waiting,
+/// running, or terminated is set); merging the patch into the existing object would leave
+/// stale sibling keys (e.g. both "running" and "waiting" present simultaneously), which
+/// breaks sonobuoy's aggregator readiness check and any other consumer that inspects state.
+fn should_replace_object(path: &str) -> bool {
+    // state under any containerStatuses element, e.g.:
+    //   "containerStatuses.state", "initContainerStatuses.state", "ephemeralContainerStatuses.state"
+    // The path uses "." as separator and each segment after the array merge is relative
+    // to the element, so the path looks like "<prefix>.state" where prefix ends with
+    // one of the status array names.
+    path.ends_with(".state")
+        && (path.contains("containerStatuses")
+            || path.contains("initContainerStatuses")
+            || path.contains("ephemeralContainerStatuses"))
 }
 
 fn has_replace_directive(arr: &serde_json::Value) -> bool {
@@ -950,6 +971,88 @@ mod tests {
         assert_eq!(
             target["metadata"]["labels"]["patched"], "yes",
             "other patched fields must be applied"
+        );
+    }
+
+    #[test]
+    fn container_state_is_replaced_not_merged_on_status_patch() {
+        // ContainerStatus.state is a discriminated union — exactly one of waiting/running/terminated
+        // must be set. If kubelet patches state from waiting to running via strategic-merge-patch,
+        // the old "waiting" key must be gone; leaving both present causes sonobuoy's aggregator
+        // readiness check to see "waiting: ContainerCreating" and hang forever even though the
+        // pod phase is Running.
+        let mut pod = json!({
+            "status": {
+                "containerStatuses": [{
+                    "name": "kube-sonobuoy",
+                    "state": {
+                        "waiting": { "reason": "ContainerCreating" }
+                    },
+                    "ready": false,
+                    "started": false
+                }]
+            }
+        });
+        let patch = json!({
+            "status": {
+                "containerStatuses": [{
+                    "name": "kube-sonobuoy",
+                    "state": {
+                        "running": { "startedAt": "2026-06-04T00:00:00Z" }
+                    },
+                    "ready": true,
+                    "started": true
+                }]
+            }
+        });
+        strategic_merge_patch(&mut pod, &patch).unwrap();
+
+        let state = &pod["status"]["containerStatuses"][0]["state"];
+        assert!(
+            state.get("waiting").is_none(),
+            "waiting key must be absent after transition to running — both present simultaneously \
+             breaks sonobuoy aggregator readiness (it sees ContainerCreating and waits forever)"
+        );
+        assert!(
+            state.get("running").is_some(),
+            "running key must be present after kubelet patches state to running"
+        );
+    }
+
+    #[test]
+    fn init_container_state_is_replaced_not_merged_on_status_patch() {
+        // Same invariant as container_state_is_replaced_not_merged_on_status_patch but for
+        // initContainerStatuses, which uses the same discriminated-union state field.
+        let mut pod = json!({
+            "status": {
+                "initContainerStatuses": [{
+                    "name": "init",
+                    "state": {
+                        "waiting": { "reason": "PodInitializing" }
+                    }
+                }]
+            }
+        });
+        let patch = json!({
+            "status": {
+                "initContainerStatuses": [{
+                    "name": "init",
+                    "state": {
+                        "terminated": { "exitCode": 0 }
+                    }
+                }]
+            }
+        });
+        strategic_merge_patch(&mut pod, &patch).unwrap();
+
+        let state = &pod["status"]["initContainerStatuses"][0]["state"];
+        assert!(
+            state.get("waiting").is_none(),
+            "waiting must be absent after init container terminates"
+        );
+        assert!(
+            state.get("terminated").is_some(),
+            "terminated must be present after init container exits"
         );
     }
 }
