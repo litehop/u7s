@@ -3020,7 +3020,7 @@ mod tests {
     fn pod_ip_selection_is_bounded_by_address_count() {
         // Simulate the index-selection logic used in webhook_url.
         // This test exercises the formula directly so it can fail if reverted to `first()`.
-        let addresses = vec!["10.0.0.1", "10.0.0.2", "10.0.0.3"];
+        let addresses = ["10.0.0.1", "10.0.0.2", "10.0.0.3"];
         let n = addresses.len();
 
         // Any nanos value must produce an index in [0, n).
