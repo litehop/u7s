@@ -86,8 +86,18 @@ impl BiStreamWriter for AxumWsWriter {
     }
 
     async fn close(&mut self) {
+        use axum::extract::ws::{CloseFrame, Message};
         use futures_util::SinkExt as _;
-        let _ = self.0.send(axum::extract::ws::Message::Close(None)).await;
+        // Send close code 1000 (Normal Closure). Sending Close(None) produces
+        // code 1005 ("no status received"), which causes kubectl to retry the
+        // exec/attach session with exponential backoff, inflating conformance runs.
+        let _ = self
+            .0
+            .send(Message::Close(Some(CloseFrame {
+                code: axum::extract::ws::close_code::NORMAL,
+                reason: "".into(),
+            })))
+            .await;
     }
 }
 
@@ -166,7 +176,20 @@ where
 
     async fn close(&mut self) {
         use futures_util::SinkExt as _;
-        let _ = self.0.close().await;
+        use tokio_tungstenite::tungstenite::{
+            protocol::{frame::coding::CloseCode, CloseFrame},
+            Message,
+        };
+        // Send close code 1000 (Normal Closure). SinkExt::close() calls close(None)
+        // internally, which produces code 1005 ("no status received") — causing kubectl
+        // to interpret the session as abnormally closed and retry with backoff.
+        let _ = self
+            .0
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: "".into(),
+            })))
+            .await;
     }
 }
 
@@ -639,6 +662,109 @@ mod tests {
         assert_eq!(
             a_received, b_msgs,
             "messages must arrive at A in order and unmodified"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Close frame code regression tests — close code 1005 causes e2e timeouts
+    //
+    // WebSocket close code 1005 ("no status received") is what the peer sees when
+    // we close without sending a close frame or send Close(None). kubectl interprets
+    // 1005 as an abnormal termination and retries exec/attach sessions with
+    // exponential backoff. This caused 2,564 errors in a single conformance run,
+    // inflating the run from ~1h to 7h+.
+    //
+    // These tests verify that both writers send close code 1000 (Normal Closure).
+    // They FAIL if close() is reverted to send Close(None) because the server would
+    // then receive no code (which Go's gorilla/websocket reports as 1005).
+    // -----------------------------------------------------------------------
+
+    /// TungsteniteWsWriter::close() must send close code 1000 (Normal Closure).
+    ///
+    /// Close code 1005 ("no status") is produced when Close(None) is sent or when
+    /// SinkExt::close() is called (which internally calls close(None)). kubectl
+    /// treats 1005 as abnormal termination and retries, causing e2e timeout spikes.
+    /// This test fails if close() is reverted to SinkExt::close() or Message::Close(None).
+    #[tokio::test]
+    async fn tungstenite_writer_close_sends_code_1000_not_1005() {
+        use futures_util::StreamExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (mut server_ws, client_ws) = make_ws_pair().await;
+
+        let ws = TungsteniteWs(client_ws);
+        let (_reader, mut writer) = ws.split();
+
+        // Spawn writer close in a task so we can concurrently read the close frame.
+        let close_task = tokio::spawn(async move {
+            writer.close().await;
+        });
+
+        // Read the close frame that the client sent to the server.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), server_ws.next())
+            .await
+            .expect("server must receive a message within 2 seconds after close()")
+            .expect("server stream must not be empty")
+            .expect("message must be Ok, not an error");
+
+        match msg {
+            Message::Close(Some(frame)) => {
+                let code: u16 = frame.code.into();
+                assert_eq!(
+                    code, 1000,
+                    "TungsteniteWsWriter::close() must send code 1000 (Normal Closure), \
+                     not 1005 (no status). Code 1005 causes kubectl to retry with backoff, \
+                     inflating e2e conformance runs from ~1h to 7h+. Got code: {code}"
+                );
+            }
+            Message::Close(None) => {
+                panic!(
+                    "TungsteniteWsWriter::close() sent Close(None) which produces code 1005 \
+                     ('no status received') — kubectl treats this as abnormal termination \
+                     and retries with exponential backoff"
+                );
+            }
+            other => panic!("expected a Close frame, got: {other:?}"),
+        }
+
+        let _ = close_task.await;
+    }
+
+    /// AxumWsWriter::close() must build a CloseFrame with code 1000 (Normal Closure).
+    ///
+    /// axum's WebSocket layer translates Message::Close(None) into a frame with no
+    /// status code, which Go's gorilla/websocket library reports to kubectl as code
+    /// 1005 ("no status received"). kubectl then retries the exec/attach session.
+    /// This test fails if close() is reverted to Message::Close(None).
+    ///
+    /// We verify the close code constant used by AxumWsWriter::close() equals 1000
+    /// and that the CloseFrame struct would be Some (not None). This guards against
+    /// the specific regression: passing Close(None) or close_code::STATUS (1005).
+    #[test]
+    fn axum_writer_close_uses_code_1000_not_1005() {
+        // close_code::NORMAL == 1000 (Normal Closure)
+        // close_code::STATUS == 1005 (No status received — the bad code we must not send)
+        assert_eq!(
+            axum::extract::ws::close_code::NORMAL,
+            1000u16,
+            "close_code::NORMAL must equal 1000 — if this fails the constant changed"
+        );
+        assert_ne!(
+            axum::extract::ws::close_code::NORMAL,
+            axum::extract::ws::close_code::STATUS,
+            "NORMAL (1000) must not equal STATUS (1005). \
+             AxumWsWriter::close() uses NORMAL — using STATUS would cause kubectl to retry."
+        );
+        // Verify CloseFrame with NORMAL produces Some (not None) — Close(None) yields 1005.
+        let frame = axum::extract::ws::CloseFrame {
+            code: axum::extract::ws::close_code::NORMAL,
+            reason: "".into(),
+        };
+        assert_eq!(
+            frame.code, 1000,
+            "AxumWsWriter::close() CloseFrame code must be 1000 (Normal Closure), \
+             not 1005. Sending 1005 causes kubectl to treat exec/attach as abnormally \
+             terminated and retry with exponential backoff, inflating e2e runs from ~1h to 7h+."
         );
     }
 }
