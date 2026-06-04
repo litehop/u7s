@@ -1885,6 +1885,51 @@ async fn seed_services(store: &SqliteStore) -> anyhow::Result<()> {
         Err(e) => return Err(anyhow::anyhow!("seed Endpoints default/kubernetes: {e}")),
     }
 
+    // default/kubernetes EndpointSlice — kube-proxy (added in k8s 1.34+) uses EndpointSlices
+    // exclusively. The Endpoints above carry skip-mirror:true so the mirroring controller won't
+    // create a slice; we seed it directly, matching upstream apiserver behaviour where the
+    // apiserver's own reconciler calls EnsureEndpointSliceFromEndpoints on each cycle.
+    // Without this slice kube-proxy never programs 10.96.0.1:443 → 127.0.0.1:6443, so pods
+    // cannot reach the apiserver via the in-cluster ClusterIP (breaks sonobuoy aggregator, etc).
+    let eps_key = keys::group_object_key(
+        "discovery.k8s.io",
+        "endpointslices",
+        Some("default"),
+        "kubernetes",
+    );
+    let eps_body = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "kubernetes",
+            "namespace": "default",
+            "uid": "00000000-0000-0000-0000-000000000023",
+            "creationTimestamp": "2024-01-01T00:00:00Z",
+            "labels": {
+                "kubernetes.io/service-name": "kubernetes",
+                "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
+            }
+        },
+        "addressType": "IPv4",
+        "endpoints": [{
+            "addresses": ["127.0.0.1"],
+            "conditions": { "ready": true, "serving": true, "terminating": false }
+        }],
+        "ports": [{ "name": "https", "port": 6443, "protocol": "TCP" }]
+    });
+    match store
+        .put(&eps_key, Bytes::from(eps_body.to_string()), Some(0))
+        .await
+    {
+        Ok(_) => tracing::info!("seeded EndpointSlice: default/kubernetes"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "seed EndpointSlice default/kubernetes: {e}"
+            ))
+        }
+    }
+
     Ok(())
 }
 
@@ -3398,6 +3443,70 @@ mod tests {
             ports[0]["protocol"].as_str(),
             Some("TCP"),
             "kubernetes Endpoints port must be TCP"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_services_creates_kubernetes_endpointslice() {
+        // kube-proxy (k8s 1.34+) uses EndpointSlices exclusively. The kubernetes Endpoints carries
+        // skip-mirror:true so the mirroring controller won't create a slice. Without a seeded
+        // EndpointSlice, kube-proxy never programs 10.96.0.1:443 → 127.0.0.1:6443, so pods cannot
+        // reach the apiserver via ClusterIP — sonobuoy aggregator hangs with connection refused.
+        let store = make_store();
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
+        seed_services(&store).await.expect("seed must not fail");
+
+        let eps_key = keys::group_object_key(
+            "discovery.k8s.io",
+            "endpointslices",
+            Some("default"),
+            "kubernetes",
+        );
+        let eps_obj = store.get(&eps_key).await.expect("get must not fail");
+        assert!(
+            eps_obj.is_some(),
+            "EndpointSlice default/kubernetes must exist after seeding — \
+             kube-proxy uses EndpointSlices to program ClusterIP iptables rules; \
+             without it pods cannot reach the apiserver at 10.96.0.1:443"
+        );
+        let eps: serde_json::Value =
+            serde_json::from_slice(&eps_obj.unwrap().value).expect("valid json");
+        assert_eq!(
+            eps["addressType"].as_str(),
+            Some("IPv4"),
+            "addressType must be IPv4 — empty or missing addressType causes kube-proxy to log \
+             'EndpointSlice address type not supported' and skip programming the iptables rule"
+        );
+        assert_eq!(
+            eps["metadata"]["labels"]["kubernetes.io/service-name"].as_str(),
+            Some("kubernetes"),
+            "service-name label must match the kubernetes service so kube-proxy associates this slice"
+        );
+        let endpoints = eps["endpoints"]
+            .as_array()
+            .expect("endpoints must be an array");
+        assert!(
+            !endpoints.is_empty(),
+            "EndpointSlice must have at least one endpoint"
+        );
+        let addresses = endpoints[0]["addresses"]
+            .as_array()
+            .expect("addresses must be an array");
+        assert!(
+            !addresses.is_empty(),
+            "endpoint must have at least one address"
+        );
+        let ports = eps["ports"].as_array().expect("ports must be an array");
+        assert!(
+            !ports.is_empty(),
+            "EndpointSlice must have at least one port"
+        );
+        assert_eq!(
+            ports[0]["port"].as_u64(),
+            Some(6443),
+            "EndpointSlice port must be 6443 (the actual apiserver port, not the service port 443)"
         );
     }
 
