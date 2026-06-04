@@ -8877,8 +8877,8 @@ mod tests {
     fn spec_volumes_projected_with_service_account_token_survives_proto_decode() {
         // ServiceAccountTokenProjection { audience (field 1) = "api", expirationSeconds (field 2) = 3600, path (field 3) = "token" }
         let mut sat = encode_length_delimited(1, b"api");
-        // expirationSeconds = 3600 as varint: field 2, wire type 0
-        let field_tag: u64 = (2 << 3) | 0; // field 2, varint
+        // expirationSeconds = 3600 as varint: field 2, wire type 0 (varint)
+        let field_tag: u64 = 2 << 3; // field 2, wire type 0 (varint)
         sat.extend_from_slice(&encode_varint(field_tag));
         sat.extend_from_slice(&encode_varint(3600));
         sat.extend_from_slice(&encode_length_delimited(3, b"token"));
