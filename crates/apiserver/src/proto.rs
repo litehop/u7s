@@ -620,6 +620,76 @@ struct VolumeMount {
     sub_path_expr: String,
 }
 
+/// ConfigMapKeySelector — api-core-v1-generated.proto message ConfigMapKeySelector
+/// Selects a key from a ConfigMap; used as EnvVarSource.configMapKeyRef.
+/// field 1 = LocalObjectReference (embedded message, field 1 = name string)
+/// field 2 = key (string)
+/// field 3 = optional (bool)
+#[derive(Clone, PartialEq, Message)]
+struct ConfigMapKeySelector {
+    /// localObjectReference.name (field 1, embedded message — inner field 1 = string)
+    #[prost(message, tag = "1")]
+    local_object_reference: Option<LocalObjectReference>,
+    /// key (field 2, string) — key within the ConfigMap
+    #[prost(string, tag = "2")]
+    key: String,
+    /// optional (field 3, bool) — whether the ConfigMap or key must exist
+    #[prost(bool, tag = "3")]
+    optional: bool,
+}
+
+/// SecretKeySelector — api-core-v1-generated.proto message SecretKeySelector
+/// Selects a key from a Secret; used as EnvVarSource.secretKeyRef.
+/// field 1 = LocalObjectReference (embedded message, field 1 = name string)
+/// field 2 = key (string)
+/// field 3 = optional (bool)
+#[derive(Clone, PartialEq, Message)]
+struct SecretKeySelector {
+    /// localObjectReference.name (field 1, embedded message — inner field 1 = string)
+    #[prost(message, tag = "1")]
+    local_object_reference: Option<LocalObjectReference>,
+    /// key (field 2, string) — key within the Secret
+    #[prost(string, tag = "2")]
+    key: String,
+    /// optional (field 3, bool) — whether the Secret or key must exist
+    #[prost(bool, tag = "3")]
+    optional: bool,
+}
+
+/// EnvVarSource — api-core-v1-generated.proto message EnvVarSource
+/// Exactly one of the four fields should be set; others are empty/None.
+#[derive(Clone, PartialEq, Message)]
+struct EnvVarSource {
+    /// fieldRef (field 1, message ObjectFieldSelector)
+    #[prost(message, tag = "1")]
+    field_ref: Option<ObjectFieldSelector>,
+    /// resourceFieldRef (field 2, message ResourceFieldSelector)
+    #[prost(message, tag = "2")]
+    resource_field_ref: Option<ResourceFieldSelector>,
+    /// configMapKeyRef (field 3, message ConfigMapKeySelector)
+    #[prost(message, tag = "3")]
+    config_map_key_ref: Option<ConfigMapKeySelector>,
+    /// secretKeyRef (field 4, message SecretKeySelector)
+    #[prost(message, tag = "4")]
+    secret_key_ref: Option<SecretKeySelector>,
+}
+
+/// EnvVar — api-core-v1-generated.proto message EnvVar
+/// One environment variable to set in a container.
+/// field 1 = name (string), field 2 = value (string), field 3 = valueFrom (EnvVarSource)
+#[derive(Clone, PartialEq, Message)]
+struct EnvVar {
+    /// name (field 1, string) — name of the environment variable
+    #[prost(string, tag = "1")]
+    name: String,
+    /// value (field 2, string) — literal value (mutually exclusive with value_from)
+    #[prost(string, tag = "2")]
+    value: String,
+    /// valueFrom (field 3, message EnvVarSource) — source for the value
+    #[prost(message, tag = "3")]
+    value_from: Option<EnvVarSource>,
+}
+
 /// Container — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Container
 #[derive(Clone, PartialEq, Message)]
@@ -636,6 +706,9 @@ struct Container {
     /// args (field 4, repeated string)
     #[prost(string, repeated, tag = "4")]
     args: Vec<String>,
+    /// env (field 7, repeated EnvVar) — environment variables for the container
+    #[prost(message, repeated, tag = "7")]
+    env: Vec<EnvVar>,
     /// resources (field 8, message ResourceRequirements)
     #[prost(message, tag = "8")]
     resources: Option<ResourceRequirements>,
@@ -3576,6 +3649,124 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
                         c.args.into_iter().map(serde_json::Value::String).collect(),
                     ),
                 );
+            }
+            if !c.env.is_empty() {
+                let env_json: Vec<serde_json::Value> = c
+                    .env
+                    .into_iter()
+                    .map(|ev| {
+                        let mut em = serde_json::Map::new();
+                        if !ev.name.is_empty() {
+                            em.insert("name".to_string(), serde_json::Value::String(ev.name));
+                        }
+                        if !ev.value.is_empty() {
+                            em.insert("value".to_string(), serde_json::Value::String(ev.value));
+                        }
+                        if let Some(vf) = ev.value_from {
+                            let mut vfm = serde_json::Map::new();
+                            if let Some(fr) = vf.field_ref {
+                                let mut frm = serde_json::Map::new();
+                                if !fr.api_version.is_empty() {
+                                    frm.insert(
+                                        "apiVersion".to_string(),
+                                        serde_json::Value::String(fr.api_version),
+                                    );
+                                }
+                                if !fr.field_path.is_empty() {
+                                    frm.insert(
+                                        "fieldPath".to_string(),
+                                        serde_json::Value::String(fr.field_path),
+                                    );
+                                }
+                                vfm.insert("fieldRef".to_string(), serde_json::Value::Object(frm));
+                            }
+                            if let Some(rfr) = vf.resource_field_ref {
+                                let mut rfrm = serde_json::Map::new();
+                                if !rfr.container_name.is_empty() {
+                                    rfrm.insert(
+                                        "containerName".to_string(),
+                                        serde_json::Value::String(rfr.container_name),
+                                    );
+                                }
+                                if !rfr.resource.is_empty() {
+                                    rfrm.insert(
+                                        "resource".to_string(),
+                                        serde_json::Value::String(rfr.resource),
+                                    );
+                                }
+                                if let Some(divisor_str) = rfr.divisor.and_then(|q| q.string) {
+                                    if !divisor_str.is_empty() {
+                                        rfrm.insert(
+                                            "divisor".to_string(),
+                                            serde_json::Value::String(divisor_str),
+                                        );
+                                    }
+                                }
+                                vfm.insert(
+                                    "resourceFieldRef".to_string(),
+                                    serde_json::Value::Object(rfrm),
+                                );
+                            }
+                            if let Some(cmkr) = vf.config_map_key_ref {
+                                let mut cmkrm = serde_json::Map::new();
+                                if let Some(lor) = cmkr.local_object_reference {
+                                    if !lor.name.is_empty() {
+                                        cmkrm.insert(
+                                            "name".to_string(),
+                                            serde_json::Value::String(lor.name),
+                                        );
+                                    }
+                                }
+                                if !cmkr.key.is_empty() {
+                                    cmkrm.insert(
+                                        "key".to_string(),
+                                        serde_json::Value::String(cmkr.key),
+                                    );
+                                }
+                                if cmkr.optional {
+                                    cmkrm.insert(
+                                        "optional".to_string(),
+                                        serde_json::Value::Bool(cmkr.optional),
+                                    );
+                                }
+                                vfm.insert(
+                                    "configMapKeyRef".to_string(),
+                                    serde_json::Value::Object(cmkrm),
+                                );
+                            }
+                            if let Some(skr) = vf.secret_key_ref {
+                                let mut skrm = serde_json::Map::new();
+                                if let Some(lor) = skr.local_object_reference {
+                                    if !lor.name.is_empty() {
+                                        skrm.insert(
+                                            "name".to_string(),
+                                            serde_json::Value::String(lor.name),
+                                        );
+                                    }
+                                }
+                                if !skr.key.is_empty() {
+                                    skrm.insert(
+                                        "key".to_string(),
+                                        serde_json::Value::String(skr.key),
+                                    );
+                                }
+                                if skr.optional {
+                                    skrm.insert(
+                                        "optional".to_string(),
+                                        serde_json::Value::Bool(skr.optional),
+                                    );
+                                }
+                                vfm.insert(
+                                    "secretKeyRef".to_string(),
+                                    serde_json::Value::Object(skrm),
+                                );
+                            }
+                            em.insert("valueFrom".to_string(), serde_json::Value::Object(vfm));
+                        }
+                        serde_json::Value::Object(em)
+                    })
+                    .collect();
+                cm.insert("env".to_string(), serde_json::Value::Array(env_json));
             }
             if let Some(res) = c.resources {
                 let mut res_map = serde_json::Map::new();
@@ -9129,6 +9320,96 @@ mod tests {
         assert_eq!(
             sources[0]["serviceAccountToken"]["expirationSeconds"], 3600,
             "expirationSeconds must be 3600 — kubelet uses this to schedule token rotation"
+        );
+    }
+
+    /// decode_pod_proto must preserve container.env (field 7) in decoded JSON.
+    ///
+    /// When client-go submits pods via protobuf (the default), env vars are encoded in
+    /// Container.env (field 7, repeated EnvVar). Before this fix, field 7 was absent from
+    /// the Container struct, so ALL env vars were silently dropped. Kubelet received containers
+    /// with no environment, so env-dependent tests (Downward API env vars like POD_NAME,
+    /// POD_UID, HOST_IP; ConfigMap/Secret env injection) all failed because the containers
+    /// simply did not see the expected variables.
+    ///
+    /// This test must fail if:
+    /// - EnvVar struct is removed
+    /// - field 7 (env) is removed from Container
+    /// - the env serialization block in pod_spec_to_json is removed
+    /// - EnvVarSource field tags are wrong (drops valueFrom env vars silently)
+    #[test]
+    fn decode_pod_proto_preserves_container_env_vars() {
+        // Build proto bytes for a pod with two env vars:
+        //   1. POD_NAME with plain value "my-pod"
+        //   2. MY_FIELD with valueFrom.fieldRef {apiVersion:"v1", fieldPath:"metadata.name"}
+
+        // EnvVar { name (field 1) = "POD_NAME", value (field 2) = "my-pod" }
+        let mut plain_env = encode_length_delimited(1, b"POD_NAME");
+        plain_env.extend_from_slice(&encode_length_delimited(2, b"my-pod"));
+
+        // ObjectFieldSelector { apiVersion (field 1) = "v1", fieldPath (field 2) = "metadata.name" }
+        let mut field_selector = encode_length_delimited(1, b"v1");
+        field_selector.extend_from_slice(&encode_length_delimited(2, b"metadata.name"));
+
+        // EnvVarSource { fieldRef (field 1) = ObjectFieldSelector }
+        let env_var_source = encode_length_delimited(1, &field_selector);
+
+        // EnvVar { name (field 1) = "MY_FIELD", valueFrom (field 3) = EnvVarSource }
+        let mut downward_env = encode_length_delimited(1, b"MY_FIELD");
+        downward_env.extend_from_slice(&encode_length_delimited(3, &env_var_source));
+
+        // Container { name (field 1), image (field 2), env (field 7) x2 }
+        let mut container = encode_length_delimited(1, b"app");
+        container.extend_from_slice(&encode_length_delimited(2, b"app:v1"));
+        container.extend_from_slice(&encode_length_delimited(7, &plain_env));
+        container.extend_from_slice(&encode_length_delimited(7, &downward_env));
+
+        // PodSpec { containers (field 2) = [Container] }
+        let podspec = encode_length_delimited(2, &container);
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"my-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed when Container has env vars at field 7");
+
+        let env = result["spec"]["containers"][0]["env"].as_array().expect(
+            "env must be present in decoded JSON — if absent, kubelet starts the container \
+                 with no environment variables, breaking POD_NAME/POD_UID/HOST_IP injection and \
+                 any ConfigMap/Secret env references",
+        );
+        assert_eq!(
+            env.len(),
+            2,
+            "both env vars must decode; if EnvVar struct or Container.env field 7 is missing, \
+             the repeated message is silently dropped and the array is absent or empty"
+        );
+        assert_eq!(
+            env[0]["name"], "POD_NAME",
+            "first env var name must be 'POD_NAME'"
+        );
+        assert_eq!(
+            env[0]["value"], "my-pod",
+            "plain-value env var must serialize as 'value' key — kubelet uses this verbatim"
+        );
+        assert_eq!(
+            env[1]["name"], "MY_FIELD",
+            "second env var name must be 'MY_FIELD'"
+        );
+        assert!(
+            env[1].get("value").is_none() || env[1]["value"] == "",
+            "valueFrom env var must not have a non-empty 'value' key"
+        );
+        assert_eq!(
+            env[1]["valueFrom"]["fieldRef"]["apiVersion"], "v1",
+            "valueFrom.fieldRef.apiVersion must be 'v1' — kubelet needs this to resolve the field"
+        );
+        assert_eq!(
+            env[1]["valueFrom"]["fieldRef"]["fieldPath"], "metadata.name",
+            "valueFrom.fieldRef.fieldPath must be 'metadata.name' — this is the Downward API path \
+             the kubelet expands into the actual pod name at runtime"
         );
     }
 }
