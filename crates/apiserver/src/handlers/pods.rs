@@ -487,6 +487,7 @@ pub async fn delete_pod<S: Store>(
 pub async fn patch_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    Query(patch_query): Query<super::json_patch::PatchQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -540,6 +541,11 @@ pub async fn patch_pod<S: Store>(
             .delete(&key, None)
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
+        return Ok(Json(current_obj.body));
+    }
+
+    // Dry-run: validation passed; return the would-be patched object without persisting.
+    if patch_query.is_dry_run() {
         return Ok(Json(current_obj.body));
     }
 
@@ -4326,6 +4332,80 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// SSA PATCH (application/apply-patch+yaml) with ?dryRun=All must return the would-be
+    /// patched pod but must NOT persist the change to the store.
+    ///
+    /// This is the regression test for the dryRun=All bug in patch_pod: before the fix,
+    /// patch_pod read no query params and always wrote to the store, causing
+    /// "kubectl server-side dry-run: update Pods" sonobuoy tests to fail because
+    /// the Pod image was changed on the server when it should not have been.
+    #[tokio::test]
+    async fn patch_pod_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "dry-run-pod",
+            serde_json::json!({
+                "spec": {"containers": [{"name": "app", "image": "nginx:original"}]}
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        // SSA PATCH with dryRun=All: change image to "nginx:new".
+        let patch_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "dry-run-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx:new"}]}
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/dry-run-pod?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/apply-patch+yaml")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "dry-run PATCH must return 200"
+        );
+
+        // Response must show the would-be new image.
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let containers = resp_json["spec"]["containers"].as_array().unwrap();
+        assert_eq!(
+            containers[0]["image"], "nginx:new",
+            "dry-run response must show the would-be new image"
+        );
+
+        // The store must still have the original image — the write was skipped.
+        let stored = store
+            .get("/registry/pods/default/dry-run-pod")
+            .await
+            .unwrap()
+            .expect("pod must still exist in store");
+        let stored_json: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let stored_containers = stored_json["spec"]["containers"].as_array().unwrap();
+        assert_eq!(
+            stored_containers[0]["image"],
+            "nginx:original",
+            "dry-run PATCH must NOT mutate the store — image must remain 'nginx:original'; \
+             if this fails, the dryRun=All guard was removed from patch_pod and the write went through"
+        );
     }
 
     // -----------------------------------------------------------------------
