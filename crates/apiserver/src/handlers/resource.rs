@@ -8187,4 +8187,100 @@ mod tests {
              if this fails, the dryRun=All check in create_namespaced_resource was removed"
         );
     }
+
+    /// SSA PATCH (application/apply-patch+yaml) with ?dryRun=All must return the would-be
+    /// result but must NOT persist the change.  This is the regression test for the kubectl
+    /// diff (Deployment) and kubectl server-side dry-run paths: both send SSA PATCH with
+    /// dryRun=All.  If do_patch's dry_run guard is removed, the stored spec changes.
+    #[tokio::test]
+    async fn ssa_patch_with_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a Lease with holderIdentity="original-ssa-holder".
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/ssa-dry-run-lease";
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "ssa-dry-run-lease",
+                "namespace": "kube-node-lease",
+                "resourceVersion": "1"
+            },
+            "spec": { "holderIdentity": "original-ssa-holder", "leaseDurationSeconds": 40 }
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // SSA PATCH with dryRun=All: change holderIdentity.
+        let patch_body = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "ssa-dry-run-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "new-ssa-holder", "leaseDurationSeconds": 40 }
+        });
+        let dry_run_query = PatchQuery {
+            field_manager: Some("kubectl-client-side-apply".to_string()),
+            _field_validation: None,
+            dry_run: Some("All".to_string()),
+        };
+
+        let mut ssa_headers = axum::http::HeaderMap::new();
+        ssa_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let patch_resp = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "ssa-dry-run-lease".to_string(),
+            )),
+            axum::extract::Query(dry_run_query),
+            ssa_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("SSA dry-run PATCH must succeed: {e:?}"))
+        .into_response();
+
+        // The response must show the would-be new holder.
+        let resp_bytes = to_bytes(patch_resp.into_body(), usize::MAX).await.unwrap();
+        let resp_body: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_body["spec"]["holderIdentity"], "new-ssa-holder",
+            "SSA dry-run response must show the would-be new holderIdentity"
+        );
+
+        // The store must still have the original holder — the write was skipped.
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["spec"]["holderIdentity"], "original-ssa-holder",
+            "SSA PATCH with dryRun=All must NOT mutate the store — holderIdentity must remain \
+             'original-ssa-holder'; if this fails, do_patch's dry_run guard was removed and \
+             kubectl diff / kubectl server-side dry-run tests will fail"
+        );
+    }
 }
