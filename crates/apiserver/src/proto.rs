@@ -217,13 +217,19 @@ struct SleepAction {
 }
 
 /// LifecycleHandler — api-core-v1-generated.proto message LifecycleHandler
-/// field 1 = exec (ExecAction), field 4 = sleep (SleepAction)
-/// httpGet (field 2) and tcpSocket (field 3) are skipped — not decoded.
+/// field 1 = exec (ExecAction), field 2 = httpGet (HTTPGetAction),
+/// field 3 = tcpSocket (TCPSocketAction), field 4 = sleep (SleepAction)
 #[derive(Clone, PartialEq, Message)]
 struct LifecycleHandler {
     /// exec (field 1, message LifecycleExecAction)
     #[prost(message, tag = "1")]
     exec: Option<LifecycleExecAction>,
+    /// httpGet (field 2, message HttpGetProbeAction — same proto shape as HTTPGetAction)
+    #[prost(message, tag = "2")]
+    http_get: Option<HttpGetProbeAction>,
+    /// tcpSocket (field 3, message TcpSocketProbeAction — same proto shape as TCPSocketAction)
+    #[prost(message, tag = "3")]
+    tcp_socket: Option<TcpSocketProbeAction>,
     /// sleep (field 4, message SleepAction)
     #[prost(message, tag = "4")]
     sleep: Option<SleepAction>,
@@ -2310,8 +2316,6 @@ fn probe_to_json(p: Probe) -> serde_json::Value {
 }
 
 /// Convert a decoded `LifecycleHandler` into a `serde_json::Value`.
-///
-/// Only exec and sleep are decoded; httpGet and tcpSocket are skipped (not in the prost struct).
 fn lifecycle_handler_to_json(h: LifecycleHandler) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if let Some(exec) = h.exec {
@@ -2323,6 +2327,35 @@ fn lifecycle_handler_to_json(h: LifecycleHandler) -> serde_json::Value {
                 }),
             );
         }
+    }
+    if let Some(http_get) = h.http_get {
+        let mut hg = serde_json::Map::new();
+        if !http_get.path.is_empty() {
+            hg.insert("path".to_string(), serde_json::Value::String(http_get.path));
+        }
+        if let Some(port) = http_get.port {
+            hg.insert("port".to_string(), port.to_json());
+        }
+        if !http_get.host.is_empty() {
+            hg.insert("host".to_string(), serde_json::Value::String(http_get.host));
+        }
+        if !http_get.scheme.is_empty() {
+            hg.insert(
+                "scheme".to_string(),
+                serde_json::Value::String(http_get.scheme),
+            );
+        }
+        m.insert("httpGet".to_string(), serde_json::Value::Object(hg));
+    }
+    if let Some(tcp) = h.tcp_socket {
+        let mut ts = serde_json::Map::new();
+        if let Some(port) = tcp.port {
+            ts.insert("port".to_string(), port.to_json());
+        }
+        if !tcp.host.is_empty() {
+            ts.insert("host".to_string(), serde_json::Value::String(tcp.host));
+        }
+        m.insert("tcpSocket".to_string(), serde_json::Value::Object(ts));
     }
     if let Some(sleep) = h.sleep {
         m.insert(
@@ -5693,6 +5726,114 @@ mod tests {
         assert!(
             lifecycle["postStart"].is_null(),
             "lifecycle.postStart must not appear when not set in proto"
+        );
+    }
+
+    /// decode_pod_proto must preserve lifecycle.postStart.httpGet in decoded JSON.
+    ///
+    /// When a pod is submitted via protobuf with a postStart httpGet hook, kubelet fires an HTTP
+    /// request to the specified endpoint immediately after the container starts.  If httpGet is
+    /// stripped during proto decode (stored as `postStart: {}`), kubelet attempts to execute an
+    /// empty hook and kills the container with FailedPostStartHook — the pod enters an infinite
+    /// restart loop and never becomes Ready, causing the conformance test
+    /// 'should execute poststart http hook properly' to time out after 300 s.
+    ///
+    /// This test must fail if LifecycleHandler.http_get is removed or if lifecycle_handler_to_json
+    /// omits the httpGet branch.
+    #[test]
+    fn decode_pod_proto_preserves_poststart_http_get_hook() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "hook", namespace: "default" },
+        //   spec: PodSpec {
+        //     containers: [Container {
+        //       name: "hook", image: "pause:3.10",
+        //       lifecycle: Lifecycle {          // Container field 12
+        //         postStart: LifecycleHandler { // Lifecycle field 1
+        //           httpGet: HTTPGetAction {    // LifecycleHandler field 2
+        //             path: "/started",         // HTTPGetAction field 1 (string)
+        //             port: IntOrString(int=8080), // HTTPGetAction field 2 (IntOrString)
+        //             host: "hook-svc",         // HTTPGetAction field 3 (string)
+        //           }
+        //         }
+        //       }
+        //     }]
+        //   }
+        // }
+
+        // Encode IntOrString: type=0 (int) at field 1, intVal=8080 at field 2
+        let mut int_or_string = encode_varint((1u64 << 3) | 0); // field 1, varint wire type
+        int_or_string.extend_from_slice(&encode_varint(0)); // type = 0 (int)
+        int_or_string.extend_from_slice(&encode_varint((2u64 << 3) | 0)); // field 2, varint
+        int_or_string.extend_from_slice(&encode_varint(8080));
+
+        // Encode HTTPGetAction: path at field 1, port at field 2, host at field 3
+        let mut http_get_action = encode_length_delimited(1, b"/started");
+        http_get_action.extend_from_slice(&encode_length_delimited(2, &int_or_string));
+        http_get_action.extend_from_slice(&encode_length_delimited(3, b"hook-svc"));
+
+        // Encode LifecycleHandler: httpGet at field 2
+        let handler = encode_length_delimited(2, &http_get_action);
+
+        // Encode Lifecycle: postStart at field 1
+        let lifecycle = encode_length_delimited(1, &handler);
+
+        // Encode Container: name=field 1, image=field 2, lifecycle=field 12
+        let mut container = encode_length_delimited(1, b"hook");
+        container.extend_from_slice(&encode_length_delimited(2, b"pause:3.10"));
+        container.extend_from_slice(&encode_length_delimited(12, &lifecycle));
+
+        let mut obj_meta = encode_length_delimited(1, b"hook");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        let pod_spec = encode_length_delimited(2, &container); // PodSpec.containers = field 2
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto).expect(
+            "decode_pod_proto must succeed — lifecycle.postStart.httpGet decoding must not panic",
+        );
+
+        assert_eq!(result["metadata"]["name"], "hook");
+
+        let lifecycle = &result["spec"]["containers"][0]["lifecycle"];
+        assert!(
+            lifecycle.is_object(),
+            "lifecycle must be present in decoded JSON — if missing, postStart hook is skipped"
+        );
+
+        let post_start = &lifecycle["postStart"];
+        assert!(
+            post_start.is_object(),
+            "lifecycle.postStart must be present — kubelet reads this to fire the HTTP hook \
+             immediately after container start; if absent, hook fires to wrong endpoint"
+        );
+
+        assert!(
+            post_start["httpGet"].is_object(),
+            "postStart.httpGet must be present in decoded JSON — if stripped, kubelet sees \
+             postStart: {{}} and fires an empty hook, causing FailedPostStartHook and restart loop \
+             (conformance: 'should execute poststart http hook properly')"
+        );
+
+        assert_eq!(
+            post_start["httpGet"]["path"], "/started",
+            "postStart.httpGet.path must be '/started' — kubelet uses this path for the hook request"
+        );
+
+        assert_eq!(
+            post_start["httpGet"]["port"], 8080,
+            "postStart.httpGet.port must be 8080 — kubelet connects to this port for the hook"
+        );
+
+        assert_eq!(
+            post_start["httpGet"]["host"], "hook-svc",
+            "postStart.httpGet.host must be 'hook-svc' — kubelet resolves this host for the hook"
+        );
+
+        // Verify preStop is absent when not encoded
+        assert!(
+            lifecycle["preStop"].is_null(),
+            "lifecycle.preStop must not appear when not set in proto"
         );
     }
 
