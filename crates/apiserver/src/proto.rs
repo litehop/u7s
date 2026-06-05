@@ -690,6 +690,52 @@ struct EnvVar {
     value_from: Option<EnvVarSource>,
 }
 
+/// ConfigMapEnvSource — api-core-v1-generated.proto message ConfigMapEnvSource
+/// Selects a ConfigMap to populate environment variables from.
+/// field 1 = localObjectReference (embedded message, inner field 1 = name string)
+/// field 2 = optional (bool) — whether the ConfigMap must exist
+#[derive(Clone, PartialEq, Message)]
+struct ConfigMapEnvSource {
+    /// localObjectReference (field 1, embedded message) — ConfigMap name
+    #[prost(message, tag = "1")]
+    local_object_reference: Option<LocalObjectReference>,
+    /// optional (field 2, bool) — whether the ConfigMap must be defined
+    #[prost(bool, tag = "2")]
+    optional: bool,
+}
+
+/// SecretEnvSource — api-core-v1-generated.proto message SecretEnvSource
+/// Selects a Secret to populate environment variables from.
+/// field 1 = localObjectReference (embedded message, inner field 1 = name string)
+/// field 2 = optional (bool) — whether the Secret must exist
+#[derive(Clone, PartialEq, Message)]
+struct SecretEnvSource {
+    /// localObjectReference (field 1, embedded message) — Secret name
+    #[prost(message, tag = "1")]
+    local_object_reference: Option<LocalObjectReference>,
+    /// optional (field 2, bool) — whether the Secret must be defined
+    #[prost(bool, tag = "2")]
+    optional: bool,
+}
+
+/// EnvFromSource — api-core-v1-generated.proto message EnvFromSource
+/// Represents the source of a set of ConfigMaps or Secrets as env vars.
+/// field 1 = prefix (string) — optional prefix for each env var key
+/// field 2 = configMapRef (message ConfigMapEnvSource)
+/// field 3 = secretRef (message SecretEnvSource)
+#[derive(Clone, PartialEq, Message)]
+struct EnvFromSource {
+    /// prefix (field 1, string) — optional prefix prepended to each key
+    #[prost(string, tag = "1")]
+    prefix: String,
+    /// configMapRef (field 2, message ConfigMapEnvSource)
+    #[prost(message, tag = "2")]
+    config_map_ref: Option<ConfigMapEnvSource>,
+    /// secretRef (field 3, message SecretEnvSource)
+    #[prost(message, tag = "3")]
+    secret_ref: Option<SecretEnvSource>,
+}
+
 /// Container — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Container
 #[derive(Clone, PartialEq, Message)]
@@ -709,6 +755,9 @@ struct Container {
     /// env (field 7, repeated EnvVar) — environment variables for the container
     #[prost(message, repeated, tag = "7")]
     env: Vec<EnvVar>,
+    /// envFrom (field 19, repeated EnvFromSource) — environment from ConfigMap/Secret
+    #[prost(message, repeated, tag = "19")]
+    env_from: Vec<EnvFromSource>,
     /// resources (field 8, message ResourceRequirements)
     #[prost(message, tag = "8")]
     resources: Option<ResourceRequirements>,
@@ -3767,6 +3816,59 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
                     })
                     .collect();
                 cm.insert("env".to_string(), serde_json::Value::Array(env_json));
+            }
+            if !c.env_from.is_empty() {
+                let env_from_json: Vec<serde_json::Value> = c
+                    .env_from
+                    .into_iter()
+                    .map(|ef| {
+                        let mut efm = serde_json::Map::new();
+                        if !ef.prefix.is_empty() {
+                            efm.insert("prefix".to_string(), serde_json::Value::String(ef.prefix));
+                        }
+                        if let Some(cmr) = ef.config_map_ref {
+                            let mut cmrm = serde_json::Map::new();
+                            if let Some(lor) = cmr.local_object_reference {
+                                if !lor.name.is_empty() {
+                                    cmrm.insert(
+                                        "name".to_string(),
+                                        serde_json::Value::String(lor.name),
+                                    );
+                                }
+                            }
+                            if cmr.optional {
+                                cmrm.insert(
+                                    "optional".to_string(),
+                                    serde_json::Value::Bool(cmr.optional),
+                                );
+                            }
+                            efm.insert("configMapRef".to_string(), serde_json::Value::Object(cmrm));
+                        }
+                        if let Some(sr) = ef.secret_ref {
+                            let mut srm = serde_json::Map::new();
+                            if let Some(lor) = sr.local_object_reference {
+                                if !lor.name.is_empty() {
+                                    srm.insert(
+                                        "name".to_string(),
+                                        serde_json::Value::String(lor.name),
+                                    );
+                                }
+                            }
+                            if sr.optional {
+                                srm.insert(
+                                    "optional".to_string(),
+                                    serde_json::Value::Bool(sr.optional),
+                                );
+                            }
+                            efm.insert("secretRef".to_string(), serde_json::Value::Object(srm));
+                        }
+                        serde_json::Value::Object(efm)
+                    })
+                    .collect();
+                cm.insert(
+                    "envFrom".to_string(),
+                    serde_json::Value::Array(env_from_json),
+                );
             }
             if let Some(res) = c.resources {
                 let mut res_map = serde_json::Map::new();
@@ -9410,6 +9512,163 @@ mod tests {
             env[1]["valueFrom"]["fieldRef"]["fieldPath"], "metadata.name",
             "valueFrom.fieldRef.fieldPath must be 'metadata.name' — this is the Downward API path \
              the kubelet expands into the actual pod name at runtime"
+        );
+    }
+
+    /// decode_pod_proto must preserve container.env[].valueFrom.configMapKeyRef in decoded JSON.
+    ///
+    /// When client-go submits pods via protobuf (the default for built-in types), env vars
+    /// sourced from ConfigMaps are encoded as EnvVarSource.configMapKeyRef (field 3).
+    /// If this field is not decoded, the kubelet receives the env entry without a configMapKeyRef,
+    /// skips ConfigMap resolution entirely, and the container never sees the expected env value.
+    ///
+    /// This is the regression test for the conformance failure
+    /// "ConfigMap should be consumable as environment variable names":
+    /// the pod ran successfully but env output showed only KUBERNETES_* vars — no data-1=value-1.
+    ///
+    /// This test MUST FAIL if:
+    /// - ConfigMapKeySelector struct is removed or field tags change
+    /// - field 3 (config_map_key_ref) is removed from EnvVarSource
+    /// - the configMapKeyRef serialisation block in pod_spec_to_json is removed
+    /// - LocalObjectReference.name is at a wrong tag (name would be empty → kubelet can't find the CM)
+    #[test]
+    fn decode_pod_proto_preserves_configmap_key_ref_env_var() {
+        // Build proto bytes for a pod with one env var sourced from a ConfigMap:
+        //   name="DATA_1", valueFrom.configMapKeyRef = {name:"test-cm", key:"data-1"}
+
+        // LocalObjectReference { name (field 1) = "test-cm" }
+        let local_obj_ref = encode_length_delimited(1, b"test-cm");
+
+        // ConfigMapKeySelector { localObjectReference (field 1) = ..., key (field 2) = "data-1" }
+        let mut cm_key_sel = encode_length_delimited(1, &local_obj_ref);
+        cm_key_sel.extend_from_slice(&encode_length_delimited(2, b"data-1"));
+
+        // EnvVarSource { configMapKeyRef (field 3) = ConfigMapKeySelector }
+        let env_var_source = encode_length_delimited(3, &cm_key_sel);
+
+        // EnvVar { name (field 1) = "DATA_1", valueFrom (field 3) = EnvVarSource }
+        let mut env_var = encode_length_delimited(1, b"DATA_1");
+        env_var.extend_from_slice(&encode_length_delimited(3, &env_var_source));
+
+        // Container { name (field 1), image (field 2), env (field 7) }
+        let mut container = encode_length_delimited(1, b"app");
+        container.extend_from_slice(&encode_length_delimited(2, b"busybox"));
+        container.extend_from_slice(&encode_length_delimited(7, &env_var));
+
+        // PodSpec { containers (field 2) }
+        let podspec = encode_length_delimited(2, &container);
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"my-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed when Container has configMapKeyRef env var");
+
+        let env = result["spec"]["containers"][0]["env"].as_array().expect(
+            "env must be present in decoded JSON — if absent, kubelet starts the container \
+             with no environment, so ConfigMap-sourced vars are never injected",
+        );
+        assert_eq!(
+            env.len(),
+            1,
+            "exactly one env var must decode; if configMapKeyRef handling is removed, \
+             the env array would be empty or the valueFrom entry would be silently dropped"
+        );
+        assert_eq!(env[0]["name"], "DATA_1", "env var name must be 'DATA_1'");
+        assert!(
+            env[0].get("value").is_none() || env[0]["value"] == "",
+            "configMapKeyRef env var must not have a literal 'value' field — \
+             kubelet injects the value by resolving the ConfigMap at pod startup"
+        );
+        assert_eq!(
+            env[0]["valueFrom"]["configMapKeyRef"]["name"], "test-cm",
+            "configMapKeyRef.name must be 'test-cm' — kubelet uses this to fetch the ConfigMap; \
+             if empty or absent, the kubelet cannot find the ConfigMap and skips env injection \
+             (conformance: 'ConfigMap should be consumable as environment variable names')"
+        );
+        assert_eq!(
+            env[0]["valueFrom"]["configMapKeyRef"]["key"], "data-1",
+            "configMapKeyRef.key must be 'data-1' — kubelet looks up this key in the ConfigMap's \
+             data map to get the env var value; if wrong, the kubelet reads a different key"
+        );
+    }
+
+    /// decode_pod_proto must preserve container.envFrom[].configMapRef in decoded JSON.
+    ///
+    /// `envFrom` (Container field 19) is the bulk env-injection feature: ALL keys from a
+    /// ConfigMap become env vars in the container, optionally with a prefix.
+    /// If envFrom is not decoded from proto, the kubelet receives a container with no envFrom
+    /// and never populates the env vars from the ConfigMap.
+    ///
+    /// This is the regression test for the conformance failure
+    /// "ConfigMap should be consumable via the environment":
+    /// the pod ran successfully but no ConfigMap-sourced env vars were present.
+    ///
+    /// This test MUST FAIL if:
+    /// - EnvFromSource struct is removed or field tags change
+    /// - field 19 (envFrom) is removed from Container
+    /// - the envFrom serialisation block in pod_spec_to_json is removed
+    /// - ConfigMapEnvSource.localObjectReference is at the wrong tag (name is empty → kubelet can't find the CM)
+    #[test]
+    fn decode_pod_proto_preserves_env_from_configmap_ref() {
+        // Build proto bytes for a pod with envFrom referencing a ConfigMap:
+        //   envFrom = [{prefix: "CM_", configMapRef: {name: "test-cm"}}]
+
+        // LocalObjectReference { name (field 1) = "test-cm" }
+        let local_obj_ref = encode_length_delimited(1, b"test-cm");
+
+        // ConfigMapEnvSource { localObjectReference (field 1) = ..., optional absent (false) }
+        let cm_env_source = encode_length_delimited(1, &local_obj_ref);
+
+        // EnvFromSource { prefix (field 1) = "CM_", configMapRef (field 2) = ConfigMapEnvSource }
+        let mut env_from_source = encode_length_delimited(1, b"CM_");
+        env_from_source.extend_from_slice(&encode_length_delimited(2, &cm_env_source));
+
+        // Container { name (field 1), image (field 2), envFrom (field 19) }
+        let mut container = encode_length_delimited(1, b"app");
+        container.extend_from_slice(&encode_length_delimited(2, b"busybox"));
+        container.extend_from_slice(&encode_length_delimited(19, &env_from_source));
+
+        // PodSpec { containers (field 2) }
+        let podspec = encode_length_delimited(2, &container);
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"my-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed when Container has envFrom at field 19");
+
+        let env_from = result["spec"]["containers"][0]["envFrom"]
+            .as_array()
+            .expect(
+            "envFrom must be present in decoded JSON — if absent, kubelet starts the container \
+             without bulk ConfigMap env injection (conformance: \
+             'ConfigMap should be consumable via the environment')",
+        );
+        assert_eq!(
+            env_from.len(),
+            1,
+            "exactly one envFrom entry must decode; if envFrom field 19 is missing from \
+             Container or EnvFromSource is not decoded, the array would be absent or empty"
+        );
+        assert_eq!(
+            env_from[0]["prefix"], "CM_",
+            "envFrom prefix must be 'CM_' — kubelet prepends this to each key from the ConfigMap \
+             to form the env var name (e.g. CM_data-1=value-1)"
+        );
+        assert_eq!(
+            env_from[0]["configMapRef"]["name"], "test-cm",
+            "configMapRef.name must be 'test-cm' — kubelet uses this to fetch the ConfigMap \
+             and inject all its keys as env vars; if empty or absent, no env vars are injected \
+             (conformance: 'ConfigMap should be consumable via the environment')"
+        );
+        assert!(
+            env_from[0]["configMapRef"]["optional"].is_null(),
+            "optional must be absent when not set — kubelet treats absent as false (required)"
         );
     }
 }
