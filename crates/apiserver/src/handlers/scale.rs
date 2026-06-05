@@ -162,7 +162,15 @@ pub async fn put_scale<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    let old_replicas = extract_replicas(&obj.body);
     obj.body["spec"]["replicas"] = serde_json::Value::Number(new_replicas.into());
+
+    // Increment generation when spec.replicas changes — controllers use
+    // generation/observedGeneration to detect spec drift and trigger reconciliation.
+    if new_replicas != old_replicas {
+        let gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
+        obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
+    }
 
     let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
     let new_rv = state
@@ -206,14 +214,23 @@ pub async fn patch_scale<S: Store>(
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    let old_replicas = extract_replicas(&obj.body);
+
     // Extract replicas from patch if present; otherwise keep current value.
     let new_replicas = if let Some(r) = patch_scale_spec.replicas {
         let r = r as i64;
         obj.body["spec"]["replicas"] = serde_json::json!(r);
         r
     } else {
-        extract_replicas(&obj.body)
+        old_replicas
     };
+
+    // Increment generation when spec.replicas changes — controllers use
+    // generation/observedGeneration to detect spec drift and trigger reconciliation.
+    if new_replicas != old_replicas {
+        let gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
+        obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
+    }
 
     let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
     let new_rv = state
@@ -809,5 +826,186 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // Generation increment on scale change (mayor-pv04 / mayor-js6s)
+    // -----------------------------------------------------------------------
+
+    /// PUT scale that changes spec.replicas must increment metadata.generation.
+    ///
+    /// The StatefulSet controller (KCM) uses generation/observedGeneration to
+    /// detect spec drift and trigger reconciliation. Without generation increment,
+    /// scale-to-0 might not trigger a status update — `status.replicas` stays
+    /// stale and AfterEach cleanup loops for 10 minutes.
+    ///
+    /// This test fails if the generation increment is removed from put_scale.
+    #[tokio::test]
+    async fn put_scale_increments_generation_when_replicas_change() {
+        let (state, store) = make_state();
+        // Seed StatefulSet with generation=1, replicas=3.
+        let key = "/registry/apps/statefulsets/default/web";
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "resourceVersion": "5",
+                "generation": 1
+            },
+            "spec": { "replicas": 3 },
+            "status": { "replicas": 3 }
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&sts).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "spec": { "replicas": 0 }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/statefulsets/web/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Confirm the stored object has generation=2.
+        let stored = store.get(key).await.unwrap().unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["metadata"]["generation"], 2,
+            "generation must be incremented when spec.replicas changes — \
+             the KCM statefulset controller uses generation/observedGeneration \
+             to detect spec drift; without increment, status.replicas may not \
+             be updated after scale-to-0 (mayor-pv04)"
+        );
+    }
+
+    /// PUT scale that does NOT change spec.replicas must NOT increment generation.
+    ///
+    /// Setting replicas to the current value is a no-op; generation must stay
+    /// the same so controllers don't do unnecessary reconciliation work.
+    ///
+    /// This test fails if generation is unconditionally incremented.
+    #[tokio::test]
+    async fn put_scale_does_not_increment_generation_when_replicas_unchanged() {
+        let (state, store) = make_state();
+        let key = "/registry/apps/statefulsets/default/web";
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "resourceVersion": "5",
+                "generation": 2
+            },
+            "spec": { "replicas": 3 },
+            "status": { "replicas": 3 }
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&sts).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        // PUT with the same replicas count.
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "spec": { "replicas": 3 }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/statefulsets/web/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["metadata"]["generation"], 2,
+            "generation must NOT change when spec.replicas is unchanged — \
+             no-op scale must not trigger unnecessary controller reconciliation"
+        );
+    }
+
+    /// PATCH scale that changes spec.replicas must also increment metadata.generation.
+    ///
+    /// Same requirement as put_scale — this test fails if the generation increment
+    /// is removed from patch_scale.
+    #[tokio::test]
+    async fn patch_scale_increments_generation_when_replicas_change() {
+        let (state, store) = make_state();
+        let key = "/registry/apps/statefulsets/default/web";
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "resourceVersion": "5",
+                "generation": 1
+            },
+            "spec": { "replicas": 5 },
+            "status": { "replicas": 5 }
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&sts).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "replicas": 0 } });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/apis/apps/v1/namespaces/default/statefulsets/web/scale")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["metadata"]["generation"], 2,
+            "generation must be incremented by patch_scale when spec.replicas changes — \
+             kubectl scale uses PATCH; without increment the KCM may not reconcile"
+        );
     }
 }

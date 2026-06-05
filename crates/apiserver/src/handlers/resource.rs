@@ -347,6 +347,21 @@ pub async fn replace_resource<S: Store>(
 
     let expected_revision = parse_resource_version(obj.resource_version())?;
 
+    // Read the stored status so we can restore it after the PUT — controllers write
+    // status via /status; a full PUT on the main endpoint must not wipe it out.
+    let stored_status = if meta.has_status_subresource {
+        let key = group_object_key(&group, &plural, None, &name);
+        state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok())
+            .map(|v| v["status"].clone())
+    } else {
+        None
+    };
+
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -362,6 +377,19 @@ pub async fn replace_resource<S: Store>(
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+
+    // Restore the stored status: controllers write status via /status; a full PUT on
+    // the main endpoint must preserve whatever the controller last wrote.
+    if meta.has_status_subresource {
+        match stored_status {
+            Some(ref s) if !s.is_null() => {
+                obj.body["status"] = s.clone();
+            }
+            _ => {
+                obj.body.as_object_mut().map(|m| m.remove("status"));
+            }
+        }
+    }
 
     let key = group_object_key(&group, &plural, None, &name);
     let new_rv = state
@@ -1188,20 +1216,31 @@ pub async fn replace_namespaced_resource<S: Store>(
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
 
-    // Capture spec before defaults/admission so we can increment generation on change.
-    let spec_before_replace = if super::defaults::is_workload_resource(&group, &plural) {
-        state
+    // Read the stored object once: capture spec (for generation increment on workload
+    // resources) and status (to restore after stripping — controllers update status
+    // via the /status subresource; a full PUT must not wipe it out).
+    let needs_stored_read =
+        super::defaults::is_workload_resource(&group, &plural) || meta.has_status_subresource;
+    let (spec_before_replace, stored_status) = if needs_stored_read {
+        let parsed = state
             .store
             .get(&key)
             .await
             .map_err(|e| Status::internal(e.to_string()))?
-            .and_then(|stored| {
-                serde_json::from_slice::<serde_json::Value>(&stored.value)
-                    .ok()
-                    .map(|v| v["spec"].clone())
-            })
+            .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+        let spec = if super::defaults::is_workload_resource(&group, &plural) {
+            parsed.as_ref().map(|v| v["spec"].clone())
+        } else {
+            None
+        };
+        let status = if meta.has_status_subresource {
+            parsed.as_ref().map(|v| v["status"].clone())
+        } else {
+            None
+        };
+        (spec, status)
     } else {
-        None
+        (None, None)
     };
 
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
@@ -1222,6 +1261,19 @@ pub async fn replace_namespaced_resource<S: Store>(
 
     if let Some(ref spec_before) = spec_before_replace {
         super::defaults::increment_workload_generation_if_spec_changed(&mut obj.body, spec_before);
+    }
+
+    // Restore the stored status: controllers write status via /status; a full PUT on
+    // the main endpoint must preserve whatever the controller last wrote.
+    if meta.has_status_subresource {
+        match stored_status {
+            Some(ref s) if !s.is_null() => {
+                obj.body["status"] = s.clone();
+            }
+            _ => {
+                obj.body.as_object_mut().map(|m| m.remove("status"));
+            }
+        }
     }
 
     let new_rv = state
@@ -7584,6 +7636,218 @@ mod tests {
                 .unwrap_or("")
                 .contains("being terminated"),
             "error message must say namespace is being terminated"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Status preservation on PUT (mayor-pv04)
+    // -----------------------------------------------------------------------
+
+    /// PUT (full replace) on a StatefulSet must preserve the current stored status.
+    ///
+    /// Real kube-apiserver strips status from PUT bodies on the main endpoint
+    /// AND restores the currently-stored status — controllers write status via
+    /// /status; a spec-only PUT must not wipe their work.
+    ///
+    /// Without this fix, after `kubectl apply`, status.replicas resets to 0 or
+    /// disappears. The KCM statefulset controller then must re-update status from
+    /// scratch, but if there are concurrent OCC conflicts it may never converge
+    /// — causing AfterEach to poll status.replicas==0 for 10 minutes (mayor-pv04).
+    ///
+    /// This test fails if the status restoration is removed from
+    /// replace_namespaced_resource.
+    #[tokio::test]
+    async fn put_statefulset_preserves_stored_status() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Seed a StatefulSet with status.replicas = 3 (set by KCM).
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "generation": 1,
+                "uid": "aaaa-bbbb"
+            },
+            "spec": {
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "nginx" } },
+                "template": {
+                    "metadata": { "labels": { "app": "nginx" } },
+                    "spec": { "containers": [{ "name": "nginx", "image": "nginx:latest" }] }
+                }
+            },
+            "status": { "replicas": 3, "readyReplicas": 3, "observedGeneration": 1 }
+        });
+        let key = "/registry/apps/statefulsets/default/web";
+        let stored_rv = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Client (kubectl scale / apply) PUTs spec-only body — no status field.
+        // The stored status.replicas=3 must survive this PUT.
+        let put_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "resourceVersion": stored_rv.to_string()
+            },
+            "spec": {
+                "replicas": 0,
+                "selector": { "matchLabels": { "app": "nginx" } },
+                "template": {
+                    "metadata": { "labels": { "app": "nginx" } },
+                    "spec": { "containers": [{ "name": "nginx", "image": "nginx:latest" }] }
+                }
+            }
+        });
+
+        let result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "statefulsets".to_string(),
+                "web".to_string(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("PUT StatefulSet must succeed, got: {e:?}"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::OK);
+
+        // Read the stored object and verify status is preserved.
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["replicas"], 3,
+            "status.replicas must be preserved after full PUT — the KCM writes \
+             status via /status; a spec-only PUT must not wipe it out (mayor-pv04)"
+        );
+        assert_eq!(
+            v["status"]["readyReplicas"], 3,
+            "status.readyReplicas must be preserved after full PUT"
+        );
+        // The spec change must be applied.
+        assert_eq!(
+            v["spec"]["replicas"], 0,
+            "spec.replicas must be updated by the PUT"
+        );
+    }
+
+    /// PUT with an explicit status field in the body must NOT use the body's status
+    /// — it must be stripped and the stored status used instead.
+    ///
+    /// This ensures clients cannot accidentally reset status via the main endpoint.
+    /// This test fails if status stripping is removed from replace_namespaced_resource.
+    #[tokio::test]
+    async fn put_statefulset_ignores_body_status_uses_stored_status() {
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Seed StatefulSet with status.replicas=5 (KCM-set).
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {
+                "name": "web",
+                "namespace": "default"
+            },
+            "spec": {
+                "replicas": 5,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
+                }
+            },
+            "status": { "replicas": 5, "readyReplicas": 5 }
+        });
+        let key = "/registry/apps/statefulsets/default/web";
+        let stored_rv = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Client PUTs with a stale/wrong status — must be ignored.
+        let put_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default", "resourceVersion": stored_rv.to_string() },
+            "spec": {
+                "replicas": 5,
+                "selector": { "matchLabels": { "app": "web" } },
+                "template": {
+                    "metadata": { "labels": { "app": "web" } },
+                    "spec": { "containers": [{ "name": "web", "image": "nginx" }] }
+                }
+            },
+            "status": { "replicas": 0, "readyReplicas": 0 }
+        });
+
+        let result = replace_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "statefulsets".to_string(),
+                "web".to_string(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("PUT must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(result.status(), axum::http::StatusCode::OK);
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["status"]["replicas"], 5,
+            "body status (replicas=0) must be ignored; stored status (replicas=5) \
+             must be preserved — the main endpoint must not let clients reset status"
         );
     }
 }
