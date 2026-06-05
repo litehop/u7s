@@ -2036,7 +2036,7 @@ fn object_meta_to_json(meta: ObjectMeta) -> serde_json::Value {
         m["resourceVersion"] = serde_json::Value::String(meta.resource_version);
     }
     if let Some(ts) = meta.creation_timestamp {
-        if ts.seconds != 0 {
+        if ts.seconds > 0 {
             m["creationTimestamp"] =
                 serde_json::Value::String(crate::util::secs_to_rfc3339(ts.seconds as u64));
         }
@@ -2669,7 +2669,7 @@ pub fn decode_lease_proto(data: &[u8]) -> Option<serde_json::Value> {
             );
         }
         if let Some(t) = spec.acquire_time {
-            if t.seconds != 0 {
+            if t.seconds > 0 {
                 let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
                     t.seconds as u64,
                 ));
@@ -2677,7 +2677,7 @@ pub fn decode_lease_proto(data: &[u8]) -> Option<serde_json::Value> {
             }
         }
         if let Some(t) = spec.renew_time {
-            if t.seconds != 0 {
+            if t.seconds > 0 {
                 let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
                     t.seconds as u64,
                 ));
@@ -2796,7 +2796,7 @@ pub fn decode_event_proto(data: &[u8]) -> Option<serde_json::Value> {
             );
         }
         if let Some(t) = s.last_observed_time {
-            if t.seconds != 0 {
+            if t.seconds > 0 {
                 let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
                     t.seconds as u64,
                 ));
@@ -6275,6 +6275,64 @@ mod tests {
             result["spec"]["leaseTransitions"], 3,
             "leaseTransitions must be preserved; dropping it makes leader election \
              metrics report zero transitions and hides controller restart storms"
+        );
+    }
+
+    /// Regression test for mayor-z7v0: MicroTime with seconds = -1 must NOT produce
+    /// year 584554049254 ("584554049254-11-09T...").
+    ///
+    /// Root cause: `t.seconds as u64` for negative i64 wraps to a huge u64 value
+    /// (e.g. -1_i64 as u64 = u64::MAX ≈ 1.845×10^19), which `secs_to_rfc3339` then
+    /// renders as year ~584554049254. client-go fails to parse the timestamp, causing
+    /// the Lease API conformance test to fail.
+    ///
+    /// Fix: guard changed from `!= 0` to `> 0` so negative (corrupted) seconds values
+    /// are silently dropped instead of casting to a wildly wrong u64.
+    ///
+    /// This test fails if the guard is reverted to `!= 0`: the `acquireTime` and
+    /// `renewTime` keys would be present with year-584554049254 values instead of absent.
+    #[test]
+    fn decode_lease_proto_negative_microseconds_seconds_does_not_overflow_year() {
+        // Build a Lease with MicroTime where seconds = -1 (encoded as the
+        // 10-byte all-1s varint that represents -1 in two's-complement int64).
+        // This simulates a corrupted or misencoded MicroTime field.
+        //
+        // -1 in proto varint = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]
+        // (10 bytes — the canonical encoding of -1 as int64 varint)
+        let neg_one_varint: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+
+        let obj_meta = encode_length_delimited(1, b"test-lease");
+
+        // renewTime (field 4, wire 2) with seconds = -1 (field 1, wire 0)
+        let mut renew_time_msg = encode_varint(1 << 3); // field 1, wire 0
+        renew_time_msg.extend_from_slice(neg_one_varint);
+        let mut lease_spec = encode_length_delimited(4, &renew_time_msg);
+
+        // acquireTime (field 3, wire 2) with seconds = -1
+        let mut acquire_time_msg = encode_varint(1 << 3); // field 1, wire 0
+        acquire_time_msg.extend_from_slice(neg_one_varint);
+        lease_spec = {
+            let mut s = encode_length_delimited(3, &acquire_time_msg);
+            s.extend_from_slice(&lease_spec);
+            s
+        };
+
+        let mut lease_proto = encode_length_delimited(1, &obj_meta);
+        lease_proto.extend_from_slice(&encode_length_delimited(2, &lease_spec));
+
+        let result = decode_lease_proto(&lease_proto).expect("must decode Lease proto");
+
+        assert!(
+            result["spec"]["renewTime"].is_null(),
+            "renewTime with seconds=-1 must be absent, not year-584554049254; \
+             got: {} — negative MicroTime seconds must be dropped, not cast to u64::MAX",
+            result["spec"]["renewTime"]
+        );
+        assert!(
+            result["spec"]["acquireTime"].is_null(),
+            "acquireTime with seconds=-1 must be absent, not year-584554049254; \
+             got: {} — negative MicroTime seconds must be dropped, not cast to u64::MAX",
+            result["spec"]["acquireTime"]
         );
     }
 
