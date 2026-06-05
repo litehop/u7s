@@ -26,7 +26,7 @@ use super::generic::{
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
-    strip_managed_fields, CreateQuery, PatchQuery, PatchType,
+    strip_managed_fields, CreateQuery, PatchQuery, PatchType, ReplaceQuery,
 };
 use super::watch::{fetch_initial_events, watch_generic, WatchConfig};
 
@@ -261,6 +261,16 @@ pub async fn create_resource<S: Store>(
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
+    // Dry-run: validation and admission passed; return the would-be created object without persisting.
+    if create_query.is_dry_run() {
+        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+        let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
+        if let Some(hv) = warn_header {
+            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        }
+        return Ok(resp);
+    }
+
     let key = group_object_key(&group, &plural, None, &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
     let new_rv = match result {
@@ -303,6 +313,7 @@ pub async fn create_resource<S: Store>(
 pub async fn replace_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Query(replace_query): Query<ReplaceQuery>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
@@ -389,6 +400,11 @@ pub async fn replace_resource<S: Store>(
                 obj.body.as_object_mut().map(|m| m.remove("status"));
             }
         }
+    }
+
+    // Dry-run: validation and admission passed; return the would-be result without persisting.
+    if replace_query.is_dry_run() {
+        return Ok(Json(obj.body).into_response());
     }
 
     let key = group_object_key(&group, &plural, None, &name);
@@ -497,6 +513,9 @@ pub(crate) struct PatchConfig<'a> {
     pub field_manager: Option<&'a str>,
     pub patch_type: PatchType,
     pub body: Bytes,
+    /// When true, run all validation but skip the store write.
+    /// Set when `?dryRun=All` is present in the request query string.
+    pub dry_run: bool,
 }
 
 /// Shared patch logic for cluster-scoped and namespaced resources.
@@ -521,6 +540,7 @@ pub(crate) async fn do_patch<S: Store>(
         field_manager,
         patch_type,
         body,
+        dry_run,
     } = cfg;
     let stored_opt = state
         .store
@@ -546,6 +566,15 @@ pub(crate) async fn do_patch<S: Store>(
         super::defaults::apply_defaults(group, plural, &mut obj.body);
         super::defaults::validate_resource(group, plural, &obj.body)
             .map_err(Status::unprocessable_entity)?;
+        if dry_run {
+            // Dry-run: validation passed; return the would-be created object without persisting.
+            if let Some(fm) = field_manager {
+                let api_ver = obj.body["apiVersion"].as_str().unwrap_or("").to_string();
+                let now = crate::util::utc_now_rfc3339();
+                inject_managed_fields(&mut obj.body, fm, &api_ver, &now);
+            }
+            return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
+        }
         let new_rv = match state.store.put(key, obj.to_bytes(), Some(0)).await {
             Ok(rv) => rv,
             Err(StoreError::AlreadyExists { .. }) => {
@@ -680,6 +709,21 @@ pub(crate) async fn do_patch<S: Store>(
     current.body = run_mutating_webhooks(state, current.body, &admission_ctx).await?;
     run_validating_webhooks(state, &current.body, &admission_ctx).await?;
 
+    // Dry-run: validation and admission passed; return the would-be result without persisting.
+    if dry_run {
+        if is_ssa {
+            if let Some(fm) = field_manager {
+                let api_ver = current.body["apiVersion"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let now = crate::util::utc_now_rfc3339();
+                inject_managed_fields(&mut current.body, fm, &api_ver, &now);
+            }
+        }
+        return Ok(Json(current.body).into_response());
+    }
+
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
         .store
@@ -748,6 +792,7 @@ pub async fn patch_resource<S: Store>(
             field_manager: patch_query.field_manager.as_deref(),
             patch_type,
             body,
+            dry_run: patch_query.is_dry_run(),
         },
     )
     .await
@@ -1025,6 +1070,16 @@ pub async fn create_namespaced_resource<S: Store>(
     // ResourceQuota: ensure object count does not exceed hard limits.
     quota::check_resource_quota(&state, &ns, &group, &plural).await?;
 
+    // Dry-run: validation and admission passed; return the would-be created object without persisting.
+    if create_query.is_dry_run() {
+        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
+        let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
+        if let Some(hv) = warn_header {
+            resp.headers_mut().insert(axum::http::header::WARNING, hv);
+        }
+        return Ok(resp);
+    }
+
     let key = group_object_key(&group, &plural, Some(&ns), &name);
     let result = state.store.put(&key, obj.to_bytes(), Some(0)).await;
     let new_rv = match result {
@@ -1174,6 +1229,7 @@ async fn propagate_rs_revision_to_deployment<S: Store>(
 pub async fn replace_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    Query(replace_query): Query<ReplaceQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1274,6 +1330,11 @@ pub async fn replace_namespaced_resource<S: Store>(
                 obj.body.as_object_mut().map(|m| m.remove("status"));
             }
         }
+    }
+
+    // Dry-run: validation and admission passed; return the would-be result without persisting.
+    if replace_query.is_dry_run() {
+        return Ok(Json(obj.body).into_response());
     }
 
     let new_rv = state
@@ -1428,6 +1489,7 @@ pub async fn patch_namespaced_resource<S: Store>(
             field_manager: patch_query.field_manager.as_deref(),
             patch_type,
             body,
+            dry_run: patch_query.is_dry_run(),
         },
     )
     .await
@@ -1857,6 +1919,7 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             make_lease_body(None),
         )
@@ -1885,6 +1948,7 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             make_lease_body(None),
         )
@@ -1910,6 +1974,7 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             make_lease_body(Some(&rv)),
         )
@@ -1935,6 +2000,7 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             make_lease_body(None),
         )
@@ -1950,6 +2016,7 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             make_lease_body(Some("999")),
         )
@@ -2221,6 +2288,7 @@ mod tests {
                 "leases".to_string(),
                 "worker-node-1".to_string(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             make_lease_body(None),
         )
@@ -2316,6 +2384,7 @@ mod tests {
             axum::extract::Query(PatchQuery {
                 field_manager: Some("argocd".to_string()),
                 _field_validation: None,
+                dry_run: None,
             }),
             ssa_headers.clone(),
             patch_bytes.clone(),
@@ -2390,6 +2459,7 @@ mod tests {
             axum::extract::Query(PatchQuery {
                 field_manager: Some("argocd".to_string()),
                 _field_validation: None,
+                dry_run: None,
             }),
             ssa_headers,
             update_bytes,
@@ -3205,6 +3275,7 @@ mod tests {
                 "csinodes".into(),
                 "replace-node".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -3255,6 +3326,7 @@ mod tests {
                 "csinodes".into(),
                 "rv-node".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -3291,6 +3363,7 @@ mod tests {
                 "csinodes".into(),
                 "rv-node".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -3330,6 +3403,7 @@ mod tests {
                 "csinodes".into(),
                 "stale-node".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -3359,6 +3433,7 @@ mod tests {
                 "csinodes".into(),
                 "stale-node".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -3662,6 +3737,7 @@ mod tests {
                 "leases".into(),
                 "stale-lease".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
         )
@@ -3687,6 +3763,7 @@ mod tests {
                 "leases".into(),
                 "stale-lease".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&stale).unwrap()),
         )
@@ -3967,6 +4044,7 @@ mod tests {
                 "widgets".into(),
                 "my-widget".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -4145,6 +4223,7 @@ mod tests {
                 "widgets".into(),
                 "rns-widget".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
         )
@@ -4630,6 +4709,7 @@ mod tests {
                 "leases".into(),
                 "url-name".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -4667,6 +4747,7 @@ mod tests {
                 "csinodes".into(),
                 "url-name".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -4792,6 +4873,7 @@ mod tests {
                 "csinodes".into(),
                 "test-node".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             Extension(crate::auth::UserInfo {
                 username: "admin".into(),
                 uid: String::new(),
@@ -4828,6 +4910,7 @@ mod tests {
                 "leases".into(),
                 "my-lease".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             bytes::Bytes::from("not json"),
         )
@@ -6473,6 +6556,7 @@ mod tests {
                 "replicasets".into(),
                 "my-rs".into(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             put_bytes,
         )
@@ -7731,6 +7815,7 @@ mod tests {
                 "statefulsets".to_string(),
                 "web".to_string(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -7833,6 +7918,7 @@ mod tests {
                 "statefulsets".to_string(),
                 "web".to_string(),
             )),
+            axum::extract::Query(ReplaceQuery::default()),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -7848,6 +7934,257 @@ mod tests {
             v["status"]["replicas"], 5,
             "body status (replicas=0) must be ignored; stored status (replicas=5) \
              must be preserved — the main endpoint must not let clients reset status"
+        );
+    }
+
+    // -- dryRun=All regression tests --
+    //
+    // These tests verify that ?dryRun=All never mutates the store.
+    // If the fix is reverted (dry_run check removed), the stored object's identity
+    // changes to the patched value, causing the assertion to fail.
+
+    fn merge_patch_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        h
+    }
+
+    /// PATCH with ?dryRun=All must return the would-be patched object but must NOT
+    /// mutate the stored object.  This is the primary regression guard for the fix:
+    /// reverting the dry_run check in do_patch causes the stored holderIdentity to change
+    /// to "patched-holder", failing the assertion.
+    #[tokio::test]
+    async fn patch_with_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a Lease with holderIdentity="original-holder" directly in the store.
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/dry-run-lease";
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "dry-run-lease",
+                "namespace": "kube-node-lease",
+                "resourceVersion": "1"
+            },
+            "spec": { "holderIdentity": "original-holder", "leaseDurationSeconds": 40 }
+        });
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // PATCH with dryRun=All: change holderIdentity.
+        let patch_body = serde_json::json!({"spec": {"holderIdentity": "patched-holder"}});
+        let dry_run_query = PatchQuery {
+            field_manager: None,
+            _field_validation: None,
+            dry_run: Some("All".to_string()),
+        };
+        let patch_resp = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "dry-run-lease".to_string(),
+            )),
+            axum::extract::Query(dry_run_query),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dry-run PATCH must succeed (200): {e:?}"))
+        .into_response();
+
+        // The response must show the would-be patched value.
+        let resp_bytes = to_bytes(patch_resp.into_body(), usize::MAX).await.unwrap();
+        let resp_body: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_body["spec"]["holderIdentity"], "patched-holder",
+            "dry-run response must show the would-be patched value"
+        );
+
+        // But the STORE must still have the original value — the write was skipped.
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["spec"]["holderIdentity"],
+            "original-holder",
+            "dry-run PATCH must NOT mutate the store — holderIdentity must remain 'original-holder'; \
+             if this fails, the dryRun=All check was removed and the write went through"
+        );
+    }
+
+    /// PUT (replace) with ?dryRun=All must return the would-be replaced object but
+    /// must NOT persist it.  Reverting the dry_run check in replace_namespaced_resource
+    /// causes the stored object's holderIdentity to change, failing the assertion.
+    #[tokio::test]
+    async fn replace_with_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // Seed a Lease (no resourceVersion → unconditional create).
+        replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "dry-run-node".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": { "name": "dry-run-node", "namespace": "kube-node-lease" },
+                    "spec": { "holderIdentity": "original-holder", "leaseDurationSeconds": 40 }
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("seed Lease must succeed: {e:?}"));
+
+        // PUT with dryRun=All: change holderIdentity to "new-holder".
+        let dry_run_query = ReplaceQuery {
+            _field_manager: None,
+            dry_run: Some("All".to_string()),
+        };
+        let put_resp = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+                "dry-run-node".to_string(),
+            )),
+            axum::extract::Query(dry_run_query),
+            json_headers(),
+            bytes::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "coordination.k8s.io/v1",
+                    "kind": "Lease",
+                    "metadata": { "name": "dry-run-node", "namespace": "kube-node-lease" },
+                    "spec": { "holderIdentity": "new-holder", "leaseDurationSeconds": 40 }
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dry-run PUT must succeed: {e:?}"))
+        .into_response();
+
+        // Response must show the would-be new holder.
+        let resp_bytes = to_bytes(put_resp.into_body(), usize::MAX).await.unwrap();
+        let resp_body: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(
+            resp_body["spec"]["holderIdentity"], "new-holder",
+            "dry-run PUT response must show the would-be new value"
+        );
+
+        // The store must still have the original holder.
+        let key = crate::keys::group_object_key(
+            "coordination.k8s.io",
+            "leases",
+            Some("kube-node-lease"),
+            "dry-run-node",
+        );
+        let stored = state.store.get(&key).await.unwrap().unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["spec"]["holderIdentity"],
+            "original-holder",
+            "dry-run PUT must NOT mutate the store — holderIdentity must remain 'original-holder'; \
+             if this fails, the dryRun=All check in replace_namespaced_resource was removed"
+        );
+    }
+
+    /// POST with ?dryRun=All must return 201 with the would-be object but must NOT
+    /// persist it.  Reverting the dry_run check in create_namespaced_resource causes
+    /// the store to contain the Lease, failing the assertion.
+    #[tokio::test]
+    async fn create_with_dry_run_all_does_not_mutate_store() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let lease = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "dry-run-new-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "new-node", "leaseDurationSeconds": 40 }
+        });
+        let dry_run_query = CreateQuery {
+            _field_manager: None,
+            field_validation: None,
+            dry_run: Some("All".to_string()),
+        };
+        let create_resp = create_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "coordination.k8s.io".to_string(),
+                "v1".to_string(),
+                "kube-node-lease".to_string(),
+                "leases".to_string(),
+            )),
+            axum::extract::Query(dry_run_query),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("dry-run POST must succeed: {e:?}"))
+        .into_response();
+
+        // Response must be 201 with the would-be object.
+        assert_eq!(
+            create_resp.status(),
+            axum::http::StatusCode::CREATED,
+            "dry-run POST must return 201 CREATED"
+        );
+        let resp_bytes = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+        let resp_body: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+        assert_eq!(resp_body["metadata"]["name"], "dry-run-new-lease");
+
+        // The store must NOT contain the Lease — the write was skipped.
+        let key = crate::keys::group_object_key(
+            "coordination.k8s.io",
+            "leases",
+            Some("kube-node-lease"),
+            "dry-run-new-lease",
+        );
+        let stored = state.store.get(&key).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "dry-run POST must NOT persist the object — store must remain empty; \
+             if this fails, the dryRun=All check in create_namespaced_resource was removed"
         );
     }
 }
