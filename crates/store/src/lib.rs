@@ -187,6 +187,12 @@ pub trait Store: Send + Sync + 'static {
 
 const RING_CAPACITY: usize = 1000;
 const BROADCAST_CAPACITY: usize = 512;
+/// Capacity of the deletion log: how many deletion tombstones are remembered independently
+/// of the main ring buffer. Deletions are rare compared to creates/updates, so this log
+/// retains the last DELETION_LOG_CAPACITY deletions even after the main ring has compacted
+/// them out. This prevents Watch streams from missing DELETED events when the client
+/// reconnects after a 410 Compacted and the deletion happened before the new watch revision.
+const DELETION_LOG_CAPACITY: usize = 1000;
 
 pub struct SqliteStore {
     /// Single write connection. Mutex ensures serial access across spawn_blocking calls.
@@ -201,6 +207,13 @@ pub struct SqliteStore {
     /// Ring buffer of recent events for replay.
     /// std::sync::RwLock so push_event can write synchronously from async context.
     ring: Arc<RwLock<VecDeque<Arc<InternalEvent>>>>,
+    /// Deletion-only log that persists tombstones independently of the main ring buffer.
+    /// When the main ring compacts (evicts old events), deletion events may be lost, causing
+    /// reconnecting watchers to miss DELETED events for objects deleted before the compaction.
+    /// This log retains the last DELETION_LOG_CAPACITY deletions so that before a Compacted
+    /// event is sent, any deletions that would otherwise be invisible to the reconnecting
+    /// client can be replayed.
+    deletion_log: Arc<RwLock<VecDeque<Arc<InternalEvent>>>>,
     /// Lowest revision still in the ring buffer (revision of oldest entry + 1).
     compaction_horizon: Arc<AtomicU64>,
     /// Revision of the most recently committed write. List reads are compared against
@@ -253,6 +266,9 @@ impl SqliteStore {
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let ring = Arc::new(RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)));
+        let deletion_log = Arc::new(RwLock::new(VecDeque::with_capacity(
+            DELETION_LOG_CAPACITY + 1,
+        )));
         let compaction_horizon = Arc::new(AtomicU64::new(0));
         let last_written_revision = Arc::new(AtomicU64::new(0));
 
@@ -261,6 +277,7 @@ impl SqliteStore {
             read_conn,
             tx,
             ring,
+            deletion_log,
             compaction_horizon,
             last_written_revision,
         })
@@ -279,6 +296,17 @@ impl SqliteStore {
                     self.compaction_horizon
                         .store(oldest.revision, Ordering::Relaxed);
                 }
+            }
+        }
+        // Also persist deletion tombstones to the deletion_log independently of the main ring.
+        // When the main ring compacts and evicts old entries, deletion events can be lost.
+        // The deletion_log retains the most recent DELETION_LOG_CAPACITY deletions so that
+        // reconnecting watchers can still see DELETED events even after a compaction cycle.
+        if event.value.is_none() {
+            let mut guard = self.deletion_log.write().expect("deletion_log poisoned");
+            guard.push_back(Arc::clone(&event));
+            if guard.len() > DELETION_LOG_CAPACITY {
+                guard.pop_front();
             }
         }
         // Best-effort broadcast; lagging receivers are dropped automatically.
@@ -1002,10 +1030,28 @@ impl Store for SqliteStore {
         // without terminating the stream when the broadcast channel lags transiently.
         let tx_clone = self.tx.clone();
         let ring_arc = Arc::clone(&self.ring);
+        // Captured to replay deletion tombstones that survived compaction of the main ring.
+        let deletion_log_arc = Arc::clone(&self.deletion_log);
 
         let stream = async_stream::stream! {
             // Yield compacted event if from_revision is before the horizon.
+            // Before yielding Compacted, emit any deletion tombstones from the deletion_log
+            // that the client missed (revision > from_revision). These are deletions that were
+            // compacted out of the main ring buffer — without replaying them here, the client
+            // would reconnect after a relist and never see the DELETED events, deadlocking any
+            // watcher that waits for a DELETED event for an object deleted in the compaction window.
             if from_revision > 0 && from_revision < horizon {
+                let tombstones: Vec<Arc<InternalEvent>> = {
+                    let guard = deletion_log_arc.read().expect("deletion_log poisoned");
+                    guard
+                        .iter()
+                        .filter(|e| e.key.starts_with(&prefix_owned) && e.revision > from_revision)
+                        .cloned()
+                        .collect()
+                };
+                for tombstone in &tombstones {
+                    yield internal_to_watch(tombstone);
+                }
                 yield WatchEvent::Compacted { requested: from_revision, horizon };
                 return;
             }
@@ -1059,8 +1105,28 @@ impl Store for SqliteStore {
                         }
                         // If the ring buffer was also compacted past last_replayed (events lost
                         // from both broadcast and ring buffer), signal the gap to the consumer.
+                        // Before signalling Compacted, replay any deletion tombstones from the
+                        // deletion_log that are not already covered by the ring buffer catchup.
+                        // Without this, a namespace deleted during the lag+compaction window
+                        // would never deliver its DELETED event: the client would reconnect after
+                        // a relist, open a new Watch at the current revision, and wait forever.
                         let current_horizon = compaction_horizon_arc.load(Ordering::Relaxed);
                         if current_horizon > last_replayed {
+                            let tombstones: Vec<Arc<InternalEvent>> = {
+                                let guard = deletion_log_arc.read().expect("deletion_log poisoned");
+                                guard
+                                    .iter()
+                                    .filter(|e| {
+                                        e.key.starts_with(&prefix_owned)
+                                            && e.revision > last_replayed
+                                    })
+                                    .cloned()
+                                    .collect()
+                            };
+                            for tombstone in &tombstones {
+                                last_replayed = last_replayed.max(tombstone.revision);
+                                yield internal_to_watch(tombstone);
+                            }
                             yield WatchEvent::Compacted {
                                 requested: last_replayed,
                                 horizon: current_horizon,
@@ -1446,6 +1512,9 @@ mod tests {
         let ring = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
             RING_CAPACITY + 1,
         )));
+        let deletion_log = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
+            DELETION_LOG_CAPACITY + 1,
+        )));
         let compaction_horizon = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let store = SqliteStore {
@@ -1453,6 +1522,7 @@ mod tests {
             read_conn,
             tx,
             ring,
+            deletion_log,
             compaction_horizon,
             last_written_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -1544,6 +1614,9 @@ mod tests {
         let ring = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
             RING_CAPACITY + 1,
         )));
+        let deletion_log = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
+            DELETION_LOG_CAPACITY + 1,
+        )));
         let compaction_horizon = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let store = Arc::new(SqliteStore {
@@ -1551,6 +1624,7 @@ mod tests {
             read_conn,
             tx,
             ring,
+            deletion_log,
             compaction_horizon,
             last_written_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
@@ -3009,6 +3083,112 @@ mod tests {
             "no extra events expected; pre-existing object ADDED must be filtered out; \
              got: {:?}",
             extra
+        );
+    }
+
+    /// Regression test for mayor-szby: a namespace DELETED event must be delivered to a
+    /// watcher even when the deletion was evicted from the main ring buffer by subsequent writes.
+    ///
+    /// Scenario (12h conformance run):
+    ///   1. Namespace is created at revision C, deleted at revision D.
+    ///      DELETED event enters both the main ring and the deletion_log.
+    ///   2. 1000+ subsequent writes cause the main ring to compact, evicting the DELETED event.
+    ///      compaction_horizon advances past D. deletion_log still holds the tombstone.
+    ///   3. A watcher reconnects (after a prior 410 + relist) and opens a Watch from
+    ///      from_revision=C (its last known position), which is now below the horizon.
+    ///   4. The initial Compacted check fires: from_revision(C) < horizon(D+1).
+    ///      Without the fix: stream emits only WatchEvent::Compacted — DELETED is lost.
+    ///      With the fix: stream emits WatchEvent::Deleted from deletion_log, then Compacted.
+    ///   5. The e2e framework sees the DELETED event and does not deadlock.
+    ///
+    /// This test FAILS if the deletion_log replay is removed: `saw_deleted` would be false.
+    #[tokio::test]
+    async fn watch_deleted_event_replayed_before_compacted_when_deletion_evicted_from_ring() {
+        let store = make_store();
+        let ns_key = "/registry/namespaces/webhook-622";
+
+        // Step 1: Create then delete the namespace.
+        // Both events go into the main ring AND the deletion (only) goes into deletion_log.
+        let ns_json = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "webhook-622" }
+            })
+            .to_string(),
+        );
+        let create_rv = store
+            .put(ns_key, ns_json, Some(0))
+            .await
+            .expect("create namespace");
+        let delete_rv = store.delete(ns_key, None).await.expect("delete namespace");
+        assert!(delete_rv > create_rv, "delete must advance revision");
+
+        // Step 2: Simulate ring buffer compaction by advancing the compaction horizon past
+        // the deletion revision. In production this happens when 1000+ writes follow the
+        // deletion, evicting it from the main ring. The deletion_log retains the tombstone.
+        // We also manually evict from the ring to ensure the main ring cannot cover it.
+        store.set_compaction_horizon_for_test(delete_rv + 1);
+        {
+            // Clear the main ring so the deletion event cannot be replayed from there.
+            // This simulates the scenario where the ring has overflowed past delete_rv.
+            let mut guard = store.ring.write().expect("ring poisoned");
+            guard.clear();
+        }
+
+        // Step 3: Open a Watch from create_rv (the client's last-known position before the
+        // 410 and relist). This is now below the compaction horizon, so the initial Compacted
+        // check fires. The horizon is captured at watch() call time.
+        let stream = store
+            .watch("/registry/namespaces/", create_rv)
+            .await
+            .expect("watch from create_rv");
+        let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
+
+        // Step 4: Collect events. With the fix, we expect:
+        //   - WatchEvent::Deleted { key: ns_key, revision: delete_rv }  (from deletion_log)
+        //   - WatchEvent::Compacted { .. }                               (from_revision < horizon)
+        // Without the fix:
+        //   - WatchEvent::Compacted { .. }  only — DELETED is lost, e2e deadlocks.
+        let mut saw_deleted = false;
+        let mut saw_compacted = false;
+
+        for _ in 0..5 {
+            match next_event(&mut stream).await {
+                Some(WatchEvent::Deleted { key, revision }) => {
+                    assert_eq!(
+                        key, ns_key,
+                        "DELETED event must identify the deleted namespace key"
+                    );
+                    assert_eq!(
+                        revision, delete_rv,
+                        "DELETED event must carry the original deletion revision"
+                    );
+                    saw_deleted = true;
+                }
+                Some(WatchEvent::Compacted { .. }) => {
+                    saw_compacted = true;
+                    break; // stream ends after Compacted
+                }
+                Some(other) => {
+                    panic!("unexpected event before Compacted: {:?}", other);
+                }
+                None => break, // stream closed (timeout)
+            }
+        }
+
+        assert!(
+            saw_deleted,
+            "watch stream must replay the DELETED event from deletion_log before emitting \
+             Compacted; without the mayor-szby fix, a namespace deleted in the compaction \
+             window is permanently invisible — the e2e AdmissionWebhook test waits forever \
+             for a DELETED event that never arrives, deadlocking the entire conformance run"
+        );
+        assert!(
+            saw_compacted,
+            "watch stream must emit Compacted after the DELETED (from_revision({create_rv}) \
+             < horizon({}))",
+            delete_rv + 1
         );
     }
 }
