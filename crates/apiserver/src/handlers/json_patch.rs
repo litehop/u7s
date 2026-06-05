@@ -126,6 +126,17 @@ fn known_top_level_fields(group: &str, plural: &str) -> &'static [&'static str] 
         ("apps", "controllerrevisions") => &["apiVersion", "kind", "metadata", "data", "revision"],
         // Lease
         ("coordination.k8s.io", "leases") => &["apiVersion", "kind", "metadata", "spec"],
+        // EndpointSlice — top-level fields are not spec/status but addressType/endpoints/ports.
+        // Without this entry, fieldValidation=Strict rejects valid EndpointSlice bodies with
+        // 422 "unknown field" for addressType, endpoints, and ports.
+        ("discovery.k8s.io", "endpointslices") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "addressType",
+            "endpoints",
+            "ports",
+        ],
         // Default: universal set + spec + status covers most resources
         _ => &["apiVersion", "kind", "metadata", "spec", "status"],
     }
@@ -615,5 +626,97 @@ mod tests {
         assert_eq!(mf[0]["operation"], "Apply");
         assert_eq!(mf[0]["apiVersion"], "apps/v1");
         assert_eq!(mf[0]["time"], "2026-05-23T00:00:00Z");
+    }
+
+    // ---------------------------------------------------------------------------
+    // EndpointSlice field validation — regression for mayor-9b6g
+    // ---------------------------------------------------------------------------
+
+    /// EndpointSlice top-level fields (addressType, endpoints, ports) must not be
+    /// reported as unknown by detect_unknown_fields.
+    ///
+    /// EndpointSlice uses a non-standard schema: its payload fields are at the top
+    /// level instead of under spec/status.  Before this fix, fieldValidation=Strict
+    /// rejected valid EndpointSlice bodies with 422 "unknown field" for all three
+    /// resource-specific fields, blocking EndpointSlice create/update conformance
+    /// tests.
+    #[test]
+    fn endpointslice_top_level_fields_are_not_unknown() {
+        let body = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": { "name": "my-slice", "namespace": "default" },
+            "addressType": "IPv4",
+            "endpoints": [
+                {
+                    "addresses": ["10.0.0.1"],
+                    "conditions": { "ready": true }
+                }
+            ],
+            "ports": [
+                { "name": "http", "port": 80, "protocol": "TCP" },
+                { "name": "https", "port": 443, "protocol": "TCP" }
+            ]
+        });
+
+        let unknown = detect_unknown_fields(&body, "discovery.k8s.io", "endpointslices");
+
+        assert!(
+            unknown.is_empty(),
+            "EndpointSlice fields addressType/endpoints/ports must not be flagged as unknown — \
+             before the fix, fieldValidation=Strict returned 422 rejecting valid EndpointSlice \
+             creates, blocking conformance tests. Got unknown: {:?}",
+            unknown
+        );
+    }
+
+    /// A ConfigMap with the spec/status fields that don't belong to it must be
+    /// flagged as unknown by detect_unknown_fields in Strict mode.  This ensures
+    /// the detection logic still works for resources that use the default known set.
+    #[test]
+    fn unknown_top_level_field_is_detected_for_default_resource() {
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "test" },
+            "data": { "key": "val" },
+            "bogusField": "should be detected"
+        });
+
+        let unknown = detect_unknown_fields(&body, "", "configmaps");
+
+        assert!(
+            unknown.contains(&"bogusField".to_string()),
+            "bogusField must be detected as unknown for ConfigMap — \
+             the regression test protects against detect_unknown_fields being silently bypassed"
+        );
+    }
+
+    /// apply_field_validation with Strict mode must return Ok when an EndpointSlice
+    /// body has only known fields (addressType, endpoints, ports).
+    ///
+    /// Before the fix, this returned Err(422) because addressType/endpoints/ports
+    /// were flagged as unknown, preventing EndpointSlice creation via kubectl.
+    #[test]
+    fn apply_field_validation_strict_accepts_valid_endpointslice() {
+        let body = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": { "name": "my-slice", "namespace": "default" },
+            "addressType": "IPv4",
+            "endpoints": [{"addresses": ["10.0.0.1"]}],
+            "ports": [{"name": "http", "port": 80, "protocol": "TCP"}]
+        });
+
+        let result =
+            apply_field_validation(&body, Some("Strict"), "discovery.k8s.io", "endpointslices");
+
+        assert!(
+            result.is_ok(),
+            "EndpointSlice with addressType/endpoints/ports must pass Strict validation — \
+             before the fix, these fields were flagged as unknown and the create returned \
+             422 blocking all EndpointSlice conformance tests. Error: {:?}",
+            result.err()
+        );
     }
 }
