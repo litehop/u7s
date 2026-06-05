@@ -1313,6 +1313,20 @@ pub async fn delete_namespaced_resource<S: Store>(
         state.release_service_ip(&cluster_ip).await;
     }
 
+    // Cascade-delete pods owned by a deleted DaemonSet.
+    // When a DaemonSet is deleted, pods with ownerReferences pointing to it must be
+    // deleted immediately — otherwise they remain Running for the full pod GC timeout
+    // (10+ minutes), blocking AfterEach cleanup in conformance tests.
+    if group == "apps" && plural == "daemonsets" {
+        let ds_uid = obj.body["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if !ds_uid.is_empty() {
+            delete_pods_owned_by(&state, &ns, &ds_uid, "DaemonSet").await;
+        }
+    }
+
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
@@ -1559,6 +1573,58 @@ async fn maybe_allocate_cluster_ip<S: Store>(
 
 fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
     format!("/apis/{group}/{version}/{plural}/{name}")
+}
+
+/// Delete all pods in `namespace` whose `ownerReferences` contain an entry with
+/// `kind == owner_kind` and `uid == owner_uid`.
+///
+/// Called after a DaemonSet hard-delete to cascade-delete owned pods immediately.
+/// Without this, DaemonSet pods linger for the full pod GC timeout (10+ minutes),
+/// burning AfterEach cleanup in conformance tests (~35 min per full run).
+async fn delete_pods_owned_by<S: Store>(
+    state: &crate::state::AppState<S>,
+    namespace: &str,
+    owner_uid: &str,
+    owner_kind: &str,
+) {
+    let prefix = crate::keys::group_list_prefix("", "pods", Some(namespace));
+    let resp = match state
+        .store
+        .list(&prefix, u7s_store::ListOptions::default())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("cascade-delete pods in {namespace}: list failed: {e}");
+            return;
+        }
+    };
+
+    for item in resp.items {
+        let pod: serde_json::Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let owned = pod["metadata"]["ownerReferences"]
+            .as_array()
+            .map(|refs| {
+                refs.iter().any(|r| {
+                    r["uid"].as_str() == Some(owner_uid) && r["kind"].as_str() == Some(owner_kind)
+                })
+            })
+            .unwrap_or(false);
+        if !owned {
+            continue;
+        }
+        let pod_name = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
+        if pod_name.is_empty() {
+            continue;
+        }
+        let pod_key = crate::keys::group_object_key("", "pods", Some(namespace), &pod_name);
+        if let Err(e) = state.store.delete(&pod_key, None).await {
+            tracing::warn!("cascade-delete pod {namespace}/{pod_name}: {e}");
+        }
+    }
 }
 
 /// Inject `kind` and `apiVersion` into an object response body.
@@ -2557,6 +2623,121 @@ mod tests {
             Err(err) => assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND),
             Ok(_) => panic!("delete of missing object must return 404 error"),
         }
+    }
+
+    /// Deleting a DaemonSet must cascade-delete pods owned by it immediately.
+    ///
+    /// Without this, pods remain Running for the full pod GC timeout (10+ minutes).
+    /// AfterEach in conformance tests waits for pods to disappear — if they don't,
+    /// each test burns ~600s and the full run wastes ~35 min.
+    #[tokio::test]
+    async fn delete_daemonset_cascades_to_owned_pods() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ds_uid = "aaaaaaaa-0000-0000-0000-000000000001";
+        let ns = "kube-system";
+
+        // Seed the DaemonSet.
+        let ds = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": { "name": "my-ds", "namespace": ns, "uid": ds_uid }
+        });
+        let ds_key = "/registry/apps/daemonsets/kube-system/my-ds";
+        store
+            .put(
+                ds_key,
+                bytes::Bytes::from(serde_json::to_vec(&ds).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by this DaemonSet.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-ds-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "DaemonSet",
+                    "name": "my-ds",
+                    "uid": ds_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/kube-system/my-ds-pod";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed an unrelated pod (must NOT be deleted).
+        let other_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "other-pod", "namespace": ns }
+        });
+        let other_pod_key = "/registry/pods/kube-system/other-pod";
+        store
+            .put(
+                other_pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&other_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the DaemonSet.
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                ns.to_string(),
+                "daemonsets".into(),
+                "my-ds".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // Owned pod must be deleted.
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "pod owned by deleted DaemonSet must be cascade-deleted — \
+             without this pods block AfterEach cleanup for 10+ minutes"
+        );
+
+        // DaemonSet itself must be deleted.
+        assert!(
+            store.get(ds_key).await.unwrap().is_none(),
+            "DaemonSet itself must be deleted"
+        );
+
+        // Unrelated pod must survive.
+        assert!(
+            store.get(other_pod_key).await.unwrap().is_some(),
+            "pod not owned by the deleted DaemonSet must not be affected"
+        );
     }
 
     /// Security invariant: a soft-deleted ClusterRoleBinding must be removed from the
