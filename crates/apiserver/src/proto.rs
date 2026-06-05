@@ -5761,9 +5761,10 @@ mod tests {
         // }
 
         // Encode IntOrString: type=0 (int) at field 1, intVal=8080 at field 2
-        let mut int_or_string = encode_varint((1u64 << 3) | 0); // field 1, varint wire type
+        // Wire type 0 = varint; tag = (field_number << 3) | wire_type
+        let mut int_or_string = encode_varint(1u64 << 3); // field 1, varint wire type 0
         int_or_string.extend_from_slice(&encode_varint(0)); // type = 0 (int)
-        int_or_string.extend_from_slice(&encode_varint((2u64 << 3) | 0)); // field 2, varint
+        int_or_string.extend_from_slice(&encode_varint(2u64 << 3)); // field 2, varint wire type 0
         int_or_string.extend_from_slice(&encode_varint(8080));
 
         // Encode HTTPGetAction: path at field 1, port at field 2, host at field 3
