@@ -3526,11 +3526,13 @@ fn downward_api_volume_file_to_json(f: DownwardAPIVolumeFile) -> serde_json::Val
                 serde_json::Value::String(rfr.resource),
             );
         }
-        // divisor is required by the kubelet; if omitted the volume fails to mount.
-        // Serialize the Quantity string value, defaulting to "1" if absent.
+        // divisor is required by the kubelet; if omitted or zero the volume fails to mount.
+        // The Kubernetes API server defaults an absent/zero divisor to "1".
+        // A zero Quantity serialises as string "0" in proto — treat that as the default too.
         let divisor_str = rfr
             .divisor
             .and_then(|q| q.string)
+            .filter(|s| !s.is_empty() && s != "0")
             .unwrap_or_else(|| "1".to_string());
         rfr_map.insert(
             "divisor".to_string(),
@@ -3561,12 +3563,14 @@ fn downward_api_volume_source_to_json(
             .collect();
         m.insert("items".to_string(), serde_json::Value::Array(items_json));
     }
-    if default_mode != 0 {
-        m.insert(
-            "defaultMode".to_string(),
-            serde_json::Value::Number(default_mode.into()),
-        );
-    }
+    // defaultMode is required by the kubelet; if omitted the volume mount fails with
+    // "no defaultMode used, not even the default value for it".
+    // The Kubernetes API server defaults an absent (proto zero) value to 0644 = 420.
+    let dm = if default_mode == 0 { 420 } else { default_mode };
+    m.insert(
+        "defaultMode".to_string(),
+        serde_json::Value::Number(dm.into()),
+    );
     serde_json::Value::Object(m)
 }
 
@@ -9353,6 +9357,96 @@ mod tests {
             item["resourceFieldRef"]["divisor"], "1",
             "divisor must default to '1' when absent from proto — kubelet requires this field \
              to be present or it cannot determine the unit for the resource value"
+        );
+    }
+
+    /// spec.volumes[].downwardAPI resourceFieldRef with zero Quantity divisor defaults to "1".
+    ///
+    /// The Kubernetes Go client serialises a zero resource.Quantity as Quantity{string: "0"} in
+    /// proto. The kubelet rejects divisor "0" (division by zero). Our server must default any
+    /// zero-valued divisor to "1", matching the real Kubernetes apiserver behaviour.
+    ///
+    /// This test fails if the `filter(|s| s != "0")` guard is removed, in which case divisor "0"
+    /// passes through and the kubelet refuses to mount the volume.
+    #[test]
+    fn spec_volumes_downward_api_resource_field_ref_zero_divisor_defaults_to_one() {
+        // Quantity { string (field 1) = "0" } — zero Quantity as sent by Go client
+        let zero_quantity = encode_length_delimited(1, b"0");
+
+        // ResourceFieldSelector { containerName = "c", resource = "limits.cpu", divisor = Quantity{"0"} }
+        let mut resource_field_selector = encode_length_delimited(1, b"c");
+        resource_field_selector.extend_from_slice(&encode_length_delimited(2, b"limits.cpu"));
+        resource_field_selector.extend_from_slice(&encode_length_delimited(3, &zero_quantity));
+
+        // DownwardAPIVolumeFile { path = "cpu_limit", resourceFieldRef }
+        let mut dav_file = encode_length_delimited(1, b"cpu_limit");
+        dav_file.extend_from_slice(&encode_length_delimited(3, &resource_field_selector));
+
+        // DownwardAPIVolumeSource { items = [DownwardAPIVolumeFile] }
+        let da_src = encode_length_delimited(1, &dav_file);
+        let volume_source = encode_length_delimited(16, &da_src);
+        let mut volume = encode_length_delimited(1, b"vol");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+        let container = encode_length_delimited(1, b"c");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with zero divisor Quantity");
+
+        let item = &result["spec"]["volumes"][0]["downwardAPI"]["items"][0];
+        assert_eq!(
+            item["resourceFieldRef"]["divisor"], "1",
+            "divisor '0' must be treated as zero/absent and defaulted to '1' — \
+             the kubelet would divide by zero otherwise, causing volume mount failure"
+        );
+    }
+
+    /// spec.volumes[].downwardAPI must always emit defaultMode, defaulting to 420 (0644 octal).
+    ///
+    /// When the e2e test creates a pod without an explicit defaultMode (relying on apiserver
+    /// defaulting), the proto sends defaultMode=0 (field absent). The kubelet rejects this with
+    /// "no defaultMode used, not even the default value for it", causing a 300 s hang in
+    /// ContainerCreating. We must emit defaultMode=420 whenever the proto value is zero.
+    ///
+    /// This test fails if the `if default_mode == 0 { 420 }` defaulting is removed, in which
+    /// case defaultMode is omitted from the JSON and the kubelet refuses to mount the volume.
+    #[test]
+    fn spec_volumes_downward_api_default_mode_defaults_to_420_when_absent() {
+        // DownwardAPIVolumeFile { path = "podname", fieldRef = {apiVersion: "v1", fieldPath: "metadata.name"} }
+        let mut field_ref = encode_length_delimited(1, b"v1");
+        field_ref.extend_from_slice(&encode_length_delimited(2, b"metadata.name"));
+        let mut dav_file = encode_length_delimited(1, b"podname");
+        dav_file.extend_from_slice(&encode_length_delimited(2, &field_ref));
+
+        // DownwardAPIVolumeSource { items = [DownwardAPIVolumeFile] } — no defaultMode field (=0)
+        let da_src = encode_length_delimited(1, &dav_file);
+        let volume_source = encode_length_delimited(16, &da_src);
+        let mut volume = encode_length_delimited(1, b"vol");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+        let container = encode_length_delimited(1, b"c");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with absent defaultMode");
+
+        let downward_api = &result["spec"]["volumes"][0]["downwardAPI"];
+        assert!(
+            downward_api["defaultMode"].is_number(),
+            "defaultMode must always be present in JSON — the kubelet rejects volumes where \
+             defaultMode is absent with 'no defaultMode used, not even the default value for it'"
+        );
+        assert_eq!(
+            downward_api["defaultMode"], 420,
+            "defaultMode must be 420 (0644 octal) when absent from proto — this is the \
+             Kubernetes API server default that the kubelet expects"
         );
     }
 
