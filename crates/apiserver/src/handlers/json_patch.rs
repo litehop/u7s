@@ -15,6 +15,18 @@ pub(crate) struct PatchQuery {
     /// Accepted and ignored: we do not implement server-side field validation.
     #[serde(rename = "fieldValidation")]
     pub _field_validation: Option<String>,
+    /// When set to "All", the server validates the request but does NOT persist the change.
+    /// The response looks identical to a successful write (200 + would-be object).
+    /// Only "All" is meaningful server-side; "client" is handled by kubectl itself.
+    #[serde(rename = "dryRun")]
+    pub dry_run: Option<String>,
+}
+
+impl PatchQuery {
+    /// Returns true when the request must be a dry-run (no store write).
+    pub(crate) fn is_dry_run(&self) -> bool {
+        self.dry_run.as_deref() == Some("All")
+    }
 }
 
 /// Query parameters accepted by CREATE endpoints (POST).
@@ -29,6 +41,33 @@ pub(crate) struct CreateQuery {
     pub _field_manager: Option<String>,
     #[serde(rename = "fieldValidation")]
     pub field_validation: Option<String>,
+    /// When set to "All", validate but do NOT persist the object.
+    #[serde(rename = "dryRun")]
+    pub dry_run: Option<String>,
+}
+
+impl CreateQuery {
+    /// Returns true when the request must be a dry-run (no store write).
+    pub(crate) fn is_dry_run(&self) -> bool {
+        self.dry_run.as_deref() == Some("All")
+    }
+}
+
+/// Query parameters accepted by PUT (replace) endpoints.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ReplaceQuery {
+    #[serde(rename = "fieldManager")]
+    pub _field_manager: Option<String>,
+    /// When set to "All", validate but do NOT persist the replacement object.
+    #[serde(rename = "dryRun")]
+    pub dry_run: Option<String>,
+}
+
+impl ReplaceQuery {
+    /// Returns true when the request must be a dry-run (no store write).
+    pub(crate) fn is_dry_run(&self) -> bool {
+        self.dry_run.as_deref() == Some("All")
+    }
 }
 
 // ---------------------------------------------------------------------------

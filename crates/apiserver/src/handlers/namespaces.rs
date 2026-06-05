@@ -383,6 +383,7 @@ pub async fn patch_namespace<S: Store>(
                 field_manager: patch_query.field_manager.as_deref(),
                 patch_type: PatchType::StrategicMerge,
                 body,
+                dry_run: patch_query.is_dry_run(),
             },
         )
         .await;
@@ -2546,6 +2547,7 @@ mod tests {
             axum::extract::Query(PatchQuery {
                 field_manager: Some("e2e-test".to_string()),
                 _field_validation: None,
+                dry_run: None,
             }),
             ssa_headers,
             patch_bytes,
@@ -2625,6 +2627,7 @@ mod tests {
             axum::extract::Query(PatchQuery {
                 field_manager: Some("kubectl-apply".to_string()),
                 _field_validation: None,
+                dry_run: None,
             }),
             ssa_headers,
             patch_bytes,
