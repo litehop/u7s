@@ -109,6 +109,8 @@ struct WebhookEntry {
     reinvocation_policy: String,
     #[serde(default)]
     namespace_selector: Option<LabelSelector>,
+    #[serde(default)]
+    object_selector: Option<LabelSelector>,
 }
 
 /// Kubernetes LabelSelector: both fields are optional; absence means match-all.
@@ -259,15 +261,15 @@ enum WebhookTarget {
 /// Resolve a webhook's clientConfig to a `WebhookTarget`.
 ///
 /// If `clientConfig.url` is set, returns `DirectUrl`.
-/// If `clientConfig.service` is set, looks up the Service to resolve service port →
-/// target port, and returns `ServiceResolved` with a URL using the service DNS name
-/// (e.g. `https://<svc>.<ns>.svc:<port><path>`).
+/// If `clientConfig.service` is set, returns `ServiceResolved` with a URL using the
+/// service DNS name and the SERVICE port (e.g. `https://<svc>.<ns>.svc:<svc_port><path>`).
 ///
 /// With kube-proxy running inside the VM (PR #406), the konnectivity-agent resolves
-/// service DNS names via CoreDNS and routes to ClusterIPs correctly — no pod-IP
-/// substitution is needed.
+/// service DNS names via CoreDNS → ClusterIP, and kube-proxy NATs ClusterIP:svc_port →
+/// PodIP:targetPort. Using the service port (not target port) ensures kube-proxy
+/// intercepts the connection correctly.
 async fn webhook_url<S: Store>(
-    state: &AppState<S>,
+    _state: &AppState<S>,
     config: &WebhookClientConfig,
     webhook_name: &str,
 ) -> Result<WebhookTarget, String> {
@@ -278,34 +280,13 @@ async fn webhook_url<S: Store>(
     if let Some(svc_ref) = &config.service {
         let svc_port = svc_ref.port.unwrap_or(443);
 
-        // Look up the Service to resolve service port → target port.
-        let svc_key = format!("/registry/services/{}/{}", svc_ref.namespace, svc_ref.name);
-        let target_port = state
-            .store
-            .get(&svc_key)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.value).ok())
-            .and_then(|v| {
-                v["spec"]["ports"].as_array().and_then(|ports| {
-                    ports
-                        .iter()
-                        .find(|p| p["port"].as_i64() == Some(svc_port as i64))
-                        .and_then(|p| {
-                            // targetPort can be a number or a string (named port)
-                            p["targetPort"]
-                                .as_i64()
-                                .map(|n| n as u16)
-                                .or_else(|| p["targetPort"].as_str().and_then(|s| s.parse().ok()))
-                        })
-                })
-            })
-            .unwrap_or(svc_port);
-
+        // With kube-proxy running inside the VM (PR #406), the konnectivity-agent
+        // resolves the service DNS name via CoreDNS → ClusterIP, and kube-proxy NATs
+        // ClusterIP:svc_port → PodIP:targetPort. Use the service port (not target port)
+        // in the URL so kube-proxy intercepts the connection correctly.
         let path = svc_ref.path.as_deref().unwrap_or("/");
         let svc_host = format!("{}.{}.svc", svc_ref.name, svc_ref.namespace);
-        let url = format!("https://{svc_host}:{target_port}{path}");
+        let url = format!("https://{svc_host}:{svc_port}{path}");
         return Ok(WebhookTarget::ServiceResolved { url });
     }
 
@@ -610,6 +591,25 @@ async fn invoke_mutating_webhook<S: Store>(
         }
     }
 
+    // objectSelector: skip this webhook if the object's labels don't match.
+    if webhook.object_selector.is_some() {
+        let obj_labels: BTreeMap<String, String> = object["metadata"]["labels"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !label_selector_matches(webhook.object_selector.as_ref(), &obj_labels) {
+            tracing::debug!(
+                "admission: mutating webhook \"{}\" skipped: object does not match objectSelector",
+                webhook.name
+            );
+            return Ok((object.clone(), false));
+        }
+    }
+
     let target = match webhook_url(state, &webhook.client_config, &webhook.name).await {
         Ok(t) => t,
         Err(e) => {
@@ -854,6 +854,25 @@ pub async fn run_validating_webhooks<S: Store>(
                     );
                     continue;
                 }
+            }
+        }
+
+        // objectSelector: skip if the object's labels don't match.
+        if webhook.object_selector.is_some() {
+            let obj_labels: BTreeMap<String, String> = object["metadata"]["labels"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !label_selector_matches(webhook.object_selector.as_ref(), &obj_labels) {
+                tracing::debug!(
+                    "admission: validating webhook \"{}\" skipped: object does not match objectSelector",
+                    webhook.name
+                );
+                continue;
             }
         }
 
@@ -2060,8 +2079,7 @@ mod tests {
         );
 
         // MutatingWebhookConfiguration with service-based clientConfig.
-        // No Service or Endpoints seeded — webhook_url builds the DNS URL without
-        // looking up endpoints (port defaults to the configured port when no Service found).
+        // webhook_url uses the configured svc_port directly (no Service lookup needed).
         let mwc = json!({
             "apiVersion": "admissionregistration.k8s.io/v1",
             "kind": "MutatingWebhookConfiguration",
@@ -2421,7 +2439,7 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        // No Service stored — target_port defaults to svc_port; URL is built but unreachable.
+        // No Service stored — svc_port is used directly; URL is built but unreachable.
         let mwc_fail = json!({
             "apiVersion": "admissionregistration.k8s.io/v1",
             "kind": "MutatingWebhookConfiguration",
@@ -2849,5 +2867,332 @@ mod tests {
         );
         // Client is usable — no panic during build.
         drop(client);
+    }
+
+    // -- objectSelector regression tests --
+
+    /// A mutating webhook with objectSelector must be skipped for objects whose labels do not match.
+    ///
+    /// The conformance readiness check (waitWebhookConfigurationReady) creates ConfigMaps
+    /// with a specific label and expects only the marker webhook to fire for them. Without
+    /// objectSelector support, all webhooks would fire for all objects in the namespace,
+    /// causing the non-marker webhooks to apply unwanted mutations or denials.
+    ///
+    /// Reverting the fix (removing objectSelector from WebhookEntry) makes this test fail
+    /// because the webhook would be invoked for the non-matching object (unreachable URL +
+    /// failurePolicy=Fail → error, not success).
+    #[tokio::test]
+    async fn object_selector_non_matching_object_skips_mutating_webhook() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Webhook with objectSelector requiring label "env=prod".
+        // Points to an unreachable URL with failurePolicy=Fail — if invoked, the pipeline
+        // would fail. The object we pass has label "env=dev", so the webhook must be skipped.
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "prod-only-obj-mwc"},
+            "webhooks": [{
+                "name": "prod.object.webhook.example.com",
+                "clientConfig": {
+                    "url": "http://127.0.0.1:1"  // unreachable — would cause Fail if invoked
+                },
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "objectSelector": {
+                    "matchLabels": {"env": "prod"}
+                }
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/prod-only-obj-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Object with label "env=dev" — does NOT match objectSelector "env=prod".
+        let obj = json!({
+            "kind": "ConfigMap",
+            "metadata": {"name": "my-config", "labels": {"env": "dev"}}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "my-config",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+
+        assert!(
+            result.is_ok(),
+            "webhook with non-matching objectSelector must be skipped, not invoked; \
+             invoking it would fail because the URL is unreachable with failurePolicy=Fail"
+        );
+        assert_eq!(
+            result.unwrap_or_else(|_| panic!("must succeed")),
+            obj,
+            "object must be unchanged when webhook is skipped by objectSelector"
+        );
+    }
+
+    /// A mutating webhook with objectSelector must be invoked for objects whose labels match.
+    ///
+    /// When the object has the required label, the webhook must fire. An unreachable URL
+    /// with failurePolicy=Fail must cause an error — confirming the webhook was actually
+    /// invoked (not silently skipped due to a bug in objectSelector matching).
+    #[tokio::test]
+    async fn object_selector_matching_object_invokes_mutating_webhook() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "prod-only-obj-mwc-match"},
+            "webhooks": [{
+                "name": "prod.object.match.webhook.example.com",
+                "clientConfig": {
+                    "url": "http://127.0.0.1:1"  // unreachable — causes Fail when invoked
+                },
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "objectSelector": {
+                    "matchLabels": {"env": "prod"}
+                }
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/prod-only-obj-mwc-match",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Object WITH label "env=prod" — matches objectSelector.
+        let obj = json!({
+            "kind": "ConfigMap",
+            "metadata": {"name": "my-prod-config", "labels": {"env": "prod"}}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "my-prod-config",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+
+        assert!(
+            result.is_err(),
+            "webhook with matching objectSelector must be invoked; \
+             the unreachable URL with failurePolicy=Fail must cause an error"
+        );
+    }
+
+    /// A validating webhook with objectSelector must be skipped for objects whose labels do not match.
+    ///
+    /// Same correctness requirement as the mutating case: the objectSelector must prevent
+    /// the webhook from firing on objects it was not configured to inspect.
+    #[tokio::test]
+    async fn object_selector_non_matching_object_skips_validating_webhook() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "prod-only-obj-vwc"},
+            "webhooks": [{
+                "name": "prod.validating.object.webhook.example.com",
+                "clientConfig": {
+                    "url": "http://127.0.0.1:1"
+                },
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "objectSelector": {
+                    "matchLabels": {"env": "prod"}
+                }
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/prod-only-obj-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({
+            "kind": "ConfigMap",
+            "metadata": {"name": "my-dev-config", "labels": {"env": "dev"}}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "my-dev-config",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+
+        assert!(
+            result.is_ok(),
+            "validating webhook with non-matching objectSelector must be skipped; \
+             invoking it would fail because the URL is unreachable with failurePolicy=Fail"
+        );
+    }
+
+    /// Service-based webhook URL must use the SERVICE port (not target port).
+    ///
+    /// kube-proxy routes ClusterIP:svc_port → PodIP:targetPort inside the VM.
+    /// If we use target_port in the URL, the connection goes to ClusterIP:targetPort,
+    /// which kube-proxy does not intercept — the connection fails even when the pod is running.
+    /// The readiness check (waitWebhookConfigurationReady) depends on the webhook being
+    /// reachable to return "denied"; using the wrong port causes the check to time out.
+    ///
+    /// Reverting the fix (using target_port instead of svc_port) makes this test fail because
+    /// the URL would contain ":8444" instead of ":8443".
+    #[tokio::test]
+    async fn service_webhook_url_uses_service_port_not_target_port() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a Service with port 8443 → targetPort 8444. The webhook URL must use
+        // svc_port (8443), not targetPort (8444).
+        let svc = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-webhook-svc", "namespace": "webhook-ns"},
+            "spec": {
+                "ports": [{"port": 8443, "targetPort": 8444}]
+            }
+        });
+        store
+            .put(
+                "/registry/services/webhook-ns/my-webhook-svc",
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // MutatingWebhookConfiguration that refers to the service above.
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "svc-port-test"},
+            "webhooks": [{
+                "name": "svc.port.test.example.com",
+                "clientConfig": {
+                    "service": {
+                        "namespace": "webhook-ns",
+                        "name": "my-webhook-svc",
+                        "port": 8443,
+                        "path": "/mutate"
+                    }
+                },
+                "rules": [{
+                    "apiGroups": ["apps"],
+                    "apiVersions": ["v1"],
+                    "resources": ["deployments"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Ignore"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/svc-port-test",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Resolve the webhook URL via webhook_url (private) by observing it through
+        // run_mutating_webhooks: with failurePolicy=Ignore and unreachable host, the
+        // pipeline succeeds. We verify the URL indirectly via the comment above, and
+        // directly by calling webhook_url.
+        let config = WebhookClientConfig {
+            url: None,
+            service: Some(ServiceReference {
+                namespace: "webhook-ns".to_string(),
+                name: "my-webhook-svc".to_string(),
+                port: Some(8443),
+                path: Some("/mutate".to_string()),
+            }),
+            ca_bundle: None,
+        };
+
+        let target = webhook_url(&state, &config, "test").await.unwrap();
+        let url = match target {
+            WebhookTarget::ServiceResolved { url } => url,
+            WebhookTarget::DirectUrl(_) => panic!("expected ServiceResolved"),
+        };
+
+        assert!(
+            url.contains(":8443/"),
+            "service webhook URL must use service port 8443, not target port 8444; \
+             kube-proxy routes ClusterIP:8443 → PodIP:8444, so connecting to :8444 fails: url={url}"
+        );
+        assert!(
+            !url.contains(":8444"),
+            "service webhook URL must NOT use target port 8444; \
+             using target port bypasses kube-proxy routing and causes connection failures: url={url}"
+        );
+        assert!(
+            url.contains("my-webhook-svc.webhook-ns.svc"),
+            "service webhook URL must use service DNS name for correct TLS SNI and kube-proxy routing: url={url}"
+        );
     }
 }
