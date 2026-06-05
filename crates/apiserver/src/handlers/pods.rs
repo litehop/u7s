@@ -1054,6 +1054,23 @@ pub fn apply_status_patch(
             result["status"] = patch_status.clone();
         }
     }
+    // Enforce hostNetwork invariant: a pod sharing the host network namespace has
+    // the node's IP as its pod IP, not a pod-CIDR address.  The kubelet sets
+    // status.podIP from the CNI sandbox result, which for hostNetwork pods is
+    // still a pod-CIDR address because the sandbox creation path doesn't special-
+    // case hostNetwork.  Override podIP/podIPs here so the downward API exposes
+    // the correct value (HOST_IP == POD_IP for hostNetwork pods).
+    if result["spec"]["hostNetwork"] == serde_json::json!(true) {
+        let host_ip = result["status"]["hostIP"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        if let Some(host_ip) = host_ip {
+            result["status"]["podIP"] = serde_json::json!(host_ip);
+            result["status"]["podIPs"] = serde_json::json!([{"ip": host_ip}]);
+        }
+    }
+
     result
 }
 
@@ -1651,6 +1668,89 @@ mod status_tests {
         assert!(
             containers_ready.is_some(),
             "ContainersReady condition must be added by the patch"
+        );
+    }
+
+    /// apply_status_patch for a hostNetwork pod must set status.podIP == status.hostIP.
+    ///
+    /// A pod with spec.hostNetwork=true shares the node's network namespace, so its
+    /// pod IP is the node IP, not a pod-CIDR address.  The kubelet sets status.podIP
+    /// from the CNI sandbox result, which is a pod-CIDR IP even for hostNetwork pods.
+    /// Without this override, the downward API exposes HOST_IP != POD_IP, breaking
+    /// the sonobuoy test "Downward API should provide host IP and pod IP as an env var
+    /// if pod uses host network" (SONOBUOY_FOCUS='Downward API should provide host IP
+    /// and pod IP.*host network').
+    #[test]
+    fn host_network_pod_status_pod_ip_equals_host_ip() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "hostnet-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "hostNetwork": true,
+                "containers": [{"name": "app", "image": "nginx"}]
+            },
+            "status": {"phase": "Pending"}
+        });
+        // Kubelet patches status with hostIP (node IP) and podIP (pod-CIDR address from CNI).
+        let patch = serde_json::json!({
+            "status": {
+                "phase": "Running",
+                "hostIP": "192.168.5.15",
+                "podIP": "10.85.1.153",
+                "podIPs": [{"ip": "10.85.1.153"}]
+            }
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+
+        assert_eq!(
+            result["status"]["podIP"], "192.168.5.15",
+            "hostNetwork pod status.podIP must equal status.hostIP (192.168.5.15), not \
+             the pod-CIDR address (10.85.1.153) — downward API POD_IP must match HOST_IP \
+             for pods sharing the host network namespace"
+        );
+        assert_eq!(
+            result["status"]["podIPs"][0]["ip"], "192.168.5.15",
+            "hostNetwork pod status.podIPs[0].ip must equal hostIP — same invariant as podIP"
+        );
+        assert_eq!(
+            result["status"]["hostIP"], "192.168.5.15",
+            "hostIP must remain unchanged at the node IP"
+        );
+    }
+
+    /// apply_status_patch for a normal (non-hostNetwork) pod must NOT override podIP.
+    ///
+    /// Only hostNetwork pods receive the host IP override; regular pods keep their
+    /// pod-CIDR address.  Incorrect over-application would break all pod networking.
+    #[test]
+    fn non_host_network_pod_status_pod_ip_unchanged() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "normal-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "hostNetwork": false,
+                "containers": [{"name": "app", "image": "nginx"}]
+            },
+            "status": {"phase": "Pending"}
+        });
+        let patch = serde_json::json!({
+            "status": {
+                "phase": "Running",
+                "hostIP": "192.168.5.15",
+                "podIP": "10.85.1.153",
+                "podIPs": [{"ip": "10.85.1.153"}]
+            }
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+
+        assert_eq!(
+            result["status"]["podIP"], "10.85.1.153",
+            "non-hostNetwork pod status.podIP must not be overridden — \
+             only hostNetwork pods share the node IP"
         );
     }
 }
