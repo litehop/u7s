@@ -1381,6 +1381,83 @@ mod tests {
         );
     }
 
+    /// Regression test for mayor-fvkg: PATCH resourcequotas/status updates status.used
+    /// but must not touch spec.hard.
+    ///
+    /// The KCM's resourcequota controller patches this endpoint to record how many objects
+    /// have been created against each quota. If the patch clobbers spec.hard, the quota's
+    /// hard limits are lost and subsequent enforcement checks will allow unlimited creates.
+    #[tokio::test]
+    async fn patch_resourcequota_status_updates_used_not_spec() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "compute-quota", "namespace": "default", "resourceVersion": "1" },
+            "spec": { "hard": { "pods": "10", "services": "5" } },
+            "status": { "hard": { "pods": "10", "services": "5" }, "used": { "pods": "0", "services": "0" } }
+        });
+        let key = "/registry/resourcequotas/default/compute-quota";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // KCM quota controller patches status.used after a pod is created.
+        let patch = serde_json::json!({
+            "status": {
+                "hard": { "pods": "10", "services": "5" },
+                "used": { "pods": "1", "services": "0" }
+            }
+        });
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "resourcequotas".into(),
+                "compute-quota".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "PATCH resourcequotas/status must succeed so KCM quota controller can update used counts"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["status"]["used"]["pods"], "1",
+            "status.used.pods must be updated to 1 after KCM patches it — \
+             if not, kubectl describe quota shows stale counts and conformance polls forever"
+        );
+        assert_eq!(
+            v["spec"]["hard"]["pods"], "10",
+            "spec.hard must not be modified by a PATCH to /status — \
+             status subresource isolation prevents controllers from accidentally overwriting limits"
+        );
+        assert_eq!(
+            v["spec"]["hard"]["services"], "5",
+            "spec.hard.services must survive a PATCH to /status"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // MockStore — injects RevisionMismatch on the first put() after arm() is called.
     //

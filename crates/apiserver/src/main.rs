@@ -779,6 +779,7 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "rules": [
             { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] },
             { "apiGroups": [""], "resources": ["endpoints","pods","replicationcontrollers","serviceaccounts","configmaps","secrets","services","namespaces","nodes","persistentvolumes","persistentvolumeclaims","resourcequotas"], "verbs": ["get","list","watch","create","update","patch","delete"] },
+            { "apiGroups": [""], "resources": ["resourcequotas/status"], "verbs": ["get","update","patch"] },
             { "apiGroups": ["apps"], "resources": ["daemonsets","deployments","replicasets","statefulsets","controllerrevisions"], "verbs": ["get","list","watch","create","update","patch","delete"] },
             { "apiGroups": ["batch"], "resources": ["jobs","cronjobs"], "verbs": ["get","list","watch","create","update","patch","delete"] },
             { "apiGroups": ["autoscaling"], "resources": ["horizontalpodautoscalers"], "verbs": ["get","list","watch","update","patch"] },
@@ -3328,6 +3329,65 @@ mod tests {
         assert!(
             !state.rbac_index.is_allowed(&pod_read_other),
             "users not in system:nodes must not inherit kubelet permissions"
+        );
+    }
+
+    /// Regression test for mayor-fvkg: the KCM resourcequota controller must be able
+    /// to PATCH resourcequotas/status after pod creation. With --use-service-account-credentials=false
+    /// the KCM uses the system:kube-controller-manager identity for all controllers. If
+    /// resourcequotas/status is absent from that ClusterRole, the quota controller gets 403
+    /// and quota.status.used is never updated — conformance polls for 300s and times out.
+    #[tokio::test]
+    async fn kcm_identity_can_patch_resourcequotas_status() {
+        let store = std::sync::Arc::new(make_store());
+        seed_rbac(&store).await.expect("seed must not fail");
+
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        state.init().await;
+
+        let groups: Vec<String> = vec![];
+
+        // KCM's resourcequota controller patches quota status to update used counts.
+        let patch_status = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "patch",
+            api_group: "",
+            resource: "resourcequotas",
+            subresource: "status",
+            namespace: Some("default"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&patch_status),
+            "system:kube-controller-manager must be allowed to PATCH resourcequotas/status — \
+             without this the KCM quota controller gets 403 and quota.status.used is never updated \
+             (mayor-fvkg)"
+        );
+
+        // Also verify GET on resourcequotas/status (quota controller reads current status).
+        let get_status = rbac::AuthzRequest {
+            username: "system:kube-controller-manager",
+            groups: &groups,
+            verb: "get",
+            api_group: "",
+            resource: "resourcequotas",
+            subresource: "status",
+            namespace: Some("default"),
+            name: None,
+            non_resource_url: None,
+        };
+        assert!(
+            state.rbac_index.is_allowed(&get_status),
+            "system:kube-controller-manager must be allowed to GET resourcequotas/status — \
+             quota controller reads current status before updating it"
         );
     }
 
