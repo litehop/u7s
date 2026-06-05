@@ -444,9 +444,9 @@ struct ResourceFieldSelector {
     /// resource (field 2, string) — e.g. "limits.cpu", "requests.memory"
     #[prost(string, tag = "2")]
     resource: String,
-    /// divisor (field 3, bytes/Quantity) — skipped, defaults to "1"
-    #[prost(bytes = "vec", tag = "3")]
-    divisor: Vec<u8>,
+    /// divisor (field 3, message Quantity) — e.g. "1m", "1Mi"; defaults to "1" if absent
+    #[prost(message, tag = "3")]
+    divisor: Option<Quantity>,
 }
 
 /// DownwardAPIVolumeFile — api-core-v1-generated.proto message DownwardAPIVolumeFile
@@ -3404,6 +3404,16 @@ fn downward_api_volume_file_to_json(f: DownwardAPIVolumeFile) -> serde_json::Val
                 serde_json::Value::String(rfr.resource),
             );
         }
+        // divisor is required by the kubelet; if omitted the volume fails to mount.
+        // Serialize the Quantity string value, defaulting to "1" if absent.
+        let divisor_str = rfr
+            .divisor
+            .and_then(|q| q.string)
+            .unwrap_or_else(|| "1".to_string());
+        rfr_map.insert(
+            "divisor".to_string(),
+            serde_json::Value::String(divisor_str),
+        );
         m.insert(
             "resourceFieldRef".to_string(),
             serde_json::Value::Object(rfr_map),
@@ -8864,6 +8874,134 @@ mod tests {
         assert_eq!(
             items[0]["fieldRef"]["fieldPath"], "metadata.name",
             "fieldRef.fieldPath must be 'metadata.name' — kubelet reads this field from the pod"
+        );
+    }
+
+    /// spec.volumes[].downwardAPI with resourceFieldRef must decode and serialize divisor.
+    ///
+    /// Without this fix, pods using `resourceFieldRef` (cpu request/limit, memory request/limit)
+    /// stall 300 s in ContainerCreating because the kubelet sees an item with only a `path`
+    /// and no source selector. The fix: ResourceFieldSelector.divisor is now decoded as a
+    /// Quantity message (not raw bytes) and serialized as a string in the JSON output.
+    ///
+    /// This test fails if:
+    /// - `ResourceFieldSelector.divisor` reverts to `Vec<u8>` (divisor becomes absent)
+    /// - The divisor serialization block in `downward_api_volume_file_to_json` is removed
+    /// - `resourceFieldRef` is dropped from the JSON output
+    #[test]
+    fn spec_volumes_downward_api_resource_field_ref_decoded_with_divisor() {
+        // Quantity { string (field 1) = "1m" }
+        let divisor_quantity = encode_length_delimited(1, b"1m");
+
+        // ResourceFieldSelector {
+        //   containerName (field 1) = "test-container",
+        //   resource (field 2) = "requests.cpu",
+        //   divisor (field 3) = Quantity{string: "1m"}
+        // }
+        let mut resource_field_selector = encode_length_delimited(1, b"test-container");
+        resource_field_selector.extend_from_slice(&encode_length_delimited(2, b"requests.cpu"));
+        resource_field_selector.extend_from_slice(&encode_length_delimited(3, &divisor_quantity));
+
+        // DownwardAPIVolumeFile {
+        //   path (field 1) = "cpu_request",
+        //   resourceFieldRef (field 3) = ResourceFieldSelector
+        // }
+        let mut dav_file = encode_length_delimited(1, b"cpu_request");
+        dav_file.extend_from_slice(&encode_length_delimited(3, &resource_field_selector));
+
+        // DownwardAPIVolumeSource { items (field 1) = [DownwardAPIVolumeFile] }
+        let da_src = encode_length_delimited(1, &dav_file);
+
+        // VolumeSource { downwardAPI (field 16) = DownwardAPIVolumeSource }
+        let volume_source = encode_length_delimited(16, &da_src);
+
+        // Volume { name (field 1) = "podinfo", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"podinfo");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"test-container");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with a resourceFieldRef downwardAPI volume");
+
+        let items = result["spec"]["volumes"][0]["downwardAPI"]["items"]
+            .as_array()
+            .expect("downwardAPI.items must be present");
+        assert_eq!(items.len(), 1, "one downwardAPI item must decode");
+
+        let item = &items[0];
+        assert_eq!(
+            item["path"], "cpu_request",
+            "item.path must be 'cpu_request'"
+        );
+        assert!(
+            item["fieldRef"].is_null() || item.get("fieldRef").is_none(),
+            "fieldRef must be absent when only resourceFieldRef is specified"
+        );
+        assert!(
+            item["resourceFieldRef"].is_object(),
+            "resourceFieldRef must be a JSON object — without it kubelet cannot prepare the volume \
+             and the pod hangs 300 s in ContainerCreating"
+        );
+        assert_eq!(
+            item["resourceFieldRef"]["containerName"], "test-container",
+            "resourceFieldRef.containerName must be 'test-container' — kubelet uses this to look \
+             up the container's resource allocation"
+        );
+        assert_eq!(
+            item["resourceFieldRef"]["resource"], "requests.cpu",
+            "resourceFieldRef.resource must be 'requests.cpu' — identifies which resource to expose"
+        );
+        assert_eq!(
+            item["resourceFieldRef"]["divisor"], "1m",
+            "resourceFieldRef.divisor must be '1m' — kubelet divides the resource value by this \
+             to produce the file content; if absent kubelet rejects the volume spec"
+        );
+    }
+
+    /// spec.volumes[].downwardAPI resourceFieldRef without explicit divisor defaults to "1".
+    ///
+    /// Kubernetes API server may omit the divisor when it equals "1". The kubelet requires
+    /// the divisor field to be present in JSON. If missing, the volume mount fails.
+    #[test]
+    fn spec_volumes_downward_api_resource_field_ref_defaults_divisor_to_one() {
+        // ResourceFieldSelector { containerName (field 1) = "c", resource (field 2) = "limits.memory" }
+        // No divisor field — omitted means default "1"
+        let mut resource_field_selector = encode_length_delimited(1, b"c");
+        resource_field_selector.extend_from_slice(&encode_length_delimited(2, b"limits.memory"));
+
+        // DownwardAPIVolumeFile { path (field 1) = "mem_limit", resourceFieldRef (field 3) }
+        let mut dav_file = encode_length_delimited(1, b"mem_limit");
+        dav_file.extend_from_slice(&encode_length_delimited(3, &resource_field_selector));
+
+        // DownwardAPIVolumeSource { items (field 1) = [DownwardAPIVolumeFile] }
+        let da_src = encode_length_delimited(1, &dav_file);
+        let volume_source = encode_length_delimited(16, &da_src);
+        let mut volume = encode_length_delimited(1, b"vol");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+        let container = encode_length_delimited(1, b"c");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with resourceFieldRef missing divisor");
+
+        let item = &result["spec"]["volumes"][0]["downwardAPI"]["items"][0];
+        assert_eq!(
+            item["resourceFieldRef"]["divisor"], "1",
+            "divisor must default to '1' when absent from proto — kubelet requires this field \
+             to be present or it cannot determine the unit for the resource value"
         );
     }
 
