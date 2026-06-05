@@ -8,9 +8,11 @@
 #   scripts/lima-start.sh
 
 vmType: vz
-rosetta:
-  enabled: true
-  binfmt: true
+vmOpts:
+  vz:
+    rosetta:
+      enabled: true
+      binfmt: true
 
 cpus: 8
 memory: 4GiB
