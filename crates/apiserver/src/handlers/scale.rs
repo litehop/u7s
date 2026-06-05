@@ -78,11 +78,16 @@ fn require_scale_resource(resource: &str) -> Result<(), crate::status::StatusErr
 }
 
 /// Build a Scale (autoscaling/v1) object from the given name, namespace, and
-/// replica count.  `resource_version` is taken from the stored workload.
+/// replica counts.  `resource_version` is taken from the stored workload.
+///
+/// `spec_replicas` is the desired count written by clients (HPA, kubectl scale).
+/// `status_replicas` is the actual count of pods currently managed by the controller;
+/// it may lag `spec_replicas` while pods are being created or terminated.
 pub fn build_scale(
     name: &str,
     ns: &str,
-    replicas: i64,
+    spec_replicas: i64,
+    status_replicas: i64,
     resource_version: &str,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -93,8 +98,8 @@ pub fn build_scale(
             "namespace": ns,
             "resourceVersion": resource_version
         },
-        "spec": { "replicas": replicas },
-        "status": { "replicas": replicas, "selector": "" }
+        "spec": { "replicas": spec_replicas },
+        "status": { "replicas": status_replicas, "selector": "" }
     })
 }
 
@@ -102,6 +107,20 @@ pub fn build_scale(
 pub fn extract_replicas(obj: &serde_json::Value) -> i64 {
     let spec: ScaleSpec = serde_json::from_value(obj["spec"].clone()).unwrap_or_default();
     spec.replicas.unwrap_or(0) as i64
+}
+
+/// Extract status.replicas from a stored workload object.
+///
+/// Returns the actual pod count last reported by the controller.  Falls back to
+/// `spec.replicas` when the status field has not yet been written (e.g. immediately
+/// after creation before the first controller reconciliation).
+pub fn extract_status_replicas(obj: &serde_json::Value) -> i64 {
+    if let Some(n) = obj["status"]["replicas"].as_i64() {
+        n
+    } else {
+        // Status not yet written by controller — treat as equal to spec.
+        extract_replicas(obj)
+    }
 }
 
 /// GET /apis/apps/v1/namespaces/:ns/:resource/:name/scale
@@ -122,13 +141,14 @@ pub async fn get_scale<S: Store>(
     let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    let replicas = extract_replicas(&obj);
+    let spec_replicas = extract_replicas(&obj);
+    let status_replicas = extract_status_replicas(&obj);
     let rv = obj["metadata"]["resourceVersion"]
         .as_str()
         .unwrap_or("")
         .to_string();
 
-    Ok(Json(build_scale(&name, &ns, replicas, &rv)).into_response())
+    Ok(Json(build_scale(&name, &ns, spec_replicas, status_replicas, &rv)).into_response())
 }
 
 /// PUT /apis/apps/v1/namespaces/:ns/:resource/:name/scale
@@ -163,6 +183,8 @@ pub async fn put_scale<S: Store>(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     let old_replicas = extract_replicas(&obj.body);
+    // Capture actual pod count before changing spec so the response reflects reality.
+    let status_replicas = extract_status_replicas(&obj.body);
     obj.body["spec"]["replicas"] = serde_json::Value::Number(new_replicas.into());
 
     // Increment generation when spec.replicas changes — controllers use
@@ -183,6 +205,7 @@ pub async fn put_scale<S: Store>(
         &name,
         &ns,
         new_replicas,
+        status_replicas,
         &new_rv.to_string(),
     )))
 }
@@ -215,6 +238,8 @@ pub async fn patch_scale<S: Store>(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     let old_replicas = extract_replicas(&obj.body);
+    // Capture actual pod count before changing spec so the response reflects reality.
+    let status_replicas = extract_status_replicas(&obj.body);
 
     // Extract replicas from patch if present; otherwise keep current value.
     let new_replicas = if let Some(r) = patch_scale_spec.replicas {
@@ -243,6 +268,7 @@ pub async fn patch_scale<S: Store>(
         &name,
         &ns,
         new_replicas,
+        status_replicas,
         &new_rv.to_string(),
     )))
 }
@@ -261,23 +287,33 @@ mod tests {
     fn build_scale_returns_autoscaling_v1_shape() {
         // The Scale object must be autoscaling/v1 — kubectl and HPA both
         // assert on the apiVersion/kind to identify the response.
-        let scale = build_scale("my-deploy", "default", 3, "42");
+        let scale = build_scale("my-deploy", "default", 3, 3, "42");
         assert_eq!(scale["apiVersion"], "autoscaling/v1");
         assert_eq!(scale["kind"], "Scale");
     }
 
     #[test]
-    fn build_scale_embeds_replicas_in_spec_and_status() {
-        // spec.replicas is what callers write; status.replicas is what the
-        // controller reports.  Both must reflect the current count.
-        let scale = build_scale("my-deploy", "default", 5, "7");
-        assert_eq!(scale["spec"]["replicas"], 5);
-        assert_eq!(scale["status"]["replicas"], 5);
+    fn build_scale_embeds_spec_and_status_replicas_independently() {
+        // spec.replicas is the desired count; status.replicas is the actual count.
+        // They may differ while pods are being created or terminated — build_scale
+        // must embed each value in the correct field so HPA and test AfterEach loops
+        // can distinguish "desired=0" from "actual=0".
+        let scale = build_scale("my-sts", "default", 0, 3, "7");
+        assert_eq!(
+            scale["spec"]["replicas"], 0,
+            "spec.replicas must reflect the desired count written by kubectl scale"
+        );
+        assert_eq!(
+            scale["status"]["replicas"], 3,
+            "status.replicas must reflect the actual pod count, not spec.replicas — \
+             scale-to-0 AfterEach loops poll status.replicas; if it equals spec.replicas \
+             immediately the test cannot detect that pods are still running"
+        );
     }
 
     #[test]
     fn build_scale_includes_metadata_name_namespace_rv() {
-        let scale = build_scale("my-deploy", "production", 2, "99");
+        let scale = build_scale("my-deploy", "production", 2, 2, "99");
         assert_eq!(scale["metadata"]["name"], "my-deploy");
         assert_eq!(scale["metadata"]["namespace"], "production");
         assert_eq!(scale["metadata"]["resourceVersion"], "99");
@@ -304,6 +340,46 @@ mod tests {
     fn extract_replicas_defaults_to_zero_for_null() {
         let obj = serde_json::json!({ "spec": { "replicas": null } });
         assert_eq!(extract_replicas(&obj), 0);
+    }
+
+    // -- extract_status_replicas --
+
+    #[test]
+    fn extract_status_replicas_reads_status_replicas() {
+        // The KCM writes status.replicas as pods are created/deleted; get_scale
+        // must return this value so HPA and kubectl see the real pod count.
+        let obj = serde_json::json!({ "spec": { "replicas": 0 }, "status": { "replicas": 3 } });
+        assert_eq!(
+            extract_status_replicas(&obj),
+            3,
+            "status.replicas must be read from status, not spec — scale-to-0 AfterEach \
+             polls the Scale object; if status.replicas equals spec.replicas immediately \
+             the test cannot distinguish desired=0 from actual=0"
+        );
+    }
+
+    #[test]
+    fn extract_status_replicas_falls_back_to_spec_when_status_absent() {
+        // Before the KCM reconciles for the first time, status.replicas may be absent.
+        // Fall back to spec.replicas so callers get a plausible default.
+        let obj = serde_json::json!({ "spec": { "replicas": 5 } });
+        assert_eq!(
+            extract_status_replicas(&obj),
+            5,
+            "when status.replicas is absent, fall back to spec.replicas"
+        );
+    }
+
+    #[test]
+    fn extract_status_replicas_zero_is_terminal_state() {
+        // A StatefulSet that has been fully scaled to 0 must return 0, not
+        // fall back to spec.replicas. This is the terminal state AfterEach waits for.
+        let obj = serde_json::json!({ "spec": { "replicas": 0 }, "status": { "replicas": 0 } });
+        assert_eq!(
+            extract_status_replicas(&obj),
+            0,
+            "status.replicas=0 must be returned as 0, not overridden by spec fallback"
+        );
     }
 
     // -- require_scale_resource --
@@ -455,6 +531,66 @@ mod handler_tests {
         assert_eq!(json["metadata"]["namespace"], "default");
     }
 
+    /// GET scale on a StatefulSet whose spec.replicas=0 but status.replicas=3 (pods still running)
+    /// must return status.replicas=3, not 0.
+    ///
+    /// This is the regression test for mayor-bg94: after scale-to-0, AfterEach polls the scale
+    /// subresource waiting for status.replicas==0. If status.replicas is always set to spec.replicas,
+    /// it incorrectly shows 0 immediately even while pods are still running, making the AfterEach
+    /// think cleanup is done prematurely while other tests see stale pods.
+    #[tokio::test]
+    async fn get_scale_status_replicas_reflects_stored_status_not_spec() {
+        let (state, store) = make_state();
+
+        // Simulate a StatefulSet that was scaled to 0 (spec.replicas=0) but whose pods
+        // have not yet terminated (status.replicas=3 — written by the KCM).
+        let key = "/registry/apps/statefulsets/default/web";
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "web", "namespace": "default", "resourceVersion": "10" },
+            "spec": { "replicas": 0 },
+            "status": { "replicas": 3 }
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&sts).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                get(get_scale),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/apis/apps/v1/namespaces/default/statefulsets/web/scale")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json["spec"]["replicas"], 0,
+            "spec.replicas must reflect the desired count (0 — scale-to-0 was issued)"
+        );
+        assert_eq!(
+            json["status"]["replicas"], 3,
+            "status.replicas must reflect actual pod count (3) even after scale-to-0 — \
+             if it returned 0 immediately, AfterEach would think cleanup is done while \
+             3 pods are still running, causing subsequent tests to see unexpected pods \
+             (mayor-bg94 regression: scale subresource status.replicas must lag spec.replicas)"
+        );
+    }
+
     /// GET scale for a resource type that does not support scale (e.g. pods)
     /// must return 404. Scale is only valid for deployments, replicasets, statefulsets.
     #[tokio::test]
@@ -582,8 +718,17 @@ mod handler_tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        // spec.replicas reflects the newly desired count.
         assert_eq!(json["spec"]["replicas"], 5);
-        assert_eq!(json["status"]["replicas"], 5);
+        // status.replicas reflects the actual pod count (from stored status before write).
+        // The stored deployment has no status.replicas yet, so it falls back to the
+        // old spec.replicas (1). The controller will update status.replicas asynchronously.
+        assert_eq!(
+            json["status"]["replicas"], 1,
+            "status.replicas must reflect the actual pod count at the time of the write, \
+             not the newly-desired spec.replicas — the two may differ while pods are being \
+             created or terminated (mayor-bg94)"
+        );
 
         // Confirm the workload in the store was actually updated.
         let key = "/registry/apps/deployments/default/my-deploy";
