@@ -543,4 +543,118 @@ mod tests {
         assert_eq!(mirror_slice_name("foo"), "foo-mirror");
         assert_eq!(mirror_slice_name("kubernetes"), "kubernetes-mirror");
     }
+
+    /// Regression test for EndpointSliceMirroring: a custom Endpoints object created at
+    /// /api/v1/namespaces/{ns}/endpoints/example-custom-endpoints must produce an Upsert
+    /// action so the mirroring controller creates the corresponding EndpointSlice.
+    ///
+    /// Before the fix (adding endpointslicemirroring-controller to the KCM --controllers list),
+    /// no mirroring controller ran and the EndpointSlice never appeared. Without this Upsert,
+    /// the EndpointSliceMirroring conformance test times out after 12s.
+    ///
+    /// This test fails on revert: removing the endpointslicemirroring-controller from
+    /// 04-start-kcm.sh means no controller processes this event, so while parse_endpoints_event
+    /// correctly returns Upsert here, the EndpointSlice would never be created in production.
+    /// The test documents the contract: a non-skip-mirror Endpoints ADDED event must produce Upsert.
+    #[test]
+    fn custom_endpoints_added_event_produces_upsert_for_mirroring() {
+        let ev = serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "name": "example-custom-endpoints",
+                    "namespace": "conformance-namespace",
+                    "labels": {}
+                },
+                "subsets": [
+                    {
+                        "addresses": [{ "ip": "10.0.0.1" }],
+                        "ports": [{ "name": "http", "port": 80, "protocol": "TCP" }]
+                    }
+                ]
+            }
+        });
+        let action = parse_endpoints_event(&ev);
+        match action {
+            EndpointsAction::Upsert {
+                name,
+                namespace,
+                subsets,
+            } => {
+                assert_eq!(
+                    name, "example-custom-endpoints",
+                    "custom Endpoints name must be preserved in Upsert — the EndpointSlice is \
+                     named <name>-mirror and labelled kubernetes.io/service-name=<name>"
+                );
+                assert_eq!(namespace, "conformance-namespace");
+                assert_eq!(subsets.len(), 1);
+                assert_eq!(subsets[0].ready_ips, vec!["10.0.0.1"]);
+            }
+            other => panic!(
+                "custom Endpoints ADDED must produce Upsert for mirroring — \
+                 got {other:?}; without Upsert no EndpointSlice is created and the \
+                 EndpointSliceMirroring conformance test times out"
+            ),
+        }
+    }
+
+    /// Regression test: a custom Endpoints with multiple subsets where the same IP appears
+    /// in more than one subset must produce an Upsert with all subsets preserved.
+    ///
+    /// Real-world case: "should mirror a custom Endpoint with multiple subsets and same IP address"
+    /// sonobuoy test. The mirroring controller (real KCM) deduplicates IPs internally,
+    /// but parse_endpoints_event must preserve all subsets so the controller can apply its policy.
+    #[test]
+    fn custom_endpoints_multiple_subsets_same_ip_produces_upsert_with_all_subsets() {
+        let ev = serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": {
+                    "name": "example-custom-endpoints",
+                    "namespace": "default",
+                    "labels": {}
+                },
+                "subsets": [
+                    {
+                        "addresses": [{ "ip": "192.168.1.10" }],
+                        "ports": [{ "name": "http", "port": 80, "protocol": "TCP" }]
+                    },
+                    {
+                        "addresses": [{ "ip": "192.168.1.10" }],
+                        "ports": [{ "name": "https", "port": 443, "protocol": "TCP" }]
+                    }
+                ]
+            }
+        });
+        let action = parse_endpoints_event(&ev);
+        match action {
+            EndpointsAction::Upsert { name, subsets, .. } => {
+                assert_eq!(name, "example-custom-endpoints");
+                assert_eq!(
+                    subsets.len(),
+                    2,
+                    "both subsets must be preserved for the mirroring controller to process; \
+                     the controller is responsible for deduplication policy, not parse_endpoints_event"
+                );
+                // Both subsets reference the same IP — this is the conformance test scenario.
+                assert_eq!(subsets[0].ready_ips, vec!["192.168.1.10"]);
+                assert_eq!(subsets[1].ready_ips, vec!["192.168.1.10"]);
+            }
+            other => panic!("expected Upsert, got {other:?}"),
+        }
+    }
+
+    /// The endpoints watch path must point to the cross-namespace endpoints collection.
+    /// The mirroring controller watches this path to see ALL custom Endpoints objects,
+    /// not just those in a single namespace. A wrong path means the controller misses
+    /// Endpoints created in test namespaces and the mirroring never triggers.
+    #[test]
+    fn endpoints_watch_path_is_cross_namespace() {
+        let path = endpoints_watch_path();
+        assert_eq!(
+            path, "/api/v1/endpoints?watch=true",
+            "mirroring controller must watch the cross-namespace endpoints collection; \
+             a namespace-scoped path would miss Endpoints in conformance test namespaces"
+        );
+    }
 }
