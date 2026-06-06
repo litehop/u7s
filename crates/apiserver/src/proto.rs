@@ -4812,6 +4812,157 @@ pub fn decode_mutatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_js
     }))
 }
 
+// --- k8s.io/api/networking/v1/generated.proto ---
+
+/// IngressClassSpec — networking.k8s.io/v1/generated.proto
+/// Source: k8s.io/api/networking/v1/generated.proto message IngressClassSpec
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
+/// Only `controller` (field 1) is decoded; `parameters` (field 2) is a complex optional
+/// TypedLocalObjectReference that the apiserver does not need to inspect.
+#[derive(Clone, PartialEq, Message)]
+struct IngressClassSpec {
+    /// controller (field 1, string)
+    #[prost(string, tag = "1")]
+    controller: String,
+}
+
+/// IngressClass — networking.k8s.io/v1/generated.proto
+/// Source: k8s.io/api/networking/v1/generated.proto message IngressClass
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
+#[derive(Clone, PartialEq, Message)]
+struct IngressClass {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message IngressClassSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<IngressClassSpec>,
+}
+
+/// Decode a proto-encoded IngressClass into a serde_json::Value.
+///
+/// The conformance test POSTs IngressClass with Content-Type: application/vnd.kubernetes.protobuf.
+/// Without this decoder, decode_core_proto_by_kind returns None, extract_body returns raw proto
+/// bytes, and the handler returns 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_ingressclass_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = IngressClass::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "IngressClass",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        out["spec"] = serde_json::json!({ "controller": spec.controller });
+    }
+    Some(out)
+}
+
+// --- k8s.io/api/scheduling/v1/generated.proto ---
+
+/// PriorityClass — scheduling.k8s.io/v1/generated.proto
+/// Source: k8s.io/api/scheduling/v1/generated.proto message PriorityClass
+/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
+#[derive(Clone, PartialEq, Message)]
+struct PriorityClass {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// value (field 2, int32) — the scheduling priority of this class
+    #[prost(int32, tag = "2")]
+    value: i32,
+    /// preemptionPolicy (field 3, string) — e.g. "PreemptLowerPriority"
+    #[prost(string, tag = "3")]
+    preemption_policy: String,
+    /// globalDefault (field 4, bool) — if true, this is the default priority for pods
+    #[prost(bool, tag = "4")]
+    global_default: bool,
+    /// description (field 5, string) — human-readable description
+    #[prost(string, tag = "5")]
+    description: String,
+}
+
+/// Decode a proto-encoded PriorityClass into a serde_json::Value.
+///
+/// The SchedulerPreemption conformance test POSTs PriorityClass objects with
+/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder,
+/// decode_core_proto_by_kind returns None, extract_body returns raw proto bytes, and the
+/// handler returns 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_priorityclass_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = PriorityClass::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "scheduling.k8s.io/v1",
+        "kind": "PriorityClass",
+        "metadata": meta,
+        "value": obj.value
+    });
+    if !obj.preemption_policy.is_empty() {
+        out["preemptionPolicy"] = serde_json::Value::String(obj.preemption_policy);
+    }
+    if obj.global_default {
+        out["globalDefault"] = serde_json::Value::Bool(true);
+    }
+    if !obj.description.is_empty() {
+        out["description"] = serde_json::Value::String(obj.description);
+    }
+    Some(out)
+}
+
+// --- k8s.io/api/apps/v1/generated.proto (ControllerRevision) ---
+
+/// RawExtension — k8s.io/apimachinery/pkg/runtime/generated.proto
+/// Source: apimachinery-runtime-generated.proto message RawExtension
+/// field 1 = raw (bytes): the serialized object bytes.
+#[derive(Clone, PartialEq, Message)]
+struct ControllerRevisionRawExtension {
+    /// raw (field 1, bytes) — JSON-encoded serialization of the controller state
+    #[prost(bytes = "vec", tag = "1")]
+    raw: Vec<u8>,
+}
+
+/// ControllerRevision — apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message ControllerRevision
+/// (field numbers verified from proto/api-apps-v1-generated.proto)
+#[derive(Clone, PartialEq, Message)]
+struct ControllerRevision {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// data (field 2, message RawExtension) — serialized snapshot of controller state
+    #[prost(message, tag = "2")]
+    data: Option<ControllerRevisionRawExtension>,
+    /// revision (field 3, int64) — monotonically increasing revision number
+    #[prost(int64, tag = "3")]
+    revision: i64,
+}
+
+/// Decode a proto-encoded ControllerRevision into a serde_json::Value.
+///
+/// DaemonSet and StatefulSet controllers POST ControllerRevision objects with
+/// Content-Type: application/vnd.kubernetes.protobuf to track rollout history.
+/// Without this decoder, decode_core_proto_by_kind returns None, extract_body returns raw proto
+/// bytes, and the handler returns 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_controllerrevision_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = ControllerRevision::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "ControllerRevision",
+        "metadata": meta,
+        "revision": obj.revision
+    });
+    // data.raw contains JSON-encoded state; include it as a parsed JSON value if possible.
+    if let Some(raw_ext) = obj.data {
+        if !raw_ext.raw.is_empty() {
+            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&raw_ext.raw) {
+                out["data"] = parsed;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Decode a proto-encoded core Kubernetes object by kind.
 ///
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
@@ -4858,6 +5009,9 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "PriorityLevelConfiguration" => decode_prioritylevelconfiguration_proto(raw),
         "ValidatingWebhookConfiguration" => decode_validatingwebhookconfiguration_proto(raw),
         "MutatingWebhookConfiguration" => decode_mutatingwebhookconfiguration_proto(raw),
+        "IngressClass" => decode_ingressclass_proto(raw),
+        "PriorityClass" => decode_priorityclass_proto(raw),
+        "ControllerRevision" => decode_controllerrevision_proto(raw),
         _ => None,
     }
 }
@@ -9906,5 +10060,181 @@ mod tests {
             env_from[0]["configMapRef"]["optional"].is_null(),
             "optional must be absent when not set — kubelet treats absent as false (required)"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_ingressclass_proto / decode_core_proto_by_kind IngressClass
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch IngressClass proto and extract metadata and
+    /// spec.controller. Without this decoder, the IngressClass conformance test fails with
+    /// 400 "invalid JSON: expected value at line 1 column 1" when client-go POSTs with
+    /// Content-Type: application/vnd.kubernetes.protobuf.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_ingressclass() {
+        // Build: IngressClass {
+        //   metadata: ObjectMeta { name: "nginx" },
+        //   spec: IngressClassSpec { controller: "k8s.io/ingress-nginx" }
+        // }
+        let obj_meta = encode_length_delimited(1, b"nginx"); // ObjectMeta.name
+
+        // IngressClassSpec: field 1 = controller (string)
+        let ic_spec = encode_length_delimited(1, b"k8s.io/ingress-nginx");
+
+        // IngressClass: field 1=ObjectMeta, field 2=IngressClassSpec
+        let mut ic_proto = encode_length_delimited(1, &obj_meta);
+        ic_proto.extend_from_slice(&encode_length_delimited(2, &ic_spec));
+
+        let result = decode_core_proto_by_kind("IngressClass", &ic_proto).expect(
+            "IngressClass must decode via decode_core_proto_by_kind — without this, \
+                     the IngressClass API conformance test fails with 400 on POST",
+        );
+
+        assert_eq!(
+            result["kind"], "IngressClass",
+            "kind must be IngressClass so Object::from_bytes can route the object"
+        );
+        assert_eq!(result["apiVersion"], "networking.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "nginx",
+            "name must be extracted so the object is stored under the correct key"
+        );
+        assert_eq!(
+            result["spec"]["controller"], "k8s.io/ingress-nginx",
+            "controller must be extracted from IngressClassSpec field 1 — \
+             ingress controllers read this field to claim their IngressClass"
+        );
+    }
+
+    /// decode_ingressclass_proto must return None for malformed proto input.
+    #[test]
+    fn decode_ingressclass_proto_returns_none_for_garbage() {
+        assert!(decode_ingressclass_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_priorityclass_proto / decode_core_proto_by_kind PriorityClass
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch PriorityClass proto and extract metadata and
+    /// value. Without this decoder, the SchedulerPreemption conformance test fails with
+    /// 400 "invalid JSON: expected value at line 1 column 1" when client-go POSTs with
+    /// Content-Type: application/vnd.kubernetes.protobuf.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_priorityclass() {
+        // Build: PriorityClass {
+        //   metadata: ObjectMeta { name: "high-priority" },
+        //   value: 1000000,
+        //   preemptionPolicy: "PreemptLowerPriority",
+        //   globalDefault: false,
+        //   description: "high priority class",
+        // }
+        let obj_meta = encode_length_delimited(1, b"high-priority"); // ObjectMeta.name
+
+        // PriorityClass fields:
+        // field 1 = ObjectMeta, field 2 = value (int32/varint), field 3 = preemptionPolicy,
+        // field 4 = globalDefault (bool), field 5 = description
+        //
+        // value = 1000000: tag = (2 << 3) | 0 = 0x10; encode varint 1000000
+        // 1000000 = 0x0F4240 → varint: 0xC0, 0x84, 0x3D
+        let mut pc_proto = encode_length_delimited(1, &obj_meta); // field 1 = ObjectMeta
+                                                                  // field 2 = value (varint 1000000)
+        pc_proto.push(0x10); // tag: field 2, wire type 0
+        pc_proto.extend_from_slice(&encode_varint(1_000_000));
+        // field 3 = preemptionPolicy
+        pc_proto.extend_from_slice(&encode_length_delimited(3, b"PreemptLowerPriority"));
+        // field 5 = description
+        pc_proto.extend_from_slice(&encode_length_delimited(5, b"high priority class"));
+
+        let result = decode_core_proto_by_kind("PriorityClass", &pc_proto).expect(
+            "PriorityClass must decode via decode_core_proto_by_kind — without this, \
+                     the SchedulerPreemption conformance test fails with 400 on POST",
+        );
+
+        assert_eq!(
+            result["kind"], "PriorityClass",
+            "kind must be PriorityClass so Object::from_bytes can route the object"
+        );
+        assert_eq!(result["apiVersion"], "scheduling.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "high-priority",
+            "name must be extracted so the object is stored under the correct key"
+        );
+        assert_eq!(
+            result["value"], 1_000_000,
+            "value must be extracted from PriorityClass field 2 — \
+             kube-scheduler uses this to rank pod priority for preemption decisions"
+        );
+        assert_eq!(
+            result["preemptionPolicy"], "PreemptLowerPriority",
+            "preemptionPolicy must be extracted from PriorityClass field 3 — \
+             scheduler uses this to decide if the pod can preempt lower priority pods"
+        );
+        assert_eq!(
+            result["description"], "high priority class",
+            "description must be extracted from PriorityClass field 5"
+        );
+    }
+
+    /// decode_priorityclass_proto must return None for malformed proto input.
+    #[test]
+    fn decode_priorityclass_proto_returns_none_for_garbage() {
+        assert!(decode_priorityclass_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_controllerrevision_proto / decode_core_proto_by_kind ControllerRevision
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch ControllerRevision proto and extract metadata
+    /// and revision. Without this decoder, DaemonSet/StatefulSet rollout history tracking
+    /// fails with 400 "invalid JSON: expected value at line 1 column 1" when the controller
+    /// POSTs ControllerRevision with Content-Type: application/vnd.kubernetes.protobuf.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_controllerrevision() {
+        // Build: ControllerRevision {
+        //   metadata: ObjectMeta { name: "my-ds-abc123", namespace: "default" },
+        //   data: RawExtension { raw: b"{}" },
+        //   revision: 3,
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"my-ds-abc123"); // ObjectMeta.name
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
+
+        // RawExtension: field 1 = raw (bytes)
+        let raw_ext = encode_length_delimited(1, b"{}");
+
+        // ControllerRevision: field 1=ObjectMeta, field 2=RawExtension, field 3=revision (int64)
+        let mut cr_proto = encode_length_delimited(1, &obj_meta);
+        cr_proto.extend_from_slice(&encode_length_delimited(2, &raw_ext));
+        // field 3 = revision (varint 3)
+        cr_proto.push(0x18); // tag: field 3, wire type 0
+        cr_proto.extend_from_slice(&encode_varint(3));
+
+        let result = decode_core_proto_by_kind("ControllerRevision", &cr_proto).expect(
+            "ControllerRevision must decode via decode_core_proto_by_kind — without this, \
+                     DaemonSet/StatefulSet rollout history tracking fails with 400 on POST",
+        );
+
+        assert_eq!(
+            result["kind"], "ControllerRevision",
+            "kind must be ControllerRevision so Object::from_bytes can route the object"
+        );
+        assert_eq!(result["apiVersion"], "apps/v1");
+        assert_eq!(
+            result["metadata"]["name"], "my-ds-abc123",
+            "name must be extracted so the object is stored under the correct key"
+        );
+        assert_eq!(result["metadata"]["namespace"], "default");
+        assert_eq!(
+            result["revision"], 3,
+            "revision must be extracted from ControllerRevision field 3 — \
+             DaemonSet/StatefulSet controllers use this to track the rollout history version"
+        );
+    }
+
+    /// decode_controllerrevision_proto must return None for malformed proto input.
+    #[test]
+    fn decode_controllerrevision_proto_returns_none_for_garbage() {
+        assert!(decode_controllerrevision_proto(&[0xff, 0xff, 0xff]).is_none());
     }
 }
