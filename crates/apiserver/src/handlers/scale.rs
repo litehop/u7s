@@ -1480,7 +1480,7 @@ mod handler_tests {
         }
 
         fn vfield(field: u64, v: i32) -> Vec<u8> {
-            let tag = (field << 3) | 0; // wire type 0 = varint
+            let tag = field << 3; // wire type 0 = varint
             let mut out = varint(tag);
             out.extend(varint(v as u64));
             out
