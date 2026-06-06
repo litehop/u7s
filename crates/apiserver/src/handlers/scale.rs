@@ -1,13 +1,21 @@
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use u7s_store::Store;
 
-use crate::{keys::group_object_key, state::AppState, status::Status, types::Object};
+use crate::{
+    keys::group_object_key,
+    state::AppState,
+    status::Status,
+    types::Object,
+    util::{content_type, extract_body},
+};
 
 // ---------------------------------------------------------------------------
 // Typed Scale structs — local to this file (single-use, not in types.rs)
@@ -47,6 +55,147 @@ struct Scale {
     spec: ScaleSpec,
     #[serde(default)]
     status: ScaleStatus,
+}
+
+// ---------------------------------------------------------------------------
+// Protobuf types for Scale body decoding
+//
+// kubectl and client-go send write requests with Content-Type:
+// application/vnd.kubernetes.protobuf by default.  The wire format wraps the
+// payload in a k8s Unknown envelope (4-byte magic + proto-encoded Unknown).
+// For autoscaling/v1.Scale the `raw` field contains a proto-encoded Scale
+// message; we only need spec.replicas from it.
+//
+// These types mirror the official k8s .proto definitions (field numbers are
+// canonical and must not change).
+// ---------------------------------------------------------------------------
+
+const K8S_PROTO_MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
+
+/// k8s Unknown proto envelope — wraps the actual serialised object.
+/// Source: apimachinery/pkg/runtime/generated.proto message Unknown
+#[derive(Clone, PartialEq, Message)]
+struct ProtoUnknown {
+    /// typeMeta (field 1)
+    #[prost(message, tag = "1")]
+    type_meta: Option<ProtoTypeMeta>,
+    /// raw bytes of the encoded object (field 2)
+    #[prost(bytes = "vec", tag = "2")]
+    raw: Vec<u8>,
+    /// contentEncoding (field 3)
+    #[prost(string, tag = "3")]
+    content_encoding: String,
+    /// contentType (field 4): "application/json" or "application/vnd.kubernetes.protobuf"
+    #[prost(string, tag = "4")]
+    content_type: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoTypeMeta {
+    #[prost(string, tag = "1")]
+    api_version: String,
+    #[prost(string, tag = "2")]
+    kind: String,
+}
+
+/// autoscaling/v1 ScaleSpec — field 2 of Scale.
+/// Source: k8s.io/api/autoscaling/v1/generated.proto message ScaleSpec
+#[derive(Clone, PartialEq, Message)]
+struct ProtoScaleSpec {
+    /// replicas (field 1, int32)
+    #[prost(int32, tag = "1")]
+    replicas: i32,
+}
+
+/// autoscaling/v1 Scale — the object sent by client-go for PUT/PATCH scale.
+/// Source: k8s.io/api/autoscaling/v1/generated.proto message Scale
+///
+/// We only need spec.replicas; metadata and status are ignored here.
+#[derive(Clone, PartialEq, Message)]
+struct ProtoScale {
+    /// metadata (field 1, message) — skipped by using bytes
+    #[prost(bytes = "vec", tag = "1")]
+    metadata_raw: Vec<u8>,
+    /// spec (field 2, message)
+    #[prost(message, tag = "2")]
+    spec: Option<ProtoScaleSpec>,
+}
+
+/// Try to decode a k8s proto envelope body as a Scale JSON object.
+///
+/// client-go (and kubectl) send `Content-Type: application/vnd.kubernetes.protobuf`
+/// for PUT/PATCH requests.  The payload is:
+///   [4-byte magic] [proto-encoded Unknown envelope]
+///
+/// The Unknown envelope may contain either:
+///   - JSON bytes (contentType = "application/json")  — returned directly.
+///   - Proto-encoded Scale bytes (contentType = "" or "…/protobuf") — decoded
+///     using the minimal ProtoScale prost type above.
+///
+/// Returns `None` if the body is not a recognisable k8s proto envelope.  The
+/// caller falls through to the plain-JSON path in that case.
+fn try_decode_proto_scale_body(body: &Bytes) -> Option<Scale> {
+    // Must start with k8s proto magic.
+    if body.len() < 4 || &body[..4] != K8S_PROTO_MAGIC.as_slice() {
+        return None;
+    }
+    let envelope = ProtoUnknown::decode(&body[4..]).ok()?;
+
+    // If the raw field contains JSON (envelope was produced by a fallback path),
+    // parse it directly — no proto decode needed.
+    if envelope.content_type == "application/json" {
+        return serde_json::from_slice(&envelope.raw).ok();
+    }
+
+    // Otherwise raw is proto-encoded autoscaling/v1 Scale.
+    let proto_scale = ProtoScale::decode(envelope.raw.as_slice()).ok()?;
+    let replicas = proto_scale.spec.map(|s| s.replicas);
+
+    Some(Scale {
+        api_version: "autoscaling/v1".into(),
+        kind: "Scale".into(),
+        metadata: ScaleMetadata::default(),
+        spec: ScaleSpec { replicas },
+        status: ScaleStatus::default(),
+    })
+}
+
+/// Decode the request body into a `Scale` object.
+///
+/// Accepts both `application/json` and `application/vnd.kubernetes.protobuf`
+/// bodies.  When the body is proto-encoded, the k8s Unknown envelope is
+/// unwrapped and the Scale message is decoded with the minimal ProtoScale type.
+///
+/// Returns `Err(StatusError)` on parse failure so the caller can propagate the
+/// 400 directly.
+fn decode_scale_body(
+    body: &Bytes,
+    headers: &HeaderMap,
+) -> Result<Scale, crate::status::StatusError> {
+    let ct = content_type(headers);
+    // Try extract_body first: handles JSON-in-proto-envelope transparently.
+    let decoded = extract_body(body, ct);
+
+    // Fast path: try JSON parse (works for plain JSON or JSON extracted from
+    // a proto envelope by extract_body).
+    if let Ok(s) = serde_json::from_slice::<Scale>(&decoded) {
+        return Ok(s);
+    }
+
+    // Slow path: body was a proto envelope whose raw field is proto-encoded
+    // Scale (not JSON).  extract_body returns the original bytes in this case
+    // because there is no Scale decoder registered in decode_core_proto_by_kind.
+    // Use the inline decoder instead.
+    if let Some(s) = try_decode_proto_scale_body(body) {
+        return Ok(s);
+    }
+
+    // Nothing worked — propagate the JSON parse error.
+    let e = serde_json::from_slice::<Scale>(body)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "unrecognised body format".into());
+    Err(Status::bad_request(format!("invalid JSON: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -155,15 +304,18 @@ pub async fn get_scale<S: Store>(
 ///
 /// Accepts a Scale object body; writes `spec.replicas` back into the stored
 /// workload, increments resourceVersion, returns the updated Scale.
+///
+/// Accepts both `application/json` and `application/vnd.kubernetes.protobuf`
+/// request bodies — client-go sends protobuf by default.
 pub async fn put_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, resource, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     require_scale_resource(&resource)?;
 
-    let scale: Scale = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    let scale = decode_scale_body(&body, &headers)?;
 
     let new_replicas = scale
         .spec
@@ -214,15 +366,32 @@ pub async fn put_scale<S: Store>(
 ///
 /// Accepts a JSON merge-patch body targeting the Scale object.  Only
 /// `spec.replicas` is extracted and written back to the stored workload.
+///
+/// Accepts both `application/json` and `application/vnd.kubernetes.protobuf`
+/// request bodies — client-go sends protobuf by default.
 pub async fn patch_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, resource, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     require_scale_resource(&resource)?;
 
-    let patch_body: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+    // Accept both JSON and proto bodies; extract spec.replicas from whichever.
+    let ct = content_type(&headers);
+    let decoded = extract_body(&body, ct);
+    let patch_body: serde_json::Value =
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+            v
+        } else if let Some(scale) = try_decode_proto_scale_body(&body) {
+            serde_json::to_value(scale).unwrap_or_default()
+        } else {
+            let e = serde_json::from_slice::<serde_json::Value>(&body)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unrecognised body format".into());
+            return Err(Status::bad_request(format!("invalid JSON: {e}")));
+        };
     let patch_scale_spec: ScaleSpec =
         serde_json::from_value(patch_body["spec"].clone()).unwrap_or_default();
 
@@ -1151,6 +1320,222 @@ mod handler_tests {
             obj["metadata"]["generation"], 2,
             "generation must be incremented by patch_scale when spec.replicas changes — \
              kubectl scale uses PATCH; without increment the KCM may not reconcile"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for mayor-q0y9: proto body support and no-status
+    // StatefulSet handling
+    // -----------------------------------------------------------------------
+
+    /// PUT scale on a StatefulSet with no status field returns valid JSON.
+    ///
+    /// This is the direct regression test for mayor-q0y9. A freshly-created
+    /// StatefulSet may have no `status` key at all (the KCM hasn't reconciled
+    /// yet). Before the fix, `extract_status_replicas` could panic or produce
+    /// an unexpected value; with the fix it falls back to `spec.replicas`.
+    ///
+    /// The response MUST be parseable JSON with the correct spec.replicas —
+    /// the sonobuoy "should have a working scale subresource" test asserts on
+    /// `scaleResult.Spec.Replicas` and treats any parse failure as a test error.
+    #[tokio::test]
+    async fn put_scale_on_statefulset_with_no_status_returns_valid_json() {
+        let (state, store) = make_state();
+
+        // Seed a StatefulSet with NO status field at all (no `status` key).
+        // This is the state immediately after creation, before KCM reconciles.
+        let key = "/registry/apps/statefulsets/default/web";
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "generation": 1
+            },
+            "spec": { "replicas": 1 }
+            // Deliberately absent "status" key — simulates freshly-created StatefulSet
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&sts).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "spec": { "replicas": 3 }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/statefulsets/web/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // MUST return 200, not 400 or 500.
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PUT scale on a StatefulSet with no status must return 200 — \
+             the sonobuoy 'should have a working scale subresource' conformance \
+             test fails with 'invalid JSON' if the response body is empty or missing"
+        );
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // MUST be parseable as JSON — if the body is empty the Go test reports
+        // "invalid JSON: expected value at line 1 column 1".
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).expect(
+            "PUT scale response must be valid JSON — empty body causes \
+             'invalid JSON: expected value at line 1 column 1' in sonobuoy",
+        );
+
+        assert_eq!(
+            json["apiVersion"], "autoscaling/v1",
+            "PUT scale response must be an autoscaling/v1 Scale object"
+        );
+        assert_eq!(
+            json["spec"]["replicas"], 3,
+            "spec.replicas must reflect the PUT value (3)"
+        );
+        // status.replicas must fall back to the old spec.replicas (1) since the
+        // StatefulSet has no status field — KCM hasn't reconciled yet.
+        assert_eq!(
+            json["status"]["replicas"], 1,
+            "status.replicas must fall back to spec.replicas (1) when status is absent — \
+             KCM hasn't written status.replicas yet for a freshly-created StatefulSet"
+        );
+    }
+
+    /// PUT scale with a proto-encoded body returns valid JSON.
+    ///
+    /// client-go sends `Content-Type: application/vnd.kubernetes.protobuf` by
+    /// default for write operations (PUT/PATCH).  Before the fix, put_scale
+    /// tried to parse proto bytes as JSON, failed with "expected value at line 1
+    /// column 1", and returned HTTP 400.  The sonobuoy conformance test then
+    /// reported "Failed to put scale subresource: invalid JSON: …".
+    ///
+    /// This test constructs a minimal k8s proto envelope containing an
+    /// autoscaling/v1 Scale and verifies that put_scale accepts it and returns
+    /// valid JSON with the correct spec.replicas.
+    #[tokio::test]
+    async fn put_scale_accepts_proto_body_and_returns_valid_json() {
+        let (state, store) = make_state();
+        seed_workload(&store, "statefulsets", "default", "web", 1).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        // Build a minimal k8s proto envelope whose raw field contains a
+        // proto-encoded autoscaling/v1 Scale with spec.replicas = 3.
+        //
+        // Wire format:
+        //   [4-byte magic: 0x6b, 0x38, 0x73, 0x00]
+        //   [proto-encoded Unknown envelope]
+        //     field 1 (TypeMeta):    tag=0x0a (field 1, wire type 2)
+        //       field 1 (apiVersion): "autoscaling/v1"
+        //       field 2 (kind):       "Scale"
+        //     field 2 (raw bytes):   proto-encoded Scale
+        //       Scale field 2 (ScaleSpec):
+        //         ScaleSpec field 1 (replicas): 3 (varint)
+        //     field 4 (contentType): "" (proto)
+
+        fn varint(v: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut v = v;
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(b);
+                    break;
+                }
+                out.push(b | 0x80);
+            }
+            out
+        }
+
+        fn ld(field: u64, payload: &[u8]) -> Vec<u8> {
+            let tag = (field << 3) | 2;
+            let mut out = varint(tag);
+            out.extend(varint(payload.len() as u64));
+            out.extend_from_slice(payload);
+            out
+        }
+
+        fn vfield(field: u64, v: i32) -> Vec<u8> {
+            let tag = field << 3; // wire type 0 = varint
+            let mut out = varint(tag);
+            out.extend(varint(v as u64));
+            out
+        }
+
+        // TypeMeta { apiVersion: "autoscaling/v1", kind: "Scale" }
+        let api_version = ld(1, b"autoscaling/v1");
+        let kind = ld(2, b"Scale");
+        let type_meta_bytes: Vec<u8> = [api_version, kind].concat();
+
+        // ScaleSpec { replicas: 3 }
+        let scale_spec_bytes = vfield(1, 3); // ScaleSpec.replicas = 3 (varint field 1)
+
+        // Scale { spec: ScaleSpec } — spec is field 2 of Scale
+        let scale_raw = ld(2, &scale_spec_bytes);
+
+        // Unknown { typeMeta, raw, contentType="" }
+        let envelope: Vec<u8> = [
+            ld(1, &type_meta_bytes), // field 1: TypeMeta
+            ld(2, &scale_raw),       // field 2: raw (proto-encoded Scale)
+        ]
+        .concat();
+
+        let mut proto_body: Vec<u8> = K8S_PROTO_MAGIC.to_vec();
+        proto_body.extend(envelope);
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/statefulsets/web/scale")
+            .header("content-type", "application/vnd.kubernetes.protobuf")
+            .body(Body::from(Bytes::from(proto_body)))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PUT scale with proto body must return 200 — before the fix, proto bytes \
+             were passed to serde_json::from_slice which returned 'invalid JSON: \
+             expected value at line 1 column 1' and the handler returned 400"
+        );
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body)
+            .expect("PUT scale response to proto body must be valid JSON");
+
+        assert_eq!(
+            json["spec"]["replicas"], 3,
+            "spec.replicas must be 3 (the value from the proto body)"
+        );
+        assert_eq!(
+            json["apiVersion"], "autoscaling/v1",
+            "response must be autoscaling/v1 Scale"
         );
     }
 }
