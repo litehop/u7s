@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
@@ -187,12 +187,6 @@ pub trait Store: Send + Sync + 'static {
 
 const RING_CAPACITY: usize = 1000;
 const BROADCAST_CAPACITY: usize = 512;
-/// Capacity of the deletion log: how many deletion tombstones are remembered independently
-/// of the main ring buffer. Deletions are rare compared to creates/updates, so this log
-/// retains the last DELETION_LOG_CAPACITY deletions even after the main ring has compacted
-/// them out. This prevents Watch streams from missing DELETED events when the client
-/// reconnects after a 410 Compacted and the deletion happened before the new watch revision.
-const DELETION_LOG_CAPACITY: usize = 1000;
 
 pub struct SqliteStore {
     /// Single write connection. Mutex ensures serial access across spawn_blocking calls.
@@ -210,10 +204,10 @@ pub struct SqliteStore {
     /// Deletion-only log that persists tombstones independently of the main ring buffer.
     /// When the main ring compacts (evicts old events), deletion events may be lost, causing
     /// reconnecting watchers to miss DELETED events for objects deleted before the compaction.
-    /// This log retains the last DELETION_LOG_CAPACITY deletions so that before a Compacted
-    /// event is sent, any deletions that would otherwise be invisible to the reconnecting
-    /// client can be replayed.
-    deletion_log: Arc<RwLock<VecDeque<Arc<InternalEvent>>>>,
+    /// Keyed by store key: each key maps to its latest DELETED event. This means tombstones
+    /// are never evicted by unrelated writes — a namespace deleted early in a long conformance
+    /// run will still deliver its DELETED event even after 10 000+ subsequent writes.
+    deletion_log: Arc<RwLock<HashMap<String, Arc<InternalEvent>>>>,
     /// Lowest revision still in the ring buffer (revision of oldest entry + 1).
     compaction_horizon: Arc<AtomicU64>,
     /// Revision of the most recently committed write. List reads are compared against
@@ -266,9 +260,7 @@ impl SqliteStore {
 
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let ring = Arc::new(RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)));
-        let deletion_log = Arc::new(RwLock::new(VecDeque::with_capacity(
-            DELETION_LOG_CAPACITY + 1,
-        )));
+        let deletion_log = Arc::new(RwLock::new(HashMap::new()));
         let compaction_horizon = Arc::new(AtomicU64::new(0));
         let last_written_revision = Arc::new(AtomicU64::new(0));
 
@@ -300,14 +292,12 @@ impl SqliteStore {
         }
         // Also persist deletion tombstones to the deletion_log independently of the main ring.
         // When the main ring compacts and evicts old entries, deletion events can be lost.
-        // The deletion_log retains the most recent DELETION_LOG_CAPACITY deletions so that
-        // reconnecting watchers can still see DELETED events even after a compaction cycle.
+        // The deletion_log maps each store key to its latest DELETED event. Using a HashMap
+        // ensures tombstones are never evicted by unrelated writes: a namespace deleted early
+        // in a long conformance run retains its tombstone regardless of write volume.
         if event.value.is_none() {
             let mut guard = self.deletion_log.write().expect("deletion_log poisoned");
-            guard.push_back(Arc::clone(&event));
-            if guard.len() > DELETION_LOG_CAPACITY {
-                guard.pop_front();
-            }
+            guard.insert(event.key.clone(), Arc::clone(&event));
         }
         // Best-effort broadcast; lagging receivers are dropped automatically.
         let _ = self.tx.send(event);
@@ -1044,7 +1034,7 @@ impl Store for SqliteStore {
                 let tombstones: Vec<Arc<InternalEvent>> = {
                     let guard = deletion_log_arc.read().expect("deletion_log poisoned");
                     guard
-                        .iter()
+                        .values()
                         .filter(|e| e.key.starts_with(&prefix_owned) && e.revision > from_revision)
                         .cloned()
                         .collect()
@@ -1115,7 +1105,7 @@ impl Store for SqliteStore {
                             let tombstones: Vec<Arc<InternalEvent>> = {
                                 let guard = deletion_log_arc.read().expect("deletion_log poisoned");
                                 guard
-                                    .iter()
+                                    .values()
                                     .filter(|e| {
                                         e.key.starts_with(&prefix_owned)
                                             && e.revision > last_replayed
@@ -1512,9 +1502,7 @@ mod tests {
         let ring = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
             RING_CAPACITY + 1,
         )));
-        let deletion_log = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
-            DELETION_LOG_CAPACITY + 1,
-        )));
+        let deletion_log = Arc::new(RwLock::new(std::collections::HashMap::new()));
         let compaction_horizon = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let store = SqliteStore {
@@ -1614,9 +1602,7 @@ mod tests {
         let ring = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
             RING_CAPACITY + 1,
         )));
-        let deletion_log = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
-            DELETION_LOG_CAPACITY + 1,
-        )));
+        let deletion_log = Arc::new(RwLock::new(std::collections::HashMap::new()));
         let compaction_horizon = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let store = Arc::new(SqliteStore {
@@ -3189,6 +3175,100 @@ mod tests {
             "watch stream must emit Compacted after the DELETED (from_revision({create_rv}) \
              < horizon({}))",
             delete_rv + 1
+        );
+    }
+
+    /// Regression test for mayor-76nd: a namespace DELETED tombstone must survive 2000+
+    /// unrelated writes without being evicted from the deletion_log.
+    ///
+    /// The previous VecDeque implementation capped deletion_log at 1000 entries shared across
+    /// ALL resources. In a sonobuoy conformance run the sonobuoy namespace is created once and
+    /// deleted only at the very end; between those two events, 1000+ pod/configmap writes
+    /// evicted the sonobuoy namespace tombstone, causing the aggregator's Watch to deadlock for
+    /// 5+ hours waiting for a DELETED event that was silently dropped.
+    ///
+    /// This test FAILS if the HashMap is reverted to a bounded VecDeque: the tombstone for
+    /// "sonobuoy" would be evicted long before the 2000-write loop finishes, and the watcher
+    /// would receive only Compacted — never Deleted — causing the assertion to fail.
+    #[tokio::test]
+    async fn deletion_tombstone_survives_2000_unrelated_writes() {
+        let store = make_store();
+
+        let ns_key = "/registry/namespaces/sonobuoy";
+
+        // Create and delete the sonobuoy namespace (simulating run start + end).
+        let ns_json = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "sonobuoy" }
+            })
+            .to_string(),
+        );
+        let create_rv = store
+            .put(ns_key, ns_json, Some(0))
+            .await
+            .expect("create sonobuoy namespace");
+        let delete_rv = store
+            .delete(ns_key, None)
+            .await
+            .expect("delete sonobuoy namespace");
+
+        // Simulate the 35-minute sonobuoy run: 2000 pod writes in other namespaces.
+        // These writes must NOT evict the sonobuoy deletion tombstone.
+        for i in 0..2000u64 {
+            let pod_key = format!("/registry/pods/default/pod-{i}");
+            store
+                .put(&pod_key, pod_json(&format!("pod-{i}")), Some(0))
+                .await
+                .expect("put pod");
+        }
+
+        // Advance compaction horizon past the namespace deletion so the initial Compacted
+        // check fires. In production this happens automatically after 1000+ ring writes.
+        store.set_compaction_horizon_for_test(delete_rv + 1);
+        {
+            let mut guard = store.ring.write().expect("ring poisoned");
+            guard.clear();
+        }
+
+        // Open a Watch from create_rv (the aggregator's last known position).
+        let stream = store
+            .watch("/registry/namespaces/", create_rv)
+            .await
+            .expect("watch from create_rv");
+        let mut stream: Pin<Box<dyn Stream<Item = WatchEvent> + Send>> = Box::pin(stream);
+
+        let mut saw_deleted = false;
+        let mut saw_compacted = false;
+        for _ in 0..5 {
+            match next_event(&mut stream).await {
+                Some(WatchEvent::Deleted { key, revision }) => {
+                    assert_eq!(key, ns_key, "DELETED key must be the sonobuoy namespace");
+                    assert_eq!(
+                        revision, delete_rv,
+                        "DELETED revision must match the original deletion"
+                    );
+                    saw_deleted = true;
+                }
+                Some(WatchEvent::Compacted { .. }) => {
+                    saw_compacted = true;
+                    break;
+                }
+                Some(other) => panic!("unexpected event: {:?}", other),
+                None => break,
+            }
+        }
+
+        assert!(
+            saw_deleted,
+            "sonobuoy namespace DELETED event must survive 2000 unrelated writes in the \
+             deletion_log; with a bounded VecDeque the tombstone is evicted and the \
+             aggregator Watch deadlocks for hours (mayor-76nd)"
+        );
+        assert!(
+            saw_compacted,
+            "watch stream must emit Compacted after replaying the sonobuoy DELETED tombstone"
         );
     }
 }
