@@ -1269,6 +1269,13 @@ pub async fn replace_namespaced_resource<S: Store>(
         )));
     }
 
+    // Stamp namespace from the URL into the body. If the client omits metadata.namespace
+    // in the PUT body, the stored object would have no namespace. A cluster-wide Watch
+    // (e.g. the KCM EndpointSlice mirroring controller watching /api/v1/endpoints) would
+    // then return the object with a blank namespace, causing the informer to build a key
+    // with no namespace prefix and all DELETE operations to target the wrong URL path.
+    obj.body["metadata"]["namespace"] = serde_json::Value::String(ns.clone());
+
     // Strip status from the incoming body on the main endpoint when the resource
     // has a dedicated status subresource.
     if meta.has_status_subresource {
@@ -4943,6 +4950,90 @@ mod tests {
             ),
             Ok(_) => panic!("invalid JSON body must return 400"),
         }
+    }
+
+    /// Regression test for the blank-namespace EndpointSlice mirroring retry loop:
+    /// replace_namespaced_resource (PUT) must stamp metadata.namespace from the URL path into the
+    /// stored body even when the client omits it from the request body.
+    ///
+    /// Without the fix: a PUT body without metadata.namespace stores the object with namespace="".
+    /// The KCM EndpointSlice mirroring controller watches /api/v1/endpoints cluster-wide and builds
+    /// an informer key of just "<name>" (no "namespace/" prefix) for objects with blank namespace.
+    /// The controller then issues DELETE requests without a namespace in the URL path, producing
+    /// a "not found" retry loop that never resolves.
+    ///
+    /// This test fails on revert: if the namespace-stamp line is removed, the PUT body without
+    /// namespace gets stored with namespace="" and the list returns namespace="" for the object.
+    #[tokio::test]
+    async fn replace_namespaced_resource_stamps_namespace_when_body_omits_it() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // PUT body deliberately omits metadata.namespace — simulates a test client or
+        // kubectl apply that does not include the namespace field in the body.
+        let body_without_ns = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "my-lease" },
+            "spec": { "holderIdentity": "test-holder" }
+        });
+
+        let resp = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "my-lease".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body_without_ns).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("replace must succeed when body omits namespace"))
+        .into_response();
+
+        // The response body must have the namespace stamped.
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let returned: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            returned["metadata"]["namespace"], "kube-node-lease",
+            "PUT response must include the URL namespace in metadata.namespace; \
+             without the fix, namespace is absent and the mirroring controller builds \
+             a blank-namespace informer key, causing an infinite DELETE retry loop"
+        );
+
+        // The stored object must also have namespace stamped so cluster-wide LIST/Watch events
+        // include the namespace — this is what the KCM mirroring controller sees.
+        let key = "/registry/coordination.k8s.io/leases/kube-node-lease/my-lease";
+        let stored = store
+            .get(key)
+            .await
+            .expect("store get must succeed")
+            .expect("object must be stored");
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_obj["metadata"]["namespace"], "kube-node-lease",
+            "stored object must have metadata.namespace='kube-node-lease'; \
+             a cluster-wide Watch emits the raw stored JSON — if namespace is missing there, \
+             KCM informers receive blank-namespace objects and the EndpointSlice mirroring \
+             controller enters an infinite retry loop (blank-namespace DELETE requests fail \
+             with 'not found')"
+        );
     }
 
     /// rbac_cluster_key and rbac_namespaced_key produce the expected paths.
