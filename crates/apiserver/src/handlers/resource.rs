@@ -709,6 +709,15 @@ pub(crate) async fn do_patch<S: Store>(
     current.body = run_mutating_webhooks(state, current.body, &admission_ctx).await?;
     run_validating_webhooks(state, &current.body, &admission_ctx).await?;
 
+    // A user PATCH on an Endpoints object signals that the endpoints are now user-managed.
+    // Clear the annotation the KCM endpoints-controller stamps; the mirroring controller
+    // skips any Endpoints that carry it, blocking EndpointSliceMirroring.
+    if plural == "endpoints" {
+        if let Some(annotations) = current.body["metadata"]["annotations"].as_object_mut() {
+            annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
+        }
+    }
+
     // Dry-run: validation and admission passed; return the would-be result without persisting.
     if dry_run {
         if is_ssa {
@@ -1329,6 +1338,16 @@ pub async fn replace_namespaced_resource<S: Store>(
             _ => {
                 obj.body.as_object_mut().map(|m| m.remove("status"));
             }
+        }
+    }
+
+    // A user PUT on an Endpoints object signals that the endpoints are now user-managed,
+    // not service-controller-managed.  Clear the annotation the KCM endpoints-controller
+    // stamps on objects it owns; the mirroring controller skips any Endpoints that carry
+    // this annotation, so leaving it causes EndpointSliceMirroring to produce no slice.
+    if plural == "endpoints" {
+        if let Some(annotations) = obj.body["metadata"]["annotations"].as_object_mut() {
+            annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
         }
     }
 
@@ -8281,6 +8300,174 @@ mod tests {
             "SSA PATCH with dryRun=All must NOT mutate the store — holderIdentity must remain \
              'original-ssa-holder'; if this fails, do_patch's dry_run guard was removed and \
              kubectl diff / kubectl server-side dry-run tests will fail"
+        );
+    }
+
+    // -- Regression: EndpointSlice mirroring blocked by last-change-trigger-time (mayor-tjtl) --
+
+    /// PUT on an Endpoints object must clear `endpoints.kubernetes.io/last-change-trigger-time`.
+    ///
+    /// Root cause: the KCM endpoints-controller stamps this annotation on Endpoints it owns.
+    /// When the user then PUTs custom subsets, the annotation persists and the KCM mirroring
+    /// controller sees it and skips mirroring — no EndpointSlice is ever created.
+    /// Clearing the annotation on user PUT signals "user-managed" to the mirroring controller.
+    #[tokio::test]
+    async fn put_endpoints_clears_last_change_trigger_time_annotation() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // First create an Endpoints object (simulating what the KCM endpoints-controller
+        // creates for a Service — with the annotation stamped).
+        let ep_with_annotation = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": {
+                "name": "my-svc",
+                "namespace": "default",
+                "annotations": {
+                    "endpoints.kubernetes.io/last-change-trigger-time": "2024-01-01T00:00:00Z"
+                }
+            },
+            "subsets": []
+        });
+        let _ = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "endpoints".to_string(),
+                "my-svc".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&ep_with_annotation).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("initial Endpoints PUT must succeed: {e:?}"));
+
+        // Now simulate the user overwriting the Endpoints with custom subsets.
+        // The annotation is still present in the body (it was retrieved from the API and re-PUT).
+        let ep_user_put = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": {
+                "name": "my-svc",
+                "namespace": "default",
+                "annotations": {
+                    "endpoints.kubernetes.io/last-change-trigger-time": "2024-01-01T00:00:00Z"
+                }
+            },
+            "subsets": [{"addresses": [{"ip": "10.0.0.1"}], "ports": [{"port": 8080}]}]
+        });
+        let resp = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "endpoints".to_string(),
+                "my-svc".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&ep_user_put).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("user PUT of Endpoints must succeed: {e:?}"))
+        .into_response();
+
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp_body: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+
+        assert!(
+            resp_body["metadata"]["annotations"]
+                ["endpoints.kubernetes.io/last-change-trigger-time"]
+                .is_null(),
+            "PUT on Endpoints must clear 'endpoints.kubernetes.io/last-change-trigger-time'; \
+             if this annotation persists, the KCM mirroring controller skips the object and \
+             no EndpointSlice is created — EndpointSliceMirroring conformance test fails"
+        );
+    }
+
+    /// PATCH on an Endpoints object must clear `endpoints.kubernetes.io/last-change-trigger-time`.
+    ///
+    /// Same root cause as the PUT case: the annotation signals KCM-managed endpoints and
+    /// blocks the mirroring controller.  A user PATCH must also clear it.
+    #[tokio::test]
+    async fn patch_endpoints_clears_last_change_trigger_time_annotation() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // Create the Endpoints with the annotation.
+        let ep_with_annotation = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": {
+                "name": "patched-svc",
+                "namespace": "default",
+                "annotations": {
+                    "endpoints.kubernetes.io/last-change-trigger-time": "2024-01-01T00:00:00Z"
+                }
+            },
+            "subsets": []
+        });
+        let _ = replace_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "endpoints".to_string(),
+                "patched-svc".to_string(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&ep_with_annotation).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("initial Endpoints PUT must succeed: {e:?}"));
+
+        // PATCH with merge-patch to update subsets (annotation still present in store).
+        let merge_patch = serde_json::json!({
+            "subsets": [{"addresses": [{"ip": "10.0.0.2"}], "ports": [{"port": 9090}]}]
+        });
+        let mut merge_headers = axum::http::HeaderMap::new();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let resp = patch_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".to_string(),
+                "v1".to_string(),
+                "default".to_string(),
+                "endpoints".to_string(),
+                "patched-svc".to_string(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&merge_patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("merge-patch on Endpoints must succeed: {e:?}"))
+        .into_response();
+
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let resp_body: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+
+        assert!(
+            resp_body["metadata"]["annotations"]
+                ["endpoints.kubernetes.io/last-change-trigger-time"]
+                .is_null(),
+            "PATCH on Endpoints must clear 'endpoints.kubernetes.io/last-change-trigger-time'; \
+             if this annotation persists, the KCM mirroring controller skips the object and \
+             no EndpointSlice is created — EndpointSliceMirroring conformance test fails"
         );
     }
 }
