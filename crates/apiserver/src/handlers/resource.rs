@@ -1466,6 +1466,20 @@ pub async fn delete_namespaced_resource<S: Store>(
         }
     }
 
+    // Cascade-delete ReplicaSets owned by a deleted Deployment.
+    // Without this, orphaned ReplicaSets continue creating pods indefinitely —
+    // observed: smoke-test-mutate RS (desired: 1337) created 14000+ pods after
+    // its Deployment was deleted.
+    if group == "apps" && plural == "deployments" {
+        let deploy_uid = obj.body["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if !deploy_uid.is_empty() {
+            delete_replicasets_owned_by(&state, &ns, &deploy_uid).await;
+        }
+    }
+
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
@@ -1763,6 +1777,56 @@ async fn delete_pods_owned_by<S: Store>(
         let pod_key = crate::keys::group_object_key("", "pods", Some(namespace), &pod_name);
         if let Err(e) = state.store.delete(&pod_key, None).await {
             tracing::warn!("cascade-delete pod {namespace}/{pod_name}: {e}");
+        }
+    }
+}
+
+/// Called after a Deployment hard-delete to cascade-delete owned ReplicaSets immediately.
+/// Without this, orphaned ReplicaSets keep their desired-replica count active and continue
+/// creating pods indefinitely — observed: RS with desired=1337 created 14000+ pods after
+/// its Deployment was deleted.
+async fn delete_replicasets_owned_by<S: Store>(
+    state: &crate::state::AppState<S>,
+    namespace: &str,
+    owner_uid: &str,
+) {
+    let prefix = crate::keys::group_list_prefix("apps", "replicasets", Some(namespace));
+    let resp = match state
+        .store
+        .list(&prefix, u7s_store::ListOptions::default())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("cascade-delete replicasets in {namespace}: list failed: {e}");
+            return;
+        }
+    };
+
+    for item in resp.items {
+        let rs: serde_json::Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let owned = rs["metadata"]["ownerReferences"]
+            .as_array()
+            .map(|refs| {
+                refs.iter().any(|r| {
+                    r["uid"].as_str() == Some(owner_uid) && r["kind"].as_str() == Some("Deployment")
+                })
+            })
+            .unwrap_or(false);
+        if !owned {
+            continue;
+        }
+        let rs_name = rs["metadata"]["name"].as_str().unwrap_or("").to_string();
+        if rs_name.is_empty() {
+            continue;
+        }
+        let rs_key =
+            crate::keys::group_object_key("apps", "replicasets", Some(namespace), &rs_name);
+        if let Err(e) = state.store.delete(&rs_key, None).await {
+            tracing::warn!("cascade-delete replicaset {namespace}/{rs_name}: {e}");
         }
     }
 }
@@ -2885,6 +2949,121 @@ mod tests {
         assert!(
             store.get(other_pod_key).await.unwrap().is_some(),
             "pod not owned by the deleted DaemonSet must not be affected"
+        );
+    }
+
+    /// Deleting a Deployment must cascade-delete owned ReplicaSets immediately.
+    ///
+    /// Without this, orphaned ReplicaSets keep their desired-replica count active and
+    /// continue creating pods indefinitely — observed: RS with desired=1337 created
+    /// 14000+ pods after its Deployment was deleted.
+    #[tokio::test]
+    async fn delete_deployment_cascades_to_owned_replicasets() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let deploy_uid = "bbbbbbbb-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the Deployment.
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "my-deploy", "namespace": ns, "uid": deploy_uid }
+        });
+        let deploy_key = "/registry/apps/deployments/default/my-deploy";
+        store
+            .put(
+                deploy_key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a ReplicaSet owned by this Deployment.
+        let rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "my-deploy-7f96b54d4b",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "my-deploy",
+                    "uid": deploy_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "replicas": 1337 }
+        });
+        let rs_key = "/registry/apps/replicasets/default/my-deploy-7f96b54d4b";
+        store
+            .put(
+                rs_key,
+                bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed an unrelated ReplicaSet (must NOT be deleted).
+        let other_rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": { "name": "other-rs", "namespace": ns }
+        });
+        let other_rs_key = "/registry/apps/replicasets/default/other-rs";
+        store
+            .put(
+                other_rs_key,
+                bytes::Bytes::from(serde_json::to_vec(&other_rs).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the Deployment.
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                ns.to_string(),
+                "deployments".into(),
+                "my-deploy".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // Owned ReplicaSet must be cascade-deleted so it stops creating pods.
+        assert!(
+            store.get(rs_key).await.unwrap().is_none(),
+            "ReplicaSet owned by deleted Deployment must be cascade-deleted — \
+             without this, RS keeps desired-replica count active and creates pods indefinitely"
+        );
+
+        // Deployment itself must be deleted.
+        assert!(
+            store.get(deploy_key).await.unwrap().is_none(),
+            "Deployment itself must be deleted"
+        );
+
+        // Unrelated ReplicaSet must survive.
+        assert!(
+            store.get(other_rs_key).await.unwrap().is_some(),
+            "ReplicaSet not owned by the deleted Deployment must not be affected"
         );
     }
 
