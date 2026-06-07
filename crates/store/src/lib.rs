@@ -1102,13 +1102,26 @@ impl Store for SqliteStore {
                         // a relist, open a new Watch at the current revision, and wait forever.
                         let current_horizon = compaction_horizon_arc.load(Ordering::Relaxed);
                         if current_horizon > last_replayed {
+                            // Use from_revision (the watcher's original start) rather than
+                            // last_replayed as the lower bound for deletion_log replay.
+                            //
+                            // Why: after ring catchup, last_replayed is advanced by non-prefix
+                            // events (e.g. pod writes advancing the ring), so last_replayed may
+                            // now be GREATER than the tombstone's revision even though the
+                            // tombstone was never delivered. A deletion at revision D and
+                            // last_replayed at D+500 would be silently skipped with
+                            // `> last_replayed`, causing sonobuoy delete --wait to deadlock.
+                            //
+                            // Using from_revision ensures every deletion since the watcher
+                            // started is delivered before Compacted. The client relists after
+                            // Compacted anyway, so a pre-Compacted duplicate DELETED is harmless.
                             let tombstones: Vec<Arc<InternalEvent>> = {
                                 let guard = deletion_log_arc.read().expect("deletion_log poisoned");
                                 guard
                                     .values()
                                     .filter(|e| {
                                         e.key.starts_with(&prefix_owned)
-                                            && e.revision > last_replayed
+                                            && e.revision > from_revision
                                     })
                                     .cloned()
                                     .collect()
@@ -3265,6 +3278,185 @@ mod tests {
             "sonobuoy namespace DELETED event must survive 2000 unrelated writes in the \
              deletion_log; with a bounded VecDeque the tombstone is evicted and the \
              aggregator Watch deadlocks for hours (mayor-76nd)"
+        );
+        assert!(
+            saw_compacted,
+            "watch stream must emit Compacted after replaying the sonobuoy DELETED tombstone"
+        );
+    }
+
+    /// Regression test for mayor-76nd (second scenario): a Watch opened AFTER a namespace enters
+    /// Terminating must still receive the DELETED event when the hard-delete happens and then the
+    /// watcher lags+compacts such that ring catchup advances last_replayed PAST the tombstone
+    /// revision.
+    ///
+    /// Root cause: the lag-recovery deletion_log filter used `revision > last_replayed`.
+    /// After ring catchup, last_replayed advances to the highest revision of matching ring events.
+    /// If a ring event at delete_rv+1 (e.g. some-other-ns) is in the ring, last_replayed becomes
+    /// delete_rv+1. The tombstone at delete_rv fails `delete_rv > delete_rv+1` = false, so it is
+    /// silently dropped. sonobuoy delete --wait deadlocks waiting for a DELETED that never arrives.
+    ///
+    /// Fix: use `revision > from_revision` (watcher start) rather than `> last_replayed`.
+    ///
+    /// This test FAILS if the fix is reverted to `> last_replayed`: saw_deleted would be false
+    /// because the tombstone at delete_rv is below the last_replayed value advanced by ring
+    /// catchup.
+    #[tokio::test]
+    async fn watch_lag_recovery_delivers_deleted_event_when_last_replayed_exceeds_tombstone_revision(
+    ) {
+        use std::sync::Arc;
+        use tokio::sync::broadcast;
+
+        // Build a store with a tiny broadcast capacity (4) so lag is easy to trigger.
+        let write_conn = {
+            use rusqlite::Connection;
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID;
+                 CREATE TABLE IF NOT EXISTS meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
+                 CREATE INDEX IF NOT EXISTS idx_pods_nodename ON objects (json_extract(value, '$.spec.nodeName')) WHERE key LIKE '/registry/pods/%';
+                 CREATE INDEX IF NOT EXISTS idx_ns_name ON objects(ns, obj_name) WHERE ns IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS idx_name ON objects(obj_name);",
+            ).unwrap();
+            conn
+        };
+        let write_conn = Arc::new(tokio::sync::Mutex::new(write_conn));
+        let read_conn = Arc::clone(&write_conn);
+
+        let (tx, _) = broadcast::channel::<Arc<InternalEvent>>(4);
+        let ring = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
+            RING_CAPACITY + 1,
+        )));
+        let deletion_log = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let compaction_horizon = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let store = Arc::new(SqliteStore {
+            write_conn,
+            read_conn,
+            tx,
+            ring,
+            deletion_log,
+            compaction_horizon,
+            last_written_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+
+        let ns_key = "/registry/namespaces/sonobuoy";
+        let ns_json = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "sonobuoy" }
+            })
+            .to_string(),
+        );
+
+        // Step 1: Create the namespace.
+        let _create_rv = store
+            .put(ns_key, ns_json, Some(0))
+            .await
+            .expect("create namespace");
+
+        // Step 2: Open a watch at the current revision — simulates sonobuoy delete --wait
+        // opening a Watch after the namespace is already Terminating (soft-deleted).
+        // from_revision = watch_start_rv; last_replayed starts at watch_start_rv.
+        let watch_start_rv = store
+            .list("/registry/namespaces/", ListOptions::default())
+            .await
+            .expect("list")
+            .revision;
+
+        let stream = store
+            .watch("/registry/namespaces/", watch_start_rv)
+            .await
+            .expect("watch from current revision");
+        let mut stream: Pin<Box<dyn futures_core::Stream<Item = WatchEvent> + Send>> =
+            Box::pin(stream);
+
+        // Step 3: Hard-delete the namespace. Tombstone stored in deletion_log at delete_rv.
+        // This event is also broadcast; the watcher may or may not receive it before lag.
+        let delete_rv = store.delete(ns_key, None).await.expect("delete namespace");
+        assert!(
+            delete_rv > watch_start_rv,
+            "delete revision must follow watch start"
+        );
+
+        // Step 4: Inject a ring event at delete_rv+1 for the SAME namespace prefix.
+        // This simulates "some-other-ns" being modified right after the sonobuoy delete.
+        // During lag recovery ring catchup, this event matches the prefix and advances
+        // last_replayed to delete_rv+1 (> delete_rv). With the old filter `> last_replayed`,
+        // the tombstone at delete_rv would be silently skipped. With the new filter
+        // `> from_revision`, delete_rv > watch_start_rv is true → tombstone delivered.
+        //
+        // Also clear the delete event from the ring to simulate it having been compacted.
+        // Then flood the broadcast channel (write 6 > capacity=4) to trigger Lagged.
+        {
+            let mut guard = store.ring.write().expect("ring poisoned");
+            // Remove the delete event (it was at delete_rv). Only keep the injected event.
+            guard.retain(|e| e.revision != delete_rv);
+            // Inject a namespace-prefix event at delete_rv+1 (advances last_replayed past
+            // delete_rv during ring catchup).
+            guard.push_back(Arc::new(InternalEvent {
+                key: "/registry/namespaces/some-other-ns".to_string(),
+                revision: delete_rv + 1,
+                value: Some(Bytes::from_static(b"{}")),
+                is_create: true,
+            }));
+        }
+        // Set compaction_horizon > last_replayed (after catchup, last_replayed = delete_rv+1)
+        // so the Compacted branch fires. Use delete_rv+2 to be safely above delete_rv+1.
+        store.set_compaction_horizon_for_test(delete_rv + 2);
+
+        // Step 5: Flood the broadcast channel so the watcher gets a Lagged error.
+        // Writing 6 events with channel capacity=4 guarantees at least one is dropped.
+        // The watcher has not consumed any events yet (we haven't polled the stream).
+        // These writes go to the ring too; the watcher will replay them during catchup.
+        // We write pod events (non-namespace prefix) so they don't interfere with assertions.
+        for i in 0..6u64 {
+            let key = format!("/registry/pods/default/flood-pod-{i}");
+            store
+                .put(&key, pod_json(&format!("flood-pod-{i}")), Some(0))
+                .await
+                .expect("put flood pod");
+        }
+
+        // Step 6: Consume the stream. Expected sequence:
+        //   - Any number of Added/Modified (ring replay of namespace create, plus some-other-ns)
+        //   - Lagged triggers internally → ring catchup advances last_replayed to delete_rv+1
+        //   - Compacted path fires (horizon=delete_rv+2 > last_replayed=delete_rv+1)
+        //   - deletion_log filter `> from_revision` (= watch_start_rv) delivers delete_rv tombstone
+        //   - WatchEvent::Deleted for sonobuoy namespace
+        //   - WatchEvent::Compacted
+        //
+        // With old `> last_replayed` filter: delete_rv > delete_rv+1 = false → DELETED dropped.
+        let mut saw_deleted = false;
+        let mut saw_compacted = false;
+        for _ in 0..20 {
+            match next_event(&mut stream).await {
+                Some(WatchEvent::Deleted { key, revision }) if key == ns_key => {
+                    assert_eq!(
+                        revision, delete_rv,
+                        "DELETED revision must match the original deletion revision"
+                    );
+                    saw_deleted = true;
+                }
+                Some(WatchEvent::Compacted { .. }) => {
+                    saw_compacted = true;
+                    break;
+                }
+                Some(_) => {
+                    // Added/Modified from ring replay or some-other-ns; ignore.
+                }
+                None => break,
+            }
+        }
+
+        assert!(
+            saw_deleted,
+            "DELETED event for sonobuoy must be delivered during lag+compaction recovery \
+             even when ring catchup advances last_replayed to delete_rv+1 (past the tombstone \
+             at delete_rv); with `> last_replayed` the tombstone is silently skipped and \
+             sonobuoy delete --wait deadlocks (mayor-76nd second scenario)"
         );
         assert!(
             saw_compacted,
