@@ -1901,14 +1901,65 @@ struct PersistentVolumeClaim {
     metadata: Option<ObjectMeta>,
 }
 
+/// EndpointAddress — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message EndpointAddress
+/// targetRef (field 4, ObjectReference) is skipped — not needed.
+#[derive(Clone, PartialEq, Message)]
+struct EndpointAddress {
+    /// ip (field 1, string)
+    #[prost(string, tag = "1")]
+    ip: String,
+    /// hostname (field 2, string)
+    #[prost(string, tag = "2")]
+    hostname: String,
+    /// nodeName (field 3, string)
+    #[prost(string, tag = "3")]
+    node_name: String,
+}
+
+/// EndpointPort — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message EndpointPort
+#[derive(Clone, PartialEq, Message)]
+struct EndpointPort {
+    /// name (field 1, string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// port (field 2, int32)
+    #[prost(int32, tag = "2")]
+    port: i32,
+    /// protocol (field 3, string)
+    #[prost(string, tag = "3")]
+    protocol: String,
+    /// appProtocol (field 4, string)
+    #[prost(string, tag = "4")]
+    app_protocol: String,
+}
+
+/// EndpointSubset — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message EndpointSubset
+#[derive(Clone, PartialEq, Message)]
+struct EndpointSubset {
+    /// addresses (field 1, repeated EndpointAddress)
+    #[prost(message, repeated, tag = "1")]
+    addresses: Vec<EndpointAddress>,
+    /// notReadyAddresses (field 2, repeated EndpointAddress)
+    #[prost(message, repeated, tag = "2")]
+    not_ready_addresses: Vec<EndpointAddress>,
+    /// ports (field 3, repeated EndpointPort)
+    #[prost(message, repeated, tag = "3")]
+    ports: Vec<EndpointPort>,
+}
+
 /// Endpoints — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Endpoints
-/// subsets (field 2, repeated EndpointSubset) is skipped — not needed for routing.
 #[derive(Clone, PartialEq, Message)]
 struct Endpoints {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// subsets (field 2, repeated EndpointSubset)
+    #[prost(message, repeated, tag = "2")]
+    subsets: Vec<EndpointSubset>,
 }
 
 // --- k8s.io/api/storage/v1/generated.proto ---
@@ -4223,14 +4274,84 @@ pub fn decode_persistentvolumeclaim_proto(data: &[u8]) -> Option<serde_json::Val
 }
 
 /// Decode a proto-encoded Endpoints object into a `serde_json::Value`.
+///
+/// Decodes metadata and subsets (field 2, repeated EndpointSubset).
+/// Without decoding subsets, a proto PUT/PATCH silently drops user-supplied subsets,
+/// leaving the stored object with null subsets and breaking EndpointSliceMirroring.
 pub fn decode_endpoints_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = Endpoints::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Endpoints",
         "metadata": meta
-    }))
+    });
+    if !obj.subsets.is_empty() {
+        let subsets: Vec<serde_json::Value> = obj
+            .subsets
+            .into_iter()
+            .map(|subset| {
+                let mut s = serde_json::json!({});
+                if !subset.addresses.is_empty() {
+                    s["addresses"] = subset
+                        .addresses
+                        .into_iter()
+                        .map(|a| {
+                            let mut addr = serde_json::json!({ "ip": a.ip });
+                            if !a.hostname.is_empty() {
+                                addr["hostname"] = serde_json::Value::String(a.hostname);
+                            }
+                            if !a.node_name.is_empty() {
+                                addr["nodeName"] = serde_json::Value::String(a.node_name);
+                            }
+                            addr
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                }
+                if !subset.not_ready_addresses.is_empty() {
+                    s["notReadyAddresses"] = subset
+                        .not_ready_addresses
+                        .into_iter()
+                        .map(|a| {
+                            let mut addr = serde_json::json!({ "ip": a.ip });
+                            if !a.hostname.is_empty() {
+                                addr["hostname"] = serde_json::Value::String(a.hostname);
+                            }
+                            if !a.node_name.is_empty() {
+                                addr["nodeName"] = serde_json::Value::String(a.node_name);
+                            }
+                            addr
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                }
+                if !subset.ports.is_empty() {
+                    s["ports"] = subset
+                        .ports
+                        .into_iter()
+                        .map(|p| {
+                            let mut port = serde_json::json!({ "port": p.port });
+                            if !p.name.is_empty() {
+                                port["name"] = serde_json::Value::String(p.name);
+                            }
+                            if !p.protocol.is_empty() {
+                                port["protocol"] = serde_json::Value::String(p.protocol);
+                            }
+                            if !p.app_protocol.is_empty() {
+                                port["appProtocol"] = serde_json::Value::String(p.app_protocol);
+                            }
+                            port
+                        })
+                        .collect::<Vec<_>>()
+                        .into();
+                }
+                s
+            })
+            .collect();
+        result["subsets"] = subsets.into();
+    }
+    Some(result)
 }
 
 /// Decode a proto-encoded StorageClass object into a `serde_json::Value`.
@@ -8567,6 +8688,76 @@ mod tests {
         assert_eq!(result["apiVersion"], "v1", "apiVersion must be v1");
         assert_eq!(result["metadata"]["name"], "my-ep");
         assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    /// decode_endpoints_proto must preserve subsets (field 2) from proto-encoded Endpoints.
+    ///
+    /// When client-go PUTs/PATCHes Endpoints with Content-Type protobuf, field 2 carries
+    /// the subsets. If they are dropped, the stored object has null subsets, the
+    /// EndpointSliceMirroring controller finds nothing to mirror, and the mirrored
+    /// EndpointSlice never appears — breaking any test that verifies EndpointSlice presence.
+    #[test]
+    fn decode_endpoints_proto_preserves_subsets() {
+        // Build Endpoints {
+        //   metadata: { name: "my-ep", namespace: "default" },
+        //   subsets: [{
+        //     addresses: [{ ip: "10.1.2.3" }],
+        //     ports: [{ name: "http", port: 80, protocol: "TCP" }]
+        //   }]
+        // }
+
+        // metadata
+        let mut meta = encode_length_delimited(1, b"my-ep");
+        meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        // EndpointAddress { ip: "10.1.2.3" }
+        let addr = encode_length_delimited(1, b"10.1.2.3");
+
+        // EndpointPort { name: "http", port: 80, protocol: "TCP" }
+        // port=80: tag=(2<<3)|0=0x10, value=80=0x50
+        let mut ep_port = encode_length_delimited(1, b"http");
+        ep_port.push(0x10); // field 2, wire type 0 (varint)
+        ep_port.push(80); // port = 80
+        ep_port.extend_from_slice(&encode_length_delimited(3, b"TCP"));
+
+        // EndpointSubset { addresses: [addr], ports: [ep_port] }
+        let mut subset = encode_length_delimited(1, &addr);
+        subset.extend_from_slice(&encode_length_delimited(3, &ep_port));
+
+        // Endpoints { metadata, subsets: [subset] }
+        let mut proto = encode_length_delimited(1, &meta);
+        proto.extend_from_slice(&encode_length_delimited(2, &subset));
+
+        let result = decode_core_proto_by_kind("Endpoints", &proto)
+            .expect("Endpoints must decode via decode_core_proto_by_kind");
+
+        assert_eq!(result["kind"], "Endpoints");
+        assert_eq!(result["metadata"]["name"], "my-ep");
+
+        let subsets = result["subsets"]
+            .as_array()
+            .expect("subsets must be present — dropping field 2 breaks EndpointSliceMirroring");
+        assert_eq!(subsets.len(), 1, "one subset must be decoded");
+
+        let addresses = subsets[0]["addresses"]
+            .as_array()
+            .expect("addresses must be present in subset");
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(
+            addresses[0]["ip"], "10.1.2.3",
+            "ip must survive proto decode — EndpointSlice mirroring uses subset addresses"
+        );
+
+        let ports = subsets[0]["ports"]
+            .as_array()
+            .expect("ports must be present in subset");
+        assert_eq!(ports.len(), 1);
+        assert_eq!(
+            ports[0]["port"], 80,
+            "port number must survive proto decode"
+        );
+        assert_eq!(ports[0]["protocol"], "TCP");
+        assert_eq!(ports[0]["name"], "http");
     }
 
     // ---------------------------------------------------------------------------
