@@ -224,26 +224,18 @@ impl<S: Store> AppState<S> {
         cluster_ca_der: Option<&[u8]>,
         webhook_identity_pem: Option<&[u8]>,
         konnectivity_proxy_addr: Option<&str>,
-    ) -> reqwest::Client {
+    ) -> Result<reqwest::Client, String> {
         let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
 
         if let Some(ca_der) = cluster_ca_der {
             // tls_certs_only disables the system/Mozilla root store and trusts only
             // the cluster CA. This closes the SSRF/exfiltration vector: a user with
             // webhook RBAC can only reach servers that present a cert signed by our CA.
-            // Certificate::from_der parses the DER bytes; if malformed it returns Err
-            // here or the error surfaces at build() time. In production cluster_ca_der
-            // is always valid DER from generate_tls, so this path always succeeds.
-            match reqwest::Certificate::from_der(ca_der) {
-                Ok(cert) => {
-                    builder = builder.tls_certs_only([cert]);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "webhook client: failed to parse cluster CA DER: {e}; using system roots"
-                    );
-                }
-            }
+            // A corrupt CA file is a configuration error — fail hard rather than falling
+            // back to the system trust store (which would re-open the SSRF vector).
+            let cert = reqwest::Certificate::from_der(ca_der)
+                .map_err(|e| format!("webhook client: failed to parse cluster CA DER: {e}"))?;
+            builder = builder.tls_certs_only([cert]);
         }
 
         if let Some(identity_pem) = webhook_identity_pem {
@@ -272,7 +264,9 @@ impl<S: Store> AppState<S> {
             }
         }
 
-        builder.build().expect("webhook HTTP client must build")
+        builder
+            .build()
+            .map_err(|e| format!("webhook HTTP client failed to build: {e}"))
     }
 
     /// Construct an `AppState` from an [`AppStateConfig`].
@@ -286,7 +280,8 @@ impl<S: Store> AppState<S> {
             cfg.cluster_ca_der.as_deref(),
             cfg.webhook_identity_pem.as_deref(),
             cfg.konnectivity_proxy_addr.as_deref(),
-        );
+        )
+        .expect("corrupt cluster CA or invalid webhook client configuration — cannot start");
         // If no key is supplied, generate a fresh random 32-byte key from the OS CSPRNG.
         // uuid::Uuid::new_v4() uses getrandom internally — two UUIDs give 32 bytes.
         let continue_token_key: [u8; 32] = cfg.continue_token_key.unwrap_or_else(|| {
@@ -1101,8 +1096,9 @@ mod tests {
             .expect("generate self-signed cert");
         let ca_der = cert.cert.der().to_vec();
 
-        // Must not panic — if CA DER is valid, client construction succeeds.
-        let _client = AppState::<SqliteStore>::build_webhook_client(Some(&ca_der), None, None);
+        // Must succeed — if CA DER is valid, client construction returns Ok.
+        let _client = AppState::<SqliteStore>::build_webhook_client(Some(&ca_der), None, None)
+            .expect("valid CA DER must produce Ok client");
     }
 
     /// build_webhook_client succeeds with no CA and no identity (test path).
@@ -1112,7 +1108,8 @@ mod tests {
     /// after the security fix is applied.
     #[test]
     fn build_webhook_client_succeeds_with_no_ca_no_identity() {
-        let _client = AppState::<SqliteStore>::build_webhook_client(None, None, None);
+        let _client = AppState::<SqliteStore>::build_webhook_client(None, None, None)
+            .expect("no-CA no-identity must produce Ok client");
     }
 
     /// build_webhook_client succeeds with a konnectivity proxy addr configured.
@@ -1124,7 +1121,8 @@ mod tests {
     #[test]
     fn build_webhook_client_succeeds_with_konnectivity_proxy_addr() {
         let _client =
-            AppState::<SqliteStore>::build_webhook_client(None, None, Some("127.0.0.1:8135"));
+            AppState::<SqliteStore>::build_webhook_client(None, None, Some("127.0.0.1:8135"))
+                .expect("konnectivity proxy must produce Ok client");
     }
 
     /// build_webhook_client succeeds when given a valid PEM identity (cert + key).
@@ -1172,6 +1170,27 @@ mod tests {
             Some(&ca_cert_der),
             Some(&identity_pem),
             None,
+        )
+        .expect("valid CA DER + valid identity PEM must produce Ok client");
+    }
+
+    /// build_webhook_client returns Err when given invalid CA DER bytes.
+    ///
+    /// Security regression test (mayor-ca6p): before the fix, a corrupt or replaced
+    /// ca.crt caused Certificate::from_der to fail silently, and the webhook client
+    /// fell back to the system/Mozilla CA trust store. That allowed an attacker with
+    /// webhook RBAC to register a webhook pointing to any system-trusted HTTPS server
+    /// and receive full object bodies (SSRF/exfiltration). After the fix, bad DER
+    /// produces Err and the apiserver refuses to start rather than degrading security.
+    #[test]
+    fn build_webhook_client_fails_with_invalid_ca_der() {
+        // Garbage bytes are not valid DER — Certificate::from_der must return Err.
+        let bad_der: &[u8] = b"this is not valid DER";
+        let result = AppState::<SqliteStore>::build_webhook_client(Some(bad_der), None, None);
+        assert!(
+            result.is_err(),
+            "invalid CA DER must cause Err so the server fails at startup \
+             rather than falling back to the system trust store"
         );
     }
 
