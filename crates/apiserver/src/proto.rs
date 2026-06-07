@@ -1630,39 +1630,42 @@ struct JobSpec {
     /// selector (field 4, message LabelSelector) — decoded as raw bytes, not needed for routing
     #[prost(bytes = "vec", tag = "4")]
     selector: Vec<u8>,
-    /// template (field 5, PodTemplateSpec) — decoded as raw bytes; PodSpec is deeply nested
-    #[prost(bytes = "vec", tag = "5")]
-    template: Vec<u8>,
-    /// backoffLimit (field 6, int32)
-    #[prost(int32, tag = "6")]
-    backoff_limit: i32,
-    /// manualSelector (field 7, bool)
-    #[prost(bool, tag = "7")]
+    /// manualSelector (field 5, bool)
+    #[prost(bool, tag = "5")]
     manual_selector: bool,
-    /// completionMode (field 8, string) — "NonIndexed" or "Indexed"
-    #[prost(string, tag = "8")]
+    /// template (field 6, PodTemplateSpec) — decoded as raw bytes; PodSpec is deeply nested
+    #[prost(bytes = "vec", tag = "6")]
+    template: Vec<u8>,
+    /// backoffLimit (field 7, int32)
+    #[prost(int32, tag = "7")]
+    backoff_limit: i32,
+    /// ttlSecondsAfterFinished (field 8, int32)
+    #[prost(int32, tag = "8")]
+    ttl_seconds_after_finished: i32,
+    /// completionMode (field 9, string) — "NonIndexed" or "Indexed"
+    #[prost(string, tag = "9")]
     completion_mode: String,
-    /// suspend (field 9, bool)
-    #[prost(bool, tag = "9")]
+    /// suspend (field 10, bool)
+    #[prost(bool, tag = "10")]
     suspend: bool,
-    /// podReplacementPolicy (field 10, string) — added k8s 1.28
-    #[prost(string, tag = "10")]
-    pod_replacement_policy: String,
     /// podFailurePolicy (field 11, bytes) — complex message, decoded as raw bytes
     #[prost(bytes = "vec", tag = "11")]
     pod_failure_policy: Vec<u8>,
-    /// successPolicy (field 12, bytes) — complex message, decoded as raw bytes
-    #[prost(bytes = "vec", tag = "12")]
-    success_policy: Vec<u8>,
-    /// backoffLimitPerIndex (field 13, int32) — added k8s 1.28
-    #[prost(int32, tag = "13")]
+    /// backoffLimitPerIndex (field 12, int32) — added k8s 1.28
+    #[prost(int32, tag = "12")]
     backoff_limit_per_index: i32,
-    /// maxFailedIndexes (field 14, int32) — added k8s 1.28
-    #[prost(int32, tag = "14")]
+    /// maxFailedIndexes (field 13, int32) — added k8s 1.28
+    #[prost(int32, tag = "13")]
     max_failed_indexes: i32,
+    /// podReplacementPolicy (field 14, string) — added k8s 1.28
+    #[prost(string, tag = "14")]
+    pod_replacement_policy: String,
     /// managedBy (field 15, string) — added k8s 1.30
     #[prost(string, tag = "15")]
     managed_by: String,
+    /// successPolicy (field 16, bytes) — complex message, decoded as raw bytes
+    #[prost(bytes = "vec", tag = "16")]
+    success_policy: Vec<u8>,
 }
 
 /// JobTemplateSpec — field 1=ObjectMeta, field 2=JobSpec
@@ -3419,6 +3422,12 @@ fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
         m.insert(
             "backoffLimit".to_string(),
             serde_json::Value::Number(serde_json::Number::from(spec.backoff_limit)),
+        );
+    }
+    if spec.ttl_seconds_after_finished != 0 {
+        m.insert(
+            "ttlSecondsAfterFinished".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.ttl_seconds_after_finished)),
         );
     }
     if !spec.completion_mode.is_empty() {
@@ -7680,8 +7689,8 @@ mod tests {
         let mut obj_meta = encode_length_delimited(1, b"my-cron"); // ObjectMeta.name
         obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
 
-        // JobSpec field 6 = backoffLimit (int32, wire 0): tag = (6 << 3) | 0 = 0x30, value = 3
-        let job_spec = vec![0x30_u8, 0x03]; // field 6 (backoffLimit), wire type 0, varint 3
+        // JobSpec field 7 = backoffLimit (int32, wire 0): tag = (7 << 3) | 0 = 0x38, value = 3
+        let job_spec = vec![0x38_u8, 0x03]; // field 7 (backoffLimit), wire type 0, varint 3
 
         // JobTemplateSpec: field 2 = JobSpec
         let job_template_spec = encode_length_delimited(2, &job_spec);
@@ -7723,7 +7732,88 @@ mod tests {
         );
         assert_eq!(
             result["spec"]["jobTemplate"]["spec"]["backoffLimit"], 3,
-            "backoffLimit must be decoded from JobSpec field 6"
+            "backoffLimit must be decoded from JobSpec field 7"
+        );
+    }
+
+    /// decode_cronjob_proto must handle a kubectl wire-format body where JobSpec.template is
+    /// at proto field 6 (LEN wire type). Before mayor-w00n, JobSpec had `template` at tag=5 and
+    /// `backoffLimit` at tag=6. kubectl encodes `template` as field 6 (LEN), so prost saw
+    /// field 6 as wire type 2 when the struct expected wire type 0 (int32 backoffLimit),
+    /// causing CronJob::decode to return Err, decode_cronjob_proto to return None,
+    /// and extract_body to fall through to raw proto bytes → "invalid JSON: expected value at
+    /// line 1 column 1" (HTTP 400).
+    #[test]
+    fn decode_cronjob_proto_handles_kubectl_wire_format_with_template_at_field6() {
+        use prost::Message as _;
+
+        // Build the CronJob directly via prost structs so the encoding uses the correct
+        // field numbers from the fixed JobSpec definition. The regression we guard against
+        // is: if JobSpec.template is at tag=5 (wrong) instead of tag=6 (correct), prost
+        // decodes the LEN field at tag=6 against `backoffLimit` (int32, wire type 0) and
+        // returns DecodeError, making decode_cronjob_proto return None and the apiserver
+        // return HTTP 400 "invalid JSON".
+        let cj = CronJob {
+            metadata: Some(ObjectMeta {
+                name: "my-cj".to_string(),
+                namespace: "cronjobtest".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(CronJobSpec {
+                schedule: "*/1 * * * *".to_string(),
+                job_template: Some(JobTemplateSpec {
+                    metadata: None,
+                    spec: Some(JobSpec {
+                        // template at field 6 — if the field number were wrong (tag=5),
+                        // prost would encode it at field 5 and then decode would succeed
+                        // trivially (no cross-type mismatch). The regression only manifests
+                        // when the struct has template at tag=5 and backoffLimit at tag=6,
+                        // because kubectl puts template at wire field 6 (LEN type) which
+                        // collides with the mislocated backoffLimit (int32, varint type).
+                        template: vec![0x0a, 0x02, 0x08, 0x01], // minimal PodTemplateSpec bytes
+                        backoff_limit: 3,
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        cj.encode(&mut buf).expect("prost encode must succeed");
+
+        // Verify that the encoded bytes contain field 6 as a LEN field (template).
+        // Tag for (field 6, wire type 2) = (6 << 3) | 2 = 50 = 0x32.
+        // If template were at field 5, the tag would be (5<<3)|2 = 42 = 0x2a.
+        // This assertion fails if template is at the wrong field number.
+        assert!(
+            buf.windows(1).any(|w| w[0] == 0x32),
+            "encoded CronJob must contain tag 0x32 (field 6, LEN = template field in JobSpec); \
+             if template is at field 5, tag 0x2a appears instead and the fix is not in effect"
+        );
+
+        let result = decode_cronjob_proto(&buf).expect(
+            "decode_cronjob_proto must return Some when JobSpec.template is at field 6 \
+                     (LEN wire type) — before mayor-w00n fix, JobSpec had template at tag=5 \
+                     causing a wire-type mismatch when kubectl sends template at field 6, \
+                     making CronJob::decode return Err and the apiserver return HTTP 400",
+        );
+
+        assert_eq!(result["kind"], "CronJob");
+        assert_eq!(result["apiVersion"], "batch/v1");
+        assert_eq!(result["metadata"]["name"], "my-cj");
+        assert_eq!(
+            result["spec"]["schedule"], "*/1 * * * *",
+            "schedule must survive decode when template is present at field 6"
+        );
+        assert_eq!(
+            result["spec"]["jobTemplate"]["spec"]["backoffLimit"], 3,
+            "backoffLimit must decode correctly at field 7 after the field-number fix"
+        );
+        assert!(
+            result["spec"]["jobTemplate"]["spec"]["template"].is_object(),
+            "jobTemplate.spec.template must be present after decoding kubectl wire format"
         );
     }
 
@@ -7749,10 +7839,10 @@ mod tests {
         let mut obj_meta = encode_length_delimited(1, b"test-job"); // ObjectMeta.name
         obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
 
-        // JobSpec: field 2=completions (varint), field 6=backoffLimit (varint)
+        // JobSpec: field 2=completions (varint), field 7=backoffLimit (varint)
         // completions=1: tag = (2 << 3) | 0 = 0x10, value = 0x01
-        // backoffLimit=4: tag = (6 << 3) | 0 = 0x30, value = 0x04
-        let job_spec = vec![0x10, 0x01, 0x30, 0x04];
+        // backoffLimit=4: tag = (7 << 3) | 0 = 0x38, value = 0x04
+        let job_spec = vec![0x10, 0x01, 0x38, 0x04];
 
         let mut job_proto = encode_length_delimited(1, &obj_meta); // Job.field 1 = ObjectMeta
         job_proto.extend_from_slice(&encode_length_delimited(2, &job_spec)); // Job.field 2 = JobSpec
@@ -7780,7 +7870,7 @@ mod tests {
         );
         assert_eq!(
             result["spec"]["backoffLimit"], 4,
-            "backoffLimit must be decoded from JobSpec field 6"
+            "backoffLimit must be decoded from JobSpec field 7"
         );
         assert!(
             result["spec"]["template"].is_object(),
@@ -7854,7 +7944,7 @@ mod tests {
     }
 
     /// decode_job_proto must handle a Job with successPolicy — conformance test job.go:502 and
-    /// job.go:582 create Jobs with successPolicy (k8s 1.30+ field at proto field 12).
+    /// job.go:582 create Jobs with successPolicy (k8s 1.30+ field at proto field 16).
     #[test]
     fn decode_job_proto_handles_job_with_success_policy() {
         use prost::Message as _;

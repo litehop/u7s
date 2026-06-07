@@ -5597,8 +5597,8 @@ mod tests {
         obj_meta.extend_from_slice(&encode_ld(3, b"default"));
         obj_meta.extend_from_slice(&encode_ld(8, &[])); // creationTimestamp
 
-        // JobSpec { backoffLimit: 6 (field 6, wire type 0 = varint) }
-        let job_spec = encode_varint_field(6, 6); // backoffLimit = 6
+        // JobSpec { backoffLimit: 6 (field 7, wire type 0 = varint) }
+        let job_spec = encode_varint_field(7, 6); // backoffLimit = 6
 
         // JobTemplateSpec sub-message bytes: field 2 = spec (JobSpec)
         // jt_bytes IS the complete sub-message content for JobTemplateSpec
