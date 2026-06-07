@@ -1906,17 +1906,24 @@ struct PersistentVolumeClaim {
 
 /// EndpointAddress — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message EndpointAddress
-/// targetRef (field 4, ObjectReference) is skipped — not needed.
+/// Canonical field layout:
+///   1: ip (string)
+///   2: targetRef (ObjectReference, LEN/message) — decoded as raw bytes, not serialized
+///   3: hostname (string)
+///   4: nodeName (string)
 #[derive(Clone, PartialEq, Message)]
 struct EndpointAddress {
     /// ip (field 1, string)
     #[prost(string, tag = "1")]
     ip: String,
-    /// hostname (field 2, string)
-    #[prost(string, tag = "2")]
-    hostname: String,
-    /// nodeName (field 3, string)
+    /// targetRef (field 2, ObjectReference) — captured as bytes, not serialized to JSON
+    #[prost(bytes = "vec", tag = "2")]
+    target_ref: Vec<u8>,
+    /// hostname (field 3, string)
     #[prost(string, tag = "3")]
+    hostname: String,
+    /// nodeName (field 4, string)
+    #[prost(string, tag = "4")]
     node_name: String,
 }
 
@@ -8848,6 +8855,54 @@ mod tests {
         );
         assert_eq!(ports[0]["protocol"], "TCP");
         assert_eq!(ports[0]["name"], "http");
+    }
+
+    /// EndpointAddress hostname must be decoded from proto field 3 (not field 2).
+    ///
+    /// Canonical k8s proto has targetRef at field 2 (LEN/message) and hostname at field 3.
+    /// If hostname were at field 2, any Endpoints object with a targetRef would corrupt the
+    /// hostname field (prost would try to decode ObjectReference bytes as UTF-8), and actual
+    /// hostname/nodeName values would be silently dropped — breaking EndpointSliceMirroring.
+    #[test]
+    fn decode_endpoints_proto_hostname_at_field_3_nodename_at_field_4() {
+        // Build EndpointAddress with:
+        //   field 1: ip = "192.168.1.5"
+        //   field 2: targetRef = some LEN-encoded bytes (simulates an ObjectReference)
+        //   field 3: hostname = "my-host"
+        //   field 4: nodeName = "node-1"
+        let mut addr = encode_length_delimited(1, b"192.168.1.5");
+        // targetRef at field 2: a minimal LEN-encoded ObjectReference (just a non-empty payload)
+        addr.extend_from_slice(&encode_length_delimited(2, b"\x0a\x03Pod"));
+        addr.extend_from_slice(&encode_length_delimited(3, b"my-host"));
+        addr.extend_from_slice(&encode_length_delimited(4, b"node-1"));
+
+        // EndpointSubset { addresses: [addr] }
+        let subset = encode_length_delimited(1, &addr);
+
+        // Endpoints { metadata: { name: "ep" }, subsets: [subset] }
+        let meta = encode_length_delimited(1, b"ep");
+        let mut proto = encode_length_delimited(1, &meta);
+        proto.extend_from_slice(&encode_length_delimited(2, &subset));
+
+        let result = decode_core_proto_by_kind("Endpoints", &proto)
+            .expect("Endpoints with hostname at field 3 must decode");
+
+        let addresses = result["subsets"][0]["addresses"]
+            .as_array()
+            .expect("addresses must be present");
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(
+            addresses[0]["ip"], "192.168.1.5",
+            "ip must be decoded from field 1"
+        );
+        assert_eq!(
+            addresses[0]["hostname"], "my-host",
+            "hostname must be decoded from field 3, not field 2 — wrong tag corrupts hostname when targetRef is present"
+        );
+        assert_eq!(
+            addresses[0]["nodeName"], "node-1",
+            "nodeName must be decoded from field 4 — wrong tag drops nodeName silently"
+        );
     }
 
     // ---------------------------------------------------------------------------
