@@ -4992,15 +4992,15 @@ struct PriorityClass {
     /// value (field 2, int32) — the scheduling priority of this class
     #[prost(int32, tag = "2")]
     value: i32,
-    /// preemptionPolicy (field 3, string) — e.g. "PreemptLowerPriority"
-    #[prost(string, tag = "3")]
-    preemption_policy: String,
-    /// globalDefault (field 4, bool) — if true, this is the default priority for pods
-    #[prost(bool, tag = "4")]
+    /// globalDefault (field 3, bool) — if true, this is the default priority for pods
+    #[prost(bool, tag = "3")]
     global_default: bool,
-    /// description (field 5, string) — human-readable description
-    #[prost(string, tag = "5")]
+    /// description (field 4, string) — human-readable description
+    #[prost(string, tag = "4")]
     description: String,
+    /// preemptionPolicy (field 5, string) — e.g. "PreemptLowerPriority", added in k8s 1.19
+    #[prost(string, tag = "5")]
+    preemption_policy: String,
 }
 
 /// Decode a proto-encoded PriorityClass into a serde_json::Value.
@@ -10322,9 +10322,9 @@ mod tests {
         // }
         let obj_meta = encode_length_delimited(1, b"high-priority"); // ObjectMeta.name
 
-        // PriorityClass fields:
-        // field 1 = ObjectMeta, field 2 = value (int32/varint), field 3 = preemptionPolicy,
-        // field 4 = globalDefault (bool), field 5 = description
+        // PriorityClass fields (k8s.io/api/scheduling/v1/generated.proto):
+        // field 1 = ObjectMeta, field 2 = value (int32/varint), field 3 = globalDefault (bool),
+        // field 4 = description (string), field 5 = preemptionPolicy (string, added k8s 1.19)
         //
         // value = 1000000: tag = (2 << 3) | 0 = 0x10; encode varint 1000000
         // 1000000 = 0x0F4240 → varint: 0xC0, 0x84, 0x3D
@@ -10332,10 +10332,11 @@ mod tests {
                                                                   // field 2 = value (varint 1000000)
         pc_proto.push(0x10); // tag: field 2, wire type 0
         pc_proto.extend_from_slice(&encode_varint(1_000_000));
-        // field 3 = preemptionPolicy
-        pc_proto.extend_from_slice(&encode_length_delimited(3, b"PreemptLowerPriority"));
-        // field 5 = description
-        pc_proto.extend_from_slice(&encode_length_delimited(5, b"high priority class"));
+        // field 3 = globalDefault (bool false = zero, not encoded; we leave it absent)
+        // field 4 = description
+        pc_proto.extend_from_slice(&encode_length_delimited(4, b"high priority class"));
+        // field 5 = preemptionPolicy
+        pc_proto.extend_from_slice(&encode_length_delimited(5, b"PreemptLowerPriority"));
 
         let result = decode_core_proto_by_kind("PriorityClass", &pc_proto).expect(
             "PriorityClass must decode via decode_core_proto_by_kind — without this, \
@@ -10358,12 +10359,12 @@ mod tests {
         );
         assert_eq!(
             result["preemptionPolicy"], "PreemptLowerPriority",
-            "preemptionPolicy must be extracted from PriorityClass field 3 — \
+            "preemptionPolicy must be extracted from PriorityClass field 5 — \
              scheduler uses this to decide if the pod can preempt lower priority pods"
         );
         assert_eq!(
             result["description"], "high priority class",
-            "description must be extracted from PriorityClass field 5"
+            "description must be extracted from PriorityClass field 4"
         );
     }
 
