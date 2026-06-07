@@ -4949,6 +4949,60 @@ pub fn decode_mutatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_js
     }))
 }
 
+/// MutatingAdmissionPolicy — admissionregistration.k8s.io/v1/generated.proto
+/// Source: k8s.io/api/admissionregistration/v1/generated.proto message MutatingAdmissionPolicy
+/// field 1 = metadata (ObjectMeta), field 2 = spec (MutatingAdmissionPolicySpec, opaque to u7s)
+/// Only metadata is decoded; the spec is stored/returned as-is through the JSON object store.
+#[derive(Clone, PartialEq, Message)]
+struct MutatingAdmissionPolicy {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// Decode a proto-encoded MutatingAdmissionPolicy into a serde_json::Value.
+///
+/// The MutatingAdmissionPolicy conformance test POSTs with Content-Type:
+/// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
+/// returns None, extract_body returns raw proto bytes, and the handler returns
+/// 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_mutatingadmissionpolicy_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = MutatingAdmissionPolicy::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "MutatingAdmissionPolicy",
+        "metadata": meta
+    }))
+}
+
+/// MutatingAdmissionPolicyBinding — admissionregistration.k8s.io/v1/generated.proto
+/// Source: k8s.io/api/admissionregistration/v1/generated.proto message MutatingAdmissionPolicyBinding
+/// field 1 = metadata (ObjectMeta), field 2 = spec (MutatingAdmissionPolicyBindingSpec, opaque to u7s)
+/// Only metadata is decoded; the spec is stored/returned as-is through the JSON object store.
+#[derive(Clone, PartialEq, Message)]
+struct MutatingAdmissionPolicyBinding {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+}
+
+/// Decode a proto-encoded MutatingAdmissionPolicyBinding into a serde_json::Value.
+///
+/// The MutatingAdmissionPolicyBinding conformance test POSTs with Content-Type:
+/// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
+/// returns None, extract_body returns raw proto bytes, and the handler returns
+/// 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_mutatingadmissionpolicybinding_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = MutatingAdmissionPolicyBinding::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    Some(serde_json::json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "MutatingAdmissionPolicyBinding",
+        "metadata": meta
+    }))
+}
+
 // --- k8s.io/api/networking/v1/generated.proto ---
 
 /// IngressClassSpec — networking.k8s.io/v1/generated.proto
@@ -5146,6 +5200,8 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "PriorityLevelConfiguration" => decode_prioritylevelconfiguration_proto(raw),
         "ValidatingWebhookConfiguration" => decode_validatingwebhookconfiguration_proto(raw),
         "MutatingWebhookConfiguration" => decode_mutatingwebhookconfiguration_proto(raw),
+        "MutatingAdmissionPolicy" => decode_mutatingadmissionpolicy_proto(raw),
+        "MutatingAdmissionPolicyBinding" => decode_mutatingadmissionpolicybinding_proto(raw),
         "IngressClass" => decode_ingressclass_proto(raw),
         "PriorityClass" => decode_priorityclass_proto(raw),
         "ControllerRevision" => decode_controllerrevision_proto(raw),
@@ -10573,6 +10629,82 @@ mod tests {
     #[test]
     fn decode_priorityclass_proto_returns_none_for_garbage() {
         assert!(decode_priorityclass_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_mutatingadmissionpolicy_proto / decode_core_proto_by_kind MutatingAdmissionPolicy
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch MutatingAdmissionPolicy proto and extract
+    /// metadata. Without this decoder, the MutatingAdmissionPolicy conformance test fails with
+    /// 400 "invalid JSON: expected value at line 1 column 1" when client-go POSTs with
+    /// Content-Type: application/vnd.kubernetes.protobuf.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_mutatingadmissionpolicy() {
+        // Build: MutatingAdmissionPolicy { metadata: ObjectMeta { name: "test-map" } }
+        // MutatingAdmissionPolicy: field 1 = ObjectMeta (metadata)
+        // ObjectMeta: field 1 = name (string)
+        let obj_meta = encode_length_delimited(1, b"test-map"); // ObjectMeta.name
+        let proto = encode_length_delimited(1, &obj_meta); // MutatingAdmissionPolicy.metadata
+
+        let result = decode_core_proto_by_kind("MutatingAdmissionPolicy", &proto).expect(
+            "MutatingAdmissionPolicy must decode via decode_core_proto_by_kind — without this, \
+             the MutatingAdmissionPolicy API conformance test fails with 400 on POST",
+        );
+
+        assert_eq!(
+            result["kind"], "MutatingAdmissionPolicy",
+            "kind must be MutatingAdmissionPolicy so Object::from_bytes can route the object"
+        );
+        assert_eq!(result["apiVersion"], "admissionregistration.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "test-map",
+            "name must be extracted so the object is stored under the correct key"
+        );
+    }
+
+    /// decode_mutatingadmissionpolicy_proto must return None for malformed proto input.
+    #[test]
+    fn decode_mutatingadmissionpolicy_proto_returns_none_for_garbage() {
+        assert!(decode_mutatingadmissionpolicy_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_mutatingadmissionpolicybinding_proto / decode_core_proto_by_kind MutatingAdmissionPolicyBinding
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch MutatingAdmissionPolicyBinding proto and extract
+    /// metadata. Without this decoder, the MutatingAdmissionPolicyBinding conformance test
+    /// fails with 400 "invalid JSON: expected value at line 1 column 1" when client-go POSTs
+    /// with Content-Type: application/vnd.kubernetes.protobuf.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_mutatingadmissionpolicybinding() {
+        // Build: MutatingAdmissionPolicyBinding { metadata: ObjectMeta { name: "test-mapb" } }
+        // MutatingAdmissionPolicyBinding: field 1 = ObjectMeta (metadata)
+        // ObjectMeta: field 1 = name (string)
+        let obj_meta = encode_length_delimited(1, b"test-mapb"); // ObjectMeta.name
+        let proto = encode_length_delimited(1, &obj_meta); // MutatingAdmissionPolicyBinding.metadata
+
+        let result = decode_core_proto_by_kind("MutatingAdmissionPolicyBinding", &proto).expect(
+            "MutatingAdmissionPolicyBinding must decode via decode_core_proto_by_kind — without \
+             this, the MutatingAdmissionPolicyBinding API conformance test fails with 400 on POST",
+        );
+
+        assert_eq!(
+            result["kind"], "MutatingAdmissionPolicyBinding",
+            "kind must be MutatingAdmissionPolicyBinding so Object::from_bytes can route the object"
+        );
+        assert_eq!(result["apiVersion"], "admissionregistration.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "test-mapb",
+            "name must be extracted so the object is stored under the correct key"
+        );
+    }
+
+    /// decode_mutatingadmissionpolicybinding_proto must return None for malformed proto input.
+    #[test]
+    fn decode_mutatingadmissionpolicybinding_proto_returns_none_for_garbage() {
+        assert!(decode_mutatingadmissionpolicybinding_proto(&[0xff, 0xff, 0xff]).is_none());
     }
 
     // ---------------------------------------------------------------------------
