@@ -1454,8 +1454,8 @@ struct TokenRequestSpec {
     /// audiences (field 1, repeated string)
     #[prost(string, repeated, tag = "1")]
     audiences: Vec<String>,
-    /// expirationSeconds (field 2, int64) — optional, 0 = unset
-    #[prost(int64, tag = "2")]
+    /// expirationSeconds (field 4, int64) — optional, 0 = unset
+    #[prost(int64, tag = "4")]
     expiration_seconds: i64,
     /// boundObjectRef (field 3, message BoundObjectReference)
     #[prost(message, tag = "3")]
@@ -3037,8 +3037,8 @@ pub struct TokenRequestFields {
 ///   field 1 (ObjectMeta, wire 2): ignored
 ///   field 2 (TokenRequestSpec, wire 2): spec
 ///     field 1 (repeated string): audiences
-///     field 2 (int64): expirationSeconds (0 = unset)
 ///     field 3 (BoundObjectReference, message): boundObjectRef
+///     field 4 (int64): expirationSeconds (0 = unset)
 ///
 /// Returns `None` if the bytes are not a recognisable protobuf message (malformed input).
 pub fn decode_token_request(raw: &[u8]) -> Option<TokenRequestFields> {
@@ -7630,7 +7630,7 @@ mod tests {
     ///
     /// The hand-rolled decoder had a bug where expirationSeconds was looked up at the
     /// wrong field number inside the spec sub-message. prost decodes it correctly via
-    /// the official field 2 (int64) in TokenRequestSpec.
+    /// the official field 4 (int64) in TokenRequestSpec.
     ///
     /// This test must fail if decode_token_request returns None or extracts wrong values.
     #[test]
@@ -7666,6 +7666,62 @@ mod tests {
             Some(7200),
             "expirationSeconds=7200 must be decoded correctly; None here means the \
              hand-rolled decoder was reading the wrong field number"
+        );
+    }
+
+    /// Regression test for mayor-c9o3: expirationSeconds is at field 4 in the canonical
+    /// k8s TokenRequestSpec proto, not field 2. If our prost tag is wrong (e.g. tag=2),
+    /// decoding real k8s client bytes will always yield expiration_seconds=0 (default),
+    /// so every token request uses the server default TTL regardless of what was asked.
+    ///
+    /// This test constructs raw wire bytes with expirationSeconds at field 4 (as a real
+    /// k8s client sends) and asserts the value is decoded correctly. It MUST fail if the
+    /// prost tag on expiration_seconds is reverted to 2.
+    ///
+    /// Wire layout for the spec sub-message:
+    ///   field 1 (repeated string, wire 2): audiences = "aud"  → tag 0x0a, len 0x03, "aud"
+    ///   field 4 (int64, wire 0): expirationSeconds = 3600     → tag 0x20, varint 0x80 0x1c
+    ///
+    /// Outer TokenRequest: field 2 (message, wire 2): spec sub-message
+    #[test]
+    fn decode_token_request_expiration_seconds_at_field_4_raw_bytes() {
+        // Build spec sub-message manually:
+        //   field 1, wire 2 (len-delimited string): "aud"
+        //     tag = (1 << 3) | 2 = 0x0a
+        //     len = 3
+        //     payload = b"aud"
+        //   field 4, wire 0 (varint): 3600
+        //     tag = (4 << 3) | 0 = 0x20
+        //     3600 in varint = 0x80 0x1c
+        let mut spec_bytes: Vec<u8> = Vec::new();
+        // field 1: audiences = "aud"
+        spec_bytes.extend_from_slice(&[0x0a, 0x03, b'a', b'u', b'd']);
+        // field 4: expirationSeconds = 3600 (varint: 3600 = 0xE10 → 0x90 0x1c in LEB128)
+        // 3600 = 0b0000_1110_0001_0000 → groups of 7: 0b001_1100 (low) and 0b0011100 (next)
+        // Actually: 3600 = 0xE10; low 7 bits = 0x10 | 0x80 = 0x90; next 7 bits = 0xE10 >> 7 = 0x1c
+        spec_bytes.extend_from_slice(&[0x20, 0x90, 0x1c]);
+
+        // Build outer TokenRequest: field 2 (spec), wire 2
+        //   tag = (2 << 3) | 2 = 0x12
+        let mut raw: Vec<u8> = Vec::new();
+        raw.push(0x12);
+        raw.push(spec_bytes.len() as u8);
+        raw.extend_from_slice(&spec_bytes);
+
+        let fields = decode_token_request(&raw)
+            .expect("decode_token_request must succeed with expirationSeconds at field 4");
+
+        assert_eq!(
+            fields.audiences,
+            vec!["aud"],
+            "audience must be decoded from field 1"
+        );
+        assert_eq!(
+            fields.expiration_seconds,
+            Some(3600),
+            "expirationSeconds=3600 at field 4 must be decoded; \
+             None or wrong value means prost tag is wrong (reverted to 2 instead of 4), \
+             causing all proto token requests to use server default TTL"
         );
     }
 
