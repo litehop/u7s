@@ -9,6 +9,12 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 FOCUS="${SONOBUOY_FOCUS:-}"
+_VM="${U7S_VM_NAME:-lima-node}"
+if [ "$_VM" = "lima-node" ]; then
+  WORKDIR="$REPO/temp/u7s"
+else
+  WORKDIR="$REPO/temp/u7s-${_VM}"
+fi
 UNPACK=1
 
 while [[ $# -gt 0 ]]; do
@@ -63,7 +69,7 @@ fi
 # so /var/log/pods/ still has the container logs at this point.
 echo "Evacuating pod logs from VM..."
 limactl shell "$VM_NAME" sudo tar -czf /tmp/pod-logs-evacuation.tar.gz /var/log/pods/ 2>/dev/null || true
-limactl copy "${VM_NAME}:/tmp/pod-logs-evacuation.tar.gz" /tmp/pod-logs-evacuation.tar.gz 2>/dev/null || true
+limactl copy "${VM_NAME}:/tmp/pod-logs-evacuation.tar.gz" "$WORKDIR/pod-logs-evacuation.tar.gz" 2>/dev/null || true
 limactl shell "$VM_NAME" sudo rm -f /tmp/pod-logs-evacuation.tar.gz 2>/dev/null || true
 
 echo "Retrieving results..."
@@ -129,10 +135,10 @@ if [ "$UNPACK" -eq 1 ]; then
 
       # Print container logs from the evacuated tarball (copied before namespace GC).
       E2E_LOG="$UNPACK_DIR/plugins/e2e/results/global/e2e.log"
-      if [ -f "$E2E_LOG" ] && [ -f /tmp/pod-logs-evacuation.tar.gz ]; then
+      if [ -f "$E2E_LOG" ] && [ -f "$WORKDIR/pod-logs-evacuation.tar.gz" ]; then
         POD_LOGS_DIR="$UNPACK_DIR/pod-logs"
         mkdir -p "$POD_LOGS_DIR"
-        tar -xzf /tmp/pod-logs-evacuation.tar.gz -C "$POD_LOGS_DIR" 2>/dev/null || true
+        tar -xzf "$WORKDIR/pod-logs-evacuation.tar.gz" -C "$POD_LOGS_DIR" 2>/dev/null || true
 
         echo ""
         echo "  Pod logs from failed test namespaces:"
