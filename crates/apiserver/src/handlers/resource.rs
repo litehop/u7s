@@ -713,9 +713,13 @@ pub(crate) async fn do_patch<S: Store>(
     // Clear the annotation the KCM endpoints-controller stamps; the mirroring controller
     // skips any Endpoints that carry it, blocking EndpointSliceMirroring.
     if plural == "endpoints" {
-        if let Some(annotations) = current.body["metadata"]["annotations"].as_object_mut() {
+        let mut patch_meta: ObjectMeta =
+            serde_json::from_value(current.body["metadata"].clone()).unwrap_or_default();
+        if let Some(ref mut annotations) = patch_meta.annotations {
             annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
         }
+        current.body["metadata"] =
+            serde_json::to_value(patch_meta).map_err(|e| Status::internal(e.to_string()))?;
     }
 
     // Dry-run: validation and admission passed; return the would-be result without persisting.
@@ -1353,9 +1357,13 @@ pub async fn replace_namespaced_resource<S: Store>(
     // stamps on objects it owns; the mirroring controller skips any Endpoints that carry
     // this annotation, so leaving it causes EndpointSliceMirroring to produce no slice.
     if plural == "endpoints" {
-        if let Some(annotations) = obj.body["metadata"]["annotations"].as_object_mut() {
+        let mut put_meta: ObjectMeta =
+            serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+        if let Some(ref mut annotations) = put_meta.annotations {
             annotations.remove("endpoints.kubernetes.io/last-change-trigger-time");
         }
+        obj.body["metadata"] =
+            serde_json::to_value(put_meta).map_err(|e| Status::internal(e.to_string()))?;
     }
 
     // Dry-run: validation and admission passed; return the would-be result without persisting.
