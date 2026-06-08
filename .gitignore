@@ -19,7 +19,7 @@ ca.key
 ca.crt
 sa.key
 sa.pub
-kubeconfig
+/kubeconfig
 
 # Local dev state (scripts/u7s-start.sh)
 temp/

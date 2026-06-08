@@ -12,7 +12,7 @@ name = "u7s-scheduler"
 path = "src/main.rs"
 
 [dependencies]
-u7s-client-util = { path = "../client-util" }
+u7s-kubeconfig = { path = "../kubeconfig" }
 tokio           = { version = "1", features = ["full"] }
 hyper           = { version = "1", features = ["http1", "client"] }
 hyper-util      = { version = "0.1", features = ["tokio"] }

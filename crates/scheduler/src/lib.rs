@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_rustls::TlsConnector;
 use tracing::info;
-use u7s_client_util::HyperApiClient;
+use u7s_kubeconfig::HyperApiClient;
 
 // ---------------------------------------------------------------------------
-// HTTP helpers — delegates to HyperApiClient in client-util.
+// HTTP helpers — delegates to HyperApiClient in kubeconfig.
 // ---------------------------------------------------------------------------
 
 /// Parse `base` + `path` into (host, port, "host:port") for TCP connect.
@@ -58,11 +58,11 @@ pub async fn http_post_json(
 // Watch streaming — reads newline-delimited JSON from a watch endpoint
 // ---------------------------------------------------------------------------
 
-// Re-export drain_watch_buffer from client-util so that:
+// Re-export drain_watch_buffer from kubeconfig so that:
 // 1. The canonical implementation lives alongside watch_stream (which calls it).
 // 2. Scheduler-level unit tests exercise the same function used in production,
 //    not a separate copy.
-pub use u7s_client_util::drain_watch_buffer;
+pub use u7s_kubeconfig::drain_watch_buffer;
 
 pub async fn stream_watch_events(
     connector: &TlsConnector,
@@ -416,7 +416,7 @@ mod tests {
         );
     }
 
-    // drain_watch_buffer is re-exported from client-util where it is called by
+    // drain_watch_buffer is re-exported from kubeconfig where it is called by
     // watch_stream (and therefore stream_watch_events). This test confirms that
     // the function used in production handles multi-line chunks correctly.
     // If drain_watch_buffer were decoupled from watch_stream again (reverted to

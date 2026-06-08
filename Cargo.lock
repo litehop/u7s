@@ -3066,26 +3066,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "u7s-client-util"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "rustls-post-quantum",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "tracing",
-]
-
-[[package]]
 name = "u7s-controller-manager"
 version = "0.1.0"
 dependencies = [
@@ -3104,7 +3084,27 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
- "u7s-client-util",
+ "u7s-kubeconfig",
+]
+
+[[package]]
+name = "u7s-kubeconfig"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-post-quantum",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]
@@ -3140,7 +3140,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
- "u7s-client-util",
+ "u7s-kubeconfig",
 ]
 
 [[package]]
