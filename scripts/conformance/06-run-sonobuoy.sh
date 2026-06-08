@@ -7,7 +7,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-VM_NAME="lima-node"
+VM_NAME="${U7S_VM_NAME:-lima-node}"
 FOCUS="${SONOBUOY_FOCUS:-}"
 UNPACK=1
 

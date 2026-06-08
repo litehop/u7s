@@ -40,7 +40,7 @@ set -euo pipefail
 
 # For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
 # instead — it skips VM provisioning and just reconnects the kubelet.
-VM_NAME="lima-node"
+VM_NAME="${U7S_VM_NAME:-lima-node}"
 LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
 
 check_deps() {

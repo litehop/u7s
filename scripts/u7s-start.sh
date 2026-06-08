@@ -12,6 +12,12 @@
 #   --background  Start backgrounded (logs to ./temp/u7s/apiserver.log). Kills
 #                 any existing apiserver on the port and starts the new binary.
 #
+# Environment variables:
+#   U7S_HOST_IP   IP to bind and advertise (default: 127.0.0.1). Set to a loopback
+#                 alias (e.g. 127.0.0.2) to run multiple workers in parallel without
+#                 port collisions. The apiserver, konnectivity-server, and readiness
+#                 checks all use this address.
+#
 # After starting (foreground mode):
 #   export KUBECONFIG=./temp/u7s/kubeconfig
 #   scripts/conformance/lima-start.sh  # join kubelet (first run or after --reset)
@@ -22,6 +28,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 WORKDIR="$REPO/temp/u7s"
 BINARY="$REPO/target/release/u7s-apiserver"
 PORT=6443
+HOST_IP="${U7S_HOST_IP:-127.0.0.1}"
 
 RESET=0
 BACKGROUND=0
@@ -45,13 +52,13 @@ SERVER_BIN=$(echo "$KONNECTIVITY_OUT" | grep '^server=' | cut -d= -f2)
 # running with cert paths that no longer exist in the wiped WORKDIR.
 pkill -f konnectivity-server 2>/dev/null || true
 
-if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
-    echo "Port $PORT in use — killing existing apiserver before restart ..." >&2
+    echo "Port $HOST_IP:$PORT in use — killing existing apiserver before restart ..." >&2
     pkill -f u7s-apiserver 2>/dev/null || true
     sleep 1
   else
-    echo "error: port $PORT is already in use." >&2
+    echo "error: port $HOST_IP:$PORT is already in use." >&2
     echo "If u7s is already running, set KUBECONFIG=$WORKDIR/kubeconfig and use it." >&2
     echo "To start fresh: scripts/u7s-start.sh --reset  (rotates CA, re-join kubelet needed)" >&2
     exit 1
@@ -76,9 +83,9 @@ if [ -f "$WORKDIR/ca.crt" ]; then
       -subj "/CN=konnectivity-server" \
       -sha256 \
       -out "$WORKDIR/konnectivity-server.csr"
-    cat > "$WORKDIR/konnectivity-server-ext.cnf" <<'EXTEOF'
+    cat > "$WORKDIR/konnectivity-server-ext.cnf" <<EXTEOF
 [v3_req]
-subjectAltName = IP:127.0.0.1,DNS:host.lima.internal,DNS:localhost
+subjectAltName = IP:${HOST_IP},DNS:host.lima.internal,DNS:localhost
 EXTEOF
     openssl x509 -req -in "$WORKDIR/konnectivity-server.csr" \
       -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
@@ -102,40 +109,45 @@ EXTEOF
     --server-key="$WORKDIR/konnectivity-server.key" \
     --mode=http-connect \
     --server-port=$KONNECTIVITY_PROXY_PORT \
+    --server-bind-address="$HOST_IP" \
     --agent-port=8132 \
+    --agent-bind-address="$HOST_IP" \
     --admin-port=8133 \
+    --admin-bind-address="$HOST_IP" \
     --health-port=8134 \
+    --health-bind-address="$HOST_IP" \
     >> "$WORKDIR/konnectivity-server.log" 2>&1 &
   disown $!
 
   for i in $(seq 1 10); do
-    nc -z 127.0.0.1 $KONNECTIVITY_PROXY_PORT 2>/dev/null && break
+    nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/dev/null && break
     sleep 1
   done
-  if ! nc -z 127.0.0.1 $KONNECTIVITY_PROXY_PORT 2>/dev/null; then
-    echo "error: konnectivity-server did not open port $KONNECTIVITY_PROXY_PORT within 10s — see $WORKDIR/konnectivity-server.log" >&2
+  if ! nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/dev/null; then
+    echo "error: konnectivity-server did not open port $HOST_IP:$KONNECTIVITY_PROXY_PORT within 10s — see $WORKDIR/konnectivity-server.log" >&2
     exit 1
   fi
 fi
 
 PROXY_ARG=""
 if [ -f "$WORKDIR/ca.crt" ]; then
-  PROXY_ARG="--konnectivity-proxy-addr 127.0.0.1:$KONNECTIVITY_PROXY_PORT"
+  PROXY_ARG="--konnectivity-proxy-addr $HOST_IP:$KONNECTIVITY_PROXY_PORT"
 fi
 
-ADVERTISE_ARG=""
+ADVERTISE_ARG="--advertise-address https://$HOST_IP:$PORT"
 
 if [ "$BACKGROUND" -eq 1 ]; then
   LOG="$WORKDIR/apiserver.log"
   echo "Starting u7s-apiserver (logs: $LOG) ..."
   "$BINARY" \
     --db         "$WORKDIR/state.db" \
+    --listen     "$HOST_IP:$PORT" \
     --kubeconfig "$WORKDIR/kubeconfig" \
     --sa-key     "$WORKDIR/sa.key" \
     --sa-pub     "$WORKDIR/sa.pub" \
     --ca-key     "$WORKDIR/ca.key" \
     --ca-cert    "$WORKDIR/ca.crt" \
-    --kubelet-preferred-address "127.0.0.1" \
+    --kubelet-preferred-address "$HOST_IP" \
     --service-cluster-ip-range "10.96.0.0/12" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
@@ -146,12 +158,13 @@ else
   echo "Starting u7s-apiserver (state: $WORKDIR) ..."
   "$BINARY" \
     --db         "$WORKDIR/state.db" \
+    --listen     "$HOST_IP:$PORT" \
     --kubeconfig "$WORKDIR/kubeconfig" \
     --sa-key     "$WORKDIR/sa.key" \
     --sa-pub     "$WORKDIR/sa.pub" \
     --ca-key     "$WORKDIR/ca.key" \
     --ca-cert    "$WORKDIR/ca.crt" \
-    --kubelet-preferred-address "127.0.0.1" \
+    --kubelet-preferred-address "$HOST_IP" \
     --service-cluster-ip-range "10.96.0.0/12" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
@@ -161,7 +174,7 @@ fi
 
 echo "Waiting for server to accept connections ..."
 for i in $(seq 1 10); do
-  if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+  if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
     break
   fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -176,12 +189,12 @@ for i in $(seq 1 10); do
   sleep 1
 done
 
-if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+if ! nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
-    echo "error: server did not open port $PORT within 10s — see $LOG" >&2
+    echo "error: server did not open port $HOST_IP:$PORT within 10s — see $LOG" >&2
     tail -20 "$LOG" >&2
   else
-    echo "error: server did not open port $PORT within 10s" >&2
+    echo "error: server did not open port $HOST_IP:$PORT within 10s" >&2
   fi
   kill "$SERVER_PID" 2>/dev/null || true
   exit 1
@@ -190,16 +203,16 @@ fi
 # Start konnectivity-server now that ca.crt exists (generated by the apiserver).
 # On first run ca.crt did not exist before the apiserver launched, so we deferred
 # konnectivity startup until after the apiserver is up.
-if [ -f "$WORKDIR/ca.crt" ] && ! nc -z 127.0.0.1 $KONNECTIVITY_PROXY_PORT 2>/dev/null; then
+if [ -f "$WORKDIR/ca.crt" ] && ! nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/dev/null; then
   openssl x509 -inform DER -in "$WORKDIR/ca.crt" -out "$WORKDIR/ca.pem"
   if [ ! -f "$WORKDIR/konnectivity-server.crt" ]; then
     openssl ecparam -genkey -name prime256v1 -noout -out "$WORKDIR/konnectivity-server.key"
     openssl req -new -key "$WORKDIR/konnectivity-server.key" \
       -subj "/CN=konnectivity-server" -sha256 \
       -out "$WORKDIR/konnectivity-server.csr"
-    cat > "$WORKDIR/konnectivity-server-ext.cnf" <<'EXTEOF'
+    cat > "$WORKDIR/konnectivity-server-ext.cnf" <<EXTEOF
 [v3_req]
-subjectAltName = IP:127.0.0.1,DNS:host.lima.internal,DNS:localhost
+subjectAltName = IP:${HOST_IP},DNS:host.lima.internal,DNS:localhost
 EXTEOF
     openssl x509 -req -in "$WORKDIR/konnectivity-server.csr" \
       -CA "$WORKDIR/ca.pem" -CAkey "$WORKDIR/ca.key" \
@@ -216,26 +229,31 @@ EXTEOF
     --server-cert="$WORKDIR/konnectivity-server.crt" \
     --server-key="$WORKDIR/konnectivity-server.key" \
     --mode=http-connect --server-port=$KONNECTIVITY_PROXY_PORT \
-    --agent-port=8132 --admin-port=8133 --health-port=8134 \
+    --server-bind-address="$HOST_IP" \
+    --agent-port=8132 --agent-bind-address="$HOST_IP" \
+    --admin-port=8133 --admin-bind-address="$HOST_IP" \
+    --health-port=8134 --health-bind-address="$HOST_IP" \
     >> "$WORKDIR/konnectivity-server.log" 2>&1 &
   disown $!
   for i in $(seq 1 10); do
-    nc -z 127.0.0.1 $KONNECTIVITY_PROXY_PORT 2>/dev/null && break; sleep 1
+    nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/dev/null && break; sleep 1
   done
   # Restart apiserver with proxy flag now that konnectivity is up.
-  if nc -z 127.0.0.1 $KONNECTIVITY_PROXY_PORT 2>/dev/null && [ "$BACKGROUND" -eq 1 ]; then
+  if nc -z "$HOST_IP" $KONNECTIVITY_PROXY_PORT 2>/dev/null && [ "$BACKGROUND" -eq 1 ]; then
     kill "$SERVER_PID" 2>/dev/null || true
     sleep 1
     "$BINARY" \
       --db         "$WORKDIR/state.db" \
+      --listen     "$HOST_IP:$PORT" \
       --kubeconfig "$WORKDIR/kubeconfig" \
       --sa-key     "$WORKDIR/sa.key" \
       --sa-pub     "$WORKDIR/sa.pub" \
       --ca-key     "$WORKDIR/ca.key" \
       --ca-cert    "$WORKDIR/ca.crt" \
-      --kubelet-preferred-address "127.0.0.1" \
+      --kubelet-preferred-address "$HOST_IP" \
       --service-cluster-ip-range "10.96.0.0/12" \
-      --konnectivity-proxy-addr "127.0.0.1:$KONNECTIVITY_PROXY_PORT" \
+      --konnectivity-proxy-addr "$HOST_IP:$KONNECTIVITY_PROXY_PORT" \
+      $ADVERTISE_ARG \
       > "$LOG" 2>&1 &
     SERVER_PID=$!
     disown "$SERVER_PID"
