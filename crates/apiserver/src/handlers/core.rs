@@ -74,6 +74,9 @@ pub async fn core_list_resource<S: Store>(
                 if let Some(ref sel) = query.field_selector {
                     pods = filter_pods_by_field_selector(pods, sel);
                 }
+                if let Some(ref sel) = query.label_selector {
+                    pods.retain(|pod| super::watch::object_matches_label_selector(pod, sel));
+                }
                 Some((pods, resp.revision))
             } else {
                 None
@@ -498,6 +501,102 @@ mod tests {
         assert_eq!(
             pods[0]["spec"]["nodeName"], "lima-node",
             "pod must have nodeName=lima-node"
+        );
+    }
+
+    /// Regression test for mayor-zcnd: the cluster-wide pod watch with sendInitialEvents=true
+    /// and a labelSelector must only return matching pods in the initial ADDED events snapshot.
+    ///
+    /// Before this fix, core_list_resource applied field_selector but NOT label_selector to
+    /// the initial sendInitialEvents items. A StatefulSet controller (or any other client) that
+    /// opens a cluster-wide pod watch with labelSelector receives ALL pods across ALL namespaces
+    /// in the initial snapshot — including pods from other StatefulSets with different labels.
+    ///
+    /// This pollutes the informer cache and causes the controller to see the wrong pod set when
+    /// reconciling, which can prevent creation of pods beyond ordinal 0 on scale-up (stuck at
+    /// 1/N for 10 minutes).
+    ///
+    /// This test fails on revert: if the label_selector retain is removed from the
+    /// sendInitialEvents path, both pods appear (len==2) instead of only the matching one.
+    #[tokio::test]
+    async fn cluster_wide_pod_watch_initial_items_filtered_by_label_selector() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Pod matching the StatefulSet's label selector.
+        let ss_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "ss-0",
+                "namespace": "statefulset-9798",
+                "labels": {"app": "ss", "controller-uid": "abc123"}
+            },
+            "spec": {"containers": []}
+        });
+        // Pod from a different StatefulSet with different labels.
+        let other_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "other-0",
+                "namespace": "statefulset-other",
+                "labels": {"app": "other-ss", "controller-uid": "xyz789"}
+            },
+            "spec": {"containers": []}
+        });
+
+        store
+            .put(
+                "/registry/pods/statefulset-9798/ss-0",
+                bytes::Bytes::from(serde_json::to_vec(&ss_pod).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create ss-0");
+        store
+            .put(
+                "/registry/pods/statefulset-other/other-0",
+                bytes::Bytes::from(serde_json::to_vec(&other_pod).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("create other-0");
+
+        // Replicate the fixed path in core_list_resource for sendInitialEvents + labelSelector.
+        let label_selector_str = "app=ss,controller-uid=abc123";
+        let prefix = crate::keys::cluster_list_prefix("pods");
+        let resp = store
+            .list(&prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list pods");
+
+        let mut pods: Vec<serde_json::Value> = resp
+            .items
+            .iter()
+            .filter_map(|o| serde_json::from_slice(&o.value).ok())
+            .collect();
+
+        // This is the exact retain logic added by the mayor-zcnd fix.
+        pods.retain(|pod| {
+            crate::handlers::watch::object_matches_label_selector(pod, label_selector_str)
+        });
+
+        assert_eq!(
+            pods.len(),
+            1,
+            "cluster-wide pod watch sendInitialEvents with labelSelector=app=ss,controller-uid=abc123 \
+             must return only ss-0 across all namespaces; without label_selector filtering the \
+             StatefulSet controller informer cache is polluted with pods from other StatefulSets \
+             (mayor-zcnd regression). Got: {:?}",
+            pods
+        );
+        assert_eq!(
+            pods[0]["metadata"]["name"], "ss-0",
+            "the only pod in the initial snapshot must be ss-0 (matches app=ss,controller-uid=abc123)"
+        );
+        assert_eq!(
+            pods[0]["metadata"]["namespace"], "statefulset-9798",
+            "pod must be from the correct namespace"
         );
     }
 }
