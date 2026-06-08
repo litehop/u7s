@@ -198,7 +198,7 @@ pub async fn pod_log<S: Store>(
             .as_deref()
             .map(|v| v.as_slice()),
     )
-    .map_err(|e| Status::internal(format!("failed to build HTTP client: {e}")))?;
+    .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
 
     let kubelet_resp = client
         .get(&kubelet_url)
@@ -338,7 +338,7 @@ pub async fn resolve_attach_target<S: Store>(
             .as_deref()
             .map(|v| v.as_slice()),
     )
-    .map_err(|e| Status::internal(format!("failed to build kubelet TLS config: {e}")))?;
+    .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
 
     Ok(AttachTarget {
         kubelet_ws_url,
@@ -381,8 +381,8 @@ pub async fn pod_attach<S: Store>(
 ///
 /// When `ca_der` is `Some`, the kubelet's serving certificate is verified against
 /// the cluster CA — closing the MITM vector on exec/log/attach paths. When `ca_der`
-/// is `None` (e.g. in unit tests without a real cluster), verification is skipped
-/// and a warning is logged.
+/// is `None`, returns `Err` so callers can return 503 instead of establishing a
+/// connection without certificate verification.
 ///
 /// The `client_identity_pem` is the mTLS client cert+key used so the kubelet can
 /// authenticate the apiserver via `--client-ca-file`.
@@ -393,63 +393,21 @@ fn build_kubelet_tls_config(
     use rustls::pki_types::CertificateDer;
     use rustls::RootCertStore;
 
-    let builder = if let Some(der) = ca_der {
-        let mut root_store = RootCertStore::empty();
-        root_store
-            .add(CertificateDer::from(der.to_vec()))
-            .map_err(|e| anyhow::anyhow!("add kubelet CA to root store: {e}"))?;
-        let verifier =
-            rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(root_store))
-                .build()
-                .map_err(|e| anyhow::anyhow!("build kubelet server verifier: {e}"))?;
-        rustls::ClientConfig::builder().with_webpki_verifier(verifier)
-    } else {
-        tracing::warn!(
-            "no cluster CA available — kubelet server cert will not be verified (exec/log/attach paths)"
-        );
-        // Safety: AcceptAnyCert is only used when no CA is configured, which happens
-        // in unit tests. In production the cluster CA is always present.
-        #[derive(Debug)]
-        struct AcceptAnyCert;
-        impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
-            fn verify_server_cert(
-                &self,
-                _end_entity: &rustls::pki_types::CertificateDer<'_>,
-                _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-                _server_name: &rustls::pki_types::ServerName<'_>,
-                _ocsp_response: &[u8],
-                _now: rustls::pki_types::UnixTime,
-            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-                Ok(rustls::client::danger::ServerCertVerified::assertion())
-            }
-            fn verify_tls12_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls::pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn verify_tls13_signature(
-                &self,
-                _message: &[u8],
-                _cert: &rustls::pki_types::CertificateDer<'_>,
-                _dss: &rustls::DigitallySignedStruct,
-            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
-            {
-                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-            }
-            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-                rustls::crypto::CryptoProvider::get_default()
-                    .map(|p| p.signature_verification_algorithms.supported_schemes())
-                    .unwrap_or_default()
-            }
-        }
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyCert))
-    };
+    let der = ca_der.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no cluster CA configured — kubelet TLS cannot be verified; \
+             refusing connection to prevent MITM"
+        )
+    })?;
+
+    let mut root_store = RootCertStore::empty();
+    root_store
+        .add(CertificateDer::from(der.to_vec()))
+        .map_err(|e| anyhow::anyhow!("add kubelet CA to root store: {e}"))?;
+    let verifier = rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(root_store))
+        .build()
+        .map_err(|e| anyhow::anyhow!("build kubelet server verifier: {e}"))?;
+    let builder = rustls::ClientConfig::builder().with_webpki_verifier(verifier);
 
     let config = if let Some(pem) = client_identity_pem {
         let mut cursor = std::io::Cursor::new(pem);
@@ -477,23 +435,24 @@ fn build_kubelet_tls_config(
 /// Build a `reqwest::Client` pinned to the cluster CA for kubelet HTTPS calls (log/node-proxy).
 ///
 /// When `ca_der` is `Some`, the client trusts only that CA — preventing MITM on
-/// the exec/log/attach paths. When `ca_der` is `None`, falls back to system roots
-/// (only happens in unit tests without a real cluster).
+/// the log/node-proxy paths. When `ca_der` is `None`, returns `Err` so callers
+/// can return 503 instead of connecting without certificate verification.
 fn build_kubelet_reqwest_client(
     ca_der: Option<&[u8]>,
     client_identity_pem: Option<&[u8]>,
 ) -> anyhow::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().use_rustls_tls();
+    let der = ca_der.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no cluster CA configured — kubelet TLS cannot be verified; \
+             refusing connection to prevent MITM"
+        )
+    })?;
 
-    if let Some(der) = ca_der {
-        let cert = reqwest::Certificate::from_der(der)
-            .map_err(|e| anyhow::anyhow!("parse kubelet CA cert DER: {e}"))?;
-        builder = builder.tls_certs_only([cert]);
-    } else {
-        tracing::warn!(
-            "no cluster CA available — kubelet HTTPS cert will not be pinned (log/node-proxy paths)"
-        );
-    }
+    let cert = reqwest::Certificate::from_der(der)
+        .map_err(|e| anyhow::anyhow!("parse kubelet CA cert DER: {e}"))?;
+    let mut builder = reqwest::Client::builder()
+        .use_rustls_tls()
+        .tls_certs_only([cert]);
 
     if let Some(identity_pem) = client_identity_pem {
         match reqwest::Identity::from_pem(identity_pem) {
@@ -723,7 +682,7 @@ pub async fn resolve_exec_target<S: Store>(
             .as_deref()
             .map(|v| v.as_slice()),
     )
-    .map_err(|e| Status::internal(format!("failed to build kubelet TLS config: {e}")))?;
+    .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
 
     Ok(ExecTarget {
         kubelet_ws_url,
@@ -962,7 +921,16 @@ pub(crate) async fn validate_portforward<S: Store>(
         ))
     })?;
 
-    // 4. Build the kubelet portForward URL.
+    // 4. Require cluster CA — refuse to connect without TLS verification.
+    if state.cluster_ca_der.is_none() {
+        return Err(Status::service_unavailable(
+            "no cluster CA configured — kubelet TLS cannot be verified; \
+             refusing portforward connection to prevent MITM"
+                .to_string(),
+        ));
+    }
+
+    // 5. Build the kubelet portForward URL.
     //    wss://<node-ip>:10250/portForward/<ns>/<pod>[?ports=<port>]
     let ports_qs = ports.map(|p| format!("?ports={p}")).unwrap_or_default();
     let kubelet_url = format!("wss://{node_ip}:10250/portForward/{ns}/{pod_name}{ports_qs}");
@@ -1086,7 +1054,7 @@ pub async fn resolve_node_proxy_target<S: Store>(
             .as_deref()
             .map(|v| v.as_slice()),
     )
-    .map_err(|e| Status::internal(format!("failed to build HTTP client: {e}")))?;
+    .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
 
     let kubelet_url = format!("https://{node_ip}:10250/{path_suffix}");
     Ok((kubelet_url, client))
@@ -1258,17 +1226,15 @@ mod tests {
     // pod_log: kubelet 401 error propagated, not wrapped as opaque 500
     // -----------------------------------------------------------------------
 
-    /// /log must propagate a non-200 kubelet response status rather than
-    /// wrapping it as 500 "unknown".
+    /// /log must return 503 when no cluster CA is configured.
     ///
-    /// When kubelet returns 401 (no client cert or wrong cert), the proxy must
-    /// forward the 401 to the caller, not mask it as 500. This test verifies the
-    /// error propagation path: the handler reaches the kubelet call site and fails
-    /// with a connection error (no real kubelet at 10.0.0.1), which surfaces as
-    /// 500 "kubelet request failed" — a meaningful message, not "unknown".
+    /// Connecting to the kubelet without verifying its TLS certificate opens an MITM
+    /// vector. The handler must refuse with 503 rather than connecting over unverified
+    /// TLS. This test verifies the CA-absent path returns 503 (not 500 with opaque error
+    /// or silently connecting to the kubelet without cert verification).
     #[tokio::test]
-    async fn pod_log_kubelet_unreachable_returns_500_with_message() {
-        let state = make_state();
+    async fn pod_log_without_cluster_ca_returns_503() {
+        let state = make_state(); // cluster_ca_der is None
 
         let pod = serde_json::json!({
             "apiVersion": "v1",
@@ -1286,8 +1252,6 @@ mod tests {
             .await
             .expect("seed pod must not fail");
 
-        // Use 127.0.0.1 (loopback) so the TCP connection is refused immediately rather
-        // than timing out — this makes the test fast without needing a real kubelet.
         let node = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Node",
@@ -1310,25 +1274,12 @@ mod tests {
             .unwrap();
         let resp = router.call(req).await.unwrap();
 
-        // The response must not be 500 with an opaque "unknown" error.
-        // Acceptable outcomes:
-        //   - 500 with "kubelet request failed" (connection refused, no kubelet at this port)
-        //   - 401 (real kubelet is running but rejected us — the proxy forwarded its status)
-        // Either outcome proves the error propagation path is correct.
-        let status = resp.status().as_u16();
-        assert!(
-            status == 500 || status == 401,
-            "/log must return 500 (no kubelet) or 401 (kubelet rejected no-cert request), got {status}"
+        assert_eq!(
+            resp.status().as_u16(),
+            503,
+            "/log must return 503 when no cluster CA is configured — \
+             connecting to the kubelet without TLS verification opens an MITM vector"
         );
-        if status == 500 {
-            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
-            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            let message = v["message"].as_str().unwrap_or("");
-            assert!(
-                message.contains("kubelet request failed"),
-                "/log 500 body must contain 'kubelet request failed'; got: {message:?}"
-            );
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -1408,7 +1359,23 @@ mod tests {
     /// wrong endpoint or fails opaquely, so this must be verified.
     #[tokio::test]
     async fn resolve_exec_target_builds_correct_kubelet_url() {
-        let state = make_state();
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+        });
 
         let pod = serde_json::json!({
             "apiVersion": "v1",
@@ -1545,14 +1512,14 @@ mod tests {
         };
     }
 
-    /// resolve_attach_target must succeed for a scheduled pod even without a cluster CA.
+    /// resolve_attach_target must return 503 when no cluster CA is configured.
     ///
-    /// When no CA is configured (e.g. in tests), the proxy falls back to skipping server
-    /// cert verification with a warning. In production, the cluster CA is always present
-    /// and kubelet cert verification is enforced. If this function errors when CA is absent,
-    /// attach will fail for all pods in non-production environments.
+    /// Connecting to the kubelet without verifying its TLS certificate opens an MITM
+    /// vector. The handler must refuse to establish the connection rather than bypassing
+    /// certificate verification, so callers receive a clear 503 instead of silently
+    /// connecting over unverified TLS.
     #[tokio::test]
-    async fn pod_attach_succeeds_without_cluster_ca() {
+    async fn pod_attach_without_cluster_ca_returns_503() {
         let state = make_state(); // cluster_ca_der is None, kubelet_client_identity_pem is None
 
         let pod = serde_json::json!({
@@ -1598,9 +1565,15 @@ mod tests {
             tty: None,
         };
         match resolve_attach_target(&state, "default", "mypod", &query).await {
-            Ok(_) => {}
-            Err(e) => panic!(
-                "resolve_attach_target must succeed without cluster CA; got HTTP {}",
+            Ok(_) => panic!(
+                "resolve_attach_target must return 503 when no cluster CA is configured — \
+                 connecting without TLS verification opens an MITM vector"
+            ),
+            Err(e) => assert_eq!(
+                e.0.as_u16(),
+                503,
+                "absent cluster CA must produce 503 Service Unavailable, not {}; \
+                 silently bypassing TLS verification is a security vulnerability",
                 e.0.as_u16()
             ),
         };
@@ -1761,14 +1734,14 @@ mod tests {
         );
     }
 
-    /// validate_portforward must succeed for a scheduled pod even without a cluster CA.
+    /// validate_portforward must return 503 when no cluster CA is configured.
     ///
-    /// When no CA is configured (e.g. in tests), the proxy falls back to skipping server
-    /// cert verification. In production, the cluster CA is always present and kubelet cert
-    /// verification is enforced. If this function errors when CA is absent, portforward
-    /// will break for all pods in non-production environments.
+    /// Connecting to the kubelet without verifying its TLS certificate opens an MITM
+    /// vector on the portforward path. The handler must refuse with 503 before upgrading
+    /// the WebSocket connection so the client gets a clear error code rather than the
+    /// proxy silently connecting over unverified TLS.
     #[tokio::test]
-    async fn portforward_validation_succeeds_without_cluster_ca() {
+    async fn portforward_validation_without_cluster_ca_returns_503() {
         let state = make_state(); // cluster_ca_der is None
 
         let pod = serde_json::json!({
@@ -1804,20 +1777,27 @@ mod tests {
             .expect("seed node");
 
         let result = validate_portforward(&state, "default", "mypod", Some("8080")).await;
-        assert!(
-            result.is_ok(),
-            "validate_portforward must succeed without cluster CA — \
-             proxy accepts any kubelet cert, CA is not required at validation time"
+        let err = result.expect_err(
+            "validate_portforward must return 503 when no cluster CA is configured — \
+             silently connecting over unverified TLS opens an MITM vector",
+        );
+        assert_eq!(
+            err.0.as_u16(),
+            503,
+            "absent cluster CA must produce 503 Service Unavailable, not {}",
+            err.0.as_u16()
         );
     }
 
     /// validate_portforward returns Ok with correct kubelet URL on the happy path.
     ///
-    /// Verifies that when pod is scheduled and node has an InternalIP, the returned
-    /// kubelet URL uses the correct scheme, address, and path format expected by
-    /// the kubelet portForward endpoint.
+    /// Verifies that when pod is scheduled and node has an InternalIP and a cluster CA is
+    /// configured, the returned kubelet URL uses the correct scheme, address, and path
+    /// format expected by the kubelet portForward endpoint.
     #[tokio::test]
     async fn portforward_validation_happy_path_produces_correct_kubelet_url() {
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
         let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
         let state = AppState::new_with_config(crate::state::AppStateConfig {
             store,
@@ -1825,7 +1805,7 @@ mod tests {
             sa_decoding_key: None,
             token_map: std::collections::HashMap::new(),
             server_address: "https://localhost:6443".into(),
-            cluster_ca_der: None,
+            cluster_ca_der: Some(ca_der),
             webhook_identity_pem: None,
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
@@ -2107,7 +2087,23 @@ mod tests {
     /// This test fails if the normalization is removed from resolve_exec_target.
     #[tokio::test]
     async fn resolve_exec_target_normalizes_stdin_true_to_1() {
-        let state = make_state();
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+        });
 
         let pod = serde_json::json!({
             "apiVersion": "v1",
@@ -2188,7 +2184,23 @@ mod tests {
     /// TCP→TLS path, kubelet returns 400 during WS handshake due to SNI mismatch.
     #[tokio::test]
     async fn exec_target_url_contains_node_ip_for_direct_connect() {
-        let state = make_state();
+        let cert = rcgen::generate_simple_self_signed(vec!["192.0.2.5".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+        });
 
         let pod = serde_json::json!({
             "apiVersion": "v1", "kind": "Pod",
@@ -2237,7 +2249,23 @@ mod tests {
     /// connect_async_tls_with_config can connect without a separate TCP dial step.
     #[tokio::test]
     async fn attach_target_url_contains_node_ip_for_direct_connect() {
-        let state = make_state();
+        let cert = rcgen::generate_simple_self_signed(vec!["192.0.2.7".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+        });
 
         let pod = serde_json::json!({
             "apiVersion": "v1", "kind": "Pod",
@@ -2401,18 +2429,19 @@ mod tests {
         );
     }
 
-    /// build_kubelet_tls_config without a CA must still succeed (fallback for tests/dev).
+    /// build_kubelet_tls_config without a CA must return Err to prevent MITM.
     ///
-    /// When no CA is available, we log a warning and skip verification rather than
-    /// failing. If this errors, portforward/exec/attach will break in test environments
-    /// where no cluster CA is configured.
+    /// When no CA is configured, connecting to the kubelet without certificate verification
+    /// opens an MITM vector. The function must refuse to build a config rather than
+    /// returning one that skips verification. Callers convert this Err to HTTP 503.
     #[test]
-    fn build_kubelet_tls_config_without_ca_falls_back_gracefully() {
+    fn build_kubelet_tls_config_without_ca_returns_err() {
         let result = build_kubelet_tls_config(None, None);
         assert!(
-            result.is_ok(),
-            "build_kubelet_tls_config must succeed even without a CA (graceful fallback) — \
-             exec/attach/portforward must not crash when no CA is available"
+            result.is_err(),
+            "build_kubelet_tls_config must return Err when no CA is configured — \
+             building a config that skips TLS verification opens an MITM vector on \
+             exec/attach/portforward/log paths"
         );
     }
 
@@ -2432,6 +2461,21 @@ mod tests {
             "build_kubelet_reqwest_client must succeed with a valid CA DER — \
              if it fails, /log and node-proxy calls will be broken in production: {:?}",
             result.err()
+        );
+    }
+
+    /// build_kubelet_reqwest_client without a CA must return Err to prevent MITM.
+    ///
+    /// Without a CA, the client would connect to the kubelet without verifying its
+    /// TLS certificate, opening an MITM vector on log/node-proxy paths. Returning
+    /// Err forces callers to return 503 instead of establishing an unverified connection.
+    #[test]
+    fn build_kubelet_reqwest_client_without_ca_returns_err() {
+        let result = build_kubelet_reqwest_client(None, None);
+        assert!(
+            result.is_err(),
+            "build_kubelet_reqwest_client must return Err when no CA is configured — \
+             connecting without TLS verification opens an MITM vector on /log and node-proxy paths"
         );
     }
 
