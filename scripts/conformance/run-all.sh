@@ -10,12 +10,16 @@
 #   06-run-sonobuoy.sh     — run sonobuoy and print results
 #
 # Usage:
-#   scripts/conformance/run-all.sh [--reset] [--focus <regex>]
+#   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--vm <name>]
 #
 #   --reset   Run reset.sh before building — kills host processes, deletes the
 #             lima-node VM, and wipes temp/u7s/ for a fully clean run.
 #   --focus   Passed through to sonobuoy to narrow test selection.
 #             Also settable via SONOBUOY_FOCUS env var.
+#   --vm      Lima VM name to use (default: lima-node). Sets U7S_VM_NAME so all
+#             child scripts (lima-start, 04-start-kcm, 06-run-sonobuoy) use the
+#             same VM. Allows multiple workers to run in parallel against their
+#             own isolated VMs. Also settable via U7S_VM_NAME env var.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -28,6 +32,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
     --focus) FOCUS="$2"; shift 2 ;;
+    --vm) U7S_VM_NAME="$2"; export U7S_VM_NAME; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done

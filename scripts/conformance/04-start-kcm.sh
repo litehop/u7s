@@ -10,7 +10,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 WORKDIR="$REPO/temp/u7s"
-VM_NAME="lima-node"
+VM_NAME="${U7S_VM_NAME:-lima-node}"
 KCM_LOG="/tmp/kcm.log"
 
 echo "=== [04] Start kube-controller-manager (inside $VM_NAME) ==="
