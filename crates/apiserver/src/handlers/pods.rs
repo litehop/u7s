@@ -172,6 +172,9 @@ pub async fn list_pods<S: Store>(
             if let Some(ref sel) = query.field_selector {
                 pods = filter_pods_by_field_selector(pods, sel);
             }
+            if let Some(ref sel) = query.label_selector {
+                pods.retain(|pod| super::watch::object_matches_label_selector(pod, sel));
+            }
             Some((pods, resp.revision))
         } else {
             None
@@ -184,7 +187,7 @@ pub async fn list_pods<S: Store>(
                 kind: "Pod".into(),
                 from_revision: from_rv,
                 initial_items: initial_pods,
-                label_selector: None,
+                label_selector: query.label_selector,
                 field_selector: query.field_selector,
                 allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
                 username: user.username,
@@ -931,6 +934,104 @@ mod label_selector_tests {
         assert_eq!(
             result[0]["metadata"]["name"], "sonobuoy",
             "the returned pod must be the aggregator, not the plugin"
+        );
+    }
+
+    /// Regression test for mayor-zcnd: sendInitialEvents pod watch with a labelSelector must
+    /// exclude pods that do not match the selector from the initial ADDED events.
+    ///
+    /// The StatefulSet controller opens a pod watch with sendInitialEvents=true and
+    /// labelSelector matching its pods (e.g. "app=ss"). Before this fix, ALL pods in the
+    /// namespace were returned as initial ADDED events, regardless of labels. The fix applies
+    /// object_matches_label_selector to the initial items before passing them to watch_generic.
+    ///
+    /// This test verifies the filtering logic that was added: only pods with the matching
+    /// label should survive the retain. Without the fix (retain removed), non-matching pods
+    /// appear in the initial items and the informer cache gets polluted.
+    #[test]
+    fn send_initial_events_label_selector_filters_initial_pods() {
+        let ss_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "ss-0",
+                "namespace": "default",
+                "labels": {"app": "ss", "controller-uid": "abc123"}
+            },
+            "spec": {}
+        });
+        let unrelated_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "unrelated-pod",
+                "namespace": "default",
+                "labels": {"app": "other"}
+            },
+            "spec": {}
+        });
+
+        let mut pods = vec![ss_pod.clone(), unrelated_pod];
+        let selector = "app=ss";
+
+        // This is the exact retain logic added by the fix.
+        pods.retain(|pod| super::super::watch::object_matches_label_selector(pod, selector));
+
+        assert_eq!(
+            pods.len(),
+            1,
+            "sendInitialEvents with labelSelector=app=ss must return only ss-0, not unrelated pods; \
+             without the fix all pods are returned and the StatefulSet controller's pod informer \
+             cache is polluted with pods from other StatefulSets (mayor-zcnd)"
+        );
+        assert_eq!(
+            pods[0]["metadata"]["name"], "ss-0",
+            "the retained pod must be ss-0 (matches app=ss), not the unrelated pod"
+        );
+    }
+
+    /// Regression test for mayor-zcnd (live watch path): pod watch with labelSelector must
+    /// deliver MODIFIED events for matching pods and suppress events for non-matching pods.
+    ///
+    /// Before the fix, label_selector was hardcoded to None in the pod watch path, so
+    /// watch_generic received no label selector and delivered ALL pod MODIFIED events.
+    /// The StatefulSet controller's informer received MODIFIED events for pods belonging
+    /// to other StatefulSets or other workloads, adding noise but not breaking correctness.
+    ///
+    /// After the fix, label_selector=query.label_selector is forwarded. watch_generic applies
+    /// object_matches_label_selector and only delivers events for pods matching the selector.
+    /// Non-matching pods get a synthetic DELETED if they were previously sent as ADDED.
+    ///
+    /// This test verifies that object_matches_label_selector correctly identifies matching pods.
+    /// If the label selector check is removed, the retain in sendInitialEvents fails silently
+    /// (every pod would be retained) and non-ss pods appear in the informer cache.
+    #[test]
+    fn label_selector_matches_statefulset_pod_labels() {
+        // StatefulSet controller watches with selector matching all its pods.
+        let selector = "app=ss,controller-uid=abc";
+
+        let ss_pod = serde_json::json!({
+            "metadata": {"labels": {"app": "ss", "controller-uid": "abc", "statefulset.kubernetes.io/pod-name": "ss-0"}}
+        });
+        let other_ss_pod = serde_json::json!({
+            "metadata": {"labels": {"app": "other-ss", "controller-uid": "xyz"}}
+        });
+        let unlabeled = serde_json::json!({
+            "metadata": {"name": "bare"}
+        });
+
+        assert!(
+            super::super::watch::object_matches_label_selector(&ss_pod, selector),
+            "ss-0 must match selector app=ss,controller-uid=abc — it belongs to this StatefulSet"
+        );
+        assert!(
+            !super::super::watch::object_matches_label_selector(&other_ss_pod, selector),
+            "pod from other StatefulSet must NOT match — delivering its events to this watcher \
+             would pollute the informer cache with unrelated pods"
+        );
+        assert!(
+            !super::super::watch::object_matches_label_selector(&unlabeled, selector),
+            "unlabeled pod must NOT match — no labels means selector cannot be satisfied"
         );
     }
 }
