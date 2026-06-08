@@ -29,7 +29,12 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$REPO/scripts/conformance"
-WORKDIR="$REPO/temp/u7s"
+_VM="${U7S_VM_NAME:-lima-node}"
+if [ "$_VM" = "lima-node" ]; then
+  WORKDIR="$REPO/temp/u7s"
+else
+  WORKDIR="$REPO/temp/u7s-${_VM}"
+fi
 FOCUS="${SONOBUOY_FOCUS:-}"
 RESET=0
 
