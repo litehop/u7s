@@ -4151,4 +4151,105 @@ mod tests {
             "absent matchConstraints must match all resources"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Tests — tokenize_cel edge cases
+    //
+    // A mis-tokenized CEL expression returns None from eval_cel_apply_config,
+    // which silently drops the MAP mutation. The policy appears to work but
+    // the mutation is never applied to the resource.
+    // ---------------------------------------------------------------------------
+
+    /// tokenize_cel must handle single-quoted strings.
+    /// Single-quoted strings are valid CEL syntax; mis-tokenizing them means
+    /// string values in CEL policies fail to parse and mutations are silently dropped.
+    #[test]
+    fn tokenize_cel_single_quoted_string_parsed_correctly() {
+        let object = json!({"metadata": {"name": "x"}});
+        // Single-quoted string as a map value
+        let result = eval_cel_apply_config(r#"{"key": 'hello'}"#, &object);
+        assert!(
+            result.is_some(),
+            "single-quoted string in CEL must parse without panicking; \
+             failure means MAP mutations using single-quoted strings are silently dropped"
+        );
+        assert_eq!(
+            result.unwrap()["key"],
+            "hello",
+            "single-quoted string must produce the same value as a double-quoted string"
+        );
+    }
+
+    /// tokenize_cel must expand escape sequences inside strings.
+    /// Escape sequences (\n, \t, \r) inside CEL strings must be decoded to their
+    /// character values. Without this, policies embedding newlines are mis-tokenized.
+    #[test]
+    fn tokenize_cel_escape_sequences_decoded() {
+        let object = json!({"metadata": {"name": "x"}});
+        // The escape sequences should be decoded inside the string
+        let result = eval_cel_apply_config(r#"{"key": "a\nb\tc\rd"}"#, &object);
+        assert!(
+            result.is_some(),
+            "CEL string with escape sequences must parse without panicking"
+        );
+        let val = result.unwrap();
+        let s = val["key"].as_str().expect("key must be a string");
+        assert!(
+            s.contains('\n') && s.contains('\t') && s.contains('\r'),
+            "escape sequences \\n, \\t, \\r must be decoded to their character values; \
+             got: {:?}",
+            s
+        );
+    }
+
+    /// parse_cel_primary: unary negation applied to a non-numeric value returns None.
+    /// The caller (eval_cel_apply_config) returns None, which causes the MAP mutation
+    /// to be silently dropped. This test ensures the None path does not panic.
+    #[test]
+    fn tokenize_cel_unary_negation_of_non_numeric_returns_none() {
+        let object = json!({"metadata": {"name": "x"}});
+        // Unary minus applied to a string produces None without panicking
+        let result = eval_cel_apply_config(r#"-"hello""#, &object);
+        assert!(
+            result.is_none(),
+            "unary negation of a non-numeric value must return None, not panic; \
+             the MAP mutation should be dropped gracefully rather than crashing the admission handler"
+        );
+    }
+
+    /// tokenize_cel: `map()` style macro call tokenizes without panicking.
+    /// CEL expressions with method-call syntax (identifier followed by parentheses)
+    /// are tokenized as Ident + LParen + ... + RParen. This test ensures the
+    /// tokenizer and evaluator handle this without panicking; degrading to None is acceptable.
+    #[test]
+    fn tokenize_cel_map_macro_call_does_not_panic() {
+        let object = json!({"metadata": {"name": "x"}});
+        // map() is a valid CEL macro but our evaluator doesn't implement it fully.
+        // It must not panic — returning None is acceptable.
+        let result = eval_cel_apply_config(r#"[1, 2, 3].map(x, x + 1)"#, &object);
+        // We don't assert a specific value — only that it doesn't panic.
+        let _ = result;
+    }
+
+    /// parse_cel_primary: field access on `object` for an unknown field returns null.
+    /// When a CEL expression accesses a field that doesn't exist on the admitted resource,
+    /// serde_json returns Null. The evaluator must not panic; it should produce Null,
+    /// allowing callers to handle the missing field gracefully.
+    #[test]
+    fn tokenize_cel_unknown_field_on_object_returns_null() {
+        let object = json!({"metadata": {"name": "x"}});
+        // object.nonexistent is not in the object above
+        let result = eval_cel_apply_config("object.nonexistent", &object);
+        // Field access on object returns the serde_json Null (absent key)
+        assert!(
+            result.is_some(),
+            "field access on a missing key must return Some(Null), not None — \
+             returning None would silently drop MAP mutations that reference absent fields"
+        );
+        assert_eq!(
+            result.unwrap(),
+            serde_json::Value::Null,
+            "missing field access on `object` must evaluate to Null, not panic"
+        );
+    }
 }
