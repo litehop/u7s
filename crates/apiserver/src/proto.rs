@@ -4949,15 +4949,263 @@ pub fn decode_mutatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_js
     }))
 }
 
+// ---------------------------------------------------------------------------
+// MutatingAdmissionPolicy proto structs
+// Source: k8s.io/api/admissionregistration/v1/generated.proto
+// Field numbers verified against k8s 1.33 canonical source.
+// ---------------------------------------------------------------------------
+
+/// NamedRuleWithOperations — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=resourceNames (repeated string), field 2=ruleWithOperations (embedded as separate
+/// operation+rule fields; k8s encodes this as a nested message starting at field 3 for operations
+/// and the Rule embedded fields)
+/// In the proto encoding: field 1=apiGroups, field 2=apiVersions, field 3=resources,
+/// field 4=scope, field 6=operations (from RuleWithOperations which embeds Rule 1-4 + ops at 6)
+#[derive(Clone, PartialEq, Message)]
+struct MapNamedRuleWithOperations {
+    /// resourceNames (field 1, repeated string)
+    #[prost(string, repeated, tag = "1")]
+    resource_names: Vec<String>,
+    /// apiGroups (field 2, repeated string) — from embedded Rule
+    #[prost(string, repeated, tag = "2")]
+    api_groups: Vec<String>,
+    /// apiVersions (field 3, repeated string) — from embedded Rule
+    #[prost(string, repeated, tag = "3")]
+    api_versions: Vec<String>,
+    /// resources (field 4, repeated string) — from embedded Rule
+    #[prost(string, repeated, tag = "4")]
+    resources: Vec<String>,
+    /// scope (field 5, string) — from embedded Rule
+    #[prost(string, tag = "5")]
+    scope: String,
+    /// operations (field 6, repeated string) — from RuleWithOperations
+    #[prost(string, repeated, tag = "6")]
+    operations: Vec<String>,
+}
+
+/// MatchResources — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=namespaceSelector, field 2=objectSelector, field 3=resourceRules,
+/// field 4=excludeResourceRules, field 5=matchPolicy
+#[derive(Clone, PartialEq, Message)]
+struct MapMatchResources {
+    /// namespaceSelector (field 1, message LabelSelector)
+    #[prost(message, tag = "1")]
+    namespace_selector: Option<AdmissionLabelSelector>,
+    /// objectSelector (field 2, message LabelSelector)
+    #[prost(message, tag = "2")]
+    object_selector: Option<AdmissionLabelSelector>,
+    /// resourceRules (field 3, repeated NamedRuleWithOperations)
+    #[prost(message, repeated, tag = "3")]
+    resource_rules: Vec<MapNamedRuleWithOperations>,
+    /// excludeResourceRules (field 4, repeated NamedRuleWithOperations)
+    #[prost(message, repeated, tag = "4")]
+    exclude_resource_rules: Vec<MapNamedRuleWithOperations>,
+    /// matchPolicy (field 5, string)
+    #[prost(string, tag = "5")]
+    match_policy: String,
+}
+
+/// ApplyConfiguration — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=expression (string)
+#[derive(Clone, PartialEq, Message)]
+struct MapApplyConfiguration {
+    /// expression (field 1, string)
+    #[prost(string, tag = "1")]
+    expression: String,
+}
+
+/// Mutation — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=patchType (string), field 2=applyConfiguration (ApplyConfiguration)
+/// field 3=jsonPatch (JSONPatch)
+#[derive(Clone, PartialEq, Message)]
+struct MapMutation {
+    /// patchType (field 1, string)
+    #[prost(string, tag = "1")]
+    patch_type: String,
+    /// applyConfiguration (field 2, message ApplyConfiguration)
+    #[prost(message, tag = "2")]
+    apply_configuration: Option<MapApplyConfiguration>,
+}
+
+/// Variable — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=name (string), field 2=expression (string)
+#[derive(Clone, PartialEq, Message)]
+struct MapVariable {
+    /// name (field 1, string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// expression (field 2, string)
+    #[prost(string, tag = "2")]
+    expression: String,
+}
+
+/// MatchCondition — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=name (string), field 2=expression (string)
+#[derive(Clone, PartialEq, Message)]
+struct MapMatchCondition {
+    /// name (field 1, string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// expression (field 2, string)
+    #[prost(string, tag = "2")]
+    expression: String,
+}
+
+/// ParamKind — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=apiVersion (string), field 2=kind (string)
+#[derive(Clone, PartialEq, Message)]
+struct MapParamKind {
+    /// apiVersion (field 1, string)
+    #[prost(string, tag = "1")]
+    api_version: String,
+    /// kind (field 2, string)
+    #[prost(string, tag = "2")]
+    kind: String,
+}
+
+/// MutatingAdmissionPolicySpec — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=matchConstraints, field 2=variables, field 3=mutations, field 4=failurePolicy,
+/// field 5=matchConditions, field 6=reinvocationPolicy, field 7=paramKind
+#[derive(Clone, PartialEq, Message)]
+struct MapSpec {
+    /// matchConstraints (field 1, message MatchResources)
+    #[prost(message, tag = "1")]
+    match_constraints: Option<MapMatchResources>,
+    /// variables (field 2, repeated Variable)
+    #[prost(message, repeated, tag = "2")]
+    variables: Vec<MapVariable>,
+    /// mutations (field 3, repeated Mutation)
+    #[prost(message, repeated, tag = "3")]
+    mutations: Vec<MapMutation>,
+    /// failurePolicy (field 4, string)
+    #[prost(string, tag = "4")]
+    failure_policy: String,
+    /// matchConditions (field 5, repeated MatchCondition)
+    #[prost(message, repeated, tag = "5")]
+    match_conditions: Vec<MapMatchCondition>,
+    /// reinvocationPolicy (field 6, string)
+    #[prost(string, tag = "6")]
+    reinvocation_policy: String,
+    /// paramKind (field 7, message ParamKind)
+    #[prost(message, tag = "7")]
+    param_kind: Option<MapParamKind>,
+}
+
 /// MutatingAdmissionPolicy — admissionregistration.k8s.io/v1/generated.proto
 /// Source: k8s.io/api/admissionregistration/v1/generated.proto message MutatingAdmissionPolicy
-/// field 1 = metadata (ObjectMeta), field 2 = spec (MutatingAdmissionPolicySpec, opaque to u7s)
-/// Only metadata is decoded; the spec is stored/returned as-is through the JSON object store.
+/// field 1 = metadata (ObjectMeta), field 2 = spec (MutatingAdmissionPolicySpec)
 #[derive(Clone, PartialEq, Message)]
 struct MutatingAdmissionPolicy {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message MutatingAdmissionPolicySpec)
+    #[prost(message, tag = "2")]
+    spec: Option<MapSpec>,
+}
+
+/// Convert a MapNamedRuleWithOperations to JSON.
+fn map_named_rule_to_json(r: MapNamedRuleWithOperations) -> serde_json::Value {
+    let mut rule = serde_json::json!({
+        "apiGroups": r.api_groups,
+        "apiVersions": r.api_versions,
+        "resources": r.resources,
+        "operations": r.operations,
+    });
+    if !r.scope.is_empty() {
+        rule["scope"] = serde_json::Value::String(r.scope);
+    }
+    if !r.resource_names.is_empty() {
+        rule["resourceNames"] = serde_json::Value::Array(
+            r.resource_names
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
+    }
+    rule
+}
+
+/// Convert a MapMatchResources to JSON.
+fn map_match_resources_to_json(mc: MapMatchResources) -> serde_json::Value {
+    let mut obj = serde_json::json!({});
+    let resource_rules: Vec<serde_json::Value> = mc
+        .resource_rules
+        .into_iter()
+        .map(map_named_rule_to_json)
+        .collect();
+    if !resource_rules.is_empty() {
+        obj["resourceRules"] = serde_json::Value::Array(resource_rules);
+    }
+    let exclude_rules: Vec<serde_json::Value> = mc
+        .exclude_resource_rules
+        .into_iter()
+        .map(map_named_rule_to_json)
+        .collect();
+    if !exclude_rules.is_empty() {
+        obj["excludeResourceRules"] = serde_json::Value::Array(exclude_rules);
+    }
+    if let Some(ns) = mc.namespace_selector {
+        obj["namespaceSelector"] = label_selector_to_json(ns);
+    }
+    if let Some(os) = mc.object_selector {
+        obj["objectSelector"] = label_selector_to_json(os);
+    }
+    if !mc.match_policy.is_empty() {
+        obj["matchPolicy"] = serde_json::Value::String(mc.match_policy);
+    }
+    obj
+}
+
+/// Convert a MapSpec to JSON.
+fn map_spec_to_json(spec: MapSpec) -> serde_json::Value {
+    let mut obj = serde_json::json!({});
+    if let Some(mc) = spec.match_constraints {
+        obj["matchConstraints"] = map_match_resources_to_json(mc);
+    }
+    if !spec.failure_policy.is_empty() {
+        obj["failurePolicy"] = serde_json::Value::String(spec.failure_policy);
+    }
+    if !spec.reinvocation_policy.is_empty() {
+        obj["reinvocationPolicy"] = serde_json::Value::String(spec.reinvocation_policy);
+    }
+    if let Some(pk) = spec.param_kind {
+        obj["paramKind"] = serde_json::json!({
+            "apiVersion": pk.api_version,
+            "kind": pk.kind,
+        });
+    }
+    if !spec.variables.is_empty() {
+        let vars: Vec<serde_json::Value> = spec
+            .variables
+            .into_iter()
+            .map(|v| serde_json::json!({"name": v.name, "expression": v.expression}))
+            .collect();
+        obj["variables"] = serde_json::Value::Array(vars);
+    }
+    if !spec.mutations.is_empty() {
+        let mutations: Vec<serde_json::Value> = spec
+            .mutations
+            .into_iter()
+            .map(|m| {
+                let mut entry = serde_json::json!({"patchType": m.patch_type});
+                if let Some(ac) = m.apply_configuration {
+                    entry["applyConfiguration"] = serde_json::json!({"expression": ac.expression});
+                }
+                entry
+            })
+            .collect();
+        obj["mutations"] = serde_json::Value::Array(mutations);
+    }
+    if !spec.match_conditions.is_empty() {
+        let conds: Vec<serde_json::Value> = spec
+            .match_conditions
+            .into_iter()
+            .map(|c| serde_json::json!({"name": c.name, "expression": c.expression}))
+            .collect();
+        obj["matchConditions"] = serde_json::Value::Array(conds);
+    }
+    obj
 }
 
 /// Decode a proto-encoded MutatingAdmissionPolicy into a serde_json::Value.
@@ -4966,25 +5214,76 @@ struct MutatingAdmissionPolicy {
 /// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
 /// returns None, extract_body returns raw proto bytes, and the handler returns
 /// 400 "invalid JSON: expected value at line 1 column 1".
+///
+/// The spec field (field 2) is fully decoded so that PUT/PATCH operations preserve
+/// spec content. Without spec decoding, a PUT with a new spec reverts the object to
+/// its previous spec because the decoder only emitted metadata.
 pub fn decode_mutatingadmissionpolicy_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = MutatingAdmissionPolicy::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "admissionregistration.k8s.io/v1",
         "kind": "MutatingAdmissionPolicy",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = obj.spec {
+        result["spec"] = map_spec_to_json(spec);
+    }
+    Some(result)
+}
+
+// ---------------------------------------------------------------------------
+// MutatingAdmissionPolicyBinding proto structs
+// Source: k8s.io/api/admissionregistration/v1/generated.proto
+// Field numbers verified against k8s 1.33 canonical source.
+// ---------------------------------------------------------------------------
+
+/// ParamRef — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=name (string), field 2=namespace (string), field 3=selector (LabelSelector),
+/// field 4=parameterNotFoundAction (string)
+#[derive(Clone, PartialEq, Message)]
+struct MapbParamRef {
+    /// name (field 1, string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// namespace (field 2, string)
+    #[prost(string, tag = "2")]
+    namespace: String,
+    /// selector (field 3, message LabelSelector)
+    #[prost(message, tag = "3")]
+    selector: Option<AdmissionLabelSelector>,
+    /// parameterNotFoundAction (field 4, string)
+    #[prost(string, tag = "4")]
+    parameter_not_found_action: String,
+}
+
+/// MutatingAdmissionPolicyBindingSpec — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=policyName (string), field 2=paramRef (ParamRef),
+/// field 3=matchResources (MatchResources), field 4=validationActions (repeated string)
+#[derive(Clone, PartialEq, Message)]
+struct MapbSpec {
+    /// policyName (field 1, string)
+    #[prost(string, tag = "1")]
+    policy_name: String,
+    /// paramRef (field 2, message ParamRef)
+    #[prost(message, tag = "2")]
+    param_ref: Option<MapbParamRef>,
+    /// matchResources (field 3, message MatchResources)
+    #[prost(message, tag = "3")]
+    match_resources: Option<MapMatchResources>,
 }
 
 /// MutatingAdmissionPolicyBinding — admissionregistration.k8s.io/v1/generated.proto
 /// Source: k8s.io/api/admissionregistration/v1/generated.proto message MutatingAdmissionPolicyBinding
-/// field 1 = metadata (ObjectMeta), field 2 = spec (MutatingAdmissionPolicyBindingSpec, opaque to u7s)
-/// Only metadata is decoded; the spec is stored/returned as-is through the JSON object store.
+/// field 1 = metadata (ObjectMeta), field 2 = spec (MutatingAdmissionPolicyBindingSpec)
 #[derive(Clone, PartialEq, Message)]
 struct MutatingAdmissionPolicyBinding {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message MutatingAdmissionPolicyBindingSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<MapbSpec>,
 }
 
 /// Decode a proto-encoded MutatingAdmissionPolicyBinding into a serde_json::Value.
@@ -4993,14 +5292,46 @@ struct MutatingAdmissionPolicyBinding {
 /// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
 /// returns None, extract_body returns raw proto bytes, and the handler returns
 /// 400 "invalid JSON: expected value at line 1 column 1".
+///
+/// The spec field (field 2) is fully decoded so that PUT/PATCH operations preserve
+/// spec content. Without spec decoding, a PUT with a new spec reverts the object to
+/// its previous spec because the decoder only emitted metadata.
 pub fn decode_mutatingadmissionpolicybinding_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = MutatingAdmissionPolicyBinding::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "admissionregistration.k8s.io/v1",
         "kind": "MutatingAdmissionPolicyBinding",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::json!({});
+        if !spec.policy_name.is_empty() {
+            spec_json["policyName"] = serde_json::Value::String(spec.policy_name);
+        }
+        if let Some(pr) = spec.param_ref {
+            let mut pr_json = serde_json::json!({});
+            if !pr.name.is_empty() {
+                pr_json["name"] = serde_json::Value::String(pr.name);
+            }
+            if !pr.namespace.is_empty() {
+                pr_json["namespace"] = serde_json::Value::String(pr.namespace);
+            }
+            if !pr.parameter_not_found_action.is_empty() {
+                pr_json["parameterNotFoundAction"] =
+                    serde_json::Value::String(pr.parameter_not_found_action);
+            }
+            if let Some(sel) = pr.selector {
+                pr_json["selector"] = label_selector_to_json(sel);
+            }
+            spec_json["paramRef"] = pr_json;
+        }
+        if let Some(mr) = spec.match_resources {
+            spec_json["matchResources"] = map_match_resources_to_json(mr);
+        }
+        result["spec"] = spec_json;
+    }
+    Some(result)
 }
 
 // --- k8s.io/api/networking/v1/generated.proto ---
@@ -10667,6 +10998,125 @@ mod tests {
     #[test]
     fn decode_mutatingadmissionpolicy_proto_returns_none_for_garbage() {
         assert!(decode_mutatingadmissionpolicy_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    /// PUT to MutatingAdmissionPolicy must preserve the spec field (failurePolicy, matchConstraints,
+    /// mutations). Without spec decoding, a PUT with a new spec was silently dropped and the stored
+    /// object retained the old spec — the conformance test "updated object should have the applied
+    /// spec" then fails.
+    #[test]
+    fn decode_mutatingadmissionpolicy_proto_preserves_spec_on_put() {
+        // Encode MapSpec: field 4=failurePolicy(string), field 3=mutations(repeated message),
+        //                 field 1=matchConstraints(message)
+        //
+        // MapMutation: field 1=patchType(string "ApplyConfiguration"), field 2=applyConfiguration
+        // MapApplyConfiguration: field 1=expression(string)
+
+        // Build applyConfiguration message: field 1 = expression
+        let apply_config = encode_length_delimited(
+            1,
+            b"Object{metadata: Object.metadata{labels: {\"injected\": \"true\"}}}",
+        );
+
+        // Build mutation message: field 1 = patchType, field 2 = applyConfiguration
+        let mut mutation = encode_length_delimited(1, b"ApplyConfiguration");
+        mutation.extend_from_slice(&encode_length_delimited(2, &apply_config));
+
+        // Build matchConstraints: field 3 = resourceRules (NamedRuleWithOperations)
+        // MapNamedRuleWithOperations: field 2=apiGroups, field 3=apiVersions, field 4=resources, field 6=operations
+        let mut resource_rule: Vec<u8> = Vec::new();
+        resource_rule.extend_from_slice(&encode_length_delimited(2, b"apps")); // apiGroups
+        resource_rule.extend_from_slice(&encode_length_delimited(3, b"v1")); // apiVersions
+        resource_rule.extend_from_slice(&encode_length_delimited(4, b"deployments")); // resources
+        resource_rule.extend_from_slice(&encode_length_delimited(6, b"CREATE")); // operations
+        let match_constraints = encode_length_delimited(3, &resource_rule); // resourceRules at field 3
+
+        // Build spec: field 1=matchConstraints, field 3=mutations, field 4=failurePolicy
+        let mut spec: Vec<u8> = Vec::new();
+        spec.extend_from_slice(&encode_length_delimited(1, &match_constraints)); // matchConstraints at field 1
+        spec.extend_from_slice(&encode_length_delimited(3, &mutation)); // mutations at field 3
+        spec.extend_from_slice(&encode_length_delimited(4, b"Fail")); // failurePolicy at field 4
+
+        // Build MutatingAdmissionPolicy: field 1=metadata, field 2=spec
+        let obj_meta = encode_length_delimited(1, b"test-map-spec"); // ObjectMeta.name
+        let mut proto = encode_length_delimited(1, &obj_meta);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result = decode_mutatingadmissionpolicy_proto(&proto)
+            .expect("MutatingAdmissionPolicy with spec must decode successfully");
+
+        assert_eq!(result["metadata"]["name"], "test-map-spec");
+
+        // Regression: spec.failurePolicy must survive the proto decode — if it reverts to the
+        // previous value, PUT/PATCH operations silently drop the user's intended spec changes.
+        assert_eq!(
+            result["spec"]["failurePolicy"], "Fail",
+            "spec.failurePolicy must be preserved in the decoded JSON; \
+             if missing, a PUT that changes failurePolicy has no effect (spec is dropped by decoder)"
+        );
+
+        // Regression: spec.mutations must be present so the admission controller can evaluate
+        // them. If mutations are absent, CEL-based mutation policies stop working after a PUT.
+        let mutations = result["spec"]["mutations"].as_array().expect(
+            "spec.mutations must be a JSON array; absent mutations = CEL policy noop after PUT",
+        );
+        assert_eq!(
+            mutations.len(),
+            1,
+            "one mutation must survive the proto round-trip"
+        );
+        assert_eq!(
+            mutations[0]["patchType"], "ApplyConfiguration",
+            "mutation patchType must be preserved; wrong value means admission controller \
+             skips the mutation (it checks patchType == 'ApplyConfiguration')"
+        );
+        assert!(
+            !mutations[0]["applyConfiguration"]["expression"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty(),
+            "applyConfiguration.expression must be non-empty; absent = CEL mutation has no effect"
+        );
+
+        // Regression: spec.matchConstraints.resourceRules must be present for the policy to match
+        // any resources. If absent, matches_match_constraints returns true for all resources
+        // (match-all fallback), which is wrong after a PUT that set explicit constraints.
+        let resource_rules = result["spec"]["matchConstraints"]["resourceRules"]
+            .as_array()
+            .expect("matchConstraints.resourceRules must be a JSON array");
+        assert!(
+            !resource_rules.is_empty(),
+            "resourceRules must be non-empty"
+        );
+        assert_eq!(resource_rules[0]["apiGroups"][0], "apps");
+        assert_eq!(resource_rules[0]["resources"][0], "deployments");
+    }
+
+    /// PUT to MutatingAdmissionPolicyBinding must preserve the spec field (policyName).
+    /// Without spec decoding, a PUT binding to a different policy name silently dropped the
+    /// change — the conformance test "updated object should have the applied spec" fails.
+    #[test]
+    fn decode_mutatingadmissionpolicybinding_proto_preserves_spec_on_put() {
+        // Build MapbSpec: field 1=policyName
+        let spec = encode_length_delimited(1, b"my-policy"); // policyName
+
+        // Build MutatingAdmissionPolicyBinding: field 1=metadata, field 2=spec
+        let obj_meta = encode_length_delimited(1, b"test-mapb-spec"); // ObjectMeta.name
+        let mut proto = encode_length_delimited(1, &obj_meta);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result = decode_mutatingadmissionpolicybinding_proto(&proto)
+            .expect("MutatingAdmissionPolicyBinding with spec must decode successfully");
+
+        assert_eq!(result["metadata"]["name"], "test-mapb-spec");
+
+        // Regression: spec.policyName must survive the proto decode — if it reverts, a PUT that
+        // rebinds to a different policy has no effect (binding still points to old policy).
+        assert_eq!(
+            result["spec"]["policyName"], "my-policy",
+            "spec.policyName must be preserved in the decoded JSON; \
+             if missing, a PUT that changes policyName is silently ignored"
+        );
     }
 
     // ---------------------------------------------------------------------------
