@@ -22,7 +22,9 @@ sa.pub
 /kubeconfig
 
 # Local dev state (scripts/u7s-start.sh)
-temp/
+temp/*
+!temp/u7s/
+!temp/u7s/.gitkeep
 
 .claude/scheduled_tasks.json
 .claude/plans/
