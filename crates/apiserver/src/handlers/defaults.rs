@@ -293,6 +293,12 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
     if let ("apps", "statefulsets") = (group, plural) {
         validate_selector(obj, "StatefulSet")?;
     }
+    if group == "admissionregistration.k8s.io"
+        && (plural == "validatingwebhookconfigurations"
+            || plural == "mutatingwebhookconfigurations")
+    {
+        crate::admission::validate_webhook_match_conditions_cel(obj)?;
+    }
     Ok(())
 }
 
@@ -1944,6 +1950,102 @@ mod tests {
                 .unwrap()
                 .contains_key("creationTimestamp"),
             "creationTimestamp must not appear when it was never in the input"
+        );
+    }
+
+    /// A ValidatingWebhookConfiguration with an empty matchConditions expression must be
+    /// rejected. The conformance test POSTs a webhook configuration with an invalid CEL
+    /// expression and expects a 422 — without this check the apiserver returns 200 OK.
+    #[test]
+    fn validating_webhook_configuration_rejects_empty_cel_expression() {
+        let obj = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test"},
+            "webhooks": [{
+                "name": "test.example.com",
+                "matchConditions": [{"name": "check", "expression": ""}]
+            }]
+        });
+        let result = validate_resource(
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations",
+            &obj,
+        );
+        assert!(
+            result.is_err(),
+            "ValidatingWebhookConfiguration with empty matchConditions expression must be rejected; \
+             without this check the apiserver returns 200 OK and the conformance test fails"
+        );
+    }
+
+    /// A ValidatingWebhookConfiguration with a valid CEL expression must be accepted.
+    #[test]
+    fn validating_webhook_configuration_accepts_valid_cel_expression() {
+        let obj = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test"},
+            "webhooks": [{
+                "name": "test.example.com",
+                "matchConditions": [{"name": "check", "expression": "object.metadata.name == \"test\""}]
+            }]
+        });
+        let result = validate_resource(
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations",
+            &obj,
+        );
+        assert!(
+            result.is_ok(),
+            "ValidatingWebhookConfiguration with a valid CEL expression must pass validation"
+        );
+    }
+
+    /// A MutatingWebhookConfiguration with an empty matchConditions expression must be
+    /// rejected for the same reason as the validating variant.
+    #[test]
+    fn mutating_webhook_configuration_rejects_empty_cel_expression() {
+        let obj = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "test"},
+            "webhooks": [{
+                "name": "test.example.com",
+                "matchConditions": [{"name": "check", "expression": ""}]
+            }]
+        });
+        let result = validate_resource(
+            "admissionregistration.k8s.io",
+            "mutatingwebhookconfigurations",
+            &obj,
+        );
+        assert!(
+            result.is_err(),
+            "MutatingWebhookConfiguration with empty matchConditions expression must be rejected"
+        );
+    }
+
+    /// A webhook configuration without matchConditions must still be accepted.
+    #[test]
+    fn webhook_configuration_without_match_conditions_passes_validation() {
+        let obj = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test"},
+            "webhooks": [{
+                "name": "test.example.com",
+                "clientConfig": {"url": "https://example.com/webhook"}
+            }]
+        });
+        let result = validate_resource(
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations",
+            &obj,
+        );
+        assert!(
+            result.is_ok(),
+            "ValidatingWebhookConfiguration without matchConditions must pass validation"
         );
     }
 }
