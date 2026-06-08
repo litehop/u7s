@@ -20,6 +20,11 @@
 #             child scripts (lima-start, 04-start-kcm, 06-run-sonobuoy) use the
 #             same VM. Allows multiple workers to run in parallel against their
 #             own isolated VMs. Also settable via U7S_VM_NAME env var.
+#   --ip      Host IP for the apiserver and konnectivity-server to bind to
+#             (default: 127.0.0.1). Set to a loopback alias (e.g. 127.0.0.2) to
+#             run multiple workers in parallel without port collisions. Exports
+#             U7S_HOST_IP so u7s-start.sh uses the correct address.
+#             Also settable via U7S_HOST_IP env var.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -33,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     --reset) RESET=1; shift ;;
     --focus) FOCUS="$2"; shift 2 ;;
     --vm) U7S_VM_NAME="$2"; export U7S_VM_NAME; shift 2 ;;
+    --ip) U7S_HOST_IP="$2"; export U7S_HOST_IP; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
