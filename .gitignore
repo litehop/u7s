@@ -1,6 +1,8 @@
 
-# Mayor Method working files
-ai/findings/
+# Mayor Method working files — ignore content but keep the stub so the
+# directory exists in all worktrees.
+ai/findings/*
+!ai/findings/.gitkeep
 
 # Beads / Dolt files (added by bd init)
 .dolt/

@@ -25,7 +25,14 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-WORKDIR="$REPO/temp/u7s"
+# Derive WORKDIR from VM name so parallel workers get isolated state dirs.
+# Default (lima-node) stays at temp/u7s for backward compatibility.
+_VM="${U7S_VM_NAME:-lima-node}"
+if [ "$_VM" = "lima-node" ]; then
+  WORKDIR="$REPO/temp/u7s"
+else
+  WORKDIR="$REPO/temp/u7s-${_VM}"
+fi
 BINARY="$REPO/target/release/u7s-apiserver"
 PORT=6443
 HOST_IP="${U7S_HOST_IP:-127.0.0.1}"
