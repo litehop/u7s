@@ -2434,4 +2434,86 @@ mod tests {
             result.err()
         );
     }
+
+    // -----------------------------------------------------------------------
+    // is_exec_status_frame: absorbing kubelet status frames prevents conformance failures
+    //
+    // The conformance test reads the first WebSocket message from /exec and asserts it
+    // is channel 1 (stdout). If channel 3 or 4 is forwarded instead of absorbed, the
+    // test fails with "Got message from server that didn't start with channel 1".
+    // -----------------------------------------------------------------------
+
+    /// Channel 3 (error/status stream) must be absorbed, not forwarded to kubectl.
+    /// If channel 3 frames reach kubectl, the conformance test fails because the
+    /// first received message is not channel 1 (stdout).
+    #[test]
+    fn is_exec_status_frame_absorbs_channel_3_error_stream() {
+        let frame = bytes::Bytes::from_static(&[3u8, b'{', b'}']);
+        assert!(
+            is_exec_status_frame(&frame),
+            "channel 3 (error/status stream) must be absorbed — forwarding it to kubectl \
+             causes conformance failures because kubectl expects channel 1 first"
+        );
+    }
+
+    /// Channel 4 (resize) must be absorbed, not forwarded to kubectl.
+    /// Channel 4 carries terminal resize events in the v5 subprotocol; forwarding
+    /// it to kubectl as data would corrupt the exec stream.
+    #[test]
+    fn is_exec_status_frame_absorbs_channel_4_resize() {
+        let frame = bytes::Bytes::from_static(&[4u8, 0, 0]);
+        assert!(
+            is_exec_status_frame(&frame),
+            "channel 4 (resize) must be absorbed — forwarding it to kubectl causes \
+             conformance failures and stream corruption"
+        );
+    }
+
+    /// Channel 0 (stdin) must be forwarded, not absorbed.
+    /// Absorbing stdin would silently discard user input, breaking interactive exec sessions.
+    #[test]
+    fn is_exec_status_frame_forwards_channel_0_stdin() {
+        let frame = bytes::Bytes::from_static(&[0u8, b'h', b'i']);
+        assert!(
+            !is_exec_status_frame(&frame),
+            "channel 0 (stdin) must be forwarded — absorbing stdin discards user input \
+             and breaks interactive exec sessions"
+        );
+    }
+
+    /// Channel 1 (stdout) must be forwarded, not absorbed.
+    /// Absorbing stdout would silently discard command output, which is the primary
+    /// data stream in an exec session.
+    #[test]
+    fn is_exec_status_frame_forwards_channel_1_stdout() {
+        let frame = bytes::Bytes::from_static(&[1u8, b'o', b'k']);
+        assert!(
+            !is_exec_status_frame(&frame),
+            "channel 1 (stdout) must be forwarded — absorbing stdout discards command output \
+             and breaks the exec conformance test"
+        );
+    }
+
+    /// Channel 2 (stderr) must be forwarded, not absorbed.
+    /// Absorbing stderr would hide error messages from the user, making debugging impossible.
+    #[test]
+    fn is_exec_status_frame_forwards_channel_2_stderr() {
+        let frame = bytes::Bytes::from_static(&[2u8, b'e', b'r', b'r']);
+        assert!(
+            !is_exec_status_frame(&frame),
+            "channel 2 (stderr) must be forwarded — absorbing stderr hides error output \
+             from the user and breaks exec conformance tests"
+        );
+    }
+
+    /// An empty frame must not be absorbed (returns false, not panic).
+    /// Empty frames have no channel byte; they should be treated as non-status frames.
+    #[test]
+    fn is_exec_status_frame_empty_frame_not_absorbed() {
+        let frame = bytes::Bytes::new();
+        assert!(
+            !is_exec_status_frame(&frame),
+            "empty frame must not be absorbed — is_some_and returns false for None"
+        );
+    }
 }
