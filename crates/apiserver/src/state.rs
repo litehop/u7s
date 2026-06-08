@@ -810,6 +810,18 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rm("CertificateSigningRequest", false, true),
     );
 
+    // apiregistration.k8s.io/v1 — cluster-scoped
+    // The KCM GC graph builder lists every resource type it discovers. We advertise
+    // apiregistration.k8s.io in discovery (STATIC_GROUPS); without a registry entry
+    // the GC gets 404 on LIST, the informer never syncs, and WaitForCacheSync times
+    // out after 30s — blocking the EndpointSlice mirroring controller informer.
+    // Registering apiservices here causes LIST to return 200 OK with an empty list,
+    // the informer syncs immediately, and the GC graph builder completes on time.
+    m.insert(
+        rk("apiregistration.k8s.io", "v1", "apiservices"),
+        rm("APIService", false, true),
+    );
+
     // resource.k8s.io/v1 — Dynamic Resource Allocation (DRA), GA since k8s 1.32
     m.insert(
         rk("resource.k8s.io", "v1", "deviceclasses"),
@@ -1567,5 +1579,31 @@ mod tests {
             "ValidatingAdmissionPolicyBinding is cluster-scoped"
         );
         assert_eq!(vapb_meta.kind, "ValidatingAdmissionPolicyBinding");
+    }
+
+    /// apiregistration.k8s.io/v1/apiservices must be in build_registry so that GC LIST
+    /// returns 200 OK with an empty list rather than 404.
+    ///
+    /// Root cause of GC graph builder sync timeout: the KCM GC graph builder discovers
+    /// apiregistration.k8s.io/v1/apiservices via the discovery API (we advertise it in
+    /// STATIC_GROUPS) and issues GET /apis/apiregistration.k8s.io/v1/apiservices?limit=500
+    /// for each resource type. Without a registry entry the generic handler falls through to
+    /// the CR handler, which returns 404. The reflector in client-go retries on 404 and the
+    /// informer never reaches synced=true. WaitForCacheSync times out after 30s, preventing
+    /// the EndpointSlice mirroring controller informer from establishing its Watch.
+    ///
+    /// With the registry entry, LIST returns 200 OK with an empty list, the informer syncs
+    /// immediately, and the GC graph builder completes within the 30s window.
+    #[test]
+    fn apiservices_registered_so_gc_list_returns_200_not_404() {
+        let registry = build_registry();
+        let key = rk("apiregistration.k8s.io", "v1", "apiservices");
+        let meta = registry.get(&key).expect(
+            "apiservices must be in build_registry — without this entry the GC graph \
+                     builder gets 404 on LIST, the informer never syncs, and \
+                     WaitForCacheSync times out after 30s blocking EndpointSlice mirroring",
+        );
+        assert!(!meta.namespaced, "APIService is cluster-scoped");
+        assert_eq!(meta.kind, "APIService");
     }
 }
