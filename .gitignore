@@ -25,6 +25,8 @@ sa.pub
 temp/*
 !temp/u7s/
 !temp/u7s/.gitkeep
+!temp/u7s-lima-node-smoke/
+!temp/u7s-lima-node-smoke/.gitkeep
 
 .claude/scheduled_tasks.json
 .claude/plans/
