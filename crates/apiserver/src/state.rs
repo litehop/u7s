@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -123,6 +123,10 @@ pub struct AppState<S = SqliteStore> {
     /// Stored here so the per-webhook reqwest::Client can present the same identity as the shared
     /// webhook_client when talking to the konnectivity proxy (which requires mTLS).
     pub webhook_identity_pem: Option<Arc<Vec<u8>>>,
+    /// JTI (JWT ID) revocation set. JTIs inserted here are rejected by the SA JWT verifier
+    /// even if the token is otherwise valid and has not yet expired. Shared across all clones
+    /// of AppState so a revocation is immediately visible on all request-handling threads.
+    pub revoked_jtis: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -173,6 +177,7 @@ impl<S> Clone for AppState<S> {
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
             webhook_identity_pem: self.webhook_identity_pem.clone(),
+            revoked_jtis: self.revoked_jtis.clone(),
         }
     }
 }
@@ -309,6 +314,7 @@ impl<S: Store> AppState<S> {
             continue_token_key: Arc::new(continue_token_key),
             konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,
             webhook_identity_pem: cfg.webhook_identity_pem.map(Arc::new),
+            revoked_jtis: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 

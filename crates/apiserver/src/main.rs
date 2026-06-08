@@ -262,6 +262,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
+            Arc::clone(&state.revoked_jtis),
         ))
         .layer(InflightLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
@@ -3785,6 +3786,7 @@ mod tests {
             std::sync::Arc::clone(&state.rbac_index),
             (*state.token_map).clone(),
             state.sa_decoding_key.clone(),
+            std::sync::Arc::clone(&state.revoked_jtis),
         ));
 
         for path in ["/openapi/v2", "/openapi/v3"] {
@@ -4431,6 +4433,7 @@ mod tests {
             &std::collections::HashMap::new(),
             Some(&dec_key),
             &[],
+            &std::collections::HashSet::new(),
         )
         .expect("minted SA token must authenticate successfully — round-trip broken if None");
 
