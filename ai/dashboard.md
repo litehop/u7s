@@ -1,38 +1,35 @@
 # Dashboard
-2026-06-02T~17:00 — Phase 3 PR #395 in CI (6 checks pending); ready to merge when green
+2026-06-08T~10:00 — focus runs in progress; coverage audit complete; 17 beads ready
 
-## Konnectivity sub-project status
+## Resume
+`SONOBUOY_FOCUS='StatefulSet Basic StatefulSet functionality' scripts/conformance/run-all.sh` — in progress
 
-| Bead | Title | Status |
-|------|-------|--------|
-| mayor-s1bs | Binary download script | ✅ merged #393 |
-| mayor-0iwa | Mac-side server startup | ✅ merged #394 |
-| mayor-0yoa | Lima VM agent startup | ⏳ PR #395 — 6 CI checks pending |
-| mayor-6m1q | 20/20 confirm + debug log strip | 🔜 waiting on #395 |
-
-## PR #395 — waiting for CI
-- `feat(konnectivity): start konnectivity-agent in lima VM`
-- MCP-verified: agent process confirmed running in VM, dialing `host.lima.internal:8132`
-- Agent retrying (expected — server side was not yet up when tested)
-- 6 checks still pending; no failures
-
-## Sonobuoy scorecard
-
-| Group | Result |
-|-------|--------|
-| AggregatedDiscovery | ✅ 4/4 |
-| LimitRange | ✅ 2/2 |
-| Exec WebSocket | ✅ 1/1 |
-| SubjectAccessReview | ✅ 20/20 |
-| ResourceQuota | ❌ needs retest |
-| AdmissionWebhook | 🟡 19/20 — konnectivity fix in progress |
-| FlowSchema | ❌ APF gap |
+## Operator attention needed
+- StatefulSet focused run in progress (bfmlhuqhs) — key test: does Burst/Predictable scaling now advance past 1/N?
+- MutatingAdmissionPolicy focused run queued after StatefulSet
 
 ## Open PRs
-- #395 — konnectivity agent in VM — ⏳ CI pending (0 failures)
+None.
 
-## Next action
-Merge #395 when green → dispatch mayor-6m1q (sonobuoy 20/20 + strip debug logs)
+## Focus run status
+```
+✅ EndpointSliceMirroring — 20/21 (conformance passes; non-conformance hostname gap remains)
+🔄 StatefulSet — IN PROGRESS (pod Watch label selector fix #462)
+⏳ MutatingAdmissionPolicy — queued (spec preservation fix #463)
+```
+
+## Coverage audit (ai/findings/coverage-audit.md)
+- Actual coverage: **91.4%** (threshold was 61% — now raised to 90%)
+- Top gaps: proto decoders with no tests (mayor-j2xg), CEL tokenizer edge cases (mayor-2712), is_exec_status_frame (mayor-k2zw)
+
+## Recent merges
+#461 GC apiservices 404 fix · #462 pod Watch label selector · #463 MAP spec preservation
+#458 MutatingAdmissionPolicy CEL · #459 Deployment cascade delete · #460 MAP proto decoders
+
+## Bead queue (17 ready)
+**P1:** mayor-zcnd StatefulSet scale-up · mayor-e539 coverage threshold (DONE — threshold raised)
+**P2 coverage:** mayor-j2xg proto decoder tests · mayor-2712 CEL tokenizer tests · mayor-k2zw is_exec_status_frame test
+**P2 correctness:** mayor-rzve SA JWT jti · mayor-ryds AcceptAnyCert without CA · mayor-2m6s rename client-util · mayor-ht9a split store/lib.rs · mayor-3w0r agnhost hostname · mayor-s3aq show-results.sh · mayor-y2cj annotation typing · mayor-z981 StatefulSet AfterEach · mayor-9k2w ValidatingWebhookConfiguration CEL · mayor-tkwj ControllerRevision template update
 
 ## Main at
-`4281260` — feat(konnectivity): start server on Mac side (#394)
+833ad15 — pod Watch label selector + MAP spec + GC apiservices fix
