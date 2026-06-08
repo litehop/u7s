@@ -8,6 +8,7 @@ use serde_json::Value;
 pub mod endpoint_slice_controller;
 pub mod endpoint_slice_mirroring_controller;
 pub mod namespace_controller;
+pub mod statefulset_controller;
 
 // ---------------------------------------------------------------------------
 // Secret construction
