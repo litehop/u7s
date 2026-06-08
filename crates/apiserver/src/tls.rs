@@ -212,6 +212,9 @@ fn load_or_generate_ca(
 pub struct TlsMaterial {
     /// DER-encoded CA certificate (written into kubeconfig).
     pub ca_cert_der: Vec<u8>,
+    /// DER-encoded server leaf certificate (the single cert in the TLS chain).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub server_cert_der: Vec<u8>,
     /// DER-encoded admin client certificate (written into kubeconfig).
     pub admin_cert_der: Vec<u8>,
     /// PEM-encoded admin client certificate (concatenate with admin_key_pem for reqwest::Identity).
@@ -317,12 +320,12 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     let kubelet_client_cert = kubelet_client_params.signed_by(&kubelet_client_key, &ca_issuer)?;
 
     // --- Build rustls ServerConfig ---
-    // Use ca_cert_der (the stable, original bytes) for the chain and trust store —
-    // not ca_cert.der(), which is re-issued on each load and would differ from disk.
-    let server_cert_chain = vec![
-        CertificateDer::from(server_cert.der().to_vec()),
-        CertificateDer::from(ca_cert_der.clone()),
-    ];
+    // Present only the leaf cert in the chain. The CA cert is already in the
+    // kubelet's trust store (via kubeconfig certificate-authority-data). Including
+    // the self-signed CA as an intermediate causes Go's TLS verifier to reject the
+    // chain on full re-handshake (after session cache expiry): it sees a chain where
+    // intermediate == trust anchor, which is invalid per RFC 5246 chain validation.
+    let server_cert_chain = vec![CertificateDer::from(server_cert.der().to_vec())];
     let server_key_der = PrivateKeyDer::try_from(server_key.serialize_der())
         .map_err(|e| anyhow::anyhow!("key error: {e}"))?;
 
@@ -347,12 +350,14 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(server_cert_chain, server_key_der)?;
 
+    let server_cert_der = server_cert.der().to_vec();
     let admin_cert_der = admin_cert.der().to_vec();
     let admin_cert_pem = pem_encode("CERTIFICATE", &admin_cert_der);
     let kubelet_client_cert_der = kubelet_client_cert.der().to_vec();
     let kubelet_client_cert_pem = pem_encode("CERTIFICATE", &kubelet_client_cert_der);
     Ok(TlsMaterial {
         ca_cert_der,
+        server_cert_der,
         admin_cert_der,
         admin_cert_pem,
         admin_key_pem: admin_key.serialize_pem().into_bytes(),
@@ -1034,5 +1039,47 @@ mod tests {
             "write_private_key must write the exact bytes provided"
         );
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// The server TLS chain must contain only the leaf cert, not the CA cert.
+    ///
+    /// Go's TLS verifier performs full chain validation on every reconnect after
+    /// session cache expiry (~70 min). When the CA cert appears as an intermediate
+    /// in the chain, the verifier sees intermediate == trust anchor, which violates
+    /// RFC 5246 chain building and produces "ECDSA verification failure". Initial
+    /// connections succeed via session resumption; reconnects fail. Sonobuoy runs
+    /// (90+ min) hit this window reliably. The fix is to present only the leaf cert —
+    /// the CA is already in the client's trust store via kubeconfig.
+    #[test]
+    fn server_cert_chain_does_not_include_ca() {
+        let dir = test_temp_dir("chain-no-ca");
+        let args = Args {
+            db: "./state.db".into(),
+            listen: "0.0.0.0:6443".into(),
+            kubeconfig: "./kubeconfig".into(),
+            token_auth_file: None,
+            sa_key: "./sa.key".into(),
+            sa_pub: "./sa.pub".into(),
+            ca_key: dir.join("ca.key").to_string_lossy().into_owned(),
+            ca_cert: dir.join("ca.crt").to_string_lossy().into_owned(),
+            advertise_address: None,
+            service_cluster_ip_range: "10.96.0.0/12".into(),
+            kubelet_preferred_address: None,
+            konnectivity_proxy_addr: None,
+        };
+        let tls = generate_tls(&args).expect("generate_tls must succeed");
+
+        assert_ne!(
+            tls.server_cert_der, tls.ca_cert_der,
+            "server cert and CA cert must be distinct: the server must present a CA-signed \
+             leaf cert, not the CA cert itself"
+        );
+
+        assert!(
+            !tls.server_cert_der.is_empty(),
+            "server_cert_der must not be empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
