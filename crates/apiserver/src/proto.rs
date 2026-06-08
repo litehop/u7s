@@ -4951,41 +4951,55 @@ pub fn decode_mutatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_js
 
 // ---------------------------------------------------------------------------
 // MutatingAdmissionPolicy proto structs
-// Source: k8s.io/api/admissionregistration/v1/generated.proto
-// Field numbers verified against k8s 1.33 canonical source.
+// Source: k8s.io/api/admissionregistration/v1/generated.proto (v0.36.1)
+// Field numbers match the k8s 1.36 canonical proto definition.
 // ---------------------------------------------------------------------------
 
+/// Rule — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=apiGroups, field 2=apiVersions, field 3=resources, field 4=scope
+#[derive(Clone, PartialEq, Message)]
+struct MapRule {
+    /// apiGroups (field 1, repeated string)
+    #[prost(string, repeated, tag = "1")]
+    api_groups: Vec<String>,
+    /// apiVersions (field 2, repeated string)
+    #[prost(string, repeated, tag = "2")]
+    api_versions: Vec<String>,
+    /// resources (field 3, repeated string)
+    #[prost(string, repeated, tag = "3")]
+    resources: Vec<String>,
+    /// scope (field 4, string)
+    #[prost(string, tag = "4")]
+    scope: String,
+}
+
+/// RuleWithOperations — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=operations (repeated string), field 2=rule (Rule)
+#[derive(Clone, PartialEq, Message)]
+struct MapRuleWithOperations {
+    /// operations (field 1, repeated string)
+    #[prost(string, repeated, tag = "1")]
+    operations: Vec<String>,
+    /// rule (field 2, message Rule)
+    #[prost(message, tag = "2")]
+    rule: Option<MapRule>,
+}
+
 /// NamedRuleWithOperations — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=resourceNames (repeated string), field 2=ruleWithOperations (embedded as separate
-/// operation+rule fields; k8s encodes this as a nested message starting at field 3 for operations
-/// and the Rule embedded fields)
-/// In the proto encoding: field 1=apiGroups, field 2=apiVersions, field 3=resources,
-/// field 4=scope, field 6=operations (from RuleWithOperations which embeds Rule 1-4 + ops at 6)
+/// field 1=resourceNames (repeated string), field 2=ruleWithOperations (RuleWithOperations)
 #[derive(Clone, PartialEq, Message)]
 struct MapNamedRuleWithOperations {
     /// resourceNames (field 1, repeated string)
     #[prost(string, repeated, tag = "1")]
     resource_names: Vec<String>,
-    /// apiGroups (field 2, repeated string) — from embedded Rule
-    #[prost(string, repeated, tag = "2")]
-    api_groups: Vec<String>,
-    /// apiVersions (field 3, repeated string) — from embedded Rule
-    #[prost(string, repeated, tag = "3")]
-    api_versions: Vec<String>,
-    /// resources (field 4, repeated string) — from embedded Rule
-    #[prost(string, repeated, tag = "4")]
-    resources: Vec<String>,
-    /// scope (field 5, string) — from embedded Rule
-    #[prost(string, tag = "5")]
-    scope: String,
-    /// operations (field 6, repeated string) — from RuleWithOperations
-    #[prost(string, repeated, tag = "6")]
-    operations: Vec<String>,
+    /// ruleWithOperations (field 2, message RuleWithOperations)
+    #[prost(message, tag = "2")]
+    rule_with_operations: Option<MapRuleWithOperations>,
 }
 
 /// MatchResources — admissionregistration.k8s.io/v1/generated.proto
 /// field 1=namespaceSelector, field 2=objectSelector, field 3=resourceRules,
-/// field 4=excludeResourceRules, field 5=matchPolicy
+/// field 4=excludeResourceRules, field 7=matchPolicy
 #[derive(Clone, PartialEq, Message)]
 struct MapMatchResources {
     /// namespaceSelector (field 1, message LabelSelector)
@@ -5000,8 +5014,8 @@ struct MapMatchResources {
     /// excludeResourceRules (field 4, repeated NamedRuleWithOperations)
     #[prost(message, repeated, tag = "4")]
     exclude_resource_rules: Vec<MapNamedRuleWithOperations>,
-    /// matchPolicy (field 5, string)
-    #[prost(string, tag = "5")]
+    /// matchPolicy (field 7, string)
+    #[prost(string, tag = "7")]
     match_policy: String,
 }
 
@@ -5015,15 +5029,15 @@ struct MapApplyConfiguration {
 }
 
 /// Mutation — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=patchType (string), field 2=applyConfiguration (ApplyConfiguration)
-/// field 3=jsonPatch (JSONPatch)
+/// field 2=patchType (string), field 3=applyConfiguration (ApplyConfiguration),
+/// field 4=jsonPatch (JSONPatch)
 #[derive(Clone, PartialEq, Message)]
 struct MapMutation {
-    /// patchType (field 1, string)
-    #[prost(string, tag = "1")]
+    /// patchType (field 2, string)
+    #[prost(string, tag = "2")]
     patch_type: String,
-    /// applyConfiguration (field 2, message ApplyConfiguration)
-    #[prost(message, tag = "2")]
+    /// applyConfiguration (field 3, message ApplyConfiguration)
+    #[prost(message, tag = "3")]
     apply_configuration: Option<MapApplyConfiguration>,
 }
 
@@ -5064,31 +5078,31 @@ struct MapParamKind {
 }
 
 /// MutatingAdmissionPolicySpec — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=matchConstraints, field 2=variables, field 3=mutations, field 4=failurePolicy,
-/// field 5=matchConditions, field 6=reinvocationPolicy, field 7=paramKind
+/// field 1=paramKind, field 2=matchConstraints, field 3=variables, field 4=mutations,
+/// field 5=failurePolicy, field 6=matchConditions, field 7=reinvocationPolicy
 #[derive(Clone, PartialEq, Message)]
 struct MapSpec {
-    /// matchConstraints (field 1, message MatchResources)
+    /// paramKind (field 1, message ParamKind)
     #[prost(message, tag = "1")]
-    match_constraints: Option<MapMatchResources>,
-    /// variables (field 2, repeated Variable)
-    #[prost(message, repeated, tag = "2")]
-    variables: Vec<MapVariable>,
-    /// mutations (field 3, repeated Mutation)
-    #[prost(message, repeated, tag = "3")]
-    mutations: Vec<MapMutation>,
-    /// failurePolicy (field 4, string)
-    #[prost(string, tag = "4")]
-    failure_policy: String,
-    /// matchConditions (field 5, repeated MatchCondition)
-    #[prost(message, repeated, tag = "5")]
-    match_conditions: Vec<MapMatchCondition>,
-    /// reinvocationPolicy (field 6, string)
-    #[prost(string, tag = "6")]
-    reinvocation_policy: String,
-    /// paramKind (field 7, message ParamKind)
-    #[prost(message, tag = "7")]
     param_kind: Option<MapParamKind>,
+    /// matchConstraints (field 2, message MatchResources)
+    #[prost(message, tag = "2")]
+    match_constraints: Option<MapMatchResources>,
+    /// variables (field 3, repeated Variable)
+    #[prost(message, repeated, tag = "3")]
+    variables: Vec<MapVariable>,
+    /// mutations (field 4, repeated Mutation)
+    #[prost(message, repeated, tag = "4")]
+    mutations: Vec<MapMutation>,
+    /// failurePolicy (field 5, string)
+    #[prost(string, tag = "5")]
+    failure_policy: String,
+    /// matchConditions (field 6, repeated MatchCondition)
+    #[prost(message, repeated, tag = "6")]
+    match_conditions: Vec<MapMatchCondition>,
+    /// reinvocationPolicy (field 7, string)
+    #[prost(string, tag = "7")]
+    reinvocation_policy: String,
 }
 
 /// MutatingAdmissionPolicy — admissionregistration.k8s.io/v1/generated.proto
@@ -5106,14 +5120,16 @@ struct MutatingAdmissionPolicy {
 
 /// Convert a MapNamedRuleWithOperations to JSON.
 fn map_named_rule_to_json(r: MapNamedRuleWithOperations) -> serde_json::Value {
+    let rwo = r.rule_with_operations.unwrap_or_default();
+    let inner = rwo.rule.unwrap_or_default();
     let mut rule = serde_json::json!({
-        "apiGroups": r.api_groups,
-        "apiVersions": r.api_versions,
-        "resources": r.resources,
-        "operations": r.operations,
+        "apiGroups": inner.api_groups,
+        "apiVersions": inner.api_versions,
+        "resources": inner.resources,
+        "operations": rwo.operations,
     });
-    if !r.scope.is_empty() {
-        rule["scope"] = serde_json::Value::String(r.scope);
+    if !inner.scope.is_empty() {
+        rule["scope"] = serde_json::Value::String(inner.scope);
     }
     if !r.resource_names.is_empty() {
         rule["resourceNames"] = serde_json::Value::Array(
@@ -11004,38 +11020,49 @@ mod tests {
     /// mutations). Without spec decoding, a PUT with a new spec was silently dropped and the stored
     /// object retained the old spec — the conformance test "updated object should have the applied
     /// spec" then fails.
+    ///
+    /// Field numbers follow the k8s 1.36 proto definition (crates/apiserver/proto/api-admissionregistration-v1-generated.proto):
+    /// MutatingAdmissionPolicySpec: paramKind=1, matchConstraints=2, variables=3, mutations=4, failurePolicy=5, matchConditions=6, reinvocationPolicy=7
+    /// Mutation: patchType=2, applyConfiguration=3
+    /// NamedRuleWithOperations: resourceNames=1, ruleWithOperations=2
+    /// RuleWithOperations: operations=1, rule=2
+    /// Rule: apiGroups=1, apiVersions=2, resources=3, scope=4
     #[test]
     fn decode_mutatingadmissionpolicy_proto_preserves_spec_on_put() {
-        // Encode MapSpec: field 4=failurePolicy(string), field 3=mutations(repeated message),
-        //                 field 1=matchConstraints(message)
-        //
-        // MapMutation: field 1=patchType(string "ApplyConfiguration"), field 2=applyConfiguration
-        // MapApplyConfiguration: field 1=expression(string)
-
-        // Build applyConfiguration message: field 1 = expression
+        // Build ApplyConfiguration: field 1 = expression
         let apply_config = encode_length_delimited(
             1,
             b"Object{metadata: Object.metadata{labels: {\"injected\": \"true\"}}}",
         );
 
-        // Build mutation message: field 1 = patchType, field 2 = applyConfiguration
-        let mut mutation = encode_length_delimited(1, b"ApplyConfiguration");
-        mutation.extend_from_slice(&encode_length_delimited(2, &apply_config));
+        // Build Mutation: field 2 = patchType, field 3 = applyConfiguration
+        let mut mutation: Vec<u8> = Vec::new();
+        mutation.extend_from_slice(&encode_length_delimited(2, b"ApplyConfiguration")); // patchType at field 2
+        mutation.extend_from_slice(&encode_length_delimited(3, &apply_config)); // applyConfiguration at field 3
 
-        // Build matchConstraints: field 3 = resourceRules (NamedRuleWithOperations)
-        // MapNamedRuleWithOperations: field 2=apiGroups, field 3=apiVersions, field 4=resources, field 6=operations
-        let mut resource_rule: Vec<u8> = Vec::new();
-        resource_rule.extend_from_slice(&encode_length_delimited(2, b"apps")); // apiGroups
-        resource_rule.extend_from_slice(&encode_length_delimited(3, b"v1")); // apiVersions
-        resource_rule.extend_from_slice(&encode_length_delimited(4, b"deployments")); // resources
-        resource_rule.extend_from_slice(&encode_length_delimited(6, b"CREATE")); // operations
-        let match_constraints = encode_length_delimited(3, &resource_rule); // resourceRules at field 3
+        // Build Rule: field 1=apiGroups, field 2=apiVersions, field 3=resources
+        let mut rule: Vec<u8> = Vec::new();
+        rule.extend_from_slice(&encode_length_delimited(1, b"apps")); // apiGroups
+        rule.extend_from_slice(&encode_length_delimited(2, b"v1")); // apiVersions
+        rule.extend_from_slice(&encode_length_delimited(3, b"deployments")); // resources
 
-        // Build spec: field 1=matchConstraints, field 3=mutations, field 4=failurePolicy
+        // Build RuleWithOperations: field 1=operations, field 2=rule
+        let mut rwo: Vec<u8> = Vec::new();
+        rwo.extend_from_slice(&encode_length_delimited(1, b"CREATE")); // operations
+        rwo.extend_from_slice(&encode_length_delimited(2, &rule)); // rule
+
+        // Build NamedRuleWithOperations: field 2=ruleWithOperations
+        let named_rule = encode_length_delimited(2, &rwo); // ruleWithOperations at field 2
+
+        // Build MatchResources: field 3 = resourceRules
+        let match_constraints = encode_length_delimited(3, &named_rule); // resourceRules at field 3
+
+        // Build MutatingAdmissionPolicySpec:
+        //   field 2=matchConstraints, field 4=mutations, field 5=failurePolicy
         let mut spec: Vec<u8> = Vec::new();
-        spec.extend_from_slice(&encode_length_delimited(1, &match_constraints)); // matchConstraints at field 1
-        spec.extend_from_slice(&encode_length_delimited(3, &mutation)); // mutations at field 3
-        spec.extend_from_slice(&encode_length_delimited(4, b"Fail")); // failurePolicy at field 4
+        spec.extend_from_slice(&encode_length_delimited(2, &match_constraints)); // matchConstraints at field 2
+        spec.extend_from_slice(&encode_length_delimited(4, &mutation)); // mutations at field 4
+        spec.extend_from_slice(&encode_length_delimited(5, b"Fail")); // failurePolicy at field 5
 
         // Build MutatingAdmissionPolicy: field 1=metadata, field 2=spec
         let obj_meta = encode_length_delimited(1, b"test-map-spec"); // ObjectMeta.name
