@@ -1,0 +1,997 @@
+use super::*;
+
+use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use tokio::sync::{broadcast, Mutex};
+
+const RING_CAPACITY: usize = 1000;
+const BROADCAST_CAPACITY: usize = 512;
+
+pub struct SqliteStore {
+    /// Single write connection. Mutex ensures serial access across spawn_blocking calls.
+    /// ALL rusqlite calls must go through spawn_blocking — rusqlite is synchronous.
+    write_conn: Arc<Mutex<Connection>>,
+    /// Read connection (WAL allows concurrent readers).
+    /// For Phase 1 with one vCPU, a single read connection is sufficient.
+    /// For :memory: databases, this is the same connection as write_conn.
+    read_conn: Arc<Mutex<Connection>>,
+    /// Broadcast channel for live events after writes.
+    tx: broadcast::Sender<Arc<InternalEvent>>,
+    /// Ring buffer of recent events for replay.
+    /// std::sync::RwLock so push_event can write synchronously from async context.
+    ring: Arc<RwLock<VecDeque<Arc<InternalEvent>>>>,
+    /// Deletion-only log that persists tombstones independently of the main ring buffer.
+    /// When the main ring compacts (evicts old events), deletion events may be lost, causing
+    /// reconnecting watchers to miss DELETED events for objects deleted before the compaction.
+    /// Keyed by store key: each key maps to its latest DELETED event. This means tombstones
+    /// are never evicted by unrelated writes — a namespace deleted early in a long conformance
+    /// run will still deliver its DELETED event even after 10 000+ subsequent writes.
+    deletion_log: Arc<RwLock<HashMap<String, Arc<InternalEvent>>>>,
+    /// Lowest revision still in the ring buffer (revision of oldest entry + 1).
+    compaction_horizon: Arc<AtomicU64>,
+    /// Revision of the most recently committed write. List reads are compared against
+    /// this: if the read snapshot is older, the list is retried via the write connection
+    /// to guarantee the returned resourceVersion never regresses after a write.
+    last_written_revision: Arc<AtomicU64>,
+}
+
+impl SqliteStore {
+    pub fn new(db_path: &str) -> Result<Self> {
+        let write_conn = open_conn(db_path)?;
+
+        // Run migrations on the write connection.
+        write_conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS objects (
+                key      TEXT    NOT NULL PRIMARY KEY,
+                value    BLOB    NOT NULL,
+                revision INTEGER NOT NULL,
+                ns       TEXT,
+                obj_name TEXT
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
+
+            CREATE INDEX IF NOT EXISTS idx_pods_nodename
+            ON objects (json_extract(value, '$.spec.nodeName'))
+            WHERE key LIKE '/registry/pods/%';
+
+            CREATE INDEX IF NOT EXISTS idx_ns_name ON objects(ns, obj_name) WHERE ns IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_name ON objects(obj_name);
+        ",
+        )?;
+
+        let write_conn = Arc::new(Mutex::new(write_conn));
+
+        // For :memory: databases (tests), share the write connection for reads.
+        // Separate in-memory connections are always distinct databases.
+        // For file databases, open a second connection for concurrent reads under WAL.
+        let read_conn = if db_path == ":memory:" {
+            Arc::clone(&write_conn)
+        } else {
+            Arc::new(Mutex::new(open_conn(db_path)?))
+        };
+
+        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let ring = Arc::new(RwLock::new(VecDeque::with_capacity(RING_CAPACITY + 1)));
+        let deletion_log = Arc::new(RwLock::new(HashMap::new()));
+        let compaction_horizon = Arc::new(AtomicU64::new(0));
+        let last_written_revision = Arc::new(AtomicU64::new(0));
+
+        Ok(Self {
+            write_conn,
+            read_conn,
+            tx,
+            ring,
+            deletion_log,
+            compaction_horizon,
+            last_written_revision,
+        })
+    }
+
+    fn push_event(&self, event: Arc<InternalEvent>) {
+        // Write to ring buffer synchronously using std::sync::RwLock.
+        // This avoids a spawned task race between write and watch replay.
+        {
+            let mut guard = self.ring.write().expect("ring poisoned");
+            guard.push_back(Arc::clone(&event));
+            if guard.len() > RING_CAPACITY {
+                guard.pop_front();
+                // Update compaction horizon to the revision of the oldest remaining entry.
+                if let Some(oldest) = guard.front() {
+                    self.compaction_horizon
+                        .store(oldest.revision, Ordering::Relaxed);
+                }
+            }
+        }
+        // Also persist deletion tombstones to the deletion_log independently of the main ring.
+        // When the main ring compacts and evicts old entries, deletion events can be lost.
+        // The deletion_log maps each store key to its latest DELETED event. Using a HashMap
+        // ensures tombstones are never evicted by unrelated writes: a namespace deleted early
+        // in a long conformance run retains its tombstone regardless of write volume.
+        if event.value.is_none() {
+            let mut guard = self.deletion_log.write().expect("deletion_log poisoned");
+            guard.insert(event.key.clone(), Arc::clone(&event));
+        }
+        // Best-effort broadcast; lagging receivers are dropped automatically.
+        let _ = self.tx.send(event);
+    }
+
+    /// Return the current compaction horizon: the lowest revision no longer in the ring.
+    /// If `from_revision > 0 && from_revision < compaction_horizon()`, the revision is expired.
+    pub fn compaction_horizon(&self) -> u64 {
+        self.compaction_horizon.load(Ordering::Relaxed)
+    }
+
+    /// Directly set the compaction horizon. Intended for tests that simulate compaction
+    /// without needing to overflow the ring buffer (which requires 1000+ writes).
+    pub fn set_compaction_horizon_for_test(&self, horizon: u64) {
+        self.compaction_horizon.store(horizon, Ordering::Relaxed);
+    }
+}
+
+fn open_conn(path: &str) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous  = NORMAL;
+        PRAGMA cache_size   = -8000;
+        PRAGMA busy_timeout = 5000;
+        PRAGMA wal_autocheckpoint = 1000;
+    ",
+    )?;
+    Ok(conn)
+}
+
+/// Stamps metadata.resourceVersion into the stored JSON.
+/// Parses the JSON, sets the field, re-serializes.
+fn stamp_resource_version(value: &Bytes, revision: u64) -> Result<Bytes> {
+    let mut obj: serde_json::Value = serde_json::from_slice(value)?;
+    obj["metadata"]["resourceVersion"] = serde_json::Value::String(revision.to_string());
+    Ok(Bytes::from(serde_json::to_vec(&obj)?))
+}
+
+// Full write procedure — runs inside spawn_blocking.
+// Returns (new_revision, stamped_value, is_create).
+fn put_sync(
+    conn: &Connection,
+    key: &str,
+    value: Bytes,
+    expected_revision: Option<u64>,
+    last_written: &AtomicU64,
+) -> Result<(u64, Bytes, bool)> {
+    // 1. Begin exclusive write transaction.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    // 2. Read current stored revision for optimistic concurrency check.
+    // SQLite stores integers as i64; cast to u64 (revisions fit in i63 range).
+    let stored: Option<u64> = conn
+        .query_row(
+            "SELECT revision FROM objects WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
+        )
+        .optional()?;
+
+    let is_create = stored.is_none();
+
+    // 3. Optimistic concurrency check.
+    match (stored, expected_revision) {
+        (_, None) => {}       // unconditional
+        (None, Some(0)) => {} // create-only, absent: OK
+        (Some(_), Some(0)) => {
+            conn.execute_batch("ROLLBACK")?;
+            return Err(StoreError::AlreadyExists {
+                key: key.to_string(),
+            });
+        }
+        (None, Some(exp)) => {
+            conn.execute_batch("ROLLBACK")?;
+            return Err(StoreError::RevisionMismatch {
+                expected: exp,
+                current: 0,
+            });
+        }
+        (Some(stored_rv), Some(exp)) if stored_rv == exp => {} // match: OK
+        (Some(stored_rv), Some(exp)) => {
+            conn.execute_batch("ROLLBACK")?;
+            return Err(StoreError::RevisionMismatch {
+                expected: exp,
+                current: stored_rv,
+            });
+        }
+    }
+
+    // 4. Increment global revision counter.
+    conn.execute(
+        "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
+        [],
+    )?;
+
+    // 5. Read the new revision.
+    let new_revision: u64 = conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
+        [],
+        |r| r.get::<_, i64>(0).map(|v| v as u64),
+    )?;
+
+    // 6. Stamp metadata.resourceVersion in the JSON value.
+    let stamped_value = stamp_resource_version(&value, new_revision)?;
+
+    // 7. Extract ns and obj_name for indexed columns.
+    let (ns, obj_name) = {
+        let obj: serde_json::Value = serde_json::from_slice(&stamped_value)?;
+        let ns = obj["metadata"]["namespace"].as_str().map(str::to_owned);
+        let obj_name = obj["metadata"]["name"].as_str().map(str::to_owned);
+        (ns, obj_name)
+    };
+
+    // 8. Upsert the object.
+    conn.execute(
+        "INSERT INTO objects (key, value, revision, ns, obj_name) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, revision = excluded.revision,
+         ns = excluded.ns, obj_name = excluded.obj_name",
+        params![
+            key,
+            stamped_value.as_ref(),
+            new_revision as i64,
+            ns,
+            obj_name
+        ],
+    )?;
+
+    conn.execute_batch("COMMIT")?;
+    // Update last_written_revision immediately after COMMIT on this blocking thread.
+    // Doing this here (rather than in the async caller) eliminates the scheduling window
+    // where a concurrent list on the read connection could see the new WAL data but
+    // load a stale last_written_revision from the async task queue — causing the list
+    // guard to miss the stale-read and return an older resourceVersion to the reflector.
+    last_written.fetch_max(new_revision, Ordering::Release);
+    Ok((new_revision, stamped_value, is_create))
+}
+
+fn delete_sync(
+    conn: &Connection,
+    key: &str,
+    expected_revision: Option<u64>,
+    last_written: &AtomicU64,
+) -> Result<u64> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let stored: Option<u64> = conn
+        .query_row(
+            "SELECT revision FROM objects WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
+        )
+        .optional()?;
+
+    // Optimistic concurrency check (same logic as put).
+    match (stored, expected_revision) {
+        (None, _) => {
+            conn.execute_batch("ROLLBACK")?;
+            return Err(StoreError::NotFound {
+                key: key.to_string(),
+            });
+        }
+        (Some(_), None) => {}
+        (Some(_), Some(0)) => {} // 0 means "must exist" for delete (unconditional)
+        (Some(stored_rv), Some(exp)) if stored_rv == exp => {}
+        (Some(stored_rv), Some(exp)) => {
+            conn.execute_batch("ROLLBACK")?;
+            return Err(StoreError::RevisionMismatch {
+                expected: exp,
+                current: stored_rv,
+            });
+        }
+    }
+
+    conn.execute(
+        "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
+        [],
+    )?;
+    let new_revision: u64 = conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
+        [],
+        |r| r.get::<_, i64>(0).map(|v| v as u64),
+    )?;
+
+    conn.execute("DELETE FROM objects WHERE key = ?1", params![key])?;
+    conn.execute_batch("COMMIT")?;
+    // Same rationale as put_sync: update last_written_revision on the blocking thread
+    // immediately after COMMIT so the list guard sees it before any reader can observe
+    // the new WAL state from a concurrent read connection.
+    last_written.fetch_max(new_revision, Ordering::Release);
+    Ok(new_revision)
+}
+
+/// Delete all objects in a namespace atomically.
+///
+/// Returns the keys that were deleted (may be empty) and the new revision
+/// (only meaningful when at least one object was deleted).
+fn delete_namespace_sync(
+    conn: &Connection,
+    namespace: &str,
+    last_written: &AtomicU64,
+) -> Result<(u64, Vec<String>)> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    // Collect all keys in the namespace.
+    let mut stmt = conn.prepare("SELECT key FROM objects WHERE ns = ?1")?;
+    let keys: Vec<String> = stmt
+        .query_map(params![namespace], |r| r.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if keys.is_empty() {
+        conn.execute_batch("ROLLBACK")?;
+        // Return current revision without incrementing (nothing was deleted).
+        let rev: u64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
+                [],
+                |r| r.get::<_, i64>(0).map(|v| v as u64),
+            )
+            .unwrap_or(0);
+        return Ok((rev, vec![]));
+    }
+
+    // Increment global revision once for the batch.
+    conn.execute(
+        "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
+        [],
+    )?;
+    let new_revision: u64 = conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
+        [],
+        |r| r.get::<_, i64>(0).map(|v| v as u64),
+    )?;
+
+    // Delete all objects in the namespace.
+    conn.execute("DELETE FROM objects WHERE ns = ?1", params![namespace])?;
+    conn.execute_batch("COMMIT")?;
+    // Same rationale as put_sync: update immediately after COMMIT on the blocking thread.
+    last_written.fetch_max(new_revision, Ordering::Release);
+    Ok((new_revision, keys))
+}
+
+fn get_sync(conn: &Connection, key: &str) -> Result<Option<StoreObject>> {
+    let result = conn
+        .query_row(
+            "SELECT key, value, revision FROM objects WHERE key = ?1",
+            params![key],
+            |r| {
+                Ok(StoreObject {
+                    key: r.get::<_, String>(0)?,
+                    value: Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                    revision: r.get::<_, i64>(2).map(|v| v as u64)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// Compute the exclusive upper bound for a prefix range scan.
+/// Increments the last byte of the prefix that is not 0xFF.
+/// Returns empty string if no upper bound is possible (all 0xFF — pathological).
+fn prefix_upper_bound(prefix: &str) -> String {
+    let mut bytes = prefix.as_bytes().to_vec();
+    for b in bytes.iter_mut().rev() {
+        if *b < 0xFF {
+            *b += 1;
+            return String::from_utf8(bytes).unwrap();
+        }
+        *b = 0x00;
+    }
+    String::new() // no upper bound needed
+}
+
+fn query_all(conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Result<Vec<StoreObject>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt
+        .query_map(p, |r| {
+            Ok(StoreObject {
+                key: r.get(0)?,
+                value: Bytes::from(r.get::<_, Vec<u8>>(1)?),
+                revision: r.get::<_, i64>(2).map(|v| v as u64)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<ListResponse> {
+    conn.execute_batch("BEGIN DEFERRED")?;
+
+    let upper = prefix_upper_bound(prefix);
+    let ck = opts.continue_key.as_deref().unwrap_or("");
+
+    // When limit is set with no field selector, use SQL-level pagination (fetch limit+1).
+    // When a field selector is present, collect all matching rows then paginate in memory,
+    // because in-memory filtering may discard rows between the cursor and the limit boundary.
+    let (items, continue_key) = match &opts.field_selector {
+        // SQL index fast-path: metadata.name=<value> — uses idx_name index.
+        Some(FieldSelector {
+            field,
+            value,
+            negated: false,
+        }) if field == "metadata.name" => {
+            let raw = if upper.is_empty() {
+                if ck.is_empty() {
+                    query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND obj_name = ?2 ORDER BY key ASC",
+                        &[&prefix, value as &dyn rusqlite::ToSql],
+                    )?
+                } else {
+                    query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND obj_name = ?2 AND key > ?3 ORDER BY key ASC",
+                        &[&prefix, value as &dyn rusqlite::ToSql, &ck],
+                    )?
+                }
+            } else if ck.is_empty() {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 ORDER BY key ASC",
+                    &[&prefix, &upper, value as &dyn rusqlite::ToSql],
+                )?
+            } else {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key >= ?1 AND key < ?2 AND obj_name = ?3 AND key > ?4 ORDER BY key ASC",
+                    &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck],
+                )?
+            };
+            paginate_in_memory(raw, opts.limit)
+        }
+
+        // SQL index fast-path: metadata.namespace=<value> — uses idx_ns index.
+        Some(FieldSelector {
+            field,
+            value,
+            negated: false,
+        }) if field == "metadata.namespace" => {
+            let raw = if upper.is_empty() {
+                if ck.is_empty() {
+                    query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND ns = ?2 ORDER BY key ASC",
+                        &[&prefix, value as &dyn rusqlite::ToSql],
+                    )?
+                } else {
+                    query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects \
+                         WHERE key >= ?1 AND ns = ?2 AND key > ?3 ORDER BY key ASC",
+                        &[&prefix, value as &dyn rusqlite::ToSql, &ck],
+                    )?
+                }
+            } else if ck.is_empty() {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key >= ?1 AND key < ?2 AND ns = ?3 ORDER BY key ASC",
+                    &[&prefix, &upper, value as &dyn rusqlite::ToSql],
+                )?
+            } else {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key >= ?1 AND key < ?2 AND ns = ?3 AND key > ?4 ORDER BY key ASC",
+                    &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck],
+                )?
+            };
+            paginate_in_memory(raw, opts.limit)
+        }
+
+        // Indexed fast-path: spec.nodeName on pods — uses the partial index.
+        Some(FieldSelector {
+            field,
+            value,
+            negated: false,
+        }) if field == "spec.nodeName" && prefix.starts_with("/registry/pods/") => {
+            let like_prefix = format!("{}%", prefix);
+            let raw = if ck.is_empty() {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
+                     ORDER BY key ASC",
+                    &[&like_prefix, value as &dyn rusqlite::ToSql],
+                )?
+            } else {
+                query_all(
+                    conn,
+                    "SELECT key, value, revision FROM objects \
+                     WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
+                     AND key > ?3 ORDER BY key ASC",
+                    &[&like_prefix, value as &dyn rusqlite::ToSql, &ck],
+                )?
+            };
+            paginate_in_memory(raw, opts.limit)
+        }
+
+        // Generic field selector: full scan + in-memory filter + in-memory pagination.
+        Some(FieldSelector {
+            field,
+            value,
+            negated,
+        }) => {
+            let raw = if upper.is_empty() {
+                if ck.is_empty() {
+                    query_all(
+                        conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
+                        &[&prefix],
+                    )?
+                } else {
+                    query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key > ?2 ORDER BY key ASC",
+                        &[&prefix, &ck],
+                    )?
+                }
+            } else if ck.is_empty() {
+                query_all(conn,
+                    "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC",
+                    &[&prefix, &upper],
+                )?
+            } else {
+                query_all(conn,
+                    "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC",
+                    &[&prefix, &upper, &ck],
+                )?
+            };
+
+            // Walk the dot-separated path in the parsed JSON and compare to expected value.
+            let path_parts: Vec<&str> = field.split('.').collect();
+            let filtered: Vec<StoreObject> = raw
+                .into_iter()
+                .filter(|obj| {
+                    let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
+                        return false;
+                    };
+                    let mut cur = &parsed;
+                    let mut absent = false;
+                    for part in &path_parts {
+                        match cur.get(part) {
+                            Some(next) => cur = next,
+                            None => {
+                                absent = true;
+                                break;
+                            }
+                        }
+                    }
+                    // Absent fields are treated as the zero value: "" for strings,
+                    // false for bools. Both compare equal to "false" or "".
+                    let matches = if absent {
+                        value.is_empty() || value == "false"
+                    } else {
+                        match cur {
+                            serde_json::Value::String(s) => s == value,
+                            serde_json::Value::Bool(b) => {
+                                value == if *b { "true" } else { "false" }
+                            }
+                            serde_json::Value::Null => value.is_empty(),
+                            serde_json::Value::Number(n) => value.as_str() == n.to_string(),
+                            _ => false,
+                        }
+                    };
+                    if *negated {
+                        !matches
+                    } else {
+                        matches
+                    }
+                })
+                .collect();
+            paginate_in_memory(filtered, opts.limit)
+        }
+
+        // No field selector: SQL-level pagination when limit is set (fetch limit+1 rows).
+        None => {
+            let fetch_limit = opts.limit.map(|l| (l + 1) as i64);
+            let raw = if upper.is_empty() {
+                match (ck.is_empty(), fetch_limit) {
+                    (true, None)       => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC",
+                        &[&prefix])?,
+                    (true, Some(lim))  => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 ORDER BY key ASC LIMIT ?2",
+                        &[&prefix, &lim])?,
+                    (false, None)      => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key > ?2 ORDER BY key ASC",
+                        &[&prefix, &ck])?,
+                    (false, Some(lim)) => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key > ?2 ORDER BY key ASC LIMIT ?3",
+                        &[&prefix, &ck, &lim])?,
+                }
+            } else {
+                match (ck.is_empty(), fetch_limit) {
+                    (true, None)       => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC",
+                        &[&prefix, &upper])?,
+                    (true, Some(lim))  => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key ASC LIMIT ?3",
+                        &[&prefix, &upper, &lim])?,
+                    (false, None)      => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC",
+                        &[&prefix, &upper, &ck])?,
+                    (false, Some(lim)) => query_all(conn,
+                        "SELECT key, value, revision FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key ASC LIMIT ?4",
+                        &[&prefix, &upper, &ck, &lim])?,
+                }
+            };
+            // If we fetched limit+1 rows, there are more items. Discard the extra row
+            // and use the last returned item's key as the cursor for the next page.
+            if let Some(limit) = opts.limit.map(|l| l as usize) {
+                if raw.len() > limit {
+                    let mut items = raw;
+                    items.pop(); // discard the probe row; it belongs to the next page
+                    let ck = items.last().map(|o| o.key.clone());
+                    (items, ck)
+                } else {
+                    (raw, None)
+                }
+            } else {
+                (raw, None)
+            }
+        }
+    };
+
+    let snapshot_revision: u64 = conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
+        [],
+        |r| r.get::<_, i64>(0).map(|v| v as u64),
+    )?;
+
+    // When there are more pages, count the remaining items so callers can populate
+    // metadata.remainingItemCount in list responses (required by chunking conformance).
+    let remaining_count = match &continue_key {
+        None => None,
+        Some(cursor) => {
+            let upper = prefix_upper_bound(prefix);
+            let count: u64 = if upper.is_empty() {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM objects WHERE key >= ?1 AND key > ?2",
+                    params![prefix, cursor],
+                    |r| r.get::<_, i64>(0).map(|v| v as u64),
+                )?
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM objects WHERE key >= ?1 AND key < ?2 AND key > ?3",
+                    params![prefix, &upper, cursor],
+                    |r| r.get::<_, i64>(0).map(|v| v as u64),
+                )?
+            };
+            Some(count)
+        }
+    };
+
+    conn.execute_batch("COMMIT")?;
+
+    Ok(ListResponse {
+        items,
+        revision: snapshot_revision,
+        continue_key,
+        remaining_count,
+    })
+}
+
+/// Apply in-memory pagination: if limit is set, return at most limit items and
+/// set continue_key to the last item's key if more remain.
+fn paginate_in_memory(
+    mut items: Vec<StoreObject>,
+    limit: Option<u64>,
+) -> (Vec<StoreObject>, Option<String>) {
+    if let Some(limit) = limit {
+        let limit = limit as usize;
+        if items.len() > limit {
+            items.truncate(limit);
+            let ck = items.last().map(|o| o.key.clone());
+            (items, ck)
+        } else {
+            (items, None)
+        }
+    } else {
+        (items, None)
+    }
+}
+
+impl Store for SqliteStore {
+    async fn get(&self, key: &str) -> Result<Option<StoreObject>> {
+        let conn = self.read_conn.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            get_sync(&conn, &key)
+        })
+        .await?
+    }
+
+    async fn list(&self, prefix: &str, opts: ListOptions) -> Result<ListResponse> {
+        let read_conn = self.read_conn.clone();
+        let prefix = prefix.to_string();
+        let prefix2 = prefix.clone();
+        let opts2 = opts.clone();
+        let resp = tokio::task::spawn_blocking(move || {
+            let conn = read_conn.blocking_lock();
+            list_sync(&conn, &prefix, &opts2)
+        })
+        .await??;
+
+        // Guard: if the read snapshot is older than the most recently committed write,
+        // the WAL read connection returned a stale view. Retry via the write connection,
+        // which always reflects the latest committed state. This prevents the KCM informer
+        // from seeing a list resourceVersion that regresses below a revision it already
+        // observed from a watch event.
+        let min_rev = self.last_written_revision.load(Ordering::Acquire);
+        if resp.revision < min_rev {
+            let write_conn = self.write_conn.clone();
+            return tokio::task::spawn_blocking(move || {
+                let conn = write_conn.blocking_lock();
+                list_sync(&conn, &prefix2, &opts)
+            })
+            .await?;
+        }
+
+        Ok(resp)
+    }
+
+    async fn put(&self, key: &str, value: Bytes, expected_revision: Option<u64>) -> Result<u64> {
+        let conn = self.write_conn.clone();
+        let key_str = key.to_string();
+        let last_written = Arc::clone(&self.last_written_revision);
+        let (revision, stamped_value, is_create) = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            put_sync(&conn, &key_str, value, expected_revision, &last_written)
+        })
+        .await??;
+
+        self.push_event(Arc::new(InternalEvent {
+            key: key.to_string(),
+            revision,
+            value: Some(stamped_value),
+            is_create,
+        }));
+
+        Ok(revision)
+    }
+
+    async fn delete(&self, key: &str, expected_revision: Option<u64>) -> Result<u64> {
+        let conn = self.write_conn.clone();
+        let key_str = key.to_string();
+        let last_written = Arc::clone(&self.last_written_revision);
+        let revision = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            delete_sync(&conn, &key_str, expected_revision, &last_written)
+        })
+        .await??;
+
+        self.push_event(Arc::new(InternalEvent {
+            key: key.to_string(),
+            revision,
+            value: None,
+            is_create: false,
+        }));
+
+        Ok(revision)
+    }
+
+    async fn delete_namespace_resources(&self, namespace: &str) -> Result<Vec<String>> {
+        let conn = self.write_conn.clone();
+        let ns = namespace.to_string();
+        let last_written = Arc::clone(&self.last_written_revision);
+        let (revision, keys) = tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            delete_namespace_sync(&conn, &ns, &last_written)
+        })
+        .await??;
+
+        if !keys.is_empty() {
+            for key in &keys {
+                self.push_event(Arc::new(InternalEvent {
+                    key: key.clone(),
+                    revision,
+                    value: None,
+                    is_create: false,
+                }));
+            }
+        }
+
+        Ok(keys)
+    }
+
+    async fn watch(
+        &self,
+        prefix: &str,
+        from_revision: u64,
+    ) -> Result<impl futures_core::Stream<Item = WatchEvent> + Send + 'static> {
+        // Subscribe FIRST to avoid missing events between replay and live.
+        let mut rx = self.tx.subscribe();
+
+        let horizon = self.compaction_horizon.load(Ordering::Relaxed);
+
+        // Collect ring buffer snapshot while holding read lock (std::sync::RwLock — synchronous).
+        let replayed: Vec<Arc<InternalEvent>> = {
+            let guard = self.ring.read().expect("ring poisoned");
+            guard
+                .iter()
+                .filter(|e| e.key.starts_with(prefix) && e.revision > from_revision)
+                .cloned()
+                .collect()
+        };
+
+        let prefix_owned = prefix.to_string();
+        let compaction_horizon_arc = Arc::clone(&self.compaction_horizon);
+        // Captured for lag recovery: allows re-subscribing and re-scanning ring buffer
+        // without terminating the stream when the broadcast channel lags transiently.
+        let tx_clone = self.tx.clone();
+        let ring_arc = Arc::clone(&self.ring);
+        // Captured to replay deletion tombstones that survived compaction of the main ring.
+        let deletion_log_arc = Arc::clone(&self.deletion_log);
+
+        let stream = async_stream::stream! {
+            // Yield compacted event if from_revision is before the horizon.
+            // Before yielding Compacted, emit any deletion tombstones from the deletion_log
+            // that the client missed (revision > from_revision). These are deletions that were
+            // compacted out of the main ring buffer — without replaying them here, the client
+            // would reconnect after a relist and never see the DELETED events, deadlocking any
+            // watcher that waits for a DELETED event for an object deleted in the compaction window.
+            if from_revision > 0 && from_revision < horizon {
+                let tombstones: Vec<Arc<InternalEvent>> = {
+                    let guard = deletion_log_arc.read().expect("deletion_log poisoned");
+                    guard
+                        .values()
+                        .filter(|e| e.key.starts_with(&prefix_owned) && e.revision > from_revision)
+                        .cloned()
+                        .collect()
+                };
+                for tombstone in &tombstones {
+                    yield internal_to_watch(tombstone);
+                }
+                yield WatchEvent::Compacted { requested: from_revision, horizon };
+                return;
+            }
+
+            // Replay historical events from ring buffer.
+            let mut last_replayed = from_revision;
+            for event in &replayed {
+                last_replayed = last_replayed.max(event.revision);
+                yield internal_to_watch(event);
+            }
+
+            // Forward live broadcast events, skipping already-replayed revisions.
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if !event.key.starts_with(&prefix_owned) {
+                            continue;
+                        }
+                        // Deduplicate: skip if already covered by replay or a previous live event.
+                        if event.revision <= last_replayed {
+                            continue;
+                        }
+                        last_replayed = event.revision;
+                        yield internal_to_watch(&event);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_n)) => {
+                        // The broadcast channel dropped messages because this receiver was too slow.
+                        // Attempt recovery: re-subscribe (to capture all future events) then
+                        // re-scan the ring buffer for events missed during the lag.  This avoids
+                        // terminating the stream with a 410 error for a transient slow-consumer
+                        // scenario — which forces the client to relist and re-watch, wasting
+                        // another full round-trip and potentially lagging again.
+                        //
+                        // If the ring buffer has also been compacted past last_replayed, we
+                        // fall back to yielding Compacted so the client can relist from a valid
+                        // revision rather than silently skipping events.
+                        rx = tx_clone.subscribe();
+                        let catchup: Vec<Arc<InternalEvent>> = {
+                            let guard = ring_arc.read().expect("ring poisoned");
+                            guard
+                                .iter()
+                                .filter(|e| {
+                                    e.key.starts_with(&prefix_owned) && e.revision > last_replayed
+                                })
+                                .cloned()
+                                .collect()
+                        };
+                        for event in &catchup {
+                            last_replayed = last_replayed.max(event.revision);
+                            yield internal_to_watch(event);
+                        }
+                        // If the ring buffer was also compacted past last_replayed (events lost
+                        // from both broadcast and ring buffer), signal the gap to the consumer.
+                        // Before signalling Compacted, replay any deletion tombstones from the
+                        // deletion_log that are not already covered by the ring buffer catchup.
+                        // Without this, a namespace deleted during the lag+compaction window
+                        // would never deliver its DELETED event: the client would reconnect after
+                        // a relist, open a new Watch at the current revision, and wait forever.
+                        let current_horizon = compaction_horizon_arc.load(Ordering::Relaxed);
+                        if current_horizon > last_replayed {
+                            // Use from_revision (the watcher's original start) rather than
+                            // last_replayed as the lower bound for deletion_log replay.
+                            //
+                            // Why: after ring catchup, last_replayed is advanced by non-prefix
+                            // events (e.g. pod writes advancing the ring), so last_replayed may
+                            // now be GREATER than the tombstone's revision even though the
+                            // tombstone was never delivered. A deletion at revision D and
+                            // last_replayed at D+500 would be silently skipped with
+                            // `> last_replayed`, causing sonobuoy delete --wait to deadlock.
+                            //
+                            // Using from_revision ensures every deletion since the watcher
+                            // started is delivered before Compacted. The client relists after
+                            // Compacted anyway, so a pre-Compacted duplicate DELETED is harmless.
+                            let tombstones: Vec<Arc<InternalEvent>> = {
+                                let guard = deletion_log_arc.read().expect("deletion_log poisoned");
+                                guard
+                                    .values()
+                                    .filter(|e| {
+                                        e.key.starts_with(&prefix_owned)
+                                            && e.revision > from_revision
+                                    })
+                                    .cloned()
+                                    .collect()
+                            };
+                            for tombstone in &tombstones {
+                                last_replayed = last_replayed.max(tombstone.revision);
+                                yield internal_to_watch(tombstone);
+                            }
+                            yield WatchEvent::Compacted {
+                                requested: last_replayed,
+                                horizon: current_horizon,
+                            };
+                            return;
+                        }
+                        // Ring buffer covered the gap; continue watching from last_replayed.
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Sender dropped; stop stream.
+                        return;
+                    }
+                }
+            }
+        };
+
+        Ok(stream)
+    }
+
+    fn compaction_horizon(&self) -> u64 {
+        self.compaction_horizon.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn internal_to_watch(event: &InternalEvent) -> WatchEvent {
+    match &event.value {
+        Some(value) => {
+            let obj = StoreObject {
+                key: event.key.clone(),
+                value: value.clone(),
+                revision: event.revision,
+            };
+            if event.is_create {
+                WatchEvent::Added(obj)
+            } else {
+                WatchEvent::Modified(obj)
+            }
+        }
+        None => WatchEvent::Deleted {
+            key: event.key.clone(),
+            revision: event.revision,
+        },
+    }
+}
