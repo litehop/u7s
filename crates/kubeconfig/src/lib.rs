@@ -1,4 +1,4 @@
-/// u7s-client-util — shared kubeconfig parsing and TLS client construction.
+/// u7s-kubeconfig — shared kubeconfig parsing and TLS client construction.
 ///
 /// Both u7s-scheduler and u7s-controller-manager need to read a kubeconfig
 /// file, extract TLS credentials, and build a tokio-rustls TlsConnector for
@@ -445,7 +445,7 @@ mod tests {
             .subsec_nanos();
         let tid = std::thread::current().id();
         let path =
-            std::env::temp_dir().join(format!("u7s-client-util-{suffix}-{nanos}-{tid:?}.txt"));
+            std::env::temp_dir().join(format!("u7s-kubeconfig-{suffix}-{nanos}-{tid:?}.txt"));
         std::fs::write(&path, content).expect("write temp file");
         path
     }
@@ -481,7 +481,7 @@ mod tests {
     /// A kubeconfig file that doesn't exist must return an error, not panic.
     #[test]
     fn parse_kubeconfig_missing_file_errors() {
-        let result = parse_kubeconfig("/tmp/u7s-client-util-nonexistent-99999.yaml");
+        let result = parse_kubeconfig("/tmp/u7s-kubeconfig-nonexistent-99999.yaml");
         assert!(
             result.is_err(),
             "missing file must return Err, not panic or Ok"

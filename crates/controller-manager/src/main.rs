@@ -13,13 +13,13 @@ use clap::Parser;
 use hyper::Method;
 use serde_json::Value;
 use tracing::{error, info, warn};
-use u7s_client_util::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 use u7s_controller_manager::{
     build_sa_token_secret, cluster_role_patch_path, cluster_roles_watch_path,
     compute_aggregated_rules, endpoint_slice_controller, endpoint_slice_mirroring_controller,
     namespace_controller, parse_cluster_role_event, parse_sa_added_event, secrets_path,
     token_request_path, ClusterRoleSnapshot,
 };
+use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig, HyperApiClient};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -45,7 +45,7 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP helpers — delegates to HyperApiClient in client-util.
+// HTTP helpers — delegates to HyperApiClient in kubeconfig.
 // ---------------------------------------------------------------------------
 
 async fn http_post_json(

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use tracing::{error, info};
-use u7s_client_util::{build_tls_connector, parse_kubeconfig};
+use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use u7s_scheduler::{bind_pod, needs_scheduling, pick_node, should_schedule, stream_watch_events};
 
 // ---------------------------------------------------------------------------
