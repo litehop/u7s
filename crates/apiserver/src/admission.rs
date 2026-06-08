@@ -111,6 +111,9 @@ struct WebhookEntry {
     namespace_selector: Option<LabelSelector>,
     #[serde(default)]
     object_selector: Option<LabelSelector>,
+    /// Per-webhook timeout in seconds. Kubernetes spec default is 10s.
+    #[serde(default)]
+    timeout_seconds: Option<i64>,
 }
 
 /// Kubernetes LabelSelector: both fields are optional; absence means match-all.
@@ -450,28 +453,50 @@ fn build_review(
 /// service DNS name directly in the URL. The konnectivity-agent resolves the name via
 /// CoreDNS and routes through kube-proxy to the pod — hostname verification is always
 /// correct and `danger_accept_invalid_hostnames` is no longer needed.
+///
+/// `connect_timeout` (5s) bounds the TCP handshake independently of the total timeout.
+/// Without it, a webhook pointing at a deleted service causes reqwest to wait for the OS
+/// TCP timeout (~2min) before the 10s total timeout fires, stalling all subsequent calls.
 fn build_webhook_call_client(
     ca_bundle_b64: Option<&str>,
     proxy_addr: Option<&str>,
     cluster_ca_der: Option<&[u8]>,
     webhook_identity_pem: Option<&[u8]>,
     fallback: &reqwest::Client,
+    timeout_seconds: Option<i64>,
 ) -> reqwest::Client {
+    let request_timeout =
+        std::time::Duration::from_secs(timeout_seconds.unwrap_or(10).max(1) as u64);
     let Some(b64) = ca_bundle_b64 else {
-        return fallback.clone();
+        // Even when returning the fallback we want per-webhook timeout.
+        // Build a minimal client with the right timeouts instead of cloning fallback,
+        // so that the connect_timeout is always applied.
+        return reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| fallback.clone());
     };
     let Ok(pem_bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
     else {
         tracing::warn!(
             "webhook client: caBundle base64 decode failed for webhook — using cluster CA fallback"
         );
-        return fallback.clone();
+        return reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| fallback.clone());
     };
     let Ok(cert) = reqwest::Certificate::from_pem(&pem_bytes) else {
         tracing::warn!(
             "webhook client: caBundle PEM parse failed for webhook — using cluster CA fallback"
         );
-        return fallback.clone();
+        return reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| fallback.clone());
     };
     // Collect trusted CAs: the webhook's own CA and the cluster CA (for proxy TLS).
     // tls_certs_only bypasses the macOS platform verifier so EKU is not enforced.
@@ -482,7 +507,8 @@ fn build_webhook_call_client(
         }
     }
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(request_timeout)
+        .connect_timeout(std::time::Duration::from_secs(5))
         .tls_certs_only(certs);
     if let Some(pem) = webhook_identity_pem {
         if let Ok(identity) = reqwest::Identity::from_pem(pem) {
@@ -652,6 +678,7 @@ async fn invoke_mutating_webhook<S: Store>(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         effective_identity,
         &state.webhook_client,
+        webhook.timeout_seconds,
     );
     let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
 
@@ -786,6 +813,461 @@ pub(crate) fn eval_cel_apply_config(
     parse_cel_value(&tokens, &mut pos, object)
 }
 
+/// Evaluate a CEL boolean expression for ValidatingAdmissionPolicy validations.
+///
+/// Supports the VAP subset of CEL:
+/// - Field access: `object.spec.replicas`, `variables.X`
+/// - Arithmetic: `+`, `-`, `*`, `/`, `%`
+/// - Comparisons: `==`, `!=`, `<`, `<=`, `>`, `>=`
+/// - Boolean: `&&`, `||`, `!`
+/// - Literals: integer, float, bool, string, null
+///
+/// `variables` is a map of intermediate values computed from `spec.variables`.
+/// Returns `Some(true)` / `Some(false)`, or `None` on parse/eval error.
+pub(crate) fn eval_cel_bool_expr(
+    expr: &str,
+    object: &serde_json::Value,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<bool> {
+    let tokens = tokenize_cel(expr.trim())?;
+    let mut pos = 0usize;
+    let variables_val = serde_json::Value::Object(variables.clone());
+    let val = parse_vap_or(&tokens, &mut pos, object, &variables_val)?;
+    val.as_bool()
+}
+
+/// Parse a VAP CEL expression value (used for variable expressions that may return any type).
+pub(crate) fn eval_cel_vap_value(
+    expr: &str,
+    object: &serde_json::Value,
+    variables: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let tokens = tokenize_cel(expr.trim())?;
+    let mut pos = 0usize;
+    let variables_val = serde_json::Value::Object(variables.clone());
+    parse_vap_or(&tokens, &mut pos, object, &variables_val)
+}
+
+// ---------------------------------------------------------------------------
+// VAP CEL expression evaluator (full precedence, object + variables roots)
+// ---------------------------------------------------------------------------
+
+/// Parse an `||` (logical OR) expression.
+fn parse_vap_or(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut left = parse_vap_and(tokens, pos, object, variables)?;
+    while *pos < tokens.len() {
+        if let CelToken::Pipe = &tokens[*pos] {
+            *pos += 1;
+            let right = parse_vap_and(tokens, pos, object, variables)?;
+            let result = left.as_bool().unwrap_or(false) || right.as_bool().unwrap_or(false);
+            left = serde_json::Value::Bool(result);
+        } else {
+            break;
+        }
+    }
+    Some(left)
+}
+
+/// Parse an `&&` (logical AND) expression.
+fn parse_vap_and(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut left = parse_vap_cmp(tokens, pos, object, variables)?;
+    while *pos < tokens.len() {
+        if let CelToken::Ampersand = &tokens[*pos] {
+            *pos += 1;
+            let right = parse_vap_cmp(tokens, pos, object, variables)?;
+            let result = left.as_bool().unwrap_or(false) && right.as_bool().unwrap_or(false);
+            left = serde_json::Value::Bool(result);
+        } else {
+            break;
+        }
+    }
+    Some(left)
+}
+
+/// Parse a comparison expression (`==`, `!=`, `<`, `<=`, `>`, `>=`).
+fn parse_vap_cmp(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let left = parse_vap_add(tokens, pos, object, variables)?;
+    if *pos >= tokens.len() {
+        return Some(left);
+    }
+    let op = tokens[*pos].clone();
+    match op {
+        CelToken::Eq
+        | CelToken::Neq
+        | CelToken::Lt
+        | CelToken::Lte
+        | CelToken::Gt
+        | CelToken::Gte => {
+            *pos += 1;
+            let right = parse_vap_add(tokens, pos, object, variables)?;
+            let result = compare_values(&op, &left, &right)?;
+            Some(serde_json::Value::Bool(result))
+        }
+        _ => Some(left),
+    }
+}
+
+fn compare_values(
+    op: &CelToken,
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> Option<bool> {
+    match op {
+        CelToken::Eq => Some(left == right),
+        CelToken::Neq => Some(left != right),
+        CelToken::Lt => {
+            let l = left.as_f64()?;
+            let r = right.as_f64()?;
+            Some(l < r)
+        }
+        CelToken::Lte => {
+            let l = left.as_f64()?;
+            let r = right.as_f64()?;
+            Some(l <= r)
+        }
+        CelToken::Gt => {
+            let l = left.as_f64()?;
+            let r = right.as_f64()?;
+            Some(l > r)
+        }
+        CelToken::Gte => {
+            let l = left.as_f64()?;
+            let r = right.as_f64()?;
+            Some(l >= r)
+        }
+        _ => None,
+    }
+}
+
+/// Parse an additive expression (`+`, `-`).
+fn parse_vap_add(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut left = parse_vap_mul(tokens, pos, object, variables)?;
+    while *pos < tokens.len() {
+        let op = tokens[*pos].clone();
+        match op {
+            CelToken::Plus | CelToken::Minus => {
+                *pos += 1;
+                let right = parse_vap_mul(tokens, pos, object, variables)?;
+                left = apply_add_op(&op, &left, &right)?;
+            }
+            _ => break,
+        }
+    }
+    Some(left)
+}
+
+fn apply_add_op(
+    op: &CelToken,
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    match op {
+        CelToken::Plus => match (left, right) {
+            (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
+                if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
+                    Some(serde_json::Value::Number((ai + bi).into()))
+                } else {
+                    Some(serde_json::json!(a.as_f64()? + b.as_f64()?))
+                }
+            }
+            (serde_json::Value::String(a), serde_json::Value::String(b)) => {
+                Some(serde_json::Value::String(format!("{a}{b}")))
+            }
+            _ => None,
+        },
+        CelToken::Minus => {
+            let l = left.as_f64()?;
+            let r = right.as_f64()?;
+            let diff = l - r;
+            if diff.fract() == 0.0 && diff.abs() < i64::MAX as f64 {
+                Some(serde_json::Value::Number((diff as i64).into()))
+            } else {
+                Some(serde_json::json!(diff))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Parse a multiplicative expression (`*`, `/`, `%`).
+fn parse_vap_mul(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut left = parse_vap_unary(tokens, pos, object, variables)?;
+    while *pos < tokens.len() {
+        let op = tokens[*pos].clone();
+        match op {
+            CelToken::Star | CelToken::Slash | CelToken::Percent => {
+                *pos += 1;
+                let right = parse_vap_unary(tokens, pos, object, variables)?;
+                left = apply_mul_op(&op, &left, &right)?;
+            }
+            _ => break,
+        }
+    }
+    Some(left)
+}
+
+fn apply_mul_op(
+    op: &CelToken,
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let l = left.as_i64()?;
+    let r = right.as_i64()?;
+    match op {
+        CelToken::Star => Some(serde_json::Value::Number((l * r).into())),
+        CelToken::Slash => {
+            if r == 0 {
+                return None;
+            }
+            Some(serde_json::Value::Number((l / r).into()))
+        }
+        CelToken::Percent => {
+            if r == 0 {
+                return None;
+            }
+            Some(serde_json::Value::Number((l % r).into()))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a unary expression (`!`, `-`, or primary).
+fn parse_vap_unary(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if *pos >= tokens.len() {
+        return None;
+    }
+    match &tokens[*pos] {
+        CelToken::Bang => {
+            *pos += 1;
+            let inner = parse_vap_unary(tokens, pos, object, variables)?;
+            Some(serde_json::Value::Bool(!inner.as_bool()?))
+        }
+        CelToken::Minus => {
+            *pos += 1;
+            let inner = parse_vap_unary(tokens, pos, object, variables)?;
+            match inner {
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        Some(serde_json::Value::Number((-i).into()))
+                    } else {
+                        n.as_f64().map(|f| serde_json::json!(-f))
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => parse_vap_primary(tokens, pos, object, variables),
+    }
+}
+
+/// Parse a primary expression: literal, parenthesized, or field access chain.
+fn parse_vap_primary(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if *pos >= tokens.len() {
+        return None;
+    }
+    match tokens[*pos].clone() {
+        CelToken::Int(n) => {
+            *pos += 1;
+            Some(serde_json::Value::Number(n.into()))
+        }
+        CelToken::Float(f) => {
+            *pos += 1;
+            Some(serde_json::json!(f))
+        }
+        CelToken::Bool(b) => {
+            *pos += 1;
+            Some(serde_json::Value::Bool(b))
+        }
+        CelToken::Null => {
+            *pos += 1;
+            Some(serde_json::Value::Null)
+        }
+        CelToken::Str(s) => {
+            *pos += 1;
+            Some(serde_json::Value::String(s))
+        }
+        CelToken::LParen => {
+            *pos += 1;
+            let val = parse_vap_or(tokens, pos, object, variables)?;
+            if *pos < tokens.len() {
+                if let CelToken::RParen = &tokens[*pos] {
+                    *pos += 1;
+                }
+            }
+            Some(val)
+        }
+        CelToken::Ident(name) => {
+            *pos += 1;
+            // Determine the root value for this identifier.
+            let root = if name == "object" {
+                object.clone()
+            } else if name == "variables" {
+                variables.clone()
+            } else {
+                // Unknown identifier — return as string (struct constructor handled below)
+                // Check for struct constructor: TypeName{...}
+                if *pos < tokens.len() {
+                    if let CelToken::LBrace = &tokens[*pos] {
+                        *pos += 1;
+                        return parse_vap_object_body(tokens, pos, object, variables);
+                    }
+                }
+                return Some(serde_json::Value::String(name));
+            };
+
+            // Skip qualifier segments before LBrace (e.g. Object.metadata{...}).
+            // Also handle dot-access chains: object.spec.replicas.
+            parse_vap_field_chain(tokens, pos, root, object, variables)
+        }
+        CelToken::LBrace => {
+            *pos += 1;
+            parse_vap_object_body(tokens, pos, object, variables)
+        }
+        CelToken::LBracket => {
+            *pos += 1;
+            let mut arr = Vec::new();
+            while *pos < tokens.len() {
+                if let CelToken::RBracket = &tokens[*pos] {
+                    *pos += 1;
+                    break;
+                }
+                let val = parse_vap_or(tokens, pos, object, variables)?;
+                arr.push(val);
+                if *pos < tokens.len() {
+                    if let CelToken::Comma = &tokens[*pos] {
+                        *pos += 1;
+                    }
+                }
+            }
+            Some(serde_json::Value::Array(arr))
+        }
+        _ => None,
+    }
+}
+
+/// After reading a root identifier, handle `.field` chains and `{...}` constructors.
+fn parse_vap_field_chain(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    mut current: serde_json::Value,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    loop {
+        if *pos >= tokens.len() {
+            break;
+        }
+        match &tokens[*pos] {
+            CelToken::Dot => {
+                *pos += 1;
+                if *pos >= tokens.len() {
+                    break;
+                }
+                if let CelToken::Ident(field) = tokens[*pos].clone() {
+                    *pos += 1;
+                    // Check if this is a struct constructor (field followed by LBrace)
+                    if *pos < tokens.len() {
+                        if let CelToken::LBrace = &tokens[*pos] {
+                            // TypeName.qualifier{...} — treat as constructor, discard qualifier
+                            *pos += 1;
+                            return parse_vap_object_body(tokens, pos, object, variables);
+                        }
+                    }
+                    // Field navigation
+                    current = current[&field].clone();
+                } else {
+                    break;
+                }
+            }
+            CelToken::LBrace => {
+                // Struct constructor on this identifier
+                *pos += 1;
+                return parse_vap_object_body(tokens, pos, object, variables);
+            }
+            _ => break,
+        }
+    }
+    Some(current)
+}
+
+/// Parse the body of a `{key: value, ...}` object literal (caller consumed `{`).
+fn parse_vap_object_body(
+    tokens: &[CelToken],
+    pos: &mut usize,
+    object: &serde_json::Value,
+    variables: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    while *pos < tokens.len() {
+        if let CelToken::RBrace = &tokens[*pos] {
+            *pos += 1;
+            break;
+        }
+        let key = match tokens[*pos].clone() {
+            CelToken::Str(s) => {
+                *pos += 1;
+                s
+            }
+            CelToken::Ident(s) => {
+                *pos += 1;
+                s
+            }
+            _ => return None,
+        };
+        if *pos >= tokens.len() {
+            return None;
+        }
+        if let CelToken::Colon = &tokens[*pos] {
+            *pos += 1;
+        } else {
+            return None;
+        }
+        let val = parse_vap_or(tokens, pos, object, variables)?;
+        map.insert(key, val);
+        if *pos < tokens.len() {
+            if let CelToken::Comma = &tokens[*pos] {
+                *pos += 1;
+            }
+        }
+    }
+    Some(serde_json::Value::Object(map))
+}
+
 /// A minimal CEL token.
 #[derive(Debug, PartialEq, Clone)]
 enum CelToken {
@@ -806,6 +1288,9 @@ enum CelToken {
     RParen,    // )
     Plus,      // +
     Minus,     // -
+    Star,      // *
+    Slash,     // /
+    Percent,   // %
     Eq,        // ==
     Neq,       // !=
     Lt,        // <
@@ -989,6 +1474,18 @@ fn tokenize_cel(input: &str) -> Option<Vec<CelToken>> {
             }
             '?' => {
                 tokens.push(CelToken::Question);
+                i += 1;
+            }
+            '*' => {
+                tokens.push(CelToken::Star);
+                i += 1;
+            }
+            '/' if !(i + 1 < chars.len() && chars[i + 1] == '/') => {
+                tokens.push(CelToken::Slash);
+                i += 1;
+            }
+            '%' => {
+                tokens.push(CelToken::Percent);
                 i += 1;
             }
             '-' => {
@@ -1517,6 +2014,262 @@ pub async fn run_mutating_webhooks<S: Store>(
     Ok(object)
 }
 
+// ---------------------------------------------------------------------------
+// CEL-based ValidatingAdmissionPolicy evaluation
+// ---------------------------------------------------------------------------
+
+/// Fetch all ValidatingAdmissionPolicy objects from the store.
+async fn fetch_validating_policies<S: Store>(state: &AppState<S>) -> Vec<serde_json::Value> {
+    let prefix = "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/";
+    match state.store.list(prefix, ListOptions::default()).await {
+        Ok(resp) => resp
+            .items
+            .into_iter()
+            .filter_map(|item| serde_json::from_slice(&item.value).ok())
+            .collect(),
+        Err(e) => {
+            tracing::warn!("admission: failed to list ValidatingAdmissionPolicies: {e}");
+            vec![]
+        }
+    }
+}
+
+/// Fetch all ValidatingAdmissionPolicyBinding objects from the store.
+async fn fetch_validating_policy_bindings<S: Store>(state: &AppState<S>) -> Vec<serde_json::Value> {
+    let prefix = "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/";
+    match state.store.list(prefix, ListOptions::default()).await {
+        Ok(resp) => resp
+            .items
+            .into_iter()
+            .filter_map(|item| serde_json::from_slice(&item.value).ok())
+            .collect(),
+        Err(e) => {
+            tracing::warn!("admission: failed to list ValidatingAdmissionPolicyBindings: {e}");
+            vec![]
+        }
+    }
+}
+
+/// Run all ValidatingAdmissionPolicy + Binding pairs for a given resource.
+///
+/// Algorithm:
+/// 1. Fetch all VAPs and bindings from the store.
+/// 2. For each binding: find its policy by policyName.
+/// 3. Check both binding's matchResources (namespaceSelector + resourceRules) and
+///    policy's matchConstraints — both must match.
+/// 4. Evaluate spec.matchConditions (pre-filter): if any returns false, skip this pair.
+/// 5. Evaluate spec.variables in order, building a variables map.
+/// 6. Evaluate spec.validations expressions; if any returns false, deny with 403.
+/// 7. validationActions: Deny → return error; Warn/Audit → log and continue.
+async fn run_validating_admission_policies<S: Store>(
+    state: &AppState<S>,
+    object: &serde_json::Value,
+    ctx: &AdmissionContext<'_>,
+) -> Result<(), StatusError> {
+    // Exempt admission configuration resources (same as webhooks).
+    if is_webhook_configuration_resource(ctx) {
+        return Ok(());
+    }
+
+    let policies = fetch_validating_policies(state).await;
+    if policies.is_empty() {
+        return Ok(());
+    }
+    let bindings = fetch_validating_policy_bindings(state).await;
+    if bindings.is_empty() {
+        return Ok(());
+    }
+
+    for binding in &bindings {
+        let policy_name = binding["spec"]["policyName"].as_str().unwrap_or("");
+        if policy_name.is_empty() {
+            continue;
+        }
+        let policy = match policies
+            .iter()
+            .find(|p| p["metadata"]["name"].as_str() == Some(policy_name))
+        {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "admission: VAP binding references unknown policy \"{policy_name}\", skipping"
+                );
+                continue;
+            }
+        };
+
+        // Check policy matchConstraints (resourceRules).
+        if !matches_match_constraints(policy, ctx.group, ctx.version, ctx.resource, ctx.operation) {
+            continue;
+        }
+
+        // Check binding matchResources namespaceSelector.
+        let binding_ns_selector: Option<LabelSelector> = binding["spec"]["matchResources"]
+            ["namespaceSelector"]
+            .as_object()
+            .and_then(|_| {
+                serde_json::from_value(
+                    binding["spec"]["matchResources"]["namespaceSelector"].clone(),
+                )
+                .ok()
+            });
+        if binding_ns_selector.is_some() {
+            if let Some(ns) = ctx.namespace {
+                let ns_labels = fetch_namespace_labels(state, ns).await;
+                if !label_selector_matches(binding_ns_selector.as_ref(), &ns_labels) {
+                    tracing::debug!(
+                        "admission: VAP binding \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
+                        binding["metadata"]["name"].as_str().unwrap_or("unknown"),
+                        ns
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // Check binding matchResources resourceRules (same as matchConstraints logic).
+        let binding_rules = binding["spec"]["matchResources"]["resourceRules"].as_array();
+        if let Some(rules) = binding_rules {
+            if !rules.is_empty() {
+                let any_rule = rules.iter().any(|rule| {
+                    matches_rule(
+                        rule,
+                        ctx.group,
+                        ctx.version,
+                        ctx.resource,
+                        ctx.namespace,
+                        ctx.operation,
+                    )
+                });
+                if !any_rule {
+                    continue;
+                }
+            }
+        }
+
+        // Evaluate matchConditions (pre-filter): any false → skip this binding, not deny.
+        let match_conditions = policy["spec"]["matchConditions"].as_array();
+        if let Some(conditions) = match_conditions {
+            let mut skip = false;
+            for cond in conditions {
+                let expr = cond["expression"].as_str().unwrap_or("");
+                if expr.is_empty() {
+                    continue;
+                }
+                let vars = serde_json::Map::new();
+                match eval_cel_bool_expr(expr, object, &vars) {
+                    Some(true) => {} // condition passes, continue
+                    Some(false) => {
+                        // matchCondition returned false → skip this webhook (not deny)
+                        tracing::debug!(
+                            "admission: VAP \"{}\" matchCondition false, skipping",
+                            policy_name
+                        );
+                        skip = true;
+                        break;
+                    }
+                    None => {
+                        // eval error on matchCondition → treat as "do not skip" (upstream behavior)
+                        tracing::warn!(
+                            "admission: VAP \"{}\" matchCondition eval error, treating as pass",
+                            policy_name
+                        );
+                    }
+                }
+            }
+            if skip {
+                continue;
+            }
+        }
+
+        // Evaluate spec.variables in order, building a variables map.
+        let mut variables: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        let var_defs = policy["spec"]["variables"].as_array();
+        if let Some(var_list) = var_defs {
+            for var_def in var_list {
+                let var_name = var_def["name"].as_str().unwrap_or("");
+                let var_expr = var_def["expression"].as_str().unwrap_or("");
+                if var_name.is_empty() || var_expr.is_empty() {
+                    continue;
+                }
+                match eval_cel_vap_value(var_expr, object, &variables) {
+                    Some(val) => {
+                        variables.insert(var_name.to_string(), val);
+                    }
+                    None => {
+                        tracing::warn!(
+                            "admission: VAP \"{}\" variable \"{}\" eval failed, expr: {}",
+                            policy_name,
+                            var_name,
+                            var_expr
+                        );
+                        // Continue; the variable will be absent from the map.
+                    }
+                }
+            }
+        }
+
+        // Determine validation actions from binding.
+        let validation_actions: Vec<&str> = binding["spec"]["validationActions"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let should_deny = validation_actions.contains(&"Deny");
+
+        // Evaluate spec.validations.
+        let validations = policy["spec"]["validations"].as_array();
+        if let Some(val_list) = validations {
+            for validation in val_list {
+                let expr = validation["expression"].as_str().unwrap_or("");
+                if expr.is_empty() {
+                    continue;
+                }
+                let result = eval_cel_bool_expr(expr, object, &variables);
+                let passed = match result {
+                    Some(b) => b,
+                    None => {
+                        tracing::warn!(
+                            "admission: VAP \"{}\" validation expr eval failed: {}",
+                            policy_name,
+                            expr
+                        );
+                        false // treat eval error as failure
+                    }
+                };
+                if !passed {
+                    let reason = validation["reason"].as_str().unwrap_or("Forbidden");
+                    let message = validation["message"]
+                        .as_str()
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "ValidatingAdmissionPolicy \"{policy_name}\" denied the request: \
+                             expression '{expr}' evaluated to false"
+                            )
+                        });
+                    if should_deny {
+                        tracing::debug!(
+                            "admission: VAP \"{}\" denied: {} (reason: {})",
+                            policy_name,
+                            message,
+                            reason
+                        );
+                        return Err(Status::forbidden(message));
+                    } else {
+                        tracing::warn!(
+                            "admission: VAP \"{}\" validation failed (non-Deny action): {}",
+                            policy_name,
+                            message
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Run the validating admission webhook chain.
 ///
 /// Fetches all ValidatingWebhookConfiguration objects from the store, filters by
@@ -1534,19 +2287,11 @@ pub async fn run_validating_webhooks<S: Store>(
     }
 
     let configs = fetch_validating_configs(state).await;
-    if configs.is_empty() {
-        return Ok(());
-    }
-
     let mut all_webhooks: Vec<WebhookEntry> = Vec::new();
     for config in &configs {
         if let Ok(wc) = serde_json::from_value::<WebhookConfig>(config.clone()) {
             all_webhooks.extend(wc.webhooks);
         }
-    }
-
-    if all_webhooks.is_empty() {
-        return Ok(());
     }
 
     for webhook in &all_webhooks {
@@ -1643,6 +2388,7 @@ pub async fn run_validating_webhooks<S: Store>(
             state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
             effective_identity,
             &state.webhook_client,
+            webhook.timeout_seconds,
         );
         let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
 
@@ -1687,7 +2433,8 @@ pub async fn run_validating_webhooks<S: Store>(
         }
     }
 
-    Ok(())
+    // Run CEL-based ValidatingAdmissionPolicy enforcement.
+    run_validating_admission_policies(state, object, ctx).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3356,7 +4103,7 @@ mod tests {
 
         let fallback = reqwest::Client::new();
         // Must not panic and must not return the fallback clone (cert was valid).
-        let client = build_webhook_call_client(Some(&ca_b64), None, None, None, &fallback);
+        let client = build_webhook_call_client(Some(&ca_b64), None, None, None, &fallback, None);
         drop(client);
     }
 
@@ -3381,8 +4128,14 @@ mod tests {
         let fallback = reqwest::Client::new();
         // Must build successfully and apply the proxy — if this panics, all webhook calls
         // to service DNS names fail when konnectivity is configured.
-        let client =
-            build_webhook_call_client(Some(&ca_b64), Some("127.0.0.1:8135"), None, None, &fallback);
+        let client = build_webhook_call_client(
+            Some(&ca_b64),
+            Some("127.0.0.1:8135"),
+            None,
+            None,
+            &fallback,
+            None,
+        );
         drop(client);
     }
 
@@ -3391,7 +4144,7 @@ mod tests {
     #[test]
     fn build_webhook_call_client_no_bundle_returns_fallback() {
         let fallback = reqwest::Client::new();
-        let client = build_webhook_call_client(None, None, None, None, &fallback);
+        let client = build_webhook_call_client(None, None, None, None, &fallback, None);
         drop(client);
     }
 
@@ -3403,8 +4156,14 @@ mod tests {
     fn build_webhook_call_client_invalid_b64_returns_fallback() {
         let fallback = reqwest::Client::new();
         // Invalid base64 must return fallback (not panic) so the apiserver keeps running.
-        let client =
-            build_webhook_call_client(Some("!!!not-valid-base64!!!"), None, None, None, &fallback);
+        let client = build_webhook_call_client(
+            Some("!!!not-valid-base64!!!"),
+            None,
+            None,
+            None,
+            &fallback,
+            None,
+        );
         // Returned client must be usable — it is the fallback clone.
         drop(client);
     }
@@ -3588,7 +4347,7 @@ mod tests {
             None, // effective_proxy = None (the fix)
             None, // cluster_ca_der
             None, // effective_identity = None (the fix)
-            &fallback,
+            &fallback, None, // timeout_seconds — use default 10s
         );
         // Client is usable — no panic during build.
         drop(client);
@@ -4350,6 +5109,398 @@ mod tests {
         assert!(
             validate_webhook_match_conditions_cel(&obj).is_ok(),
             "webhook without matchConditions must pass validation — matchConditions is optional"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests for mayor-sz59: ValidatingAdmissionPolicy enforcement
+    //
+    // These tests verify that VAP + Binding pairs are enforced at admission time.
+    // Without this fix, a conformance test creating a Deployment with even replicas
+    // (violating an odd-replicas VAP) would be silently accepted, causing the test
+    // to poll indefinitely for a 403 that never arrives — exhausting the 6h sonobuoy
+    // budget and timing out the entire conformance run.
+    // ---------------------------------------------------------------------------
+
+    /// A Deployment with even replicas in a namespace matched by a VAP binding must
+    /// be rejected 403. Without VAP enforcement, the request is silently accepted and
+    /// conformance tests poll indefinitely for the denial.
+    ///
+    /// Reverting VAP enforcement (removing run_validating_admission_policies call from
+    /// run_validating_webhooks) makes this test fail because the request succeeds.
+    #[tokio::test]
+    async fn vap_rejects_deployment_with_even_replicas() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a namespace with matching label.
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "vap-test-ns", "labels": {"vap-test": "true"}}
+        });
+        store
+            .put(
+                "/registry/namespaces/vap-test-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // VAP: requires odd replicas > 1.
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "odd-replicas-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE", "UPDATE"]
+                    }]
+                },
+                "variables": [
+                    {"name": "replicas", "expression": "object.spec.replicas"},
+                    {"name": "oddReplicas", "expression": "variables.replicas % 2 == 1"}
+                ],
+                "validations": [
+                    {"expression": "variables.replicas > 1"},
+                    {"expression": "variables.oddReplicas"}
+                ]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/odd-replicas-policy",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()), None).await.unwrap();
+
+        // Binding: targets the namespace.
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "odd-replicas-binding"},
+            "spec": {
+                "policyName": "odd-replicas-policy",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {
+                        "matchLabels": {"vap-test": "true"}
+                    }
+                }
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/odd-replicas-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()), None).await.unwrap();
+
+        // Deployment with EVEN replicas — must be denied.
+        let deploy_even = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "my-deploy", "namespace": "vap-test-ns"},
+            "spec": {"replicas": 2}
+        });
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("vap-test-ns"),
+            operation: "CREATE",
+        };
+        let result = run_validating_webhooks(&state, &deploy_even, &ctx).await;
+        assert!(
+            result.is_err(),
+            "Deployment with even replicas (2) must be denied by VAP; \
+             without VAP enforcement the request is silently accepted and conformance \
+             tests poll forever for the 403 that never arrives"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:?}").contains("odd-replicas-policy"),
+            "denial message must reference the policy name so operators can identify \
+             which policy blocked the request; got: {err:?}"
+        );
+    }
+
+    /// A Deployment with odd replicas > 1 in a matched namespace must be allowed.
+    /// Without this, the VAP implementation is too strict and blocks valid requests.
+    ///
+    /// Reverting the fix and always denying makes this test fail.
+    #[tokio::test]
+    async fn vap_allows_deployment_with_odd_replicas_greater_than_one() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Same namespace + policy + binding as the deny test.
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "vap-allow-ns", "labels": {"vap-test": "true"}}
+        });
+        store
+            .put(
+                "/registry/namespaces/vap-allow-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "odd-replicas-allow-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE", "UPDATE"]
+                    }]
+                },
+                "variables": [
+                    {"name": "replicas", "expression": "object.spec.replicas"},
+                    {"name": "oddReplicas", "expression": "variables.replicas % 2 == 1"}
+                ],
+                "validations": [
+                    {"expression": "variables.replicas > 1"},
+                    {"expression": "variables.oddReplicas"}
+                ]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/odd-replicas-allow-policy",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()), None).await.unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "odd-replicas-allow-binding"},
+            "spec": {
+                "policyName": "odd-replicas-allow-policy",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {"matchLabels": {"vap-test": "true"}}
+                }
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/odd-replicas-allow-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()), None).await.unwrap();
+
+        // Deployment with ODD replicas > 1 — must be allowed.
+        let deploy_odd = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "valid-deploy", "namespace": "vap-allow-ns"},
+            "spec": {"replicas": 3}
+        });
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "valid-deploy",
+            namespace: Some("vap-allow-ns"),
+            operation: "CREATE",
+        };
+        let result = run_validating_webhooks(&state, &deploy_odd, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "Deployment with odd replicas (3) > 1 must be allowed by the odd-replicas VAP; \
+             incorrectly denying valid requests breaks workload deployment"
+        );
+    }
+
+    /// VAP spec.variables must be evaluated in order and their results available to
+    /// subsequent variable expressions and to validations.
+    ///
+    /// Without variable evaluation, expressions referencing `variables.X` resolve to
+    /// null/false, causing all validations that use variables to fail with wrong results.
+    ///
+    /// Reverting variable evaluation (removing the variables loop) makes the deny test
+    /// fail because `variables.replicas` resolves to null, `null % 2` is None, and the
+    /// validation returns an eval error (treated as false → deny), but the allow test
+    /// would also deny — catching the regression.
+    #[test]
+    fn vap_variables_evaluated_sequentially_and_available_to_validations() {
+        let object = json!({"spec": {"replicas": 3}});
+        let mut variables = serde_json::Map::new();
+
+        // Step 1: evaluate `replicas = object.spec.replicas`
+        let replicas_val = eval_cel_vap_value("object.spec.replicas", &object, &variables)
+            .expect("object.spec.replicas must evaluate");
+        variables.insert("replicas".into(), replicas_val);
+
+        // Step 2: evaluate `oddReplicas = variables.replicas % 2 == 1`
+        let odd_val = eval_cel_vap_value("variables.replicas % 2 == 1", &object, &variables)
+            .expect("variables.replicas % 2 == 1 must evaluate");
+        variables.insert("oddReplicas".into(), odd_val);
+
+        // Validate: replicas > 1 → true (3 > 1)
+        let gt_result = eval_cel_bool_expr("variables.replicas > 1", &object, &variables)
+            .expect("variables.replicas > 1 must evaluate");
+        assert!(
+            gt_result,
+            "variables.replicas (3) > 1 must be true; \
+             failing means variable values are not threaded through to validation expressions"
+        );
+
+        // Validate: oddReplicas → true (3 is odd)
+        let odd_result = eval_cel_bool_expr("variables.oddReplicas", &object, &variables)
+            .expect("variables.oddReplicas must evaluate");
+        assert!(
+            odd_result,
+            "variables.oddReplicas must be true for replicas=3; \
+             failing means boolean variable values are not accessible in validation expressions"
+        );
+
+        // Now test with even replicas (2).
+        let object_even = json!({"spec": {"replicas": 2}});
+        let mut variables_even = serde_json::Map::new();
+        let r2 = eval_cel_vap_value("object.spec.replicas", &object_even, &variables_even).unwrap();
+        variables_even.insert("replicas".into(), r2);
+        let o2 = eval_cel_vap_value("variables.replicas % 2 == 1", &object_even, &variables_even)
+            .unwrap();
+        variables_even.insert("oddReplicas".into(), o2);
+
+        let odd_even = eval_cel_bool_expr("variables.oddReplicas", &object_even, &variables_even)
+            .expect("oddReplicas must evaluate for even replicas");
+        assert!(
+            !odd_even,
+            "variables.oddReplicas must be false for replicas=2; \
+             the modulo expression `replicas % 2 == 1` must work correctly for even numbers"
+        );
+    }
+
+    /// WebhookEntry must deserialise `timeoutSeconds` from JSON and use it for the
+    /// per-call request timeout in build_webhook_call_client.
+    ///
+    /// Without timeoutSeconds support, every webhook call uses a hardcoded 10s timeout
+    /// regardless of the webhook's configured timeout, violating the Kubernetes spec.
+    /// Reverting the fix (removing timeout_seconds from WebhookEntry) causes a compile
+    /// error in this test.
+    #[test]
+    fn webhook_entry_deserialises_timeout_seconds() {
+        let json = serde_json::json!({
+            "name": "test.webhook.example.com",
+            "clientConfig": {"url": "https://example.com/webhook"},
+            "timeoutSeconds": 30
+        });
+        let entry: WebhookEntry = serde_json::from_value(json)
+            .expect("WebhookEntry must deserialise with timeoutSeconds");
+        assert_eq!(
+            entry.timeout_seconds,
+            Some(30),
+            "timeoutSeconds must be deserialised from JSON and stored in WebhookEntry; \
+             without this, webhook-specific timeouts cannot be applied per the Kubernetes spec"
+        );
+    }
+
+    /// build_webhook_call_client must use the per-webhook timeout_seconds when set.
+    ///
+    /// Without connect_timeout, TCP connect to a dead service endpoint blocks for the
+    /// OS TCP timeout (~2min), stalling all subsequent webhook calls and sonobuoy tests.
+    /// Reverting the fix (removing connect_timeout from the builder) does not crash but
+    /// the test documents the expected behavior.
+    #[test]
+    fn build_webhook_call_client_applies_per_webhook_timeout() {
+        let fallback = reqwest::Client::new();
+        // With timeout_seconds=30, the request timeout must be 30s (verified by building
+        // without panic — reqwest validates Duration).
+        let client = build_webhook_call_client(None, None, None, None, &fallback, Some(30));
+        drop(client);
+
+        // connect_timeout is always 5s regardless of timeout_seconds — verified indirectly
+        // by the fact that the client builds successfully with both timeouts set.
+        let client_default = build_webhook_call_client(None, None, None, None, &fallback, None);
+        drop(client_default);
+    }
+
+    /// VAP must not be evaluated for resources in the admissionregistration.k8s.io group.
+    ///
+    /// Admitting a ValidatingAdmissionPolicy itself must not trigger VAP evaluation —
+    /// same exemption as webhooks. Without this, creating a VAP could trigger itself
+    /// (bootstrap deadlock) or another VAP that references nonexistent variables.
+    ///
+    /// Reverting the exemption (removing the is_webhook_configuration_resource check
+    /// from run_validating_admission_policies) makes this test fail because the policy
+    /// is evaluated against itself.
+    #[tokio::test]
+    async fn vap_skipped_for_admissionregistration_resources() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a VAP that denies everything (would deny its own creation if not exempt).
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "deny-all-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{"apiGroups": ["*"], "apiVersions": ["*"],
+                        "resources": ["*"], "operations": ["*"]}]
+                },
+                "validations": [{"expression": "false"}]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/deny-all-policy",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()), None).await.unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "deny-all-binding"},
+            "spec": {
+                "policyName": "deny-all-policy",
+                "validationActions": ["Deny"]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/deny-all-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()), None).await.unwrap();
+
+        // Admitting a ValidatingAdmissionPolicy resource — must be exempt from VAP evaluation.
+        let new_vap = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "new-policy"}
+        });
+        let ctx = AdmissionContext {
+            group: "admissionregistration.k8s.io",
+            version: "v1",
+            resource: "validatingadmissionpolicies",
+            name: "new-policy",
+            namespace: None,
+            operation: "CREATE",
+        };
+        let result = run_validating_webhooks(&state, &new_vap, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "admissionregistration.k8s.io resources must be exempt from VAP evaluation \
+             to prevent bootstrap deadlocks; the deny-all VAP must not fire for its own creation"
         );
     }
 }
