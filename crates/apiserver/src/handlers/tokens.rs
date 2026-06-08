@@ -70,17 +70,12 @@ pub(crate) const MIN_JWT_LIFETIME_SECS: u64 = 86_400; // 24 h
 
 #[derive(Serialize)]
 struct KubernetesClaims {
-    /// Unique token ID used for revocation. Checked against AppState::revoked_jtis on every request.
     jti: String,
     iss: String,
     sub: String,
     aud: Vec<String>,
     exp: u64,
     iat: u64,
-    /// Unique token ID — enables per-token revocation and replay detection.
-    /// Each minted token gets a fresh UUID v4 so even two tokens for the same
-    /// SA issued at the same second are distinct.
-    jti: String,
     #[serde(rename = "kubernetes.io")]
     kubernetes_io: KubernetesClaimsExt,
 }
@@ -200,7 +195,6 @@ pub async fn create_token<S: Store>(
         aud: spec.audiences,
         exp: jwt_exp,
         iat: now,
-        jti: uuid::Uuid::new_v4().to_string(),
         kubernetes_io: KubernetesClaimsExt {
             namespace: ns.as_str().to_owned(),
             serviceaccount: SaRef {
@@ -312,13 +306,12 @@ mod tests {
     #[test]
     fn claims_serialize_field_names() {
         let claims = KubernetesClaims {
-            jti: "test-jti-1".to_owned(),
+            jti: "test-jti-value".to_owned(),
             iss: "https://kubernetes.default.svc".to_owned(),
             sub: "system:serviceaccount:default:my-sa".to_owned(),
             aud: vec!["https://kubernetes.default.svc".to_owned()],
             exp: 1_704_070_800,
             iat: 1_704_067_200,
-            jti: "test-jti-value".to_owned(),
             kubernetes_io: KubernetesClaimsExt {
                 namespace: "default".to_owned(),
                 serviceaccount: SaRef {
@@ -351,13 +344,12 @@ mod tests {
     #[test]
     fn claims_serialize_sa_uid() {
         let claims = KubernetesClaims {
-            jti: "test-jti-2".to_owned(),
+            jti: "test-jti".to_owned(),
             iss: "https://kubernetes.default.svc".to_owned(),
             sub: "system:serviceaccount:kube-system:coredns".to_owned(),
             aud: vec!["https://kubernetes.default.svc".to_owned()],
             exp: 1_704_070_800,
             iat: 1_704_067_200,
-            jti: "test-jti".to_owned(),
             kubernetes_io: KubernetesClaimsExt {
                 namespace: "kube-system".to_owned(),
                 serviceaccount: SaRef {
