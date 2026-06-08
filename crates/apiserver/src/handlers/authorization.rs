@@ -514,12 +514,15 @@ pub async fn token_review<S: Store>(
         }
     };
     let token = req.spec.token;
+    let revoked_jtis_guard = state.revoked_jtis.lock().unwrap();
     let user_info = crate::auth::authenticate_token_with_audiences(
         &token,
         &state.token_map,
         state.sa_decoding_key.as_deref(),
         &req.spec.audiences,
+        &revoked_jtis_guard,
     );
+    drop(revoked_jtis_guard);
 
     let status = match user_info {
         Some(u) => TokenReviewStatus {
@@ -793,7 +796,8 @@ mod tests {
             },
         );
 
-        let result = authenticate_token_with_audiences("argocd-token", &map, None, &[]);
+        let result =
+            authenticate_token_with_audiences("argocd-token", &map, None, &[], &Default::default());
         let user = result.expect("known token must resolve to a user");
         assert_eq!(user.username, "argocd-admin");
         assert!(user.groups.contains(&"system:authenticated".to_owned()));
@@ -807,7 +811,13 @@ mod tests {
         use std::collections::HashMap;
 
         let map = HashMap::new();
-        let result = authenticate_token_with_audiences("unknown-token", &map, None, &[]);
+        let result = authenticate_token_with_audiences(
+            "unknown-token",
+            &map,
+            None,
+            &[],
+            &Default::default(),
+        );
         assert!(result.is_none(), "unrecognized token must not authenticate");
     }
 

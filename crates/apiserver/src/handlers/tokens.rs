@@ -70,6 +70,8 @@ pub(crate) const MIN_JWT_LIFETIME_SECS: u64 = 86_400; // 24 h
 
 #[derive(Serialize)]
 struct KubernetesClaims {
+    /// Unique token ID used for revocation. Checked against AppState::revoked_jtis on every request.
+    jti: String,
     iss: String,
     sub: String,
     aud: Vec<String>,
@@ -188,6 +190,7 @@ pub async fn create_token<S: Store>(
         "TokenRequest: minting SA JWT"
     );
     let claims = KubernetesClaims {
+        jti: uuid::Uuid::new_v4().to_string(),
         iss: "https://kubernetes.default.svc".to_owned(),
         sub: format!("system:serviceaccount:{}:{}", ns.as_str(), sa_name),
         aud: spec.audiences,
@@ -304,6 +307,7 @@ mod tests {
     #[test]
     fn claims_serialize_field_names() {
         let claims = KubernetesClaims {
+            jti: "test-jti-1".to_owned(),
             iss: "https://kubernetes.default.svc".to_owned(),
             sub: "system:serviceaccount:default:my-sa".to_owned(),
             aud: vec!["https://kubernetes.default.svc".to_owned()],
@@ -337,6 +341,7 @@ mod tests {
     #[test]
     fn claims_serialize_sa_uid() {
         let claims = KubernetesClaims {
+            jti: "test-jti-2".to_owned(),
             iss: "https://kubernetes.default.svc".to_owned(),
             sub: "system:serviceaccount:kube-system:coredns".to_owned(),
             aud: vec!["https://kubernetes.default.svc".to_owned()],

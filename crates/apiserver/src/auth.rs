@@ -4,11 +4,11 @@
 // RS256 JWT verification for service-account tokens, and x509 client
 // certificate authentication.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{BufRead as _, BufReader};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -50,6 +50,8 @@ pub struct UserInfo {
 /// Must match the fields minted by `handlers::tokens::create_token`.
 #[derive(Debug, Deserialize)]
 struct SaClaims {
+    /// Unique token ID. Checked against the revocation set before accepting the token.
+    jti: Option<String>,
     /// Subject — format: "system:serviceaccount:<namespace>:<name>"
     sub: String,
 }
@@ -157,6 +159,7 @@ fn authenticate(
     token_map: &HashMap<String, UserInfo>,
     sa_decoding_key: Option<&DecodingKey>,
     peer_cert: Option<&PeerCertificate>,
+    revoked_jtis: &HashSet<String>,
 ) -> AuthnResult {
     let auth_header = req.headers().get("authorization");
 
@@ -196,7 +199,7 @@ fn authenticate(
                 }
                 // 2. If a SA decoding key is available, attempt JWT verification.
                 if let Some(key) = sa_decoding_key {
-                    if let Some(user) = try_verify_sa_jwt(token, key, &[]) {
+                    if let Some(user) = try_verify_sa_jwt(token, key, &[], revoked_jtis) {
                         return AuthnResult::Identified(user);
                     }
                 }
@@ -301,6 +304,7 @@ pub fn authenticate_token_with_audiences(
     token_map: &HashMap<String, UserInfo>,
     sa_decoding_key: Option<&DecodingKey>,
     audiences: &[String],
+    revoked_jtis: &HashSet<String>,
 ) -> Option<UserInfo> {
     if let Some(info) = ct_token_lookup(token_map, token) {
         let mut user = info.clone();
@@ -314,7 +318,7 @@ pub fn authenticate_token_with_audiences(
     }
     if let Some(key) = sa_decoding_key {
         // try_verify_sa_jwt already appends system:authenticated.
-        if let Some(user) = try_verify_sa_jwt(token, key, audiences) {
+        if let Some(user) = try_verify_sa_jwt(token, key, audiences, revoked_jtis) {
             return Some(user);
         }
     }
@@ -322,10 +326,17 @@ pub fn authenticate_token_with_audiences(
 }
 
 /// Attempt to decode and verify a bearer token as an RS256 SA JWT.
-/// Returns `Some(UserInfo)` on success, `None` if the token is invalid.
+/// Returns `Some(UserInfo)` on success, `None` if the token is invalid or revoked.
 /// `audiences` is the list of acceptable audiences; defaults to
 /// ["https://kubernetes.default.svc"] when empty.
-fn try_verify_sa_jwt(token: &str, key: &DecodingKey, audiences: &[String]) -> Option<UserInfo> {
+/// `revoked_jtis` is the set of revoked JTI values; a token whose `jti` claim
+/// appears in this set is rejected even if the signature and expiry are valid.
+pub(crate) fn try_verify_sa_jwt(
+    token: &str,
+    key: &DecodingKey,
+    audiences: &[String],
+    revoked_jtis: &HashSet<String>,
+) -> Option<UserInfo> {
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_issuer(&["https://kubernetes.default.svc"]);
     if audiences.is_empty() {
@@ -339,6 +350,15 @@ fn try_verify_sa_jwt(token: &str, key: &DecodingKey, audiences: &[String]) -> Op
 
     match jsonwebtoken::decode::<SaClaims>(token, key, &validation) {
         Ok(data) => {
+            // Check revocation before accepting the token. A revoked JTI is rejected
+            // even if the signature and expiry are otherwise valid — this allows
+            // immediate token invalidation without waiting for the 24h JWT expiry.
+            if let Some(jti) = &data.claims.jti {
+                if revoked_jtis.contains(jti.as_str()) {
+                    tracing::debug!("SA JWT rejected: jti={jti} is in the revocation list");
+                    return None;
+                }
+            }
             let sub = data.claims.sub;
             tracing::debug!("SA JWT verified: sub={sub}");
             // sub format: system:serviceaccount:{ns}:{name}
@@ -571,6 +591,7 @@ pub struct AuthLayer {
     rbac_index: Arc<RbacIndex>,
     token_map: Arc<HashMap<String, UserInfo>>,
     sa_decoding_key: Option<Arc<DecodingKey>>,
+    revoked_jtis: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AuthLayer {
@@ -578,11 +599,13 @@ impl AuthLayer {
         rbac_index: Arc<RbacIndex>,
         token_map: HashMap<String, UserInfo>,
         sa_decoding_key: Option<Arc<DecodingKey>>,
+        revoked_jtis: Arc<Mutex<HashSet<String>>>,
     ) -> Self {
         AuthLayer {
             rbac_index,
             token_map: Arc::new(token_map),
             sa_decoding_key,
+            revoked_jtis,
         }
     }
 }
@@ -596,6 +619,7 @@ impl<S> Layer<S> for AuthLayer {
             rbac_index: Arc::clone(&self.rbac_index),
             token_map: Arc::clone(&self.token_map),
             sa_decoding_key: self.sa_decoding_key.clone(),
+            revoked_jtis: Arc::clone(&self.revoked_jtis),
         }
     }
 }
@@ -610,6 +634,7 @@ pub struct AuthService<S> {
     rbac_index: Arc<RbacIndex>,
     token_map: Arc<HashMap<String, UserInfo>>,
     sa_decoding_key: Option<Arc<DecodingKey>>,
+    revoked_jtis: Arc<Mutex<HashSet<String>>>,
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -638,11 +663,13 @@ where
 
         // 1. Authenticate.
         let peer_cert = req.extensions().get::<PeerCertificate>().cloned();
+        let revoked_jtis_guard = self.revoked_jtis.lock().unwrap();
         let authenticated_user = match authenticate(
             &req,
             &self.token_map,
             self.sa_decoding_key.as_deref(),
             peer_cert.as_ref(),
+            &revoked_jtis_guard,
         ) {
             AuthnResult::Identified(u) => u,
             AuthnResult::BadToken => {
@@ -824,7 +851,7 @@ mod tests {
         // Without an Authorization header, caller must be anonymous.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        let result = authenticate(&req, &map, None, None);
+        let result = authenticate(&req, &map, None, None, &HashSet::new());
         match result {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:anonymous");
@@ -847,7 +874,7 @@ mod tests {
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
-        match authenticate(&req, &map, None, None) {
+        match authenticate(&req, &map, None, None, &HashSet::new()) {
             AuthnResult::Identified(u) => assert_eq!(u.username, "alice"),
             AuthnResult::BadToken => panic!("expected Identified"),
         }
@@ -860,7 +887,7 @@ mod tests {
         // silently downgraded to anonymous access.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer wrong-token"));
-        match authenticate(&req, &map, None, None) {
+        match authenticate(&req, &map, None, None, &HashSet::new()) {
             AuthnResult::BadToken => {}
             AuthnResult::Identified(_) => panic!("unknown token must not succeed"),
         }
@@ -1195,7 +1222,7 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
+        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:serviceaccount:default:my-sa");
                 assert!(
@@ -1219,7 +1246,7 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
+        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
             AuthnResult::Identified(u) => {
                 assert!(
                     u.groups.contains(&"system:serviceaccounts".to_owned()),
@@ -1248,7 +1275,7 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
+        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("tampered JWT must not succeed"),
         }
@@ -1264,7 +1291,7 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
+        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("expired JWT must not succeed"),
         }
@@ -1282,7 +1309,7 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec2), None) {
+        match authenticate(&req, &HashMap::new(), Some(&dec2), None, &HashSet::new()) {
             AuthnResult::BadToken => {} // correct
             AuthnResult::Identified(_) => panic!("JWT from wrong key must not succeed"),
         }
@@ -1312,8 +1339,13 @@ mod tests {
         let token = jsonwebtoken::encode(&header, &claims, &enc).expect("mint JWT");
 
         // Must fail with default (https://kubernetes.default.svc) audience.
-        let result_default =
-            authenticate_token_with_audiences(&token, &HashMap::new(), Some(&dec), &[]);
+        let result_default = authenticate_token_with_audiences(
+            &token,
+            &HashMap::new(),
+            Some(&dec),
+            &[],
+            &HashSet::new(),
+        );
         assert!(
             result_default.is_none(),
             "token with non-default audience must NOT authenticate when no audiences specified"
@@ -1321,7 +1353,13 @@ mod tests {
 
         // Must succeed when the correct audience is explicitly requested.
         let aud = vec!["system:konnectivity-server".to_owned()];
-        let result = authenticate_token_with_audiences(&token, &HashMap::new(), Some(&dec), &aud);
+        let result = authenticate_token_with_audiences(
+            &token,
+            &HashMap::new(),
+            Some(&dec),
+            &aud,
+            &HashSet::new(),
+        );
         let user = result.expect(
             "token with system:konnectivity-server audience must authenticate \
              when that audience is explicitly requested via TokenReview spec.audiences — \
@@ -1349,11 +1387,109 @@ mod tests {
         let (enc, dec) = test_rsa_keypair();
         // Only three parts — missing the service account name.
         let token = mint_sa_jwt(&enc, "system:serviceaccount:only-three", 3600);
-        let result = try_verify_sa_jwt(&token, &dec, &[]);
+        let result = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new());
         assert!(
             result.is_none(),
             "JWT with malformed sub (missing name segment) must be rejected, \
              not silently accepted with incomplete groups"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // JTI revocation tests
+    // ---------------------------------------------------------------------------
+
+    /// Mint a JWT that includes a `jti` claim for testing revocation.
+    fn mint_sa_jwt_with_jti(
+        enc: &jsonwebtoken::EncodingKey,
+        sub: &str,
+        jti: &str,
+        exp_offset_secs: i64,
+    ) -> String {
+        use serde_json::json;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = json!({
+            "jti": jti,
+            "iss": "https://kubernetes.default.svc",
+            "sub": sub,
+            "aud": ["https://kubernetes.default.svc"],
+            "iat": now,
+            "exp": now + exp_offset_secs,
+        });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        jsonwebtoken::encode(&header, &claims, enc).expect("mint JWT with jti")
+    }
+
+    /// A token whose JTI is in the revocation set must be rejected by try_verify_sa_jwt
+    /// even though the signature and expiry are valid.
+    ///
+    /// Without this check, a compromised or leaked SA token remains usable for the full
+    /// 24-hour JWT lifetime. JTI revocation allows immediate invalidation before expiry.
+    #[test]
+    fn revoked_jti_is_rejected_by_try_verify_sa_jwt() {
+        let (enc, dec) = test_rsa_keypair();
+        let jti = "revoked-jti-abc-123";
+        let token = mint_sa_jwt_with_jti(&enc, "system:serviceaccount:default:my-sa", jti, 3600);
+
+        let mut revoked = HashSet::new();
+        revoked.insert(jti.to_owned());
+
+        let result = try_verify_sa_jwt(&token, &dec, &[], &revoked);
+        assert!(
+            result.is_none(),
+            "a token whose JTI is in the revocation set must be rejected — \
+             without this, revoked SA tokens remain usable for up to 24h after revocation"
+        );
+    }
+
+    /// A token whose JTI is NOT in the revocation set must pass verification normally.
+    ///
+    /// Revocation must only block tokens with explicitly revoked JTIs. An unrevoked token
+    /// with a valid signature and unexpired exp must authenticate successfully.
+    #[test]
+    fn unrevoked_jti_passes_try_verify_sa_jwt() {
+        let (enc, dec) = test_rsa_keypair();
+        let jti = "live-jti-xyz-456";
+        let token = mint_sa_jwt_with_jti(&enc, "system:serviceaccount:default:my-sa", jti, 3600);
+
+        // Revocation set contains a DIFFERENT jti — this token's jti is not revoked.
+        let mut revoked = HashSet::new();
+        revoked.insert("some-other-revoked-jti".to_owned());
+
+        let result = try_verify_sa_jwt(&token, &dec, &[], &revoked);
+        assert!(
+            result.is_some(),
+            "a token whose JTI is not in the revocation set must authenticate — \
+             revocation must not block valid unrevoked tokens"
+        );
+        let user = result.unwrap();
+        assert_eq!(
+            user.username, "system:serviceaccount:default:my-sa",
+            "authenticated username must match the token subject"
+        );
+    }
+
+    /// A token without a jti claim (legacy tokens from before this change) must
+    /// still authenticate if the revocation set is non-empty. The jti field is
+    /// optional in SaClaims so old tokens without it are not broken.
+    #[test]
+    fn token_without_jti_authenticates_despite_nonempty_revocation_set() {
+        let (enc, dec) = test_rsa_keypair();
+        // mint_sa_jwt produces a token WITHOUT a jti claim (legacy format).
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:legacy-sa", 3600);
+
+        let mut revoked = HashSet::new();
+        revoked.insert("some-revoked-jti".to_owned());
+
+        let result = try_verify_sa_jwt(&token, &dec, &[], &revoked);
+        assert!(
+            result.is_some(),
+            "a token without a jti claim must not be blocked by a non-empty revocation set — \
+             the jti field is optional and absence means it cannot be revoked via JTI"
         );
     }
 
@@ -1373,7 +1509,7 @@ mod tests {
         let (enc, dec) = test_rsa_keypair();
         // Use a static token string — not a JWT — to confirm static path fires.
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer static-tok"));
-        match authenticate(&req, &map, Some(&dec), None) {
+        match authenticate(&req, &map, Some(&dec), None, &HashSet::new()) {
             AuthnResult::Identified(u) => assert_eq!(u.username, "static-user"),
             AuthnResult::BadToken => panic!("static token must resolve"),
         }
@@ -1457,7 +1593,7 @@ mod tests {
         let cert = PeerCertificate(der);
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        match authenticate(&req, &map, None, Some(&cert)) {
+        match authenticate(&req, &map, None, Some(&cert), &HashSet::new()) {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "alice");
                 assert!(u.groups.contains(&"system:masters".to_owned()));
@@ -1482,7 +1618,7 @@ mod tests {
         let der = make_cert_der("alice", &["system:masters"]);
         let cert = PeerCertificate(der);
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer tok"));
-        match authenticate(&req, &map, None, Some(&cert)) {
+        match authenticate(&req, &map, None, Some(&cert), &HashSet::new()) {
             AuthnResult::Identified(u) => assert_eq!(u.username, "bob"),
             AuthnResult::BadToken => panic!("static token must resolve"),
         }
@@ -1505,7 +1641,7 @@ mod tests {
             "/api/v1/pods",
             Some(&format!("Bearer {token}")),
         );
-        match authenticate(&req, &HashMap::new(), Some(&dec), None) {
+        match authenticate(&req, &HashMap::new(), Some(&dec), None, &HashSet::new()) {
             AuthnResult::Identified(u) => {
                 assert!(
                     u.groups.contains(&"system:authenticated".to_owned()),
@@ -1546,7 +1682,7 @@ mod tests {
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
-        match authenticate(&req, &map, None, None) {
+        match authenticate(&req, &map, None, None, &HashSet::new()) {
             AuthnResult::Identified(u) => {
                 assert!(
                     u.groups.contains(&"system:authenticated".to_owned()),
@@ -1566,7 +1702,7 @@ mod tests {
         // unauthenticated and must only get system:unauthenticated.
         let map = HashMap::new();
         let req = make_req(Method::GET, "/api/v1/pods", None);
-        match authenticate(&req, &map, None, None) {
+        match authenticate(&req, &map, None, None, &HashSet::new()) {
             AuthnResult::Identified(u) => {
                 assert_eq!(u.username, "system:anonymous");
                 assert!(
@@ -1746,7 +1882,12 @@ mod tests {
         // (bob has a ClusterRole binding for list pods; alice has no pod binding.)
         let app = Router::new()
             .route("/api/v1/namespaces/default/pods", get(whoami))
-            .layer(AuthLayer::new(Arc::clone(&idx), token_map, None));
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(Mutex::new(HashSet::new())),
+            ));
 
         // Request as alice, impersonating bob.
         let req = Request::builder()
@@ -1800,7 +1941,12 @@ mod tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/default/pods", get(|| async { "ok" }))
-            .layer(AuthLayer::new(Arc::clone(&idx), token_map, None));
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(Mutex::new(HashSet::new())),
+            ));
 
         let req = Request::builder()
             .method("GET")
@@ -1843,7 +1989,12 @@ mod tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/default/pods", get(whoami))
-            .layer(AuthLayer::new(Arc::clone(&idx), token_map, None));
+            .layer(AuthLayer::new(
+                Arc::clone(&idx),
+                token_map,
+                None,
+                Arc::new(Mutex::new(HashSet::new())),
+            ));
 
         let req = Request::builder()
             .method("GET")
