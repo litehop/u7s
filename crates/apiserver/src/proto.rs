@@ -807,6 +807,9 @@ struct Container {
 ///   field 9  = automountServiceAccountToken (bool, skipped)
 ///   field 10 = nodeName (string)
 ///   field 11 = hostNetwork (bool, skipped)
+///   field 16 = hostname (string)
+///   field 17 = subdomain (string)
+///   field 20 = initContainers (repeated Container)
 #[derive(Clone, PartialEq, Message)]
 struct PodSpec {
     /// volumes (field 1, repeated Volume) — backing volumes for container volumeMounts
@@ -824,6 +827,18 @@ struct PodSpec {
     /// nodeName (field 10, string)
     #[prost(string, tag = "10")]
     node_name: String,
+    /// hostname (field 16, string) — sets the pod's hostname; kubelet uses this to configure
+    /// the container's hostname so that /hostname and DNS lookups return the correct value
+    #[prost(string, tag = "16")]
+    hostname: String,
+    /// subdomain (field 17, string) — when set together with hostname enables DNS-based
+    /// hostname resolution via <hostname>.<subdomain>.<namespace>.svc.<cluster-domain>
+    #[prost(string, tag = "17")]
+    subdomain: String,
+    /// initContainers (field 20, repeated Container) — run to completion before main containers;
+    /// kubelet blocks pod startup if any init container fails or is not decoded
+    #[prost(message, repeated, tag = "20")]
+    init_containers: Vec<Container>,
 }
 
 /// Pod — k8s.io/api/core/v1/generated.proto
@@ -3754,295 +3769,274 @@ fn projected_volume_source_to_json(proj: ProjectedVolumeSource) -> serde_json::V
 /// Mirrors the container/spec serialization in `decode_pod_proto`, extracted here so
 /// `apps_spec_to_json` can embed the pod spec inside `spec.template.spec` for Deployment,
 /// StatefulSet, ReplicaSet, and DaemonSet without duplicating the logic.
+fn container_to_json(c: Container) -> serde_json::Value {
+    let mut cm = serde_json::Map::new();
+    if !c.name.is_empty() {
+        cm.insert("name".to_string(), serde_json::Value::String(c.name));
+    }
+    if !c.image.is_empty() {
+        cm.insert("image".to_string(), serde_json::Value::String(c.image));
+    }
+    if !c.image_pull_policy.is_empty() {
+        cm.insert(
+            "imagePullPolicy".to_string(),
+            serde_json::Value::String(c.image_pull_policy),
+        );
+    }
+    if !c.termination_message_path.is_empty() {
+        cm.insert(
+            "terminationMessagePath".to_string(),
+            serde_json::Value::String(c.termination_message_path),
+        );
+    }
+    if !c.termination_message_policy.is_empty() {
+        cm.insert(
+            "terminationMessagePolicy".to_string(),
+            serde_json::Value::String(c.termination_message_policy),
+        );
+    }
+    if !c.command.is_empty() {
+        cm.insert(
+            "command".to_string(),
+            serde_json::Value::Array(
+                c.command
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+    if !c.args.is_empty() {
+        cm.insert(
+            "args".to_string(),
+            serde_json::Value::Array(c.args.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+    if !c.env.is_empty() {
+        let env_json: Vec<serde_json::Value> = c
+            .env
+            .into_iter()
+            .map(|ev| {
+                let mut em = serde_json::Map::new();
+                if !ev.name.is_empty() {
+                    em.insert("name".to_string(), serde_json::Value::String(ev.name));
+                }
+                if !ev.value.is_empty() {
+                    em.insert("value".to_string(), serde_json::Value::String(ev.value));
+                }
+                if let Some(vf) = ev.value_from {
+                    let mut vfm = serde_json::Map::new();
+                    if let Some(fr) = vf.field_ref {
+                        let mut frm = serde_json::Map::new();
+                        if !fr.api_version.is_empty() {
+                            frm.insert(
+                                "apiVersion".to_string(),
+                                serde_json::Value::String(fr.api_version),
+                            );
+                        }
+                        if !fr.field_path.is_empty() {
+                            frm.insert(
+                                "fieldPath".to_string(),
+                                serde_json::Value::String(fr.field_path),
+                            );
+                        }
+                        vfm.insert("fieldRef".to_string(), serde_json::Value::Object(frm));
+                    }
+                    if let Some(rfr) = vf.resource_field_ref {
+                        let mut rfrm = serde_json::Map::new();
+                        if !rfr.container_name.is_empty() {
+                            rfrm.insert(
+                                "containerName".to_string(),
+                                serde_json::Value::String(rfr.container_name),
+                            );
+                        }
+                        if !rfr.resource.is_empty() {
+                            rfrm.insert(
+                                "resource".to_string(),
+                                serde_json::Value::String(rfr.resource),
+                            );
+                        }
+                        if let Some(divisor_str) = rfr.divisor.and_then(|q| q.string) {
+                            if !divisor_str.is_empty() {
+                                rfrm.insert(
+                                    "divisor".to_string(),
+                                    serde_json::Value::String(divisor_str),
+                                );
+                            }
+                        }
+                        vfm.insert(
+                            "resourceFieldRef".to_string(),
+                            serde_json::Value::Object(rfrm),
+                        );
+                    }
+                    if let Some(cmkr) = vf.config_map_key_ref {
+                        let mut cmkrm = serde_json::Map::new();
+                        if let Some(lor) = cmkr.local_object_reference {
+                            if !lor.name.is_empty() {
+                                cmkrm.insert(
+                                    "name".to_string(),
+                                    serde_json::Value::String(lor.name),
+                                );
+                            }
+                        }
+                        if !cmkr.key.is_empty() {
+                            cmkrm.insert("key".to_string(), serde_json::Value::String(cmkr.key));
+                        }
+                        if cmkr.optional {
+                            cmkrm.insert(
+                                "optional".to_string(),
+                                serde_json::Value::Bool(cmkr.optional),
+                            );
+                        }
+                        vfm.insert(
+                            "configMapKeyRef".to_string(),
+                            serde_json::Value::Object(cmkrm),
+                        );
+                    }
+                    if let Some(skr) = vf.secret_key_ref {
+                        let mut skrm = serde_json::Map::new();
+                        if let Some(lor) = skr.local_object_reference {
+                            if !lor.name.is_empty() {
+                                skrm.insert(
+                                    "name".to_string(),
+                                    serde_json::Value::String(lor.name),
+                                );
+                            }
+                        }
+                        if !skr.key.is_empty() {
+                            skrm.insert("key".to_string(), serde_json::Value::String(skr.key));
+                        }
+                        if skr.optional {
+                            skrm.insert(
+                                "optional".to_string(),
+                                serde_json::Value::Bool(skr.optional),
+                            );
+                        }
+                        vfm.insert("secretKeyRef".to_string(), serde_json::Value::Object(skrm));
+                    }
+                    em.insert("valueFrom".to_string(), serde_json::Value::Object(vfm));
+                }
+                serde_json::Value::Object(em)
+            })
+            .collect();
+        cm.insert("env".to_string(), serde_json::Value::Array(env_json));
+    }
+    if !c.env_from.is_empty() {
+        let env_from_json: Vec<serde_json::Value> = c
+            .env_from
+            .into_iter()
+            .map(|ef| {
+                let mut efm = serde_json::Map::new();
+                if !ef.prefix.is_empty() {
+                    efm.insert("prefix".to_string(), serde_json::Value::String(ef.prefix));
+                }
+                if let Some(cmr) = ef.config_map_ref {
+                    let mut cmrm = serde_json::Map::new();
+                    if let Some(lor) = cmr.local_object_reference {
+                        if !lor.name.is_empty() {
+                            cmrm.insert("name".to_string(), serde_json::Value::String(lor.name));
+                        }
+                    }
+                    if cmr.optional {
+                        cmrm.insert(
+                            "optional".to_string(),
+                            serde_json::Value::Bool(cmr.optional),
+                        );
+                    }
+                    efm.insert("configMapRef".to_string(), serde_json::Value::Object(cmrm));
+                }
+                if let Some(sr) = ef.secret_ref {
+                    let mut srm = serde_json::Map::new();
+                    if let Some(lor) = sr.local_object_reference {
+                        if !lor.name.is_empty() {
+                            srm.insert("name".to_string(), serde_json::Value::String(lor.name));
+                        }
+                    }
+                    if sr.optional {
+                        srm.insert("optional".to_string(), serde_json::Value::Bool(sr.optional));
+                    }
+                    efm.insert("secretRef".to_string(), serde_json::Value::Object(srm));
+                }
+                serde_json::Value::Object(efm)
+            })
+            .collect();
+        cm.insert(
+            "envFrom".to_string(),
+            serde_json::Value::Array(env_from_json),
+        );
+    }
+    if let Some(res) = c.resources {
+        let mut res_map = serde_json::Map::new();
+        if !res.limits.is_empty() {
+            res_map.insert(
+                "limits".to_string(),
+                limitrange_quantity_map_to_json(res.limits),
+            );
+        }
+        if !res.requests.is_empty() {
+            res_map.insert(
+                "requests".to_string(),
+                limitrange_quantity_map_to_json(res.requests),
+            );
+        }
+        cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
+    }
+    if let Some(p) = c.liveness_probe {
+        cm.insert("livenessProbe".to_string(), probe_to_json(p));
+    }
+    if let Some(p) = c.readiness_probe {
+        cm.insert("readinessProbe".to_string(), probe_to_json(p));
+    }
+    if let Some(p) = c.startup_probe {
+        cm.insert("startupProbe".to_string(), probe_to_json(p));
+    }
+    if let Some(lc) = c.lifecycle {
+        cm.insert("lifecycle".to_string(), lifecycle_to_json(lc));
+    }
+    if !c.volume_mounts.is_empty() {
+        let mounts: Vec<serde_json::Value> = c
+            .volume_mounts
+            .into_iter()
+            .map(|vm| {
+                let mut m = serde_json::Map::new();
+                if !vm.name.is_empty() {
+                    m.insert("name".to_string(), serde_json::Value::String(vm.name));
+                }
+                if !vm.mount_path.is_empty() {
+                    m.insert(
+                        "mountPath".to_string(),
+                        serde_json::Value::String(vm.mount_path),
+                    );
+                }
+                if vm.read_only {
+                    m.insert(
+                        "readOnly".to_string(),
+                        serde_json::Value::Bool(vm.read_only),
+                    );
+                }
+                if !vm.sub_path.is_empty() {
+                    m.insert(
+                        "subPath".to_string(),
+                        serde_json::Value::String(vm.sub_path),
+                    );
+                }
+                if !vm.sub_path_expr.is_empty() {
+                    m.insert(
+                        "subPathExpr".to_string(),
+                        serde_json::Value::String(vm.sub_path_expr),
+                    );
+                }
+                serde_json::Value::Object(m)
+            })
+            .collect();
+        cm.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
+    }
+    serde_json::Value::Object(cm)
+}
+
 fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
-    let containers: Vec<serde_json::Value> = spec
-        .containers
-        .into_iter()
-        .map(|c| {
-            let mut cm = serde_json::Map::new();
-            if !c.name.is_empty() {
-                cm.insert("name".to_string(), serde_json::Value::String(c.name));
-            }
-            if !c.image.is_empty() {
-                cm.insert("image".to_string(), serde_json::Value::String(c.image));
-            }
-            if !c.image_pull_policy.is_empty() {
-                cm.insert(
-                    "imagePullPolicy".to_string(),
-                    serde_json::Value::String(c.image_pull_policy),
-                );
-            }
-            if !c.termination_message_path.is_empty() {
-                cm.insert(
-                    "terminationMessagePath".to_string(),
-                    serde_json::Value::String(c.termination_message_path),
-                );
-            }
-            if !c.termination_message_policy.is_empty() {
-                cm.insert(
-                    "terminationMessagePolicy".to_string(),
-                    serde_json::Value::String(c.termination_message_policy),
-                );
-            }
-            if !c.command.is_empty() {
-                cm.insert(
-                    "command".to_string(),
-                    serde_json::Value::Array(
-                        c.command
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    ),
-                );
-            }
-            if !c.args.is_empty() {
-                cm.insert(
-                    "args".to_string(),
-                    serde_json::Value::Array(
-                        c.args.into_iter().map(serde_json::Value::String).collect(),
-                    ),
-                );
-            }
-            if !c.env.is_empty() {
-                let env_json: Vec<serde_json::Value> = c
-                    .env
-                    .into_iter()
-                    .map(|ev| {
-                        let mut em = serde_json::Map::new();
-                        if !ev.name.is_empty() {
-                            em.insert("name".to_string(), serde_json::Value::String(ev.name));
-                        }
-                        if !ev.value.is_empty() {
-                            em.insert("value".to_string(), serde_json::Value::String(ev.value));
-                        }
-                        if let Some(vf) = ev.value_from {
-                            let mut vfm = serde_json::Map::new();
-                            if let Some(fr) = vf.field_ref {
-                                let mut frm = serde_json::Map::new();
-                                if !fr.api_version.is_empty() {
-                                    frm.insert(
-                                        "apiVersion".to_string(),
-                                        serde_json::Value::String(fr.api_version),
-                                    );
-                                }
-                                if !fr.field_path.is_empty() {
-                                    frm.insert(
-                                        "fieldPath".to_string(),
-                                        serde_json::Value::String(fr.field_path),
-                                    );
-                                }
-                                vfm.insert("fieldRef".to_string(), serde_json::Value::Object(frm));
-                            }
-                            if let Some(rfr) = vf.resource_field_ref {
-                                let mut rfrm = serde_json::Map::new();
-                                if !rfr.container_name.is_empty() {
-                                    rfrm.insert(
-                                        "containerName".to_string(),
-                                        serde_json::Value::String(rfr.container_name),
-                                    );
-                                }
-                                if !rfr.resource.is_empty() {
-                                    rfrm.insert(
-                                        "resource".to_string(),
-                                        serde_json::Value::String(rfr.resource),
-                                    );
-                                }
-                                if let Some(divisor_str) = rfr.divisor.and_then(|q| q.string) {
-                                    if !divisor_str.is_empty() {
-                                        rfrm.insert(
-                                            "divisor".to_string(),
-                                            serde_json::Value::String(divisor_str),
-                                        );
-                                    }
-                                }
-                                vfm.insert(
-                                    "resourceFieldRef".to_string(),
-                                    serde_json::Value::Object(rfrm),
-                                );
-                            }
-                            if let Some(cmkr) = vf.config_map_key_ref {
-                                let mut cmkrm = serde_json::Map::new();
-                                if let Some(lor) = cmkr.local_object_reference {
-                                    if !lor.name.is_empty() {
-                                        cmkrm.insert(
-                                            "name".to_string(),
-                                            serde_json::Value::String(lor.name),
-                                        );
-                                    }
-                                }
-                                if !cmkr.key.is_empty() {
-                                    cmkrm.insert(
-                                        "key".to_string(),
-                                        serde_json::Value::String(cmkr.key),
-                                    );
-                                }
-                                if cmkr.optional {
-                                    cmkrm.insert(
-                                        "optional".to_string(),
-                                        serde_json::Value::Bool(cmkr.optional),
-                                    );
-                                }
-                                vfm.insert(
-                                    "configMapKeyRef".to_string(),
-                                    serde_json::Value::Object(cmkrm),
-                                );
-                            }
-                            if let Some(skr) = vf.secret_key_ref {
-                                let mut skrm = serde_json::Map::new();
-                                if let Some(lor) = skr.local_object_reference {
-                                    if !lor.name.is_empty() {
-                                        skrm.insert(
-                                            "name".to_string(),
-                                            serde_json::Value::String(lor.name),
-                                        );
-                                    }
-                                }
-                                if !skr.key.is_empty() {
-                                    skrm.insert(
-                                        "key".to_string(),
-                                        serde_json::Value::String(skr.key),
-                                    );
-                                }
-                                if skr.optional {
-                                    skrm.insert(
-                                        "optional".to_string(),
-                                        serde_json::Value::Bool(skr.optional),
-                                    );
-                                }
-                                vfm.insert(
-                                    "secretKeyRef".to_string(),
-                                    serde_json::Value::Object(skrm),
-                                );
-                            }
-                            em.insert("valueFrom".to_string(), serde_json::Value::Object(vfm));
-                        }
-                        serde_json::Value::Object(em)
-                    })
-                    .collect();
-                cm.insert("env".to_string(), serde_json::Value::Array(env_json));
-            }
-            if !c.env_from.is_empty() {
-                let env_from_json: Vec<serde_json::Value> = c
-                    .env_from
-                    .into_iter()
-                    .map(|ef| {
-                        let mut efm = serde_json::Map::new();
-                        if !ef.prefix.is_empty() {
-                            efm.insert("prefix".to_string(), serde_json::Value::String(ef.prefix));
-                        }
-                        if let Some(cmr) = ef.config_map_ref {
-                            let mut cmrm = serde_json::Map::new();
-                            if let Some(lor) = cmr.local_object_reference {
-                                if !lor.name.is_empty() {
-                                    cmrm.insert(
-                                        "name".to_string(),
-                                        serde_json::Value::String(lor.name),
-                                    );
-                                }
-                            }
-                            if cmr.optional {
-                                cmrm.insert(
-                                    "optional".to_string(),
-                                    serde_json::Value::Bool(cmr.optional),
-                                );
-                            }
-                            efm.insert("configMapRef".to_string(), serde_json::Value::Object(cmrm));
-                        }
-                        if let Some(sr) = ef.secret_ref {
-                            let mut srm = serde_json::Map::new();
-                            if let Some(lor) = sr.local_object_reference {
-                                if !lor.name.is_empty() {
-                                    srm.insert(
-                                        "name".to_string(),
-                                        serde_json::Value::String(lor.name),
-                                    );
-                                }
-                            }
-                            if sr.optional {
-                                srm.insert(
-                                    "optional".to_string(),
-                                    serde_json::Value::Bool(sr.optional),
-                                );
-                            }
-                            efm.insert("secretRef".to_string(), serde_json::Value::Object(srm));
-                        }
-                        serde_json::Value::Object(efm)
-                    })
-                    .collect();
-                cm.insert(
-                    "envFrom".to_string(),
-                    serde_json::Value::Array(env_from_json),
-                );
-            }
-            if let Some(res) = c.resources {
-                let mut res_map = serde_json::Map::new();
-                if !res.limits.is_empty() {
-                    res_map.insert(
-                        "limits".to_string(),
-                        limitrange_quantity_map_to_json(res.limits),
-                    );
-                }
-                if !res.requests.is_empty() {
-                    res_map.insert(
-                        "requests".to_string(),
-                        limitrange_quantity_map_to_json(res.requests),
-                    );
-                }
-                cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
-            }
-            if let Some(p) = c.liveness_probe {
-                cm.insert("livenessProbe".to_string(), probe_to_json(p));
-            }
-            if let Some(p) = c.readiness_probe {
-                cm.insert("readinessProbe".to_string(), probe_to_json(p));
-            }
-            if let Some(p) = c.startup_probe {
-                cm.insert("startupProbe".to_string(), probe_to_json(p));
-            }
-            if let Some(lc) = c.lifecycle {
-                cm.insert("lifecycle".to_string(), lifecycle_to_json(lc));
-            }
-            if !c.volume_mounts.is_empty() {
-                let mounts: Vec<serde_json::Value> = c
-                    .volume_mounts
-                    .into_iter()
-                    .map(|vm| {
-                        let mut m = serde_json::Map::new();
-                        if !vm.name.is_empty() {
-                            m.insert("name".to_string(), serde_json::Value::String(vm.name));
-                        }
-                        if !vm.mount_path.is_empty() {
-                            m.insert(
-                                "mountPath".to_string(),
-                                serde_json::Value::String(vm.mount_path),
-                            );
-                        }
-                        if vm.read_only {
-                            m.insert(
-                                "readOnly".to_string(),
-                                serde_json::Value::Bool(vm.read_only),
-                            );
-                        }
-                        if !vm.sub_path.is_empty() {
-                            m.insert(
-                                "subPath".to_string(),
-                                serde_json::Value::String(vm.sub_path),
-                            );
-                        }
-                        if !vm.sub_path_expr.is_empty() {
-                            m.insert(
-                                "subPathExpr".to_string(),
-                                serde_json::Value::String(vm.sub_path_expr),
-                            );
-                        }
-                        serde_json::Value::Object(m)
-                    })
-                    .collect();
-                cm.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
-            }
-            serde_json::Value::Object(cm)
-        })
-        .collect();
+    let containers: Vec<serde_json::Value> =
+        spec.containers.into_iter().map(container_to_json).collect();
 
     let mut spec_map = serde_json::Map::new();
     if !spec.volumes.is_empty() {
@@ -4153,6 +4147,29 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
         spec_map.insert(
             "nodeName".to_string(),
             serde_json::Value::String(spec.node_name),
+        );
+    }
+    if !spec.hostname.is_empty() {
+        spec_map.insert(
+            "hostname".to_string(),
+            serde_json::Value::String(spec.hostname),
+        );
+    }
+    if !spec.subdomain.is_empty() {
+        spec_map.insert(
+            "subdomain".to_string(),
+            serde_json::Value::String(spec.subdomain),
+        );
+    }
+    if !spec.init_containers.is_empty() {
+        let init_containers: Vec<serde_json::Value> = spec
+            .init_containers
+            .into_iter()
+            .map(container_to_json)
+            .collect();
+        spec_map.insert(
+            "initContainers".to_string(),
+            serde_json::Value::Array(init_containers),
         );
     }
     serde_json::Value::Object(spec_map)
@@ -6243,6 +6260,67 @@ mod tests {
         assert_eq!(
             result["spec"]["nodeName"], "node-1",
             "nodeName must be decoded from field 10"
+        );
+    }
+
+    /// decode_pod_proto must decode PodSpec.hostname (field 16), subdomain (field 17), and
+    /// initContainers (field 20) from proto bytes.
+    ///
+    /// Why it matters: the EndpointSliceMirroring conformance test creates a pod with
+    /// spec.hostname set. If field 16 is dropped, the stored JSON has no hostname, the kubelet
+    /// falls back to metadata.name for the container hostname, and curl /hostname from agnhost
+    /// returns the wrong value — the test fails after 2 minutes of retries.
+    ///
+    /// initContainers (field 20) must also be decoded: if an init container is present but not
+    /// stored, the pod will never reach Running because the kubelet sees no init containers to
+    /// complete, but the stored spec has no record of them completing either.
+    #[test]
+    fn decode_pod_proto_preserves_hostname_subdomain_and_init_containers() {
+        let mut obj_meta = encode_length_delimited(1, b"myapp");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        let mut container = encode_length_delimited(1, b"main");
+        container.extend_from_slice(&encode_length_delimited(2, b"nginx:latest"));
+
+        let mut init_container = encode_length_delimited(1, b"init");
+        init_container.extend_from_slice(&encode_length_delimited(2, b"busybox:latest"));
+
+        let mut pod_spec = encode_length_delimited(2, &container); // containers = field 2
+        pod_spec.extend_from_slice(&encode_length_delimited(16, b"my-custom-host")); // hostname = field 16
+        pod_spec.extend_from_slice(&encode_length_delimited(17, b"test-sub")); // subdomain = field 17
+        pod_spec.extend_from_slice(&encode_length_delimited(20, &init_container)); // initContainers = field 20
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with hostname/subdomain/initContainers");
+
+        assert_eq!(
+            result["spec"]["hostname"], "my-custom-host",
+            "hostname must be decoded from PodSpec field 16 — without this, kubelet sets \
+             container hostname from metadata.name and /hostname returns the wrong value"
+        );
+        assert_eq!(
+            result["spec"]["subdomain"], "test-sub",
+            "subdomain must be decoded from PodSpec field 17 — without this, \
+             DNS-based hostname resolution does not work"
+        );
+        let init_containers = result["spec"]["initContainers"]
+            .as_array()
+            .expect("initContainers must be an array when proto field 20 is present");
+        assert_eq!(
+            init_containers.len(),
+            1,
+            "one initContainer must be decoded from PodSpec field 20"
+        );
+        assert_eq!(
+            init_containers[0]["name"], "init",
+            "initContainer name must be decoded"
+        );
+        assert_eq!(
+            init_containers[0]["image"], "busybox:latest",
+            "initContainer image must be decoded"
         );
     }
 
