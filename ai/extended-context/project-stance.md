@@ -30,3 +30,21 @@ Project stance: Pre-alpha/greenfield. No backward compatibility — delete, rena
 
 Testing policy: every bug fix must include a regression test that would fail if the fix were reverted. Extract untestable handler logic into pure functions. A fix without a test is incomplete.
 ```
+
+## VM assignment (for beads needing runtime verification)
+
+Workers get their own isolated conformance stack — they do not share the mayor's VM.
+The mayor assigns a VM name and loopback IP at dispatch time. The worker invokes:
+
+```bash
+U7S_VM_NAME=<assigned-vm> U7S_HOST_IP=<assigned-ip> \
+  ./scripts/conformance/run-all.sh [--reset] [--focus <regex>]
+```
+
+WORKDIR derives automatically: `temp/u7s/` for `lima-node`, `temp/u7s-<name>/` for all others.
+The MCP server name mirrors the VM: `mcp__<VM_NAME>__run_shell_command`.
+
+Available VMs (up to 6 in parallel, soft limit: ~4 GiB RAM each):
+`lima-node` (127.0.0.1), `lima-node-smoke` (127.0.0.2), `lima-node-2` (127.0.0.3), …
+
+Full protocol is in `docs/the-mayor-method/dispatch-prompt-template.md` — Lima VM protocol section.

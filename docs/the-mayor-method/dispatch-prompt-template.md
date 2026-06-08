@@ -122,6 +122,11 @@ git worktree add ai/worktrees/<name> -b worker/<name>
 git -C ai/worktrees/<name> config core.hooksPath .githooks
 # 3. Verify clean
 git -C ai/worktrees/<name> status --short --branch
+# 4. If the bead needs VM verification: assign an unused VM + loopback IP
+#    Available VMs: lima-node (127.0.0.1), lima-node-smoke (127.0.0.2),
+#                   lima-node-2 (127.0.0.3) … up to 6 (soft limit: memory).
+#    Check which are in use: limactl list
+#    Pick an unused or stopped VM and include U7S_VM_NAME + U7S_HOST_IP in dispatch.
 ```
 
 No file copying needed: `settings.json` is tracked in git and present in every
@@ -311,6 +316,44 @@ the fix.
 
 ## Lima VM protocol
 
+### Multi-VM model
+
+Each worker that needs runtime verification gets its **own isolated VM stack** —
+it does not share the mayor's VM. Up to 6 workers can run in parallel (soft
+limit: ~4 GiB RAM per VM).
+
+**Available VMs and their loopback aliases:**
+
+| VM name | Loopback IP | WORKDIR |
+|---|---|---|
+| `lima-node` | `127.0.0.1` | `temp/u7s/` |
+| `lima-node-smoke` | `127.0.0.2` | `temp/u7s-lima-node-smoke/` |
+| `lima-node-2` | `127.0.0.3` | `temp/u7s-lima-node-2/` |
+| `lima-node-3` | `127.0.0.4` | `temp/u7s-lima-node-3/` |
+| `lima-node-4` | `127.0.0.5` | `temp/u7s-lima-node-4/` |
+| `lima-node-5` | `127.0.0.6` | `temp/u7s-lima-node-5/` |
+
+The MCP server name mirrors the VM name: `mcp__lima-node-smoke__run_shell_command`
+for `lima-node-smoke`, etc.
+
+**Mayor assigns VM at dispatch time.** Run `limactl list` to see which VMs are
+running; pick an unused or stopped one. Pass both env vars in the dispatch prompt:
+
+```
+Your assigned VM: lima-node-smoke
+Your assigned host IP: 127.0.0.2
+```
+
+The worker uses these to invoke the conformance stack:
+
+```bash
+U7S_VM_NAME=lima-node-smoke U7S_HOST_IP=127.0.0.2 \
+  ./scripts/conformance/run-all.sh [--reset] [--focus <regex>]
+```
+
+WORKDIR and kubeconfig are derived automatically by the scripts from `U7S_VM_NAME`.
+Workers must not hard-code `lima-node` or `127.0.0.1` anywhere.
+
 ### When to inject
 
 Inject the block below for **any** bead that touches:
@@ -325,28 +368,36 @@ skips VM verification is shipping untested code.
 
 ### The block (paste verbatim into applicable dispatch prompts)
 
+Fill in `<VM_NAME>` and `<HOST_IP>` from the mayor's assignment before pasting.
+
 ```
 ## Lima VM protocol — MANDATORY for this bead
 
-You have the lima-node MCP server available. Use `mcp__lima-node__run_shell_command`
-to run commands directly inside the lima VM. You also have `limactl shell lima-node
-<cmd>` via Bash. Both are in your allowlist. The VM is always available.
+Your assigned VM: <VM_NAME>
+Your assigned host IP: <HOST_IP>
+
+You have exclusive use of this VM for this bead. Do NOT use `lima-node` or
+`127.0.0.1` — those belong to the mayor or another worker.
+
+The MCP server for your VM is `mcp__<VM_NAME>__run_shell_command`.
+You also have `limactl shell <VM_NAME> <cmd>` via Bash. Both are in your allowlist.
 
 **Cargo tests are not sufficient.** This bead touches a runtime path that
 sonobuoy exercises. You must verify against the live server.
 
 Verification sequence (do not skip any step):
 
-1. Build and start the server in the host terminal:
+1. Build and start the server bound to your host IP:
    ```bash
    cargo build -p u7s-apiserver --release 2>&1 | tail -5
-   # kill any running instance, then:
-   RUST_LOG=info ./target/release/u7s-apiserver &
+   # Kill any instance already bound to <HOST_IP>, then:
+   U7S_VM_NAME=<VM_NAME> U7S_HOST_IP=<HOST_IP> \
+     RUST_LOG=info ./target/release/u7s-apiserver &
    sleep 2
    ```
-2. From the VM, run the sonobuoy smoke:
+2. From your VM, run the sonobuoy smoke:
    ```
-   mcp__lima-node__run_shell_command: ["sonobuoy", "delete", "--all", "--wait",
+   mcp__<VM_NAME>__run_shell_command: ["sonobuoy", "delete", "--all", "--wait",
      "--kubeconfig", "/tmp/sonobuoy-kubeconfig"]
    ```
    Expected: exits 0 with no error lines. If it fails, read the server log and
@@ -355,18 +406,18 @@ Verification sequence (do not skip any step):
    A return without this output will be rejected.
 
 For script-only beads (no server restart needed):
-1. Run the exact commands manually in the VM first.
+1. Run the exact commands manually in your VM first.
 2. Then encode them in the script.
-3. Run the script in the VM and verify exit 0.
-4. Include at least one `mcp__lima-node__run_shell_command` output in your return.
+3. Run the script in your VM and verify exit 0.
+4. Include at least one `mcp__<VM_NAME>__run_shell_command` output in your return.
 ```
 
 ### Mayor enforcement at return-review time
 
 When a worker returns from a VM/sonobuoy-touching bead:
-- Check the return for sonobuoy delete output or `mcp__lima-node__run_shell_command` evidence.
+- Check the return for sonobuoy delete output or `mcp__<VM_NAME>__run_shell_command` evidence.
 - If absent: **do not merge**. Send back: "Your return contains no VM execution
-  evidence. Run `sonobuoy delete --all --wait` in the lima VM and show the output."
+  evidence. Run `sonobuoy delete --all --wait` in your assigned VM and show the output."
 - The hook pre-checks cargo quality gates. VM verification is the mayor's gate.
 
 ---
@@ -411,12 +462,16 @@ When a worker returns from a VM/sonobuoy-touching bead:
 - **Mayor "gets into the flow" and codes instead of dispatching.** The
   four-condition exception test is easy to rationalize past once the mayor has
   already read several files. The fourth condition (≤2 files read) is the
-  circuit breaker. Workers have the lima-node MCP server and can debug live.
-  Write a better brief.
+  circuit breaker. Workers have their own assigned VM with MCP access and can
+  debug live. Write a better brief.
 - **Workers guess at VM behaviour instead of observing it.**
-  `mcp__lima-node__*` and `limactl shell` are both available. Inject the Lima
-  VM protocol block for any bead touching `scripts/conformance/`,
+  `mcp__<VM_NAME>__*` and `limactl shell <VM_NAME>` are both available. Inject
+  the Lima VM protocol block for any bead touching `scripts/conformance/`,
   `scripts/*-start.sh`, or sonobuoy-exercised handlers.
+- **Workers hard-code `lima-node` or `127.0.0.1`.** Each worker gets an
+  assigned VM name and loopback IP from the mayor. Hard-coding the defaults
+  causes collisions when multiple workers run in parallel. Always use
+  `U7S_VM_NAME` and `U7S_HOST_IP` from the dispatch prompt.
 - **Workers embed bead IDs and task refs in source comments.** These rot
   immediately as beads close and PRs age. The common preamble bans bead IDs
   in source. Enforce it at review time — if a diff contains `(mayor-`, send

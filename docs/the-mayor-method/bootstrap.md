@@ -49,6 +49,9 @@ For any bead that touches RBAC, auth, collection delete, namespace drain, or any
 handler the sonobuoy smoke test exercises: inject the Lima VM protocol block from
 `dispatch-prompt-template.md` and require sonobuoy smoke verification in the
 worker's return. Cargo tests alone are not sufficient for these beads.
+Each such worker gets its own assigned VM name and loopback IP (run `limactl list`
+to find a free slot; up to 6 in parallel). Workers must use `U7S_VM_NAME` and
+`U7S_HOST_IP` from the dispatch prompt — never hard-code `lima-node` or `127.0.0.1`.
 
 **PRs.** Workers open; mayor reviews and merges on green. NEVER use `--admin` to
 bypass a failing check — read the log first; if it is a transient GitHub infra
