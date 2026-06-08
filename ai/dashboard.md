@@ -1,35 +1,25 @@
 # Dashboard
-2026-06-08T~10:00 — focus runs in progress; coverage audit complete; 17 beads ready
+2026-06-08T~22:30 — queue fully drained; all deferred. Awaiting operator decisions.
 
 ## Resume
-`SONOBUOY_FOCUS='StatefulSet Basic StatefulSet functionality' scripts/conformance/run-all.sh` — in progress
+Queue empty. Unblock by resolving 52wo or b72p, or file a new bead.
 
 ## Operator attention needed
-- StatefulSet focused run in progress (bfmlhuqhs) — key test: does Burst/Predictable scaling now advance past 1/N?
-- MutatingAdmissionPolicy focused run queued after StatefulSet
+- **mayor-52wo** — recommend close: proto layer supersedes static OpenAPI blob; /openapi/v2 stub already sufficient
+- **mayor-b72p** — recommend close: current hybrid (cargo tests + Lima VM protocol) is working policy; no new infra needed
 
 ## Open PRs
 None.
 
-## Focus run status
-```
-✅ EndpointSliceMirroring — 20/21 (conformance passes; non-conformance hostname gap remains)
-🔄 StatefulSet — IN PROGRESS (pod Watch label selector fix #462)
-⏳ MutatingAdmissionPolicy — queued (spec preservation fix #463)
-```
+## In-flight workers
+None.
 
-## Coverage audit (ai/findings/coverage-audit.md)
-- Actual coverage: **91.4%** (threshold was 61% — now raised to 90%)
-- Top gaps: proto decoders with no tests (mayor-j2xg), CEL tokenizer edge cases (mayor-2712), is_exec_status_frame (mayor-k2zw)
+## Bead queue
+All deferred: mayor-52wo · mayor-b72p · mayor-j7to · mayor-rvkq
 
-## Recent merges
-#461 GC apiservices 404 fix · #462 pod Watch label selector · #463 MAP spec preservation
-#458 MutatingAdmissionPolicy CEL · #459 Deployment cascade delete · #460 MAP proto decoders
-
-## Bead queue (17 ready)
-**P1:** mayor-zcnd StatefulSet scale-up · mayor-e539 coverage threshold (DONE — threshold raised)
-**P2 coverage:** mayor-j2xg proto decoder tests · mayor-2712 CEL tokenizer tests · mayor-k2zw is_exec_status_frame test
-**P2 correctness:** mayor-rzve SA JWT jti · mayor-ryds AcceptAnyCert without CA · mayor-2m6s rename client-util · mayor-ht9a split store/lib.rs · mayor-3w0r agnhost hostname · mayor-s3aq show-results.sh · mayor-y2cj annotation typing · mayor-z981 StatefulSet AfterEach · mayor-9k2w ValidatingWebhookConfiguration CEL · mayor-tkwj ControllerRevision template update
+## Recent merges (this session)
+#480 store split (sqlite.rs) · #479 TLS chain fix · #478 StatefulSet label_selector · #477 PodSpec hostname/subdomain/initContainers
+8236741 gitignore fix · #475 JTI revocation · #474 CEL webhook · #473 typed annotations · #472 AcceptAnyCert+jti
 
 ## Main at
-833ad15 — pod Watch label selector + MAP spec + GC apiservices fix
+94f4c1e — refactor(store): split lib.rs into sqlite.rs submodule (#480)
