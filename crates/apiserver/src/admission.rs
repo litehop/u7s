@@ -1296,6 +1296,47 @@ fn parse_cel_object_body(
     Some(serde_json::Value::Object(map))
 }
 
+/// Validate the CEL expressions in `webhooks[*].matchConditions[*].expression`.
+///
+/// Kubernetes rejects webhook configurations with invalid CEL at creation time.
+/// Without this check, a POST with a malformed expression returns 200 OK instead
+/// of 422, which causes the admission webhook conformance test to fail.
+///
+/// We validate that every expression is non-empty and tokenizes to at least one
+/// meaningful token — the same tokenizer used for MutatingAdmissionPolicy CEL.
+pub(crate) fn validate_webhook_match_conditions_cel(obj: &serde_json::Value) -> Result<(), String> {
+    let webhooks = match obj.get("webhooks").and_then(|v| v.as_array()) {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+    for (wi, webhook) in webhooks.iter().enumerate() {
+        let conditions = match webhook.get("matchConditions").and_then(|v| v.as_array()) {
+            Some(c) => c,
+            None => continue,
+        };
+        for (ci, cond) in conditions.iter().enumerate() {
+            let expr = match cond.get("expression").and_then(|v| v.as_str()) {
+                Some(e) => e,
+                None => continue,
+            };
+            if expr.trim().is_empty() {
+                return Err(format!(
+                    "webhooks[{wi}].matchConditions[{ci}].expression: \
+                     CEL expression must not be empty"
+                ));
+            }
+            let tokens = tokenize_cel(expr.trim()).unwrap_or_default();
+            if tokens.is_empty() {
+                return Err(format!(
+                    "webhooks[{wi}].matchConditions[{ci}].expression: \
+                     invalid CEL expression: {expr:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Apply a partial object (apply configuration) to an object using JSON merge patch semantics.
 ///
 /// The partial object is recursively merged into the target: for each key in the
@@ -4250,6 +4291,65 @@ mod tests {
             result.unwrap(),
             serde_json::Value::Null,
             "missing field access on `object` must evaluate to Null, not panic"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — validate_webhook_match_conditions_cel
+    //
+    // The conformance test POSTs a ValidatingWebhookConfiguration with an invalid
+    // CEL matchConditions expression and expects a 422. Without this validation the
+    // apiserver returns 200 OK.
+    // ---------------------------------------------------------------------------
+
+    /// An empty matchConditions expression must be rejected.
+    /// Kubernetes rejects webhook configurations at creation time if any
+    /// matchConditions expression is empty — an empty string is not valid CEL.
+    #[test]
+    fn validate_webhook_match_conditions_cel_rejects_empty_expression() {
+        let obj = json!({
+            "webhooks": [{"matchConditions": [{"name": "check", "expression": ""}]}]
+        });
+        assert!(
+            validate_webhook_match_conditions_cel(&obj).is_err(),
+            "empty matchConditions expression must be rejected; \
+             without this the apiserver accepts invalid webhook configurations"
+        );
+    }
+
+    /// A whitespace-only expression must be rejected — equivalent to empty.
+    #[test]
+    fn validate_webhook_match_conditions_cel_rejects_whitespace_expression() {
+        let obj = json!({
+            "webhooks": [{"matchConditions": [{"name": "check", "expression": "   "}]}]
+        });
+        assert!(
+            validate_webhook_match_conditions_cel(&obj).is_err(),
+            "whitespace-only matchConditions expression must be rejected"
+        );
+    }
+
+    /// A valid CEL expression must pass validation.
+    #[test]
+    fn validate_webhook_match_conditions_cel_accepts_valid_expression() {
+        let obj = json!({
+            "webhooks": [{"matchConditions": [{"name": "check", "expression": "object.metadata.name == \"test\""}]}]
+        });
+        assert!(
+            validate_webhook_match_conditions_cel(&obj).is_ok(),
+            "valid CEL expression must pass matchConditions validation"
+        );
+    }
+
+    /// A webhook with no matchConditions must pass validation.
+    #[test]
+    fn validate_webhook_match_conditions_cel_accepts_absent_match_conditions() {
+        let obj = json!({
+            "webhooks": [{"name": "test.example.com"}]
+        });
+        assert!(
+            validate_webhook_match_conditions_cel(&obj).is_ok(),
+            "webhook without matchConditions must pass validation — matchConditions is optional"
         );
     }
 }

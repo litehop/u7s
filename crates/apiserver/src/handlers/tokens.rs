@@ -77,6 +77,10 @@ struct KubernetesClaims {
     aud: Vec<String>,
     exp: u64,
     iat: u64,
+    /// Unique token ID — enables per-token revocation and replay detection.
+    /// Each minted token gets a fresh UUID v4 so even two tokens for the same
+    /// SA issued at the same second are distinct.
+    jti: String,
     #[serde(rename = "kubernetes.io")]
     kubernetes_io: KubernetesClaimsExt,
 }
@@ -196,6 +200,7 @@ pub async fn create_token<S: Store>(
         aud: spec.audiences,
         exp: jwt_exp,
         iat: now,
+        jti: uuid::Uuid::new_v4().to_string(),
         kubernetes_io: KubernetesClaimsExt {
             namespace: ns.as_str().to_owned(),
             serviceaccount: SaRef {
@@ -313,6 +318,7 @@ mod tests {
             aud: vec!["https://kubernetes.default.svc".to_owned()],
             exp: 1_704_070_800,
             iat: 1_704_067_200,
+            jti: "test-jti-value".to_owned(),
             kubernetes_io: KubernetesClaimsExt {
                 namespace: "default".to_owned(),
                 serviceaccount: SaRef {
@@ -333,6 +339,10 @@ mod tests {
         );
         assert_eq!(v["kubernetes.io"]["namespace"], "default");
         assert_eq!(v["kubernetes.io"]["serviceaccount"]["name"], "my-sa");
+        assert_eq!(
+            v["jti"], "test-jti-value",
+            "jti claim must be serialised so it appears in minted tokens"
+        );
     }
 
     /// SA UID must appear in the kubernetes.io.serviceaccount.uid claim so that
@@ -347,6 +357,7 @@ mod tests {
             aud: vec!["https://kubernetes.default.svc".to_owned()],
             exp: 1_704_070_800,
             iat: 1_704_067_200,
+            jti: "test-jti".to_owned(),
             kubernetes_io: KubernetesClaimsExt {
                 namespace: "kube-system".to_owned(),
                 serviceaccount: SaRef {
@@ -1094,6 +1105,88 @@ mod handler_tests {
         assert!(
             parsed.contains('T'),
             "expirationTimestamp must be in RFC3339 format"
+        );
+    }
+
+    /// Every minted SA JWT must contain a non-empty jti (JWT ID) claim.
+    ///
+    /// The jti claim uniquely identifies each minted token. Without it, a leaked token
+    /// cannot be invalidated before its 24 h expiry — the entire token space for a given
+    /// SA within its TTL is a single credential. With jti, a revocation store can
+    /// reject individual tokens by ID. This test fails if jti is removed from the claims.
+    #[tokio::test]
+    async fn create_token_jwt_has_jti_claim() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-jti-test").await;
+
+        let result = create_token(
+            State(state),
+            Path(("default".to_owned(), "my-sa".to_owned())),
+            Bytes::new(),
+        )
+        .await;
+        let resp_body = match result {
+            Ok(r) => collect_body(r).await,
+            Err(e) => panic!("token request must succeed: status={}", e.0),
+        };
+
+        let token = resp_body["status"]["token"]
+            .as_str()
+            .expect("status.token must be present");
+        let claims = decode_jwt_claims(token);
+
+        let jti = claims["jti"].as_str().unwrap_or("");
+        assert!(
+            !jti.is_empty(),
+            "minted SA JWT must contain a non-empty jti claim — \
+             without jti, leaked tokens cannot be individually revoked before expiry"
+        );
+        assert_eq!(
+            jti.len(),
+            36,
+            "jti must be a UUID (36 chars including hyphens), got: {jti:?}"
+        );
+    }
+
+    /// Two successive token requests must produce JWTs with different jti values.
+    ///
+    /// If two tokens share the same jti, a revocation store cannot distinguish them —
+    /// revoking one would revoke the other, or neither. Each token must be individually
+    /// addressable. This test fails if jti is a constant or derived from non-random data.
+    #[tokio::test]
+    async fn create_token_successive_mints_have_unique_jti() {
+        let (state, store) = make_state_with_key();
+        seed_namespace(&store, "default").await;
+        seed_serviceaccount(&store, "default", "my-sa", "uid-jti-unique").await;
+
+        let mint = |state: AppState| async move {
+            let result = create_token(
+                State(state),
+                Path(("default".to_owned(), "my-sa".to_owned())),
+                Bytes::new(),
+            )
+            .await
+            .expect("mint must succeed");
+            let body = collect_body(result).await;
+            let token = body["status"]["token"]
+                .as_str()
+                .expect("token must be present")
+                .to_owned();
+            let claims = decode_jwt_claims(&token);
+            claims["jti"]
+                .as_str()
+                .expect("jti must be present")
+                .to_owned()
+        };
+
+        let jti1 = mint(state.clone()).await;
+        let jti2 = mint(state).await;
+
+        assert_ne!(
+            jti1, jti2,
+            "successive token mints for the same SA must produce different jti values — \
+             duplicate jti values prevent individual token revocation"
         );
     }
 
