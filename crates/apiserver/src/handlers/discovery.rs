@@ -1291,10 +1291,39 @@ fn scheduling_v1_resources() -> serde_json::Value {
 // OpenAPI stub endpoints
 // ---------------------------------------------------------------------------
 
+const PROTO_OPENAPI_V2_TYPE: &str = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf";
+
 /// Swagger 2.0 document with synthesized definitions for installed CRDs.
 /// Polls the store at request time so that newly-created CRDs appear without
 /// a restart — required by the CustomResourcePublishOpenAPI conformance test.
-pub async fn openapi_v2<S: Store>(State(state): State<AppState<S>>) -> Json<serde_json::Value> {
+pub async fn openapi_v2<S: Store>(
+    State(state): State<AppState<S>>,
+    headers: HeaderMap,
+) -> Response {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !accept.is_empty() {
+        let wants_proto = accept.contains(PROTO_OPENAPI_V2_TYPE);
+        let wants_json = accept.contains("application/json") || accept.contains("*/*");
+        if wants_proto && !wants_json {
+            return (
+                StatusCode::NOT_ACCEPTABLE,
+                Json(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "message": "only application/json is supported for /openapi/v2",
+                    "reason": "NotAcceptable",
+                    "code": 406
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let mut definitions = serde_json::Map::new();
 
     if let Ok(resp) = state
@@ -1311,10 +1340,8 @@ pub async fn openapi_v2<S: Store>(State(state): State<AppState<S>>) -> Json<serd
             };
             let group = &crd.spec.group;
             let kind = &crd.spec.names.kind;
-            // Reverse the domain segments: "example.io" → "io.example"
             let reversed: String = group.split('.').rev().collect::<Vec<_>>().join(".");
             for ver in &crd.spec.versions {
-                // Key format: io.example.v1.Foo
                 let key = format!("{}.{}.{}", reversed, ver.name, kind);
                 definitions.insert(
                     key,
@@ -1339,6 +1366,7 @@ pub async fn openapi_v2<S: Store>(State(state): State<AppState<S>>) -> Json<serd
         "paths": {},
         "definitions": definitions
     }))
+    .into_response()
 }
 
 /// Minimal OpenAPI v3 discovery stub — kubectl 1.28+ calls /openapi/v3 first.
@@ -2019,7 +2047,11 @@ mod tests {
     #[tokio::test]
     async fn openapi_v2_returns_swagger_2_0() {
         let state = make_state();
-        let Json(val) = openapi_v2(State(state)).await;
+        let resp = openapi_v2(State(state), axum::http::HeaderMap::new()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             val.get("swagger").and_then(|v| v.as_str()),
             Some("2.0"),
@@ -2842,7 +2874,11 @@ mod tests {
             "create_crd must succeed"
         );
 
-        let Json(doc) = openapi_v2(State(state)).await;
+        let resp = openapi_v2(State(state), axum::http::HeaderMap::new()).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let defs = doc["definitions"]
             .as_object()
             .expect("definitions must be a JSON object");
@@ -2915,6 +2951,76 @@ mod tests {
         assert_eq!(
             accepted["status"], "True",
             "NamesAccepted condition must be True so controllers see the CRD as ready"
+        );
+    }
+
+    // GET /openapi/v2 with a proto-only Accept must return 406 so that client-go retries
+    // with JSON. Without this, client-go ignores Content-Type: application/json and
+    // proto-decodes the JSON body, producing "invalid wire-format data" and blocking
+    // all kubectl apply / validate operations.
+    #[tokio::test]
+    async fn openapi_v2_proto_only_accept_returns_406() {
+        let state = make_state();
+        let app = Router::new()
+            .route("/openapi/v2", get(openapi_v2))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/openapi/v2")
+            .header(
+                "Accept",
+                "application/com.github.proto-openapi.spec.v2@v1.0+protobuf",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::NOT_ACCEPTABLE,
+            "proto-only Accept on /openapi/v2 must return 406 — \
+             client-go ignores Content-Type and proto-decodes JSON, producing \
+             'invalid wire-format data' and breaking kubectl apply"
+        );
+    }
+
+    // GET /openapi/v2 with proto + json in Accept must return 200 with JSON —
+    // kubectl always sends both; the server must serve JSON so that schema
+    // validation works and kubectl apply does not error.
+    #[tokio::test]
+    async fn openapi_v2_proto_and_json_accept_returns_200_json() {
+        let state = make_state();
+        let app = Router::new()
+            .route("/openapi/v2", get(openapi_v2))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/openapi/v2")
+            .header(
+                "Accept",
+                "application/com.github.proto-openapi.spec.v2@v1.0+protobuf, application/json",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "proto+json Accept on /openapi/v2 must return 200 — \
+             kubectl sends both types and must receive a JSON schema to validate resources"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must be valid JSON");
+        assert_eq!(
+            val.get("swagger").and_then(|v| v.as_str()),
+            Some("2.0"),
+            "response must be a Swagger 2.0 document"
         );
     }
 }
