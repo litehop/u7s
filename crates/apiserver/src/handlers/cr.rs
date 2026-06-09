@@ -8,7 +8,7 @@ use bytes::Bytes;
 use u7s_store::{ListOptions, Store};
 
 use crate::{
-    handlers::crd::CustomResourceDefinition,
+    handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
     keys::cluster_object_key,
     state::AppState,
     status::Status,
@@ -166,8 +166,14 @@ pub struct CrContext {
 }
 
 /// Find the CRD whose spec.group == group and spec.names.plural == plural.
-/// Returns Err(404) if not found, Err(404) if the requested version is not served,
-/// and the CrContext on success.
+///
+/// Returns:
+/// - `Ok(CrContext)` when a matching, served CRD is found.
+/// - `Err(410 Gone)` when the group was registered but its CRD has been deleted.
+///   This signals informers (client-go reflector) to stop watching and clean up.
+///   Without 410, informers treat the response as a transient 404 and retry
+///   indefinitely, causing namespace deletion to hang.
+/// - `Err(404 NotFound)` when the group/version/plural was never registered.
 pub async fn find_crd<S: Store>(
     state: &AppState<S>,
     group: &str,
@@ -242,6 +248,22 @@ pub async fn find_crd<S: Store>(
             storage_version,
             conversion_webhook_client_config,
         });
+    }
+
+    // No live CRD found. Check whether this group was previously deleted.
+    // If a tombstone exists, return 410 Gone so informers stop retrying.
+    let tombstone_key = deleted_group_tombstone_key(group);
+    let tombstone_exists = state
+        .store
+        .get(&tombstone_key)
+        .await
+        .unwrap_or(None)
+        .is_some();
+
+    if tombstone_exists {
+        return Err(Status::gone(format!(
+            "the custom resource definition for {group}/{version}/{plural} has been deleted"
+        )));
     }
 
     Err(Status::not_found(
@@ -5284,6 +5306,125 @@ mod tests {
                 .unwrap_or("")
                 .contains("being terminated"),
             "error message must say namespace is being terminated"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression: deleted CRD group must return 410 Gone, not 404
+    //
+    // When a CRD is deleted, client-go informers watching its endpoints keep
+    // retrying on 404 (treats it as transient) but stop on 410 Gone. Without 410,
+    // namespace deletion hangs because the GC informer keeps the resource type
+    // "alive" from its perspective, preventing the namespace controller from
+    // draining all resources and removing the kubernetes finalizer.
+    // ---------------------------------------------------------------------------
+
+    // After a CRD is deleted, LIST for its group/version/plural must return 410 Gone.
+    // If the fix is reverted (tombstone not written, or find_crd ignores it), this
+    // test returns 404 instead of 410 and fails.
+    #[tokio::test]
+    async fn deleted_crd_group_returns_410_gone_not_404() {
+        use crate::handlers::crd;
+
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        // Verify the CRD is reachable before deletion.
+        assert!(
+            find_crd(&state, "argoproj.io", "v1alpha1", "applications")
+                .await
+                .is_ok(),
+            "find_crd must succeed before deletion"
+        );
+
+        // Delete the CRD — this must write the tombstone.
+        assert!(
+            crd::delete_crd(
+                State(state.clone()),
+                axum::extract::Path("applications.argoproj.io".to_string()),
+            )
+            .await
+            .is_ok(),
+            "delete_crd must succeed"
+        );
+
+        // Now find_crd must return 410 Gone, not 404 Not Found.
+        let err = match find_crd(&state, "argoproj.io", "v1alpha1", "applications").await {
+            Ok(_) => panic!("find_crd must fail after CRD deletion"),
+            Err(e) => e,
+        };
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 410,
+            "deleted CRD group must return 410 Gone so informers stop retrying — \
+             404 causes infinite retry loops and namespace deletion hangs"
+        );
+        assert_eq!(
+            json["reason"], "Gone",
+            "reason must be 'Gone' to match Kubernetes informer semantics"
+        );
+    }
+
+    // A group that was never registered must still return 404 (not 410).
+    // 410 is only valid for groups that existed — an unknown group is a genuine 404.
+    #[tokio::test]
+    async fn never_registered_group_returns_404_not_410() {
+        let state = make_state();
+
+        let err = match find_crd(&state, "never-existed.example.com", "v1", "things").await {
+            Ok(_) => panic!("find_crd must fail for unknown group"),
+            Err(e) => e,
+        };
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 404,
+            "never-registered group must return 404 Not Found — \
+             returning 410 would mislead informers about a group that was never installed"
+        );
+        assert_eq!(json["reason"], "NotFound");
+    }
+
+    // After a CRD is deleted, list_cr_namespaced must return 410 Gone (not 404).
+    // This covers the HTTP handler path that informers actually call.
+    #[tokio::test]
+    async fn list_cr_namespaced_returns_410_after_crd_deleted() {
+        use crate::handlers::crd;
+
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        // Delete the CRD.
+        crd::delete_crd(
+            State(state.clone()),
+            axum::extract::Path("applications.argoproj.io".to_string()),
+        )
+        .await
+        .expect("delete_crd must succeed");
+
+        let err = expect_err_status(
+            list_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    "default".to_string(),
+                    "applications".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                no_watch_query(),
+                "test-user".to_string(),
+            )
+            .await,
+            "list_cr_namespaced must error after CRD deletion",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 410,
+            "list after CRD deletion must return 410 Gone, not 404 — \
+             404 causes GC informer to retry indefinitely, blocking namespace deletion"
         );
     }
 }

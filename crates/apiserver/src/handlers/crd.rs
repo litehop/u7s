@@ -30,6 +30,14 @@ fn list_prefix() -> String {
     format!("/registry/{GROUP}/{PLURAL}/")
 }
 
+/// Key written as a tombstone when a CRD group is permanently deleted.
+/// Presence of this key tells the CR handlers to return 410 Gone instead of
+/// 404 Not Found — informers treat 410 as "stop watching" and 404 as a
+/// transient error that should be retried indefinitely.
+pub(crate) fn deleted_group_tombstone_key(group: &str) -> String {
+    format!("/registry/apiextensions.k8s.io/deleted-groups/{group}")
+}
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -455,18 +463,42 @@ pub async fn delete_crd<S: Store>(
     let key = store_key(&name);
 
     // Check existence first to return 404 rather than a store error.
-    let _ = state
+    let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, KIND))?;
 
+    // Extract the group before deleting so we can write the tombstone.
+    let group: String = serde_json::from_slice::<serde_json::Value>(&stored.value)
+        .ok()
+        .and_then(|v| v["spec"]["group"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
     state
         .store
         .delete(&key, None)
         .await
         .map_err(|e| store_err_crd(e, &name))?;
+
+    // Write a tombstone so CR handlers can return 410 Gone (not 404) for this
+    // group after deletion. Informers treat 410 as "stop watching" and 404 as
+    // a transient error retried indefinitely — without this, namespace deletion
+    // hangs because the GC informer keeps retrying the deleted CR endpoint.
+    //
+    // The value must be a JSON object (not a scalar) because the store's
+    // stamp_resource_version function indexes into ["metadata"]["resourceVersion"].
+    if !group.is_empty() {
+        let tombstone_key = deleted_group_tombstone_key(&group);
+        let tombstone_val =
+            serde_json::to_vec(&serde_json::json!({ "group": &group })).unwrap_or_default();
+        // Use None as expected_rv to unconditionally create-or-update.
+        let _ = state
+            .store
+            .put(&tombstone_key, bytes::Bytes::from(tombstone_val), None)
+            .await;
+    }
 
     Ok(Json(serde_json::json!({
         "kind": "Status",
