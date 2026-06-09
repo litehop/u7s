@@ -2114,15 +2114,22 @@ async fn run_validating_admission_policies<S: Store>(
                 .ok()
             });
         if binding_ns_selector.is_some() {
-            if let Some(ns) = ctx.namespace {
-                let ns_labels = fetch_namespace_labels(state, ns).await;
-                if !label_selector_matches(binding_ns_selector.as_ref(), &ns_labels) {
-                    tracing::debug!(
-                        "admission: VAP binding \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
-                        binding["metadata"]["name"].as_str().unwrap_or("unknown"),
-                        ns
-                    );
+            match ctx.namespace {
+                None => {
+                    // Cluster-scoped resources are never selected by a namespaceSelector.
+                    // Skip this binding.
                     continue;
+                }
+                Some(ns) => {
+                    let ns_labels = fetch_namespace_labels(state, ns).await;
+                    if !label_selector_matches(binding_ns_selector.as_ref(), &ns_labels) {
+                        tracing::debug!(
+                            "admission: VAP binding \"{}\" skipped: namespace \"{}\" does not match namespaceSelector",
+                            binding["metadata"]["name"].as_str().unwrap_or("unknown"),
+                            ns
+                        );
+                        continue;
+                    }
                 }
             }
         }
@@ -5501,6 +5508,322 @@ mod tests {
             result.is_ok(),
             "admissionregistration.k8s.io resources must be exempt from VAP evaluation \
              to prevent bootstrap deadlocks; the deny-all VAP must not fire for its own creation"
+        );
+    }
+
+    /// VAP denial must return a well-formed StatusError carrying code=403 and a non-empty message.
+    ///
+    /// Kubernetes clients parse the response body as a Status object. If the body is absent or
+    /// not a valid Status JSON, clients see `invalid JSON: expected value at line 1 column 1`
+    /// and cannot display the policy violation reason to the user.
+    ///
+    /// Reverting the `should_deny` path from run_validating_admission_policies or replacing
+    /// StatusError with a different error type would cause the body to be absent or wrong-typed.
+    #[tokio::test]
+    async fn vap_denial_produces_well_formed_status_error_with_code_403() {
+        use axum::response::IntoResponse as _;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "deny-configmaps"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["configmaps"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "validations": [{"expression": "false", "message": "configmaps are forbidden by policy"}]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/deny-configmaps",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "deny-configmaps-binding"},
+            "spec": {
+                "policyName": "deny-configmaps",
+                "validationActions": ["Deny"]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/deny-configmaps-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj =
+            json!({"kind": "ConfigMap", "metadata": {"name": "test-cm", "namespace": "default"}});
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "test-cm",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+
+        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        assert!(
+            result.is_err(),
+            "VAP with expression=false must deny the request"
+        );
+
+        let err = result.unwrap_err();
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "VAP denial must return HTTP 403 so clients can identify it as a policy violation"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        assert!(
+            !body.is_empty(),
+            "VAP denial response body must not be empty; \
+             an empty body causes clients to fail with 'invalid JSON: expected value at line 1 column 1'"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("VAP denial body must be valid JSON");
+        assert_eq!(
+            json["code"], 403,
+            "VAP denial Status.code must be 403 so clients can distinguish it from other errors"
+        );
+        assert_eq!(
+            json["kind"], "Status",
+            "VAP denial body must have kind=Status matching the Kubernetes Status API object"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .map(|m| !m.is_empty())
+                .unwrap_or(false),
+            "VAP denial Status.message must be non-empty so users see the policy violation reason"
+        );
+    }
+
+    /// A VAP binding with namespaceSelector must not apply to resources in namespaces
+    /// that do not have the required label.
+    ///
+    /// The conformance test creates a binding targeting a specific namespace label and a
+    /// marker Deployment in a namespace without that label. The marker must NOT be denied.
+    ///
+    /// Reverting the namespaceSelector fetch-and-check (or always applying the binding
+    /// regardless of namespace labels) makes this test fail because the deny-all VAP
+    /// would reject the deployment in the non-matching namespace.
+    #[tokio::test]
+    async fn vap_namespace_selector_non_matching_namespace_skips_binding() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "no-label-ns",
+                "labels": {"kubernetes.io/metadata.name": "no-label-ns"}
+            }
+        });
+        store
+            .put(
+                "/registry/namespaces/no-label-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "deny-all-deploys"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "validations": [{"expression": "false"}]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/deny-all-deploys",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "deny-all-deploys-binding"},
+            "spec": {
+                "policyName": "deny-all-deploys",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {
+                        "matchLabels": {"env": "test"}
+                    }
+                }
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/deny-all-deploys-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let deploy = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "marker-deploy", "namespace": "no-label-ns"},
+            "spec": {"replicas": 1}
+        });
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "marker-deploy",
+            namespace: Some("no-label-ns"),
+            operation: "CREATE",
+        };
+
+        let result = run_validating_webhooks(&state, &deploy, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "VAP binding with namespaceSelector env=test must not apply to namespace 'no-label-ns' \
+             which lacks that label; incorrectly denying the marker Deployment causes conformance \
+             tests to time out waiting for a resource that can never be created"
+        );
+    }
+
+    /// A VAP binding with namespaceSelector must not apply to cluster-scoped resources.
+    ///
+    /// Per Kubernetes spec: if the object is a cluster-scoped resource (no namespace), it is
+    /// never selected by a namespaceSelector. Without this fix, a binding with a namespaceSelector
+    /// would apply to cluster-scoped resources like Nodes, causing the conformance test
+    /// `can restrict access by-node` to fail.
+    ///
+    /// Reverting the fix (removing the `None => continue` branch) makes this test fail because
+    /// the binding would apply to the Node and deny the request.
+    #[tokio::test]
+    async fn vap_namespace_selector_skips_cluster_scoped_resources() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "deny-nodes"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["nodes"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "validations": [{"expression": "false"}]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/deny-nodes",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "deny-nodes-binding"},
+            "spec": {
+                "policyName": "deny-nodes",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {
+                        "matchLabels": {"env": "test"}
+                    }
+                }
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/deny-nodes-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-node-1"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "nodes",
+            name: "worker-node-1",
+            namespace: None,
+            operation: "CREATE",
+        };
+
+        let result = run_validating_webhooks(&state, &node, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "VAP binding with namespaceSelector must never apply to cluster-scoped resources \
+             (namespace=None); applying it to Nodes would deny node registration and break the cluster"
         );
     }
 }
