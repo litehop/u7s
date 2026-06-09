@@ -1,0 +1,24 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: drainables.drain.example.com
+spec:
+  group: drain.example.com
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                value:
+                  type: string
+  scope: Namespaced
+  names:
+    plural: drainables
+    singular: drainable
+    kind: Drainable
