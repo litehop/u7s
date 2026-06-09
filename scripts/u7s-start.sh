@@ -33,7 +33,9 @@ if [ "$_VM" = "lima-node" ]; then
 else
   WORKDIR="$REPO/temp/u7s-${_VM}"
 fi
-BINARY="$REPO/target/release/u7s-apiserver"
+# U7S_BINARY allows an explicit binary path (e.g. from an isolated target dir
+# built in a worker worktree). Falls back to the standard release binary.
+BINARY="${U7S_BINARY:-$REPO/target/release/u7s-apiserver}"
 PORT=6443
 HOST_IP="${U7S_HOST_IP:-127.0.0.1}"
 
@@ -62,7 +64,9 @@ pkill -f konnectivity-server 2>/dev/null || true
 if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
     echo "Port $HOST_IP:$PORT in use — killing existing apiserver before restart ..." >&2
-    pkill -f u7s-apiserver 2>/dev/null || true
+    # Scope pkill to HOST_IP so we don't kill a mayor's apiserver running on
+    # a different loopback address (e.g. 127.0.0.1 vs 127.0.0.2).
+    pkill -f "u7s-apiserver.*${HOST_IP}" 2>/dev/null || true
     sleep 1
   else
     echo "error: port $HOST_IP:$PORT is already in use." >&2

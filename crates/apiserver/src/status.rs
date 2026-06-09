@@ -219,4 +219,24 @@ impl Status {
             },
         )
     }
+
+    /// 410 Gone — the resource existed but was permanently deleted.
+    ///
+    /// Informers (client-go reflector) distinguish 410 Gone from 404 Not Found:
+    /// 410 means "stop retrying, this endpoint is gone"; 404 is treated as a
+    /// transient error and retried with exponential backoff indefinitely.
+    pub fn gone(message: String) -> StatusError {
+        StatusError(
+            StatusCode::GONE,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "Gone",
+                code: 410,
+                metadata: None,
+            },
+        )
+    }
 }
