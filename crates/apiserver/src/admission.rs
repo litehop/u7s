@@ -5503,4 +5503,121 @@ mod tests {
              to prevent bootstrap deadlocks; the deny-all VAP must not fire for its own creation"
         );
     }
+
+    /// VAP denial must return a well-formed StatusError carrying code=403 and a non-empty message.
+    ///
+    /// Kubernetes clients parse the response body as a Status object. If the body is absent or
+    /// not a valid Status JSON, clients see `invalid JSON: expected value at line 1 column 1`
+    /// and cannot display the policy violation reason to the user.
+    ///
+    /// Reverting the `should_deny` path from run_validating_admission_policies or replacing
+    /// StatusError with a different error type would cause the body to be absent or wrong-typed.
+    #[tokio::test]
+    async fn vap_denial_produces_well_formed_status_error_with_code_403() {
+        use axum::response::IntoResponse as _;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "deny-configmaps"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["configmaps"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "validations": [{"expression": "false", "message": "configmaps are forbidden by policy"}]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/deny-configmaps",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "deny-configmaps-binding"},
+            "spec": {
+                "policyName": "deny-configmaps",
+                "validationActions": ["Deny"]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/deny-configmaps-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj =
+            json!({"kind": "ConfigMap", "metadata": {"name": "test-cm", "namespace": "default"}});
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "test-cm",
+            namespace: Some("default"),
+            operation: "CREATE",
+        };
+
+        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        assert!(
+            result.is_err(),
+            "VAP with expression=false must deny the request"
+        );
+
+        let err = result.unwrap_err();
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "VAP denial must return HTTP 403 so clients can identify it as a policy violation"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        assert!(
+            !body.is_empty(),
+            "VAP denial response body must not be empty; \
+             an empty body causes clients to fail with 'invalid JSON: expected value at line 1 column 1'"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("VAP denial body must be valid JSON");
+        assert_eq!(
+            json["code"], 403,
+            "VAP denial Status.code must be 403 so clients can distinguish it from other errors"
+        );
+        assert_eq!(
+            json["kind"], "Status",
+            "VAP denial body must have kind=Status matching the Kubernetes Status API object"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .map(|m| !m.is_empty())
+                .unwrap_or(false),
+            "VAP denial Status.message must be non-empty so users see the policy violation reason"
+        );
+    }
 }
