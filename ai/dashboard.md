@@ -1,30 +1,32 @@
 # Dashboard
-2026-06-09T09:25Z — Both PRs still queued in CI (all checks null).
+2026-06-09T14:02Z — queue empty; all known VAP fixes landed; ready for next run.
 
 ## Operator attention needed
-None.
+- **Next action: run VAP focus** — all 5 fixes merged (#496–#501). Run to verify spec.replicas×2, PATCH /status, SA token all pass cleanly.
+- **SA token race** — KCM may not issue token within ~2s of pod start. If it still fails after clean run, file a bead to investigate token issuance latency.
 
 ## Open PRs
-- **#495** fix(admission): VAP/VAPB proto decode (mayor-2lot) — 17 checks queued
-- **#496** fix(admission): proto replicas field + CEL eval (mayor-fmqw) — 17 checks queued
+None.
 
 ## In-flight workers
-None (both completed, PRs open).
+None.
 
-## Active worktrees
-- `ai/worktrees/vap-400-mayor-2lot` (awaiting #495 merge)
-- `ai/worktrees/cel-replicas-mayor-fmqw` (awaiting #496 merge)
+## Ready beads
+None — queue empty.
 
-## Recent merges (this session)
-- #494 fix(admission): set VAP/VAPB status.observedGeneration on write (mayor-xw6c)
-- 7aa3ccd fix(scripts): guard empty TARGET_DIR_ARGS bash 3.2 array (direct push)
-- #493 fix(discovery): return 406 for proto-only Accept on /openapi/v2 (mayor-bp6k)
-- #492 fix(admission): thread authenticated UserInfo into AdmissionContext (mayor-bgpu)
-- #491 fix(admission): request.userInfo support in VAP CEL evaluator (mayor-gfpm)
-- #490 fix(apiserver): JSON Status 404 fallback for unmatched routes (mayor-upqy)
+## Deferred
+mayor-52wo (OpenAPI blob) · mayor-j7to (Argo CD RBAC) · mayor-rvkq (CRD CEL validation)
 
-## Bead queue
-Ready: none. Deferred: mayor-52wo · mayor-j7to · mayor-rvkq
+## Recent merges
+- #501 test(admission): store round-trip regression for VAP spec.replicas (mayor-tj0j)
+- #500 fix(namespace): delete namespace-scoped CRDs on namespace deletion (mayor-k0tn)
+- #499 chore(deps): uuid v1.23.3
+- #498 fix(auth): sa.key in PKCS#1 PEM for KCM (mayor-at5v)
+- #497 fix(admission): write_vap_status on PATCH /status (mayor-r381)
+- #496 fix(admission): preserve spec.replicas in proto decoders (mayor-fmqw)
+
+## Worktree hygiene
+Clean — no active worktrees.
 
 ## Main at
-5529cb8 — docs(dashboard): update — #495 #496 in CI, queue drained
+c546d8f — test(admission): store round-trip regression for VAP spec.replicas (#501)
