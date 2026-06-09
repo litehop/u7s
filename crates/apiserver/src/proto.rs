@@ -5367,6 +5367,213 @@ pub fn decode_mutatingadmissionpolicybinding_proto(data: &[u8]) -> Option<serde_
     Some(result)
 }
 
+// ---------------------------------------------------------------------------
+// ValidatingAdmissionPolicy / ValidatingAdmissionPolicyBinding proto structs
+// Source: k8s.io/api/admissionregistration/v1/generated.proto (v0.36.1)
+// Field numbers match the canonical proto definition.
+// ---------------------------------------------------------------------------
+
+/// Validation — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=expression, field 2=message, field 3=reason, field 4=messageExpression
+#[derive(Clone, PartialEq, Message)]
+struct VapValidation {
+    /// expression (field 1, string)
+    #[prost(string, tag = "1")]
+    expression: String,
+    /// message (field 2, string)
+    #[prost(string, tag = "2")]
+    message: String,
+    /// reason (field 3, string)
+    #[prost(string, tag = "3")]
+    reason: String,
+    /// messageExpression (field 4, string)
+    #[prost(string, tag = "4")]
+    message_expression: String,
+}
+
+/// ValidatingAdmissionPolicySpec — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=paramKind, field 2=matchConstraints, field 3=validations (repeated),
+/// field 4=failurePolicy, field 5=auditAnnotations (repeated), field 6=matchConditions (repeated)
+#[derive(Clone, PartialEq, Message)]
+struct VapSpec {
+    /// paramKind (field 1, message ParamKind)
+    #[prost(message, tag = "1")]
+    param_kind: Option<MapParamKind>,
+    /// matchConstraints (field 2, message MatchResources)
+    #[prost(message, tag = "2")]
+    match_constraints: Option<MapMatchResources>,
+    /// validations (field 3, repeated Validation)
+    #[prost(message, repeated, tag = "3")]
+    validations: Vec<VapValidation>,
+    /// failurePolicy (field 4, string)
+    #[prost(string, tag = "4")]
+    failure_policy: String,
+    /// matchConditions (field 6, repeated MatchCondition)
+    #[prost(message, repeated, tag = "6")]
+    match_conditions: Vec<MapMatchCondition>,
+}
+
+/// ValidatingAdmissionPolicy — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=metadata (ObjectMeta), field 2=spec (ValidatingAdmissionPolicySpec)
+#[derive(Clone, PartialEq, Message)]
+struct ValidatingAdmissionPolicy {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message ValidatingAdmissionPolicySpec)
+    #[prost(message, tag = "2")]
+    spec: Option<VapSpec>,
+}
+
+/// Decode a proto-encoded ValidatingAdmissionPolicy into a serde_json::Value.
+///
+/// The ValidatingAdmissionPolicy conformance test POSTs with Content-Type:
+/// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
+/// returns None, extract_body returns raw proto bytes, and the handler returns
+/// 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_validatingadmissionpolicy_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = ValidatingAdmissionPolicy::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut result = serde_json::json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicy",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::json!({});
+        if let Some(mc) = spec.match_constraints {
+            spec_json["matchConstraints"] = map_match_resources_to_json(mc);
+        }
+        if !spec.failure_policy.is_empty() {
+            spec_json["failurePolicy"] = serde_json::Value::String(spec.failure_policy);
+        }
+        if let Some(pk) = spec.param_kind {
+            spec_json["paramKind"] = serde_json::json!({
+                "apiVersion": pk.api_version,
+                "kind": pk.kind,
+            });
+        }
+        if !spec.validations.is_empty() {
+            let vals: Vec<serde_json::Value> = spec
+                .validations
+                .into_iter()
+                .map(|v| {
+                    let mut entry = serde_json::json!({"expression": v.expression});
+                    if !v.message.is_empty() {
+                        entry["message"] = serde_json::Value::String(v.message);
+                    }
+                    if !v.reason.is_empty() {
+                        entry["reason"] = serde_json::Value::String(v.reason);
+                    }
+                    if !v.message_expression.is_empty() {
+                        entry["messageExpression"] =
+                            serde_json::Value::String(v.message_expression);
+                    }
+                    entry
+                })
+                .collect();
+            spec_json["validations"] = serde_json::Value::Array(vals);
+        }
+        if !spec.match_conditions.is_empty() {
+            let conds: Vec<serde_json::Value> = spec
+                .match_conditions
+                .into_iter()
+                .map(|c| serde_json::json!({"name": c.name, "expression": c.expression}))
+                .collect();
+            spec_json["matchConditions"] = serde_json::Value::Array(conds);
+        }
+        result["spec"] = spec_json;
+    }
+    Some(result)
+}
+
+// ---------------------------------------------------------------------------
+// ValidatingAdmissionPolicyBinding proto structs
+// ---------------------------------------------------------------------------
+
+/// ValidatingAdmissionPolicyBindingSpec — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=policyName (string), field 2=paramRef (ParamRef),
+/// field 3=matchResources (MatchResources), field 4=validationActions (repeated string)
+#[derive(Clone, PartialEq, Message)]
+struct VapbSpec {
+    /// policyName (field 1, string)
+    #[prost(string, tag = "1")]
+    policy_name: String,
+    /// paramRef (field 2, message ParamRef)
+    #[prost(message, tag = "2")]
+    param_ref: Option<MapbParamRef>,
+    /// matchResources (field 3, message MatchResources)
+    #[prost(message, tag = "3")]
+    match_resources: Option<MapMatchResources>,
+    /// validationActions (field 4, repeated string)
+    #[prost(string, repeated, tag = "4")]
+    validation_actions: Vec<String>,
+}
+
+/// ValidatingAdmissionPolicyBinding — admissionregistration.k8s.io/v1/generated.proto
+/// field 1=metadata (ObjectMeta), field 2=spec (ValidatingAdmissionPolicyBindingSpec)
+#[derive(Clone, PartialEq, Message)]
+struct ValidatingAdmissionPolicyBinding {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message ValidatingAdmissionPolicyBindingSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<VapbSpec>,
+}
+
+/// Decode a proto-encoded ValidatingAdmissionPolicyBinding into a serde_json::Value.
+///
+/// The ValidatingAdmissionPolicyBinding conformance test POSTs with Content-Type:
+/// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
+/// returns None, extract_body returns raw proto bytes, and the handler returns
+/// 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_validatingadmissionpolicybinding_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = ValidatingAdmissionPolicyBinding::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut result = serde_json::json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicyBinding",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::json!({});
+        if !spec.policy_name.is_empty() {
+            spec_json["policyName"] = serde_json::Value::String(spec.policy_name);
+        }
+        if let Some(pr) = spec.param_ref {
+            let mut pr_json = serde_json::json!({});
+            if !pr.name.is_empty() {
+                pr_json["name"] = serde_json::Value::String(pr.name);
+            }
+            if !pr.namespace.is_empty() {
+                pr_json["namespace"] = serde_json::Value::String(pr.namespace);
+            }
+            if !pr.parameter_not_found_action.is_empty() {
+                pr_json["parameterNotFoundAction"] =
+                    serde_json::Value::String(pr.parameter_not_found_action);
+            }
+            if let Some(sel) = pr.selector {
+                pr_json["selector"] = label_selector_to_json(sel);
+            }
+            spec_json["paramRef"] = pr_json;
+        }
+        if let Some(mr) = spec.match_resources {
+            spec_json["matchResources"] = map_match_resources_to_json(mr);
+        }
+        if !spec.validation_actions.is_empty() {
+            spec_json["validationActions"] = serde_json::Value::Array(
+                spec.validation_actions
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
+        result["spec"] = spec_json;
+    }
+    Some(result)
+}
+
 // --- k8s.io/api/networking/v1/generated.proto ---
 
 /// IngressClassSpec — networking.k8s.io/v1/generated.proto
@@ -5566,6 +5773,8 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "MutatingWebhookConfiguration" => decode_mutatingwebhookconfiguration_proto(raw),
         "MutatingAdmissionPolicy" => decode_mutatingadmissionpolicy_proto(raw),
         "MutatingAdmissionPolicyBinding" => decode_mutatingadmissionpolicybinding_proto(raw),
+        "ValidatingAdmissionPolicy" => decode_validatingadmissionpolicy_proto(raw),
+        "ValidatingAdmissionPolicyBinding" => decode_validatingadmissionpolicybinding_proto(raw),
         "IngressClass" => decode_ingressclass_proto(raw),
         "PriorityClass" => decode_priorityclass_proto(raw),
         "ControllerRevision" => decode_controllerrevision_proto(raw),
@@ -11260,6 +11469,205 @@ mod tests {
     #[test]
     fn decode_mutatingadmissionpolicybinding_proto_returns_none_for_garbage() {
         assert!(decode_mutatingadmissionpolicybinding_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_validatingadmissionpolicy_proto / decode_core_proto_by_kind ValidatingAdmissionPolicy
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch ValidatingAdmissionPolicy proto and extract
+    /// metadata. Without this decoder, the ValidatingAdmissionPolicy conformance test
+    /// fails with 400 "invalid JSON: expected value at line 1 column 1" when client-go POSTs
+    /// with Content-Type: application/vnd.kubernetes.protobuf.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_validatingadmissionpolicy() {
+        let obj_meta = encode_length_delimited(1, b"test-vap");
+        let proto = encode_length_delimited(1, &obj_meta);
+
+        let result = decode_core_proto_by_kind("ValidatingAdmissionPolicy", &proto).expect(
+            "ValidatingAdmissionPolicy must decode via decode_core_proto_by_kind — without \
+             this, the ValidatingAdmissionPolicy API conformance test fails with 400 on POST \
+             because client-go sends Content-Type: application/vnd.kubernetes.protobuf",
+        );
+
+        assert_eq!(
+            result["kind"], "ValidatingAdmissionPolicy",
+            "kind must be ValidatingAdmissionPolicy so Object::from_bytes routes the object correctly"
+        );
+        assert_eq!(result["apiVersion"], "admissionregistration.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "test-vap",
+            "name must be extracted so the object is stored under the correct key"
+        );
+    }
+
+    /// PUT to ValidatingAdmissionPolicy must preserve the spec field (validations, failurePolicy,
+    /// matchConstraints). Without spec decoding, a PUT with a new spec was silently dropped and the
+    /// stored object retained the old spec — the conformance test "updated object should have the
+    /// applied spec" then fails.
+    ///
+    /// ValidatingAdmissionPolicySpec field numbers (k8s 1.36 proto):
+    ///   paramKind=1, matchConstraints=2, validations=3, failurePolicy=4, matchConditions=6
+    /// Validation field numbers: expression=1, message=2, reason=3, messageExpression=4
+    #[test]
+    fn decode_validatingadmissionpolicy_proto_preserves_spec_on_put() {
+        // Build Validation: field 1=expression, field 2=message
+        let mut validation: Vec<u8> = Vec::new();
+        validation.extend_from_slice(&encode_length_delimited(1, b"object.spec.replicas <= 5"));
+        validation.extend_from_slice(&encode_length_delimited(2, b"replicas must be <= 5"));
+
+        // Build Rule: field 1=apiGroups, field 2=apiVersions, field 3=resources
+        let mut rule: Vec<u8> = Vec::new();
+        rule.extend_from_slice(&encode_length_delimited(1, b"apps"));
+        rule.extend_from_slice(&encode_length_delimited(2, b"v1"));
+        rule.extend_from_slice(&encode_length_delimited(3, b"deployments"));
+
+        // Build RuleWithOperations: field 1=operations, field 2=rule
+        let mut rwo: Vec<u8> = Vec::new();
+        rwo.extend_from_slice(&encode_length_delimited(1, b"CREATE"));
+        rwo.extend_from_slice(&encode_length_delimited(2, &rule));
+
+        // Build NamedRuleWithOperations: field 2=ruleWithOperations
+        let named_rule = encode_length_delimited(2, &rwo);
+
+        // Build MatchResources: field 3=resourceRules
+        let match_constraints = encode_length_delimited(3, &named_rule);
+
+        // Build ValidatingAdmissionPolicySpec:
+        //   field 2=matchConstraints, field 3=validations, field 4=failurePolicy
+        let mut spec: Vec<u8> = Vec::new();
+        spec.extend_from_slice(&encode_length_delimited(2, &match_constraints));
+        spec.extend_from_slice(&encode_length_delimited(3, &validation));
+        spec.extend_from_slice(&encode_length_delimited(4, b"Fail"));
+
+        // Build ValidatingAdmissionPolicy: field 1=metadata, field 2=spec
+        let obj_meta = encode_length_delimited(1, b"test-vap-spec");
+        let mut proto = encode_length_delimited(1, &obj_meta);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result = decode_validatingadmissionpolicy_proto(&proto)
+            .expect("ValidatingAdmissionPolicy with spec must decode successfully");
+
+        assert_eq!(result["metadata"]["name"], "test-vap-spec");
+
+        assert_eq!(
+            result["spec"]["failurePolicy"], "Fail",
+            "spec.failurePolicy must survive proto decode — without it, a PUT changing \
+             failurePolicy has no effect (spec is dropped by decoder)"
+        );
+
+        let validations = result["spec"]["validations"].as_array().expect(
+            "spec.validations must be a JSON array — absent validations mean the VAP \
+             has no CEL rules to enforce after a PUT",
+        );
+        assert_eq!(
+            validations.len(),
+            1,
+            "one validation must survive the proto round-trip"
+        );
+        assert_eq!(
+            validations[0]["expression"], "object.spec.replicas <= 5",
+            "validation expression must be preserved — without it, VAP stops enforcing the rule"
+        );
+        assert_eq!(
+            validations[0]["message"], "replicas must be <= 5",
+            "validation message must be preserved so users get meaningful rejection messages"
+        );
+
+        let resource_rules = result["spec"]["matchConstraints"]["resourceRules"]
+            .as_array()
+            .expect("matchConstraints.resourceRules must be a JSON array");
+        assert!(
+            !resource_rules.is_empty(),
+            "resourceRules must be non-empty"
+        );
+        assert_eq!(resource_rules[0]["apiGroups"][0], "apps");
+        assert_eq!(resource_rules[0]["resources"][0], "deployments");
+    }
+
+    /// decode_validatingadmissionpolicy_proto must return None for malformed proto input.
+    #[test]
+    fn decode_validatingadmissionpolicy_proto_returns_none_for_garbage() {
+        assert!(decode_validatingadmissionpolicy_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_validatingadmissionpolicybinding_proto / decode_core_proto_by_kind ValidatingAdmissionPolicyBinding
+    // ---------------------------------------------------------------------------
+
+    /// decode_core_proto_by_kind must dispatch ValidatingAdmissionPolicyBinding proto and extract
+    /// metadata. Without this decoder, the ValidatingAdmissionPolicyBinding conformance test
+    /// fails with 400 "invalid JSON: expected value at line 1 column 1" when client-go POSTs
+    /// with Content-Type: application/vnd.kubernetes.protobuf.
+    #[test]
+    fn decode_core_proto_by_kind_dispatches_validatingadmissionpolicybinding() {
+        let obj_meta = encode_length_delimited(1, b"test-vapb");
+        let proto = encode_length_delimited(1, &obj_meta);
+
+        let result = decode_core_proto_by_kind("ValidatingAdmissionPolicyBinding", &proto).expect(
+            "ValidatingAdmissionPolicyBinding must decode via decode_core_proto_by_kind — without \
+             this, the ValidatingAdmissionPolicyBinding API conformance test fails with 400 on POST \
+             because client-go sends Content-Type: application/vnd.kubernetes.protobuf",
+        );
+
+        assert_eq!(
+            result["kind"], "ValidatingAdmissionPolicyBinding",
+            "kind must be ValidatingAdmissionPolicyBinding so Object::from_bytes routes correctly"
+        );
+        assert_eq!(result["apiVersion"], "admissionregistration.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "test-vapb",
+            "name must be extracted so the object is stored under the correct key"
+        );
+    }
+
+    /// PUT to ValidatingAdmissionPolicyBinding must preserve spec (policyName, validationActions).
+    /// Without spec decoding, a PUT rebinding to a different policy or changing validationActions
+    /// is silently dropped.
+    ///
+    /// ValidatingAdmissionPolicyBindingSpec field numbers (k8s 1.36 proto):
+    ///   policyName=1, paramRef=2, matchResources=3, validationActions=4
+    #[test]
+    fn decode_validatingadmissionpolicybinding_proto_preserves_spec_on_put() {
+        // Build VapbSpec: field 1=policyName, field 4=validationActions
+        let mut spec: Vec<u8> = Vec::new();
+        spec.extend_from_slice(&encode_length_delimited(1, b"my-vap-policy"));
+        spec.extend_from_slice(&encode_length_delimited(4, b"Deny"));
+        spec.extend_from_slice(&encode_length_delimited(4, b"Audit"));
+
+        // Build ValidatingAdmissionPolicyBinding: field 1=metadata, field 2=spec
+        let obj_meta = encode_length_delimited(1, b"test-vapb-spec");
+        let mut proto = encode_length_delimited(1, &obj_meta);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result = decode_validatingadmissionpolicybinding_proto(&proto)
+            .expect("ValidatingAdmissionPolicyBinding with spec must decode successfully");
+
+        assert_eq!(result["metadata"]["name"], "test-vapb-spec");
+
+        assert_eq!(
+            result["spec"]["policyName"], "my-vap-policy",
+            "spec.policyName must survive proto decode — without it, a PUT rebinding to a \
+             different policy has no effect (binding still points to old policy)"
+        );
+
+        let actions = result["spec"]["validationActions"].as_array().expect(
+            "spec.validationActions must be a JSON array — absent actions mean the binding \
+             has no enforcement mode after a PUT",
+        );
+        assert_eq!(
+            actions.len(),
+            2,
+            "both validationActions must survive the proto round-trip"
+        );
+        assert_eq!(actions[0], "Deny");
+        assert_eq!(actions[1], "Audit");
+    }
+
+    /// decode_validatingadmissionpolicybinding_proto must return None for malformed proto input.
+    #[test]
+    fn decode_validatingadmissionpolicybinding_proto_returns_none_for_garbage() {
+        assert!(decode_validatingadmissionpolicybinding_proto(&[0xff, 0xff, 0xff]).is_none());
     }
 
     // ---------------------------------------------------------------------------
