@@ -350,6 +350,9 @@ pub async fn create_crd<S: Store>(
         .await
         .map_err(|e| store_err_crd(e, &name))?;
 
+    let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
+    let _ = state.store.delete(&tombstone_key, None).await;
+
     crd.metadata.resource_version = rv.to_string();
     Ok((StatusCode::CREATED, Json(crd)))
 }
@@ -1249,6 +1252,65 @@ mod tests {
         assert_eq!(
             bm["object"]["kind"], "PartialObjectMetadata",
             "BOOKMARK for POM watch must have kind=PartialObjectMetadata, not CustomResourceDefinition"
+        );
+    }
+
+    /// Re-creating a CRD after deletion must remove the deleted-group tombstone.
+    ///
+    /// Without this fix, a CRD deleted and then re-created for the same spec.group
+    /// leaves a stale tombstone that causes all CR requests for that group to return
+    /// 410 Gone instead of routing to the new CRD. Informers treat 410 as "stop
+    /// watching" and never recover — controllers lose visibility into the resource
+    /// forever until the server restarts.
+    #[tokio::test]
+    async fn recreate_crd_clears_deleted_group_tombstone() {
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let name = "applications.argoproj.io";
+        let body = minimal_crd_bytes(name);
+        let group = "argoproj.io";
+
+        create_crd(State(state.clone()), HeaderMap::new(), body.clone())
+            .await
+            .expect("initial create must succeed");
+
+        delete_crd(State(state.clone()), Path(name.to_string()))
+            .await
+            .expect("delete must succeed");
+
+        let tombstone_key = deleted_group_tombstone_key(group);
+        let after_delete = store
+            .get(&tombstone_key)
+            .await
+            .expect("store get must not error");
+        assert!(
+            after_delete.is_some(),
+            "tombstone must be written after CRD deletion so CR handlers return 410 Gone"
+        );
+
+        create_crd(State(state.clone()), HeaderMap::new(), body)
+            .await
+            .expect("re-create must succeed — AlreadyExists means delete did not fully clean up");
+
+        let after_recreate = store
+            .get(&tombstone_key)
+            .await
+            .expect("store get must not error");
+        assert!(
+            after_recreate.is_none(),
+            "tombstone must be removed when CRD is re-created; if it persists, CR requests \
+             for group '{}' return 410 Gone instead of routing to the new CRD",
+            group
         );
     }
 }
