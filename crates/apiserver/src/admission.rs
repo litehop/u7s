@@ -6086,4 +6086,113 @@ mod tests {
              worker-2 must not be allowed to update worker-1's node object"
         );
     }
+
+    /// AdmissionContext.user_info must be populated from the authenticated request identity.
+    /// If handlers pass user_info: None, VAP expressions like `request.userInfo.username == X`
+    /// always evaluate against an empty username and incorrectly deny allowed users.
+    ///
+    /// This test verifies that:
+    /// - `user_info: Some({username: "alice"})` causes the VAP to allow (expression is true)
+    /// - `user_info: None` causes the VAP to deny (evaluator fills empty username, expression
+    ///   is false, so the admission check fails)
+    #[tokio::test]
+    async fn vap_user_info_none_denies_when_expression_requires_specific_username() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // VAP that only allows requests from "alice".
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "alice-only-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["configmaps"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "validations": [{
+                    "expression": "request.userInfo.username == \"alice\"",
+                    "message": "only alice may create configmaps"
+                }]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/alice-only-policy",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "alice-only-binding"},
+            "spec": {
+                "policyName": "alice-only-policy",
+                "validationActions": ["Deny"]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/alice-only-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let cm = json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "test-cm", "namespace": "default"}
+        });
+
+        // With user_info populated as "alice": VAP expression is true → allow.
+        let ctx_alice = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "test-cm",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: Some(json!({"username": "alice", "uid": "", "groups": []})),
+            dry_run: false,
+        };
+        let result_alice = run_validating_webhooks(&state, &cm, &ctx_alice).await;
+        assert!(
+            result_alice.is_ok(),
+            "VAP must allow alice when user_info is threaded through AdmissionContext; \
+             if handlers pass user_info: None, this test fails because username is empty"
+        );
+
+        // With user_info: None: evaluator fills empty username → expression false → VAP denies.
+        let ctx_none = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "test-cm",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result_none = run_validating_webhooks(&state, &cm, &ctx_none).await;
+        assert!(
+            result_none.is_err(),
+            "VAP must deny when user_info is None (handlers not threading identity); \
+             if this passes, the policy no longer distinguishes alice from unauthenticated requests"
+        );
+    }
 }

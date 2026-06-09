@@ -216,6 +216,7 @@ pub async fn core_patch_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
     Query(patch_query): Query<PatchQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -223,6 +224,7 @@ pub async fn core_patch_resource<S: Store>(
         State(state),
         Path(("".into(), "v1".into(), plural, name)),
         Query(patch_query),
+        Extension(user),
         headers,
         body,
     )
@@ -298,6 +300,7 @@ pub async fn core_create_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural)): Path<(String, String)>,
     Query(create_query): Query<CreateQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -305,6 +308,7 @@ pub async fn core_create_namespaced_resource<S: Store>(
         State(state),
         Path(("".into(), "v1".into(), ns, plural)),
         Query(create_query),
+        Extension(user),
         headers,
         body,
     )
@@ -315,6 +319,7 @@ pub async fn core_replace_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
     Query(replace_query): Query<ReplaceQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -322,6 +327,7 @@ pub async fn core_replace_namespaced_resource<S: Store>(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
         Query(replace_query),
+        Extension(user),
         headers,
         body,
     )
@@ -356,6 +362,7 @@ pub async fn core_patch_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
     Query(patch_query): Query<PatchQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -363,6 +370,7 @@ pub async fn core_patch_namespaced_resource<S: Store>(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
         Query(patch_query),
+        Extension(user),
         headers,
         body,
     )

@@ -1365,6 +1365,14 @@ mod tests {
 
     use crate::handlers::crd::create_crd;
 
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
+    }
+
     fn make_state() -> AppState {
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
         AppState::new(
@@ -1421,9 +1429,14 @@ mod tests {
             "v1beta1",
         );
         assert!(
-            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
-                .await
-                .is_ok(),
+            create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body
+            )
+            .await
+            .is_ok(),
             "create must succeed"
         );
 
@@ -1529,9 +1542,14 @@ mod tests {
             "v1alpha1",
         );
         assert!(
-            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
-                .await
-                .is_ok(),
+            create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body
+            )
+            .await
+            .is_ok(),
             "create must succeed"
         );
 
@@ -1596,9 +1614,14 @@ mod tests {
             .to_string(),
         );
         assert!(
-            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
-                .await
-                .is_ok(),
+            create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body
+            )
+            .await
+            .is_ok(),
             "create must succeed"
         );
 
@@ -2311,9 +2334,14 @@ mod tests {
             .to_string(),
         );
         assert!(
-            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
-                .await
-                .is_ok(),
+            create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body
+            )
+            .await
+            .is_ok(),
             "create must succeed"
         );
 
@@ -2803,9 +2831,14 @@ mod tests {
 
         let body = crd_bytes("example.io", "foos", "foo", "Foo", "Namespaced", "v1");
         assert!(
-            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
-                .await
-                .is_ok(),
+            create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body
+            )
+            .await
+            .is_ok(),
             "create_crd must succeed"
         );
 
@@ -2841,9 +2874,14 @@ mod tests {
 
         let body = crd_bytes("example.io", "bars", "bar", "Bar", "Cluster", "v1alpha1");
         assert!(
-            create_crd(State(state.clone()), axum::http::HeaderMap::new(), body)
-                .await
-                .is_ok(),
+            create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body
+            )
+            .await
+            .is_ok(),
             "create_crd must succeed"
         );
 

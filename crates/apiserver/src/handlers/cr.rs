@@ -1399,6 +1399,14 @@ mod tests {
         )
     }
 
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
+    }
+
     fn expect_err_status<T>(
         result: Result<T, crate::status::StatusError>,
         msg: &str,
@@ -1462,6 +1470,7 @@ mod tests {
         assert!(
             crd::create_crd(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespaced_crd_bytes()
             )
@@ -1476,6 +1485,7 @@ mod tests {
         assert!(
             crd::create_crd(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 cluster_crd_bytes()
             )
@@ -2369,6 +2379,7 @@ mod tests {
         assert!(
             crd::create_crd(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespaced_crd_with_status_subresource_bytes(),
             )
@@ -2383,6 +2394,7 @@ mod tests {
         assert!(
             crd::create_crd(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 cluster_crd_with_status_subresource_bytes(),
             )
@@ -3075,6 +3087,7 @@ mod tests {
         assert!(
             crd::create_crd(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 crd_bytes
             )
@@ -3154,6 +3167,7 @@ mod tests {
         assert!(
             crd::create_crd(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 crd_bytes
             )
@@ -3247,6 +3261,7 @@ mod tests {
         assert!(
             crd::create_crd(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 crd_bytes
             )
