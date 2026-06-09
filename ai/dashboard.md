@@ -1,19 +1,19 @@
 # Dashboard
-2026-06-09T08:25Z — Dispatch paused: documenting manual VM verification steps before dispatch.
+2026-06-09T09:10Z — Two PRs in CI. Queue empty pending merge.
 
 ## Operator attention needed
-- **Dispatch template gap** — Lima VM protocol block describes `run-all.sh` only; workers
-  cannot run scripts directly (not in allowlist). Manual step-by-step equivalent needed
-  for steps 3 (lima-start) and 5 (sonobuoy + result retrieval) before dispatching
-  mayor-fmqw and mayor-2lot. Mayor asked operator: write the section?
+- **#495 and #496 CI** — all checks null (queued). Merge loop will fire when green.
 
 ## Open PRs
-None.
+- **#495** fix(admission): VAP/VAPB proto decode (mayor-2lot) — 17 checks queued
+- **#496** fix(admission): proto replicas field + CEL eval (mayor-fmqw) — 8 checks queued
 
 ## In-flight workers
-None. Two worktrees pre-created, workers not yet dispatched:
-- `ai/worktrees/cel-replicas-mayor-fmqw` — branch `worker/cel-replicas-mayor-fmqw`
-- `ai/worktrees/vap-400-mayor-2lot` — branch `worker/vap-400-mayor-2lot`
+None (both completed, PRs open).
+
+## Active worktrees
+- `ai/worktrees/vap-400-mayor-2lot` — branch `worker/vap-400-mayor-2lot` (awaiting merge)
+- `ai/worktrees/cel-replicas-mayor-fmqw` — branch `worker/cel-replicas-mayor-fmqw` (awaiting merge)
 
 ## Recent merges (this session)
 - #494 fix(admission): set VAP/VAPB status.observedGeneration on write (mayor-xw6c)
@@ -24,12 +24,11 @@ None. Two worktrees pre-created, workers not yet dispatched:
 - #490 fix(apiserver): JSON Status 404 fallback for unmatched routes (mayor-upqy)
 
 ## Bead queue
-- mayor-fmqw — VAP marker denied by own policy / replicas CEL eval (P2) — worktree ready
-- mayor-2lot — VAP/VAPB create returns 400 invalid JSON (P2) — worktree ready
-- Deferred: mayor-52wo · mayor-j7to · mayor-rvkq
+Ready: none (queue drained).
+Deferred: mayor-52wo · mayor-j7to · mayor-rvkq
 
 ## Worktree hygiene
-Two pre-created worktrees. No dispatched workers.
+Two active worktrees (pending PR merge). All else clean.
 
 ## Main at
-9611f16 — fix(admission): set VAP/VAPB status.observedGeneration on write (#494)
+c92c55c — docs(prompts): add vm-operations.md manual stack guide for workers
