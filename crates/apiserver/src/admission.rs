@@ -6087,10 +6087,9 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-bgpu: AdmissionContext.user_info must be populated from the
-    /// authenticated request identity. If handlers revert to passing user_info: None, VAP
-    /// expressions like `request.userInfo.username == X` will always evaluate against an empty
-    /// username and incorrectly deny requests from the allowed user.
+    /// AdmissionContext.user_info must be populated from the authenticated request identity.
+    /// If handlers pass user_info: None, VAP expressions like `request.userInfo.username == X`
+    /// always evaluate against an empty username and incorrectly deny allowed users.
     ///
     /// This test verifies that:
     /// - `user_info: Some({username: "alice"})` causes the VAP to allow (expression is true)
@@ -6178,8 +6177,7 @@ mod tests {
              if handlers pass user_info: None, this test fails because username is empty"
         );
 
-        // With user_info: None (old behaviour before mayor-bgpu): evaluator fills empty
-        // username → expression false → VAP denies the request.
+        // With user_info: None: evaluator fills empty username → expression false → VAP denies.
         let ctx_none = AdmissionContext {
             group: "",
             version: "v1",
