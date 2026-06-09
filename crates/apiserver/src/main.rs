@@ -546,7 +546,24 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::status::put_namespaced_resource_status)
                 .patch(handlers::status::patch_namespaced_resource_status),
         )
+        .fallback(fallback_handler)
         .with_state(state)
+}
+
+async fn fallback_handler() -> status::StatusError {
+    use axum::http::StatusCode;
+    status::StatusError(
+        StatusCode::NOT_FOUND,
+        status::Status {
+            kind: "Status",
+            api_version: "v1",
+            status: "Failure",
+            message: "the server could not find the requested resource".into(),
+            reason: "NotFound",
+            code: 404,
+            metadata: None,
+        },
+    )
 }
 
 async fn seed_namespaces(store: &SqliteStore) -> anyhow::Result<()> {
@@ -5827,5 +5844,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Requests to unregistered routes must return HTTP 404 with a valid
+    /// Kubernetes Status JSON body.
+    ///
+    /// Without a fallback handler axum returns an empty-body 404. Clients such
+    /// as conformance-test harnesses and kubectl parse the body with serde_json
+    /// and fail immediately with "invalid JSON: expected value at line 1 column 1".
+    #[tokio::test]
+    async fn unregistered_route_returns_json_status_404() {
+        use axum::body::to_bytes;
+        use axum::http::{Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        let req = Request::builder()
+            .uri("/completely/unregistered/path")
+            .body(axum::body::Body::empty())
+            .expect("request must build");
+        let resp = router.call(req).await.expect("router must not error");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "unregistered route must return 404, not an empty response — \
+             clients parse the body as JSON and fail with parse errors on empty bodies"
+        );
+
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let val: serde_json::Value = serde_json::from_slice(&body).expect(
+            "fallback response body must be valid JSON — \
+                 empty body causes serde_json to report 'expected value at line 1 column 1'",
+        );
+        assert_eq!(
+            val["kind"], "Status",
+            "fallback body must have kind=Status — Kubernetes clients check this field \
+             to distinguish API errors from non-Kubernetes HTTP errors"
+        );
+        assert_eq!(
+            val["code"], 404,
+            "fallback body must have code=404 — clients use this field for error display"
+        );
+        assert_eq!(
+            val["status"], "Failure",
+            "fallback body must have status=Failure per Kubernetes Status schema"
+        );
     }
 }
