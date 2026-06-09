@@ -257,7 +257,11 @@ pub async fn create_resource<S: Store>(
         name: &name,
         namespace: None,
         operation: "CREATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
@@ -387,7 +391,11 @@ pub async fn replace_resource<S: Store>(
         name: &name,
         namespace: None,
         operation: "UPDATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
@@ -520,6 +528,9 @@ pub(crate) struct PatchConfig<'a> {
     /// When true, run all validation but skip the store write.
     /// Set when `?dryRun=All` is present in the request query string.
     pub dry_run: bool,
+    /// Authenticated user info for the request. Used by VAP CEL expressions
+    /// that reference `request.userInfo.*`.
+    pub user_info: Option<serde_json::Value>,
 }
 
 /// Shared patch logic for cluster-scoped and namespaced resources.
@@ -545,6 +556,7 @@ pub(crate) async fn do_patch<S: Store>(
         patch_type,
         body,
         dry_run,
+        user_info,
     } = cfg;
     let stored_opt = state
         .store
@@ -709,7 +721,7 @@ pub(crate) async fn do_patch<S: Store>(
         name,
         namespace: ns,
         operation: "UPDATE",
-        user_info: None,
+        user_info,
         dry_run: false,
     };
     current.body = run_mutating_webhooks(state, current.body, &admission_ctx).await?;
@@ -776,6 +788,7 @@ pub async fn patch_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
     Query(patch_query): Query<PatchQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -812,6 +825,11 @@ pub async fn patch_resource<S: Store>(
             patch_type,
             body,
             dry_run: patch_query.is_dry_run(),
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
         },
     )
     .await
@@ -993,6 +1011,7 @@ pub async fn create_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(create_query): Query<CreateQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1079,7 +1098,11 @@ pub async fn create_namespaced_resource<S: Store>(
         name: &name,
         namespace: Some(&ns),
         operation: "CREATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
@@ -1251,6 +1274,7 @@ pub async fn replace_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     Query(replace_query): Query<ReplaceQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1339,7 +1363,11 @@ pub async fn replace_namespaced_resource<S: Store>(
         name: &name,
         namespace: Some(&ns),
         operation: "UPDATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
@@ -1511,6 +1539,7 @@ pub async fn patch_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
     Query(patch_query): Query<PatchQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1548,6 +1577,11 @@ pub async fn patch_namespaced_resource<S: Store>(
             patch_type,
             body,
             dry_run: patch_query.is_dry_run(),
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
         },
     )
     .await
@@ -1932,6 +1966,14 @@ mod tests {
         )
     }
 
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
+    }
+
     // -- cr_status_put_updates_status_field --
 
     /// Verify that put_namespaced_resource_status works for CRD-backed resources whose group
@@ -2028,6 +2070,7 @@ mod tests {
                 "worker-node-1".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             make_lease_body(None),
         )
@@ -2057,6 +2100,7 @@ mod tests {
                 "worker-node-1".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             make_lease_body(None),
         )
@@ -2083,6 +2127,7 @@ mod tests {
                 "worker-node-1".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             make_lease_body(Some(&rv)),
         )
@@ -2109,6 +2154,7 @@ mod tests {
                 "worker-node-1".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             make_lease_body(None),
         )
@@ -2125,6 +2171,7 @@ mod tests {
                 "worker-node-1".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             make_lease_body(Some("999")),
         )
@@ -2251,6 +2298,7 @@ mod tests {
                 "nonexistent-node".to_string(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             smp_headers,
             patch_bytes,
         )
@@ -2301,6 +2349,7 @@ mod tests {
                 "lima-node".to_string(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             ssa_headers,
             patch_bytes,
         )
@@ -2360,6 +2409,7 @@ mod tests {
                 "lima-node".to_string(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             ssa_headers,
             patch_bytes,
         )
@@ -2397,6 +2447,7 @@ mod tests {
                 "worker-node-1".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             make_lease_body(None),
         )
@@ -2428,6 +2479,7 @@ mod tests {
                 "worker-node-1".to_string(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             ssa_headers,
             patch_bytes,
         )
@@ -2494,6 +2546,7 @@ mod tests {
                 _field_validation: None,
                 dry_run: None,
             }),
+            test_user(),
             ssa_headers.clone(),
             patch_bytes.clone(),
         )
@@ -2569,6 +2622,7 @@ mod tests {
                 _field_validation: None,
                 dry_run: None,
             }),
+            test_user(),
             ssa_headers,
             update_bytes,
         )
@@ -2763,6 +2817,7 @@ mod tests {
                 "leases".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
         )
@@ -3726,6 +3781,7 @@ mod tests {
                 "patch-node".into(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             jp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3792,6 +3848,7 @@ mod tests {
                 "ns-patch-lease".into(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             mp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -3961,6 +4018,7 @@ mod tests {
                 "stale-lease".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
         )
@@ -3987,6 +4045,7 @@ mod tests {
                 "stale-lease".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&stale).unwrap()),
         )
@@ -4124,6 +4183,7 @@ mod tests {
                 "gc-node".into(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             mp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4342,6 +4402,7 @@ mod tests {
                 "nonexistent".into(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             mp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4378,6 +4439,7 @@ mod tests {
                 "nonexistent".into(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             mp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4412,6 +4474,7 @@ mod tests {
                 "widgets".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
         )
@@ -4447,6 +4510,7 @@ mod tests {
                 "rns-widget".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
         )
@@ -4491,6 +4555,7 @@ mod tests {
                 "any-node".into(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             bad_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4533,6 +4598,7 @@ mod tests {
                 "any-lease".into(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             bad_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -4574,6 +4640,7 @@ mod tests {
                 "leases".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             body.clone(),
         )
@@ -4592,6 +4659,7 @@ mod tests {
                 "leases".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             body,
         )
@@ -4933,6 +5001,7 @@ mod tests {
                 "url-name".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -5007,6 +5076,7 @@ mod tests {
                 "leases".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from("not json at all"),
         )
@@ -5134,6 +5204,7 @@ mod tests {
                 "my-lease".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from("not json"),
         )
@@ -5197,6 +5268,7 @@ mod tests {
                 "my-lease".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body_without_ns).unwrap()),
         )
@@ -5345,6 +5417,7 @@ mod tests {
             State(state.clone()),
             Path(("".into(), "v1".into(), "default".into(), "services".into())),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
         )
@@ -5410,6 +5483,7 @@ mod tests {
             State(state.clone()),
             Path(("".into(), "v1".into(), "default".into(), "services".into())),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
         )
@@ -5488,6 +5562,7 @@ mod tests {
                 State(state.clone()),
                 Path(("".into(), "v1".into(), "default".into(), "services".into())),
                 axum::extract::Query(CreateQuery::default()),
+                test_user(),
                 json_headers(),
                 bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
             )
@@ -5612,6 +5687,7 @@ mod tests {
             State(state),
             Path(("".into(), "v1".into(), "default".into(), "services".into())),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
         )
@@ -5668,6 +5744,7 @@ mod tests {
                 State(state.clone()),
                 Path(("".into(), "v1".into(), "default".into(), "services".into())),
                 axum::extract::Query(CreateQuery::default()),
+                test_user(),
                 json_headers(),
                 bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
             )
@@ -5719,6 +5796,7 @@ mod tests {
             State(state),
             Path(("".into(), "v1".into(), "default".into(), "services".into())),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
         )
@@ -5762,6 +5840,7 @@ mod tests {
             State(state),
             Path(("".into(), "v1".into(), "default".into(), "services".into())),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
         )
@@ -5877,6 +5956,7 @@ mod tests {
                     "leases".into(),
                 )),
                 axum::extract::Query(CreateQuery::default()),
+                test_user(),
                 json_headers(),
                 bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
             )
@@ -5962,6 +6042,7 @@ mod tests {
                 "configmaps".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             body.clone(),
         )
@@ -5985,6 +6066,7 @@ mod tests {
                 "configmaps".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             body,
         )
@@ -6129,6 +6211,7 @@ mod tests {
                 "serviceaccounts".to_string(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&sa).unwrap()),
         )
@@ -6206,6 +6289,7 @@ mod tests {
                     "configmaps".to_string(),
                 )),
                 axum::extract::Query(CreateQuery::default()),
+                test_user(),
                 json_headers(),
                 bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
             )
@@ -6229,6 +6313,7 @@ mod tests {
                     "app-config".to_string(),
                 )),
                 axum::extract::Query(PatchQuery::default()),
+                test_user(),
                 mp_headers,
                 bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
             )
@@ -6402,6 +6487,7 @@ mod tests {
                 "configmaps".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&cm).unwrap()),
         )
@@ -6490,6 +6576,7 @@ mod tests {
                 "deployments".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
         )
@@ -6549,6 +6636,7 @@ mod tests {
                 "replicasets".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
         )
@@ -6607,6 +6695,7 @@ mod tests {
                 "statefulsets".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&ss).unwrap()),
         )
@@ -6667,6 +6756,7 @@ mod tests {
                 "deployments".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
         )
@@ -6734,6 +6824,7 @@ mod tests {
                 "deployments".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
         )
@@ -6809,6 +6900,7 @@ mod tests {
                 "replicasets".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             body_bytes,
         )
@@ -6864,6 +6956,7 @@ mod tests {
                 "my-rs".into(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             put_bytes,
         )
@@ -7232,6 +7325,7 @@ mod tests {
                 "my-pod.series-event".to_string(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             mp_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
         )
@@ -7315,6 +7409,7 @@ mod tests {
                 field_validation: Some("Strict".to_string()),
                 ..Default::default()
             }),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -7375,6 +7470,7 @@ mod tests {
                 field_validation: Some("Ignore".to_string()),
                 ..Default::default()
             }),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -7417,6 +7513,7 @@ mod tests {
                 field_validation: Some("Warn".to_string()),
                 ..Default::default()
             }),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -7465,6 +7562,7 @@ mod tests {
                 field_validation: Some("Strict".to_string()),
                 ..Default::default()
             }),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
         )
@@ -7533,6 +7631,7 @@ mod tests {
                 "events".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&event).unwrap()),
         )
@@ -7696,6 +7795,7 @@ mod tests {
                 "deployments".to_string(),
             )),
             axum::extract::Query(super::super::json_patch::CreateQuery::default()),
+            test_user(),
             json_hdrs.clone(),
             deploy_bytes,
         )
@@ -7738,6 +7838,7 @@ mod tests {
                 "sample-webhook-deployment".to_string(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             smp_hdrs,
             patch_bytes,
         )
@@ -7852,6 +7953,7 @@ mod tests {
                 "deployments".to_string(),
             )),
             axum::extract::Query(super::super::json_patch::CreateQuery::default()),
+            test_user(),
             json_hdrs.clone(),
             bytes::Bytes::from(serde_json::to_vec(&deployment).unwrap()),
         )
@@ -7922,6 +8024,7 @@ mod tests {
                 "replicasets".to_string(),
             )),
             axum::extract::Query(super::super::json_patch::CreateQuery::default()),
+            test_user(),
             json_hdrs,
             bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
         )
@@ -8000,6 +8103,7 @@ mod tests {
                 "configmaps".to_string(),
             )),
             axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
             json_headers(),
             Bytes::from(serde_json::to_vec(&cm).unwrap()),
         )
@@ -8123,6 +8227,7 @@ mod tests {
                 "web".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -8226,6 +8331,7 @@ mod tests {
                 "web".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
         )
@@ -8317,6 +8423,7 @@ mod tests {
                 "dry-run-lease".to_string(),
             )),
             axum::extract::Query(dry_run_query),
+            test_user(),
             merge_patch_headers(),
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
         )
@@ -8364,6 +8471,7 @@ mod tests {
                 "dry-run-node".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(
                 serde_json::to_vec(&serde_json::json!({
@@ -8393,6 +8501,7 @@ mod tests {
                 "dry-run-node".to_string(),
             )),
             axum::extract::Query(dry_run_query),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(
                 serde_json::to_vec(&serde_json::json!({
@@ -8463,6 +8572,7 @@ mod tests {
                 "leases".to_string(),
             )),
             axum::extract::Query(dry_run_query),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&lease).unwrap()),
         )
@@ -8565,6 +8675,7 @@ mod tests {
                 "ssa-dry-run-lease".to_string(),
             )),
             axum::extract::Query(dry_run_query),
+            test_user(),
             ssa_headers,
             bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
         )
@@ -8630,6 +8741,7 @@ mod tests {
                 "my-svc".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&ep_with_annotation).unwrap()),
         )
@@ -8660,6 +8772,7 @@ mod tests {
                 "my-svc".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&ep_user_put).unwrap()),
         )
@@ -8714,6 +8827,7 @@ mod tests {
                 "patched-svc".to_string(),
             )),
             axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&ep_with_annotation).unwrap()),
         )
@@ -8739,6 +8853,7 @@ mod tests {
                 "patched-svc".to_string(),
             )),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             merge_headers,
             bytes::Bytes::from(serde_json::to_vec(&merge_patch).unwrap()),
         )

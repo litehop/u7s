@@ -279,6 +279,7 @@ pub async fn list_crds<S: Store>(
 
 pub async fn create_crd<S: Store>(
     State(state): State<AppState<S>>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -316,7 +317,11 @@ pub async fn create_crd<S: Store>(
             name: &name,
             namespace: None,
             operation: "CREATE",
-            user_info: None,
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
             dry_run: false,
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
@@ -382,6 +387,7 @@ pub async fn get_crd<S: Store>(
 pub async fn replace_crd<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -443,7 +449,11 @@ pub async fn replace_crd<S: Store>(
             name: &name,
             namespace: None,
             operation: "UPDATE",
-            user_info: None,
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
             dry_run: false,
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
@@ -518,6 +528,7 @@ pub async fn delete_crd<S: Store>(
 pub async fn patch_crd<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -566,7 +577,11 @@ pub async fn patch_crd<S: Store>(
             name: &name,
             namespace: None,
             operation: "UPDATE",
-            user_info: None,
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
             dry_run: false,
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
@@ -605,6 +620,14 @@ mod tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         )
+    }
+
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
     }
 
     fn minimal_crd_bytes(name: &str) -> Bytes {
@@ -732,7 +755,7 @@ mod tests {
         let body = minimal_crd_bytes(name);
 
         assert!(
-            create_crd(State(state.clone()), HeaderMap::new(), body)
+            create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
                 .await
                 .is_ok(),
             "create must succeed"
@@ -753,13 +776,18 @@ mod tests {
         let body = minimal_crd_bytes(name);
 
         assert!(
-            create_crd(State(state.clone()), HeaderMap::new(), body.clone())
-                .await
-                .is_ok(),
+            create_crd(
+                State(state.clone()),
+                test_user(),
+                HeaderMap::new(),
+                body.clone()
+            )
+            .await
+            .is_ok(),
             "first create must succeed"
         );
 
-        let err = err_status(create_crd(State(state), HeaderMap::new(), body).await);
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 409);
         assert_eq!(json["reason"], "AlreadyExists");
@@ -798,6 +826,7 @@ mod tests {
             replace_crd(
                 State(state),
                 Path("missing.example.com".to_string()),
+                test_user(),
                 HeaderMap::new(),
                 body,
             )
@@ -865,7 +894,7 @@ mod tests {
             .to_string(),
         );
 
-        let err = err_status(create_crd(State(state), HeaderMap::new(), body).await);
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 422, "mismatched name must return 422");
         assert!(
@@ -901,7 +930,7 @@ mod tests {
         );
 
         assert!(
-            create_crd(State(state), HeaderMap::new(), body)
+            create_crd(State(state), test_user(), HeaderMap::new(), body)
                 .await
                 .is_ok(),
             "correct name widgets.example.io must be accepted"
@@ -973,6 +1002,7 @@ mod tests {
         // Create CRD first.
         create_crd(
             State(state.clone()),
+            test_user(),
             HeaderMap::new(),
             minimal_crd_bytes(name),
         )
@@ -1016,6 +1046,7 @@ mod tests {
         let result = patch_crd(
             State(state.clone()),
             Path(name.to_string()),
+            test_user(),
             headers,
             patch_bytes,
         )
@@ -1058,6 +1089,7 @@ mod tests {
         let err = match patch_crd(
             State(state),
             Path("missing.example.com".to_string()),
+            test_user(),
             headers,
             patch_bytes,
         )
@@ -1100,7 +1132,7 @@ mod tests {
             .to_string(),
         );
 
-        let err = err_status(create_crd(State(state), HeaderMap::new(), body).await);
+        let err = err_status(create_crd(State(state), test_user(), HeaderMap::new(), body).await);
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(
             json["code"], 422,
@@ -1136,7 +1168,7 @@ mod tests {
         );
 
         assert!(
-            create_crd(State(state), HeaderMap::new(), body)
+            create_crd(State(state), test_user(), HeaderMap::new(), body)
                 .await
                 .is_ok(),
             "user-controlled group must be accepted"
@@ -1185,7 +1217,7 @@ mod tests {
 
         // Seed one CRD so the initial-events stream is non-empty.
         let body = minimal_crd_bytes("applications.argoproj.io");
-        create_crd(State(state.clone()), HeaderMap::new(), body)
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
             .await
             .unwrap_or_else(|_| panic!("create must succeed"));
 
@@ -1286,9 +1318,14 @@ mod tests {
         let body = minimal_crd_bytes(name);
         let group = "argoproj.io";
 
-        create_crd(State(state.clone()), HeaderMap::new(), body.clone())
-            .await
-            .expect("initial create must succeed");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            body.clone(),
+        )
+        .await
+        .expect("initial create must succeed");
 
         delete_crd(State(state.clone()), Path(name.to_string()))
             .await
@@ -1304,7 +1341,7 @@ mod tests {
             "tombstone must be written after CRD deletion so CR handlers return 410 Gone"
         );
 
-        create_crd(State(state.clone()), HeaderMap::new(), body)
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
             .await
             .expect("re-create must succeed — AlreadyExists means delete did not fully clean up");
 
@@ -1348,6 +1385,14 @@ mod admission_tests {
             std::collections::HashMap::new(),
             "https://localhost:6443".into(),
         )
+    }
+
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
     }
 
     async fn start_mock_webhook(router: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -1432,6 +1477,7 @@ mod admission_tests {
 
         let result = create_crd(
             axum::extract::State(state),
+            test_user(),
             HeaderMap::new(),
             crd_body("foos.example.com"),
         )
@@ -1460,6 +1506,7 @@ mod admission_tests {
         // First create the CRD (no webhook registered yet).
         let create_result = create_crd(
             axum::extract::State(state.clone()),
+            test_user(),
             HeaderMap::new(),
             crd_body("foos.example.com"),
         )
@@ -1491,6 +1538,7 @@ mod admission_tests {
         let result = replace_crd(
             axum::extract::State(state),
             axum::extract::Path("foos.example.com".to_string()),
+            test_user(),
             HeaderMap::new(),
             crd_body("foos.example.com"),
         )

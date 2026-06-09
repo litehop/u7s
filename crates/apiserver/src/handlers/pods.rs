@@ -249,6 +249,7 @@ pub async fn list_pods<S: Store>(
 pub async fn create_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -280,7 +281,11 @@ pub async fn create_pod<S: Store>(
         name: &name,
         namespace: Some(ns.as_str()),
         operation: "CREATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
@@ -327,6 +332,7 @@ pub async fn get_pod<S: Store>(
 pub async fn replace_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -368,7 +374,11 @@ pub async fn replace_pod<S: Store>(
         name: &name,
         namespace: Some(ns.as_str()),
         operation: "UPDATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
@@ -3732,6 +3742,16 @@ mod handler_tests {
         (state, store)
     }
 
+    /// Return an axum Extension layer that injects a test UserInfo, required by handlers
+    /// that extract Extension<UserInfo>. Without this, Router-based tests get 500.
+    fn auth_layer() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
+    }
+
     /// Seed the store with a namespace so parse_namespace succeeds.
     async fn seed_namespace(store: &Arc<SqliteStore>, ns: &str) {
         let key = format!("/registry/namespaces/{ns}");
@@ -3847,6 +3867,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let pod = serde_json::json!({
@@ -3875,6 +3896,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let req = Request::builder()
@@ -3909,6 +3931,7 @@ mod handler_tests {
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
             .route("/api/v1/namespaces/{ns}/pods/{name}", get(get_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         // Create a pod with an explicit dnsPolicy.
@@ -3986,6 +4009,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let pod = serde_json::json!({
@@ -4041,6 +4065,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let pod = serde_json::json!({
@@ -4112,6 +4137,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let pod = serde_json::json!({
@@ -4181,6 +4207,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         // URL says "nginx" but body says "other-pod".
@@ -4992,6 +5019,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let body = serde_json::json!({
@@ -5030,6 +5058,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", put(replace_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let stale_body = serde_json::json!({
@@ -5156,6 +5185,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         // First create — must succeed.
@@ -5990,6 +6020,14 @@ mod admission_tests {
         )
     }
 
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
+    }
+
     async fn seed_namespace(store: &Arc<SqliteStore>, ns: &str) {
         let key = format!("/registry/namespaces/{ns}");
         let val = serde_json::json!({"kind": "Namespace", "metadata": {"name": ns}});
@@ -6105,6 +6143,7 @@ mod admission_tests {
         let result = create_pod(
             axum::extract::State(state),
             axum::extract::Path(("default".to_string(),)),
+            test_user(),
             headers,
             pod_body,
         )
@@ -6180,6 +6219,7 @@ mod admission_tests {
         let result = create_pod(
             axum::extract::State(state),
             axum::extract::Path(("default".to_string(),)),
+            test_user(),
             headers,
             pod_body,
         )
@@ -6275,6 +6315,7 @@ mod admission_tests {
         let result = replace_pod(
             axum::extract::State(state),
             axum::extract::Path(("default".to_string(), "my-pod".to_string())),
+            test_user(),
             headers,
             pod_body,
         )

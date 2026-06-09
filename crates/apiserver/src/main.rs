@@ -2716,6 +2716,14 @@ mod tests {
         SqliteStore::new(":memory:").expect("open in-memory db")
     }
 
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
+    }
+
     #[tokio::test]
     async fn seed_namespaces_creates_default_and_kube_system() {
         // All four namespaces must exist after a single call — required by Kubernetes API contract.
@@ -3935,6 +3943,7 @@ mod tests {
                 "jobs".to_string(),
             )),
             axum::extract::Query(handlers::json_patch::CreateQuery::default()),
+            test_user(),
             headers,
             body_bytes,
         )
@@ -4204,6 +4213,7 @@ mod tests {
                 "gateways".to_string(),
             )),
             axum::extract::Query(handlers::json_patch::CreateQuery::default()),
+            test_user(),
             headers,
             body_bytes,
         )
@@ -5036,12 +5046,17 @@ mod tests {
                 "ports": [{ "port": 80, "targetPort": 8080 }]
             }
         });
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::POST)
             .uri("/api/v1/namespaces/default/services")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .expect("request must build");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
 
         let resp = router.call(req).await.expect("router must not error");
         assert_eq!(
@@ -5098,12 +5113,18 @@ mod tests {
                 "metadata": { "name": name, "namespace": "default" },
                 "spec": { "ports": [{ "port": 80 }] }
             });
-            Request::builder()
+            let mut req = Request::builder()
                 .method(Method::POST)
                 .uri("/api/v1/namespaces/default/services")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(body.to_string()))
-                .expect("request must build")
+                .expect("request must build");
+            req.extensions_mut().insert(auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec![],
+            });
+            req
         };
 
         let resp1 = router
@@ -5381,12 +5402,17 @@ mod tests {
             "data": { "key": "dmFsdWU=" }
         });
 
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("POST")
             .uri("/api/v1/namespaces/default/secrets")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .expect("request build must not fail");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
 
         let resp = router.call(req).await.expect("router must not error");
         assert_eq!(
@@ -5442,12 +5468,17 @@ mod tests {
             }
         });
 
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("POST")
             .uri("/apis/batch/v1/namespaces/default/jobs")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .expect("request build must not fail");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
 
         let resp = router.call(req).await.expect("router must not error");
         assert_eq!(
@@ -5534,12 +5565,17 @@ mod tests {
         let mut proto_body = MAGIC.to_vec();
         proto_body.extend_from_slice(&unknown);
 
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("POST")
             .uri("/api/v1/namespaces/default/secrets")
             .header("content-type", "application/vnd.kubernetes.protobuf")
             .body(axum::body::Body::from(proto_body))
             .expect("request build must not fail");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
 
         let resp = router.call(req).await.expect("router must not error");
         assert_eq!(
@@ -5643,12 +5679,17 @@ mod tests {
         let mut proto_body = MAGIC.to_vec();
         proto_body.extend_from_slice(&unknown);
 
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("POST")
             .uri("/apis/batch/v1/namespaces/default/cronjobs")
             .header("content-type", "application/vnd.kubernetes.protobuf")
             .body(axum::body::Body::from(proto_body))
             .expect("request build must not fail");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
 
         let resp = router.call(req).await.expect("router must not error");
         assert_eq!(

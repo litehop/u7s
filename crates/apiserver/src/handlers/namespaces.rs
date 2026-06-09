@@ -113,6 +113,7 @@ pub async fn list_namespaces<S: Store>(
 
 pub async fn create_namespace<S: Store>(
     State(state): State<AppState<S>>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -259,7 +260,11 @@ pub async fn create_namespace<S: Store>(
         name: &name,
         namespace: None,
         operation: "CREATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
@@ -357,6 +362,7 @@ pub async fn patch_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
     Query(patch_query): Query<PatchQuery>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -386,6 +392,11 @@ pub async fn patch_namespace<S: Store>(
                 patch_type: PatchType::StrategicMerge,
                 body,
                 dry_run: patch_query.is_dry_run(),
+                user_info: Some(serde_json::json!({
+                    "username": user.username,
+                    "uid": user.uid,
+                    "groups": user.groups,
+                })),
             },
         )
         .await;
@@ -810,6 +821,14 @@ mod tests {
         )
     }
 
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
+    }
+
     fn namespace_body(name: &str) -> Bytes {
         Bytes::from(
             serde_json::json!({
@@ -830,6 +849,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("my-ns"),
             )
@@ -876,6 +896,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("finalizer-ns"),
             )
@@ -924,6 +945,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("label-test-ns"),
             )
@@ -978,9 +1000,14 @@ mod tests {
         );
 
         assert!(
-            create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body,)
-                .await
-                .is_ok(),
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                body,
+            )
+            .await
+            .is_ok(),
             "create with existing labels must succeed"
         );
 
@@ -1023,6 +1050,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("ts-ns"),
             )
@@ -1062,6 +1090,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("label-ns"),
             )
@@ -1135,6 +1164,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("patch-ns"),
             )
@@ -1157,6 +1187,7 @@ mod tests {
                 State(state.clone()),
                 Path("patch-ns".to_string()),
                 axum::extract::Query(PatchQuery::default()),
+                test_user(),
                 headers,
                 patch_body,
             )
@@ -1194,6 +1225,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("del-ns"),
             )
@@ -1303,6 +1335,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("bookmark-ns"),
             )
@@ -1381,6 +1414,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("list-ns"),
             )
@@ -1425,6 +1459,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("get-ns"),
             )
@@ -1473,8 +1508,13 @@ mod tests {
             .to_string(),
         );
 
-        let result =
-            create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body).await;
+        let result = create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected error"),
@@ -1496,8 +1536,13 @@ mod tests {
             .to_string(),
         );
 
-        let result =
-            create_namespace(State(state.clone()), axum::http::HeaderMap::new(), body).await;
+        let result = create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected error"),
@@ -1514,6 +1559,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("dup-ns"),
             )
@@ -1524,6 +1570,7 @@ mod tests {
 
         let result = create_namespace(
             State(state.clone()),
+            test_user(),
             axum::http::HeaderMap::new(),
             namespace_body("dup-ns"),
         )
@@ -1589,6 +1636,7 @@ mod tests {
             State(state.clone()),
             Path("any-ns".to_string()),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             headers,
             patch_body,
         )
@@ -1620,6 +1668,7 @@ mod tests {
             State(state.clone()),
             Path("no-such-ns".to_string()),
             axum::extract::Query(PatchQuery::default()),
+            test_user(),
             headers,
             patch_body,
         )
@@ -1677,6 +1726,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body_with_finalizers("fin-ns", &["kubernetes"]),
             )
@@ -1881,6 +1931,7 @@ mod tests {
                 "configmaps".into(),
             )),
             axum::extract::Query(CreateQuery::default()),
+            test_user(),
             headers,
             cm_post_body,
         )
@@ -1911,6 +1962,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body_with_finalizers("drain-ns", &["kubernetes"]),
             )
@@ -1942,6 +1994,7 @@ mod tests {
                 State(state.clone()),
                 Path("drain-ns".to_string()),
                 axum::extract::Query(PatchQuery::default()),
+                test_user(),
                 headers,
                 patch_body,
             )
@@ -1974,6 +2027,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("occ-ns"),
             )
@@ -2028,6 +2082,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body_with_finalizers("finalize-ns", &["kubernetes"]),
             )
@@ -2111,6 +2166,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body_with_finalizers("multi-fin-ns", &["kubernetes", "other"]),
             )
@@ -2225,6 +2281,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body_with_finalizers("put-drain-ns", &["kubernetes"]),
             )
@@ -2297,6 +2354,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("status-get-ns"),
             )
@@ -2326,6 +2384,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("status-put-ns"),
             )
@@ -2444,6 +2503,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("status-patch-ns"),
             )
@@ -2520,6 +2580,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("ssa-ns"),
             )
@@ -2551,6 +2612,7 @@ mod tests {
                 _field_validation: None,
                 dry_run: None,
             }),
+            test_user(),
             ssa_headers,
             patch_bytes,
         )
@@ -2603,6 +2665,7 @@ mod tests {
         assert!(
             create_namespace(
                 State(state.clone()),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 namespace_body("mf-ns"),
             )
@@ -2631,6 +2694,7 @@ mod tests {
                 _field_validation: None,
                 dry_run: None,
             }),
+            test_user(),
             ssa_headers,
             patch_bytes,
         )
@@ -2768,6 +2832,14 @@ mod admission_tests {
         )
     }
 
+    fn test_user() -> axum::Extension<crate::auth::UserInfo> {
+        axum::Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+        })
+    }
+
     async fn start_mock_webhook(router: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2843,6 +2915,7 @@ mod admission_tests {
 
         let result = create_namespace(
             axum::extract::State(state),
+            test_user(),
             axum::http::HeaderMap::new(),
             ns_body,
         )
@@ -2922,6 +2995,7 @@ mod admission_tests {
 
         let result = create_namespace(
             axum::extract::State(state),
+            test_user(),
             axum::http::HeaderMap::new(),
             ns_body,
         )
