@@ -1,0 +1,7 @@
+apiVersion: drain.example.com/v1
+kind: Drainable
+metadata:
+  name: sample
+  namespace: integration-drain-test
+spec:
+  value: "hello"

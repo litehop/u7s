@@ -1,0 +1,18 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vap-test-compliant
+  namespace: integration-vap-test
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: vap-test-ok
+  template:
+    metadata:
+      labels:
+        app: vap-test-ok
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
