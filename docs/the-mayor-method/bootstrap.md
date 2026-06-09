@@ -20,9 +20,12 @@ beads only after merge or verifiable completion; record close reasons concretely
 with cross-refs to PRs. Decisions go in BOTH the bead notes AND the merging
 PR's body — the PR body is the durable git-history record.
 
-**Read the siblings, in order:** `dispatch-prompt-template.md` (canonical worker
-prompts; paste the worktree-boundary block verbatim into every editing
-dispatch), then `README.md` (the longer "why"; refer back to sections as needed).
+**REQUIRED before your first dispatch:** Read `docs/the-mayor-method/dispatch-prompt-template.md`
+in full — do not dispatch any worker until you have done this. It defines the worktree
+pre-creation pattern, the worktree-boundary block (paste verbatim into every editing
+dispatch), the Lima VM protocol, and critical bans (e.g. `isolation="worktree"` in the
+Agent tool is BANNED). Then read `docs/the-mayor-method/README.md` (the longer "why";
+refer back to sections as needed).
 
 **Dashboard.** Maintain `ai/dashboard.md` for the operator: timestamp, one-line
 resume command, then "what needs the operator now" (decisions, blockers, files
