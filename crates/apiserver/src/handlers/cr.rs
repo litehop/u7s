@@ -438,13 +438,6 @@ pub async fn list_cr<S: Store>(
 ) -> Result<Response, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
-    if ctx.namespaced {
-        return Err(Status::not_found(
-            &format!("{group}/{version}/{plural}"),
-            "Resource",
-        ));
-    }
-
     // When version != storage_version, list from the storage version's key prefix.
     // Watch streams are not converted (watch conversion is out of scope).
     let (list_version, needs_conversion) = if version != ctx.storage_version {
@@ -456,6 +449,9 @@ pub async fn list_cr<S: Store>(
         (version.as_str(), false)
     };
 
+    // For namespaced CRDs, the cluster-wide path lists across all namespaces.
+    // Namespaced CRs are stored as /registry/cr/{group}/{version}/{plural}/{ns}/{name},
+    // so prefix without namespace matches all of them.
     let prefix = cr_list_prefix(&group, list_version, &plural, None);
 
     let accept = headers
@@ -1604,30 +1600,160 @@ mod tests {
         assert_eq!(json["code"], 404);
     }
 
-    // Using a cluster-scoped path for a namespaced CRD must return 404.
+    // GET /apis/{group}/{version}/{plural} (no namespace segment) on a Namespaced CRD
+    // must return 200 with an empty list, not 404. KCM GC informers watch this path to
+    // garbage-collect custom resources cluster-wide; a 404 causes them to retry every 15s
+    // and prevents namespace deletion from completing.
     #[tokio::test]
-    async fn cluster_path_for_namespaced_crd_returns_404() {
+    async fn cluster_wide_list_for_namespaced_crd_returns_200() {
         let state = make_state();
         install_namespaced_crd(&state).await;
 
-        let err = expect_err_status(
-            list_cr(
+        let resp = match list_cr(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "applications".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            no_watch_query(),
+            "test-user".to_string(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let json = serde_json::to_value(&e.1).unwrap();
+                panic!(
+                    "cluster-wide list on namespaced CRD must return 200, got: {}",
+                    json
+                );
+            }
+        };
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "KCM informers watch cluster-wide path; 404 causes infinite retry"
+        );
+    }
+
+    // GET /apis/{group}/{version}/{plural} on a Namespaced CRD with CRs in multiple
+    // namespaces must return all of them. KCM GC needs the full cross-namespace view
+    // to discover owner references and garbage-collect correctly.
+    #[tokio::test]
+    async fn cluster_wide_list_for_namespaced_crd_returns_all_namespaces() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        // Create CRs in two different namespaces.
+        assert!(
+            create_cr_namespaced(
                 State(state.clone()),
                 Path((
                     "argoproj.io".to_string(),
                     "v1alpha1".to_string(),
+                    "ns-a".to_string(),
                     "applications".to_string(),
                 )),
                 axum::http::HeaderMap::new(),
-                no_watch_query(),
-                "test-user".to_string(),
+                app_body("app-in-ns-a", "ns-a"),
             )
-            .await,
-            "namespaced CRD must reject cluster-scoped path",
+            .await
+            .is_ok(),
+            "create in ns-a must succeed"
+        );
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    "ns-b".to_string(),
+                    "applications".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                app_body("app-in-ns-b", "ns-b"),
+            )
+            .await
+            .is_ok(),
+            "create in ns-b must succeed"
         );
 
-        let json = serde_json::to_value(&err.1).unwrap();
-        assert_eq!(json["code"], 404);
+        let resp = match list_cr(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "applications".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            no_watch_query(),
+            "test-user".to_string(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let json = serde_json::to_value(&e.1).unwrap();
+                panic!("cluster-wide list must succeed, got: {}", json);
+            }
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = list["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            2,
+            "cluster-wide list must include CRs from all namespaces, got {}",
+            items.len()
+        );
+    }
+
+    // WATCH /apis/{group}/{version}/{plural} (no namespace) on a Namespaced CRD must
+    // return 200 with chunked streaming. KCM informers use this watch path.
+    #[tokio::test]
+    async fn cluster_wide_watch_for_namespaced_crd_returns_200_chunked() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let resp = match list_cr(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "applications".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            watch_query(),
+            "test-user".to_string(),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let json = serde_json::to_value(&e.1).unwrap();
+                panic!(
+                    "cluster-wide watch on namespaced CRD must return 200, got: {}",
+                    json
+                );
+            }
+        };
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("transfer-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("chunked"),
+            "cluster-wide watch on namespaced CRD must use chunked transfer encoding"
+        );
     }
 
     // Creating the same CR twice must return 409 AlreadyExists.
