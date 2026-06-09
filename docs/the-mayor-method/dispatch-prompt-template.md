@@ -379,8 +379,10 @@ Your assigned host IP: <HOST_IP>
 You have exclusive use of this VM for this bead. Do NOT use `lima-node` or
 `127.0.0.1` — those belong to the mayor or another worker.
 
-The MCP server for your VM is `mcp__<VM_NAME>__run_shell_command`.
-You also have `limactl shell <VM_NAME> <cmd>` via Bash. Both are in your allowlist.
+You cannot invoke shell scripts directly (not in the Bash allowlist). Use
+`limactl shell <VM>`, `kubectl`, and `cargo` commands instead. The full manual
+equivalents for every stack operation are in `ai/prompts/vm-operations.md` —
+read that file before starting any VM work.
 
 **Cargo tests are not sufficient.** This bead touches a runtime path that
 sonobuoy exercises. You must verify against the live server.
