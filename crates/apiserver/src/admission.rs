@@ -2078,7 +2078,7 @@ async fn fetch_validating_policy_bindings<S: Store>(state: &AppState<S>) -> Vec<
 ///    policy's matchConstraints — both must match.
 /// 4. Evaluate spec.matchConditions (pre-filter): if any returns false, skip this pair.
 /// 5. Evaluate spec.variables in order, building a variables map.
-/// 6. Evaluate spec.validations expressions; if any returns false, deny with 403.
+/// 6. Evaluate spec.validations expressions; if any returns false, deny (422 by default, 403 if reason=Forbidden).
 /// 7. validationActions: Deny → return error; Warn/Audit → log and continue.
 async fn run_validating_admission_policies<S: Store>(
     state: &AppState<S>,
@@ -2294,7 +2294,7 @@ async fn run_validating_admission_policies<S: Store>(
                     }
                 };
                 if !passed {
-                    let reason = validation["reason"].as_str().unwrap_or("Forbidden");
+                    let reason = validation["reason"].as_str().unwrap_or("");
                     let message = validation["message"]
                         .as_str()
                         .map(|m| m.to_string())
@@ -2311,7 +2311,15 @@ async fn run_validating_admission_policies<S: Store>(
                             message,
                             reason
                         );
-                        return Err(Status::forbidden(message));
+                        // Real Kubernetes: default reason is Invalid (422 Unprocessable Entity).
+                        // Only reason="Forbidden" maps to 403. The conformance test polls for
+                        // apierrors.IsInvalid (HTTP 422) — any other code fails the test.
+                        let err = if reason == "Forbidden" {
+                            Status::forbidden(message)
+                        } else {
+                            Status::unprocessable_entity(message)
+                        };
+                        return Err(err);
                     } else {
                         tracing::warn!(
                             "admission: VAP \"{}\" validation failed (non-Deny action): {}",
@@ -5645,16 +5653,17 @@ mod tests {
         );
     }
 
-    /// VAP denial must return a well-formed StatusError carrying code=403 and a non-empty message.
+    /// VAP denial with no reason field must return HTTP 422 Invalid, not 403 Forbidden.
     ///
-    /// Kubernetes clients parse the response body as a Status object. If the body is absent or
-    /// not a valid Status JSON, clients see `invalid JSON: expected value at line 1 column 1`
-    /// and cannot display the policy violation reason to the user.
+    /// Real Kubernetes maps a missing/empty spec.validations[].reason to "Invalid" (422).
+    /// The conformance test at validatingadmissionpolicy.go:120 and :270 polls using
+    /// apierrors.IsInvalid(err), which checks for HTTP 422. Any non-422 response is treated
+    /// as unexpected and fails the test immediately instead of retrying.
     ///
     /// Reverting the `should_deny` path from run_validating_admission_policies or replacing
     /// StatusError with a different error type would cause the body to be absent or wrong-typed.
     #[tokio::test]
-    async fn vap_denial_produces_well_formed_status_error_with_code_403() {
+    async fn vap_denial_default_reason_returns_422_invalid() {
         use axum::response::IntoResponse as _;
 
         let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
@@ -5732,8 +5741,8 @@ mod tests {
         let response = err.into_response();
         assert_eq!(
             response.status(),
-            axum::http::StatusCode::FORBIDDEN,
-            "VAP denial must return HTTP 403 so clients can identify it as a policy violation"
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "VAP denial with no reason must return HTTP 422 so apierrors.IsInvalid() matches it"
         );
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -5748,8 +5757,12 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&body).expect("VAP denial body must be valid JSON");
         assert_eq!(
-            json["code"], 403,
-            "VAP denial Status.code must be 403 so clients can distinguish it from other errors"
+            json["code"], 422,
+            "VAP denial Status.code must be 422 so apierrors.IsInvalid() returns true"
+        );
+        assert_eq!(
+            json["reason"], "Invalid",
+            "VAP denial Status.reason must be Invalid matching Kubernetes default for validation failures"
         );
         assert_eq!(
             json["kind"], "Status",
@@ -5761,6 +5774,114 @@ mod tests {
                 .map(|m| !m.is_empty())
                 .unwrap_or(false),
             "VAP denial Status.message must be non-empty so users see the policy violation reason"
+        );
+    }
+
+    /// VAP denial with reason="Forbidden" must return HTTP 403.
+    ///
+    /// When a policy author explicitly sets spec.validations[].reason = "Forbidden", Kubernetes
+    /// returns 403. This allows policies to signal authorization failures rather than validation
+    /// failures. Returning 422 for Forbidden-reason policies would break clients that check
+    /// apierrors.IsForbidden() to distinguish the two denial types.
+    #[tokio::test]
+    async fn vap_denial_reason_forbidden_returns_403() {
+        use axum::response::IntoResponse as _;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "deny-configmaps-authz"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["configmaps"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "validations": [{
+                    "expression": "false",
+                    "message": "not authorized to create configmaps",
+                    "reason": "Forbidden"
+                }]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/deny-configmaps-authz",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "deny-configmaps-authz-binding"},
+            "spec": {
+                "policyName": "deny-configmaps-authz",
+                "validationActions": ["Deny"]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/deny-configmaps-authz-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj =
+            json!({"kind": "ConfigMap", "metadata": {"name": "test-cm2", "namespace": "default"}});
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "test-cm2",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        assert!(
+            result.is_err(),
+            "VAP with reason=Forbidden and expression=false must deny the request"
+        );
+
+        let err = result.unwrap_err();
+        let response = err.into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "VAP denial with reason=Forbidden must return HTTP 403 so apierrors.IsForbidden() matches it"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body must be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("VAP denial body must be valid JSON");
+        assert_eq!(
+            json["code"], 403,
+            "VAP denial with reason=Forbidden must have Status.code=403"
+        );
+        assert_eq!(
+            json["reason"], "Forbidden",
+            "VAP denial with reason=Forbidden must have Status.reason=Forbidden"
         );
     }
 
