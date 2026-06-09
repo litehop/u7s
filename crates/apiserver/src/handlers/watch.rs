@@ -368,6 +368,15 @@ pub(crate) async fn watch_generic<S: Store>(
         if let Some((items, list_rv)) = initial_items {
             last_rv = last_rv.max(list_rv);
             for item in items {
+                // Apply the same label/field selector filtering as live events so that
+                // a watch with sendInitialEvents=true and a fieldSelector does not deliver
+                // every object in the prefix as ADDED (which would cause the BOOKMARK to
+                // never be emitted for non-matching objects, hanging the watch).
+                if !object_matches_label_selector(&item, &label_selector)
+                    || !object_matches_field_selector(&item, &field_selector)
+                {
+                    continue;
+                }
                 let emit = if as_partial_object_metadata {
                     to_partial_object_metadata(&item)
                 } else {
@@ -2029,6 +2038,203 @@ mod tests {
              if it does not, timeout_seconds is being ignored and the server uses a longer \
              default — Kubernetes informers that set timeoutSeconds will get streams that \
              close at the wrong time (mayor-guqc)"
+        );
+    }
+
+    // -- sendInitialEvents + fieldSelector regression (mayor-ezur) --
+
+    /// Regression for mayor-ezur: a watch with sendInitialEvents=true AND a matching
+    /// fieldSelector must deliver an ADDED event for the matching object followed by a
+    /// BOOKMARK with k8s.io/initial-events-end=true.
+    ///
+    /// Without the fix, the initial snapshot is emitted without field selector filtering,
+    /// so all objects are emitted as ADDED regardless of the selector. After the fix,
+    /// only matching objects are emitted. This test verifies the matching path works.
+    ///
+    /// This test fails if the field selector filter is removed from the initial snapshot loop.
+    #[tokio::test]
+    async fn watch_generic_send_initial_events_with_matching_field_selector_emits_added_then_bookmark(
+    ) {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Seed the object we will filter for.
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {
+                "name": "default",
+                "namespace": "test-ns"
+            }
+        });
+        store
+            .put(
+                "/registry/serviceaccounts/test-ns/default",
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let initial_items =
+            fetch_initial_events(&state, "/registry/serviceaccounts/test-ns/", true)
+                .await
+                .expect("fetch_initial_events must not fail");
+
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/serviceaccounts/test-ns/".into(),
+                api_version: "v1".into(),
+                kind: "ServiceAccount".into(),
+                from_revision: 0,
+                initial_items,
+                label_selector: None,
+                field_selector: Some("metadata.name=default".into()),
+                allow_watch_bookmarks: true,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .expect("watch_generic must succeed");
+
+        let lines = read_watch_body_with_timeout(resp).await;
+
+        // Must have exactly one ADDED event for the matching object.
+        let added: Vec<_> = lines.iter().filter(|v| v["type"] == "ADDED").collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "sendInitialEvents + fieldSelector=metadata.name=default must emit exactly 1 ADDED \
+             for the matching object; got {:?}",
+            lines
+        );
+        assert_eq!(
+            added[0]["object"]["metadata"]["name"], "default",
+            "ADDED event must carry the matching object (mayor-ezur)"
+        );
+
+        // Must have a BOOKMARK with k8s.io/initial-events-end=true.
+        let bookmark = lines.iter().find(|v| {
+            v["type"] == "BOOKMARK"
+                && v["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"] == "true"
+        });
+        assert!(
+            bookmark.is_some(),
+            "sendInitialEvents watch must emit initial-events-end BOOKMARK; \
+             without it the watch hangs forever (mayor-ezur). Got lines: {:?}",
+            lines
+        );
+    }
+
+    /// Regression for mayor-ezur: a watch with sendInitialEvents=true AND a non-matching
+    /// fieldSelector must emit NO ADDED events (the object is filtered out) but still emit
+    /// the BOOKMARK with k8s.io/initial-events-end=true.
+    ///
+    /// Without the fix, the non-matching object is emitted as ADDED (field selector ignored
+    /// for initial snapshot). After the fix it is filtered out. The BOOKMARK must still
+    /// arrive so the watch does not hang.
+    ///
+    /// This test fails if the field selector filter is removed from the initial snapshot loop.
+    #[tokio::test]
+    async fn watch_generic_send_initial_events_with_non_matching_field_selector_emits_only_bookmark(
+    ) {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Seed an object whose name does NOT match the field selector.
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {
+                "name": "other-sa",
+                "namespace": "test-ns2"
+            }
+        });
+        store
+            .put(
+                "/registry/serviceaccounts/test-ns2/other-sa",
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let initial_items =
+            fetch_initial_events(&state, "/registry/serviceaccounts/test-ns2/", true)
+                .await
+                .expect("fetch_initial_events must not fail");
+
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/serviceaccounts/test-ns2/".into(),
+                api_version: "v1".into(),
+                kind: "ServiceAccount".into(),
+                from_revision: 0,
+                initial_items,
+                label_selector: None,
+                // Selector for "default" — the stored SA is named "other-sa", so no match.
+                field_selector: Some("metadata.name=default".into()),
+                allow_watch_bookmarks: true,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .expect("watch_generic must succeed");
+
+        let lines = read_watch_body_with_timeout(resp).await;
+
+        // Must have zero ADDED events — the object does not match the selector.
+        let added_count = lines.iter().filter(|v| v["type"] == "ADDED").count();
+        assert_eq!(
+            added_count, 0,
+            "sendInitialEvents + non-matching fieldSelector must emit no ADDED events; \
+             field selector filtering of initial snapshot is broken (mayor-ezur). Got: {:?}",
+            lines
+        );
+
+        // The BOOKMARK with initial-events-end must still arrive so the watch doesn't hang.
+        let bookmark = lines.iter().find(|v| {
+            v["type"] == "BOOKMARK"
+                && v["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"] == "true"
+        });
+        assert!(
+            bookmark.is_some(),
+            "sendInitialEvents watch must emit initial-events-end BOOKMARK even when no objects \
+             match the fieldSelector; without it the watch hangs forever (mayor-ezur). \
+             Got lines: {:?}",
+            lines
         );
     }
 
