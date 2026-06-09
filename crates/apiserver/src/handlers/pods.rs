@@ -280,6 +280,8 @@ pub async fn create_pod<S: Store>(
         name: &name,
         namespace: Some(ns.as_str()),
         operation: "CREATE",
+        user_info: None,
+        dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
@@ -366,6 +368,8 @@ pub async fn replace_pod<S: Store>(
         name: &name,
         namespace: Some(ns.as_str()),
         operation: "UPDATE",
+        user_info: None,
+        dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;

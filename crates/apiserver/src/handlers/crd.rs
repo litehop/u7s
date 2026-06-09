@@ -316,6 +316,8 @@ pub async fn create_crd<S: Store>(
             name: &name,
             namespace: None,
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mutated = run_mutating_webhooks(&state, obj_val, &admission_ctx).await?;
@@ -441,6 +443,8 @@ pub async fn replace_crd<S: Store>(
             name: &name,
             namespace: None,
             operation: "UPDATE",
+            user_info: None,
+            dry_run: false,
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mutated = run_mutating_webhooks(&state, obj_val, &admission_ctx).await?;
@@ -562,6 +566,8 @@ pub async fn patch_crd<S: Store>(
             name: &name,
             namespace: None,
             operation: "UPDATE",
+            user_info: None,
+            dry_run: false,
         };
         let obj_val = serde_json::to_value(&crd).map_err(|e| Status::internal(e.to_string()))?;
         let mutated = run_mutating_webhooks(&state, obj_val, &admission_ctx).await?;

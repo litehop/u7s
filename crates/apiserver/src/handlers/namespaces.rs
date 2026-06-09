@@ -259,6 +259,8 @@ pub async fn create_namespace<S: Store>(
         name: &name,
         namespace: None,
         operation: "CREATE",
+        user_info: None,
+        dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;

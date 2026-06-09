@@ -367,6 +367,11 @@ pub struct AdmissionContext<'a> {
     pub name: &'a str,
     pub namespace: Option<&'a str>,
     pub operation: &'a str,
+    /// Authenticated user info for the request. Used by VAP CEL expressions
+    /// that reference `request.userInfo.*`. None if auth info is unavailable.
+    pub user_info: Option<serde_json::Value>,
+    /// Whether this is a dry-run request. Exposed as `request.dryRun` in VAP CEL.
+    pub dry_run: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -816,23 +821,25 @@ pub(crate) fn eval_cel_apply_config(
 /// Evaluate a CEL boolean expression for ValidatingAdmissionPolicy validations.
 ///
 /// Supports the VAP subset of CEL:
-/// - Field access: `object.spec.replicas`, `variables.X`
+/// - Field access: `object.spec.replicas`, `variables.X`, `request.userInfo.username`
 /// - Arithmetic: `+`, `-`, `*`, `/`, `%`
 /// - Comparisons: `==`, `!=`, `<`, `<=`, `>`, `>=`
 /// - Boolean: `&&`, `||`, `!`
 /// - Literals: integer, float, bool, string, null
 ///
 /// `variables` is a map of intermediate values computed from `spec.variables`.
+/// `request` is the admission request context (operation, name, namespace, userInfo, dryRun).
 /// Returns `Some(true)` / `Some(false)`, or `None` on parse/eval error.
 pub(crate) fn eval_cel_bool_expr(
     expr: &str,
     object: &serde_json::Value,
     variables: &serde_json::Map<String, serde_json::Value>,
+    request: &serde_json::Value,
 ) -> Option<bool> {
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
-    let val = parse_vap_or(&tokens, &mut pos, object, &variables_val)?;
+    let val = parse_vap_or(&tokens, &mut pos, object, &variables_val, request)?;
     val.as_bool()
 }
 
@@ -841,11 +848,12 @@ pub(crate) fn eval_cel_vap_value(
     expr: &str,
     object: &serde_json::Value,
     variables: &serde_json::Map<String, serde_json::Value>,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
-    parse_vap_or(&tokens, &mut pos, object, &variables_val)
+    parse_vap_or(&tokens, &mut pos, object, &variables_val, request)
 }
 
 // ---------------------------------------------------------------------------
@@ -858,12 +866,13 @@ fn parse_vap_or(
     pos: &mut usize,
     object: &serde_json::Value,
     variables: &serde_json::Value,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_and(tokens, pos, object, variables)?;
+    let mut left = parse_vap_and(tokens, pos, object, variables, request)?;
     while *pos < tokens.len() {
         if let CelToken::Pipe = &tokens[*pos] {
             *pos += 1;
-            let right = parse_vap_and(tokens, pos, object, variables)?;
+            let right = parse_vap_and(tokens, pos, object, variables, request)?;
             let result = left.as_bool().unwrap_or(false) || right.as_bool().unwrap_or(false);
             left = serde_json::Value::Bool(result);
         } else {
@@ -879,12 +888,13 @@ fn parse_vap_and(
     pos: &mut usize,
     object: &serde_json::Value,
     variables: &serde_json::Value,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_cmp(tokens, pos, object, variables)?;
+    let mut left = parse_vap_cmp(tokens, pos, object, variables, request)?;
     while *pos < tokens.len() {
         if let CelToken::Ampersand = &tokens[*pos] {
             *pos += 1;
-            let right = parse_vap_cmp(tokens, pos, object, variables)?;
+            let right = parse_vap_cmp(tokens, pos, object, variables, request)?;
             let result = left.as_bool().unwrap_or(false) && right.as_bool().unwrap_or(false);
             left = serde_json::Value::Bool(result);
         } else {
@@ -900,8 +910,9 @@ fn parse_vap_cmp(
     pos: &mut usize,
     object: &serde_json::Value,
     variables: &serde_json::Value,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let left = parse_vap_add(tokens, pos, object, variables)?;
+    let left = parse_vap_add(tokens, pos, object, variables, request)?;
     if *pos >= tokens.len() {
         return Some(left);
     }
@@ -914,7 +925,7 @@ fn parse_vap_cmp(
         | CelToken::Gt
         | CelToken::Gte => {
             *pos += 1;
-            let right = parse_vap_add(tokens, pos, object, variables)?;
+            let right = parse_vap_add(tokens, pos, object, variables, request)?;
             let result = compare_values(&op, &left, &right)?;
             Some(serde_json::Value::Bool(result))
         }
@@ -960,14 +971,15 @@ fn parse_vap_add(
     pos: &mut usize,
     object: &serde_json::Value,
     variables: &serde_json::Value,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_mul(tokens, pos, object, variables)?;
+    let mut left = parse_vap_mul(tokens, pos, object, variables, request)?;
     while *pos < tokens.len() {
         let op = tokens[*pos].clone();
         match op {
             CelToken::Plus | CelToken::Minus => {
                 *pos += 1;
-                let right = parse_vap_mul(tokens, pos, object, variables)?;
+                let right = parse_vap_mul(tokens, pos, object, variables, request)?;
                 left = apply_add_op(&op, &left, &right)?;
             }
             _ => break,
@@ -1015,14 +1027,15 @@ fn parse_vap_mul(
     pos: &mut usize,
     object: &serde_json::Value,
     variables: &serde_json::Value,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_unary(tokens, pos, object, variables)?;
+    let mut left = parse_vap_unary(tokens, pos, object, variables, request)?;
     while *pos < tokens.len() {
         let op = tokens[*pos].clone();
         match op {
             CelToken::Star | CelToken::Slash | CelToken::Percent => {
                 *pos += 1;
-                let right = parse_vap_unary(tokens, pos, object, variables)?;
+                let right = parse_vap_unary(tokens, pos, object, variables, request)?;
                 left = apply_mul_op(&op, &left, &right)?;
             }
             _ => break,
@@ -1062,6 +1075,7 @@ fn parse_vap_unary(
     pos: &mut usize,
     object: &serde_json::Value,
     variables: &serde_json::Value,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     if *pos >= tokens.len() {
         return None;
@@ -1069,12 +1083,12 @@ fn parse_vap_unary(
     match &tokens[*pos] {
         CelToken::Bang => {
             *pos += 1;
-            let inner = parse_vap_unary(tokens, pos, object, variables)?;
+            let inner = parse_vap_unary(tokens, pos, object, variables, request)?;
             Some(serde_json::Value::Bool(!inner.as_bool()?))
         }
         CelToken::Minus => {
             *pos += 1;
-            let inner = parse_vap_unary(tokens, pos, object, variables)?;
+            let inner = parse_vap_unary(tokens, pos, object, variables, request)?;
             match inner {
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
@@ -1086,7 +1100,7 @@ fn parse_vap_unary(
                 _ => None,
             }
         }
-        _ => parse_vap_primary(tokens, pos, object, variables),
+        _ => parse_vap_primary(tokens, pos, object, variables, request),
     }
 }
 
@@ -1096,6 +1110,7 @@ fn parse_vap_primary(
     pos: &mut usize,
     object: &serde_json::Value,
     variables: &serde_json::Value,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     if *pos >= tokens.len() {
         return None;
@@ -1123,7 +1138,7 @@ fn parse_vap_primary(
         }
         CelToken::LParen => {
             *pos += 1;
-            let val = parse_vap_or(tokens, pos, object, variables)?;
+            let val = parse_vap_or(tokens, pos, object, variables, request)?;
             if *pos < tokens.len() {
                 if let CelToken::RParen = &tokens[*pos] {
                     *pos += 1;
@@ -1138,13 +1153,15 @@ fn parse_vap_primary(
                 object.clone()
             } else if name == "variables" {
                 variables.clone()
+            } else if name == "request" {
+                request.clone()
             } else {
                 // Unknown identifier — return as string (struct constructor handled below)
                 // Check for struct constructor: TypeName{...}
                 if *pos < tokens.len() {
                     if let CelToken::LBrace = &tokens[*pos] {
                         *pos += 1;
-                        return parse_vap_object_body(tokens, pos, object, variables);
+                        return parse_vap_object_body(tokens, pos, object, variables, request);
                     }
                 }
                 return Some(serde_json::Value::String(name));
@@ -1152,11 +1169,11 @@ fn parse_vap_primary(
 
             // Skip qualifier segments before LBrace (e.g. Object.metadata{...}).
             // Also handle dot-access chains: object.spec.replicas.
-            parse_vap_field_chain(tokens, pos, root, object, variables)
+            parse_vap_field_chain(tokens, pos, root, object, variables, request)
         }
         CelToken::LBrace => {
             *pos += 1;
-            parse_vap_object_body(tokens, pos, object, variables)
+            parse_vap_object_body(tokens, pos, object, variables, request)
         }
         CelToken::LBracket => {
             *pos += 1;
@@ -1166,7 +1183,7 @@ fn parse_vap_primary(
                     *pos += 1;
                     break;
                 }
-                let val = parse_vap_or(tokens, pos, object, variables)?;
+                let val = parse_vap_or(tokens, pos, object, variables, request)?;
                 arr.push(val);
                 if *pos < tokens.len() {
                     if let CelToken::Comma = &tokens[*pos] {
@@ -1187,6 +1204,7 @@ fn parse_vap_field_chain(
     mut current: serde_json::Value,
     object: &serde_json::Value,
     variables: &serde_json::Value,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     loop {
         if *pos >= tokens.len() {
@@ -1205,7 +1223,7 @@ fn parse_vap_field_chain(
                         if let CelToken::LBrace = &tokens[*pos] {
                             // TypeName.qualifier{...} — treat as constructor, discard qualifier
                             *pos += 1;
-                            return parse_vap_object_body(tokens, pos, object, variables);
+                            return parse_vap_object_body(tokens, pos, object, variables, request);
                         }
                     }
                     // Field navigation
@@ -1217,7 +1235,7 @@ fn parse_vap_field_chain(
             CelToken::LBrace => {
                 // Struct constructor on this identifier
                 *pos += 1;
-                return parse_vap_object_body(tokens, pos, object, variables);
+                return parse_vap_object_body(tokens, pos, object, variables, request);
             }
             _ => break,
         }
@@ -1231,6 +1249,7 @@ fn parse_vap_object_body(
     pos: &mut usize,
     object: &serde_json::Value,
     variables: &serde_json::Value,
+    request: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let mut map = serde_json::Map::new();
     while *pos < tokens.len() {
@@ -1257,7 +1276,7 @@ fn parse_vap_object_body(
         } else {
             return None;
         }
-        let val = parse_vap_or(tokens, pos, object, variables)?;
+        let val = parse_vap_or(tokens, pos, object, variables, request)?;
         map.insert(key, val);
         if *pos < tokens.len() {
             if let CelToken::Comma = &tokens[*pos] {
@@ -2154,6 +2173,37 @@ async fn run_validating_admission_policies<S: Store>(
             }
         }
 
+        // Build a `request` JSON object from the admission context for CEL evaluation.
+        // This allows VAP expressions to reference request.userInfo.username,
+        // request.operation, request.name, request.namespace, and request.dryRun.
+        let request_val = {
+            let mut req = serde_json::Map::new();
+            req.insert(
+                "operation".to_string(),
+                serde_json::Value::String(ctx.operation.to_string()),
+            );
+            req.insert(
+                "name".to_string(),
+                serde_json::Value::String(ctx.name.to_string()),
+            );
+            req.insert(
+                "namespace".to_string(),
+                ctx.namespace
+                    .map(|ns| serde_json::Value::String(ns.to_string()))
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            req.insert("dryRun".to_string(), serde_json::Value::Bool(ctx.dry_run));
+            if let Some(ref ui) = ctx.user_info {
+                req.insert("userInfo".to_string(), ui.clone());
+            } else {
+                req.insert(
+                    "userInfo".to_string(),
+                    serde_json::json!({"username": "", "groups": []}),
+                );
+            }
+            serde_json::Value::Object(req)
+        };
+
         // Evaluate matchConditions (pre-filter): any false → skip this binding, not deny.
         let match_conditions = policy["spec"]["matchConditions"].as_array();
         if let Some(conditions) = match_conditions {
@@ -2164,7 +2214,7 @@ async fn run_validating_admission_policies<S: Store>(
                     continue;
                 }
                 let vars = serde_json::Map::new();
-                match eval_cel_bool_expr(expr, object, &vars) {
+                match eval_cel_bool_expr(expr, object, &vars, &request_val) {
                     Some(true) => {} // condition passes, continue
                     Some(false) => {
                         // matchCondition returned false → skip this webhook (not deny)
@@ -2199,7 +2249,7 @@ async fn run_validating_admission_policies<S: Store>(
                 if var_name.is_empty() || var_expr.is_empty() {
                     continue;
                 }
-                match eval_cel_vap_value(var_expr, object, &variables) {
+                match eval_cel_vap_value(var_expr, object, &variables, &request_val) {
                     Some(val) => {
                         variables.insert(var_name.to_string(), val);
                     }
@@ -2231,7 +2281,7 @@ async fn run_validating_admission_policies<S: Store>(
                 if expr.is_empty() {
                     continue;
                 }
-                let result = eval_cel_bool_expr(expr, object, &variables);
+                let result = eval_cel_bool_expr(expr, object, &variables, &request_val);
                 let passed = match result {
                     Some(b) => b,
                     None => {
@@ -2542,6 +2592,8 @@ mod tests {
             name: "new-mwc",
             namespace: None,
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         // Must succeed without invoking any webhook (skipped by deadlock prevention).
         let result = run_mutating_webhooks(&state, new_mwc.clone(), &ctx).await;
@@ -2604,6 +2656,8 @@ mod tests {
             name: "new-vwc",
             namespace: None,
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_validating_webhooks(&state, &new_vwc, &ctx).await;
         assert!(
@@ -2730,6 +2784,8 @@ mod tests {
             name: "test",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
         assert!(result.is_ok(), "no webhooks must not fail");
@@ -2751,6 +2807,8 @@ mod tests {
             name: "test",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_validating_webhooks(&state, &obj, &ctx).await;
         assert!(result.is_ok(), "no webhooks must return Ok");
@@ -2864,6 +2922,8 @@ mod tests {
             name: "test-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let review = build_review(
             "uid-1",
@@ -2888,6 +2948,8 @@ mod tests {
             name: "test-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let review = build_review(
             "uid-2",
@@ -2916,6 +2978,8 @@ mod tests {
             name: "test",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let review = build_review("uid-3", &ctx, &obj);
         let resp = mock_call_webhook(patch_handler(), &review).await;
@@ -2987,6 +3051,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
 
@@ -3049,6 +3115,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
 
@@ -3105,6 +3173,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_validating_webhooks(&state, &obj, &ctx).await;
 
@@ -3161,6 +3231,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_validating_webhooks(&state, &obj, &ctx).await;
 
@@ -3220,6 +3292,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
 
@@ -3445,6 +3519,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("dev-ns"), // namespace labelled env=dev, not env=prod
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
 
@@ -3530,6 +3606,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("prod-ns"), // namespace labelled env=prod — selector matches
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
 
@@ -3599,6 +3677,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         // The webhook is invoked at https://my-webhook-svc.webhook-ns.svc:8443/mutate,
         // fails to connect (no cluster in unit tests), but failurePolicy=Ignore means
@@ -3791,6 +3871,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
 
         let result = run_mutating_webhooks(&state, obj, &ctx).await;
@@ -3888,6 +3970,8 @@ mod tests {
             name: "no-patch-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
 
         let result = run_mutating_webhooks(&state, obj, &ctx).await;
@@ -3959,6 +4043,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
         assert!(
@@ -4063,6 +4149,8 @@ mod tests {
             name: "my-config",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
 
         let result = run_mutating_webhooks(&state, configmap, &ctx).await;
@@ -4242,6 +4330,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let obj = serde_json::json!({
             "apiVersion": "apps/v1",
@@ -4279,6 +4369,8 @@ mod tests {
             name: "my-pod",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         // Object without a "kind" field.
         let obj = serde_json::json!({"metadata": {"name": "my-pod"}});
@@ -4428,6 +4520,8 @@ mod tests {
             name: "my-config",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
 
@@ -4501,6 +4595,8 @@ mod tests {
             name: "my-prod-config",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
 
@@ -4567,6 +4663,8 @@ mod tests {
             name: "my-dev-config",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_validating_webhooks(&state, &obj, &ctx).await;
 
@@ -4752,6 +4850,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
 
         let result = run_mutating_webhooks(&state, deployment, &ctx).await;
@@ -4828,6 +4928,8 @@ mod tests {
             name: "my-cm",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
 
         let result = run_mutating_webhooks(&state, cm.clone(), &ctx).await;
@@ -5222,6 +5324,8 @@ mod tests {
             name: "my-deploy",
             namespace: Some("vap-test-ns"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_validating_webhooks(&state, &deploy_even, &ctx).await;
         assert!(
@@ -5325,6 +5429,8 @@ mod tests {
             name: "valid-deploy",
             namespace: Some("vap-allow-ns"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_validating_webhooks(&state, &deploy_odd, &ctx).await;
         assert!(
@@ -5349,19 +5455,28 @@ mod tests {
         let object = json!({"spec": {"replicas": 3}});
         let mut variables = serde_json::Map::new();
 
+        let no_request = serde_json::Value::Null;
+
         // Step 1: evaluate `replicas = object.spec.replicas`
-        let replicas_val = eval_cel_vap_value("object.spec.replicas", &object, &variables)
-            .expect("object.spec.replicas must evaluate");
+        let replicas_val =
+            eval_cel_vap_value("object.spec.replicas", &object, &variables, &no_request)
+                .expect("object.spec.replicas must evaluate");
         variables.insert("replicas".into(), replicas_val);
 
         // Step 2: evaluate `oddReplicas = variables.replicas % 2 == 1`
-        let odd_val = eval_cel_vap_value("variables.replicas % 2 == 1", &object, &variables)
-            .expect("variables.replicas % 2 == 1 must evaluate");
+        let odd_val = eval_cel_vap_value(
+            "variables.replicas % 2 == 1",
+            &object,
+            &variables,
+            &no_request,
+        )
+        .expect("variables.replicas % 2 == 1 must evaluate");
         variables.insert("oddReplicas".into(), odd_val);
 
         // Validate: replicas > 1 → true (3 > 1)
-        let gt_result = eval_cel_bool_expr("variables.replicas > 1", &object, &variables)
-            .expect("variables.replicas > 1 must evaluate");
+        let gt_result =
+            eval_cel_bool_expr("variables.replicas > 1", &object, &variables, &no_request)
+                .expect("variables.replicas > 1 must evaluate");
         assert!(
             gt_result,
             "variables.replicas (3) > 1 must be true; \
@@ -5369,8 +5484,9 @@ mod tests {
         );
 
         // Validate: oddReplicas → true (3 is odd)
-        let odd_result = eval_cel_bool_expr("variables.oddReplicas", &object, &variables)
-            .expect("variables.oddReplicas must evaluate");
+        let odd_result =
+            eval_cel_bool_expr("variables.oddReplicas", &object, &variables, &no_request)
+                .expect("variables.oddReplicas must evaluate");
         assert!(
             odd_result,
             "variables.oddReplicas must be true for replicas=3; \
@@ -5380,14 +5496,30 @@ mod tests {
         // Now test with even replicas (2).
         let object_even = json!({"spec": {"replicas": 2}});
         let mut variables_even = serde_json::Map::new();
-        let r2 = eval_cel_vap_value("object.spec.replicas", &object_even, &variables_even).unwrap();
+        let r2 = eval_cel_vap_value(
+            "object.spec.replicas",
+            &object_even,
+            &variables_even,
+            &no_request,
+        )
+        .unwrap();
         variables_even.insert("replicas".into(), r2);
-        let o2 = eval_cel_vap_value("variables.replicas % 2 == 1", &object_even, &variables_even)
-            .unwrap();
+        let o2 = eval_cel_vap_value(
+            "variables.replicas % 2 == 1",
+            &object_even,
+            &variables_even,
+            &no_request,
+        )
+        .unwrap();
         variables_even.insert("oddReplicas".into(), o2);
 
-        let odd_even = eval_cel_bool_expr("variables.oddReplicas", &object_even, &variables_even)
-            .expect("oddReplicas must evaluate for even replicas");
+        let odd_even = eval_cel_bool_expr(
+            "variables.oddReplicas",
+            &object_even,
+            &variables_even,
+            &no_request,
+        )
+        .expect("oddReplicas must evaluate for even replicas");
         assert!(
             !odd_even,
             "variables.oddReplicas must be false for replicas=2; \
@@ -5502,6 +5634,8 @@ mod tests {
             name: "new-policy",
             namespace: None,
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
         let result = run_validating_webhooks(&state, &new_vap, &ctx).await;
         assert!(
@@ -5584,6 +5718,8 @@ mod tests {
             name: "test-cm",
             namespace: Some("default"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
 
         let result = run_validating_webhooks(&state, &obj, &ctx).await;
@@ -5726,6 +5862,8 @@ mod tests {
             name: "marker-deploy",
             namespace: Some("no-label-ns"),
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
 
         let result = run_validating_webhooks(&state, &deploy, &ctx).await;
@@ -5817,6 +5955,8 @@ mod tests {
             name: "worker-node-1",
             namespace: None,
             operation: "CREATE",
+            user_info: None,
+            dry_run: false,
         };
 
         let result = run_validating_webhooks(&state, &node, &ctx).await;
@@ -5824,6 +5964,126 @@ mod tests {
             result.is_ok(),
             "VAP binding with namespaceSelector must never apply to cluster-scoped resources \
              (namespace=None); applying it to Nodes would deny node registration and break the cluster"
+        );
+    }
+
+    /// A VAP expression using `request.userInfo.username` must allow the matching user
+    /// and deny others. Without request.* resolution in the CEL evaluator, the expression
+    /// always evaluates to false (userInfo is missing from the eval context), causing every
+    /// request to be incorrectly denied regardless of the requesting user's identity.
+    ///
+    /// This is the regression test for the [sig-auth] ValidatingAdmissionPolicy conformance
+    /// test `can restrict access by-node`, which uses `request.userInfo.username` to restrict
+    /// Node updates by node identity.
+    ///
+    /// Reverting request.* resolution (removing the `request` root from parse_vap_primary)
+    /// makes the VAP expression silently return false for any user, causing the matching
+    /// user's request to be incorrectly denied.
+    #[tokio::test]
+    async fn vap_request_user_info_username_allows_matching_user_denies_others() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // VAP that only allows requests from "system:node:worker-1".
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "node-identity-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["nodes"],
+                        "operations": ["UPDATE"]
+                    }]
+                },
+                "validations": [{
+                    "expression": "request.userInfo.username == \"system:node:worker-1\"",
+                    "message": "only system:node:worker-1 may update this node"
+                }]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/node-identity-policy",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "node-identity-binding"},
+            "spec": {
+                "policyName": "node-identity-policy",
+                "validationActions": ["Deny"]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/node-identity-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-1"}
+        });
+
+        // Matching user: request.userInfo.username == "system:node:worker-1" → allow.
+        let ctx_matching = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "nodes",
+            name: "worker-1",
+            namespace: None,
+            operation: "UPDATE",
+            user_info: Some(json!({
+                "username": "system:node:worker-1",
+                "groups": ["system:nodes", "system:authenticated"]
+            })),
+            dry_run: false,
+        };
+        let result_matching = run_validating_webhooks(&state, &node, &ctx_matching).await;
+        assert!(
+            result_matching.is_ok(),
+            "VAP with request.userInfo.username == 'system:node:worker-1' must allow that user; \
+             if request.* resolution is removed, userInfo is absent and the expression evaluates \
+             to false, incorrectly denying the matching user"
+        );
+
+        // Non-matching user: request.userInfo.username != "system:node:worker-1" → deny.
+        let ctx_other = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "nodes",
+            name: "worker-1",
+            namespace: None,
+            operation: "UPDATE",
+            user_info: Some(json!({
+                "username": "system:node:worker-2",
+                "groups": ["system:nodes", "system:authenticated"]
+            })),
+            dry_run: false,
+        };
+        let result_other = run_validating_webhooks(&state, &node, &ctx_other).await;
+        assert!(
+            result_other.is_err(),
+            "VAP with request.userInfo.username == 'system:node:worker-1' must deny other users; \
+             worker-2 must not be allowed to update worker-1's node object"
         );
     }
 }
