@@ -6510,4 +6510,154 @@ mod tests {
              (variables.oddReplicas = false)"
         );
     }
+
+    /// VAP `object.spec.replicas > 1` must evaluate to true for a Deployment stored and
+    /// retrieved from the store with spec.replicas=2.
+    ///
+    /// Regression: VAP expressions were evaluated against the proto-decoded JSON, which
+    /// (before the fix) silently dropped spec.replicas, causing apply_defaults to set it
+    /// to 1 and CEL to see 1 > 1 = false.  This test covers the full store round-trip:
+    /// write JSON → read JSON → run VAP — confirming spec.replicas survives storage.
+    ///
+    /// The test must fail if the stored JSON loses spec.replicas (e.g. if Object::to_bytes
+    /// or Object::from_bytes strips numeric fields, or if apply_defaults overwrites a
+    /// present replicas value).
+    #[tokio::test]
+    async fn vap_object_spec_replicas_gt_1_evaluates_true_after_store_round_trip() {
+        use crate::handlers::defaults::apply_defaults;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "vap-store-rt-ns",
+                "labels": {"vap-store-rt": "true"}
+            }
+        });
+        store
+            .put(
+                "/registry/namespaces/vap-store-rt-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "store-rt-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE", "UPDATE"]
+                    }]
+                },
+                "validations": [
+                    {"expression": "object.spec.replicas > 1"}
+                ]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/store-rt-policy",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+            None,
+        ).await.unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "store-rt-binding"},
+            "spec": {
+                "policyName": "store-rt-policy",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {"matchLabels": {"vap-store-rt": "true"}}
+                }
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/store-rt-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+            None,
+        ).await.unwrap();
+
+        // Write a Deployment with spec.replicas=2 to the store, then read it back.
+        // This simulates a Deployment that was created (e.g. via kubectl create with proto)
+        // and now undergoes an UPDATE that triggers the VAP.
+        let mut deploy = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "stored-deploy", "namespace": "vap-store-rt-ns"},
+            "spec": {
+                "replicas": 2,
+                "selector": {"matchLabels": {"app": "stored"}},
+                "template": {
+                    "metadata": {"labels": {"app": "stored"}},
+                    "spec": {"containers": [{"name": "nginx", "image": "nginx"}]}
+                }
+            }
+        });
+        apply_defaults("apps", "deployments", &mut deploy);
+
+        let obj = crate::types::Object {
+            body: deploy.clone(),
+        };
+        store
+            .put(
+                "/registry/apps/deployments/vap-store-rt-ns/stored-deploy",
+                obj.to_bytes(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Retrieve and re-parse from the store — this is the path taken on UPDATE.
+        let stored = store
+            .get("/registry/apps/deployments/vap-store-rt-ns/stored-deploy")
+            .await
+            .unwrap()
+            .expect("deployment must exist in store");
+        let retrieved: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored deployment must be valid JSON");
+
+        assert_eq!(
+            retrieved["spec"]["replicas"], 2,
+            "spec.replicas must survive the store round-trip; if it is missing or null, \
+             apply_defaults will set it to 1 and VAP expressions like \
+             `object.spec.replicas > 1` will evaluate false, wrongly denying valid workloads"
+        );
+
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "stored-deploy",
+            namespace: Some("vap-store-rt-ns"),
+            operation: "UPDATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_validating_webhooks(&state, &retrieved, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "Deployment retrieved from store with spec.replicas=2 must be allowed by \
+             'object.spec.replicas > 1' — if the store round-trip loses replicas, \
+             the VAP wrongly denies valid UPDATE operations. Error: {:?}",
+            result.err()
+        );
+    }
 }
