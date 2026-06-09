@@ -659,6 +659,55 @@ pub async fn patch_namespace_status<S: Store>(
     Ok(Json(current.body))
 }
 
+/// Delete all CRDs whose `spec.group` contains `namespace_name` as a substring.
+///
+/// CRDs created by test frameworks (e.g. VAP conformance) embed the namespace name in their
+/// group, e.g. `crontabs.stable.<namespace>.example.com`.  When the namespace is deleted,
+/// KCM's GC/quota controller registers a cluster-wide watch on that group; as long as the
+/// CRD exists, KCM re-queues the namespace drain forever and the namespace never finishes
+/// terminating.  Deleting the CRD here (with its tombstone) breaks the cycle.  Errors are
+/// non-fatal.
+async fn delete_namespace_scoped_crds<S: Store>(state: &AppState<S>, namespace_name: &str) {
+    let prefix = "/registry/apiextensions.k8s.io/customresourcedefinitions/";
+    let resp = match state.store.list(prefix, ListOptions::default()).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("cascade-delete CRDs for namespace {namespace_name}: list failed: {e}");
+            return;
+        }
+    };
+
+    for item in resp.items {
+        let crd: serde_json::Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let group = match crd["spec"]["group"].as_str() {
+            Some(g) => g,
+            None => continue,
+        };
+        if !group.contains(namespace_name) {
+            continue;
+        }
+        let crd_name = match crd["metadata"]["name"].as_str() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => continue,
+        };
+        let key = format!("/registry/apiextensions.k8s.io/customresourcedefinitions/{crd_name}");
+        if let Err(e) = state.store.delete(&key, None).await {
+            tracing::warn!("cascade-delete CRD {crd_name} for namespace {namespace_name}: {e}");
+            continue;
+        }
+        let tombstone_key = crate::handlers::crd::deleted_group_tombstone_key(group);
+        let tombstone_val =
+            serde_json::to_vec(&serde_json::json!({ "group": group })).unwrap_or_default();
+        let _ = state
+            .store
+            .put(&tombstone_key, bytes::Bytes::from(tombstone_val), None)
+            .await;
+    }
+}
+
 pub async fn delete_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
@@ -690,6 +739,7 @@ pub async fn delete_namespace<S: Store>(
             .put(&key, obj.to_bytes(), expected_rv)
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
+        delete_namespace_scoped_crds(&state, &name).await;
         obj.set_resource_version(new_rv);
         return Ok(Json(obj.body).into_response());
     }
@@ -3014,6 +3064,97 @@ mod admission_tests {
         assert!(
             stored.is_none(),
             "denied namespace must not be stored in the backing store"
+        );
+    }
+
+    /// Deleting a namespace must cascade-delete CRDs whose spec.group contains the namespace name.
+    ///
+    /// VAP conformance tests create CRDs with groups like
+    /// `crontabs.stable.<namespace>.example.com`.  KCM's GC/quota controller registers a
+    /// cluster-wide watch on that group; as long as the CRD exists, KCM re-queues the namespace
+    /// drain forever and the namespace never finishes terminating.  If this cascade is removed,
+    /// the CRD will still be present after the namespace soft-delete and this test will fail.
+    #[tokio::test]
+    async fn delete_namespace_cascades_to_namespace_scoped_crds() {
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store as _};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let ns_name = "test-ns-crd-drain";
+
+        // Create the namespace via the proper handler so spec.finalizers is stamped —
+        // this ensures the soft-delete path is triggered (not hard-delete).
+        let ns_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": ns_name }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                axum::Extension(crate::auth::UserInfo {
+                    username: "admin".into(),
+                    uid: String::new(),
+                    groups: vec![],
+                }),
+                axum::http::HeaderMap::new(),
+                ns_body,
+            )
+            .await
+            .is_ok(),
+            "namespace create must succeed"
+        );
+
+        // Seed a CRD whose spec.group embeds the namespace name.
+        let crd_name = format!("crontabs.stable.{ns_name}.example.com");
+        let crd_group = format!("stable.{ns_name}.example.com");
+        let crd = serde_json::json!({
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": { "name": &crd_name },
+            "spec": {
+                "group": &crd_group,
+                "names": { "plural": "crontabs", "singular": "crontab", "kind": "CronTab" },
+                "scope": "Namespaced",
+                "versions": [{ "name": "v1", "served": true, "storage": true }]
+            }
+        });
+        let crd_key =
+            format!("/registry/apiextensions.k8s.io/customresourcedefinitions/{crd_name}");
+        store
+            .put(
+                &crd_key,
+                Bytes::from(serde_json::to_vec(&crd).unwrap()),
+                None,
+            )
+            .await
+            .expect("CRD seed must succeed");
+
+        // Soft-delete the namespace.
+        assert!(
+            delete_namespace(State(state.clone()), Path(ns_name.to_string()))
+                .await
+                .is_ok(),
+            "namespace soft-delete must succeed"
+        );
+
+        // The CRD must be gone — KCM's GC watch on this group must not survive the namespace delete.
+        let crd_after = store.get(&crd_key).await.expect("store.get must not fail");
+        assert!(
+            crd_after.is_none(),
+            "CRD with namespace-scoped group must be deleted when namespace is soft-deleted — \
+             without this, KCM re-queues the namespace drain indefinitely and the namespace \
+             never finishes terminating"
         );
     }
 }
