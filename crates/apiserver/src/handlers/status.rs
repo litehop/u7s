@@ -17,10 +17,7 @@ use crate::{
 
 use super::generic::{lookup, store_err, validate_name};
 use super::json_patch::{apply_json_patch, detect_patch_type, PatchType};
-use super::resource::{
-    get_namespaced_resource, get_resource, write_vap_status, ADMISSION_GROUP, VAPB_PLURAL,
-    VAP_PLURAL,
-};
+use super::resource::{get_namespaced_resource, get_resource};
 
 // -- cluster-scoped --
 
@@ -134,17 +131,6 @@ pub async fn patch_resource_status<S: Store>(
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
     current.set_resource_version(new_rv);
-    if group == ADMISSION_GROUP && (plural == VAP_PLURAL || plural == VAPB_PLURAL) {
-        write_vap_status(
-            &*state.store,
-            &group,
-            &plural,
-            &key,
-            &mut current.body,
-            new_rv,
-        )
-        .await;
-    }
     Ok(Json(current.body))
 }
 
@@ -1715,12 +1701,16 @@ mod tests {
         );
     }
 
-    /// PATCH /status on a ValidatingAdmissionPolicy must populate status.observedGeneration.
-    /// The conformance test at validatingadmissionpolicy.go:627 PATCHes /status and asserts
-    /// observedGeneration is set. Without calling write_vap_status from patch_resource_status,
-    /// the field is absent and the conformance test hangs.
+    /// Regression test for mayor-k7t4: PATCH /status on a ValidatingAdmissionPolicy must return
+    /// exactly what the client sent in the patch, not a hardcoded Ready condition injected by
+    /// write_vap_status.
+    ///
+    /// The conformance test at validatingadmissionpolicy.go:601 PATCHes status.conditions with a
+    /// custom condition (PatchStatusFailed) and immediately reads the response body. If
+    /// write_vap_status overwrites status after the store write, the client sees Ready instead of
+    /// PatchStatusFailed and the conformance test fails.
     #[tokio::test]
-    async fn vap_patch_status_sets_observed_generation() {
+    async fn vap_patch_status_preserves_client_conditions_not_overwritten_by_write_vap_status() {
         use axum::body::to_bytes;
         use axum::response::IntoResponse;
 
@@ -1734,7 +1724,8 @@ mod tests {
             },
             "spec": {
                 "validations": [{"expression": "true"}]
-            }
+            },
+            "status": {}
         });
         let key = "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/test-vap";
         store
@@ -1754,7 +1745,12 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        let patch = serde_json::json!({"status": {"observedGeneration": 1}});
+        // Patch with a custom condition — exactly what the conformance test does.
+        let patch = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "PatchStatusFailed", "status": "False", "reason": "Test"}]
+            }
+        });
         let result = patch_resource_status(
             axum::extract::State(state),
             axum::extract::Path((
@@ -1775,10 +1771,18 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert!(
-            v["status"]["observedGeneration"].is_number(),
-            "PATCH /status on ValidatingAdmissionPolicy must set status.observedGeneration — \
-             conformance test validatingadmissionpolicy.go:627 polls this field and hangs if absent"
+        let conditions = v["status"]["conditions"]
+            .as_array()
+            .expect("status.conditions must be an array in the response");
+        assert_eq!(
+            conditions.len(), 1,
+            "conformance test polls for a custom status condition after PATCH /status; \
+             if write_vap_status overwrites it the test sees Ready instead of PatchStatusFailed and fails"
+        );
+        assert_eq!(
+            conditions[0]["type"], "PatchStatusFailed",
+            "conformance test polls for a custom status condition after PATCH /status; \
+             if write_vap_status overwrites it the test sees Ready instead of PatchStatusFailed and fails"
         );
     }
 }
