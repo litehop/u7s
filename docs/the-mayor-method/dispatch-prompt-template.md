@@ -389,11 +389,16 @@ Verification sequence (do not skip any step):
 
 1. Build and start the server bound to your host IP:
    ```bash
-   cargo build -p u7s-apiserver --release 2>&1 | tail -5
-   # Kill any instance already bound to <HOST_IP>, then:
+   # Build with VM-specific target dir (avoids colliding with mayor or other workers):
+   U7S_TARGET_DIR=/tmp/u7s-build-<VM_NAME> \
+     cargo build -p u7s-apiserver --release \
+     --manifest-path <ASSIGNED_WORKTREE>/Cargo.toml \
+     --target-dir /tmp/u7s-build-<VM_NAME> 2>&1 | tail -5
+
+   # Then start stack:
    U7S_VM_NAME=<VM_NAME> U7S_HOST_IP=<HOST_IP> \
-     RUST_LOG=info ./target/release/u7s-apiserver &
-   sleep 2
+     U7S_BINARY=/tmp/u7s-build-<VM_NAME>/release/u7s-apiserver \
+     <ASSIGNED_WORKTREE>/scripts/conformance/run-all.sh --reset [--focus <regex>]
    ```
 2. From your VM, run the sonobuoy smoke:
    ```
