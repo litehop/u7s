@@ -40,7 +40,9 @@ fn write_private_key(path: impl AsRef<std::path::Path>, bytes: &[u8]) -> std::io
 
 /// RSA key pair used for signing service-account JWTs.
 pub struct SaKeys {
-    /// PEM-encoded PKCS#8 private key — used to construct an EncodingKey.
+    /// PEM-encoded PKCS#1 RSA private key (`-----BEGIN RSA PRIVATE KEY-----`).
+    /// KCM requires this format; PKCS#8 (`-----BEGIN PRIVATE KEY-----`) causes
+    /// "invalid serviceaccount key" and prevents token issuance.
     pub private_key_pem: Vec<u8>,
     /// PEM-encoded RSA public key — used to construct a DecodingKey.
     pub public_key_pem: Vec<u8>,
@@ -55,20 +57,20 @@ pub struct SaKeys {
 /// Design: load-or-generate ensures tokens minted before a restart remain
 /// valid after restart, because the signing key stays constant.
 pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow::Result<SaKeys> {
-    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+    use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
     use rsa::RsaPrivateKey;
 
     // If the private key already exists, load it and re-derive the public key.
     if std::path::Path::new(sa_key_path).exists() {
-        use rsa::pkcs8::{DecodePrivateKey, EncodePublicKey, LineEnding};
+        use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
         let pem = std::fs::read(validate_cli_path(std::path::Path::new(sa_key_path))?)?;
         let pem_str = std::str::from_utf8(&pem)
             .map_err(|e| anyhow::anyhow!("SA key file is not valid UTF-8: {e}"))?;
-        let private_key = RsaPrivateKey::from_pkcs8_pem(pem_str)
+        let private_key = RsaPrivateKey::from_pkcs1_pem(pem_str)
             .map_err(|e| anyhow::anyhow!("failed to parse SA private key: {e}"))?;
         let public_pem = private_key
             .to_public_key()
-            .to_public_key_pem(LineEnding::LF)
+            .to_pkcs1_pem(LineEnding::LF)
             .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
         tracing::info!("loaded SA signing key from {sa_key_path}");
         return Ok(SaKeys {
@@ -83,12 +85,12 @@ pub fn load_or_generate_sa_keys(sa_key_path: &str, sa_pub_path: &str) -> anyhow:
     let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
 
     let private_pem = private_key
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|e| anyhow::anyhow!("PKCS#8 encode error: {e}"))?;
+        .to_pkcs1_pem(LineEnding::LF)
+        .map_err(|e| anyhow::anyhow!("PKCS#1 encode error: {e}"))?;
 
     let public_pem = private_key
         .to_public_key()
-        .to_public_key_pem(LineEnding::LF)
+        .to_pkcs1_pem(LineEnding::LF)
         .map_err(|e| anyhow::anyhow!("public key encode error: {e}"))?;
 
     write_private_key(
@@ -820,6 +822,43 @@ mod tests {
         assert_eq!(
             first.public_key_pem, second.public_key_pem,
             "public key PEM must be identical on load"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
+    }
+
+    /// sa.key must be written in PKCS#1 PEM format so KCM can parse it.
+    ///
+    /// KCM's token controller calls crypto.ParseRSAPrivateKeyFromPEM which expects
+    /// the `-----BEGIN RSA PRIVATE KEY-----` header (PKCS#1). Writing PKCS#8
+    /// (`-----BEGIN PRIVATE KEY-----`) causes "invalid serviceaccount key" in KCM logs
+    /// and prevents any SA token from being issued, so pods never get a mounted token.
+    #[test]
+    fn sa_key_is_written_in_pkcs1_pem_format_for_kcm_compatibility() {
+        let dir = test_temp_dir("sa-key-pkcs1");
+        let key_path = dir.join("sa.key").to_string_lossy().into_owned();
+        let pub_path = dir.join("sa.pub").to_string_lossy().into_owned();
+
+        let keys = load_or_generate_sa_keys(&key_path, &pub_path)
+            .expect("load_or_generate_sa_keys must succeed");
+
+        let priv_pem = std::str::from_utf8(&keys.private_key_pem)
+            .expect("private_key_pem must be valid UTF-8");
+        assert!(
+            priv_pem.contains("-----BEGIN RSA PRIVATE KEY-----"),
+            "sa.key must use PKCS#1 PEM header '-----BEGIN RSA PRIVATE KEY-----' \
+             so KCM can parse it; reverting to PKCS#8 breaks SA token issuance and \
+             prevents pods from getting a mounted token file. Got: {}",
+            priv_pem.lines().next().unwrap_or("<empty>")
+        );
+
+        let pub_pem =
+            std::str::from_utf8(&keys.public_key_pem).expect("public_key_pem must be valid UTF-8");
+        assert!(
+            pub_pem.contains("-----BEGIN RSA PUBLIC KEY-----"),
+            "sa.pub must use PKCS#1 PEM header '-----BEGIN RSA PUBLIC KEY-----'; \
+             got: {}",
+            pub_pem.lines().next().unwrap_or("<empty>")
         );
 
         let _ = std::fs::remove_dir_all(&dir); // lgtm[rust/path-injection]
