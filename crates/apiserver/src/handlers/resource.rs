@@ -1891,16 +1891,16 @@ async fn delete_replicasets_owned_by<S: Store>(
 /// (kind + apiVersion). Clients (kubectl, client-go, conformance tests) assert
 /// these fields are non-empty on every create/get/update response. Without this,
 /// client-go reports "Object Kind is missing" and the operation fails.
-const ADMISSION_GROUP: &str = "admissionregistration.k8s.io";
-const VAP_PLURAL: &str = "validatingadmissionpolicies";
-const VAPB_PLURAL: &str = "validatingadmissionpolicybindings";
+pub(crate) const ADMISSION_GROUP: &str = "admissionregistration.k8s.io";
+pub(crate) const VAP_PLURAL: &str = "validatingadmissionpolicies";
+pub(crate) const VAPB_PLURAL: &str = "validatingadmissionpolicybindings";
 
 /// After a VAP or VAPB write, set status.observedGeneration and a Ready=True
 /// condition so the conformance test framework can proceed without hanging.
 /// Real kube does this via a background controller; u7s has no controller loop,
 /// so set it synchronously.  Store errors are silenced with `let _ =` so a
 /// status write failure never breaks the create/update response.
-async fn write_vap_status<S: Store>(
+pub(crate) async fn write_vap_status<S: Store>(
     store: &S,
     group: &str,
     plural: &str,

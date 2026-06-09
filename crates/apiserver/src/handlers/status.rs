@@ -17,7 +17,10 @@ use crate::{
 
 use super::generic::{lookup, store_err, validate_name};
 use super::json_patch::{apply_json_patch, detect_patch_type, PatchType};
-use super::resource::{get_namespaced_resource, get_resource};
+use super::resource::{
+    get_namespaced_resource, get_resource, write_vap_status, ADMISSION_GROUP, VAPB_PLURAL,
+    VAP_PLURAL,
+};
 
 // -- cluster-scoped --
 
@@ -131,6 +134,17 @@ pub async fn patch_resource_status<S: Store>(
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
     current.set_resource_version(new_rv);
+    if group == ADMISSION_GROUP && (plural == VAP_PLURAL || plural == VAPB_PLURAL) {
+        write_vap_status(
+            &*state.store,
+            &group,
+            &plural,
+            &key,
+            &mut current.body,
+            new_rv,
+        )
+        .await;
+    }
     Ok(Json(current.body))
 }
 
@@ -1698,6 +1712,73 @@ mod tests {
             err.0,
             axum::http::StatusCode::CONFLICT,
             "RevisionMismatch must produce 409 Conflict so controllers can retry"
+        );
+    }
+
+    /// PATCH /status on a ValidatingAdmissionPolicy must populate status.observedGeneration.
+    /// The conformance test at validatingadmissionpolicy.go:627 PATCHes /status and asserts
+    /// observedGeneration is set. Without calling write_vap_status from patch_resource_status,
+    /// the field is absent and the conformance test hangs.
+    #[tokio::test]
+    async fn vap_patch_status_sets_observed_generation() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let vap = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {
+                "name": "test-vap",
+                "generation": 1
+            },
+            "spec": {
+                "validations": [{"expression": "true"}]
+            }
+        });
+        let key = "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/test-vap";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&vap).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({"status": {"observedGeneration": 1}});
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "admissionregistration.k8s.io".into(),
+                "v1".into(),
+                "validatingadmissionpolicies".into(),
+                "test-vap".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let resp = match result {
+            Ok(r) => r.into_response(),
+            Err(e) => panic!("PATCH /status on VAP must succeed, got: {e:?}"),
+        };
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            v["status"]["observedGeneration"].is_number(),
+            "PATCH /status on ValidatingAdmissionPolicy must set status.observedGeneration — \
+             conformance test validatingadmissionpolicy.go:627 polls this field and hangs if absent"
         );
     }
 }
