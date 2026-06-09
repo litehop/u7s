@@ -1792,10 +1792,9 @@ struct AppsPodTemplateSpec {
 
 /// DeploymentSpec — k8s.io/api/apps/v1/generated.proto
 /// Source: api-apps-v1-generated.proto message DeploymentSpec
-/// Only selector and template decoded; other fields not needed for selector defaulting.
 #[derive(Clone, PartialEq, Message)]
 struct DeploymentSpec {
-    /// replicas (field 1, int32) — skipped
+    /// replicas (field 1, int32)
     #[prost(int32, tag = "1")]
     replicas: i32,
     /// selector (field 2, message LabelSelector)
@@ -1808,10 +1807,9 @@ struct DeploymentSpec {
 
 /// StatefulSetSpec — k8s.io/api/apps/v1/generated.proto
 /// Source: api-apps-v1-generated.proto message StatefulSetSpec
-/// Only selector and template decoded; other fields not needed for selector defaulting.
 #[derive(Clone, PartialEq, Message)]
 struct StatefulSetSpec {
-    /// replicas (field 1, int32) — skipped
+    /// replicas (field 1, int32)
     #[prost(int32, tag = "1")]
     replicas: i32,
     /// selector (field 2, message LabelSelector)
@@ -1824,10 +1822,9 @@ struct StatefulSetSpec {
 
 /// ReplicaSetSpec — k8s.io/api/apps/v1/generated.proto
 /// Source: api-apps-v1-generated.proto message ReplicaSetSpec
-/// Only selector and template decoded; other fields not needed for selector defaulting.
 #[derive(Clone, PartialEq, Message)]
 struct ReplicaSetSpec {
-    /// replicas (field 1, int32) — skipped
+    /// replicas (field 1, int32)
     #[prost(int32, tag = "1")]
     replicas: i32,
     /// selector (field 2, message LabelSelector)
@@ -4226,7 +4223,17 @@ pub fn decode_statefulset_proto(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta
     });
     if let Some(spec) = obj.spec {
-        if let Some(spec_json) = apps_spec_to_json(spec.selector, spec.template) {
+        let replicas = spec.replicas;
+        let mut spec_json =
+            apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
+        if replicas != 0 {
+            spec_json["replicas"] = serde_json::Value::Number(replicas.into());
+        }
+        if spec_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
             out["spec"] = spec_json;
         }
     }
@@ -4243,7 +4250,21 @@ pub fn decode_deployment_proto(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta
     });
     if let Some(spec) = obj.spec {
-        if let Some(spec_json) = apps_spec_to_json(spec.selector, spec.template) {
+        let replicas = spec.replicas;
+        let mut spec_json =
+            apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
+        // Include spec.replicas when non-zero (proto3 default is 0 = "not set").
+        // Without this, clients using protobuf encoding silently lose spec.replicas,
+        // apply_defaults defaults it to 1, and VAP expressions like `object.spec.replicas > 1`
+        // evaluate to false even when the submitted Deployment had replicas > 1.
+        if replicas != 0 {
+            spec_json["replicas"] = serde_json::Value::Number(replicas.into());
+        }
+        if spec_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
             out["spec"] = spec_json;
         }
     }
@@ -4277,7 +4298,17 @@ pub fn decode_replicaset_proto(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta
     });
     if let Some(spec) = obj.spec {
-        if let Some(spec_json) = apps_spec_to_json(spec.selector, spec.template) {
+        let replicas = spec.replicas;
+        let mut spec_json =
+            apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
+        if replicas != 0 {
+            spec_json["replicas"] = serde_json::Value::Number(replicas.into());
+        }
+        if spec_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
             out["spec"] = spec_json;
         }
     }
@@ -11724,5 +11755,110 @@ mod tests {
     #[test]
     fn decode_controllerrevision_proto_returns_none_for_garbage() {
         assert!(decode_controllerrevision_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — spec.replicas preservation in proto decoders (VAP regression)
+    // ---------------------------------------------------------------------------
+
+    /// decode_deployment_proto must preserve spec.replicas from protobuf encoding.
+    ///
+    /// When kubectl creates a Deployment with replicas=3 using Content-Type protobuf,
+    /// the proto decoder must include spec.replicas=3 in the JSON output.
+    /// Without this, apply_defaults silently defaults replicas to 1, and VAP expressions
+    /// like `object.spec.replicas > 1` evaluate to false even when the user submitted
+    /// replicas=3 — causing the VAP to deny its own marker Deployment.
+    #[test]
+    fn decode_deployment_proto_preserves_spec_replicas() {
+        // DeploymentSpec field 1 = replicas (int32, varint wire type)
+        // tag = (1 << 3) | 0 = 0x08, value = 3
+        let mut spec_bytes = vec![0x08, 0x03]; // field 1 (replicas), varint 3
+
+        // Add minimal selector + template so apps_spec_to_json returns non-empty
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        // Deployment { metadata: { name: "my-deploy" }, spec: spec_bytes }
+        let name_bytes = encode_length_delimited(1, b"my-deploy");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("Deployment", &proto)
+            .expect("Deployment proto must decode successfully");
+
+        assert_eq!(
+            result["spec"]["replicas"], 3,
+            "spec.replicas must be 3 after proto decode — if missing, apply_defaults sets it to 1 \
+             and VAP expressions like `object.spec.replicas > 1` evaluate false, denying the \
+             marker Deployment that the test itself created (conformance tests: should support \
+             ValidatingAdmissionPolicy API operations, should allow expressions to refer variables)"
+        );
+    }
+
+    /// decode_statefulset_proto must preserve spec.replicas from protobuf encoding.
+    ///
+    /// Same class of bug as Deployment: without replicas in JSON, apply_defaults sets 1,
+    /// and VAP expressions that test replica count evaluate false on proto-encoded StatefulSets.
+    #[test]
+    fn decode_statefulset_proto_preserves_spec_replicas() {
+        // StatefulSetSpec field 1 = replicas (int32, varint wire type)
+        let mut spec_bytes = vec![0x08, 0x05]; // field 1 (replicas), varint 5
+
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"sts-test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-sts");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("StatefulSet", &proto)
+            .expect("StatefulSet proto must decode successfully");
+
+        assert_eq!(
+            result["spec"]["replicas"], 5,
+            "spec.replicas must be 5 after proto decode — without this, apply_defaults sets it to 1 \
+             and VAP expressions evaluating replica count return wrong results for proto-encoded StatefulSets"
+        );
+    }
+
+    /// decode_replicaset_proto must preserve spec.replicas from protobuf encoding.
+    ///
+    /// Same class of bug as Deployment: without replicas in JSON, apply_defaults sets 1,
+    /// and VAP expressions that test replica count evaluate false on proto-encoded ReplicaSets.
+    #[test]
+    fn decode_replicaset_proto_preserves_spec_replicas() {
+        // ReplicaSetSpec field 1 = replicas (int32, varint wire type)
+        let mut spec_bytes = vec![0x08, 0x04]; // field 1 (replicas), varint 4
+
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"rs-test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-rs");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("ReplicaSet", &proto)
+            .expect("ReplicaSet proto must decode successfully");
+
+        assert_eq!(
+            result["spec"]["replicas"], 4,
+            "spec.replicas must be 4 after proto decode — without this, apply_defaults sets it to 1 \
+             and VAP expressions evaluating replica count return wrong results for proto-encoded ReplicaSets"
+        );
     }
 }

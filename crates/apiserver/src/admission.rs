@@ -6195,4 +6195,319 @@ mod tests {
              if this passes, the policy no longer distinguishes alice from unauthenticated requests"
         );
     }
+
+    /// VAP with `object.spec.replicas > 1` must ALLOW a Deployment with replicas=3
+    /// even when the object has been through apply_defaults (which adds strategy, generation, etc.).
+    ///
+    /// Regression: conformance test "should validate against a Deployment" creates a
+    /// marker Deployment with replicas > 1 that should be ALLOWED.  If CEL field access
+    /// fails on the fully-defaulted Deployment body, the expression incorrectly evaluates
+    /// to false and the marker is denied, causing the conformance test to fail.
+    ///
+    /// This test must fail if eval_cel_bool_expr returns None (eval error) or Some(false)
+    /// for `object.spec.replicas > 1` on a Deployment with spec.replicas = 3.
+    #[tokio::test]
+    async fn vap_object_spec_replicas_gt_1_allows_replicas_3_after_apply_defaults() {
+        use crate::handlers::defaults::apply_defaults;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed namespace with matching label (mirrors conformance setup).
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "vap-conformance-ns",
+                "labels": {"vap-conformance": "true"}
+            }
+        });
+        store
+            .put(
+                "/registry/namespaces/vap-conformance-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // VAP: expression `object.spec.replicas > 1` (direct field access, no variables).
+        // This is the conformance test "should validate against a Deployment".
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "replicas-gt-1-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE", "UPDATE"]
+                    }]
+                },
+                "validations": [
+                    {"expression": "object.spec.replicas > 1"}
+                ]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/replicas-gt-1-policy",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+            None,
+        ).await.unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "replicas-gt-1-binding"},
+            "spec": {
+                "policyName": "replicas-gt-1-policy",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {"matchLabels": {"vap-conformance": "true"}}
+                }
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/replicas-gt-1-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+            None,
+        ).await.unwrap();
+
+        // Build marker Deployment (replicas=3) and run apply_defaults as the write path does.
+        // This produces a fully-defaulted body with strategy, revisionHistoryLimit, etc.
+        let mut marker = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "marker-deployment",
+                "namespace": "vap-conformance-ns"
+            },
+            "spec": {
+                "replicas": 3,
+                "selector": {"matchLabels": {"app": "marker"}},
+                "template": {
+                    "metadata": {"labels": {"app": "marker"}},
+                    "spec": {
+                        "containers": [{"name": "nginx", "image": "nginx"}]
+                    }
+                }
+            }
+        });
+        apply_defaults("apps", "deployments", &mut marker);
+
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "marker-deployment",
+            namespace: Some("vap-conformance-ns"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        // The marker Deployment (replicas=3) must be ALLOWED because 3 > 1 = true.
+        // If this fails, the policy wrongly denies valid workloads and the conformance
+        // test "should validate against a Deployment" cannot complete its wait-for-marker step.
+        let result = run_validating_webhooks(&state, &marker, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "Deployment with spec.replicas=3 must be allowed by 'object.spec.replicas > 1' \
+             policy; denying it breaks the VAP conformance marker-wait step. \
+             Error: {:?}",
+            result.err()
+        );
+
+        // Also verify that replicas=1 IS denied.
+        let mut bad_deploy = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "bad-deploy", "namespace": "vap-conformance-ns"},
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app": "bad"}},
+                "template": {
+                    "metadata": {"labels": {"app": "bad"}},
+                    "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+                }
+            }
+        });
+        apply_defaults("apps", "deployments", &mut bad_deploy);
+        let bad_result = run_validating_webhooks(&state, &bad_deploy, &ctx).await;
+        assert!(
+            bad_result.is_err(),
+            "Deployment with spec.replicas=1 must be denied by 'object.spec.replicas > 1' \
+             policy; 1 > 1 = false"
+        );
+    }
+
+    /// VAP with variables (conformance: `should allow expressions to refer variables`) must
+    /// ALLOW a Deployment with replicas=3 (odd and > 1) after apply_defaults.
+    ///
+    /// Regression: variable `replicas = object.spec.replicas` must correctly resolve to
+    /// the integer 3 from the full Deployment body.  If `object.spec.replicas` evaluation
+    /// fails on a fully-defaulted Deployment, `variables.replicas` is absent (None result
+    /// is skipped), `variables.replicas > 1` then evaluates against null (None → false),
+    /// and the marker is wrongly denied.
+    ///
+    /// This test must fail if eval_cel_vap_value returns None for `object.spec.replicas`
+    /// on a fully-defaulted Deployment body, or if the variable binding is not threaded
+    /// through to the validation expressions.
+    #[tokio::test]
+    async fn vap_variables_replicas_allows_marker_with_replicas_3_after_apply_defaults() {
+        use crate::handlers::defaults::apply_defaults;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "vap-vars-ns",
+                "labels": {"validating-admission-policy-9994": "true"}
+            }
+        });
+        store
+            .put(
+                "/registry/namespaces/vap-vars-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Exact conformance VAP from the 0609 run.
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "validating-admission-policy-9994.policy.example.com"},
+            "spec": {
+                "matchConstraints": {
+                    "namespaceSelector": {
+                        "matchLabels": {"validating-admission-policy-9994": "true"}
+                    },
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE", "UPDATE"]
+                    }]
+                },
+                "variables": [
+                    {"name": "replicas", "expression": "object.spec.replicas"},
+                    {"name": "oddReplicas", "expression": "variables.replicas % 2 == 1"}
+                ],
+                "validations": [
+                    {"expression": "variables.replicas > 1"},
+                    {"expression": "variables.oddReplicas"}
+                ]
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/validating-admission-policy-9994.policy.example.com",
+            bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+            None,
+        ).await.unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "validating-admission-policy-9994-binding"},
+            "spec": {
+                "policyName": "validating-admission-policy-9994.policy.example.com",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {
+                        "matchLabels": {"validating-admission-policy-9994": "true"}
+                    }
+                }
+            }
+        });
+        store.put(
+            "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/validating-admission-policy-9994-binding",
+            bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+            None,
+        ).await.unwrap();
+
+        // Marker Deployment: replicas=3 (odd AND > 1) — must be ALLOWED.
+        let mut marker = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "marker-deployment",
+                "namespace": "vap-vars-ns"
+            },
+            "spec": {
+                "replicas": 3,
+                "selector": {"matchLabels": {"app": "marker"}},
+                "template": {
+                    "metadata": {
+                        "creationTimestamp": null,
+                        "labels": {"app": "marker"}
+                    },
+                    "spec": {
+                        "containers": [{"name": "nginx", "image": "nginx"}]
+                    }
+                }
+            }
+        });
+        apply_defaults("apps", "deployments", &mut marker);
+
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "marker-deployment",
+            namespace: Some("vap-vars-ns"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_validating_webhooks(&state, &marker, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "Deployment with replicas=3 (odd, > 1) must be allowed by the conformance VAP \
+             using variables; denying it breaks 'should allow expressions to refer variables' \
+             conformance test. Error: {:?}",
+            result.err()
+        );
+
+        // Verify that replicas=2 (even) IS denied.
+        let mut even_deploy = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "even-deploy", "namespace": "vap-vars-ns"},
+            "spec": {
+                "replicas": 2,
+                "selector": {"matchLabels": {"app": "even"}},
+                "template": {
+                    "metadata": {"labels": {"app": "even"}},
+                    "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+                }
+            }
+        });
+        apply_defaults("apps", "deployments", &mut even_deploy);
+        let even_result = run_validating_webhooks(&state, &even_deploy, &ctx).await;
+        assert!(
+            even_result.is_err(),
+            "Deployment with replicas=2 (even) must be denied by the conformance VAP \
+             (variables.oddReplicas = false)"
+        );
+    }
 }
