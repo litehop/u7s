@@ -1,25 +1,35 @@
 # Dashboard
-2026-06-08T~23:00 — queue fully drained; all deferred. Awaiting operator decisions.
-
-## Resume
-Queue empty. Unblock by resolving 52wo or b72p, or file a new bead.
+2026-06-09T08:25Z — Dispatch paused: documenting manual VM verification steps before dispatch.
 
 ## Operator attention needed
-- **mayor-52wo** — recommend close: proto layer supersedes static OpenAPI blob; /openapi/v2 stub already sufficient
-- **mayor-b72p** — recommend close: current hybrid (cargo tests + Lima VM protocol) is working policy; no new infra needed
+- **Dispatch template gap** — Lima VM protocol block describes `run-all.sh` only; workers
+  cannot run scripts directly (not in allowlist). Manual step-by-step equivalent needed
+  for steps 3 (lima-start) and 5 (sonobuoy + result retrieval) before dispatching
+  mayor-fmqw and mayor-2lot. Mayor asked operator: write the section?
 
 ## Open PRs
 None.
 
 ## In-flight workers
-None.
-
-## Bead queue
-All deferred: mayor-52wo · mayor-b72p · mayor-j7to · mayor-rvkq
+None. Two worktrees pre-created, workers not yet dispatched:
+- `ai/worktrees/cel-replicas-mayor-fmqw` — branch `worker/cel-replicas-mayor-fmqw`
+- `ai/worktrees/vap-400-mayor-2lot` — branch `worker/vap-400-mayor-2lot`
 
 ## Recent merges (this session)
-#480 store split (sqlite.rs) · #479 TLS chain fix · #478 StatefulSet label_selector · #477 PodSpec hostname/subdomain/initContainers
-8236741 gitignore fix · #475 JTI revocation · #474 CEL webhook · #473 typed annotations · #472 AcceptAnyCert+jti
+- #494 fix(admission): set VAP/VAPB status.observedGeneration on write (mayor-xw6c)
+- 7aa3ccd fix(scripts): guard empty TARGET_DIR_ARGS bash 3.2 array (direct push)
+- #493 fix(discovery): return 406 for proto-only Accept on /openapi/v2 (mayor-bp6k)
+- #492 fix(admission): thread authenticated UserInfo into AdmissionContext (mayor-bgpu)
+- #491 fix(admission): request.userInfo support in VAP CEL evaluator (mayor-gfpm)
+- #490 fix(apiserver): JSON Status 404 fallback for unmatched routes (mayor-upqy)
+
+## Bead queue
+- mayor-fmqw — VAP marker denied by own policy / replicas CEL eval (P2) — worktree ready
+- mayor-2lot — VAP/VAPB create returns 400 invalid JSON (P2) — worktree ready
+- Deferred: mayor-52wo · mayor-j7to · mayor-rvkq
+
+## Worktree hygiene
+Two pre-created worktrees. No dispatched workers.
 
 ## Main at
-94f4c1e — refactor(store): split lib.rs into sqlite.rs submodule (#480)
+9611f16 — fix(admission): set VAP/VAPB status.observedGeneration on write (#494)
