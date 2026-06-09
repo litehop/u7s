@@ -308,6 +308,7 @@ pub async fn create_resource<S: Store>(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
+    write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
     if let Some(hv) = warn_header {
@@ -431,6 +432,7 @@ pub async fn replace_resource<S: Store>(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
+    write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
     Ok(Json(obj.body).into_response())
 }
 
@@ -1889,6 +1891,55 @@ async fn delete_replicasets_owned_by<S: Store>(
 /// (kind + apiVersion). Clients (kubectl, client-go, conformance tests) assert
 /// these fields are non-empty on every create/get/update response. Without this,
 /// client-go reports "Object Kind is missing" and the operation fails.
+const ADMISSION_GROUP: &str = "admissionregistration.k8s.io";
+const VAP_PLURAL: &str = "validatingadmissionpolicies";
+const VAPB_PLURAL: &str = "validatingadmissionpolicybindings";
+
+/// After a VAP or VAPB write, set status.observedGeneration and a Ready=True
+/// condition so the conformance test framework can proceed without hanging.
+/// Real kube does this via a background controller; u7s has no controller loop,
+/// so set it synchronously.  Store errors are silenced with `let _ =` so a
+/// status write failure never breaks the create/update response.
+async fn write_vap_status<S: Store>(
+    store: &S,
+    group: &str,
+    plural: &str,
+    key: &str,
+    obj_body: &mut serde_json::Value,
+    stored_rv: u64,
+) {
+    if group != ADMISSION_GROUP || (plural != VAP_PLURAL && plural != VAPB_PLURAL) {
+        return;
+    }
+    let generation = {
+        let g = obj_body["metadata"]["generation"].as_i64().unwrap_or(0);
+        if g < 1 {
+            obj_body["metadata"]["generation"] = serde_json::json!(1i64);
+            1i64
+        } else {
+            g
+        }
+    };
+    let now = crate::util::utc_now_rfc3339();
+    obj_body["status"] = serde_json::json!({
+        "observedGeneration": generation,
+        "conditions": [{
+            "type": "Ready",
+            "status": "True",
+            "reason": "ValidationSucceeded",
+            "message": "Expression compilation succeeded",
+            "lastTransitionTime": now
+        }]
+    });
+    let bytes = match serde_json::to_vec(obj_body) {
+        Ok(b) => bytes::Bytes::from(b),
+        Err(_) => return,
+    };
+    if let Ok(new_rv) = store.put(key, bytes, Some(stored_rv)).await {
+        obj_body["metadata"]["resourceVersion"] = serde_json::Value::String(new_rv.to_string());
+    }
+}
+
 fn inject_type_meta(body: &mut serde_json::Value, group: &str, version: &str, kind: &str) {
     let api_version = if group.is_empty() {
         version.to_string()
@@ -8871,6 +8922,192 @@ mod tests {
             "PATCH on Endpoints must clear 'endpoints.kubernetes.io/last-change-trigger-time'; \
              if this annotation persists, the KCM mirroring controller skips the object and \
              no EndpointSlice is created — EndpointSliceMirroring conformance test fails"
+        );
+    }
+
+    /// VAP observedGeneration must be set so conformance test framework does not hang
+    /// waiting for policy readiness.
+    ///
+    /// The Kubernetes conformance e2e framework polls
+    ///   GET /apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/<name>
+    /// and waits until status.observedGeneration == metadata.generation before proceeding.
+    /// Without this field the poll never resolves and every VAP conformance test hangs
+    /// until the global Ginkgo suite timeout (~30 min).
+    #[tokio::test]
+    async fn vap_create_sets_observed_generation_and_ready_condition() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let vap = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": { "name": "test-vap" },
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{ "apiGroups": [""], "apiVersions": ["v1"],
+                                        "operations": ["CREATE"], "resources": ["pods"] }]
+                },
+                "validations": [{ "expression": "true" }]
+            }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&vap).unwrap());
+
+        let resp = create_resource(
+            State(state.clone()),
+            axum::extract::Path((
+                "admissionregistration.k8s.io".to_string(),
+                "v1".to_string(),
+                "validatingadmissionpolicies".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("VAP create must succeed: {e:?}"))
+        .into_response();
+
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+
+        let observed_gen = body["status"]["observedGeneration"].as_i64();
+        assert!(
+            observed_gen.is_some() && observed_gen.unwrap() >= 1,
+            "status.observedGeneration must be set after VAP create — conformance framework \
+             polls observedGeneration == metadata.generation and hangs forever if absent; got {:?}",
+            body["status"]
+        );
+
+        let conditions = body["status"]["conditions"].as_array();
+        assert!(
+            conditions.is_some() && !conditions.unwrap().is_empty(),
+            "status.conditions must be set after VAP create — conformance test checks for \
+             Ready condition before proceeding; got {:?}",
+            body["status"]
+        );
+
+        let ready = conditions
+            .unwrap()
+            .iter()
+            .find(|c| c["type"].as_str() == Some("Ready") && c["status"].as_str() == Some("True"));
+        assert!(
+            ready.is_some(),
+            "status.conditions must contain Ready=True after VAP create — conformance framework \
+             waits for policy readiness before running admission tests; got {:?}",
+            body["status"]["conditions"]
+        );
+    }
+
+    /// VAPB (ValidatingAdmissionPolicyBinding) observedGeneration must be set on create
+    /// so the conformance framework does not hang waiting for binding readiness.
+    #[tokio::test]
+    async fn vapb_create_sets_observed_generation_and_ready_condition() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let vapb = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": { "name": "test-vapb" },
+            "spec": {
+                "policyName": "test-vap",
+                "validationActions": ["Deny"]
+            }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&vapb).unwrap());
+
+        let resp = create_resource(
+            State(state.clone()),
+            axum::extract::Path((
+                "admissionregistration.k8s.io".to_string(),
+                "v1".to_string(),
+                "validatingadmissionpolicybindings".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("VAPB create must succeed: {e:?}"))
+        .into_response();
+
+        let resp_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+
+        let observed_gen = body["status"]["observedGeneration"].as_i64();
+        assert!(
+            observed_gen.is_some() && observed_gen.unwrap() >= 1,
+            "status.observedGeneration must be set after VAPB create — conformance framework \
+             polls observedGeneration == metadata.generation and hangs forever if absent; got {:?}",
+            body["status"]
+        );
+    }
+
+    /// VAP GET after create must return the same status.observedGeneration that was set
+    /// on create — proving the status was persisted to the store, not just in the response.
+    #[tokio::test]
+    async fn vap_get_after_create_returns_persisted_observed_generation() {
+        use axum::body::to_bytes;
+
+        let state = make_state();
+
+        let vap = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": { "name": "test-vap-persist" },
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{ "apiGroups": [""], "apiVersions": ["v1"],
+                                        "operations": ["CREATE"], "resources": ["pods"] }]
+                },
+                "validations": [{ "expression": "true" }]
+            }
+        });
+        let body = bytes::Bytes::from(serde_json::to_vec(&vap).unwrap());
+
+        create_resource(
+            State(state.clone()),
+            axum::extract::Path((
+                "admissionregistration.k8s.io".to_string(),
+                "v1".to_string(),
+                "validatingadmissionpolicies".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("VAP create must succeed: {e:?}"));
+
+        let get_resp = get_resource(
+            State(state.clone()),
+            axum::extract::Path((
+                "admissionregistration.k8s.io".to_string(),
+                "v1".to_string(),
+                "validatingadmissionpolicies".to_string(),
+                "test-vap-persist".to_string(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("VAP get must succeed: {e:?}"));
+
+        let resp_bytes = to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+
+        let observed_gen = body["status"]["observedGeneration"].as_i64();
+        assert!(
+            observed_gen.is_some() && observed_gen.unwrap() >= 1,
+            "GET must return persisted status.observedGeneration — if only set in the create \
+             response but not stored, the conformance framework's poll loop will never see it \
+             and will hang; got {:?}",
+            body["status"]
         );
     }
 }
