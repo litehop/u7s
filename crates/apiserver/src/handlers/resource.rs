@@ -257,6 +257,8 @@ pub async fn create_resource<S: Store>(
         name: &name,
         namespace: None,
         operation: "CREATE",
+        user_info: None,
+        dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
@@ -385,6 +387,8 @@ pub async fn replace_resource<S: Store>(
         name: &name,
         namespace: None,
         operation: "UPDATE",
+        user_info: None,
+        dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
@@ -705,6 +709,8 @@ pub(crate) async fn do_patch<S: Store>(
         name,
         namespace: ns,
         operation: "UPDATE",
+        user_info: None,
+        dry_run: false,
     };
     current.body = run_mutating_webhooks(state, current.body, &admission_ctx).await?;
     run_validating_webhooks(state, &current.body, &admission_ctx).await?;
@@ -1073,6 +1079,8 @@ pub async fn create_namespaced_resource<S: Store>(
         name: &name,
         namespace: Some(&ns),
         operation: "CREATE",
+        user_info: None,
+        dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
@@ -1331,6 +1339,8 @@ pub async fn replace_namespaced_resource<S: Store>(
         name: &name,
         namespace: Some(&ns),
         operation: "UPDATE",
+        user_info: None,
+        dry_run: false,
     };
     obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
