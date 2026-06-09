@@ -874,11 +874,25 @@ fn admissionregistration_v1_resources() -> serde_json::Value {
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             },
             {
+                "name": "validatingadmissionpolicies/status",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "ValidatingAdmissionPolicy",
+                "verbs": ["get", "patch", "update"]
+            },
+            {
                 "name": "validatingadmissionpolicybindings",
                 "singularName": "validatingadmissionpolicybinding",
                 "namespaced": false,
                 "kind": "ValidatingAdmissionPolicyBinding",
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "validatingadmissionpolicybindings/status",
+                "singularName": "",
+                "namespaced": false,
+                "kind": "ValidatingAdmissionPolicyBinding",
+                "verbs": ["get", "patch", "update"]
             },
             {
                 "name": "validatingwebhookconfigurations",
@@ -2226,6 +2240,10 @@ mod tests {
     // admissionregistration.k8s.io/v1 must include validatingadmissionpolicies and
     // mutatingadmissionpolicies — GA since k8s 1.30/1.32 respectively; conformance
     // tests fail with "resource not found" without them.
+    // The /status subresource must also be listed — the ValidatingAdmissionPolicy
+    // conformance test explicitly checks for validatingadmissionpolicies/status in the
+    // resource list and fails with "expected validatingadmissionpolicies/status, got [...]"
+    // if it is absent.
     #[tokio::test]
     async fn admissionregistration_v1_resources_includes_admission_policies() {
         let state = make_state();
@@ -2250,6 +2268,13 @@ mod tests {
             names.contains(&"validatingadmissionpolicies"),
             "validatingadmissionpolicies must be in admissionregistration.k8s.io/v1 — \
              CEL-based admission GA since k8s 1.30; got: {names:?}"
+        );
+        assert!(
+            names.contains(&"validatingadmissionpolicies/status"),
+            "validatingadmissionpolicies/status must be in admissionregistration.k8s.io/v1 — \
+             the ValidatingAdmissionPolicy conformance test checks for this subresource \
+             in the resource list and fails with 'expected validatingadmissionpolicies/status' \
+             if it is absent; got: {names:?}"
         );
         assert!(
             names.contains(&"mutatingadmissionpolicies"),
