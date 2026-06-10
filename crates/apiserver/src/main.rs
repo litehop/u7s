@@ -285,6 +285,10 @@ fn build_router(state: AppState) -> Router {
         // OpenAPI stubs — clients like Argo CD and kubectl call these on startup
         .route("/openapi/v2", get(handlers::discovery::openapi_v2))
         .route("/openapi/v3", get(handlers::discovery::openapi_v3))
+        .route(
+            "/openapi/v3/apis/{group}/{version}",
+            get(handlers::discovery::openapi_v3_group),
+        )
         // Core discovery
         .route("/api", get(handlers::discovery::api_versions))
         .route("/api/v1", get(handlers::discovery::api_v1_resources))
