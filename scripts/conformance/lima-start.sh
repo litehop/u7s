@@ -83,7 +83,11 @@ fi
 echo "u7s is reachable."
 
 # Start or resume the lima VM.
-if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${VM_NAME}$"; then
+# Use the instance directory as authoritative existence check — limactl list
+# can transiently return empty output if lima is busy, which would otherwise
+# cause the provisioning branch to run and hit "instance already exists".
+VM_DIR="${HOME}/.lima/${VM_NAME}"
+if [ -d "$VM_DIR" ]; then
   STATUS=$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${VM_NAME} / {print \$2}")
   if [ "$STATUS" != "Running" ]; then
     echo "Starting stopped VM '$VM_NAME'..."
@@ -290,6 +294,9 @@ rules:
 - apiGroups: [discovery.k8s.io]
   resources: [endpointslices]
   verbs: [get, list, watch]
+- apiGroups: [networking.k8s.io]
+  resources: [servicecidrs]
+  verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -391,9 +398,14 @@ fi
 # Install ipset (required by kube-proxy IPVS mode).
 limactl shell "$VM_NAME" sudo apt-get install -y ipset 2>/dev/null | tail -1 || true
 
-# Load IPVS kernel modules.
+# Load IPVS and bridge netfilter kernel modules.
+# br_netfilter is required so that bridge traffic (pod-to-pod) passes through
+# netfilter hooks; without it, IPVS DNAT for ClusterIP services never fires for
+# traffic originating from pods, breaking in-pod DNS and service connectivity.
 limactl shell "$VM_NAME" sudo bash -c '
   modprobe ip_vs ip_vs_rr ip_vs_wrr ip_vs_sh 2>/dev/null || true
+  modprobe br_netfilter 2>/dev/null || true
+  sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1 >/dev/null
 ' 2>/dev/null
 
 # Write the systemd service unit.

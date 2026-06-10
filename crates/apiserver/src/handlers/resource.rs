@@ -86,8 +86,14 @@ pub async fn list_resource<S: Store>(
             (av, meta.kind.clone())
         };
         let from_rv = query.resource_version.unwrap_or(0);
-        let initial =
-            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
+        let initial = fetch_initial_events(
+            &state,
+            &prefix,
+            query.send_initial_events == Some(true),
+            &group,
+            &plural,
+        )
+        .await?;
         return watch_generic(
             state,
             WatchConfig {
@@ -886,8 +892,14 @@ pub async fn list_namespaced_resource<S: Store>(
             (av, meta.kind.clone())
         };
         let from_rv = query.resource_version.unwrap_or(0);
-        let initial =
-            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
+        let initial = fetch_initial_events(
+            &state,
+            &prefix,
+            query.send_initial_events == Some(true),
+            &group,
+            &plural,
+        )
+        .await?;
         return watch_generic(
             state,
             WatchConfig {

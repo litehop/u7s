@@ -131,6 +131,8 @@ pub(crate) async fn fetch_initial_events<S: Store>(
     state: &AppState<S>,
     prefix: &str,
     send_initial_events: bool,
+    group: &str,
+    plural: &str,
 ) -> Result<Option<(Vec<serde_json::Value>, u64)>, crate::status::StatusError> {
     if !send_initial_events {
         return Ok(None);
@@ -144,6 +146,10 @@ pub(crate) async fn fetch_initial_events<S: Store>(
         .items
         .iter()
         .filter_map(|o| serde_json::from_slice(&o.value).ok())
+        .map(|mut v| {
+            super::defaults::apply_defaults(group, plural, &mut v);
+            v
+        })
         .collect();
     Ok(Some((items, resp.revision)))
 }
@@ -1535,7 +1541,7 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        let result = match fetch_initial_events(&state, "/registry/test/", false).await {
+        let result = match fetch_initial_events(&state, "/registry/test/", false, "", "").await {
             Ok(r) => r,
             Err(_) => panic!("fetch_initial_events must not fail"),
         };
@@ -1581,7 +1587,14 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        let result = match fetch_initial_events(&state, "/registry/configmaps/default/", true).await
+        let result = match fetch_initial_events(
+            &state,
+            "/registry/configmaps/default/",
+            true,
+            "",
+            "configmaps",
+        )
+        .await
         {
             Ok(r) => r,
             Err(_) => panic!("fetch_initial_events must not fail"),
@@ -1613,7 +1626,15 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        let result = match fetch_initial_events(&state, "/registry/configmaps/empty/", true).await {
+        let result = match fetch_initial_events(
+            &state,
+            "/registry/configmaps/empty/",
+            true,
+            "",
+            "configmaps",
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => panic!("fetch_initial_events must not fail"),
         };
@@ -1825,6 +1846,8 @@ mod tests {
             &state,
             "/registry/gateway.networking.k8s.io/v1/gatewayclasses/",
             true, // send_initial_events = true
+            "gateway.networking.k8s.io",
+            "gatewayclasses",
         )
         .await
         {
@@ -1972,6 +1995,64 @@ mod tests {
         );
     }
 
+    /// fetch_initial_events must apply defaults to snapshot items returned via sendInitialEvents=true.
+    /// Without this, a Service seeded without ipFamilies is delivered raw to KCM's
+    /// endpoints-controller, which indexes IPFamilies[0] and panics, killing the KCM process.
+    /// This test fails on revert: fetch_initial_events would return items without ipFamilies.
+    #[tokio::test]
+    async fn fetch_initial_events_applies_defaults_to_snapshot_items() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Seed a Service WITHOUT ipFamilies — exactly as main.rs seeds kube-dns.
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "kube-dns", "namespace": "kube-system" },
+            "spec": { "clusterIP": "10.96.0.10", "selector": { "k8s-app": "kube-dns" } }
+        });
+        store
+            .put(
+                "/registry/services/kube-system/kube-dns",
+                bytes::Bytes::from(serde_json::to_vec(&svc).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let result = fetch_initial_events(
+            &state,
+            "/registry/services/kube-system/",
+            true,
+            "",
+            "services",
+        )
+        .await
+        .expect("fetch_initial_events must succeed")
+        .expect("sendInitialEvents=true must return Some");
+
+        let (items, _) = result;
+        assert_eq!(items.len(), 1, "must return the seeded service");
+        assert_eq!(
+            items[0]["spec"]["ipFamilies"],
+            serde_json::json!(["IPv4"]),
+            "fetch_initial_events must apply ipFamilies default to snapshot items; \
+             KCM indexes IPFamilies[0] on every service event — a missing ipFamilies panics \
+             the endpoints-controller and kills the KCM process"
+        );
+    }
+
     /// Regression test for mayor-guqc: timeout_seconds controls the server-side watch stream
     /// lifetime. When `timeout_seconds: Some(1)`, the stream must close within ~2 seconds.
     ///
@@ -2087,10 +2168,15 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        let initial_items =
-            fetch_initial_events(&state, "/registry/serviceaccounts/test-ns/", true)
-                .await
-                .expect("fetch_initial_events must not fail");
+        let initial_items = fetch_initial_events(
+            &state,
+            "/registry/serviceaccounts/test-ns/",
+            true,
+            "",
+            "serviceaccounts",
+        )
+        .await
+        .expect("fetch_initial_events must not fail");
 
         let resp = watch_generic(
             state,
@@ -2186,10 +2272,15 @@ mod tests {
             "https://localhost:6443".into(),
         );
 
-        let initial_items =
-            fetch_initial_events(&state, "/registry/serviceaccounts/test-ns2/", true)
-                .await
-                .expect("fetch_initial_events must not fail");
+        let initial_items = fetch_initial_events(
+            &state,
+            "/registry/serviceaccounts/test-ns2/",
+            true,
+            "",
+            "serviceaccounts",
+        )
+        .await
+        .expect("fetch_initial_events must not fail");
 
         let resp = watch_generic(
             state,

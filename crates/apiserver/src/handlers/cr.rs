@@ -473,6 +473,8 @@ pub async fn list_cr<S: Store>(
             &state,
             &prefix,
             query.send_initial_events == Some(true),
+            &group,
+            &plural,
         )
         .await?;
         return super::watch::watch_generic(
@@ -802,6 +804,8 @@ pub async fn list_cr_namespaced<S: Store>(
             &state,
             &prefix,
             query.send_initial_events == Some(true),
+            &group,
+            &plural,
         )
         .await?;
         return super::watch::watch_generic(

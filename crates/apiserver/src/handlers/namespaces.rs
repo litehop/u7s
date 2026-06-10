@@ -65,6 +65,8 @@ pub async fn list_namespaces<S: Store>(
             &state,
             &prefix,
             query.send_initial_events == Some(true),
+            "",
+            "namespaces",
         )
         .await?;
         return super::watch::watch_generic(

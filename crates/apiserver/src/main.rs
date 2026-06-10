@@ -882,7 +882,8 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "rules": [
             { "apiGroups": [""], "resources": ["endpoints","services","nodes"], "verbs": ["get","list","watch"] },
             { "apiGroups": [""], "resources": ["events"], "verbs": ["create","patch","update"] },
-            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch"] }
+            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get","list","watch"] },
+            { "apiGroups": ["networking.k8s.io"], "resources": ["servicecidrs"], "verbs": ["get","list","watch"] }
         ]
     });
     put!(key, body, "system:node-proxier", "ClusterRole");
@@ -1908,6 +1909,7 @@ async fn seed_services(
         },
         "spec": {
             "clusterIP": "10.96.0.10",
+            "selector": { "k8s-app": "kube-dns" },
             "ports": [
                 { "name": "dns", "port": 53, "targetPort": 53, "protocol": "UDP" },
                 { "name": "dns-tcp", "port": 53, "targetPort": 53, "protocol": "TCP" }

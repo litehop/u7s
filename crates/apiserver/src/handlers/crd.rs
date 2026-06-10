@@ -232,6 +232,8 @@ pub async fn list_crds<S: Store>(
             &state,
             &prefix,
             query.send_initial_events == Some(true),
+            "apiextensions.k8s.io",
+            "customresourcedefinitions",
         )
         .await?;
         return super::watch::watch_generic(

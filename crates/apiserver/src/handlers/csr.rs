@@ -108,8 +108,14 @@ pub async fn list_csr<S: Store>(
 
     if query.watch == Some(true) {
         let from_rv = query.resource_version.unwrap_or(0);
-        let initial =
-            fetch_initial_events(&state, &prefix, query.send_initial_events == Some(true)).await?;
+        let initial = fetch_initial_events(
+            &state,
+            &prefix,
+            query.send_initial_events == Some(true),
+            "certificates.k8s.io",
+            "certificatesigningrequests",
+        )
+        .await?;
         return watch_generic(
             state,
             WatchConfig {
