@@ -120,8 +120,20 @@ impl SqliteStore {
             let mut guard = self.deletion_log.write().expect("deletion_log poisoned");
             guard.insert(event.key.clone(), Arc::clone(&event));
         }
-        // Best-effort broadcast; lagging receivers are dropped automatically.
+        // Best-effort broadcast of the specific event.
         let _ = self.tx.send(event);
+        // Broadcast a global bookmark (key="") to advance all informers' sync RVs.
+        // KCM's ConsistencyStore.EnsureReady() checks each informer's
+        // LastStoreSyncResourceVersion against the RV of writes the controller made.
+        // A StatefulSet watch only sees StatefulSet events — without a global bookmark,
+        // its sync RV lags pod write RVs and EnsureReady requeues indefinitely.
+        let global_revision = self.last_written_revision.load(Ordering::Acquire);
+        let _ = self.tx.send(Arc::new(InternalEvent {
+            key: String::new(),
+            revision: global_revision,
+            value: None,
+            is_create: false,
+        }));
     }
 
     /// Return the current compaction horizon: the lowest revision no longer in the ring.
@@ -878,6 +890,16 @@ impl Store for SqliteStore {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
+                        // A global bookmark (key == "") is delivered to all watches
+                        // regardless of prefix — it advances the informer's sync RV
+                        // without carrying an object (KCM ConsistencyStore relies on this).
+                        if event.key.is_empty() {
+                            if event.revision > last_replayed {
+                                last_replayed = event.revision;
+                                yield WatchEvent::Bookmark { revision: event.revision };
+                            }
+                            continue;
+                        }
                         if !event.key.starts_with(&prefix_owned) {
                             continue;
                         }

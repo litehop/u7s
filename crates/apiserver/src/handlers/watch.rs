@@ -2419,4 +2419,87 @@ mod tests {
             lines
         );
     }
+
+    /// A write to prefix A must deliver a BOOKMARK to a watch on prefix B.
+    ///
+    /// KCM 1.36 ConsistencyStore.EnsureReady() checks each informer's
+    /// LastStoreSyncResourceVersion (advanced by BOOKMARK events) against the RV
+    /// of any write the controller made — including writes to other resource types.
+    /// A StatefulSet watch that hasn't seen a StatefulSet event stays at its initial
+    /// sync RV, so a pod write at a higher RV causes EnsureReady to requeue forever.
+    /// The global bookmark (key="") fixes this by delivering a BOOKMARK with the
+    /// current global RV to every open watch after each write.
+    #[tokio::test]
+    async fn write_to_different_prefix_delivers_bookmark_to_watch() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::{SqliteStore, Store};
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Write an object under prefix A so we have a non-zero baseline RV.
+        store
+            .put(
+                "/registry/pods/default/pod-1",
+                bytes::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "apiVersion": "v1", "kind": "Pod",
+                        "metadata": {"name": "pod-1", "namespace": "default"}
+                    }))
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .expect("pod write must succeed");
+
+        // Open a watch on prefix B (statefulsets) starting from rv=0.
+        let sts_stream = store
+            .watch("/registry/apps/statefulsets/", 0)
+            .await
+            .expect("watch must open");
+
+        // Write another object under prefix A (a second pod).
+        store
+            .put(
+                "/registry/pods/default/pod-2",
+                bytes::Bytes::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "apiVersion": "v1", "kind": "Pod",
+                        "metadata": {"name": "pod-2", "namespace": "default"}
+                    }))
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .expect("second pod write must succeed");
+
+        let pod_rv = store.current_revision();
+
+        // The statefulset watch must receive a BOOKMARK with the pod write RV,
+        // even though no statefulset was written.
+        use futures_core::Stream;
+        use std::pin::pin;
+        use tokio::time::{timeout, Duration};
+        let mut sts_stream = pin!(sts_stream);
+        let event = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(ev) = futures_util::StreamExt::next(&mut sts_stream).await {
+                    if let u7s_store::WatchEvent::Bookmark { revision } = ev {
+                        return revision;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("statefulset watch must receive a BOOKMARK within 2s after a pod write");
+
+        assert!(
+            event >= pod_rv,
+            "BOOKMARK revision {event} must be >= pod write revision {pod_rv} — \
+             without this, KCM ConsistencyStore.EnsureReady requeues the StatefulSet \
+             controller forever after every pod creation"
+        );
+    }
 }
