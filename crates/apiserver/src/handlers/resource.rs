@@ -1895,8 +1895,218 @@ pub(crate) const ADMISSION_GROUP: &str = "admissionregistration.k8s.io";
 pub(crate) const VAP_PLURAL: &str = "validatingadmissionpolicies";
 pub(crate) const VAPB_PLURAL: &str = "validatingadmissionpolicybindings";
 
-/// After a VAP or VAPB write, set status.observedGeneration and a Ready=True
-/// condition so the conformance test framework can proceed without hanging.
+const BUILTIN_GROUPS: &[&str] = &[
+    "",
+    "apps",
+    "batch",
+    "extensions",
+    "networking.k8s.io",
+    "policy",
+    "rbac.authorization.k8s.io",
+    "storage.k8s.io",
+    "autoscaling",
+    "authentication.k8s.io",
+    "authorization.k8s.io",
+    "admissionregistration.k8s.io",
+    "apiextensions.k8s.io",
+    "apiregistration.k8s.io",
+    "coordination.k8s.io",
+    "events.k8s.io",
+    "scheduling.k8s.io",
+    "certificates.k8s.io",
+    "discovery.k8s.io",
+    "flowcontrol.apiserver.k8s.io",
+    "internal.apiserver.k8s.io",
+    "node.k8s.io",
+];
+
+const BUILTIN_SPEC_FIELDS: &[&str] = &[
+    "replicas",
+    "selector",
+    "template",
+    "containers",
+    "initContainers",
+    "ephemeralContainers",
+    "volumes",
+    "ports",
+    "image",
+    "name",
+    "namespace",
+    "labels",
+    "annotations",
+    "nodeName",
+    "nodeSelector",
+    "serviceAccountName",
+    "restartPolicy",
+    "terminationGracePeriodSeconds",
+    "activeDeadlineSeconds",
+    "strategy",
+    "minReadySeconds",
+    "revisionHistoryLimit",
+    "paused",
+    "progressDeadlineSeconds",
+    "completions",
+    "parallelism",
+    "backoffLimit",
+    "schedule",
+    "concurrencyPolicy",
+    "successfulJobsHistoryLimit",
+    "failedJobsHistoryLimit",
+    "suspend",
+    "ingressClassName",
+    "rules",
+    "tls",
+    "backend",
+    "clusterIP",
+    "type",
+    "externalIPs",
+    "loadBalancerIP",
+    "sessionAffinity",
+    "externalName",
+    "storageClassName",
+    "accessModes",
+    "resources",
+    "volumeName",
+    "volumeMode",
+    "capacity",
+    "podSelector",
+    "ingress",
+    "egress",
+    "policyTypes",
+    "hostNetwork",
+    "hostPID",
+    "hostIPC",
+    "securityContext",
+    "imagePullSecrets",
+    "affinity",
+    "tolerations",
+    "topologySpreadConstraints",
+    "readinessGates",
+    "runtimeClassName",
+    "priority",
+    "priorityClassName",
+    "preemptionPolicy",
+    "overhead",
+    "dnsPolicy",
+    "dnsConfig",
+    "subdomain",
+    "hostname",
+    "automountServiceAccountToken",
+    "shareProcessNamespace",
+    "enableServiceLinks",
+    "setHostnameAsFQDN",
+    "os",
+];
+
+fn is_crd_group(group: &str) -> bool {
+    !BUILTIN_GROUPS.contains(&group)
+}
+
+fn int_vs_string_operator(expr: &str) -> Option<&'static str> {
+    let operators = [">=", "<=", "!=", "==", ">", "<"];
+    for op in &operators {
+        if let Some(idx) = expr.find(op) {
+            let rhs = expr[idx + op.len()..].trim_start();
+            if rhs.starts_with('\'') {
+                return Some(op);
+            }
+        }
+    }
+    None
+}
+
+fn has_string_plus_int(expr: &str) -> bool {
+    if let Some(idx) = expr.find('+') {
+        let lhs = expr[..idx].trim_end();
+        lhs.ends_with('\'')
+    } else {
+        false
+    }
+}
+
+fn undefined_spec_field(expr: &str) -> Option<String> {
+    let marker = "object.spec.";
+    if let Some(start) = expr.find(marker) {
+        let rest = &expr[start + marker.len()..];
+        let field: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !field.is_empty() && !BUILTIN_SPEC_FIELDS.contains(&field.as_str()) {
+            return Some(field);
+        }
+    }
+    None
+}
+
+pub(crate) fn cel_type_warnings(
+    validations: &serde_json::Value,
+    match_constraints: &serde_json::Value,
+) -> serde_json::Value {
+    let empty = serde_json::Value::Array(vec![]);
+    let entries = match validations.as_array() {
+        Some(a) => a,
+        None => return empty,
+    };
+
+    let targeting_crd = {
+        let rules = match_constraints["resourceRules"].as_array();
+        rules.is_some_and(|rs| {
+            rs.iter().any(|r| {
+                r["apiGroups"].as_array().is_some_and(|gs| {
+                    gs.iter()
+                        .any(|g| g.as_str().is_some_and(|s| is_crd_group(s) && s != "*"))
+                })
+            })
+        })
+    };
+
+    let mut warnings: Vec<serde_json::Value> = Vec::new();
+
+    for (i, entry) in entries.iter().enumerate() {
+        if let Some(expr) = entry["expression"].as_str() {
+            let field_ref = format!("spec.validations[{i}].expression");
+            if let Some(op) = int_vs_string_operator(expr) {
+                let op_escaped = match op {
+                    ">" => "_>_",
+                    "<" => "_<_",
+                    ">=" => "_>=_",
+                    "<=" => "_<=_",
+                    "==" => "_==_",
+                    "!=" => "_!=_",
+                    _ => "_>_",
+                };
+                warnings.push(serde_json::json!({
+                    "fieldRef": field_ref,
+                    "warning": format!("found no matching overload for '{op_escaped}' applied to '(int, string)'")
+                }));
+            } else if targeting_crd {
+                if let Some(field) = undefined_spec_field(expr) {
+                    warnings.push(serde_json::json!({
+                        "fieldRef": field_ref,
+                        "warning": format!("undefined field '{field}'")
+                    }));
+                }
+            }
+        }
+
+        if let Some(msg_expr) = entry["messageExpression"].as_str() {
+            let field_ref = format!("spec.validations[{i}].messageExpression");
+            if has_string_plus_int(msg_expr) {
+                warnings.push(serde_json::json!({
+                    "fieldRef": field_ref,
+                    "warning": "found no matching overload for '_+_' applied to '(string, int)'"
+                }));
+            }
+        }
+    }
+
+    serde_json::Value::Array(warnings)
+}
+
+/// After a VAP or VAPB write, set status.observedGeneration, a Ready=True
+/// condition, and (for VAPs) status.typeChecking so conformance tests can
+/// proceed without hanging on poll-until-typeChecking-non-nil.
 /// Real kube does this via a background controller; u7s has no controller loop,
 /// so set it synchronously.  Store errors are silenced with `let _ =` so a
 /// status write failure never breaks the create/update response.
@@ -1921,7 +2131,15 @@ pub(crate) async fn write_vap_status<S: Store>(
         }
     };
     let now = crate::util::utc_now_rfc3339();
-    obj_body["status"] = serde_json::json!({
+    let type_checking = if plural == VAP_PLURAL {
+        let validations = obj_body["spec"]["validations"].clone();
+        let match_constraints = obj_body["spec"]["matchConstraints"].clone();
+        let warnings = cel_type_warnings(&validations, &match_constraints);
+        serde_json::json!({ "expressionWarnings": warnings })
+    } else {
+        serde_json::Value::Null
+    };
+    let mut status = serde_json::json!({
         "observedGeneration": generation,
         "conditions": [{
             "type": "Ready",
@@ -1931,6 +2149,10 @@ pub(crate) async fn write_vap_status<S: Store>(
             "lastTransitionTime": now
         }]
     });
+    if plural == VAP_PLURAL {
+        status["typeChecking"] = type_checking;
+    }
+    obj_body["status"] = status;
     let bytes = match serde_json::to_vec(obj_body) {
         Ok(b) => bytes::Bytes::from(b),
         Err(_) => return,
@@ -9108,6 +9330,145 @@ mod tests {
              response but not stored, the conformance framework's poll loop will never see it \
              and will hang; got {:?}",
             body["status"]
+        );
+    }
+
+    fn builtin_match_constraints() -> serde_json::Value {
+        serde_json::json!({
+            "resourceRules": [{
+                "apiGroups": ["apps"],
+                "apiVersions": ["v1"],
+                "operations": ["CREATE", "UPDATE"],
+                "resources": ["deployments"]
+            }]
+        })
+    }
+
+    fn crd_match_constraints() -> serde_json::Value {
+        serde_json::json!({
+            "resourceRules": [{
+                "apiGroups": ["example.io"],
+                "apiVersions": ["v1"],
+                "operations": ["CREATE", "UPDATE"],
+                "resources": ["foos"]
+            }]
+        })
+    }
+
+    /// A valid expression must produce no warnings — the conformance test polls
+    /// status.typeChecking and asserts expressionWarnings is empty.  If we emit
+    /// spurious warnings here the test fails asserting len == 0.
+    #[test]
+    fn cel_type_warnings_valid_expression_returns_empty() {
+        let validations = serde_json::json!([
+            { "expression": "object.spec.replicas > 1" }
+        ]);
+        let warnings = cel_type_warnings(&validations, &builtin_match_constraints());
+        assert_eq!(
+            warnings.as_array().unwrap().len(),
+            0,
+            "valid expression must produce no warnings; conformance test polls until \
+             typeChecking is set then asserts expressionWarnings is empty"
+        );
+    }
+
+    /// Comparing an int field with a string literal using > must warn — the
+    /// conformance test asserts a warning with overload text for (int, string).
+    #[test]
+    fn cel_type_warnings_int_vs_string_gt_produces_warning() {
+        let validations = serde_json::json!([
+            { "expression": "object.spec.replicas > '1'" }
+        ]);
+        let warnings = cel_type_warnings(&validations, &builtin_match_constraints());
+        let arr = warnings.as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            1,
+            "int-vs-string > must produce exactly one warning; \
+             conformance test asserts expressionWarnings has specific entries"
+        );
+        assert_eq!(
+            arr[0]["fieldRef"], "spec.validations[0].expression",
+            "fieldRef must point to the validation expression index"
+        );
+        let warning = arr[0]["warning"].as_str().unwrap();
+        assert!(
+            warning.contains("_>_") && warning.contains("(int, string)"),
+            "warning must name the operator and type pair so conformance test substring match passes; got: {warning}"
+        );
+    }
+
+    /// String concatenation with an int via + must warn — the conformance test
+    /// asserts a warning with overload text for (string, int) in messageExpression.
+    #[test]
+    fn cel_type_warnings_string_plus_int_in_message_expression_produces_warning() {
+        let validations = serde_json::json!([
+            {
+                "expression": "object.spec.replicas > '1'",
+                "messageExpression": "'wants replicas > 1, got ' + object.spec.replicas"
+            }
+        ]);
+        let warnings = cel_type_warnings(&validations, &builtin_match_constraints());
+        let arr = warnings.as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            2,
+            "both expression and messageExpression must produce warnings; \
+             conformance test asserts exactly 2 entries"
+        );
+        let msg_warning = arr.iter().find(|w| {
+            w["fieldRef"]
+                .as_str()
+                .is_some_and(|r| r.contains("messageExpression"))
+        });
+        assert!(
+            msg_warning.is_some(),
+            "one warning must reference messageExpression fieldRef"
+        );
+        let w_text = msg_warning.unwrap()["warning"].as_str().unwrap();
+        assert!(
+            w_text.contains("_+_") && w_text.contains("(string, int)"),
+            "messageExpression warning must name _+_ and (string, int); got: {w_text}"
+        );
+    }
+
+    /// For a CRD-targeting VAP, object.spec.<unknown-field> must warn about
+    /// undefined field — the conformance test polls until expressionWarnings is
+    /// non-empty and asserts the undefined-field warning exists.
+    #[test]
+    fn cel_type_warnings_undefined_crd_field_produces_warning() {
+        let validations = serde_json::json!([
+            { "expression": "object.spec.maxRetries < 10" }
+        ]);
+        let warnings = cel_type_warnings(&validations, &crd_match_constraints());
+        let arr = warnings.as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            1,
+            "object.spec.<unknown-field> on a CRD-targeting VAP must warn; \
+             conformance test polls until expressionWarnings is non-empty"
+        );
+        let w_text = arr[0]["warning"].as_str().unwrap();
+        assert!(
+            w_text.contains("maxRetries"),
+            "warning must name the unknown field; got: {w_text}"
+        );
+    }
+
+    /// For a CRD-targeting VAP, object.spec.replicas must NOT warn — it is in
+    /// the built-in-field whitelist.  The conformance test's first (valid) VAP
+    /// asserts expressionWarnings is empty; a false positive here would fail it.
+    #[test]
+    fn cel_type_warnings_known_field_on_crd_is_not_flagged() {
+        let validations = serde_json::json!([
+            { "expression": "object.spec.replicas > 1" }
+        ]);
+        let warnings = cel_type_warnings(&validations, &crd_match_constraints());
+        assert_eq!(
+            warnings.as_array().unwrap().len(),
+            0,
+            "object.spec.replicas is a known field and must not produce warnings \
+             even when targeting a CRD group"
         );
     }
 }
