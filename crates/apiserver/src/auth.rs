@@ -762,23 +762,28 @@ where
 
         // 2. Authorize.
         let parsed = parse_path(&path);
-        let verb = if req.method() == axum::http::Method::GET {
-            get_verb(parsed.name.as_deref(), req.uri().query())
-        } else if req.method() == axum::http::Method::DELETE && parsed.name.is_none() {
-            "deletecollection"
-        } else {
-            method_to_verb(req.method())
-        };
 
         // Detect non-resource URL requests: paths not rooted in /api or /apis
         // (i.e. parse_path returned an empty resource) are non-resource requests.
-        // Examples: GET /version, GET /openapi/v2.
+        // Examples: GET /version, GET /openapi/v2, GET /openapi/v3/apis/<group>/<ver>.
         let non_resource_url: Option<&str> =
             if parsed.resource.is_empty() && !path.starts_with("/api") {
                 Some(&path)
             } else {
                 None
             };
+
+        // Non-resource URL verbs map directly from the HTTP method ("get", "post", ...).
+        // get_verb's list/get/watch distinction only applies to resource requests.
+        let verb = if non_resource_url.is_some() {
+            method_to_verb(req.method())
+        } else if req.method() == axum::http::Method::GET {
+            get_verb(parsed.name.as_deref(), req.uri().query())
+        } else if req.method() == axum::http::Method::DELETE && parsed.name.is_none() {
+            "deletecollection"
+        } else {
+            method_to_verb(req.method())
+        };
 
         let allowed = self.rbac_index.is_allowed(&AuthzRequest {
             username: &user.username,
@@ -1139,6 +1144,43 @@ mod tests {
             is_exempt("/openapi/v3"),
             "/openapi/v3 must be auth-exempt — conformance tests poll it without credentials \
              to detect when a CRD schema is published; a 403 causes the test to time out"
+        );
+    }
+
+    /// GET /openapi/v3/apis/<group>/<version> must use verb "get", not "list".
+    ///
+    /// parse_path() returns name=None for this path (it's not a resource path), so
+    /// get_verb(None, _) would return "list". The system:discovery ClusterRole only
+    /// grants verb "get" on /openapi/*, so a "list" check always fails with 403,
+    /// causing the e2e test "should type check a CRD" to hang while polling the
+    /// per-group schema endpoint.
+    #[test]
+    fn non_resource_url_get_uses_method_verb_not_list() {
+        let path = "/openapi/v3/apis/stable.example.com/v1";
+        let parsed = parse_path(path);
+        // parse_path returns unknown_path() for non-api/apis paths
+        assert!(
+            parsed.resource.is_empty(),
+            "openapi path must not parse as a resource"
+        );
+        // non_resource_url detection
+        let is_non_resource = parsed.resource.is_empty() && !path.starts_with("/api");
+        assert!(
+            is_non_resource,
+            "/openapi/... must be detected as non-resource"
+        );
+        // verb for non-resource GET must be "get", not "list"
+        // (get_verb(None, None) returns "list" — must NOT be called for non-resource paths)
+        let verb = if is_non_resource {
+            method_to_verb(&Method::GET)
+        } else {
+            get_verb(parsed.name.as_deref(), None)
+        };
+        assert_eq!(
+            verb, "get",
+            "GET /openapi/v3/apis/<group>/<version> must use verb \"get\" — \
+             system:discovery only grants \"get\" on /openapi/*, so \"list\" \
+             causes 403 and the type-check CRD conformance test hangs forever"
         );
     }
 
