@@ -182,4 +182,9 @@ pub trait Store: Send + Sync + 'static {
     /// Any revision below this value has been compacted out of the ring buffer.
     /// Returns 0 when no compaction has occurred.
     fn compaction_horizon(&self) -> u64;
+
+    /// Return the global revision of the most recently committed write.
+    /// Used by watch BOOKMARK heartbeats to advance informer sync RVs across
+    /// resource types (KCM ConsistencyStore checks informer RV >= last written RV).
+    fn current_revision(&self) -> u64;
 }

@@ -973,6 +973,10 @@ impl Store for SqliteStore {
     fn compaction_horizon(&self) -> u64 {
         self.compaction_horizon.load(Ordering::Relaxed)
     }
+
+    fn current_revision(&self) -> u64 {
+        self.last_written_revision.load(Ordering::Acquire)
+    }
 }
 
 pub(crate) fn internal_to_watch(event: &InternalEvent) -> WatchEvent {

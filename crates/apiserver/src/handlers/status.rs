@@ -1569,6 +1569,10 @@ mod tests {
         fn compaction_horizon(&self) -> u64 {
             self.inner.compaction_horizon()
         }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
     }
 
     /// put_resource_status returns 409 Conflict when the store rejects the write

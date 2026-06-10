@@ -144,7 +144,7 @@ fn default_service(obj: &mut serde_json::Value) {
 
     if let Some(ports) = obj["spec"]["ports"].as_array_mut() {
         for port_entry in ports.iter_mut() {
-            if port_entry["targetPort"].is_null() {
+            if port_entry["targetPort"].is_null() || port_entry["targetPort"].as_i64() == Some(0) {
                 if let Some(port_num) = port_entry["port"].as_i64() {
                     port_entry["targetPort"] =
                         serde_json::Value::Number(serde_json::Number::from(port_num));
@@ -1916,6 +1916,29 @@ mod tests {
         assert_eq!(
             svc["spec"]["ports"][0]["targetPort"], 8444,
             "explicit targetPort must not be overwritten by defaulting"
+        );
+    }
+
+    /// A port with targetPort=0 must be defaulted to the port number.
+    ///
+    /// Kubernetes client-go serializes an omitted IntOrString targetPort as 0.
+    /// Without this, the EndpointSlice controller copies port=0 into the slice,
+    /// breaking connectivity to StatefulSet pods (conformance: statefulset tests hang).
+    #[test]
+    fn service_port_zero_target_port_defaults_to_port() {
+        let mut svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "my-svc"},
+            "spec": {
+                "type": "ClusterIP",
+                "ports": [{"port": 80, "targetPort": 0, "protocol": "TCP"}]
+            }
+        });
+        default_service(&mut svc);
+        assert_eq!(
+            svc["spec"]["ports"][0]["targetPort"], 80,
+            "targetPort=0 must be defaulted to port — client-go omits targetPort as 0, \
+             EndpointSlice controller copies it verbatim and pods become unreachable"
         );
     }
 

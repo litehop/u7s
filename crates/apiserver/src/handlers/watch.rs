@@ -513,8 +513,15 @@ pub(crate) async fn watch_generic<S: Store>(
 
                 _ = bookmark_tick.tick() => {
                     if allow_watch_bookmarks {
+                        // Use the global store revision, not last_rv (the last RV seen on
+                        // this stream). KCM's ConsistencyStore checks that each informer's
+                        // LastStoreSyncResourceVersion (advanced by BOOKMARK) is >= the RV
+                        // of any write the controller made to *any* resource type. A
+                        // StatefulSet watch only sees StatefulSet events, so last_rv stays
+                        // stale relative to pod writes — causing endless requeue loops.
+                        let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
                         let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{bookmark_rv}\"}}}}}}\n"
                         );
                         yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
                     }
@@ -522,8 +529,9 @@ pub(crate) async fn watch_generic<S: Store>(
 
                 _ = &mut max_duration => {
                     if allow_watch_bookmarks {
+                        let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
                         let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\"}}}}}}\n"
+                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{bookmark_rv}\"}}}}}}\n"
                         );
                         yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
                     }
