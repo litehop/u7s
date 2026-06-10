@@ -1369,12 +1369,86 @@ pub async fn openapi_v2<S: Store>(
     .into_response()
 }
 
-/// Minimal OpenAPI v3 discovery stub — kubectl 1.28+ calls /openapi/v3 first.
-/// An empty "paths" map is valid and tells kubectl to fall back to /openapi/v2.
-pub async fn openapi_v3() -> Json<serde_json::Value> {
+pub async fn openapi_v3<S: Store>(State(state): State<AppState<S>>) -> Json<serde_json::Value> {
+    let mut paths = serde_json::Map::new();
+
+    if let Ok(resp) = state
+        .store
+        .list(
+            "/registry/apiextensions.k8s.io/customresourcedefinitions/",
+            ListOptions::default(),
+        )
+        .await
+    {
+        for obj in &resp.items {
+            let Ok(crd) = serde_json::from_slice::<CustomResourceDefinition>(&obj.value) else {
+                continue;
+            };
+            let group = &crd.spec.group;
+            for ver in &crd.spec.versions {
+                if !ver.served {
+                    continue;
+                }
+                let key = format!("apis/{}/{}", group, ver.name);
+                let url = format!("/openapi/v3/apis/{}/{}", group, ver.name);
+                paths.insert(key, serde_json::json!({ "serverRelativeURL": url }));
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "paths": paths }))
+}
+
+pub async fn openapi_v3_group<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version)): Path<(String, String)>,
+) -> Response {
+    let Ok(resp) = state
+        .store
+        .list(
+            "/registry/apiextensions.k8s.io/customresourcedefinitions/",
+            ListOptions::default(),
+        )
+        .await
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+
+    let mut schemas = serde_json::Map::new();
+
+    for obj in &resp.items {
+        let Ok(crd) = serde_json::from_slice::<CustomResourceDefinition>(&obj.value) else {
+            continue;
+        };
+        if crd.spec.group != group {
+            continue;
+        }
+        for ver in &crd.spec.versions {
+            if ver.name != version || !ver.served {
+                continue;
+            }
+            let schema = ver
+                .schema
+                .as_ref()
+                .and_then(|s| s.get("openAPIV3Schema"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "type": "object" }));
+            let kind = &crd.spec.names.kind;
+            schemas.insert(kind.clone(), schema);
+        }
+    }
+
+    if schemas.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     Json(serde_json::json!({
-        "paths": {}
+        "openapi": "3.0.0",
+        "info": { "title": format!("{}/{}", group, version), "version": "v1" },
+        "paths": {},
+        "components": { "schemas": schemas }
     }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2067,7 +2141,8 @@ mod tests {
     // first; an empty paths map causes it to fall back to /openapi/v2 gracefully.
     #[tokio::test]
     async fn openapi_v3_returns_paths_key() {
-        let Json(val) = openapi_v3().await;
+        let state = make_state();
+        let Json(val) = openapi_v3(State(state)).await;
         assert!(
             val.get("paths").is_some(),
             "/openapi/v3 must contain a \"paths\" key so kubectl can fall back to /openapi/v2"
@@ -2120,7 +2195,10 @@ mod tests {
     // first and falls back to /openapi/v2 only if it gets a valid response.
     #[tokio::test]
     async fn openapi_v3_route_returns_200_with_paths_key() {
-        let app = Router::new().route("/openapi/v3", get(openapi_v3));
+        let state = make_state();
+        let app = Router::new()
+            .route("/openapi/v3", get(openapi_v3))
+            .with_state(state);
 
         let req = Request::builder()
             .method("GET")
@@ -3021,6 +3099,138 @@ mod tests {
             val.get("swagger").and_then(|v| v.as_str()),
             Some("2.0"),
             "response must be a Swagger 2.0 document"
+        );
+    }
+
+    fn crd_bytes_with_schema(group: &str, plural: &str, kind: &str, version: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": format!("{plural}.{group}") },
+                "spec": {
+                    "group": group,
+                    "names": { "plural": plural, "singular": plural, "kind": kind },
+                    "scope": "Namespaced",
+                    "versions": [{
+                        "name": version,
+                        "served": true,
+                        "storage": true,
+                        "schema": {
+                            "openAPIV3Schema": {
+                                "type": "object",
+                                "properties": {
+                                    "spec": {
+                                        "type": "object",
+                                        "properties": {
+                                            "replicas": { "type": "integer" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    // After a CRD is installed, /openapi/v3 must list its group/version in paths.
+    // client-go's openapi3 package calls this index first; an absent entry means
+    // the CRD type-checker never loads the schema and the conformance test hangs.
+    #[tokio::test]
+    async fn openapi_v3_paths_contains_crd_group() {
+        let state = make_state();
+
+        let body = crd_bytes_with_schema("probe.example.com", "widgets", "Widget", "v1");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let Json(val) = openapi_v3(State(state)).await;
+        let paths = val["paths"].as_object().expect("paths must be an object");
+        assert!(
+            paths.contains_key("apis/probe.example.com/v1"),
+            "apis/probe.example.com/v1 must appear in /openapi/v3 paths after CRD install — \
+             client-go uses this index to discover per-group OpenAPI v3 schemas; got: {:?}",
+            paths.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // /openapi/v3/apis/<group>/<version> must return an OpenAPI v3 document containing
+    // the CRD's schema under components.schemas.<Kind>.  Without this the CEL type-checker
+    // cannot validate CR fields and the conformance test "should type check a CRD" hangs.
+    #[tokio::test]
+    async fn openapi_v3_group_returns_crd_schema() {
+        let state = make_state();
+
+        let body = crd_bytes_with_schema("probe.example.com", "widgets", "Widget", "v1");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create must succeed");
+
+        let resp = openapi_v3_group(
+            State(state),
+            Path(("probe.example.com".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/openapi/v3/apis/probe.example.com/v1 must return 200 after CRD install"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            val["openapi"].as_str(),
+            Some("3.0.0"),
+            "response must identify as OpenAPI 3.0.0"
+        );
+
+        let replicas_type = val["components"]["schemas"]["Widget"]["properties"]["spec"]
+            ["properties"]["replicas"]["type"]
+            .as_str();
+        assert_eq!(
+            replicas_type,
+            Some("integer"),
+            "Widget.spec.properties.replicas must be type=integer — the CEL type-checker reads \
+             this to validate CRD instances; got: {replicas_type:?}"
+        );
+    }
+
+    // /openapi/v3/apis/<group>/<version> must return 404 when no CRD matches.
+    // client-go must receive 404 to know the group has no schema, not hang on an error.
+    #[tokio::test]
+    async fn openapi_v3_group_returns_404_for_unknown_group() {
+        let state = make_state();
+
+        let resp = openapi_v3_group(
+            State(state),
+            Path(("unknown.example.com".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "/openapi/v3/apis/<unknown>/<version> must return 404 — \
+             client-go uses the 404 to skip schema loading for absent groups"
         );
     }
 }
