@@ -2431,7 +2431,6 @@ mod tests {
     /// current global RV to every open watch after each write.
     #[tokio::test]
     async fn write_to_different_prefix_delivers_bookmark_to_watch() {
-        use crate::state::AppState;
         use std::sync::Arc;
         use u7s_store::{SqliteStore, Store};
 
@@ -2479,16 +2478,15 @@ mod tests {
 
         // The statefulset watch must receive a BOOKMARK with the pod write RV,
         // even though no statefulset was written.
-        use futures_core::Stream;
         use std::pin::pin;
         use tokio::time::{timeout, Duration};
         let mut sts_stream = pin!(sts_stream);
         let event = timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(ev) = futures_util::StreamExt::next(&mut sts_stream).await {
-                    if let u7s_store::WatchEvent::Bookmark { revision } = ev {
-                        return revision;
-                    }
+                if let Some(u7s_store::WatchEvent::Bookmark { revision }) =
+                    futures_util::StreamExt::next(&mut sts_stream).await
+                {
+                    return revision;
                 }
             }
         })
