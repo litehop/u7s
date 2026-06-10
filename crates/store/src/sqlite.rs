@@ -909,6 +909,12 @@ impl Store for SqliteStore {
                         }
                         last_replayed = event.revision;
                         yield internal_to_watch(&event);
+                        // Immediately follow every event with a BOOKMARK at the same RV.
+                        // client-go only advances LastStoreSyncResourceVersion on BOOKMARK events.
+                        // KCM ConsistencyStore checks the pod informer's LastStoreSyncResourceVersion
+                        // immediately after writing a pod — without a trailing BOOKMARK the check
+                        // always sees a stale RV and requeues indefinitely.
+                        yield WatchEvent::Bookmark { revision: last_replayed };
                     }
                     Err(broadcast::error::RecvError::Lagged(_n)) => {
                         // The broadcast channel dropped messages because this receiver was too slow.
