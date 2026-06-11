@@ -582,6 +582,62 @@ pub async fn patch_pod<S: Store>(
 
 use crate::util::utc_now_rfc3339;
 
+/// POST /api/v1/namespaces/{ns}/pods/{name}/eviction
+///
+/// Eviction triggers graceful pod deletion. We accept any Eviction body (or
+/// empty body) and soft-delete the pod by stamping `deletionTimestamp`, exactly
+/// as `delete_pod` does. Without this endpoint the conformance test
+/// "Should recreate evicted statefulset" hangs: the test calls the Eviction API,
+/// receives a 404 (no route), the pod is never terminated, and the StatefulSet
+/// controller never triggers recreation.
+pub async fn evict_pod<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns, name)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns, &state).await?;
+    let key = object_key("pods", ns.as_str(), &name);
+
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
+    let already_terminating = meta.deletion_timestamp.is_some();
+    let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
+
+    if already_terminating && !has_finalizers {
+        state
+            .store
+            .delete(&key, None)
+            .await
+            .map_err(|e| store_err_to_status(e, &name))?;
+    } else if !already_terminating {
+        obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+        let expected_rv = parse_resource_version(obj.resource_version())?;
+        state
+            .store
+            .put(&key, obj.to_bytes(), expected_rv)
+            .await
+            .map_err(|e| store_err_to_status(e, &name))?;
+    }
+
+    let eviction: serde_json::Value = serde_json::from_slice(&body).unwrap_or_else(|_| {
+        serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": name, "namespace": ns.as_str() }
+        })
+    });
+    Ok((StatusCode::CREATED, Json(eviction)))
+}
+
 #[cfg(test)]
 mod watch_tests {
     use super::*;
@@ -4477,6 +4533,108 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------------
+    // evict_pod
+    // -----------------------------------------------------------------------
+
+    /// POST /pods/{name}/eviction on a running pod must soft-delete (stamp deletionTimestamp)
+    /// and return 201 Created with the Eviction object.
+    ///
+    /// Without this endpoint the conformance test "Should recreate evicted statefulset" never
+    /// terminates the orphan pod, so the StatefulSet controller never gets a pod-deleted event
+    /// and never recreates ss-0. The test then times out after 15 minutes.
+    ///
+    /// This test fails on revert: if evict_pod is removed, the route does not exist, and the
+    /// pod deletionTimestamp is never stamped, breaking the StatefulSet recreation flow.
+    #[tokio::test]
+    async fn evict_pod_stamps_deletion_timestamp_and_returns_201() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/ss-0";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "ss-0", "namespace": "default", "resourceVersion": "1" },
+            "spec": {},
+            "status": {}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .with_state(state);
+
+        let eviction_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "Eviction",
+            "metadata": { "name": "ss-0", "namespace": "default" }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/ss-0/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&eviction_body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "eviction must return 201 Created — the test uses this status to confirm the pod is being terminated"
+        );
+
+        let stored = store
+            .get(key)
+            .await
+            .unwrap()
+            .expect("pod must still exist after eviction — soft-delete, not hard-delete");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert!(
+            v["metadata"]["deletionTimestamp"].is_string(),
+            "eviction must stamp deletionTimestamp so the kubelet sends SIGTERM and the \
+             StatefulSet controller sees the pod as terminating — without this the orphan \
+             pod runs forever and the 'Should recreate evicted statefulset' test hangs"
+        );
+    }
+
+    /// POST /pods/{name}/eviction on a non-existent pod must return 404.
+    ///
+    /// Callers must get a clear Not Found rather than a panic or silent success.
+    #[tokio::test]
+    async fn evict_pod_missing_returns_404() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+                post(evict_pod),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/ghost/eviction")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "eviction of a non-existent pod must return 404 — callers must know the pod is gone"
+        );
     }
 
     // -----------------------------------------------------------------------

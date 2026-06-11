@@ -742,6 +742,27 @@ struct EnvFromSource {
     secret_ref: Option<SecretEnvSource>,
 }
 
+/// ContainerPort — k8s.io/api/core/v1/generated.proto message ContainerPort
+/// Represents a network port in a single container.
+#[derive(Clone, PartialEq, Message)]
+struct ContainerPort {
+    /// name (field 1, optional string)
+    #[prost(string, tag = "1")]
+    name: String,
+    /// hostPort (field 2, optional int32)
+    #[prost(int32, tag = "2")]
+    host_port: i32,
+    /// containerPort (field 3, optional int32)
+    #[prost(int32, tag = "3")]
+    container_port: i32,
+    /// protocol (field 4, optional string)
+    #[prost(string, tag = "4")]
+    protocol: String,
+    /// hostIP (field 5, optional string)
+    #[prost(string, tag = "5")]
+    host_ip: String,
+}
+
 /// Container — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Container
 #[derive(Clone, PartialEq, Message)]
@@ -758,6 +779,9 @@ struct Container {
     /// args (field 4, repeated string)
     #[prost(string, repeated, tag = "4")]
     args: Vec<String>,
+    /// ports (field 6, repeated ContainerPort)
+    #[prost(message, repeated, tag = "6")]
+    ports: Vec<ContainerPort>,
     /// env (field 7, repeated EnvVar) — environment variables for the container
     #[prost(message, repeated, tag = "7")]
     env: Vec<EnvVar>,
@@ -3807,6 +3831,41 @@ fn container_to_json(c: Container) -> serde_json::Value {
             serde_json::Value::Array(c.args.into_iter().map(serde_json::Value::String).collect()),
         );
     }
+    if !c.ports.is_empty() {
+        let ports_json: Vec<serde_json::Value> = c
+            .ports
+            .into_iter()
+            .map(|p| {
+                let mut pm = serde_json::Map::new();
+                if !p.name.is_empty() {
+                    pm.insert("name".to_string(), serde_json::Value::String(p.name));
+                }
+                if p.container_port != 0 {
+                    pm.insert(
+                        "containerPort".to_string(),
+                        serde_json::Value::Number(p.container_port.into()),
+                    );
+                }
+                if p.host_port != 0 {
+                    pm.insert(
+                        "hostPort".to_string(),
+                        serde_json::Value::Number(p.host_port.into()),
+                    );
+                }
+                if !p.protocol.is_empty() {
+                    pm.insert(
+                        "protocol".to_string(),
+                        serde_json::Value::String(p.protocol),
+                    );
+                }
+                if !p.host_ip.is_empty() {
+                    pm.insert("hostIP".to_string(), serde_json::Value::String(p.host_ip));
+                }
+                serde_json::Value::Object(pm)
+            })
+            .collect();
+        cm.insert("ports".to_string(), serde_json::Value::Array(ports_json));
+    }
     if !c.env.is_empty() {
         let env_json: Vec<serde_json::Value> = c
             .env
@@ -6333,6 +6392,66 @@ mod tests {
             "container image must be extracted"
         );
         assert_eq!(containers[0]["imagePullPolicy"], "IfNotPresent");
+    }
+
+    /// decode_pod_proto must preserve containers[].ports including hostPort.
+    ///
+    /// The StatefulSet "Should recreate evicted statefulset" conformance test creates a pod
+    /// with hostPort: 8080 via protobuf. If the proto decoder strips the ports field, the
+    /// kubelet receives a pod without ports, sends empty PortMappings to CRI-O, no port
+    /// conflict occurs, the StatefulSet pod starts successfully, and the test waits forever
+    /// for the pod to be deleted and recreated — never happening because there is no conflict.
+    #[test]
+    fn decode_pod_proto_preserves_container_ports_with_host_port() {
+        // Build ContainerPort { name: "http", containerPort: 8080, hostPort: 8080, protocol: "TCP" }
+        // ContainerPort fields: 1=name(string), 2=hostPort(int32), 3=containerPort(int32), 4=protocol(string)
+        let mut port = encode_length_delimited(1, b"http"); // name
+        port.extend_from_slice(&encode_varint(2u64 << 3)); // field 2, varint wire type 0
+        port.extend_from_slice(&encode_varint(8080));
+        port.extend_from_slice(&encode_varint(3u64 << 3)); // field 3, varint wire type 0
+        port.extend_from_slice(&encode_varint(8080));
+        port.extend_from_slice(&encode_length_delimited(4, b"TCP")); // protocol
+
+        // Container: field 1=name, field 6=ports (ContainerPort)
+        let mut container = encode_length_delimited(1, b"webserver");
+        container.extend_from_slice(&encode_length_delimited(2, b"agnhost:2.43")); // image
+        container.extend_from_slice(&encode_length_delimited(6, &port)); // ports field 6
+
+        let mut obj_meta = encode_length_delimited(1, b"test-pod");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"statefulset-ns"));
+
+        // PodSpec.containers = field 2
+        let pod_spec = encode_length_delimited(2, &container);
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed for a pod with container ports");
+
+        let ports = result["spec"]["containers"][0]["ports"]
+            .as_array()
+            .expect("containers[0].ports must be an array; missing ports causes kubelet to send empty PortMappings to CRI-O, preventing hostPort enforcement");
+        assert_eq!(
+            ports.len(),
+            1,
+            "exactly one port must be decoded; \
+             missing or extra ports would silently break hostPort conflict detection"
+        );
+        assert_eq!(
+            ports[0]["hostPort"], 8080,
+            "hostPort must be 8080; without this value the kubelet sends PortMappings:[] \
+             to CRI-O so no iptables rule is created and the port conflict never occurs"
+        );
+        assert_eq!(
+            ports[0]["containerPort"], 8080,
+            "containerPort must be 8080 to match what the conformance test sends"
+        );
+        assert_eq!(
+            ports[0]["protocol"], "TCP",
+            "protocol must be preserved as TCP"
+        );
+        assert_eq!(ports[0]["name"], "http", "port name must be preserved");
     }
 
     /// decode_core_proto_by_kind must dispatch Pod proto and return a valid JSON object.
