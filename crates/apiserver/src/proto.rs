@@ -1844,6 +1844,43 @@ struct StatefulSetSpec {
     template: Option<AppsPodTemplateSpec>,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct StatefulSetCondition {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(string, tag = "2")]
+    status: String,
+    // tag 3 = lastTransitionTime (Time message) — skipped, not needed for round-trip
+    #[prost(string, tag = "4")]
+    reason: String,
+    #[prost(string, tag = "5")]
+    message: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct StatefulSetStatus {
+    #[prost(int64, tag = "1")]
+    observed_generation: i64,
+    #[prost(int32, tag = "2")]
+    replicas: i32,
+    #[prost(int32, tag = "3")]
+    ready_replicas: i32,
+    #[prost(int32, tag = "4")]
+    current_replicas: i32,
+    #[prost(int32, tag = "5")]
+    updated_replicas: i32,
+    #[prost(string, tag = "6")]
+    current_revision: String,
+    #[prost(string, tag = "7")]
+    update_revision: String,
+    #[prost(int32, tag = "9")]
+    collision_count: i32,
+    #[prost(message, repeated, tag = "10")]
+    conditions: Vec<StatefulSetCondition>,
+    #[prost(int32, tag = "11")]
+    available_replicas: i32,
+}
+
 /// ReplicaSetSpec — k8s.io/api/apps/v1/generated.proto
 /// Source: api-apps-v1-generated.proto message ReplicaSetSpec
 #[derive(Clone, PartialEq, Message)]
@@ -1869,6 +1906,9 @@ struct StatefulSet {
     /// spec (field 2, message StatefulSetSpec)
     #[prost(message, tag = "2")]
     spec: Option<StatefulSetSpec>,
+    /// status (field 3, message StatefulSetStatus)
+    #[prost(message, tag = "3")]
+    status: Option<StatefulSetStatus>,
 }
 
 /// Deployment — k8s.io/api/apps/v1/generated.proto
@@ -4290,6 +4330,62 @@ pub fn decode_statefulset_proto(data: &[u8]) -> Option<serde_json::Value> {
             .unwrap_or(false)
         {
             out["spec"] = spec_json;
+        }
+    }
+    if let Some(status) = obj.status {
+        let mut status_json = serde_json::json!({});
+        if status.observed_generation != 0 {
+            status_json["observedGeneration"] = status.observed_generation.into();
+        }
+        if status.replicas != 0 {
+            status_json["replicas"] = status.replicas.into();
+        }
+        if status.ready_replicas != 0 {
+            status_json["readyReplicas"] = status.ready_replicas.into();
+        }
+        if status.current_replicas != 0 {
+            status_json["currentReplicas"] = status.current_replicas.into();
+        }
+        if status.updated_replicas != 0 {
+            status_json["updatedReplicas"] = status.updated_replicas.into();
+        }
+        if !status.current_revision.is_empty() {
+            status_json["currentRevision"] = status.current_revision.into();
+        }
+        if !status.update_revision.is_empty() {
+            status_json["updateRevision"] = status.update_revision.into();
+        }
+        if status.collision_count != 0 {
+            status_json["collisionCount"] = status.collision_count.into();
+        }
+        if status.available_replicas != 0 {
+            status_json["availableReplicas"] = status.available_replicas.into();
+        }
+        if !status.conditions.is_empty() {
+            status_json["conditions"] = status
+                .conditions
+                .iter()
+                .map(|c| {
+                    let mut cond = serde_json::json!({
+                        "type": c.r#type,
+                        "status": c.status,
+                    });
+                    if !c.reason.is_empty() {
+                        cond["reason"] = c.reason.clone().into();
+                    }
+                    if !c.message.is_empty() {
+                        cond["message"] = c.message.clone().into();
+                    }
+                    cond
+                })
+                .collect();
+        }
+        if status_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            out["status"] = status_json;
         }
     }
     Some(out)
@@ -11935,6 +12031,63 @@ mod tests {
             result["spec"]["replicas"], 5,
             "spec.replicas must be 5 after proto decode — without this, apply_defaults sets it to 1 \
              and VAP expressions evaluating replica count return wrong results for proto-encoded StatefulSets"
+        );
+    }
+
+    /// decode_statefulset_proto must preserve status.conditions from a protobuf-encoded body.
+    ///
+    /// client-go's UpdateStatus sends PUT /apis/apps/v1/.../statefulsets/{name}/status with
+    /// Content-Type: application/vnd.kubernetes.protobuf. Without status field decoding, the
+    /// conditions array is silently dropped, the status handler removes the stored status, and
+    /// the conformance watch times out waiting for the MODIFIED event with the StatusUpdate
+    /// condition.
+    #[test]
+    fn decode_statefulset_proto_preserves_status_conditions_for_updatestatus_round_trip() {
+        // Build StatefulSetCondition { type="StatusUpdate", status="True", reason="E2E" }
+        // Field 1 = type (string), field 2 = status (string), field 4 = reason (string)
+        let mut cond_bytes = encode_length_delimited(1, b"StatusUpdate");
+        cond_bytes.extend_from_slice(&encode_length_delimited(2, b"True"));
+        cond_bytes.extend_from_slice(&encode_length_delimited(4, b"E2E"));
+
+        // Build StatefulSetStatus { conditions: [cond] }
+        // Field 10 = conditions (repeated message)
+        let status_bytes = encode_length_delimited(10, &cond_bytes);
+
+        // Build minimal spec so we can assert it's still present after decoding
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"sts-e2e"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        let mut spec_bytes = vec![0x08, 0x01]; // replicas=1
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        // Build StatefulSet { metadata: { name: "my-sts" }, spec: ..., status: ... }
+        let name_bytes = encode_length_delimited(1, b"my-sts");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+        proto.extend_from_slice(&encode_length_delimited(3, &status_bytes));
+
+        let result = decode_core_proto_by_kind("StatefulSet", &proto)
+            .expect("StatefulSet with status must decode successfully");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "StatusUpdate",
+            "status.conditions[0].type must survive proto decode — without this, UpdateStatus \
+             via protobuf drops the condition, the conformance watch times out at 620s"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["status"], "True",
+            "status.conditions[0].status must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["reason"], "E2E",
+            "status.conditions[0].reason must survive proto decode"
+        );
+        assert!(
+            result["spec"].is_object(),
+            "spec must still be present after decoding status — decoder must not clobber spec"
         );
     }
 
