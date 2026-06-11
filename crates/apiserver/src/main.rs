@@ -522,7 +522,8 @@ fn build_router(state: AppState) -> Router {
             "/apis/{group}/{version}/namespaces/{ns}/{resource}",
             get(handlers::resource::list_namespaced_resource)
                 .post(handlers::resource::create_namespaced_resource)
-                .delete(handlers::resource::delete_collection_namespaced_resource),
+                .delete(handlers::resource::delete_collection_namespaced_resource)
+                .patch(handlers::resource::patch_collection_namespaced_resource),
         )
         // Scale subresource — apps/v1 workloads (deployments, replicasets, statefulsets)
         // Must be registered before the generic namespaced named-resource catch-all.
