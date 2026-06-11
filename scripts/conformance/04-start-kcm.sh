@@ -9,9 +9,26 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-WORKDIR="$REPO/temp/u7s"
-VM_NAME="${U7S_VM_NAME:-lima-node}"
 KCM_LOG="/tmp/kcm.log"
+
+_WORKDIR_OVERRIDE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --vm) U7S_VM_NAME="$2"; shift 2 ;;
+    --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+_VM="${U7S_VM_NAME:-lima-node}"
+VM_NAME="$_VM"
+if [ -n "$_WORKDIR_OVERRIDE" ]; then
+  WORKDIR="$_WORKDIR_OVERRIDE"
+elif [ "$_VM" = "lima-node" ]; then
+  WORKDIR="$REPO/temp/u7s"
+else
+  WORKDIR="$REPO/temp/u7s-${_VM}"
+fi
 
 echo "=== [04] Start kube-controller-manager (inside $VM_NAME) ==="
 
@@ -76,8 +93,8 @@ openssl x509 -inform DER -in "\$WORKDIR/ca.crt" -out "\$TMPDIR_KCM/ca.pem"
 CA_CERT="\$TMPDIR_KCM/ca.pem"
 
 KUBECONFIG_FILE="\$WORKDIR/kubeconfig"
-if grep -q "127.0.0.1" "\$KUBECONFIG_FILE" && grep -q "host.lima.internal" /etc/hosts 2>/dev/null; then
-  sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "\$KUBECONFIG_FILE" > "\$TMPDIR_KCM/kubeconfig"
+if grep -qE "https://127\." "\$KUBECONFIG_FILE" && grep -q "host.lima.internal" /etc/hosts 2>/dev/null; then
+  sed 's|https://127\.[0-9]*\.[0-9]*\.[0-9]*:6443|https://host.lima.internal:6443|g' "\$KUBECONFIG_FILE" > "\$TMPDIR_KCM/kubeconfig"
   KUBECONFIG_FILE="\$TMPDIR_KCM/kubeconfig"
 fi
 

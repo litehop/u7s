@@ -25,29 +25,34 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-# Derive WORKDIR from VM name so parallel workers get isolated state dirs.
-# Default (lima-node) stays at temp/u7s for backward compatibility.
-_VM="${U7S_VM_NAME:-lima-node}"
-if [ "$_VM" = "lima-node" ]; then
-  WORKDIR="$REPO/temp/u7s"
-else
-  WORKDIR="$REPO/temp/u7s-${_VM}"
-fi
-# U7S_BINARY allows an explicit binary path (e.g. from an isolated target dir
-# built in a worker worktree). Falls back to the standard release binary.
-BINARY="${U7S_BINARY:-$REPO/target/release/u7s-apiserver}"
 PORT=6443
-HOST_IP="${U7S_HOST_IP:-127.0.0.1}"
 
 RESET=0
 BACKGROUND=0
+_WORKDIR_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
     --background) BACKGROUND=1; shift ;;
+    --vm) U7S_VM_NAME="$2"; shift 2 ;;
+    --ip) U7S_HOST_IP="$2"; shift 2 ;;
+    --binary) U7S_BINARY="$2"; shift 2 ;;
+    --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+# Derive WORKDIR and runtime vars after arg parsing so flags override env.
+_VM="${U7S_VM_NAME:-lima-node}"
+if [ -n "$_WORKDIR_OVERRIDE" ]; then
+  WORKDIR="$_WORKDIR_OVERRIDE"
+elif [ "$_VM" = "lima-node" ]; then
+  WORKDIR="$REPO/temp/u7s"
+else
+  WORKDIR="$REPO/temp/u7s-${_VM}"
+fi
+BINARY="${U7S_BINARY:-$REPO/target/release/u7s-apiserver}"
+HOST_IP="${U7S_HOST_IP:-127.0.0.1}"
 
 if [ ! -f "$BINARY" ]; then
   echo "error: binary not found — run: cargo build --release -p u7s-apiserver" >&2

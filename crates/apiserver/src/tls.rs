@@ -442,12 +442,16 @@ impl Kubeconfig {
 /// The kubeconfig contains embedded client certificate and private key material,
 /// so it is written with mode 0o600 (owner read+write only), matching the same
 /// permission applied to the SA and CA key files by `write_private_key`.
-pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, _args: &Args) -> anyhow::Result<()> {
-    // Always write 127.0.0.1 as the server URL — this kubeconfig is for local use on the host.
-    // lima-start.sh rewrites it to host.lima.internal when copying into the VM.
-    // The cert SANs already include the advertise-address host so connections from either
-    // address are valid.
-    let kc = Kubeconfig::new("https://127.0.0.1:6443", tls);
+pub fn write_kubeconfig(path: &str, tls: &TlsMaterial, args: &Args) -> anyhow::Result<()> {
+    // Use the advertise-address (or listen address) as the server URL so that
+    // parallel workers running on non-default loopback IPs (127.0.0.2, etc.)
+    // get a kubeconfig that points at their own apiserver.
+    // lima-start.sh rewrites any 127.x address to host.lima.internal when copying into the VM.
+    let server_url = args
+        .advertise_address
+        .as_deref()
+        .unwrap_or("https://127.0.0.1:6443");
+    let kc = Kubeconfig::new(server_url, tls);
     write_private_key(
         validate_cli_path(std::path::Path::new(path))?,
         kc.to_yaml().as_bytes(),

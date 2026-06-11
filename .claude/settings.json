@@ -12,9 +12,11 @@
       "Bash(limactl *)",
       "Bash(rustc *)",
       "Bash(rustup *)",
-      "Bash(pkill u7s-apiserver)",
+      "Bash(pkill u7s-apiserver*)",
       "Bash(scripts/u7s-start.sh *)",
       "Bash(scripts/conformance/run-all.sh *)",
+      "Bash(scripts/conformance/lima-start.sh *)",
+      "Bash(scripts/conformance/04-start-kcm.sh *)",
       "mcp__lima-node__*",
       "mcp__mcpls__*",
       "mcp__u7s__*"

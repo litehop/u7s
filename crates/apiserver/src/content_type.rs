@@ -78,7 +78,7 @@ where
         let wants_proto = prefer_proto(req.headers());
         let method = req.method().clone();
         let uri = req.uri().to_string();
-        let accept = req
+        let _accept = req
             .headers()
             .get(header::ACCEPT)
             .and_then(|v| v.to_str().ok())
@@ -88,10 +88,11 @@ where
 
         Box::pin(async move {
             let resp = inner.call(req).await?;
+            let status = resp.status().as_u16();
 
             // Only re-encode when client asked for protobuf.
             if !wants_proto {
-                tracing::debug!(uri = %uri, accept = %accept, "skip: no proto accept");
+                tracing::info!(method = %method, uri = %uri, status, "request");
                 return Ok(resp);
             }
 
@@ -108,11 +109,11 @@ where
             // smoke tests pass with this change because they use GET for status
             // reads and kubelet's PUT path also handles JSON responses correctly.
             if method != axum::http::Method::GET {
-                tracing::debug!(uri = %uri, method = %method, "skip proto re-encode: non-GET method");
+                tracing::info!(method = %method, uri = %uri, status, "request");
                 return Ok(resp);
             }
 
-            tracing::info!(uri = %uri, accept = %accept, status = resp.status().as_u16(), "wants proto");
+            tracing::info!(method = %method, uri = %uri, status, "request proto");
 
             // Only re-encode successful (2xx) responses.
             if !resp.status().is_success() {

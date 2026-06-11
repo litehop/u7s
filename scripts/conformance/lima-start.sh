@@ -38,10 +38,26 @@
 #     (lima/kubelet.yaml provision now prevents both — delete+reprovision fixes them permanently)
 set -euo pipefail
 
+LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
+
+_WORKDIR_OVERRIDE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --vm) U7S_VM_NAME="$2"; shift 2 ;;
+    --kubeconfig) KUBECONFIG="$2"; shift 2 ;;
+    --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
 # For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
 # instead — it skips VM provisioning and just reconnects the kubelet.
 VM_NAME="${U7S_VM_NAME:-lima-node}"
-LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
+# --workdir sets the kubeconfig path. Takes priority over ambient $KUBECONFIG so
+# that workers on non-default VMs are not silently routed to the mayor's apiserver.
+if [ -n "$_WORKDIR_OVERRIDE" ]; then
+  KUBECONFIG="$_WORKDIR_OVERRIDE/kubeconfig"
+fi
 
 check_deps() {
   local missing=0
@@ -100,10 +116,11 @@ else
   limactl start --tty=false --name="$VM_NAME" "$LIMA_YAML"
 fi
 
-# Rewrite server address from 127.0.0.1 to host.lima.internal for in-VM use.
+# Rewrite server address to host.lima.internal for in-VM use.
+# Match any loopback alias (127.0.0.1, 127.0.0.2, …) so parallel workers work correctly.
 echo "Copying kubeconfig into VM..."
 REWRITTEN=$(mktemp)
-sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "$KUBECONFIG_PATH" > "$REWRITTEN"
+sed 's|https://127\.[0-9]*\.[0-9]*\.[0-9]*:6443|https://host.lima.internal:6443|g' "$KUBECONFIG_PATH" > "$REWRITTEN"
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/kubelet-kubeconfig"
 rm "$REWRITTEN"
 limactl shell "$VM_NAME" sudo cp /tmp/kubelet-kubeconfig /etc/kubelet-kubeconfig
@@ -138,7 +155,7 @@ if [ -f "$CA_CERT" ]; then
   if [ ! -f "$KUBELET_TLS_KEY" ] || [ ! -f "$KUBELET_TLS_CRT" ]; then
     openssl ecparam -genkey -name prime256v1 -noout -out "$KUBELET_TLS_KEY"
     openssl req -new -key "$KUBELET_TLS_KEY" \
-      -subj "/CN=lima-node" -sha256 \
+      -subj "/CN=${VM_NAME}" -sha256 \
       -out "$KUBELET_TLS_CSR"
     openssl x509 -req -in "$KUBELET_TLS_CSR" \
       -CA "$CA_PEM" -CAkey "$CERT_DIR/ca.key" \
@@ -159,18 +176,18 @@ if [ -f "$CA_CERT" ]; then
   limactl shell "$VM_NAME" sudo chmod 600 /etc/kubelet-tls.key
 
   # Write --client-ca-file and --tls-cert-file into the kubelet drop-in (idempotent: overwrite each run).
-  limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
+  limactl shell "$VM_NAME" sudo bash -c "mkdir -p /etc/systemd/system/kubelet.service.d && cat > /etc/systemd/system/kubelet.service.d/u7s.conf <<EOF
 [Service]
 ExecStart=
-ExecStart=/usr/bin/kubelet \
-  --config=/etc/kubelet-config.yaml \
-  --kubeconfig=/etc/kubelet-kubeconfig \
-  --client-ca-file=/etc/kubelet-ca.crt \
-  --tls-cert-file=/etc/kubelet-tls.crt \
-  --tls-private-key-file=/etc/kubelet-tls.key \
-  --hostname-override=lima-node \
+ExecStart=/usr/bin/kubelet \\\\
+  --config=/etc/kubelet-config.yaml \\\\
+  --kubeconfig=/etc/kubelet-kubeconfig \\\\
+  --client-ca-file=/etc/kubelet-ca.crt \\\\
+  --tls-cert-file=/etc/kubelet-tls.crt \\\\
+  --tls-private-key-file=/etc/kubelet-tls.key \\\\
+  --hostname-override=${VM_NAME} \\\\
   --v=2
-EOF'
+EOF"
   limactl shell "$VM_NAME" sudo systemctl daemon-reload
   echo "Kubelet client-ca-file and TLS serving cert configured."
 else
@@ -230,7 +247,7 @@ metadata:
   labels:
     app: konnectivity-agent
 spec:
-  nodeName: lima-node
+  nodeName: ${VM_NAME}
   hostNetwork: false
   restartPolicy: Always
   hostAliases:
@@ -374,7 +391,7 @@ metadata:
   name: kube-proxy-pull
   namespace: kube-system
 spec:
-  nodeName: lima-node
+  nodeName: ${VM_NAME}
   hostNetwork: true
   containers:
   - name: kube-proxy
@@ -409,15 +426,15 @@ limactl shell "$VM_NAME" sudo bash -c '
 ' 2>/dev/null
 
 # Write the systemd service unit.
-limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/systemd/system/kube-proxy.service' <<'SVCEOF'
+limactl shell "$VM_NAME" sudo bash -c "cat > /etc/systemd/system/kube-proxy.service" <<SVCEOF
 [Unit]
 Description=Kubernetes Kube Proxy
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/kube-proxy \
-  --config=/etc/kube-proxy/config.conf \
-  --hostname-override=lima-node
+ExecStart=/usr/local/bin/kube-proxy \\
+  --config=/etc/kube-proxy/config.conf \\
+  --hostname-override=${VM_NAME}
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
@@ -430,7 +447,7 @@ limactl shell "$VM_NAME" sudo systemctl daemon-reload
 limactl shell "$VM_NAME" sudo systemctl enable kube-proxy 2>/dev/null
 limactl shell "$VM_NAME" sudo systemctl restart kube-proxy
 
-echo "kube-proxy systemd service started (logs: limactl shell lima-node sudo journalctl -u kube-proxy -n 20)"
+echo "kube-proxy systemd service started (logs: limactl shell ${VM_NAME} sudo journalctl -u kube-proxy -n 20)"
 
 # Route kubernetes ClusterIP (10.96.0.1:443) to the host apiserver inside the VM.
 # Pods use in-cluster config (KUBERNETES_SERVICE_HOST=10.96.0.1) to reach the apiserver.
@@ -463,10 +480,10 @@ else
 fi
 
 # Wait for the node to appear.
-echo "Waiting for lima-node to register (up to 60s)..."
+echo "Waiting for ${VM_NAME} to register (up to 60s)..."
 FOUND=0
 for i in $(seq 1 60); do
-  if kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes 2>/dev/null | grep -q "lima-node"; then
+  if kubectl --kubeconfig="$KUBECONFIG_PATH" get nodes 2>/dev/null | grep -q "${VM_NAME}"; then
     FOUND=1
     break
   fi
@@ -474,7 +491,7 @@ for i in $(seq 1 60); do
 done
 
 if [ "$FOUND" -eq 0 ]; then
-  echo "ERROR: lima-node did not appear within 60s." >&2
+  echo "ERROR: ${VM_NAME} did not appear within 60s." >&2
   echo "--- kubelet log (last 30 lines) ---" >&2
   limactl shell "$VM_NAME" sudo journalctl -u kubelet --no-pager -n 30 >&2
   exit 1
@@ -487,4 +504,4 @@ echo ""
 echo "Run kubectl commands with:"
 echo "  export KUBECONFIG=$KUBECONFIG_PATH"
 echo "  kubectl get nodes"
-echo "  kubectl run test --image=busybox:1.36 --restart=Never --overrides='{\"spec\":{\"nodeName\":\"lima-node\",\"hostNetwork\":true,\"dnsPolicy\":\"None\",\"dnsConfig\":{}}}' -- sh -c 'echo hello'"
+echo "  kubectl run test --image=busybox:1.36 --restart=Never --overrides='{\"spec\":{\"nodeName\":\"${VM_NAME}\",\"hostNetwork\":true,\"dnsPolicy\":\"None\",\"dnsConfig\":{}}}' -- sh -c 'echo hello'"
