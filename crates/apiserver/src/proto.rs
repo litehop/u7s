@@ -2689,12 +2689,10 @@ pub fn decode_replicationcontroller_proto(data: &[u8]) -> Option<serde_json::Val
 
     if let Some(spec) = rc.spec {
         let mut spec_map = serde_json::Map::new();
-        if spec.replicas != 0 {
-            spec_map.insert(
-                "replicas".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(spec.replicas)),
-            );
-        }
+        spec_map.insert(
+            "replicas".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(spec.replicas)),
+        );
         if !spec.selector.is_empty() {
             let sel: serde_json::Map<String, serde_json::Value> = spec
                 .selector
@@ -4226,9 +4224,7 @@ pub fn decode_statefulset_proto(data: &[u8]) -> Option<serde_json::Value> {
         let replicas = spec.replicas;
         let mut spec_json =
             apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
-        if replicas != 0 {
-            spec_json["replicas"] = serde_json::Value::Number(replicas.into());
-        }
+        spec_json["replicas"] = serde_json::Value::Number(replicas.into());
         if spec_json
             .as_object()
             .map(|m| !m.is_empty())
@@ -4253,13 +4249,7 @@ pub fn decode_deployment_proto(data: &[u8]) -> Option<serde_json::Value> {
         let replicas = spec.replicas;
         let mut spec_json =
             apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
-        // Include spec.replicas when non-zero (proto3 default is 0 = "not set").
-        // Without this, clients using protobuf encoding silently lose spec.replicas,
-        // apply_defaults defaults it to 1, and VAP expressions like `object.spec.replicas > 1`
-        // evaluate to false even when the submitted Deployment had replicas > 1.
-        if replicas != 0 {
-            spec_json["replicas"] = serde_json::Value::Number(replicas.into());
-        }
+        spec_json["replicas"] = serde_json::Value::Number(replicas.into());
         if spec_json
             .as_object()
             .map(|m| !m.is_empty())
@@ -4301,9 +4291,7 @@ pub fn decode_replicaset_proto(data: &[u8]) -> Option<serde_json::Value> {
         let replicas = spec.replicas;
         let mut spec_json =
             apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
-        if replicas != 0 {
-            spec_json["replicas"] = serde_json::Value::Number(replicas.into());
-        }
+        spec_json["replicas"] = serde_json::Value::Number(replicas.into());
         if spec_json
             .as_object()
             .map(|m| !m.is_empty())
@@ -11859,6 +11847,123 @@ mod tests {
             result["spec"]["replicas"], 4,
             "spec.replicas must be 4 after proto decode — without this, apply_defaults sets it to 1 \
              and VAP expressions evaluating replica count return wrong results for proto-encoded ReplicaSets"
+        );
+    }
+
+    /// decode_deployment_proto must write spec.replicas=0 — not drop it.
+    ///
+    /// proto3 encodes 0 as absent, so the decoder receives no replicas field.
+    /// Dropping it causes the defaulter to set replicas=1, corrupting scale-to-zero.
+    #[test]
+    fn decode_deployment_proto_replicas_zero_not_dropped() {
+        // spec_bytes with no replicas field — proto3 omits default (0) values on the wire
+        let mut spec_bytes = vec![];
+
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-deploy");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("Deployment", &proto)
+            .expect("Deployment proto must decode successfully");
+
+        assert_eq!(
+            result["spec"]["replicas"], 0,
+            "spec.replicas must be 0 after proto decode — dropped replicas=0 causes defaulter to \
+             set 1, corrupting scale-to-zero"
+        );
+    }
+
+    /// decode_statefulset_proto must write spec.replicas=0 — not drop it.
+    ///
+    /// proto3 encodes 0 as absent, so the decoder receives no replicas field.
+    /// Dropping it causes the defaulter to set replicas=1, corrupting scale-to-zero.
+    #[test]
+    fn decode_statefulset_proto_replicas_zero_not_dropped() {
+        let mut spec_bytes = vec![];
+
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"sts-test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-sts");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("StatefulSet", &proto)
+            .expect("StatefulSet proto must decode successfully");
+
+        assert_eq!(
+            result["spec"]["replicas"], 0,
+            "spec.replicas must be 0 after proto decode — dropped replicas=0 causes defaulter to \
+             set 1, corrupting scale-to-zero"
+        );
+    }
+
+    /// decode_replicaset_proto must write spec.replicas=0 — not drop it.
+    ///
+    /// proto3 encodes 0 as absent, so the decoder receives no replicas field.
+    /// Dropping it causes the defaulter to set replicas=1, corrupting scale-to-zero.
+    #[test]
+    fn decode_replicaset_proto_replicas_zero_not_dropped() {
+        let mut spec_bytes = vec![];
+
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"rs-test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"my-rs");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("ReplicaSet", &proto)
+            .expect("ReplicaSet proto must decode successfully");
+
+        assert_eq!(
+            result["spec"]["replicas"], 0,
+            "spec.replicas must be 0 after proto decode — dropped replicas=0 causes defaulter to \
+             set 1, corrupting scale-to-zero"
+        );
+    }
+
+    /// decode_replicationcontroller_proto must write spec.replicas=0 — not drop it.
+    ///
+    /// proto3 encodes 0 as absent, so the decoder receives no replicas field.
+    /// Dropping it causes the defaulter to set replicas=1, corrupting scale-to-zero.
+    #[test]
+    fn decode_replicationcontroller_proto_replicas_zero_not_dropped() {
+        // ReplicationControllerSpec: replicas=field 1, selector=field 2 (map), template=field 3
+        // Encode a spec with only a selector entry (no replicas field — proto3 omits 0)
+        let mut map_entry = encode_length_delimited(1, b"app");
+        map_entry.extend_from_slice(&encode_length_delimited(2, b"rc-test"));
+        let spec_bytes = encode_length_delimited(2, &map_entry);
+
+        let name_bytes = encode_length_delimited(1, b"my-rc");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("ReplicationController", &proto)
+            .expect("ReplicationController proto must decode successfully");
+
+        assert_eq!(
+            result["spec"]["replicas"], 0,
+            "spec.replicas must be 0 after proto decode — dropped replicas=0 causes defaulter to \
+             set 1, corrupting scale-to-zero"
         );
     }
 }
