@@ -12,12 +12,14 @@ the worktree's own `temp/` so parallel workers never collide.
 - `<WORKTREE>` — your assigned worktree absolute path, e.g.
   `/Users/balint.erdos/u7s/ai/worktrees/w5fd-scale-diag`
 - `<VM>` — your assigned Lima VM name, e.g. `lima-node-2`
-- `<IP>` — your assigned loopback IP, e.g. `127.0.0.2`
+- `<PORT>` — your assigned host port, e.g. `6444` (mayor owns `6443`)
 - `<WORKDIR>` — `<WORKTREE>/temp/u7s` (create with `mkdir -p <WORKTREE>/temp/u7s`)
 
-**Networking note**: your apiserver binds to `<IP>:6443` (host loopback). Inside
-the Lima VM the host is reachable at `host.lima.internal` (QEMU NAT gateway) — NOT
-`<IP>`. The scripts handle this rewrite automatically.
+**Networking note**: all apiservers bind to `127.0.0.1:<PORT>` (host loopback). Port
+is the isolation boundary between parallel workers — different loopback IPs are NOT
+reliably reachable from inside Lima VMs via `host.lima.internal`. Inside the Lima VM
+the host is reachable at `host.lima.internal` (QEMU NAT gateway). The scripts handle
+the address rewrite automatically when given `--port <PORT>`.
 
 ---
 
@@ -42,7 +44,7 @@ mkdir -p <WORKTREE>/temp/u7s
 
 scripts/u7s-start.sh \
   --vm      <VM> \
-  --ip      <IP> \
+  --port    <PORT> \
   --binary  <WORKTREE>/target/release/u7s-apiserver \
   --workdir <WORKTREE>/temp/u7s \
   --background
@@ -51,8 +53,8 @@ scripts/u7s-start.sh \
 kubectl --kubeconfig <WORKTREE>/temp/u7s/kubeconfig get namespaces
 ```
 
-`u7s-start.sh` generates the CA, writes kubeconfig (with `<IP>` as the server
-address), and starts konnectivity-server. To start fully fresh:
+`u7s-start.sh` generates the CA, writes kubeconfig (with `127.0.0.1:<PORT>` as the
+server address), and starts konnectivity-server. To start fully fresh:
 ```bash
 rm -rf <WORKTREE>/temp/u7s && mkdir -p <WORKTREE>/temp/u7s
 ```
@@ -64,6 +66,7 @@ rm -rf <WORKTREE>/temp/u7s && mkdir -p <WORKTREE>/temp/u7s
 ```bash
 scripts/conformance/lima-start.sh \
   --vm      <VM> \
+  --port    <PORT> \
   --workdir <WORKTREE>/temp/u7s
 ```
 
@@ -92,6 +95,7 @@ limactl shell <VM> sudo journalctl -u kubelet --no-pager -n 30
 ```bash
 scripts/conformance/04-start-kcm.sh \
   --vm      <VM> \
+  --port    <PORT> \
   --workdir <WORKTREE>/temp/u7s
 ```
 

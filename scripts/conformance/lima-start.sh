@@ -4,8 +4,8 @@
 # Architecture:
 #   - u7s runs natively on the Mac (fast cargo rebuild loop)
 #   - kubelet + CRI-O run inside the lima VM (Linux kernel required)
-#   - kubelet reaches u7s via host.lima.internal:6443
-#   - kubectl runs on the Mac against 127.0.0.1:6443
+#   - kubelet reaches u7s via host.lima.internal:<port> (configurable, default 6443)
+#   - kubectl runs on the Mac against 127.0.0.1:<port>
 #
 # Quick start:
 #   1. cargo build --release -p u7s-apiserver
@@ -41,14 +41,17 @@ set -euo pipefail
 LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
 
 _WORKDIR_OVERRIDE=""
+_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) U7S_VM_NAME="$2"; shift 2 ;;
     --kubeconfig) KUBECONFIG="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
+    --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+PORT="${_PORT_OVERRIDE:-6443}"
 
 # For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
 # instead — it skips VM provisioning and just reconnects the kubelet.
@@ -120,7 +123,7 @@ fi
 # Match any loopback alias (127.0.0.1, 127.0.0.2, …) so parallel workers work correctly.
 echo "Copying kubeconfig into VM..."
 REWRITTEN=$(mktemp)
-sed 's|https://127\.[0-9]*\.[0-9]*\.[0-9]*:6443|https://host.lima.internal:6443|g' "$KUBECONFIG_PATH" > "$REWRITTEN"
+sed "s|https://127\.[0-9]*\.[0-9]*\.[0-9]*:[0-9]*|https://host.lima.internal:${PORT}|g" "$KUBECONFIG_PATH" > "$REWRITTEN"
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/kubelet-kubeconfig"
 rm "$REWRITTEN"
 limactl shell "$VM_NAME" sudo cp /tmp/kubelet-kubeconfig /etc/kubelet-kubeconfig
@@ -340,7 +343,7 @@ apiVersion: v1
 kind: Config
 clusters:
 - cluster:
-    server: https://host.lima.internal:6443
+    server: https://host.lima.internal:${PORT}
     certificate-authority-data: $(base64 < "$WORKDIR/ca.pem" | tr -d '\n')
   name: default
 contexts:
@@ -460,12 +463,12 @@ else
   # OUTPUT: catches traffic from processes on the VM host itself.
   # PREROUTING: catches traffic from containers/pods (their own network namespaces).
   # Both chains are needed so that both kubelet and in-pod API calls are routed correctly.
-  limactl shell "$VM_NAME" sudo iptables -t nat -D OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443" 2>/dev/null || true
-  limactl shell "$VM_NAME" sudo iptables -t nat -A OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443"
-  limactl shell "$VM_NAME" sudo iptables -t nat -D PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443" 2>/dev/null || true
-  limactl shell "$VM_NAME" sudo iptables -t nat -A PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:6443"
+  limactl shell "$VM_NAME" sudo iptables -t nat -D OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:${PORT}" 2>/dev/null || true
+  limactl shell "$VM_NAME" sudo iptables -t nat -A OUTPUT -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:${PORT}"
+  limactl shell "$VM_NAME" sudo iptables -t nat -D PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:${PORT}" 2>/dev/null || true
+  limactl shell "$VM_NAME" sudo iptables -t nat -A PREROUTING -d 10.96.0.1/32 -p tcp --dport 443 -j DNAT --to-destination "${HOST_IP}:${PORT}"
   limactl shell "$VM_NAME" sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
-  echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:6443 (OUTPUT + PREROUTING)"
+  echo "DNAT rule added: 10.96.0.1:443 → ${HOST_IP}:${PORT} (OUTPUT + PREROUTING)"
 
   # Patch the kubernetes EndpointSlice with the host IP so kube-proxy's IPVS rule
   # routes 10.96.0.1:443 → host (not 127.0.0.1 which is the VM's own loopback).
@@ -475,7 +478,7 @@ else
   kubectl --kubeconfig="$KUBECONFIG_PATH" patch endpointslice kubernetes -n default \
     --type=json \
     -p="[{\"op\":\"replace\",\"path\":\"/endpoints/0/addresses/0\",\"value\":\"${HOST_IP}\"}]" \
-    2>/dev/null && echo "EndpointSlice patched: 10.96.0.1:443 → ${HOST_IP}:6443" \
+    2>/dev/null && echo "EndpointSlice patched: 10.96.0.1:443 → ${HOST_IP}:${PORT}" \
     || echo "WARNING: EndpointSlice patch failed — kube-proxy IPVS may route incorrectly" >&2
 fi
 
