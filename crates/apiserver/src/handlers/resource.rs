@@ -1602,6 +1602,120 @@ pub async fn patch_namespaced_resource<S: Store>(
 }
 
 // ---------------------------------------------------------------------------
+// Collection patch handlers  (PATCH on collection endpoint)
+// ---------------------------------------------------------------------------
+
+/// PATCH /apis/{group}/{version}/namespaces/{ns}/{resource}?labelSelector=...
+///
+/// Applies the same patch body to every matched resource in the namespace.
+/// The conformance test "should list, patch and delete a collection of StatefulSets"
+/// uses this endpoint to batch-update a StatefulSet's image via labelSelector.
+pub async fn patch_collection_namespaced_resource<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    Query(query): Query<CollectionQuery>,
+    Query(patch_query): Query<PatchQuery>,
+    Extension(user): Extension<UserInfo>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    validate_name("namespace", &ns)?;
+    let meta = lookup(&state, &group, &version, &plural)
+        .cloned()
+        .map_err(|_| Status::not_found(&plural, &format!("{group}/{version}/{plural}")))?;
+
+    let prefix = group_list_prefix(&group, &plural, Some(&ns));
+    let resp = state
+        .store
+        .list(&prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let label_pairs = query
+        .label_selector
+        .as_deref()
+        .map(parse_label_selector)
+        .transpose()?;
+
+    let patch_type = detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
+    let user_info = Some(serde_json::json!({
+        "username": user.username,
+        "uid": user.uid,
+        "groups": user.groups,
+    }));
+
+    let mut patched_items: Vec<serde_json::Value> = Vec::new();
+
+    for obj in resp.items {
+        let parsed = match serde_json::from_slice::<serde_json::Value>(&obj.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if let Some(ref pairs) = label_pairs {
+            let kept = apply_label_selector(vec![parsed.clone()], pairs);
+            if kept.is_empty() {
+                continue;
+            }
+        }
+
+        let name = match parsed["metadata"]["name"].as_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        let key = group_object_key(&group, &plural, Some(&ns), &name);
+        let result = do_patch(
+            &state,
+            PatchConfig {
+                key: &key,
+                meta: &meta,
+                group: &group,
+                version: &version,
+                plural: &plural,
+                ns: Some(&ns),
+                name: &name,
+                is_ssa,
+                field_manager: patch_query.field_manager.as_deref(),
+                patch_type,
+                body: body.clone(),
+                dry_run: patch_query.is_dry_run(),
+                user_info: user_info.clone(),
+            },
+        )
+        .await;
+
+        match result {
+            Ok(resp) => {
+                let resp = resp.into_response();
+                let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                    patched_items.push(v);
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    let api_version = if group.is_empty() {
+        version.clone()
+    } else {
+        format!("{}/{}", group, version)
+    };
+    let list_kind = format!("{}List", meta.kind);
+    let body = serde_json::json!({
+        "apiVersion": api_version,
+        "kind": list_kind,
+        "metadata": { "resourceVersion": resp.revision.to_string() },
+        "items": patched_items
+    });
+    Ok(Json(body).into_response())
+}
+
+// ---------------------------------------------------------------------------
 // Collection delete handlers  (DELETE on collection endpoint)
 // ---------------------------------------------------------------------------
 
@@ -9481,6 +9595,139 @@ mod tests {
             0,
             "object.spec.replicas is a known field and must not produce warnings \
              even when targeting a CRD group"
+        );
+    }
+
+    /// PATCH on the collection endpoint must apply the patch body to every
+    /// resource that matches the labelSelector.  Without this handler the
+    /// conformance test "should list, patch and delete a collection of
+    /// StatefulSets" fails because axum returns 405 Method Not Allowed.
+    #[tokio::test]
+    async fn patch_collection_namespaced_resource_applies_patch_to_matched_objects() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        for name in &["lease-a", "lease-b"] {
+            let body = serde_json::json!({
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {
+                    "name": name,
+                    "namespace": "test-ns",
+                    "labels": { "app": "target" }
+                },
+                "spec": { "holderIdentity": "original" }
+            });
+            create_namespaced_resource(
+                State(state.clone()),
+                Path((
+                    "coordination.k8s.io".into(),
+                    "v1".into(),
+                    "test-ns".into(),
+                    "leases".into(),
+                )),
+                axum::extract::Query(CreateQuery::default()),
+                test_user(),
+                json_headers(),
+                bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("lease create must succeed"));
+        }
+
+        let unrelated = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "lease-unrelated",
+                "namespace": "test-ns",
+                "labels": { "app": "other" }
+            },
+            "spec": { "holderIdentity": "untouched" }
+        });
+        create_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "test-ns".into(),
+                "leases".into(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&unrelated).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("unrelated lease create must succeed"));
+
+        let mut patch_headers = axum::http::HeaderMap::new();
+        patch_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let patch = serde_json::json!({"spec": {"holderIdentity": "patched"}});
+
+        let result = patch_collection_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "test-ns".into(),
+                "leases".into(),
+            )),
+            Query(CollectionQuery {
+                label_selector: Some("app=target".into()),
+                watch: None,
+                resource_version: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            Query(PatchQuery::default()),
+            test_user(),
+            patch_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("collection PATCH must succeed: {e:?}"));
+
+        let resp = result.into_response();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let items = list["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            2,
+            "collection PATCH must return only the two matched objects, not the unrelated one"
+        );
+        for item in items {
+            assert_eq!(
+                item["spec"]["holderIdentity"], "patched",
+                "every matched lease must have holderIdentity updated to 'patched'; \
+                 if this fails, the collection PATCH handler stopped applying the patch"
+            );
+        }
+
+        let unrelated_key = "/registry/coordination.k8s.io/leases/test-ns/lease-unrelated";
+        let stored = state
+            .store
+            .get(unrelated_key)
+            .await
+            .expect("store get must succeed")
+            .expect("unrelated lease must still exist");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["spec"]["holderIdentity"], "untouched",
+            "unmatched lease must not be patched — labelSelector filtering is broken \
+             if this fails"
         );
     }
 }

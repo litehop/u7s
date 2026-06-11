@@ -324,7 +324,7 @@ pub(crate) fn inject_managed_fields(
 }
 
 /// Patch Content-Type variants understood by all patch endpoints.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum PatchType {
     Merge,
     StrategicMerge,
