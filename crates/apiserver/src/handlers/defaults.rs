@@ -361,6 +361,15 @@ fn default_statefulset(obj: &mut serde_json::Value) {
         }
         obj["spec"]["updateStrategy"]["type"] = serde_json::Value::String("RollingUpdate".into());
     }
+    if obj["spec"]["updateStrategy"]["type"].as_str() == Some("RollingUpdate") {
+        if !obj["spec"]["updateStrategy"]["rollingUpdate"].is_object() {
+            obj["spec"]["updateStrategy"]["rollingUpdate"] = serde_json::json!({});
+        }
+        if obj["spec"]["updateStrategy"]["rollingUpdate"]["partition"].is_null() {
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["partition"] =
+                serde_json::Value::Number(0.into());
+        }
+    }
     if obj["spec"]["revisionHistoryLimit"].is_null() {
         obj["spec"]["revisionHistoryLimit"] = serde_json::Value::Number(10.into());
     }
@@ -1180,6 +1189,86 @@ mod tests {
         assert_eq!(
             obj["spec"]["revisionHistoryLimit"],
             serde_json::Value::Number(3.into())
+        );
+    }
+
+    /// StatefulSet with RollingUpdate strategy must have rollingUpdate.partition defaulted to 0.
+    ///
+    /// The e2e Scale() function reads ss.Spec.UpdateStrategy.RollingUpdate.Partition and
+    /// nil-derefs when RollingUpdate is nil, causing a PANIC in AfterEach. Real kube-apiserver
+    /// always injects partition=0 via its defaulting admission plugin. Without this default,
+    /// any e2e test that calls Scale() on a StatefulSet will PANIC and abort the test process.
+    #[test]
+    fn rollingupdate_partition_default_prevents_nil_deref_in_scale() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "test" } },
+                "template": {}
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["partition"],
+            serde_json::Value::Number(0.into()),
+            "spec.updateStrategy.rollingUpdate.partition must default to 0 — \
+             Scale() nil-derefs RollingUpdate when the field is absent, \
+             causing a PANIC that aborts the test process"
+        );
+    }
+
+    /// StatefulSet with OnDelete strategy must NOT get rollingUpdate.partition injected.
+    ///
+    /// partition only applies to RollingUpdate; injecting it for OnDelete would be wrong.
+    #[test]
+    fn statefulset_ondelete_strategy_does_not_get_rolling_update_partition() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "updateStrategy": { "type": "OnDelete" }
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+
+        assert!(
+            obj["spec"]["updateStrategy"]["rollingUpdate"].is_null(),
+            "rollingUpdate must not be injected for OnDelete strategy — \
+             OnDelete has no rolling-update semantics"
+        );
+    }
+
+    /// Existing rollingUpdate.partition on a StatefulSet must not be overwritten.
+    ///
+    /// A canary update sets partition=N to hold back pods. Overwriting it to 0
+    /// would release all pods at once, defeating the canary rollout strategy.
+    #[test]
+    fn statefulset_existing_rolling_update_partition_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "updateStrategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": { "partition": 3 }
+                }
+            }
+        });
+
+        apply_defaults("apps", "statefulsets", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["updateStrategy"]["rollingUpdate"]["partition"],
+            serde_json::Value::Number(3.into()),
+            "existing partition must not be overwritten — resetting a canary partition \
+             to 0 would release all pods at once, defeating the staged rollout"
         );
     }
 
