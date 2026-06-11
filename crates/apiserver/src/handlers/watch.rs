@@ -71,8 +71,24 @@ pub(crate) fn encode_watch_event(
                 format!("{{\"type\":\"MODIFIED\",\"object\":{object_json}}}\n")
             }
         }
-        WatchEvent::Deleted { key, revision } => {
-            // Reconstruct a minimal tombstone object from the store key.
+        WatchEvent::Deleted {
+            key,
+            revision,
+            body,
+        } => {
+            if let Some(body_bytes) = body {
+                if let Ok(s) = std::str::from_utf8(body_bytes) {
+                    if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(s) {
+                        obj["metadata"]["resourceVersion"] =
+                            serde_json::Value::String(revision.to_string());
+                        return Some(Bytes::from(format!(
+                            "{{\"type\":\"DELETED\",\"object\":{}}}\n",
+                            serde_json::to_string(&obj).unwrap_or_default()
+                        )));
+                    }
+                }
+            }
+            // Fallback: reconstruct a minimal tombstone from the store key.
             let (name, namespace) = parse_key_name_ns(key);
             let object = if namespace.is_empty() {
                 serde_json::json!({

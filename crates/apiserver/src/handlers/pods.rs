@@ -636,14 +636,75 @@ mod watch_tests {
         assert_eq!(parsed["type"], "MODIFIED");
     }
 
-    /// encode_watch_event for Deleted reconstructs a minimal object from the store key.
-    /// The emitted object must contain name and namespace derived from the key.
+    /// DELETED watch events must carry the full last-known object body so that
+    /// informer tombstone handlers (DeletedFinalStateUnknown) can match the deleted
+    /// object against label selectors. Without labels in the tombstone, the KCM
+    /// StatefulSet controller cannot identify which StatefulSet owned the pod and
+    /// status.replicas stays at 1, causing 10-minute AfterEach hangs in conformance.
     #[test]
-    fn encode_deleted_reconstructs_metadata() {
+    fn encode_deleted_carries_full_pod_body_with_labels() {
+        let pod_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "nginx",
+                "namespace": "default",
+                "labels": {
+                    "app": "nginx",
+                    "controller-revision-hash": "abc123",
+                    "statefulset.kubernetes.io/pod-name": "nginx-0"
+                },
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "name": "nginx",
+                    "uid": "some-uid"
+                }]
+            },
+            "spec": { "containers": [] }
+        });
+        let body_bytes = Bytes::from(serde_json::to_vec(&pod_body).unwrap());
         let bytes = crate::handlers::watch::encode_watch_event(
             &WatchEvent::Deleted {
                 key: "/registry/pods/default/nginx".to_string(),
                 revision: 9,
+                body: Some(body_bytes),
+            },
+            "v1",
+            "Pod",
+            false,
+        )
+        .expect("should encode");
+        let parsed: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&bytes).unwrap().trim_end()).unwrap();
+        assert_eq!(parsed["type"], "DELETED");
+        assert_eq!(parsed["object"]["metadata"]["name"], "nginx");
+        assert_eq!(parsed["object"]["metadata"]["namespace"], "default");
+        assert_eq!(
+            parsed["object"]["metadata"]["resourceVersion"], "9",
+            "resourceVersion must be updated to deletion revision"
+        );
+        assert_eq!(
+            parsed["object"]["metadata"]["labels"]["statefulset.kubernetes.io/pod-name"], "nginx-0",
+            "DELETED tombstone must carry pod labels so KCM StatefulSet controller can \
+             identify which StatefulSet owned the pod via DeletedFinalStateUnknown handler; \
+             without labels status.replicas never drops to 0 (10-minute hang)"
+        );
+        assert!(
+            parsed["object"]["metadata"]["ownerReferences"].is_array(),
+            "DELETED tombstone must carry ownerReferences so GC can clean up owned resources"
+        );
+    }
+
+    /// When no body is available (e.g. deletion_log tombstone from before this fix),
+    /// encode_watch_event falls back to reconstructing minimal metadata from the key.
+    #[test]
+    fn encode_deleted_falls_back_to_key_when_no_body() {
+        let bytes = crate::handlers::watch::encode_watch_event(
+            &WatchEvent::Deleted {
+                key: "/registry/pods/default/nginx".to_string(),
+                revision: 9,
+                body: None,
             },
             "v1",
             "Pod",

@@ -133,6 +133,7 @@ impl SqliteStore {
             revision: global_revision,
             value: None,
             is_create: false,
+            deleted_body: None,
         }));
     }
 
@@ -275,36 +276,46 @@ fn delete_sync(
     key: &str,
     expected_revision: Option<u64>,
     last_written: &AtomicU64,
-) -> Result<u64> {
+) -> Result<(u64, Bytes)> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
-    let stored: Option<u64> = conn
+    let stored: Option<(u64, Vec<u8>)> = conn
         .query_row(
-            "SELECT revision FROM objects WHERE key = ?1",
+            "SELECT revision, value FROM objects WHERE key = ?1",
             params![key],
-            |r| r.get::<_, i64>(0).map(|v| v as u64),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0).map(|v| v as u64)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                ))
+            },
         )
         .optional()?;
 
     // Optimistic concurrency check (same logic as put).
-    match (stored, expected_revision) {
-        (None, _) => {
+    match stored.as_ref().map(|(rv, _)| *rv) {
+        None => {
             conn.execute_batch("ROLLBACK")?;
             return Err(StoreError::NotFound {
                 key: key.to_string(),
             });
         }
-        (Some(_), None) => {}
-        (Some(_), Some(0)) => {} // 0 means "must exist" for delete (unconditional)
-        (Some(stored_rv), Some(exp)) if stored_rv == exp => {}
-        (Some(stored_rv), Some(exp)) => {
-            conn.execute_batch("ROLLBACK")?;
-            return Err(StoreError::RevisionMismatch {
-                expected: exp,
-                current: stored_rv,
-            });
+        Some(_) if expected_revision.is_none() => {}
+        Some(_) if expected_revision == Some(0) => {}
+        Some(stored_rv) => {
+            if let Some(exp) = expected_revision {
+                if stored_rv != exp {
+                    conn.execute_batch("ROLLBACK")?;
+                    return Err(StoreError::RevisionMismatch {
+                        expected: exp,
+                        current: stored_rv,
+                    });
+                }
+            }
         }
     }
+
+    let last_value = Bytes::from(stored.unwrap().1);
 
     conn.execute(
         "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
@@ -322,7 +333,7 @@ fn delete_sync(
     // immediately after COMMIT so the list guard sees it before any reader can observe
     // the new WAL state from a concurrent read connection.
     last_written.fetch_max(new_revision, Ordering::Release);
-    Ok(new_revision)
+    Ok((new_revision, last_value))
 }
 
 /// Delete all objects in a namespace atomically.
@@ -778,16 +789,17 @@ impl Store for SqliteStore {
             revision,
             value: Some(stamped_value),
             is_create,
+            deleted_body: None,
         }));
 
         Ok(revision)
     }
 
-    async fn delete(&self, key: &str, expected_revision: Option<u64>) -> Result<u64> {
+    async fn delete(&self, key: &str, expected_revision: Option<u64>) -> Result<(u64, Bytes)> {
         let conn = self.write_conn.clone();
         let key_str = key.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
-        let revision = tokio::task::spawn_blocking(move || {
+        let (revision, last_value) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             delete_sync(&conn, &key_str, expected_revision, &last_written)
         })
@@ -798,9 +810,10 @@ impl Store for SqliteStore {
             revision,
             value: None,
             is_create: false,
+            deleted_body: Some(last_value.clone()),
         }));
 
-        Ok(revision)
+        Ok((revision, last_value))
     }
 
     async fn delete_namespace_resources(&self, namespace: &str) -> Result<Vec<String>> {
@@ -820,6 +833,7 @@ impl Store for SqliteStore {
                     revision,
                     value: None,
                     is_create: false,
+                    deleted_body: None,
                 }));
             }
         }
@@ -1024,6 +1038,7 @@ pub(crate) fn internal_to_watch(event: &InternalEvent) -> WatchEvent {
         None => WatchEvent::Deleted {
             key: event.key.clone(),
             revision: event.revision,
+            body: event.deleted_body.clone(),
         },
     }
 }
