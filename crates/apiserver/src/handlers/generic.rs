@@ -172,44 +172,84 @@ pub(crate) fn store_err(err: StoreError, name: &str, kind: &str) -> crate::statu
     }
 }
 
-/// Parse a label selector string of the form `key=value,key2=value2` into key-value pairs.
-/// Only simple equality selectors are supported. Returns an error on malformed input.
+/// A single term in a label selector.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LabelSelectorTerm<'a> {
+    Equality { key: &'a str, value: &'a str },
+    NotEquals { key: &'a str, value: &'a str },
+    Exists { key: &'a str },
+    DoesNotExist { key: &'a str },
+}
+
+/// Parse a label selector string into typed terms.
+///
+/// Supported forms:
+/// - `key=value` / `key==value` — Equality
+/// - `key!=value` — NotEquals
+/// - `key` (bare) — Exists
+/// - `!key` — DoesNotExist
+///
+/// Returns an error on malformed input (e.g. empty key, bare `=`).
 pub(crate) fn parse_label_selector(
     selector: &str,
-) -> Result<Vec<(&str, &str)>, crate::status::StatusError> {
-    let mut pairs = Vec::new();
+) -> Result<Vec<LabelSelectorTerm<'_>>, crate::status::StatusError> {
+    let mut terms = Vec::new();
     for part in selector.split(',') {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
-        let mut it = part.splitn(2, '=');
-        let key = it.next().unwrap_or("").trim();
-        let val = it
-            .next()
-            .ok_or_else(|| {
-                Status::bad_request(format!(
-                    "invalid label selector '{part}': expected key=value"
-                ))
-            })?
-            .trim();
+        if let Some(key) = part.strip_prefix('!') {
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(Status::bad_request(format!(
+                    "invalid label selector '{part}': empty key after '!'"
+                )));
+            }
+            terms.push(LabelSelectorTerm::DoesNotExist { key });
+            continue;
+        }
+        if let Some((key, value)) = part.split_once("!=") {
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() {
+                return Err(Status::bad_request(format!(
+                    "invalid label selector '{part}': empty key"
+                )));
+            }
+            terms.push(LabelSelectorTerm::NotEquals { key, value });
+            continue;
+        }
+        if let Some((key, value)) = part.split_once('=') {
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() {
+                return Err(Status::bad_request(format!(
+                    "invalid label selector '{part}': empty key"
+                )));
+            }
+            let value = value.strip_prefix('=').unwrap_or(value);
+            terms.push(LabelSelectorTerm::Equality { key, value });
+            continue;
+        }
+        let key = part.trim();
         if key.is_empty() {
             return Err(Status::bad_request(format!(
                 "invalid label selector '{part}': empty key"
             )));
         }
-        pairs.push((key, val));
+        terms.push(LabelSelectorTerm::Exists { key });
     }
-    Ok(pairs)
+    Ok(terms)
 }
 
-/// Filter `items` by label selector pairs. Keeps only items where all key=value pairs match
+/// Filter `items` by label selector terms. Keeps only items where all terms match
 /// the object's `metadata.labels` map.
 pub(crate) fn apply_label_selector(
     items: Vec<serde_json::Value>,
-    pairs: &[(&str, &str)],
+    terms: &[LabelSelectorTerm<'_>],
 ) -> Vec<serde_json::Value> {
-    if pairs.is_empty() {
+    if terms.is_empty() {
         return items;
     }
     items
@@ -218,9 +258,16 @@ pub(crate) fn apply_label_selector(
             let meta: ObjectMeta =
                 serde_json::from_value(item["metadata"].clone()).unwrap_or_default();
             let labels = meta.labels.unwrap_or_default();
-            pairs
-                .iter()
-                .all(|(k, v)| labels.get(*k).map(|s| s.as_str()) == Some(*v))
+            terms.iter().all(|term| match term {
+                LabelSelectorTerm::Equality { key, value } => {
+                    labels.get(*key).map(|s| s.as_str()) == Some(value)
+                }
+                LabelSelectorTerm::NotEquals { key, value } => {
+                    labels.get(*key).map(|s| s.as_str()) != Some(value)
+                }
+                LabelSelectorTerm::Exists { key } => labels.contains_key(*key),
+                LabelSelectorTerm::DoesNotExist { key } => !labels.contains_key(*key),
+            })
         })
         .collect()
 }
@@ -558,26 +605,70 @@ mod tests {
 
     #[test]
     fn parse_single_pair() {
-        let pairs = ok(parse_label_selector("app=frontend"));
-        assert_eq!(pairs, vec![("app", "frontend")]);
+        let terms = ok(parse_label_selector("app=frontend"));
+        assert_eq!(
+            terms,
+            vec![LabelSelectorTerm::Equality {
+                key: "app",
+                value: "frontend"
+            }]
+        );
     }
 
     #[test]
     fn parse_multiple_pairs() {
-        let pairs = ok(parse_label_selector("app=frontend,env=prod"));
-        assert_eq!(pairs, vec![("app", "frontend"), ("env", "prod")]);
+        let terms = ok(parse_label_selector("app=frontend,env=prod"));
+        assert_eq!(
+            terms,
+            vec![
+                LabelSelectorTerm::Equality {
+                    key: "app",
+                    value: "frontend"
+                },
+                LabelSelectorTerm::Equality {
+                    key: "env",
+                    value: "prod"
+                },
+            ]
+        );
     }
 
     #[test]
     fn parse_empty_selector_returns_empty() {
-        let pairs = ok(parse_label_selector(""));
-        assert!(pairs.is_empty());
+        let terms = ok(parse_label_selector(""));
+        assert!(terms.is_empty());
     }
 
     #[test]
-    fn parse_missing_equals_is_error() {
-        // no '=' present — must fail because label selectors require key=value
-        assert!(parse_label_selector("app").is_err());
+    fn parse_bare_key_is_exists_operator() {
+        // bare key with no operator means Exists — the key must be present with any value
+        let terms = ok(parse_label_selector("app"));
+        assert_eq!(terms, vec![LabelSelectorTerm::Exists { key: "app" }]);
+    }
+
+    #[test]
+    fn parse_does_not_exist_operator() {
+        // !key means DoesNotExist — key must NOT be present
+        let terms = ok(parse_label_selector("!service.kubernetes.io/headless"));
+        assert_eq!(
+            terms,
+            vec![LabelSelectorTerm::DoesNotExist {
+                key: "service.kubernetes.io/headless"
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_not_equals_operator() {
+        // key!=value means NotEquals
+        let terms = ok(parse_label_selector("env!=prod"));
+        assert_eq!(
+            terms,
+            vec![LabelSelectorTerm::NotEquals {
+                key: "env",
+                value: "prod"
+            }]
+        );
     }
 
     #[test]
@@ -588,8 +679,19 @@ mod tests {
     #[test]
     fn parse_value_may_be_empty() {
         // key= is valid — value is empty string
-        let pairs = ok(parse_label_selector("app="));
-        assert_eq!(pairs, vec![("app", "")]);
+        let terms = ok(parse_label_selector("app="));
+        assert_eq!(
+            terms,
+            vec![LabelSelectorTerm::Equality {
+                key: "app",
+                value: ""
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_does_not_exist_with_empty_key_is_error() {
+        assert!(parse_label_selector("!").is_err());
     }
 
     // -- build_list_response --
