@@ -356,6 +356,11 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/namespaces/{ns}/pods/{name}/binding",
             axum::routing::post(handlers::pods::bind_pod),
         )
+        // Pods — eviction subresource: graceful deletion via the Eviction API
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/eviction",
+            axum::routing::post(handlers::pods::evict_pod),
+        )
         // Pods — status subresource
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/status",
