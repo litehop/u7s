@@ -2327,6 +2327,9 @@ fn object_meta_to_json(meta: ObjectMeta) -> serde_json::Value {
     if !meta.resource_version.is_empty() {
         m["resourceVersion"] = serde_json::Value::String(meta.resource_version);
     }
+    if meta.generation != 0 {
+        m["generation"] = serde_json::Value::Number(meta.generation.into());
+    }
     if let Some(ts) = meta.creation_timestamp {
         if ts.seconds > 0 {
             m["creationTimestamp"] =
@@ -12331,6 +12334,46 @@ mod tests {
              resets partition to 0 and KCM updates all pods immediately, causing the rolling \
              update canary conformance test to fail (currentRevision equals updateRevision \
              before the test can observe the in-progress state)"
+        );
+    }
+
+    /// decode_statefulset_proto must preserve metadata.generation from the proto body.
+    ///
+    /// When the conformance test rolls back a StatefulSet (setting the old image), the typed
+    /// client sends a proto PUT with metadata.generation=2.  Without generation in the decoded
+    /// JSON, increment_workload_generation_if_spec_changed falls back to 1 and produces
+    /// generation=2 again — the same value as the previous newImage generation.  waitForStatus
+    /// then sees observedGeneration=2 >= generation=2 on the immediate poll and returns before
+    /// KCM has processed the rollback, causing the test to read a stale updateRevision.
+    #[test]
+    fn decode_statefulset_proto_preserves_metadata_generation() {
+        // ObjectMeta: name="ss2" (field 1), generation=2 (field 7, varint, tag=0x38)
+        let name_bytes = encode_length_delimited(1, b"ss2");
+        let mut meta_bytes = encode_length_delimited(1, &name_bytes);
+        // generation field 7, wire type 0 (varint): tag = (7<<3)|0 = 0x38, value = 2
+        meta_bytes.extend_from_slice(&[0x38, 0x02]);
+
+        // Minimal spec so decode_statefulset_proto returns Some(...)
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"test"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        let mut spec_bytes = vec![0x08, 0x01]; // replicas=1
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+
+        let mut proto = encode_length_delimited(1, &meta_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("StatefulSet", &proto)
+            .expect("StatefulSet proto must decode successfully");
+
+        assert_eq!(
+            result["metadata"]["generation"], 2,
+            "metadata.generation must be 2 after proto decode — without this, a rollback PUT \
+             resets generation to 2 (same as the previous spec update), waitForStatus returns \
+             before KCM processes the new spec, and updateRevision points to the old revision"
         );
     }
 }
