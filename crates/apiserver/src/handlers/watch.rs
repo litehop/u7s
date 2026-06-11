@@ -170,9 +170,12 @@ pub(crate) async fn fetch_initial_events<S: Store>(
     Ok(Some((items, resp.revision)))
 }
 
-/// Test whether a JSON object matches a label selector string (`key=value,...`).
-/// Returns true if the selector is empty (pass-through) or all pairs match
+/// Test whether a JSON object matches a label selector string.
+/// Returns true if the selector is empty (pass-through) or all terms match
 /// `metadata.labels` in the object. Used to filter live watch events.
+///
+/// Supported operators: `key=value` (Equality), `key!=value` (NotEquals),
+/// `!key` (DoesNotExist), bare `key` (Exists).
 pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &str) -> bool {
     if selector.is_empty() {
         return true;
@@ -183,18 +186,45 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
         if part.is_empty() {
             continue;
         }
-        // Only equality selectors are supported; skip malformed terms (conservative: pass through).
-        if let Some(eq_pos) = part.find('=') {
-            let key = part[..eq_pos].trim();
-            let val = part[eq_pos + 1..].trim();
+        if let Some(key) = part.strip_prefix('!') {
+            let key = key.trim();
             if key.is_empty() {
                 continue;
             }
-            if labels.get(key).and_then(|v| v.as_str()) != Some(val) {
+            if labels.get(key).is_some() {
                 return false;
             }
+            continue;
         }
-        // Unknown/malformed term: ignore (conservative, don't drop events).
+        if let Some((key, value)) = part.split_once("!=") {
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() {
+                continue;
+            }
+            if labels.get(key).and_then(|v| v.as_str()) == Some(value) {
+                return false;
+            }
+            continue;
+        }
+        if let Some((key, value)) = part.split_once('=') {
+            let key = key.trim();
+            let value = value.trim().strip_prefix('=').unwrap_or(value.trim());
+            if key.is_empty() {
+                continue;
+            }
+            if labels.get(key).and_then(|v| v.as_str()) != Some(value) {
+                return false;
+            }
+            continue;
+        }
+        let key = part.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if labels.get(key).is_none() {
+            return false;
+        }
     }
     true
 }
@@ -1684,24 +1714,38 @@ mod tests {
 
     #[test]
     fn filter_matches_all_present_labels() {
+        use super::super::generic::LabelSelectorTerm;
         let items = vec![
             item_with_labels(&[("app", "frontend"), ("env", "prod")]),
             item_with_labels(&[("app", "backend"), ("env", "prod")]),
         ];
-        let pairs = vec![("app", "frontend"), ("env", "prod")];
-        let result = apply_label_selector(items, &pairs);
+        let terms = vec![
+            LabelSelectorTerm::Equality {
+                key: "app",
+                value: "frontend",
+            },
+            LabelSelectorTerm::Equality {
+                key: "env",
+                value: "prod",
+            },
+        ];
+        let result = apply_label_selector(items, &terms);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["metadata"]["labels"]["app"], "frontend");
     }
 
     #[test]
     fn filter_removes_items_missing_label() {
+        use super::super::generic::LabelSelectorTerm;
         let items = vec![
             item_with_labels(&[("app", "frontend")]),
             item_with_labels(&[]),
         ];
-        let pairs = vec![("app", "frontend")];
-        let result = apply_label_selector(items, &pairs);
+        let terms = vec![LabelSelectorTerm::Equality {
+            key: "app",
+            value: "frontend",
+        }];
+        let result = apply_label_selector(items, &terms);
         assert_eq!(result.len(), 1);
     }
 
@@ -1717,9 +1761,13 @@ mod tests {
 
     #[test]
     fn filter_no_match_returns_empty() {
+        use super::super::generic::LabelSelectorTerm;
         let items = vec![item_with_labels(&[("app", "backend")])];
-        let pairs = vec![("app", "frontend")];
-        let result = apply_label_selector(items, &pairs);
+        let terms = vec![LabelSelectorTerm::Equality {
+            key: "app",
+            value: "frontend",
+        }];
+        let result = apply_label_selector(items, &terms);
         assert!(result.is_empty());
     }
 
@@ -1757,6 +1805,147 @@ mod tests {
     fn label_selector_object_without_labels_does_not_match() {
         let obj = serde_json::json!({"metadata": {"name": "no-labels"}});
         assert!(!object_matches_label_selector(&obj, "app=frontend"));
+    }
+
+    /// DoesNotExist (`!key`): objects WITH the key must be dropped; objects WITHOUT it must pass.
+    /// KCM's EndpointSlice controller watches with `!service.kubernetes.io/headless`;
+    /// if this operator is ignored (old bug), ALL EndpointSlice events fan out to ALL watchers.
+    #[test]
+    fn label_selector_does_not_exist_drops_objects_with_key() {
+        let has_key =
+            serde_json::json!({"metadata": {"labels": {"service.kubernetes.io/headless": ""}}});
+        let no_key = serde_json::json!({"metadata": {"labels": {"app": "web"}}});
+        let no_labels = serde_json::json!({"metadata": {"name": "bare"}});
+
+        assert!(
+            !object_matches_label_selector(&has_key, "!service.kubernetes.io/headless"),
+            "object WITH the key must not match DoesNotExist(!key) — KCM EPS fan-out regression"
+        );
+        assert!(
+            object_matches_label_selector(&no_key, "!service.kubernetes.io/headless"),
+            "object without the key must match DoesNotExist(!key)"
+        );
+        assert!(
+            object_matches_label_selector(&no_labels, "!service.kubernetes.io/headless"),
+            "object with no labels must match DoesNotExist(!key)"
+        );
+    }
+
+    /// Exists (bare `key`): objects WITHOUT the key must be dropped; objects WITH it must pass.
+    #[test]
+    fn label_selector_exists_drops_objects_missing_key() {
+        let has_key = serde_json::json!({"metadata": {"labels": {"app": "web"}}});
+        let no_key = serde_json::json!({"metadata": {"labels": {"env": "prod"}}});
+        let no_labels = serde_json::json!({"metadata": {"name": "bare"}});
+
+        assert!(
+            object_matches_label_selector(&has_key, "app"),
+            "object WITH the key must match bare-key Exists selector"
+        );
+        assert!(
+            !object_matches_label_selector(&no_key, "app"),
+            "object without the key must NOT match Exists selector — watch filter must drop it"
+        );
+        assert!(
+            !object_matches_label_selector(&no_labels, "app"),
+            "object with no labels must NOT match Exists selector"
+        );
+    }
+
+    /// NotEquals (`key!=value`): objects where key==value must be dropped; others pass.
+    #[test]
+    fn label_selector_not_equals_drops_matching_value() {
+        let matches_val = serde_json::json!({"metadata": {"labels": {"env": "prod"}}});
+        let other_val = serde_json::json!({"metadata": {"labels": {"env": "staging"}}});
+        let missing_key = serde_json::json!({"metadata": {"labels": {"app": "web"}}});
+
+        assert!(
+            !object_matches_label_selector(&matches_val, "env!=prod"),
+            "object with env=prod must NOT match env!=prod selector"
+        );
+        assert!(
+            object_matches_label_selector(&other_val, "env!=prod"),
+            "object with env=staging must match env!=prod selector"
+        );
+        assert!(
+            object_matches_label_selector(&missing_key, "env!=prod"),
+            "object without env key must match env!=prod selector (key absent != value present)"
+        );
+    }
+
+    /// Label-A watcher must NOT receive events for objects with only label B.
+    /// This is the primary scenario from the bead: watcher for "app=frontend" must not see
+    /// objects that have only "app=backend".
+    #[test]
+    fn label_selector_watcher_a_does_not_receive_events_for_label_b() {
+        let label_b_obj = serde_json::json!({"metadata": {"labels": {"app": "backend"}}});
+        assert!(
+            !object_matches_label_selector(&label_b_obj, "app=frontend"),
+            "watcher for app=frontend must not receive events for app=backend objects; \
+             label-A watcher receiving label-B events causes informer cache divergence"
+        );
+    }
+
+    // -- apply_label_selector new operator regression tests --
+
+    /// apply_label_selector with DoesNotExist operator: objects with the key are excluded.
+    #[test]
+    fn apply_label_selector_does_not_exist_excludes_objects_with_key() {
+        use super::super::generic::LabelSelectorTerm;
+        let with_key = item_with_labels(&[("managed-by", "helm")]);
+        let without_key = item_with_labels(&[("app", "web")]);
+        let terms = vec![LabelSelectorTerm::DoesNotExist { key: "managed-by" }];
+        let result = apply_label_selector(vec![with_key, without_key], &terms);
+        assert_eq!(
+            result.len(),
+            1,
+            "DoesNotExist filter must exclude objects that have the key; got {result:?}"
+        );
+        assert_eq!(
+            result[0]["metadata"]["labels"]["app"], "web",
+            "the remaining object must be the one without the key"
+        );
+    }
+
+    /// apply_label_selector with Exists operator: objects without the key are excluded.
+    #[test]
+    fn apply_label_selector_exists_excludes_objects_missing_key() {
+        use super::super::generic::LabelSelectorTerm;
+        let with_key = item_with_labels(&[("tier", "frontend")]);
+        let without_key = item_with_labels(&[("app", "web")]);
+        let terms = vec![LabelSelectorTerm::Exists { key: "tier" }];
+        let result = apply_label_selector(vec![with_key, without_key], &terms);
+        assert_eq!(
+            result.len(),
+            1,
+            "Exists filter must exclude objects that are missing the key; got {result:?}"
+        );
+        assert_eq!(
+            result[0]["metadata"]["labels"]["tier"], "frontend",
+            "the remaining object must be the one that has the key"
+        );
+    }
+
+    /// apply_label_selector with NotEquals operator: objects where key==value are excluded.
+    #[test]
+    fn apply_label_selector_not_equals_excludes_matching_value() {
+        use super::super::generic::LabelSelectorTerm;
+        let prod = item_with_labels(&[("env", "prod")]);
+        let staging = item_with_labels(&[("env", "staging")]);
+        let terms = vec![LabelSelectorTerm::NotEquals {
+            key: "env",
+            value: "prod",
+        }];
+        let result = apply_label_selector(vec![prod, staging], &terms);
+        assert_eq!(
+            result.len(),
+            1,
+            "NotEquals filter must exclude the prod object; got {result:?}"
+        );
+        assert_eq!(
+            result[0]["metadata"]["labels"]["env"], "staging",
+            "the remaining object must be the staging one"
+        );
     }
 
     // -- object_matches_field_selector edge cases --
