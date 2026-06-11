@@ -122,11 +122,10 @@ git worktree add ai/worktrees/<name> -b worker/<name>
 git -C ai/worktrees/<name> config core.hooksPath .githooks
 # 3. Verify clean
 git -C ai/worktrees/<name> status --short --branch
-# 4. If the bead needs VM verification: assign an unused VM + loopback IP
-#    Available VMs: lima-node (127.0.0.1), lima-node-smoke (127.0.0.2),
-#                   lima-node-2 (127.0.0.3) … up to 6 (soft limit: memory).
-#    Check which are in use: limactl list
-#    Pick an unused or stopped VM and include U7S_VM_NAME + U7S_HOST_IP in dispatch.
+# 4. If the bead needs VM verification: assign an unused VM + port from the table above.
+#    Check which VMs are in use: limactl list
+#    Pick an unused or stopped VM; assign the next available port (6444–6448).
+#    Include U7S_VM_NAME + --port <PORT> in dispatch. Workers always bind to 127.0.0.1.
 ```
 
 No file copying needed: `settings.json` is tracked in git and present in every
@@ -322,37 +321,42 @@ Each worker that needs runtime verification gets its **own isolated VM stack** �
 it does not share the mayor's VM. Up to 6 workers can run in parallel (soft
 limit: ~4 GiB RAM per VM).
 
-**Available VMs and their loopback aliases:**
+**Available VMs and their assigned ports:**
 
-| VM name | Loopback IP | WORKDIR |
+| VM name | Host port | Notes |
 |---|---|---|
-| `lima-node` | `127.0.0.1` | `temp/u7s/` |
-| `lima-node-smoke` | `127.0.0.2` | `temp/u7s-lima-node-smoke/` |
-| `lima-node-2` | `127.0.0.3` | `temp/u7s-lima-node-2/` |
-| `lima-node-3` | `127.0.0.4` | `temp/u7s-lima-node-3/` |
-| `lima-node-4` | `127.0.0.5` | `temp/u7s-lima-node-4/` |
-| `lima-node-5` | `127.0.0.6` | `temp/u7s-lima-node-5/` |
+| `lima-node` | `6443` | Mayor's VM — never assign to workers |
+| slot 1 | `6444` | |
+| slot 2 | `6445` | |
+| slot 3 | `6446` | |
+| slot 4 | `6447` | |
+| slot 5 | `6448` | |
+
+All workers bind to `127.0.0.1` — port is the isolation boundary between parallel
+workers. Different loopback IPs are NOT reliably reachable from inside Lima VMs via
+`host.lima.internal`; port is the only safe differentiator.
 
 The MCP server name mirrors the VM name: `mcp__lima-node-smoke__run_shell_command`
 for `lima-node-smoke`, etc.
 
-**Mayor assigns VM at dispatch time.** Run `limactl list` to see which VMs are
-running; pick an unused or stopped one. Pass both env vars in the dispatch prompt:
+**Mayor assigns VM and port at dispatch time.** Run `limactl list` to see which VMs are
+running; pick an unused or stopped one. Pass the VM name and port in the dispatch prompt:
 
 ```
 Your assigned VM: lima-node-smoke
-Your assigned host IP: 127.0.0.2
+Your assigned port: 6444
 ```
 
 The worker uses these to invoke the conformance stack:
 
 ```bash
-U7S_VM_NAME=lima-node-smoke U7S_HOST_IP=127.0.0.2 \
-  ./scripts/conformance/run-all.sh [--reset] [--focus <regex>]
+U7S_VM_NAME=lima-node-smoke \
+  ./scripts/conformance/run-all.sh --port 6444 [--reset] [--focus <regex>]
 ```
 
 WORKDIR and kubeconfig are derived automatically by the scripts from `U7S_VM_NAME`.
-Workers must not hard-code `lima-node` or `127.0.0.1` anywhere.
+Workers must not hard-code `lima-node` or `6443` anywhere. `U7S_HOST_IP` is no longer
+used — workers always bind to `127.0.0.1` and use `--port` for isolation.
 
 ### When to inject
 
@@ -374,10 +378,11 @@ Fill in `<VM_NAME>` and `<HOST_IP>` from the mayor's assignment before pasting.
 ## Lima VM protocol — MANDATORY for this bead
 
 Your assigned VM: <VM_NAME>
-Your assigned host IP: <HOST_IP>
+Your assigned port: <PORT>
 
 You have exclusive use of this VM for this bead. Do NOT use `lima-node` or
-`127.0.0.1` — those belong to the mayor or another worker.
+port `6443` — those belong to the mayor. All workers bind to `127.0.0.1` and
+use `--port` for isolation.
 
 You cannot invoke shell scripts directly (not in the Bash allowlist). Use
 `limactl shell <VM>`, `kubectl`, and `cargo` commands instead. The full manual
@@ -398,9 +403,9 @@ Verification sequence (do not skip any step):
      --target-dir /tmp/u7s-build-<VM_NAME> 2>&1 | tail -5
 
    # Then start stack:
-   U7S_VM_NAME=<VM_NAME> U7S_HOST_IP=<HOST_IP> \
+   U7S_VM_NAME=<VM_NAME> \
      U7S_BINARY=/tmp/u7s-build-<VM_NAME>/release/u7s-apiserver \
-     <ASSIGNED_WORKTREE>/scripts/conformance/run-all.sh --reset [--focus <regex>]
+     <ASSIGNED_WORKTREE>/scripts/conformance/run-all.sh --port <PORT> --reset [--focus <regex>]
    ```
 2. From your VM, run the sonobuoy smoke:
    ```
@@ -475,10 +480,11 @@ When a worker returns from a VM/sonobuoy-touching bead:
   `mcp__<VM_NAME>__*` and `limactl shell <VM_NAME>` are both available. Inject
   the Lima VM protocol block for any bead touching `scripts/conformance/`,
   `scripts/*-start.sh`, or sonobuoy-exercised handlers.
-- **Workers hard-code `lima-node` or `127.0.0.1`.** Each worker gets an
-  assigned VM name and loopback IP from the mayor. Hard-coding the defaults
-  causes collisions when multiple workers run in parallel. Always use
-  `U7S_VM_NAME` and `U7S_HOST_IP` from the dispatch prompt.
+- **Workers hard-code `lima-node` or port `6443`.** Each worker gets an
+  assigned VM name and port from the mayor. Hard-coding the defaults causes
+  collisions when multiple workers run in parallel. Always use `U7S_VM_NAME`
+  and `--port <PORT>` from the dispatch prompt. Workers always bind to
+  `127.0.0.1`; port is the only isolation boundary.
 - **Workers embed bead IDs and task refs in source comments.** These rot
   immediately as beads close and PRs age. The common preamble bans bead IDs
   in source. Enforce it at review time — if a diff contains `(mayor-`, send
