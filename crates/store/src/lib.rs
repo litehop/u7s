@@ -104,6 +104,9 @@ pub struct InternalEvent {
     pub revision: u64,
     pub value: Option<Bytes>, // None = deleted
     pub is_create: bool,      // true if key did not exist before this put
+    /// For deletions: the object bytes as they existed immediately before deletion.
+    /// None for non-deletion events.
+    pub deleted_body: Option<Bytes>,
 }
 
 /// Public watch event for consumers.
@@ -111,9 +114,20 @@ pub struct InternalEvent {
 pub enum WatchEvent {
     Added(StoreObject),
     Modified(StoreObject),
-    Deleted { key: String, revision: u64 },
-    Bookmark { revision: u64 },
-    Compacted { requested: u64, horizon: u64 },
+    Deleted {
+        key: String,
+        revision: u64,
+        /// Last-known object body before deletion. Used to emit full tombstone objects
+        /// in watch streams so informers can do label-selector matching on the deleted object.
+        body: Option<Bytes>,
+    },
+    Bookmark {
+        revision: u64,
+    },
+    Compacted {
+        requested: u64,
+        horizon: u64,
+    },
 }
 
 pub trait Store: Send + Sync + 'static {
@@ -148,12 +162,12 @@ pub trait Store: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<u64>> + Send;
 
     /// Delete an object. Same optimistic concurrency semantics as put.
-    /// Returns the new global revision on success (the deletion revision).
+    /// Returns the new global revision and the last-known object bytes on success.
     fn delete(
         &self,
         key: &str,
         expected_revision: Option<u64>,
-    ) -> impl std::future::Future<Output = Result<u64>> + Send;
+    ) -> impl std::future::Future<Output = Result<(u64, Bytes)>> + Send;
 
     /// Watch objects under prefix starting from (exclusive) from_revision.
     /// Yields historical events from the ring buffer then live broadcast events.

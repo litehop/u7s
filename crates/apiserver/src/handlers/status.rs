@@ -1533,7 +1533,8 @@ mod tests {
             &self,
             key: &str,
             expected_revision: Option<u64>,
-        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
             let inner = self.inner.clone();
             let key = key.to_string();
             async move { inner.delete(&key, expected_revision).await }
