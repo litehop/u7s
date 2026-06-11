@@ -1829,6 +1829,27 @@ struct DeploymentSpec {
     template: Option<AppsPodTemplateSpec>,
 }
 
+/// RollingUpdateStatefulSetStrategy — k8s.io/api/apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message RollingUpdateStatefulSetStrategy
+#[derive(Clone, PartialEq, Message)]
+struct RollingUpdateStatefulSetStrategy {
+    /// partition (field 1, int32) — ordinal at which the rolling update starts
+    #[prost(int32, tag = "1")]
+    partition: i32,
+}
+
+/// StatefulSetUpdateStrategy — k8s.io/api/apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message StatefulSetUpdateStrategy
+#[derive(Clone, PartialEq, Message)]
+struct StatefulSetUpdateStrategy {
+    /// type (field 1, string): "RollingUpdate" or "OnDelete"
+    #[prost(string, tag = "1")]
+    r#type: String,
+    /// rollingUpdate (field 2, message RollingUpdateStatefulSetStrategy)
+    #[prost(message, tag = "2")]
+    rolling_update: Option<RollingUpdateStatefulSetStrategy>,
+}
+
 /// StatefulSetSpec — k8s.io/api/apps/v1/generated.proto
 /// Source: api-apps-v1-generated.proto message StatefulSetSpec
 #[derive(Clone, PartialEq, Message)]
@@ -1842,6 +1863,12 @@ struct StatefulSetSpec {
     /// template (field 3, message PodTemplateSpec)
     #[prost(message, tag = "3")]
     template: Option<AppsPodTemplateSpec>,
+    // field 4 = volumeClaimTemplates (repeated PVC) — skipped
+    // field 5 = serviceName (string) — skipped
+    // field 6 = podManagementPolicy (string) — skipped
+    /// updateStrategy (field 7, message StatefulSetUpdateStrategy)
+    #[prost(message, tag = "7")]
+    update_strategy: Option<StatefulSetUpdateStrategy>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -4321,9 +4348,22 @@ pub fn decode_statefulset_proto(data: &[u8]) -> Option<serde_json::Value> {
     });
     if let Some(spec) = obj.spec {
         let replicas = spec.replicas;
+        let update_strategy = spec.update_strategy;
         let mut spec_json =
             apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
         spec_json["replicas"] = serde_json::Value::Number(replicas.into());
+        if let Some(us) = update_strategy {
+            let mut us_json = serde_json::json!({});
+            if !us.r#type.is_empty() {
+                us_json["type"] = us.r#type.clone().into();
+            }
+            if let Some(ru) = us.rolling_update {
+                us_json["rollingUpdate"] = serde_json::json!({ "partition": ru.partition });
+            }
+            if !us_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                spec_json["updateStrategy"] = us_json;
+            }
+        }
         if spec_json
             .as_object()
             .map(|m| !m.is_empty())
@@ -12236,6 +12276,61 @@ mod tests {
             result["spec"]["replicas"], 0,
             "spec.replicas must be 0 after proto decode — dropped replicas=0 causes defaulter to \
              set 1, corrupting scale-to-zero"
+        );
+    }
+
+    /// decode_statefulset_proto must preserve spec.updateStrategy.rollingUpdate.partition.
+    ///
+    /// The rolling-update canary conformance test creates a StatefulSet with partition=3 to
+    /// prevent any pod from being updated immediately. Without decoding updateStrategy, the
+    /// partition is silently dropped and apply_defaults sets it to 0, causing KCM to update
+    /// all pods at once. By the time waitForStatus returns, currentRevision already equals
+    /// updateRevision and the test assertion "currentRevision != updateRevision" fails.
+    #[test]
+    fn decode_statefulset_proto_preserves_update_strategy_partition() {
+        // Build RollingUpdateStatefulSetStrategy { partition: 3 }
+        // field 1 = partition (int32, varint wire type): tag=0x08, value=0x03
+        let rolling_update_bytes = vec![0x08, 0x03];
+
+        // Build StatefulSetUpdateStrategy { type: "RollingUpdate", rollingUpdate: ... }
+        // field 1 = type (string, wire type 2)
+        // field 2 = rollingUpdate (message, wire type 2)
+        let mut us_bytes = encode_length_delimited(1, b"RollingUpdate");
+        us_bytes.extend_from_slice(&encode_length_delimited(2, &rolling_update_bytes));
+
+        // Build StatefulSetSpec with replicas=3, selector, template, updateStrategy
+        // field 1 = replicas (varint 3)
+        // field 2 = selector (LabelSelector)
+        // field 3 = template (PodTemplateSpec)
+        // field 7 = updateStrategy (message)
+        let mut label_entry = encode_length_delimited(1, b"app");
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"sts-canary"));
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+        let tmpl_meta_bytes = encode_length_delimited(11, &label_entry);
+        let template_bytes = encode_length_delimited(1, &tmpl_meta_bytes);
+        let mut spec_bytes = vec![0x08, 0x03]; // replicas=3
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(3, &template_bytes));
+        spec_bytes.extend_from_slice(&encode_length_delimited(7, &us_bytes));
+
+        let name_bytes = encode_length_delimited(1, b"canary-sts");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_core_proto_by_kind("StatefulSet", &proto)
+            .expect("StatefulSet proto must decode successfully");
+
+        assert_eq!(
+            result["spec"]["updateStrategy"]["type"], "RollingUpdate",
+            "updateStrategy.type must be RollingUpdate — without this, KCM cannot respect the \
+             rolling update strategy sent by the client"
+        );
+        assert_eq!(
+            result["spec"]["updateStrategy"]["rollingUpdate"]["partition"], 3,
+            "updateStrategy.rollingUpdate.partition must be 3 — without this, apply_defaults \
+             resets partition to 0 and KCM updates all pods immediately, causing the rolling \
+             update canary conformance test to fail (currentRevision equals updateRevision \
+             before the test can observe the in-progress state)"
         );
     }
 }
