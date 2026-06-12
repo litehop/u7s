@@ -2183,6 +2183,31 @@ mod tests {
         );
     }
 
+    /// A MutatingWebhookConfiguration with a valid CEL expression must be accepted.
+    /// Rejecting a valid expression would block legitimate webhook configurations.
+    #[test]
+    fn mutating_webhook_configuration_accepts_valid_cel_expression() {
+        let obj = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "test"},
+            "webhooks": [{
+                "name": "test.example.com",
+                "matchConditions": [{"name": "check", "expression": "object.metadata.name == \"test\""}]
+            }]
+        });
+        let result = validate_resource(
+            "admissionregistration.k8s.io",
+            "mutatingwebhookconfigurations",
+            &obj,
+        );
+        assert!(
+            result.is_ok(),
+            "MutatingWebhookConfiguration with a valid CEL expression must pass validation; \
+             invalid CEL in a mutating webhook must be rejected at admission-config time, not silently stored"
+        );
+    }
+
     /// A webhook configuration without matchConditions must still be accepted.
     #[test]
     fn webhook_configuration_without_match_conditions_passes_validation() {
