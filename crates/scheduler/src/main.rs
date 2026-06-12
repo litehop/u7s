@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         let in_flight_ref = &in_flight;
 
         let result = stream_watch_events(connector_ref, server_ref, path, |event| {
-            let Some((namespace, pod_name)) = needs_scheduling(&event) else {
+            let Some((namespace, pod_name, node_selector)) = needs_scheduling(&event) else {
                 return;
             };
 
@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
             let in_flight_clone = in_flight_ref.clone();
             tokio::spawn(async move {
                 let result = async {
-                    let node = pick_node(&connector_clone, &server_clone).await?;
+                    let node = pick_node(&connector_clone, &server_clone, &node_selector).await?;
                     bind_pod(
                         &connector_clone,
                         &server_clone,
