@@ -172,13 +172,6 @@ and updates `/ai/dashboard.md`.
 This is the difference between "a lot of agents did things" and "the
 project advanced."
 
-**Merge trap:** `gh pr merge --delete-branch` fails when the worker
-worktree still holds the branch. Use `gh pr merge --merge --admin` (no
-`--delete-branch`), then `git push origin --delete <branch>`, then leave
-local cleanup until the worker is closed and the worktree is verifiably
-clean. Full sequence in [`bootstrap.md`](./bootstrap.md) (the PR-merge
-`/loop` block).
-
 ## Cross-review
 
 Use another model for second opinions. Do not let it become a second

@@ -78,14 +78,24 @@ check_deps() {
 }
 
 find_kubeconfig() {
-  if [ -n "${KUBECONFIG:-}" ] && [ -f "$KUBECONFIG" ]; then
-    echo "$KUBECONFIG"
-    return
+  if [ -z "${KUBECONFIG:-}" ]; then
+    echo "error: KUBECONFIG not set." >&2
+    echo "Start u7s first, then export the path it prints:" >&2
+    echo "  scripts/u7s-start.sh" >&2
+    echo "  export KUBECONFIG=./temp/u7s/kubeconfig" >&2
+    exit 1
   fi
-  echo "error: KUBECONFIG not set or file not found." >&2
-  echo "Start u7s first, then export the path it prints:" >&2
-  echo "  scripts/u7s-start.sh" >&2
-  echo "  export KUBECONFIG=./temp/u7s/kubeconfig" >&2
+  # Poll up to 10s for the apiserver to write the kubeconfig file.
+  for i in $(seq 1 10); do
+    if [ -f "$KUBECONFIG" ]; then
+      echo "$KUBECONFIG"
+      return
+    fi
+    echo "Waiting for kubeconfig at $KUBECONFIG ($i/10) ..." >&2
+    sleep 1
+  done
+  echo "error: kubeconfig not found at $KUBECONFIG after 10s." >&2
+  echo "Check that u7s-apiserver started successfully." >&2
   exit 1
 }
 
