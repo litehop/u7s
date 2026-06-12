@@ -101,6 +101,7 @@ struct WatchEvent<T> {
 #[serde(rename_all = "camelCase")]
 struct PodSpec {
     node_name: Option<String>,
+    node_selector: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Minimal typed view of a Pod's metadata needed by the scheduler.
@@ -119,12 +120,15 @@ struct PodObject {
 
 /// Determine whether a watch event represents a pod that needs scheduling.
 ///
-/// Returns `Some((namespace, pod_name))` when the event is an ADDED or
-/// MODIFIED pod with an empty `spec.nodeName`; `None` otherwise.
+/// Returns `Some((namespace, pod_name, node_selector))` when the event is an
+/// ADDED or MODIFIED pod with an empty `spec.nodeName`; `None` otherwise.
+/// `node_selector` is the pod's `spec.nodeSelector` map (empty if absent).
 ///
 /// Extracted as a pure function so the decision can be unit-tested without
 /// standing up an API server.
-pub fn needs_scheduling(event: &Value) -> Option<(String, String)> {
+pub fn needs_scheduling(
+    event: &Value,
+) -> Option<(String, String, std::collections::HashMap<String, String>)> {
     let watch_event: WatchEvent<PodObject> =
         serde_json::from_value(event.clone()).unwrap_or_else(|_| WatchEvent {
             event_type: String::new(),
@@ -151,7 +155,8 @@ pub fn needs_scheduling(event: &Value) -> Option<(String, String)> {
         .metadata
         .namespace
         .unwrap_or_else(|| "default".to_owned());
-    Some((namespace, pod_name.to_owned()))
+    let node_selector = watch_event.object.spec.node_selector.unwrap_or_default();
+    Some((namespace, pod_name.to_owned(), node_selector))
 }
 
 /// Return `true` if a spawn for `key` ("namespace/name") should proceed.
@@ -181,12 +186,48 @@ pub struct NodeItem {
 #[derive(Deserialize)]
 pub struct NodeMetadata {
     pub name: String,
+    #[serde(default)]
+    pub labels: std::collections::HashMap<String, String>,
 }
 
-/// Select the first node name from a `NodeList`.
+/// Return true when all entries in `selector` are satisfied by `labels`.
 ///
-/// Pure function extracted from `pick_node` so the selection logic can be
-/// unit-tested without network access. Returns an error when no nodes exist.
+/// An empty selector matches any node (standard Kubernetes semantics).
+/// Extracted as a pure function so the matching logic can be unit-tested
+/// without network access.
+pub fn node_selector_matches(
+    labels: &std::collections::HashMap<String, String>,
+    selector: &std::collections::HashMap<String, String>,
+) -> bool {
+    selector
+        .iter()
+        .all(|(k, v)| labels.get(k).map(|s| s == v).unwrap_or(false))
+}
+
+/// Select the first node from `list` whose labels satisfy `selector`.
+///
+/// An empty `selector` matches any node (standard Kubernetes semantics).
+/// Returns `Err` when no node satisfies the selector (pod must stay Pending).
+///
+/// Extracted as a pure function so the selection logic can be unit-tested
+/// without network access. Replaces the former `select_first_node` which
+/// ignored nodeSelector entirely, causing pods with non-matching selectors
+/// to be incorrectly bound to any available node.
+pub fn select_node_for_pod(
+    list: NodeList,
+    selector: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<String> {
+    list.items
+        .into_iter()
+        .find(|n| node_selector_matches(&n.metadata.labels, selector))
+        .map(|n| n.metadata.name)
+        .context("no node satisfies the pod's nodeSelector")
+}
+
+/// Select the first node name from a `NodeList` (no selector filtering).
+///
+/// Retained for callers that have already confirmed the pod has no nodeSelector.
+/// Returns an error when the list is empty.
 pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
     list.items
         .into_iter()
@@ -195,14 +236,22 @@ pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
         .context("no nodes available")
 }
 
-/// Return the name of the first node returned by the API server.
-pub async fn pick_node(connector: &TlsConnector, server: &str) -> anyhow::Result<String> {
+/// Return the name of the first node that satisfies `node_selector`.
+///
+/// Fetches the node list from the API server and applies `node_selector_matches`.
+/// An empty `node_selector` matches any node. Returns `Err` when no matching
+/// node exists so that the caller can skip binding and leave the pod Pending.
+pub async fn pick_node(
+    connector: &TlsConnector,
+    server: &str,
+    node_selector: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<String> {
     let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
     if !status.is_success() {
         bail!("GET /api/v1/nodes returned {status}: {body}");
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
-    select_first_node(list)
+    select_node_for_pod(list, node_selector)
 }
 
 /// The target of a Binding — identifies the node to bind to.
@@ -509,7 +558,7 @@ mod tests {
         });
         let result = needs_scheduling(&event);
         assert!(result.is_some(), "expected Some for unscheduled pod");
-        let (ns, name) = result.unwrap();
+        let (ns, name, _) = result.unwrap();
         assert_eq!(ns, "kube-system", "namespace must come from event metadata");
         assert_eq!(name, "coredns-abc");
     }
@@ -525,7 +574,7 @@ mod tests {
         });
         let result = needs_scheduling(&event);
         assert!(result.is_some());
-        let (ns, name) = result.unwrap();
+        let (ns, name, _) = result.unwrap();
         assert_eq!(ns, "default");
         assert_eq!(name, "my-pod");
     }
@@ -565,7 +614,7 @@ mod tests {
                 "spec": {}
             }
         });
-        let (ns, name) = needs_scheduling(&event).expect("should schedule");
+        let (ns, name, _) = needs_scheduling(&event).expect("should schedule");
         assert_eq!(ns, "default");
         assert_eq!(name, "no-ns-pod");
     }
@@ -583,7 +632,7 @@ mod tests {
         });
         let result = needs_scheduling(&event);
         assert!(result.is_some());
-        let (ns, name) = result.unwrap();
+        let (ns, name, _) = result.unwrap();
         assert_eq!(ns, "staging");
         assert_eq!(name, "pending-pod");
     }
@@ -749,11 +798,13 @@ mod tests {
                 NodeItem {
                     metadata: NodeMetadata {
                         name: "node-a".to_owned(),
+                        labels: Default::default(),
                     },
                 },
                 NodeItem {
                     metadata: NodeMetadata {
                         name: "node-b".to_owned(),
+                        labels: Default::default(),
                     },
                 },
             ],
@@ -827,7 +878,7 @@ mod tests {
             result.is_some(),
             "null nodeName must be treated as unscheduled"
         );
-        let (ns, name) = result.unwrap();
+        let (ns, name, _) = result.unwrap();
         assert_eq!(ns, "default");
         assert_eq!(name, "null-node-pod");
     }
@@ -851,10 +902,209 @@ mod tests {
             items: vec![NodeItem {
                 metadata: NodeMetadata {
                     name: "worker-0".to_owned(),
+                    labels: Default::default(),
                 },
             }],
         };
         let name = select_first_node(list).expect("single-item list must return Ok");
         assert_eq!(name, "worker-0");
+    }
+
+    // ---------------------------------------------------------------------------
+    // nodeSelector filtering (mayor-ewnt): the scheduler must respect spec.nodeSelector.
+    // Before this fix, pick_node blindly returned the first node regardless of labels,
+    // causing pods with non-matching selectors to be bound to the wrong node and the
+    // conformance test "validates that NodeSelector is respected if not matching" to fail.
+    // ---------------------------------------------------------------------------
+
+    fn make_node(name: &str, labels: &[(&str, &str)]) -> NodeItem {
+        NodeItem {
+            metadata: NodeMetadata {
+                name: name.to_owned(),
+                labels: labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+        }
+    }
+
+    /// node_selector_matches returns true when the node labels satisfy all selector entries.
+    ///
+    /// This is the gating condition that prevents non-matching pods from being bound.
+    /// If this always returns true (or the function is removed), every pod is scheduled
+    /// regardless of its nodeSelector, making the conformance test fail.
+    #[test]
+    fn node_selector_matches_all_required_labels() {
+        let labels: std::collections::HashMap<String, String> = [
+            ("kubernetes.io/hostname".to_owned(), "lima-node".to_owned()),
+            ("kubernetes.io/arch".to_owned(), "arm64".to_owned()),
+        ]
+        .into();
+        let selector: std::collections::HashMap<String, String> =
+            [("kubernetes.io/hostname".to_owned(), "lima-node".to_owned())].into();
+        assert!(
+            node_selector_matches(&labels, &selector),
+            "node with matching label must satisfy selector — reverting the check \
+             would cause this to always return true, scheduling pods on mismatched nodes"
+        );
+    }
+
+    /// node_selector_matches returns false when the node is missing a required label.
+    ///
+    /// This is the regression test for mayor-ewnt: before the fix, pick_node ignored
+    /// nodeSelector, so a pod requesting `scheduledOnNode=lima-node-2` would be bound
+    /// to `lima-node` (the only node). The test "NodeSelector is respected if not matching"
+    /// would then fail waiting for the pod to remain Pending.
+    #[test]
+    fn node_selector_matches_false_when_label_absent() {
+        let labels: std::collections::HashMap<String, String> =
+            [("kubernetes.io/hostname".to_owned(), "lima-node".to_owned())].into();
+        // Selector requires a label the node does not have.
+        let selector: std::collections::HashMap<String, String> =
+            [("scheduledOnNode".to_owned(), "lima-node-2".to_owned())].into();
+        assert!(
+            !node_selector_matches(&labels, &selector),
+            "node missing a required label must NOT satisfy selector — reverting \
+             this to always-true causes the scheduler to bind the pod to a mismatched \
+             node, breaking the NodeSelector conformance test"
+        );
+    }
+
+    /// node_selector_matches returns false when a label value differs.
+    #[test]
+    fn node_selector_matches_false_when_label_value_wrong() {
+        let labels: std::collections::HashMap<String, String> =
+            [("kubernetes.io/hostname".to_owned(), "lima-node".to_owned())].into();
+        let selector: std::collections::HashMap<String, String> =
+            [("kubernetes.io/hostname".to_owned(), "other-node".to_owned())].into();
+        assert!(
+            !node_selector_matches(&labels, &selector),
+            "node with wrong label value must NOT satisfy selector"
+        );
+    }
+
+    /// An empty nodeSelector matches any node.
+    ///
+    /// Standard Kubernetes semantics: absence of nodeSelector means "any node".
+    /// If this returns false, pods without a nodeSelector are never scheduled.
+    #[test]
+    fn node_selector_matches_empty_selector_matches_any_node() {
+        let labels: std::collections::HashMap<String, String> =
+            [("kubernetes.io/hostname".to_owned(), "lima-node".to_owned())].into();
+        let selector: std::collections::HashMap<String, String> = Default::default();
+        assert!(
+            node_selector_matches(&labels, &selector),
+            "empty nodeSelector must match any node — \
+             removing this would break scheduling of all pods without a nodeSelector"
+        );
+    }
+
+    /// select_node_for_pod returns the first matching node.
+    ///
+    /// When a pod has a nodeSelector that matches the node, select_node_for_pod must
+    /// return that node. If the matching logic is broken, schedulable pods stay Pending.
+    #[test]
+    fn select_node_for_pod_returns_matching_node() {
+        let list = NodeList {
+            items: vec![make_node(
+                "lima-node",
+                &[
+                    ("kubernetes.io/hostname", "lima-node"),
+                    ("kubernetes.io/arch", "arm64"),
+                ],
+            )],
+        };
+        let selector: std::collections::HashMap<String, String> =
+            [("kubernetes.io/hostname".to_owned(), "lima-node".to_owned())].into();
+        let name = select_node_for_pod(list, &selector).expect("matching node must be found");
+        assert_eq!(
+            name, "lima-node",
+            "select_node_for_pod must return the name of the node whose labels match the selector"
+        );
+    }
+
+    /// select_node_for_pod returns Err when no node satisfies the nodeSelector.
+    ///
+    /// This is the regression test for mayor-ewnt: before the fix, a pod with a
+    /// non-matching nodeSelector would be bound to the first node anyway (via
+    /// select_first_node). With the fix, select_node_for_pod returns Err so the
+    /// caller skips binding and the pod stays Pending — which is the correct behavior
+    /// verified by the conformance test "validates that NodeSelector is respected if
+    /// not matching".
+    #[test]
+    fn select_node_for_pod_errors_when_no_node_matches() {
+        let list = NodeList {
+            items: vec![make_node(
+                "lima-node",
+                &[("kubernetes.io/hostname", "lima-node")],
+            )],
+        };
+        // Pod wants a node labeled scheduledOnNode=lima-node-2, which doesn't exist.
+        let selector: std::collections::HashMap<String, String> =
+            [("scheduledOnNode".to_owned(), "lima-node-2".to_owned())].into();
+        let result = select_node_for_pod(list, &selector);
+        assert!(
+            result.is_err(),
+            "select_node_for_pod must return Err when no node satisfies the selector — \
+             reverting to always-pick-first would pass this as Ok, causing the conformance \
+             test 'validates that NodeSelector is respected if not matching' to fail because \
+             the pod gets scheduled instead of staying Pending"
+        );
+    }
+
+    /// needs_scheduling extracts the nodeSelector from the watch event.
+    ///
+    /// The nodeSelector must be extracted at the watch-event boundary (typed deserialization)
+    /// so the scheduler can pass it to pick_node. If nodeSelector is silently dropped here,
+    /// the scheduler always sees an empty selector and schedules pods on any node.
+    #[test]
+    fn needs_scheduling_returns_node_selector_from_event() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "restricted-pod", "namespace": "sched-pred" },
+                "spec": {
+                    "nodeSelector": {
+                        "scheduledOnNode": "lima-node-2"
+                    }
+                }
+            }
+        });
+        let result = needs_scheduling(&event);
+        assert!(
+            result.is_some(),
+            "expected Some for unscheduled pod with nodeSelector"
+        );
+        let (ns, name, selector) = result.unwrap();
+        assert_eq!(ns, "sched-pred");
+        assert_eq!(name, "restricted-pod");
+        assert_eq!(
+            selector.get("scheduledOnNode").map(|s| s.as_str()),
+            Some("lima-node-2"),
+            "nodeSelector must be extracted from spec.nodeSelector in the watch event — \
+             if the selector is dropped, pick_node sees an empty selector and schedules \
+             the pod on any node, breaking the NodeSelector conformance test"
+        );
+    }
+
+    /// needs_scheduling returns an empty nodeSelector for pods without one.
+    ///
+    /// A pod without spec.nodeSelector must produce an empty selector, which matches
+    /// any node. If this returns a non-empty selector, normal pods might not be scheduled.
+    #[test]
+    fn needs_scheduling_returns_empty_selector_when_no_node_selector() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "normal-pod", "namespace": "default" },
+                "spec": {}
+            }
+        });
+        let (_, _, selector) = needs_scheduling(&event).expect("should schedule");
+        assert!(
+            selector.is_empty(),
+            "pod without nodeSelector must produce an empty selector (matches any node)"
+        );
     }
 }
