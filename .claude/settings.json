@@ -2,6 +2,7 @@
   "permissions": {
     "defaultMode": "auto",
     "allow": [
+      "Bash(bash -n *)",
       "Bash(bd *)",
       "Bash(cargo *)",
       "Bash(gh pr *)",
