@@ -315,6 +315,9 @@ pub async fn create_pod<S: Store>(
     obj.body =
         crate::limit_range::apply_limit_ranges(&state, obj.body, ns.as_str(), "pods").await?;
 
+    // ResourceQuota: ensure pod count does not exceed hard limits, respecting scope selectors.
+    crate::quota::check_resource_quota(&state, ns.as_str(), "", "pods", Some(&obj.body)).await?;
+
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state
         .store
