@@ -907,6 +907,12 @@ impl Store for SqliteStore {
                 yield internal_to_watch(event);
             }
 
+            // Tracks the highest revision seen from global bookmarks. Used only for emitting
+            // BOOKMARK events to clients; deliberately separate from last_replayed so that a
+            // global bookmark from a *different* resource's write cannot advance last_replayed
+            // and cause a later out-of-order event on this prefix to be dedup-skipped.
+            let mut bookmark_rv: u64 = from_revision;
+
             // Forward live broadcast events, skipping already-replayed revisions.
             loop {
                 match rx.recv().await {
@@ -914,10 +920,18 @@ impl Store for SqliteStore {
                         // A global bookmark (key == "") is delivered to all watches
                         // regardless of prefix — it advances the informer's sync RV
                         // without carrying an object (KCM ConsistencyStore relies on this).
+                        //
+                        // Do NOT update last_replayed here: a global bookmark may arrive from
+                        // a concurrent write on a completely different prefix, with a revision
+                        // higher than a pending event on this watcher's prefix. Advancing
+                        // last_replayed from a cross-prefix bookmark would cause that pending
+                        // event to be dedup-skipped and silently dropped.
                         if event.key.is_empty() {
-                            if event.revision > last_replayed {
-                                last_replayed = event.revision;
-                                yield WatchEvent::Bookmark { revision: event.revision };
+                            if event.revision > bookmark_rv {
+                                bookmark_rv = event.revision;
+                                // Emit BOOKMARK at the highest observed RV across both specific
+                                // events and bookmarks, so clients still see advancing bookmarks.
+                                yield WatchEvent::Bookmark { revision: bookmark_rv.max(last_replayed) };
                             }
                             continue;
                         }
@@ -1156,6 +1170,82 @@ mod tests {
              bookmark, not last_written_revision — otherwise a concurrent write that commits first \
              causes the bookmark to carry a future rv, advancing last_replayed and dedup-skipping \
              svc-b's event so controllers never see it"
+        );
+    }
+
+    /// Verify that a global bookmark from a *different* resource's write does not advance
+    /// `last_replayed` on a watcher for a different prefix, causing a subsequent lower-rv
+    /// event on that prefix to be dedup-skipped.
+    ///
+    /// Why it matters: an Endpoints write at rv=365 fires a global bookmark(rv=365). A Services
+    /// watcher receives that bookmark BEFORE the service event at rv=364 (delayed by scheduling).
+    /// If the bookmark advances `last_replayed=365`, the service event(rv=364) is dedup-skipped
+    /// and controllers (KCM) never see the service — no EndpointSlice is ever created.
+    ///
+    /// The fix: global bookmarks must NOT advance `last_replayed` used for dedup. Track bookmark
+    /// progress separately (`bookmark_rv`); use `max(last_replayed, bookmark_rv)` only for
+    /// emitting BOOKMARK events to clients.
+    #[tokio::test]
+    async fn watch_cross_resource_bookmark_skips_event() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // Subscribe to /registry/services/ from rv=0.
+        let stream = store
+            .watch("/registry/services/", 0)
+            .await
+            .expect("watch failed");
+        futures_util::pin_mut!(stream);
+
+        let tx = store.tx.clone();
+
+        // 1. Global bookmark at rv=365 (from a concurrent Endpoints write on a different prefix).
+        //    This arrives BEFORE the service event at rv=364 due to scheduling jitter.
+        tx.send(Arc::new(InternalEvent {
+            key: String::new(),
+            revision: 365,
+            value: None,
+            is_create: false,
+            deleted_body: None,
+        }))
+        .expect("send bookmark");
+
+        // 2. Service event at rv=364 (arrived late due to scheduling).
+        tx.send(Arc::new(InternalEvent {
+            key: "/registry/services/default/svc-a".into(),
+            revision: 364,
+            value: Some(Bytes::from(
+                r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"svc-a","namespace":"default","resourceVersion":"364"}}"#,
+            )),
+            is_create: true,
+            deleted_body: None,
+        }))
+        .expect("send svc-a event");
+
+        // Collect Added events for a short window.
+        // With BUG:  watcher receives bookmark(rv=365)→last_replayed=365, then
+        //            svc-a(rv=364)→rv<=last_replayed→SKIP.  svc-a is never delivered.
+        // With FIX:  bookmark only updates bookmark_rv, last_replayed stays at 0;
+        //            svc-a(rv=364)→rv>last_replayed=0→Added.  svc-a is delivered.
+        let mut added_keys: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Added(obj))) => {
+                    added_keys.push(obj.key.clone());
+                }
+                Ok(Some(WatchEvent::Bookmark { .. })) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => break, // timeout
+            }
+        }
+
+        assert!(
+            added_keys.contains(&"/registry/services/default/svc-a".to_string()),
+            "svc-a must be delivered as Added even when a global bookmark with a higher rv \
+             (from a different resource's write) arrives before the service event; \
+             if global bookmarks advance last_replayed, the service event is dedup-skipped \
+             and controllers like KCM never create EndpointSlices for the service"
         );
     }
 }
