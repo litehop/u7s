@@ -1137,27 +1137,6 @@ pub async fn delete_cr_namespaced<S: Store>(
 }
 
 // ---------------------------------------------------------------------------
-// Patch helpers
-// ---------------------------------------------------------------------------
-
-fn validate_patch_content_type(headers: &HeaderMap) -> Result<(), crate::status::StatusError> {
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if content_type.contains("application/merge-patch+json")
-        || content_type.contains("application/strategic-merge-patch+json")
-    {
-        return Ok(());
-    }
-
-    Err(Status::unsupported_media_type(format!(
-        "unsupported media type '{content_type}'; use application/merge-patch+json"
-    )))
-}
-
-// ---------------------------------------------------------------------------
 // Cluster-scoped CR patch handler
 // ---------------------------------------------------------------------------
 
@@ -1167,7 +1146,7 @@ pub async fn patch_cr<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_patch_content_type(&headers)?;
+    let patch_type = crate::handlers::json_patch::detect_patch_type(&headers)?;
 
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -1186,18 +1165,25 @@ pub async fn patch_cr<S: Store>(
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    let mut patch: serde_json::Value = serde_json::from_slice(&body)
+    let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    // When the CRD declares a status subresource, the main PATCH endpoint must not
-    // update .status — clients must use PATCH /status for that.
-    if ctx.has_status_subresource {
-        if let Some(map) = patch.as_object_mut() {
-            map.remove("status");
+    match patch_type {
+        crate::handlers::json_patch::PatchType::Json => {
+            crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
+        }
+        _ => {
+            let mut patch = patch;
+            // When the CRD declares a status subresource, the main PATCH endpoint must not
+            // update .status — clients must use PATCH /status for that.
+            if ctx.has_status_subresource {
+                if let Some(map) = patch.as_object_mut() {
+                    map.remove("status");
+                }
+            }
+            crate::patch::merge_patch(&mut obj, &patch);
         }
     }
-
-    crate::patch::merge_patch(&mut obj, &patch);
 
     validate_cr_schema(&obj, &ctx)?;
 
@@ -1225,7 +1211,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_patch_content_type(&headers)?;
+    let patch_type = crate::handlers::json_patch::detect_patch_type(&headers)?;
 
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -1244,18 +1230,25 @@ pub async fn patch_cr_namespaced<S: Store>(
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    let mut patch: serde_json::Value = serde_json::from_slice(&body)
+    let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    // When the CRD declares a status subresource, the main PATCH endpoint must not
-    // update .status — clients must use PATCH /status for that.
-    if ctx.has_status_subresource {
-        if let Some(map) = patch.as_object_mut() {
-            map.remove("status");
+    match patch_type {
+        crate::handlers::json_patch::PatchType::Json => {
+            crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
+        }
+        _ => {
+            let mut patch = patch;
+            // When the CRD declares a status subresource, the main PATCH endpoint must not
+            // update .status — clients must use PATCH /status for that.
+            if ctx.has_status_subresource {
+                if let Some(map) = patch.as_object_mut() {
+                    map.remove("status");
+                }
+            }
+            crate::patch::merge_patch(&mut obj, &patch);
         }
     }
-
-    crate::patch::merge_patch(&mut obj, &patch);
 
     validate_cr_schema(&obj, &ctx)?;
 
@@ -2312,12 +2305,12 @@ mod tests {
             "application/strategic-merge-patch+json".parse().unwrap(),
         );
         assert!(
-            validate_patch_content_type(&headers).is_ok(),
+            crate::handlers::json_patch::detect_patch_type(&headers).is_ok(),
             "strategic-merge-patch must be accepted — conformance tests patch CRs with this type"
         );
     }
 
-    // validate_patch_content_type must still reject genuinely unsupported types with 415.
+    // detect_patch_type must still reject genuinely unsupported types with 415.
     // Clients that accidentally send application/json get a clear 415, not a cryptic error.
     #[test]
     fn application_json_content_type_rejected_with_415() {
@@ -2326,7 +2319,7 @@ mod tests {
             axum::http::header::CONTENT_TYPE,
             "application/json".parse().unwrap(),
         );
-        let err = validate_patch_content_type(&headers).unwrap_err();
+        let err = crate::handlers::json_patch::detect_patch_type(&headers).unwrap_err();
         assert_eq!(
             err.0,
             axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -5606,6 +5599,238 @@ mod tests {
             json["code"], 410,
             "list after CRD deletion must return 410 Gone, not 404 — \
              404 causes GC informer to retry indefinitely, blocking namespace deletion"
+        );
+    }
+
+    fn json_patch_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+        h
+    }
+
+    fn merge_patch_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        h
+    }
+
+    /// Controllers patching CRs with JSON Patch (RFC 6902) fail if the CR PATCH handler
+    /// only accepts application/merge-patch+json — the handler must route json-patch
+    /// requests to apply_json_patch so conformance tests can mutate CRs via JSON Patch.
+    #[tokio::test]
+    async fn cluster_cr_json_patch_applies_ops_and_returns_200() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                widget_body("my-widget"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/spec/color", "value": "red"}
+        ]);
+        let patch_body = Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let resp = patch_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "my-widget".to_string(),
+            )),
+            json_patch_headers(),
+            patch_body,
+        )
+        .await
+        .expect("json-patch on cluster CR must return 200, not 415");
+
+        let resp = resp.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["spec"]["color"], "red",
+            "json-patch add op must update spec.color — without the fix the handler returns 415"
+        );
+    }
+
+    /// Controllers patching namespaced CRs with JSON Patch fail if the CR PATCH handler
+    /// only accepts application/merge-patch+json — namespace-scoped CRs need the same fix.
+    #[tokio::test]
+    async fn namespaced_cr_json_patch_applies_ops_and_returns_200() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let ns = "default".to_string();
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    ns.clone(),
+                    "applications".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                app_body("my-app", &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/spec/newField", "value": "patched"}
+        ]);
+        let patch_body = Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let resp = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                ns.clone(),
+                "applications".to_string(),
+                "my-app".to_string(),
+            )),
+            json_patch_headers(),
+            patch_body,
+        )
+        .await
+        .expect("json-patch on namespaced CR must return 200, not 415");
+
+        let resp = resp.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["spec"]["newField"], "patched",
+            "json-patch add op must set spec.newField — without the fix the handler returns 415"
+        );
+    }
+
+    /// Merge-patch on a cluster-scoped CR must still work after the json-patch branch is added.
+    #[tokio::test]
+    async fn cluster_cr_merge_patch_still_works_after_json_patch_added() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                widget_body("merge-widget"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch = serde_json::json!({"spec": {"color": "green"}});
+        let patch_body = Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let resp = patch_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "merge-widget".to_string(),
+            )),
+            merge_patch_headers(),
+            patch_body,
+        )
+        .await
+        .expect("merge-patch on cluster CR must still succeed");
+
+        let resp = resp.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["spec"]["color"], "green",
+            "merge-patch must still update spec.color — regression check that the json-patch branch did not break merge-patch"
+        );
+    }
+
+    /// A malformed JSON Patch (not an array) must return 422 Unprocessable Entity,
+    /// matching core resource behaviour — controllers must get a clear error, not 500.
+    #[tokio::test]
+    async fn cluster_cr_malformed_json_patch_returns_422() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                widget_body("bad-patch-widget"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // A valid JSON object is not a valid JSON Patch (must be an array).
+        let bad_patch = serde_json::json!({"op": "add", "path": "/spec/x", "value": 1});
+        let patch_body = Bytes::from(serde_json::to_vec(&bad_patch).unwrap());
+
+        let err = expect_err_status(
+            patch_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                    "bad-patch-widget".to_string(),
+                )),
+                json_patch_headers(),
+                patch_body,
+            )
+            .await,
+            "malformed json-patch must return an error",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 422,
+            "malformed JSON Patch (non-array body) must return 422 — \
+             returning 200/500 would hide client errors from controllers"
         );
     }
 }
