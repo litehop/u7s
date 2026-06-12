@@ -2052,6 +2052,120 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
 
+    const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
+    const TS: &str = "2024-01-01T00:00:00Z";
+
+    // kube-system/coredns ServiceAccount — the kubernetes plugin uses the projected SA token
+    // to authenticate API calls. Without it, CoreDNS fails at startup with "no such file
+    // or directory" when opening /var/run/secrets/kubernetes.io/serviceaccount/token.
+    let sa_key = keys::object_key("serviceaccounts", "kube-system", "coredns");
+    let sa_body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system",
+            "uid": "00000000-0000-0000-0000-000000000032",
+            "creationTimestamp": TS
+        }
+    });
+    match store
+        .put(&sa_key, Bytes::from(sa_body.to_string()), Some(0))
+        .await
+    {
+        Ok(_) => tracing::info!("seeded ServiceAccount: kube-system/coredns"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "seed ServiceAccount kube-system/coredns: {e}"
+            ))
+        }
+    }
+
+    // ClusterRole for CoreDNS — grants read access to Services, Endpoints, Namespaces,
+    // and Pods so the kubernetes plugin can resolve in-cluster DNS names.
+    let cr_key = keys::group_object_key(RBAC_GROUP, "clusterroles", None, "system:coredns");
+    let cr_body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": {
+            "name": "system:coredns",
+            "uid": "00000000-0000-0000-0000-000000000033",
+            "creationTimestamp": TS,
+            "labels": { "kubernetes.io/bootstrapping": "rbac-defaults" }
+        },
+        "rules": [
+            { "apiGroups": [""], "resources": ["endpoints", "services", "pods", "namespaces"], "verbs": ["list", "watch"] },
+            { "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["list", "watch"] }
+        ]
+    });
+    match store
+        .put(&cr_key, Bytes::from(cr_body.to_string()), None)
+        .await
+    {
+        Ok(_) => tracing::info!("seeded ClusterRole: system:coredns"),
+        Err(e) => return Err(anyhow::anyhow!("seed ClusterRole system:coredns: {e}")),
+    }
+
+    // ClusterRoleBinding — binds the system:coredns role to the coredns SA.
+    let crb_key = keys::group_object_key(RBAC_GROUP, "clusterrolebindings", None, "system:coredns");
+    let crb_body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": {
+            "name": "system:coredns",
+            "uid": "00000000-0000-0000-0000-000000000034",
+            "creationTimestamp": TS,
+            "labels": { "kubernetes.io/bootstrapping": "rbac-defaults" }
+        },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": "system:coredns"
+        },
+        "subjects": [{
+            "kind": "ServiceAccount",
+            "name": "coredns",
+            "namespace": "kube-system"
+        }]
+    });
+    match store
+        .put(&crb_key, Bytes::from(crb_body.to_string()), None)
+        .await
+    {
+        Ok(_) => tracing::info!("seeded ClusterRoleBinding: system:coredns"),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "seed ClusterRoleBinding system:coredns: {e}"
+            ))
+        }
+    }
+
+    // kube-system/coredns ConfigMap — holds the Corefile that CoreDNS reads at startup.
+    // Without the kubernetes plugin in the Corefile, CoreDNS returns NOERROR with an empty
+    // ANSWER section for service DNS names, causing webhook and in-cluster lookups to fail.
+    let cm_key = keys::object_key("configmaps", "kube-system", "coredns");
+    let corefile = ".:53 {\n    errors\n    health\n    ready\n    kubernetes cluster.local in-addr.arpa ip6.arpa {\n        pods insecure\n        fallthrough in-addr.arpa ip6.arpa\n    }\n    forward . /etc/resolv.conf\n    cache 30\n    reload\n    loadbalance\n}\n";
+    let cm_body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system",
+            "uid": "00000000-0000-0000-0000-000000000031",
+            "creationTimestamp": TS
+        },
+        "data": { "Corefile": corefile }
+    });
+    match store
+        .put(&cm_key, Bytes::from(cm_body.to_string()), Some(0))
+        .await
+    {
+        Ok(_) => tracing::info!("seeded ConfigMap: kube-system/coredns"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(anyhow::anyhow!("seed ConfigMap kube-system/coredns: {e}")),
+    }
+
     // kube-system/coredns Deployment — provides in-cluster DNS resolution.
     // kubelet injects 10.96.0.10 (kube-dns Service) into every pod's /etc/resolv.conf;
     // without a running CoreDNS pod behind that Service, DNS lookups fail inside pods.
@@ -2063,7 +2177,7 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
             "name": "coredns",
             "namespace": "kube-system",
             "uid": "00000000-0000-0000-0000-000000000030",
-            "creationTimestamp": "2024-01-01T00:00:00Z",
+            "creationTimestamp": TS,
             "labels": { "k8s-app": "kube-dns" }
         },
         "spec": {
@@ -2072,13 +2186,28 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
             "template": {
                 "metadata": { "labels": { "k8s-app": "kube-dns" } },
                 "spec": {
+                    "serviceAccountName": "coredns",
+                    "dnsPolicy": "Default",
                     "containers": [{
                         "name": "coredns",
                         "image": "registry.k8s.io/coredns/coredns:v1.11.1",
+                        "args": ["-conf", "/etc/coredns/Corefile"],
                         "ports": [
                             { "containerPort": 53, "protocol": "UDP", "name": "dns" },
                             { "containerPort": 53, "protocol": "TCP", "name": "dns-tcp" }
-                        ]
+                        ],
+                        "volumeMounts": [{
+                            "name": "config-volume",
+                            "mountPath": "/etc/coredns",
+                            "readOnly": true
+                        }]
+                    }],
+                    "volumes": [{
+                        "name": "config-volume",
+                        "configMap": {
+                            "name": "coredns",
+                            "items": [{ "key": "Corefile", "path": "Corefile" }]
+                        }
                     }]
                 }
             }
@@ -3722,6 +3851,59 @@ mod tests {
         assert!(
             protocols.contains(&"TCP"),
             "CoreDNS must expose TCP port 53 for large DNS responses"
+        );
+        // Volume mount must reference the Corefile ConfigMap so CoreDNS loads the kubernetes plugin.
+        let volumes = parsed["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .expect("volumes must be an array");
+        assert!(
+            !volumes.is_empty(),
+            "Deployment must declare a volume for the Corefile — without it CoreDNS starts with \
+             the default Corefile which has no kubernetes plugin and returns empty ANSWER sections"
+        );
+        let vol = &volumes[0];
+        assert_eq!(
+            vol["configMap"]["name"].as_str(),
+            Some("coredns"),
+            "volume must reference the coredns ConfigMap"
+        );
+        let vol_mounts = containers[0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts must be an array");
+        assert!(
+            !vol_mounts.is_empty(),
+            "CoreDNS container must mount the Corefile volume"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_coredns_creates_configmap_with_kubernetes_plugin() {
+        // The kube-system/coredns ConfigMap must exist and contain a Corefile with the
+        // kubernetes plugin. Without this, CoreDNS resolves no service DNS names, causing
+        // webhook calls and any in-cluster service lookup to fail with "no such host".
+        let store = make_store();
+        seed_coredns(&store).await.expect("seed must not fail");
+
+        let cm_key = keys::object_key("configmaps", "kube-system", "coredns");
+        let obj = store.get(&cm_key).await.expect("get must not fail");
+        assert!(
+            obj.is_some(),
+            "ConfigMap kube-system/coredns must exist so CoreDNS can load the Corefile"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&obj.unwrap().value).expect("valid json");
+        assert_eq!(parsed["kind"].as_str(), Some("ConfigMap"));
+        let corefile = parsed["data"]["Corefile"]
+            .as_str()
+            .expect("Corefile key must be present in ConfigMap data");
+        assert!(
+            corefile.contains("kubernetes cluster.local"),
+            "Corefile must include the kubernetes plugin — without it service DNS names \
+             return empty ANSWER sections and webhook calls fail with 'no such host'"
+        );
+        assert!(
+            corefile.contains("in-addr.arpa ip6.arpa"),
+            "Corefile kubernetes plugin must include reverse zones for PTR record resolution"
         );
     }
 
