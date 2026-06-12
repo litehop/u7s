@@ -41,8 +41,18 @@ if ! kubectl --kubeconfig="$KUBECONFIG" get nodes 2>/dev/null | grep -q "$VM_NAM
 fi
 
 # ---------------------------------------------------------------------------
-# Sonobuoy progress stall detector — kills the entire sonobuoy run if
-# result-counts (passed + failed) has not incremented for 15 minutes.
+# Sonobuoy progress stall detector — kills the entire sonobuoy run if the
+# live progress signal has not advanced for 15 minutes.
+#
+# WHY progress.* and NOT result-counts: for the e2e plugin, 'sonobuoy status
+# --json' returns result-counts: null for the ENTIRE run — it is only
+# populated when the plugin finishes and writes its tarball at the very end.
+# Keying on result-counts therefore reads 0 the whole run and fires the kill
+# at 900s on healthy runs (mayor-f73c regression). The live signal lives under
+# .plugins[].progress: .completed increments as specs finish, and .msg changes
+# on every state transition. Because fast specs can leave .completed at 0 (and
+# .total can even reset to 0), .msg-change is the robust liveness signal — we
+# reset the timer when EITHER .completed increases OR .msg changes.
 #
 # This is a second independent kill switch that operates at the sonobuoy
 # level, complementing the namespace TTL watchdog.  It catches the case where
@@ -59,6 +69,7 @@ fi
 stall_watchdog_loop() {
   local vm_name="$1"
   local last_count=0
+  local last_msg=""
   local last_progress_time
   last_progress_time=$(date +%s)
   local stall_threshold=900  # 15 minutes in seconds
@@ -79,21 +90,27 @@ stall_watchdog_loop() {
       continue
     fi
 
-    # Sum result-counts.passed and result-counts.failed across all plugins.
-    local current_count
+    # Live progress signal: sum of progress.completed and the joined progress.msg
+    # across all plugins.  result-counts is deliberately NOT read (null mid-run).
+    local current_count current_msg
     current_count=$(printf '%s' "$status_json" \
-      | jq '[.plugins[]? | (."result-counts".passed // 0) + (."result-counts".failed // 0)] | add // 0')
+      | jq '[.plugins[]?.progress.completed // 0] | add // 0')
+    current_msg=$(printf '%s' "$status_json" \
+      | jq -r '[.plugins[]?.progress.msg // ""] | join("|")')
 
     local now
     now=$(date +%s)
 
-    if [ "$current_count" -gt "$last_count" ]; then
+    # Reset the stall timer when completed INCREASES or msg CHANGES vs the
+    # previous iteration — either proves the run is still making progress.
+    if [ "$current_count" -gt "$last_count" ] || [ "$current_msg" != "$last_msg" ]; then
       last_count=$current_count
+      last_msg=$current_msg
       last_progress_time=$now
     else
       local stall_s=$(( now - last_progress_time ))
       if [ "$stall_s" -ge "$stall_threshold" ]; then
-        echo "[stall-watchdog] $(date -u +%Y-%m-%dT%H:%M:%SZ) no sonobuoy progress for ${stall_s}s (passed+failed=${current_count}) — killing run"
+        echo "[stall-watchdog] $(date -u +%Y-%m-%dT%H:%M:%SZ) no sonobuoy progress for ${stall_s}s (completed=${current_count}, msg='${current_msg}') — killing run"
         limactl shell "$vm_name" sudo sonobuoy delete --all --wait \
           --kubeconfig /tmp/sonobuoy-kubeconfig 2>/dev/null || true
         return 0
