@@ -23,7 +23,39 @@ the address rewrite automatically when given `--port <PORT>`.
 
 ---
 
-## Step 1 — Build
+## Primary path — use run-all.sh
+
+For full stack bringup (build + apiserver + kubelet + KCM + sonobuoy), use `run-all.sh`:
+
+```bash
+mkdir -p <WORKTREE>/temp/u7s
+
+scripts/conformance/run-all.sh \
+  --vm      <VM> \
+  --port    <PORT> \
+  --workdir <WORKTREE>/temp/u7s \
+  --focus   "<regex>"
+```
+
+`run-all.sh` handles build, CA generation, kubeconfig, all component starts, and sonobuoy in one invocation. It is whitelisted. Do NOT replicate its steps manually unless you need a partial restart (see individual steps below).
+
+To build first and then run:
+```bash
+cargo build -p u7s-apiserver --release \
+  --manifest-path <WORKTREE>/Cargo.toml \
+  --target-dir    <WORKTREE>/target
+
+scripts/conformance/run-all.sh \
+  --vm      <VM> \
+  --port    <PORT> \
+  --binary  <WORKTREE>/target/release/u7s-apiserver \
+  --workdir <WORKTREE>/temp/u7s \
+  --focus   "<regex>"
+```
+
+---
+
+## Step 1 — Build (individual, for partial restarts only)
 
 Build from the worktree's `Cargo.toml` into the worktree's own `target/`:
 
@@ -37,7 +69,7 @@ Binary: `<WORKTREE>/target/release/u7s-apiserver`. The worktree `target/` is git
 
 ---
 
-## Step 2 — Start apiserver
+## Step 2 — Start apiserver (individual, for partial restarts only)
 
 ```bash
 mkdir -p <WORKTREE>/temp/u7s
