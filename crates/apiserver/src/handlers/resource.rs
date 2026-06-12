@@ -115,11 +115,15 @@ pub async fn list_resource<S: Store>(
         .await;
     }
 
-    let field_selector = query
-        .field_selector
-        .as_deref()
-        .map(parse_field_selector)
-        .transpose()?;
+    let store_field_selector = if plural == "events" {
+        None
+    } else {
+        query
+            .field_selector
+            .as_deref()
+            .map(parse_field_selector)
+            .transpose()?
+    };
     let continue_key = query
         .continue_token
         .as_deref()
@@ -130,7 +134,7 @@ pub async fn list_resource<S: Store>(
         .list(
             &prefix,
             ListOptions {
-                field_selector,
+                field_selector: store_field_selector,
                 limit: query.limit,
                 continue_key,
             },
@@ -149,6 +153,16 @@ pub async fn list_resource<S: Store>(
     let items = if let Some(ref sel) = query.label_selector {
         let pairs = parse_label_selector(sel)?;
         apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
+
+    let items = if plural == "events" {
+        if let Some(ref sel) = query.field_selector {
+            super::pods::filter_events_by_field_selector(items, sel)
+        } else {
+            items
+        }
     } else {
         items
     };
@@ -932,11 +946,15 @@ pub async fn list_namespaced_resource<S: Store>(
         .await;
     }
 
-    let field_selector = query
-        .field_selector
-        .as_deref()
-        .map(parse_field_selector)
-        .transpose()?;
+    let store_field_selector = if plural == "events" {
+        None
+    } else {
+        query
+            .field_selector
+            .as_deref()
+            .map(parse_field_selector)
+            .transpose()?
+    };
     let continue_key = query
         .continue_token
         .as_deref()
@@ -947,7 +965,7 @@ pub async fn list_namespaced_resource<S: Store>(
         .list(
             &prefix,
             ListOptions {
-                field_selector,
+                field_selector: store_field_selector,
                 limit: query.limit,
                 continue_key,
             },
@@ -966,6 +984,16 @@ pub async fn list_namespaced_resource<S: Store>(
     let items = if let Some(ref sel) = query.label_selector {
         let pairs = parse_label_selector(sel)?;
         apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
+
+    let items = if plural == "events" {
+        if let Some(ref sel) = query.field_selector {
+            super::pods::filter_events_by_field_selector(items, sel)
+        } else {
+            items
+        }
     } else {
         items
     };
