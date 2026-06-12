@@ -1528,6 +1528,28 @@ pub fn apply_ephemeral_containers_patch(
     result
 }
 
+pub async fn get_ephemeral_containers<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns, name)): Path<(String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns, &state).await?;
+
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        stored.value,
+    )
+        .into_response())
+}
+
 pub async fn patch_ephemeral_containers<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
@@ -1554,7 +1576,9 @@ pub async fn patch_ephemeral_containers<S: Store>(
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    let spec_before = current_obj.body["spec"].clone();
     current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &patch);
+    increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
 
     let expected_rv = parse_resource_version(current_obj.resource_version())?;
     let new_rv = state
@@ -6074,6 +6098,40 @@ mod ephemeral_containers_tests {
                     .as_array()
                     .is_none_or(|a| a.is_empty()),
             "a patch without spec.ephemeralContainers must leave the field absent"
+        );
+    }
+
+    /// Patching ephemeralContainers increments metadata.generation.
+    ///
+    /// The [sig-node] Ephemeral Containers conformance test reads back the pod and
+    /// asserts generation==2.  Without the increment the test sees generation==1 and
+    /// immediately fails (fast failure, not a 120s timeout).
+    #[test]
+    fn ephemeral_patch_increments_generation() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "target", "namespace": "default", "generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        let patch = serde_json::json!({
+            "spec": {
+                "ephemeralContainers": [{"name": "debugger", "image": "busybox"}]
+            }
+        });
+
+        let spec_before = pod["spec"].clone();
+        pod = apply_ephemeral_containers_patch(&pod, &patch);
+        increment_pod_generation_if_spec_changed(&mut pod, &spec_before);
+
+        assert_eq!(
+            pod["metadata"]["generation"],
+            serde_json::json!(2i64),
+            "generation must be incremented to 2 after ephemeralContainers PATCH — \
+             the [sig-node] Ephemeral Containers conformance test asserts generation==2 \
+             and fails immediately if this is not done"
         );
     }
 }

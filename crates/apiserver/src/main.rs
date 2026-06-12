@@ -379,7 +379,8 @@ fn build_router(state: AppState) -> Router {
         // Must be before the generic catch-all.
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
-            axum::routing::patch(handlers::pods::patch_ephemeral_containers),
+            get(handlers::pods::get_ephemeral_containers)
+                .patch(handlers::pods::patch_ephemeral_containers),
         )
         // Pods — log subresource (kubelet proxy): must be before generic catch-all
         .route(
