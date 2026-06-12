@@ -50,6 +50,40 @@ fi
 #
 # System namespaces excluded: default, kube-*, sonobuoy
 # ---------------------------------------------------------------------------
+stall_detector_loop() {
+  local vm="$1"
+  sleep 30
+  local last_count=0 last_change
+  last_change=$(date -u +%s)
+  while true; do
+    sleep 60
+    local status_json
+    status_json=$(limactl shell "$vm" sudo sonobuoy status --json \
+      --kubeconfig /tmp/sonobuoy-kubeconfig 2>/dev/null) || { continue; }
+    if ! printf '%s' "$status_json" | jq -e '.plugins' >/dev/null 2>&1; then
+      continue
+    fi
+    local passed failed total
+    passed=$(printf '%s' "$status_json" | jq -r '[.plugins[]."result-counts".passed // 0] | add // 0')
+    failed=$(printf '%s' "$status_json" | jq -r '[.plugins[]."result-counts".failed // 0] | add // 0')
+    total=$(( passed + failed ))
+    local now
+    now=$(date -u +%s)
+    if [ "$total" -gt "$last_count" ]; then
+      last_count=$total
+      last_change=$now
+    fi
+    local stale
+    stale=$(( now - last_change ))
+    if [ "$stale" -ge 900 ]; then
+      echo "[stall-detector] $(date -u +%Y-%m-%dT%H:%M:%SZ) no progress for ${stale}s (passed=${passed} failed=${failed}) — killing sonobuoy"
+      limactl shell "$vm" sudo sonobuoy delete --all --wait \
+        --kubeconfig /tmp/sonobuoy-kubeconfig 2>/dev/null || true
+      return 0
+    fi
+  done
+}
+
 watchdog_loop() {
   local kubeconfig="$1"
   while true; do
@@ -102,7 +136,8 @@ watchdog_loop() {
 # Rewrite kubeconfig server address for in-VM use
 REWRITTEN=$(mktemp)
 _WATCHDOG_PID=""
-trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true' EXIT
+_STALL_PID=""
+trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true; [ -n "$_STALL_PID" ] && kill "$_STALL_PID" 2>/dev/null || true' EXIT
 sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "$KUBECONFIG" > "$REWRITTEN"
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
 
@@ -124,6 +159,10 @@ echo "Running sonobuoy inside $VM_NAME..."
 watchdog_loop "$KUBECONFIG" &
 _WATCHDOG_PID=$!
 echo "[watchdog] started (pid=${_WATCHDOG_PID})"
+
+stall_detector_loop "$VM_NAME" &
+_STALL_PID=$!
+echo "[stall-detector] started (pid=${_STALL_PID})"
 
 if [ -n "$FOCUS" ]; then
   # shellcheck disable=SC2086
