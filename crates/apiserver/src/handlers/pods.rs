@@ -105,6 +105,53 @@ fn pod_matches_field_selector(pod: &serde_json::Value, selector: &str) -> bool {
     true
 }
 
+/// Filter a list of Event JSON values by a comma-separated field selector.
+///
+/// Supported fields (all equality, no negation):
+///   involvedObject.name, involvedObject.kind, involvedObject.namespace,
+///   involvedObject.uid, reason
+///
+/// All supplied terms are AND-evaluated: an event must match every term.
+/// An unknown field is ignored (pass-through). An event missing a constrained
+/// field does not match.
+pub fn filter_events_by_field_selector(
+    events: Vec<serde_json::Value>,
+    selector: &str,
+) -> Vec<serde_json::Value> {
+    if selector.is_empty() {
+        return events;
+    }
+    events
+        .into_iter()
+        .filter(|ev| event_matches_field_selector(ev, selector))
+        .collect()
+}
+
+fn event_matches_field_selector(ev: &serde_json::Value, selector: &str) -> bool {
+    for term in selector.split(',') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        if let Some((field, expected)) = term.split_once('=') {
+            let actual = match field {
+                "involvedObject.name" => ev["involvedObject"]["name"].as_str().unwrap_or(""),
+                "involvedObject.kind" => ev["involvedObject"]["kind"].as_str().unwrap_or(""),
+                "involvedObject.namespace" => {
+                    ev["involvedObject"]["namespace"].as_str().unwrap_or("")
+                }
+                "involvedObject.uid" => ev["involvedObject"]["uid"].as_str().unwrap_or(""),
+                "reason" => ev["reason"].as_str().unwrap_or(""),
+                _ => continue,
+            };
+            if actual != expected {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Validate a raw namespace string: format check then store lookup.
 /// Returns 400 on invalid format, 404 if namespace does not exist.
 async fn parse_namespace<S: Store>(
@@ -1046,6 +1093,106 @@ mod field_selector_tests {
     #[test]
     fn pod_store_field_selector_empty_returns_none() {
         assert!(pod_store_field_selector("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod event_field_selector_tests {
+    use super::*;
+
+    fn event(name: &str, kind: &str, ns: &str, uid: &str, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": {"name": "ev", "namespace": ns},
+            "involvedObject": {
+                "name": name,
+                "kind": kind,
+                "namespace": ns,
+                "uid": uid
+            },
+            "reason": reason
+        })
+    }
+
+    /// kubectl describe sends multi-term involvedObject selectors; all terms must be AND-evaluated.
+    /// Without AND logic, a selector with involvedObject.kind=Pod returns events for every kind,
+    /// making kubectl describe show unrelated events or none at all.
+    #[test]
+    fn multi_term_involved_object_selectors_are_and_evaluated() {
+        let pod_event = event("coredns-xxx", "Pod", "kube-system", "uid-1", "Started");
+        let node_event = event("node-1", "Node", "kube-system", "uid-2", "Started");
+        let events = vec![pod_event.clone(), node_event];
+
+        let result = filter_events_by_field_selector(
+            events,
+            "involvedObject.name=coredns-xxx,involvedObject.kind=Pod",
+        );
+
+        assert_eq!(
+            result.len(),
+            1,
+            "kubectl describe relies on multi-term involvedObject selectors being AND-evaluated; \
+             without AND logic involvedObject.kind is ignored and all events for any kind are returned, \
+             making kubectl describe show wrong events or always show Events: <none>"
+        );
+        assert_eq!(result[0]["involvedObject"]["kind"], "Pod");
+        assert_eq!(result[0]["involvedObject"]["name"], "coredns-xxx");
+    }
+
+    /// A single-term selector still works after the change.
+    #[test]
+    fn single_term_involved_object_name_still_filters() {
+        let ev1 = event("coredns-xxx", "Pod", "kube-system", "uid-1", "Started");
+        let ev2 = event("other-pod", "Pod", "kube-system", "uid-2", "Pulled");
+        let events = vec![ev1, ev2];
+
+        let result = filter_events_by_field_selector(events, "involvedObject.name=coredns-xxx");
+        assert_eq!(
+            result.len(),
+            1,
+            "single-term involvedObject.name selector must still filter correctly; \
+             if this regresses kubectl get events --field-selector involvedObject.name=X stops working"
+        );
+        assert_eq!(result[0]["involvedObject"]["name"], "coredns-xxx");
+    }
+
+    /// A selector that matches no event must return empty — not all events.
+    #[test]
+    fn selector_matching_no_event_returns_empty() {
+        let ev = event("pod-a", "Pod", "default", "uid-1", "Started");
+        let result = filter_events_by_field_selector(vec![ev], "involvedObject.name=nonexistent");
+        assert!(
+            result.is_empty(),
+            "a selector term with no match must return empty; returning all events would cause \
+             kubectl describe to show events for unrelated objects"
+        );
+    }
+
+    /// An empty selector is a pass-through — all events are returned.
+    #[test]
+    fn empty_selector_passes_all_events() {
+        let ev1 = event("pod-a", "Pod", "default", "uid-1", "Started");
+        let ev2 = event("pod-b", "Deployment", "default", "uid-2", "Scaled");
+        let events = vec![ev1, ev2];
+        let result = filter_events_by_field_selector(events.clone(), "");
+        assert_eq!(result.len(), events.len());
+    }
+
+    /// reason= field selector filters by event reason.
+    #[test]
+    fn reason_field_selector_filters_by_reason() {
+        let ev1 = event("pod-a", "Pod", "default", "uid-1", "Pulled");
+        let ev2 = event("pod-b", "Pod", "default", "uid-2", "Started");
+        let events = vec![ev1, ev2];
+        let result = filter_events_by_field_selector(events, "reason=Pulled");
+        assert_eq!(
+            result.len(),
+            1,
+            "reason= field selector must return only events with matching reason; \
+             without this, kubectl get events --field-selector reason=X returns unrelated events"
+        );
+        assert_eq!(result[0]["reason"], "Pulled");
     }
 }
 
