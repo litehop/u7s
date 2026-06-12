@@ -32,22 +32,13 @@ You implement exactly one bead. Read the bead with `bd show <id>` before writing
 ```bash
 # 0. Verify your worktree — BEFORE touching any file
 #
-# The mayor pre-creates your worktree before dispatching you.
-# Your dispatch prompt names it. Verify with git -C (not cd — 'cd' is
-# not in the Bash allowlist and will be denied on first call).
+# The harness sets your CWD to the worktree root automatically.
+# Verify before doing anything else.
 #
-WORKTREE=/Users/balint.erdos/u7s/ai/worktrees/<your-worktree-name>
-
-git -C $WORKTREE rev-parse --show-toplevel  # must print $WORKTREE
-git -C $WORKTREE branch --show-current      # must be worker/<slug>
-git -C $WORKTREE status --short             # must be clean
-
-# For subsequent commands you may cd into the worktree, but do NOT
-# use cd as the very first Bash call — it gets denied by the allowlist
-# and if you treat that denial as fatal the whole task aborts.
-# Start with git/cargo/bd/gh commands; cd after those succeed if needed.
-
-# NEVER edit files from the repo root. Always use absolute paths under $WORKTREE.
+pwd                              # your CWD — this is your worktree root
+git rev-parse --show-toplevel    # must match pwd
+git branch --show-current        # will be worker/agent-<id>
+git status --short               # must be clean
 
 # 1. Claim the bead
 bd update <id> --claim
@@ -59,17 +50,16 @@ bd show <id>
 
 # 4. Implement — surgical, minimal changes
 
-# 5. Run quality gates
-cargo build --workspace 2>&1 | tail -20
-cargo test --workspace 2>&1 | tail -30
-cargo clippy --workspace -- -D warnings 2>&1 | tail -20
+# 5. Run quality gates (CWD is already the worktree root)
+cargo test --workspace --quiet 2>&1 | tail -30
+cargo clippy --workspace --tests --quiet -- -D warnings 2>&1 | tail -20
 
 # 6. Commit
 git add <files>
 git commit -m "feat(<area>): <what and why>"
 
 # 7. Push and open PR
-git push -u origin <branch>
+git push
 gh pr create --title "..." --body "..."
 
 # Note for mayor: merge PRs with --merge (regular merge commit) by default.

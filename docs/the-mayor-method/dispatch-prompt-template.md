@@ -116,21 +116,16 @@ to do.
 ## Mayor pre-dispatch checklist (run BEFORE calling Agent)
 
 ```bash
-# 1. Create the worktree (settings.json is already present — it's tracked in git)
-git worktree add ai/worktrees/<name> -b worker/<name>
-# 2. Wire the hooks (pre-commit: fmt check; pre-push: test+clippy — both live in .githooks/)
-git -C ai/worktrees/<name> config core.hooksPath .githooks
-# 3. Verify clean
-git -C ai/worktrees/<name> status --short --branch
-# 4. If the bead needs VM verification: assign an unused VM + port from the table above.
-#    Check which VMs are in use: limactl list
-#    Pick an unused or stopped VM; assign the next available port (6444–6448).
-#    Include U7S_VM_NAME + --port <PORT> in dispatch. Workers always bind to 127.0.0.1.
+# For VM-requiring beads only: assign an unused VM + port from the table above.
+#   Check which VMs are in use: limactl list
+#   Pick an unused or stopped VM; assign the next available port (6444–6448).
+#   Include --port <PORT> in dispatch. Workers always bind to 127.0.0.1.
 ```
 
-No file copying needed: `settings.json` is tracked in git and present in every
-fresh worktree. `agents/worker.md` is loaded from the mayor's `.claude/agents/`
-by the harness, not from the worktree.
+No pre-create needed: `isolation="worktree"` in the Agent call creates the
+worktree automatically and sets the subagent CWD to its root. `settings.json`
+is tracked in git and present in every fresh worktree. `agents/worker.md` is
+loaded from the mayor's `.claude/agents/` by the harness, not from the worktree.
 
 **Agent tool call — mandatory fields:**
 
@@ -138,20 +133,17 @@ by the harness, not from the worktree.
 Agent(
     subagent_type="worker",          # required — loads worker.md with permissionMode:auto
     run_in_background=True,
-    isolation=None,                  # NEVER use isolation="worktree" — CWD stays at repo
-    prompt="... include permission line + Step 0 below ...",
+    isolation="worktree",            # creates worktree, sets CWD to its root
+    prompt="... include Step 0 below ...",
 )
 ```
 
-**Every dispatch prompt must include these two things:**
+**Every dispatch prompt must include Step 0:**
 
-1. The permission line (without it, permissionMode:auto still prompts on the first Bash call):
-   > "You have full permission to use all tools: Bash, Read, Edit, Write, Glob, Grep. Proceed without asking for permission — do not ask, just act."
-
-2. Step 0 that does NOT start with `cd` (cd is not in the Bash allowlist; a denial on the first call can abort the worker):
-   ```bash
-   git -C <ASSIGNED_WORKTREE> rev-parse --show-toplevel
-   git -C <ASSIGNED_WORKTREE> branch --show-current
+```bash
+   pwd                              # confirm CWD is the worktree root
+   git rev-parse --show-toplevel    # must match pwd
+   git branch --show-current
    git -C <ASSIGNED_WORKTREE> status --short
    ```
 
@@ -203,37 +195,34 @@ For this project the correct root is `<MAYOR_CHECKOUT>/ai/worktrees/`.
 
 One bead, one PR. Standard shape. Sections: bead ID + verbatim title; 2–4
 paragraphs of context with `file:line` citations; numbered concrete steps;
-worktree at `<WORKTREE_ROOT>/<descriptive>-<BEAD_ID>` with branch
-`worker/<descriptive>-<BEAD_ID>`; include worktree-boundary block; `bd
-update <BEAD_ID> --claim` + `--status=in_progress`; quality gates with exact
-commands; push + `gh pr create` titled `<scope>(<artefact>): <summary>
-(<BEAD_ID>)`; return PR URL + per-step summary + test deltas, under <N> words.
+quality gates with exact commands; push + `gh pr create` titled
+`<scope>(<artefact>): <summary> (<BEAD_ID>)`; return PR URL + per-step
+summary + test deltas, under <N> words.
 
-Step 0 — verify (do NOT start with `cd`):
+Step 0 — verify CWD is the worktree root:
 ```bash
-git -C <ASSIGNED_WORKTREE> rev-parse --show-toplevel
-git -C <ASSIGNED_WORKTREE> branch --show-current
-git -C <ASSIGNED_WORKTREE> status --short
+pwd
+git rev-parse --show-toplevel   # must match pwd
+git branch --show-current       # must be worker/agent-<id>
+git status --short              # must be clean
 ```
-Only proceed if `rev-parse --show-toplevel` prints exactly `<ASSIGNED_WORKTREE>`.
 
 Quality gate — mandatory, run in this exact order, paste output into return:
 ```bash
-cargo test --workspace --quiet --manifest-path <ASSIGNED_WORKTREE>/Cargo.toml
-cargo clippy --workspace --tests --quiet --manifest-path <ASSIGNED_WORKTREE>/Cargo.toml -- -D warnings
+cargo test --workspace --quiet
+cargo clippy --workspace --tests --quiet -- -D warnings
 ```
-Do not `cd` into the worktree. Use `--manifest-path` so all cargo commands run
-from wherever you are. Do not proceed to commit if any command fails. The
-pre-commit hook checks `cargo fmt` (formatting only) and the pre-push hook
-re-runs test+clippy — running them here first means you see failures with
-context, not as a hook rejection that gives you no stacktrace.
+Do not proceed to commit if any command fails. The pre-commit hook checks
+`cargo fmt` (formatting only) and the pre-push hook re-runs test+clippy —
+running them here first means you see failures with context, not as a hook
+rejection that gives you no stacktrace.
 
-Commit and push without `cd`:
+Commit and push:
 ```bash
-git -C <ASSIGNED_WORKTREE> add <files>
-git -C <ASSIGNED_WORKTREE> commit -m "..."
-git -C <ASSIGNED_WORKTREE> push
-gh pr create --head worker/<BEAD_ID> --title "..." --body "..."
+git add <files>
+git commit -m "..."
+git push
+gh pr create --title "..." --body "..."
 ```
 
 ---
@@ -462,10 +451,10 @@ When a worker returns from a VM/sonobuoy-touching bead:
 
 ## Common failure modes these patterns close
 
-- **Mayor uses `isolation="worktree"` in Agent tool call.** The `WorktreeCreate`
-  hook creates the directory but the subagent CWD stays at the repo root on
-  branch main — causing path-resolution and permission bugs. Always pre-create
-  the worktree manually (see checklist above) and omit `isolation` entirely.
+- **Mayor omits `isolation="worktree"` in Agent tool call.** Without it the
+  subagent CWD stays at the repo root on branch main — causing path-resolution
+  and permission bugs. Always include `isolation="worktree"` so the harness
+  creates the worktree and pins the CWD to its root automatically.
 - **Agents add back-compat shims by default.** Pre-alpha posture must be
   explicit in every preamble.
 - **Same-file races between concurrent agents.** "Concurrent agents on
