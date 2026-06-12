@@ -418,6 +418,7 @@ pub(crate) async fn watch_generic<S: Store>(
 
         // sendInitialEvents: emit existing objects as ADDED, then BOOKMARK.
         if let Some((items, list_rv)) = initial_items {
+            tracing::debug!(prefix = %prefix, list_rv, item_count = items.len(), "watch: sendInitialEvents start");
             last_rv = last_rv.max(list_rv);
             for item in items {
                 // Apply the same label/field selector filtering as live events so that
@@ -501,6 +502,16 @@ pub(crate) async fn watch_generic<S: Store>(
                                     if object_matches_label_selector(&parsed, &label_selector)
                                         && object_matches_field_selector(&parsed, &field_selector)
                                     {
+                                        let obj_name = parsed["metadata"]["name"].as_str().unwrap_or("");
+                                        let obj_ns = parsed["metadata"]["namespace"].as_str().unwrap_or("");
+                                        tracing::debug!(
+                                            prefix = %prefix,
+                                            event_type,
+                                            name = obj_name,
+                                            ns = obj_ns,
+                                            rv = obj.revision,
+                                            "watch: emitting event"
+                                        );
                                         super::defaults::apply_defaults(&group, &plural, &mut parsed);
                                         let emit = if as_partial_object_metadata {
                                             to_partial_object_metadata(&parsed)

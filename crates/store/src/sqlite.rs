@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{broadcast, Mutex};
 
 const RING_CAPACITY: usize = 1000;
-const BROADCAST_CAPACITY: usize = 512;
+const BROADCAST_CAPACITY: usize = 2048;
 
 pub struct SqliteStore {
     /// Single write connection. Mutex ensures serial access across spawn_blocking calls.
@@ -919,8 +919,21 @@ impl Store for SqliteStore {
                         }
                         // Deduplicate: skip if already covered by replay or a previous live event.
                         if event.revision <= last_replayed {
+                            tracing::debug!(
+                                prefix = %prefix_owned,
+                                key = %event.key,
+                                rv = event.revision,
+                                last_replayed,
+                                "watch: dedup skip"
+                            );
                             continue;
                         }
+                        tracing::debug!(
+                            prefix = %prefix_owned,
+                            key = %event.key,
+                            rv = event.revision,
+                            "watch: yielding live event"
+                        );
                         last_replayed = event.revision;
                         yield internal_to_watch(&event);
                         // Immediately follow every event with a BOOKMARK at the same RV.
