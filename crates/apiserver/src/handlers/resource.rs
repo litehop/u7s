@@ -1126,7 +1126,7 @@ pub async fn create_namespaced_resource<S: Store>(
     obj.body = limit_range::apply_limit_ranges(&state, obj.body, &ns, &plural).await?;
 
     // ResourceQuota: ensure object count does not exceed hard limits.
-    quota::check_resource_quota(&state, &ns, &group, &plural).await?;
+    quota::check_resource_quota(&state, &ns, &group, &plural, Some(&obj.body)).await?;
 
     // Dry-run: validation and admission passed; return the would-be created object without persisting.
     if create_query.is_dry_run() {

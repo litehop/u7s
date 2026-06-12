@@ -98,11 +98,54 @@ async fn count_objects<S: Store>(
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Returns true if a pod body is BestEffort QoS class.
+///
+/// A pod is BestEffort when ALL containers (including init containers) have
+/// no `resources.requests` and no `resources.limits`. This matches the
+/// Kubernetes QoS class definition for BestEffort pods.
+pub fn pod_is_best_effort(pod: &Value) -> bool {
+    let spec = &pod["spec"];
+    // Check main containers and init containers.
+    for containers_field in &["containers", "initContainers"] {
+        if let Some(arr) = spec[containers_field].as_array() {
+            for container in arr {
+                let requests = &container["resources"]["requests"];
+                let limits = &container["resources"]["limits"];
+                // Any non-null, non-empty requests or limits means not BestEffort.
+                if (requests.is_object() && !requests.as_object().unwrap().is_empty())
+                    || (limits.is_object() && !limits.as_object().unwrap().is_empty())
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Returns true if the object matches the given ResourceQuota scope.
+///
+/// Only "BestEffort" and "NotBestEffort" scope selectors are implemented here.
+/// Unknown scopes are treated conservatively: the object is assumed to match
+/// (quota applies), which is the safe default.
+fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
+    match scope {
+        "BestEffort" => object.is_some_and(pod_is_best_effort),
+        "NotBestEffort" => object.is_none_or(|pod| !pod_is_best_effort(pod)),
+        // Unknown scopes: assume match (conservative — don't silently skip quotas).
+        _ => true,
+    }
+}
+
 /// Check ResourceQuota constraints before a CREATE operation.
 ///
 /// Fetches all ResourceQuota objects in `namespace` and, for each hard limit that
 /// covers the incoming `resource` (by count), checks whether the current usage
 /// plus one exceeds the hard limit.
+///
+/// `object` is the pod (or other object) being created; it is used for scope
+/// matching. Pass `None` for non-pod resources — unrecognised scopes are
+/// treated as matching (safe default).
 ///
 /// Returns Ok(()) if all quotas allow the create, or a 403 StatusError if any
 /// quota would be exceeded. Returns Ok(()) immediately for cluster-scoped
@@ -112,6 +155,7 @@ pub async fn check_resource_quota<S: Store>(
     namespace: &str,
     group: &str,
     resource: &str,
+    object: Option<&Value>,
 ) -> Result<(), StatusError> {
     let quotas = fetch_resource_quotas(state, namespace).await;
     if quotas.is_empty() {
@@ -120,6 +164,19 @@ pub async fn check_resource_quota<S: Store>(
 
     for quota in &quotas {
         let quota_name = quota["metadata"]["name"].as_str().unwrap_or("<unknown>");
+
+        // Scope matching: if the quota has scopes, the object must match ALL of them.
+        if let Some(scopes) = quota["spec"]["scopes"].as_array() {
+            let matches = scopes
+                .iter()
+                .filter_map(|s| s.as_str())
+                .all(|scope| object_matches_scope(scope, object));
+            if !matches {
+                // This quota does not apply to the incoming object — skip it entirely.
+                continue;
+            }
+        }
+
         let hard = &quota["spec"]["hard"];
         if !hard.is_object() {
             continue;
@@ -274,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn check_quota_no_quota_objects_allows() {
         let state = make_state();
-        let result = check_resource_quota(&state, "default", "", "pods").await;
+        let result = check_resource_quota(&state, "default", "", "pods", None).await;
         assert!(result.is_ok(), "no quota must allow creation");
     }
 
@@ -305,7 +362,7 @@ mod tests {
         .await;
 
         // 0 pods currently → should allow (0 < 5)
-        let result = check_resource_quota(&state, "default", "", "pods").await;
+        let result = check_resource_quota(&state, "default", "", "pods", None).await;
         assert!(result.is_ok(), "quota under limit must allow creation");
     }
 
@@ -341,7 +398,7 @@ mod tests {
             seed(&state, &format!("/registry/pods/default/pod-{i}"), pod).await;
         }
 
-        let result = check_resource_quota(&state, "default", "", "pods").await;
+        let result = check_resource_quota(&state, "default", "", "pods", None).await;
         assert!(
             result.is_err(),
             "quota at hard limit must deny creation of additional pods"
@@ -387,7 +444,7 @@ mod tests {
         seed(&state, "/registry/resourcequotas/ns1/quota-b", quota_b).await;
 
         // Even though quota-a allows it, quota-b denies it.
-        let result = check_resource_quota(&state, "ns1", "", "pods").await;
+        let result = check_resource_quota(&state, "ns1", "", "pods", None).await;
         assert!(
             result.is_err(),
             "if any quota is exceeded, creation must be denied"
@@ -417,10 +474,123 @@ mod tests {
         seed(&state, "/registry/resourcequotas/ns-a/q", quota).await;
 
         // ns-b has no quota — must allow creation
-        let result = check_resource_quota(&state, "ns-b", "", "pods").await;
+        let result = check_resource_quota(&state, "ns-b", "", "pods", None).await;
         assert!(
             result.is_ok(),
             "exhausted quota in ns-a must not affect ns-b"
+        );
+    }
+
+    // -- BestEffort scope filtering --
+
+    /// A BestEffort-scoped ResourceQuota must only count BestEffort pods (no requests, no limits).
+    /// A Burstable pod (has CPU requests) must NOT count against a BestEffort quota.
+    /// Without scope filtering, any pod would be counted against a BestEffort quota,
+    /// causing legitimate Burstable pods to be incorrectly rejected.
+    #[tokio::test]
+    async fn bestefffort_scoped_quota_only_counts_bestefffort_pods() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // BestEffort-scoped quota: max 1 pod
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "be-quota", "namespace": "default" },
+            "spec": {
+                "scopes": ["BestEffort"],
+                "hard": { "pods": "1" }
+            }
+        });
+        seed(&state, "/registry/resourcequotas/default/be-quota", quota).await;
+
+        // Seed 1 pod (at the limit) — simulates an existing BestEffort pod.
+        let existing_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "be-pod-0", "namespace": "default" },
+            "spec": { "containers": [{"name": "c"}] }
+        });
+        seed(&state, "/registry/pods/default/be-pod-0", existing_pod).await;
+
+        // A BestEffort pod (no requests, no limits) must be denied — quota at limit.
+        let be_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "be-pod-new", "namespace": "default" },
+            "spec": {
+                "containers": [{"name": "c", "image": "nginx"}]
+            }
+        });
+        let result = check_resource_quota(&state, "default", "", "pods", Some(&be_pod)).await;
+        assert!(
+            result.is_err(),
+            "BestEffort pod must be denied when BestEffort-scoped quota is at its limit"
+        );
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::FORBIDDEN,
+            "quota exceeded for BestEffort pod must return 403"
+        );
+
+        // A Burstable pod (has CPU requests) must NOT be counted against BestEffort quota.
+        let burstable_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "burstable-pod", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "image": "nginx",
+                    "resources": {
+                        "requests": {"cpu": "100m"}
+                    }
+                }]
+            }
+        });
+        let result =
+            check_resource_quota(&state, "default", "", "pods", Some(&burstable_pod)).await;
+        assert!(
+            result.is_ok(),
+            "Burstable pod must NOT be counted against a BestEffort-scoped quota — \
+             it does not match the BestEffort scope and should be allowed"
+        );
+    }
+
+    /// pod_is_best_effort returns true for a pod with no resource constraints.
+    #[test]
+    fn pod_is_best_effort_with_no_resources() {
+        let pod = json!({
+            "spec": {
+                "containers": [{"name": "c", "image": "nginx"}]
+            }
+        });
+        assert!(
+            pod_is_best_effort(&pod),
+            "pod with no requests or limits must be BestEffort"
+        );
+    }
+
+    /// pod_is_best_effort returns false when any container has CPU requests.
+    #[test]
+    fn pod_is_best_effort_with_cpu_requests_returns_false() {
+        let pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "resources": {"requests": {"cpu": "100m"}}
+                }]
+            }
+        });
+        assert!(
+            !pod_is_best_effort(&pod),
+            "pod with CPU requests must NOT be BestEffort"
         );
     }
 }
