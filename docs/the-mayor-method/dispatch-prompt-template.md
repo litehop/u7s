@@ -372,56 +372,72 @@ skips VM verification is shipping untested code.
 
 ### The block (paste verbatim into applicable dispatch prompts)
 
-Fill in `<VM_NAME>` and `<HOST_IP>` from the mayor's assignment before pasting.
+Fill in `<VM_NAME>` and `<PORT>` from the mayor's assignment before pasting.
 
 ```
 ## Lima VM protocol — MANDATORY for this bead
 
 Your assigned VM: <VM_NAME>
 Your assigned port: <PORT>
+Your assigned worktree: <ASSIGNED_WORKTREE>
 
 You have exclusive use of this VM for this bead. Do NOT use `lima-node` or
 port `6443` — those belong to the mayor. All workers bind to `127.0.0.1` and
 use `--port` for isolation.
 
-You cannot invoke shell scripts directly (not in the Bash allowlist). Use
-`limactl shell <VM>`, `kubectl`, and `cargo` commands instead. The full manual
-equivalents for every stack operation are in `ai/prompts/vm-operations.md` —
-read that file before starting any VM work.
+Read `ai/prompts/vm-operations.md` IN FULL before issuing any build or stack
+command. It is the canonical reference for every operation below.
 
 **Cargo tests are not sufficient.** This bead touches a runtime path that
 sonobuoy exercises. You must verify against the live server.
 
+**IMPORTANT — paths and env vars:**
+- Build target: `<ASSIGNED_WORKTREE>/target` (in-worktree, gitignored, never /tmp)
+- State dir: `<ASSIGNED_WORKTREE>/temp/u7s` (create with mkdir -p if absent)
+- Never use inline env var prefixes (e.g. `FOO=bar cargo ...`). Set vars with
+  export on a separate line, or use the script flags below — inline prefixes
+  break the Bash allowlist pattern match and trigger permission prompts.
+
 Verification sequence (do not skip any step):
 
-1. Build and start the server bound to your host IP:
+1. Build from your worktree into your worktree's target dir:
    ```bash
-   # Build with VM-specific target dir (avoids colliding with mayor or other workers):
-   U7S_TARGET_DIR=/tmp/u7s-build-<VM_NAME> \
-     cargo build -p u7s-apiserver --release \
+   cargo build -p u7s-apiserver --release \
      --manifest-path <ASSIGNED_WORKTREE>/Cargo.toml \
-     --target-dir /tmp/u7s-build-<VM_NAME> 2>&1 | tail -5
+     --target-dir <ASSIGNED_WORKTREE>/target
+   ```
 
-   # Then start stack:
-   U7S_VM_NAME=<VM_NAME> \
-     U7S_BINARY=/tmp/u7s-build-<VM_NAME>/release/u7s-apiserver \
-     <ASSIGNED_WORKTREE>/scripts/conformance/run-all.sh --port <PORT> --reset [--focus <regex>]
+2. Start the full conformance stack (scripts are whitelisted):
+   ```bash
+   mkdir -p <ASSIGNED_WORKTREE>/temp/u7s
+   scripts/u7s-start.sh \
+     --vm <VM_NAME> --port <PORT> \
+     --binary <ASSIGNED_WORKTREE>/target/release/u7s-apiserver \
+     --workdir <ASSIGNED_WORKTREE>/temp/u7s \
+     --background
+   scripts/conformance/lima-start.sh \
+     --vm <VM_NAME> --port <PORT> \
+     --workdir <ASSIGNED_WORKTREE>/temp/u7s
+   scripts/conformance/04-start-kcm.sh \
+     --vm <VM_NAME> --port <PORT> \
+     --workdir <ASSIGNED_WORKTREE>/temp/u7s
    ```
-2. From your VM, run the sonobuoy smoke:
+
+3. Run the focused sonobuoy test:
+   ```bash
+   scripts/conformance/06-run-sonobuoy.sh \
+     --vm <VM_NAME> --port <PORT> \
+     --workdir <ASSIGNED_WORKTREE>/temp/u7s \
+     --focus "<regex>"
    ```
-   mcp__<VM_NAME>__run_shell_command: ["sonobuoy", "delete", "--all", "--wait",
-     "--kubeconfig", "/tmp/sonobuoy-kubeconfig"]
-   ```
-   Expected: exits 0 with no error lines. If it fails, read the server log and
-   debug in the VM until it passes.
-3. Your return MUST include the raw output of the sonobuoy delete command.
+   Your return MUST include the test result output from this command.
    A return without this output will be rejected.
 
 For script-only beads (no server restart needed):
-1. Run the exact commands manually in your VM first.
+1. Run the exact commands manually via `limactl shell <VM_NAME>` first.
 2. Then encode them in the script.
-3. Run the script in your VM and verify exit 0.
-4. Include at least one `mcp__<VM_NAME>__run_shell_command` output in your return.
+3. Run the script and verify exit 0.
+4. Include at least one `limactl shell` or mcp tool output in your return.
 ```
 
 ### Mayor enforcement at return-review time

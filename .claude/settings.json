@@ -17,6 +17,7 @@
       "Bash(scripts/conformance/run-all.sh *)",
       "Bash(scripts/conformance/lima-start.sh *)",
       "Bash(scripts/conformance/04-start-kcm.sh *)",
+      "Bash(scripts/conformance/06-run-sonobuoy.sh *)",
       "mcp__lima-node__*",
       "mcp__mcpls__*",
       "mcp__u7s__*"

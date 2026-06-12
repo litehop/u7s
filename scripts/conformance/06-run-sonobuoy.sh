@@ -21,6 +21,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --focus) FOCUS="$2"; shift 2 ;;
     --no-unpack) UNPACK=0; shift ;;
+    --vm) VM_NAME="$2"; shift 2 ;;
+    --port) shift 2 ;;
+    --workdir) WORKDIR="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
