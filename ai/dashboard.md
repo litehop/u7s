@@ -1,49 +1,51 @@
 # Dashboard
-2026-06-12T04:11Z — #522 #523 #524 merged. No workers in-flight. Queue: 5 open beads.
+2026-06-12T10:05Z — 1 worker in-flight (P1 stall-watchdog fix). No open PRs.
 
 Resume: `bd prime`
 
 ## Operator attention needed
 
-None.
+**GitHub branch protection is off.** Workers can push directly to main. Recommend enabling (PR + status checks required, 0 approvals). One `gh api` call — operator decision needed.
+
+**Decision pending: admission webhook enforcement (mayor-91p3, P1).** Large structural feature (webhook invocation path, mTLS via konnectivity, matching engine). NOT yet dispatched — needs scoping/approach decision before a worker. Recommend audit → operator decides → apply.
+
+**Confirmed root cause: stall-watchdog (b1dc438) was killing healthy runs.** It keyed on result-counts, which sonobuoy returns as `null` for the entire e2e run until the very end. Fix dispatched (mayor-f73c) — now keys on progress.completed/msg. Verified against sonobuoy docs + your midway-dump.log. This was NOT an apiserver bug.
 
 ## In-flight workers
 
-None.
+| Worker | Bead | Surface | VM |
+|---|---|---|---|
+| acc440329b9ec0b4f | mayor-f73c (P1) | scripts/conformance/06-run-sonobuoy.sh | lima-node-smoke:6444 |
 
 ## Open PRs
 
 None.
 
 ## Recent merges
-- #524 fix(apiserver): increment generation and add GET on ephemeralcontainers (mayor-d74k)
-- #523 fix(proto): regression test for GRPC probe decode (mayor-ephx)
-- #522 fix(apiserver): DNS pod exec 404 routing fix (mayor-7cjk + mayor-pbwj)
-- #521 fix(watch): suppress store BOOKMARK events when allowWatchBookmarks=false (mayor-4oqo)
-- #520 fix(apiserver): include CRD schemas in /openapi/v2 definitions (mayor-slc2)
+- #531 fix(apiserver): seed CoreDNS Corefile with kubernetes cluster.local plugin (mayor-mm5q)
+- #529 fix(apiserver): store and validate matchConditions in webhook configurations (mayor-ahqr)
+- acda944 docs(ai): lead vm-operations.md with run-all.sh as primary conformance path
+- b1dc438 fix(scripts): sonobuoy stall detector (mayor-l5hs, direct push)
 
 ## VM port assignment
 | Slot | VM | Port | Who |
 |---|---|---|---|
 | mayor | lima-node | 6443 | Mayor |
-| worker-1 | lima-node-smoke | 6444 | free (running) |
-| worker-2 | lima-node-2 | 6445 | free (running) |
+| worker-1 | lima-node-smoke | 6444 | free |
+| worker-2 | lima-node-2 | 6445 | free |
 | worker-3 | — | 6446 | free |
 | worker-4 | — | 6447 | free |
 | worker-5 | — | 6448 | free |
 
-## Queued
-- mayor-352r (P2) — namespace TTL watchdog (scripts)
-- mayor-ewnt (P2) — scheduling predicates (VM required)
-- mayor-rzmf (P2) — webhooks (large missing feature)
-- mayor-2zo1 (P2) — ResourceQuota admission (large missing feature)
-- mayor-zhr6 (P3) — projected volumes
-- mayor-l5hs (P3) — sonobuoy stall detector (blocked on mayor-352r)
+## Queued beads
+- mayor-91p3 (P1) — admission webhook enforcement (webhooks never invoked during admission)
+- mayor-b69i (P2) — CEL validation on MutatingWebhookConfiguration matchConditions
+- mayor-1mp5 (P2) — json-patch on custom resources (application/json-patch+json)
 
 ## Loops running (session-only, expire 7 days)
-- :07 hourly — posture reread (2ea6d18f)
-- :11 hourly — worktree hygiene (ff60a583)
-- :17 every 2h — cluster review (a4d9857a)
-- :23 every 2h — merge pass (28f6d4ef)
-- :43 hourly — bead dispatch pass (53ca77a8)
-- :53 hourly — dashboard refresh (c5b70796)
+- :07 hourly — posture reread (bb24b47f)
+- :11 hourly — worktree hygiene (08b00076)
+- :17 every 2h — cluster review (21c96a0e)
+- :23 every 2h — merge pass (a9211fb9)
+- :43 hourly — bead dispatch pass (6c5b835f)
+- :53 hourly — dashboard refresh (a0fe9f4a)
