@@ -561,8 +561,10 @@ pub(crate) async fn watch_generic<S: Store>(
                                 } else {
                                     tracing::warn!("watch {event_type} event has invalid UTF-8, skipping");
                                 }
-                            } else if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
-                                yield Ok::<Bytes, axum::BoxError>(chunk);
+                            } else if !matches!(&event, WatchEvent::Bookmark { .. }) || allow_watch_bookmarks {
+                                if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
+                                    yield Ok::<Bytes, axum::BoxError>(chunk);
+                                }
                             }
                         }
                     }
@@ -2714,6 +2716,96 @@ mod tests {
             "BOOKMARK revision {event} must be >= pod write revision {pod_rv} — \
              without this, KCM ConsistencyStore.EnsureReady requeues the StatefulSet \
              controller forever after every pod creation"
+        );
+    }
+
+    /// When allowWatchBookmarks is false, the server must suppress all BOOKMARK events —
+    /// including the store-generated trailing bookmark that follows every live event.
+    /// A client that does not opt in to bookmarks must receive only Added/Modified/Deleted
+    /// events. Receiving a BOOKMARK when allowWatchBookmarks=false breaks conformance tests
+    /// whose event loops treat BOOKMARK as an unexpected event type and fail with
+    /// "expected DELETE, but got BOOKMARK".
+    ///
+    /// This test fails on revert: without suppression, the trailing BOOKMARK from the
+    /// store's live loop arrives before the DELETE is processed, and the BOOKMARK count
+    /// is non-zero.
+    #[tokio::test]
+    async fn watch_generic_allow_watch_bookmarks_false_suppresses_store_bookmarks() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Create an object so we have something to delete.
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "cm-to-delete", "namespace": "default" }
+        });
+        let rv = store
+            .put(
+                "/registry/configmaps/default/cm-to-delete",
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Open watch from after the creation, so only the DELETE will appear.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: rv,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "configmaps".into(),
+                timeout_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
+
+        // Delete the object — this triggers: DELETE event + trailing BOOKMARK in store.
+        store
+            .delete("/registry/configmaps/default/cm-to-delete", Some(rv))
+            .await
+            .unwrap();
+
+        let lines = read_watch_body_with_timeout(resp).await;
+
+        let deleted_count = lines.iter().filter(|v| v["type"] == "DELETED").count();
+        assert_eq!(
+            deleted_count, 1,
+            "DELETE event must arrive when allowWatchBookmarks=false; got {:?}",
+            lines
+        );
+
+        let bookmark_count = lines.iter().filter(|v| v["type"] == "BOOKMARK").count();
+        assert_eq!(
+            bookmark_count, 0,
+            "no BOOKMARK events must appear when allowWatchBookmarks=false; \
+             the store emits a trailing BOOKMARK after every event — if watch_generic does \
+             not suppress it, clients that treat BOOKMARK as unexpected receive it instead \
+             of (or before) DELETE, causing conformance tests to fail with \
+             'expected DELETE, but got BOOKMARK'; got lines {:?}",
+            lines
         );
     }
 }
