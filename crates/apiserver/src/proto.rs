@@ -7174,6 +7174,89 @@ mod tests {
         );
     }
 
+    /// decode_pod_proto must preserve livenessProbe.grpc.port so kubelet can
+    /// perform the GRPC health-check request.
+    ///
+    /// When a pod is submitted via protobuf with a GRPC liveness probe, kubelet reads
+    /// livenessProbe.grpc.port from the stored JSON to open the gRPC connection. If the
+    /// GRPCAction sub-message is not decoded, the stored probe has no grpc field — kubelet
+    /// cannot determine which port to probe and the container stays in ContainerCreating
+    /// until the conformance test times out after 240 s.
+    ///
+    /// This test must fail if GrpcProbeAction decoding or probe_to_json's grpc branch are removed.
+    #[test]
+    fn decode_pod_proto_preserves_liveness_probe_grpc_port() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "grpc-app", namespace: "default" },
+        //   spec: PodSpec {
+        //     containers: [Container {
+        //       name: "grpc-app", image: "grpc:v1",
+        //       livenessProbe: Probe {         // Container field 10
+        //         handler: ProbeHandler {      // Probe field 1
+        //           grpc: GRPCAction {         // ProbeHandler field 4
+        //             port: 8080,              // GRPCAction field 1 (int32 varint)
+        //           }
+        //         },
+        //         periodSeconds: 10,           // Probe field 4
+        //       }
+        //     }]
+        //   }
+        // }
+
+        // Encode GRPCAction: port at field 1 (wire type 0, varint)
+        let mut grpc_action = encode_varint(1u64 << 3); // tag: field 1, wire type 0
+        grpc_action.extend_from_slice(&encode_varint(8080));
+
+        // Encode ProbeHandler: grpc at field 4 (wire type 2, length-delimited message)
+        let probe_handler = encode_length_delimited(4, &grpc_action);
+
+        // Encode Probe: handler at field 1, periodSeconds at field 4
+        let mut probe = encode_length_delimited(1, &probe_handler);
+        probe.extend_from_slice(&encode_varint(4u64 << 3)); // field 4 = periodSeconds
+        probe.extend_from_slice(&encode_varint(10));
+
+        // Encode Container: name=field 1, image=field 2, livenessProbe=field 10
+        let mut container = encode_length_delimited(1, b"grpc-app");
+        container.extend_from_slice(&encode_length_delimited(2, b"grpc:v1"));
+        container.extend_from_slice(&encode_length_delimited(10, &probe));
+
+        let mut obj_meta = encode_length_delimited(1, b"grpc-app");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        let pod_spec = encode_length_delimited(2, &container); // PodSpec.containers = field 2
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto).expect(
+            "decode_pod_proto must succeed — without grpc probe decoding, \
+             kubelet cannot determine which port to health-check",
+        );
+
+        assert_eq!(result["metadata"]["name"], "grpc-app");
+
+        let probe = &result["spec"]["containers"][0]["livenessProbe"];
+        assert!(
+            probe.is_object(),
+            "livenessProbe must be present in decoded JSON — if missing, kubelet skips \
+             the health-check entirely and the container stays in ContainerCreating"
+        );
+        assert!(
+            probe["grpc"].is_object(),
+            "livenessProbe.grpc must be present — if missing, kubelet cannot determine \
+             which port to probe and the pod hangs in ContainerCreating for 240 s \
+             (conformance: container_probe.go should be restarted with a GRPC liveness probe)"
+        );
+        assert_eq!(
+            probe["grpc"]["port"], 8080,
+            "livenessProbe.grpc.port must be 8080 — kubelet opens the gRPC connection \
+             on this port; if absent or wrong, the health-check targets the wrong address"
+        );
+        assert_eq!(
+            probe["periodSeconds"], 10,
+            "periodSeconds must be decoded alongside the grpc handler"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Tests — decode_node_proto
     // ---------------------------------------------------------------------------
