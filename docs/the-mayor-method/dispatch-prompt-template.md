@@ -348,11 +348,14 @@ Your assigned port: 6444
 The worker uses these to invoke the conformance stack:
 
 ```bash
-U7S_VM_NAME=lima-node-smoke \
-  ./scripts/conformance/run-all.sh --port 6444 [--reset] [--focus <regex>]
+scripts/conformance/run-all.sh \
+  --vm lima-node-smoke \
+  --port 6444 \
+  --workdir ./temp/u7s \
+  [--reset] [--focus <regex>]
 ```
 
-WORKDIR and kubeconfig are derived automatically by the scripts from `U7S_VM_NAME`.
+`--workdir ./temp/u7s` (relative to CWD = worktree root) is where state lands.
 Workers must not hard-code `lima-node` or `6443` anywhere. `U7S_HOST_IP` is no longer
 used — workers always bind to `127.0.0.1` and use `--port` for isolation.
 
@@ -406,30 +409,19 @@ Verification sequence (do not skip any step):
      --target-dir <ASSIGNED_WORKTREE>/target
    ```
 
-2. Start the full conformance stack (scripts are whitelisted):
+2. Run the full conformance stack. **First run must use `--reset`** — the VM may
+   have stale state from its previous owner:
    ```bash
-   mkdir -p <ASSIGNED_WORKTREE>/temp/u7s
-   scripts/u7s-start.sh \
+   scripts/conformance/run-all.sh \
      --vm <VM_NAME> --port <PORT> \
      --binary <ASSIGNED_WORKTREE>/target/release/u7s-apiserver \
      --workdir <ASSIGNED_WORKTREE>/temp/u7s \
-     --background
-   scripts/conformance/lima-start.sh \
-     --vm <VM_NAME> --port <PORT> \
-     --workdir <ASSIGNED_WORKTREE>/temp/u7s
-   scripts/conformance/04-start-kcm.sh \
-     --vm <VM_NAME> --port <PORT> \
-     --workdir <ASSIGNED_WORKTREE>/temp/u7s
-   ```
-
-3. Run the focused sonobuoy test:
-   ```bash
-   scripts/conformance/06-run-sonobuoy.sh \
-     --vm <VM_NAME> --port <PORT> \
-     --workdir <ASSIGNED_WORKTREE>/temp/u7s \
+     --reset \
      --focus "<regex>"
    ```
-   Your return MUST include the test result output from this command.
+   Subsequent runs in the same worktree omit `--reset` (reuses CA, kubeconfig, and VM).
+
+   Your return MUST include the sonobuoy result output from this command.
    A return without this output will be rejected.
 
 For script-only beads (no server restart needed):

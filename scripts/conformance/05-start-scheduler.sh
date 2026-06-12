@@ -7,8 +7,19 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-WORKDIR="$REPO/temp/u7s"
 BINARY="$REPO/target/release/u7s-scheduler"
+
+WORKDIR="$PWD/temp/u7s"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --workdir) WORKDIR="$2"; shift 2 ;;
+    --port) shift 2 ;;
+    --vm) shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
 LOG="$WORKDIR/scheduler.log"
 
 echo "=== [05] Start u7s-scheduler (on host) ==="
@@ -26,9 +37,12 @@ fi
 
 mkdir -p "$WORKDIR"
 
-if pgrep -f u7s-scheduler >/dev/null 2>&1; then
-  echo "WARNING: u7s-scheduler already running — killing and restarting" >&2
-  pkill -f u7s-scheduler 2>/dev/null || true
+# Scope the kill to a scheduler already bound to THIS kubeconfig so parallel
+# workers on other VMs/ports keep their schedulers. A global `pkill -f
+# u7s-scheduler` would tear down a peer worker's scheduler.
+if pgrep -f "u7s-scheduler.*${WORKDIR}/kubeconfig" >/dev/null 2>&1; then
+  echo "WARNING: u7s-scheduler for $WORKDIR already running — killing and restarting" >&2
+  pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
   sleep 1
 fi
 

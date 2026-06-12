@@ -21,9 +21,8 @@ sa.key
 sa.pub
 /kubeconfig
 
-# Local dev state (scripts/u7s-start.sh)
+# Local dev state (scripts/u7s-start.sh); temp/u7s/ lives in each worktree
 temp/*
-!temp/u7s/.gitkeep
 
 .claude/scheduled_tasks.json
 .claude/plans/

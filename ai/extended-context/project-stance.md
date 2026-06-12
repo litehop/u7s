@@ -41,7 +41,7 @@ U7S_VM_NAME=<assigned-vm> U7S_HOST_IP=<assigned-ip> \
   ./scripts/conformance/run-all.sh [--reset] [--focus <regex>]
 ```
 
-WORKDIR derives automatically: `temp/u7s/` for `lima-node`, `temp/u7s-<name>/` for all others.
+WORKDIR defaults to `./temp/u7s/` relative to CWD (the active worktree root). Pass `--workdir <path>` to override.
 The MCP server name mirrors the VM: `mcp__<VM_NAME>__run_shell_command`.
 
 Available VMs (up to 6 in parallel, soft limit: ~4 GiB RAM each):

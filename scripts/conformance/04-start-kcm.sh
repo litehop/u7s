@@ -27,10 +27,8 @@ _VM="${U7S_VM_NAME:-lima-node}"
 VM_NAME="$_VM"
 if [ -n "$_WORKDIR_OVERRIDE" ]; then
   WORKDIR="$_WORKDIR_OVERRIDE"
-elif [ "$_VM" = "lima-node" ]; then
-  WORKDIR="$REPO/temp/u7s"
 else
-  WORKDIR="$REPO/temp/u7s-${_VM}"
+  WORKDIR="$PWD/temp/u7s"
 fi
 
 echo "=== [04] Start kube-controller-manager (inside $VM_NAME) ==="

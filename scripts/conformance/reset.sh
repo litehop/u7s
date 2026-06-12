@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
 # Full teardown for the conformance stack — kills host processes, kills
-# in-VM processes, and deletes the lima-node VM so the next run starts clean.
+# in-VM processes, and deletes the VM so the next run starts clean.
 #
 # Usage:
-#   scripts/conformance/reset.sh
+#   scripts/conformance/reset.sh [--vm <name>] [--workdir <path>] [--port <N>]
 #
 # After this script:
-#   - temp/u7s/ is gone (DB, certs, kubeconfig, PID files all wiped)
-#   - lima-node VM is deleted (full disk wipe — no stale certs/containers)
+#   - ./temp/u7s/ is gone (DB, certs, kubeconfig, PID files all wiped)
+#   - The VM is deleted (full disk wipe — no stale certs/containers)
 #
 # To resume a fresh run:
 #   scripts/conformance/run-all.sh
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-WORKDIR="$REPO/temp/u7s"
+WORKDIR="$PWD/temp/u7s"
+VM_NAME="${U7S_VM_NAME:-lima-node}"
+PORT="${U7S_PORT:-6443}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --workdir) WORKDIR="$2"; shift 2 ;;
+    --vm) VM_NAME="$2"; shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
 
 echo "=== [reset] Conformance teardown ==="
 
@@ -35,9 +44,13 @@ for name in apiserver scheduler; do
   fi
 done
 
-# Fallback: sweep any stray processes not tracked by PID files.
-pkill -f u7s-apiserver 2>/dev/null || true
-pkill -f u7s-scheduler 2>/dev/null || true
+# Fallback: kill apiserver on this port and scheduler bound to this worktree.
+API_PID=$(lsof -ti tcp:"$PORT" 2>/dev/null || true)
+if [ -n "$API_PID" ]; then
+  echo "[reset]   killing apiserver on port $PORT (PID $API_PID)"
+  kill "$API_PID" 2>/dev/null || true
+fi
+pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
 
 # ── 2. Wipe host state ────────────────────────────────────────────────────────
 
@@ -50,23 +63,23 @@ fi
 
 # ── 3. Kill in-VM processes (best-effort) ────────────────────────────────────
 
-if limactl list --format '{{.Name}}' 2>/dev/null | grep -q '^lima-node$'; then
-  vm_status="$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk '/^lima-node / {print $2}')"
+if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "^${VM_NAME}$"; then
+  vm_status="$(limactl list --format '{{.Name}} {{.Status}}' 2>/dev/null | awk "/^${VM_NAME} / {print \$2}")"
   if [ "$vm_status" = "Running" ]; then
-    echo "[reset] Stopping processes inside lima-node VM ..."
-    limactl shell lima-node pkill -f kubelet                2>/dev/null || true
-    limactl shell lima-node pkill -f kube-controller-manager 2>/dev/null || true
-    limactl shell lima-node pkill -f sonobuoy              2>/dev/null || true
+    echo "[reset] Stopping processes inside $VM_NAME VM ..."
+    limactl shell "$VM_NAME" pkill -f kubelet                2>/dev/null || true
+    limactl shell "$VM_NAME" pkill -f kube-controller-manager 2>/dev/null || true
+    limactl shell "$VM_NAME" pkill -f sonobuoy              2>/dev/null || true
   else
-    echo "[reset] lima-node VM exists but is not running (status: $vm_status) — skipping in-VM kill"
+    echo "[reset] $VM_NAME VM exists but is not running (status: $vm_status) — skipping in-VM kill"
   fi
 else
-  echo "[reset] lima-node VM does not exist — skipping in-VM kill"
+  echo "[reset] $VM_NAME VM does not exist — skipping in-VM kill"
 fi
 
 # ── 4. Delete the VM ─────────────────────────────────────────────────────────
 
-echo "[reset] Deleting lima-node VM (full disk wipe) ..."
-limactl delete --force lima-node 2>/dev/null || true
+echo "[reset] Deleting $VM_NAME VM (full disk wipe) ..."
+limactl delete --force "$VM_NAME" 2>/dev/null || true
 
 echo "[reset] Done. Run scripts/conformance/run-all.sh for a fresh conformance run."

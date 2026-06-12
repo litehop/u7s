@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Start u7s-apiserver for local development against a lima-node kubelet.
 #
-# State persists in ./temp/u7s/ across restarts so the CA and kubelet trust
-# relationship survive a server restart without re-provisioning the VM.
+# State persists in ./temp/u7s/ (relative to CWD — always the active worktree)
+# across restarts so the CA and kubelet trust relationship survive a server
+# restart without re-provisioning the VM.
 #
 # Usage:
 #   scripts/u7s-start.sh [--reset] [--background] [--port <N>]
@@ -19,7 +20,7 @@
 #                 The apiserver, konnectivity-server, and readiness checks all use this address.
 #
 # After starting (foreground mode):
-#   export KUBECONFIG=./temp/u7s/kubeconfig
+#   export KUBECONFIG=./temp/u7s/kubeconfig   (relative to CWD / active worktree)
 #   scripts/conformance/lima-start.sh  # join kubelet (first run or after --reset)
 #   kubectl get nodes
 set -euo pipefail
@@ -48,10 +49,8 @@ PORT="${_PORT_OVERRIDE:-6443}"
 _VM="${U7S_VM_NAME:-lima-node}"
 if [ -n "$_WORKDIR_OVERRIDE" ]; then
   WORKDIR="$_WORKDIR_OVERRIDE"
-elif [ "$_VM" = "lima-node" ]; then
-  WORKDIR="$REPO/temp/u7s"
 else
-  WORKDIR="$REPO/temp/u7s-${_VM}"
+  WORKDIR="$PWD/temp/u7s"
 fi
 BINARY="${U7S_BINARY:-$REPO/target/release/u7s-apiserver}"
 HOST_IP="${U7S_HOST_IP:-127.0.0.1}"
@@ -64,16 +63,15 @@ fi
 KONNECTIVITY_OUT=$("$REPO/scripts/download-konnectivity.sh")
 SERVER_BIN=$(echo "$KONNECTIVITY_OUT" | grep '^server=' | cut -d= -f2)
 
-# Always kill any stale konnectivity-server so a --reset doesn't leave one
-# running with cert paths that no longer exist in the wiped WORKDIR.
-pkill -f konnectivity-server 2>/dev/null || true
+# Kill this worktree's konnectivity-server (scoped by cert path) so a --reset
+# doesn't leave one running with cert paths that no longer exist in the wiped WORKDIR.
+pkill -f "konnectivity-server.*${WORKDIR}" 2>/dev/null || true
 
 if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
     echo "Port $HOST_IP:$PORT in use — killing existing apiserver before restart ..." >&2
-    # Scope pkill to HOST_IP so we don't kill a mayor's apiserver running on
-    # a different loopback address (e.g. 127.0.0.1 vs 127.0.0.2).
-    pkill -f "u7s-apiserver.*${HOST_IP}" 2>/dev/null || true
+    API_PID=$(lsof -ti tcp:"$PORT" 2>/dev/null || true)
+    [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null || true
     sleep 1
   else
     echo "error: port $HOST_IP:$PORT is already in use." >&2
@@ -115,7 +113,7 @@ EXTEOF
     rm -f "$WORKDIR/konnectivity-server.csr"
   fi
 
-  pkill -f konnectivity-server || true
+  pkill -f "konnectivity-server.*${WORKDIR}" || true
 
   "$SERVER_BIN" \
     --logtostderr=true \

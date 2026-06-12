@@ -25,11 +25,24 @@ the address rewrite automatically when given `--port <PORT>`.
 
 ## Primary path — use run-all.sh
 
-For full stack bringup (build + apiserver + kubelet + KCM + sonobuoy), use `run-all.sh`:
+For full stack bringup (build + apiserver + kubelet + KCM + sonobuoy), use `run-all.sh`.
+
+**First run in a fresh worktree — always pass `--reset`.**
+The VM may have stale state from its previous owner (old certs, stale processes, leftover kubeconfig). `--reset` wipes the worktree's `temp/u7s/`, kills any process on `<PORT>`, kills in-VM processes, and deletes+reprovisions the VM.
 
 ```bash
-mkdir -p <WORKTREE>/temp/u7s
+scripts/conformance/run-all.sh \
+  --vm      <VM> \
+  --port    <PORT> \
+  --workdir <WORKTREE>/temp/u7s \
+  --reset \
+  --focus   "<regex>"
+```
 
+**Subsequent runs in the same worktree — omit `--reset`.**
+The CA, kubeconfig, and VM are already set up. Omitting `--reset` reuses them, which is faster and avoids unnecessary re-provisioning.
+
+```bash
 scripts/conformance/run-all.sh \
   --vm      <VM> \
   --port    <PORT> \
@@ -39,7 +52,7 @@ scripts/conformance/run-all.sh \
 
 `run-all.sh` handles build, CA generation, kubeconfig, all component starts, and sonobuoy in one invocation. It is whitelisted. Do NOT replicate its steps manually unless you need a partial restart (see individual steps below).
 
-To build first and then run:
+To build first from the worktree and then run:
 ```bash
 cargo build -p u7s-apiserver --release \
   --manifest-path <WORKTREE>/Cargo.toml \
@@ -50,6 +63,7 @@ scripts/conformance/run-all.sh \
   --port    <PORT> \
   --binary  <WORKTREE>/target/release/u7s-apiserver \
   --workdir <WORKTREE>/temp/u7s \
+  --reset \
   --focus   "<regex>"
 ```
 

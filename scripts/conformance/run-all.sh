@@ -14,7 +14,7 @@
 #                                  [--binary <path>] [--port <N>] [--workdir <path>]
 #
 #   --reset   Run reset.sh before building — kills host processes, deletes the
-#             lima-node VM, and wipes temp/u7s/ for a fully clean run.
+#             lima-node VM, and wipes ./temp/u7s/ (relative to CWD) for a fully clean run.
 #   --focus   Passed through to sonobuoy to narrow test selection.
 #             Also settable via SONOBUOY_FOCUS env var.
 #   --vm      Lima VM name to use (default: lima-node). Sets U7S_VM_NAME so all
@@ -33,18 +33,13 @@
 #   --port    Apiserver listen port (default: 6443). Forwarded to u7s-start.sh and
 #             lima-start.sh via U7S_PORT so both sides use the same port.
 #   --workdir Directory for apiserver state (DB, certs, kubeconfig). Forwarded to
-#             u7s-start.sh and child scripts via U7S_WORKDIR. Defaults to the
-#             standard temp/u7s[-<vm>]/ path.
+#             u7s-start.sh and child scripts. Defaults to ./temp/u7s relative to CWD
+#             (the active worktree root when invoked from a worktree).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DIR="$REPO/scripts/conformance"
-_VM="${U7S_VM_NAME:-lima-node}"
-if [ "$_VM" = "lima-node" ]; then
-  WORKDIR="$REPO/temp/u7s"
-else
-  WORKDIR="$REPO/temp/u7s-${_VM}"
-fi
+WORKDIR="$PWD/temp/u7s"
 FOCUS="${SONOBUOY_FOCUS:-}"
 RESET=0
 BINARY=""
@@ -54,6 +49,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
     --focus) FOCUS="$2"; shift 2 ;;
+    --verbose) export RUST_LOG=debug; shift ;;
     --vm) U7S_VM_NAME="$2"; export U7S_VM_NAME; shift 2 ;;
     --ip) U7S_HOST_IP="$2"; export U7S_HOST_IP; shift 2 ;;
     --binary) BINARY="$2"; shift 2 ;;
@@ -78,12 +74,15 @@ fi
 # Build optional CLI args for child scripts that accept --port / --workdir.
 _PORT_ARG=""
 _WORKDIR_ARG=""
+_VM_ARG=""
 [ -n "$PORT" ]    && _PORT_ARG="--port $PORT"
 [ -n "$WORKDIR" ] && _WORKDIR_ARG="--workdir $WORKDIR"
+[ -n "${U7S_VM_NAME:-}" ] && _VM_ARG="--vm $U7S_VM_NAME"
 
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
-  bash "$DIR/reset.sh"
+  # shellcheck disable=SC2086
+  bash "$DIR/reset.sh" ${_VM_ARG} ${_PORT_ARG} ${_WORKDIR_ARG}
 fi
 
 # Step 01: Build — skipped when --binary is supplied (caller provides the binary).

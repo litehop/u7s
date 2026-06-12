@@ -10,7 +10,7 @@ Full end-to-end: u7s on the Mac host, kubelet inside a lima VM.
 # 1. Build
 cargo build --release -p u7s-apiserver
 
-# 2. Start apiserver (state persists in ./temp/u7s/ across restarts)
+# 2. Start apiserver (state persists in ./temp/u7s/ relative to CWD)
 scripts/u7s-start.sh
 # → prints: export KUBECONFIG=./temp/u7s/kubeconfig
 
@@ -30,7 +30,7 @@ kubectl get pods -A
 
 **Re-joining after a server restart:** Just re-run `scripts/conformance/lima-start.sh` — it rewrites the kubeconfig in the VM and restarts kubelet. The CA is stable across restarts so no re-provisioning is needed.
 
-**Full reset** (rotates CA — kubelet must re-join):
+**Full reset** (rotates CA — kubelet must re-join; wipes `./temp/u7s/` in CWD):
 ```bash
 scripts/u7s-start.sh --reset
 export KUBECONFIG=./temp/u7s/kubeconfig
@@ -49,7 +49,7 @@ scripts/conformance/lima-start.sh   # provisions fresh VM then joins
 
 Builds are handled by the caller (`cargo build --release`). This script only starts the server, waits for the port to open, and prints the `KUBECONFIG` export line.
 
-State lives in `./temp/u7s/` (gitignored). The CA and SA keys persist across restarts so kubelets stay joined without re-provisioning.
+State lives in `./temp/u7s/` relative to CWD (gitignored). The CA and SA keys persist across restarts so kubelets stay joined without re-provisioning.
 
 ```bash
 scripts/u7s-start.sh             # start (errors if port 6443 already in use)
@@ -71,7 +71,7 @@ scripts/conformance/run-all.sh --focus "ConfigMap"
 
 # Or run steps individually:
 scripts/conformance/01-build.sh
-scripts/conformance/02-start-apiserver.sh   # starts apiserver backgrounded; logs to ./temp/u7s/apiserver.log
+scripts/conformance/02-start-apiserver.sh   # starts apiserver backgrounded; logs to ./temp/u7s/apiserver.log (relative to CWD)
 export KUBECONFIG=./temp/u7s/kubeconfig
 scripts/conformance/lima-start.sh
 scripts/conformance/04-start-kcm.sh
@@ -172,5 +172,5 @@ certificate signature failure
 ```bash
 # Correct diagnostic — if this works, the server and cert are fine:
 kubectl get namespaces
-curl --cacert ./temp/u7s/ca.crt https://127.0.0.1:6443/api
+curl --cacert ./temp/u7s/ca.crt https://127.0.0.1:6443/api   # ./temp/u7s/ relative to CWD
 ```

@@ -9,20 +9,16 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 VM_NAME="${U7S_VM_NAME:-lima-node}"
 FOCUS="${SONOBUOY_FOCUS:-}"
-_VM="${U7S_VM_NAME:-lima-node}"
-if [ "$_VM" = "lima-node" ]; then
-  WORKDIR="$REPO/temp/u7s"
-else
-  WORKDIR="$REPO/temp/u7s-${_VM}"
-fi
+WORKDIR="$PWD/temp/u7s"
 UNPACK=1
+PORT="${U7S_PORT:-6443}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --focus) FOCUS="$2"; shift 2 ;;
     --no-unpack) UNPACK=0; shift ;;
     --vm) VM_NAME="$2"; shift 2 ;;
-    --port) shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -183,7 +179,8 @@ REWRITTEN=$(mktemp)
 _WATCHDOG_PID=""
 _STALL_WATCHDOG_PID=""
 trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true; [ -n "$_STALL_WATCHDOG_PID" ] && kill "$_STALL_WATCHDOG_PID" 2>/dev/null || true' EXIT
-sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "$KUBECONFIG" > "$REWRITTEN"
+sed "s|https://127.0.0.1:${PORT}|https://host.lima.internal:${PORT}|g" "$KUBECONFIG" > "$REWRITTEN"
+limactl shell "$VM_NAME" sudo rm -f /tmp/sonobuoy-kubeconfig
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
 
 echo "Cleaning up any previous sonobuoy run..."
@@ -271,8 +268,8 @@ limactl shell "$VM_NAME" sudo cp "$HOST_PATH" /tmp/sonobuoy-results.tar.gz
 
 TIMESTAMP=$(date +%m%d-%H%M)
 FOCUS_SLUG=$(echo "${FOCUS:-conformance}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')
-OUTFILE="$REPO/temp/e2e/${TIMESTAMP}-${FOCUS_SLUG}.tar.gz"
-mkdir -p "$REPO/temp/e2e"
+OUTFILE="$WORKDIR/../e2e/${TIMESTAMP}-${FOCUS_SLUG}.tar.gz"
+mkdir -p "$WORKDIR/../e2e"
 limactl copy "${VM_NAME}:/tmp/sonobuoy-results.tar.gz" "$OUTFILE"
 echo "Results: $OUTFILE"
 
