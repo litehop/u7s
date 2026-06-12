@@ -219,13 +219,22 @@ Only proceed if `rev-parse --show-toplevel` prints exactly `<ASSIGNED_WORKTREE>`
 
 Quality gate — mandatory, run in this exact order, paste output into return:
 ```bash
-cargo test --workspace --quiet
-cargo clippy --workspace --tests --quiet -- -D warnings
+cargo test --workspace --quiet --manifest-path <ASSIGNED_WORKTREE>/Cargo.toml
+cargo clippy --workspace --tests --quiet --manifest-path <ASSIGNED_WORKTREE>/Cargo.toml -- -D warnings
 ```
-Do not proceed to commit if any command fails. The pre-commit hook checks
-`cargo fmt` (formatting only) and the pre-push hook re-runs test+clippy —
-running them here first means you see failures with context, not as a hook
-rejection that gives you no stacktrace.
+Do not `cd` into the worktree. Use `--manifest-path` so all cargo commands run
+from wherever you are. Do not proceed to commit if any command fails. The
+pre-commit hook checks `cargo fmt` (formatting only) and the pre-push hook
+re-runs test+clippy — running them here first means you see failures with
+context, not as a hook rejection that gives you no stacktrace.
+
+Commit and push without `cd`:
+```bash
+git -C <ASSIGNED_WORKTREE> add <files>
+git -C <ASSIGNED_WORKTREE> commit -m "..."
+git -C <ASSIGNED_WORKTREE> push
+gh pr create --head worker/<BEAD_ID> --title "..." --body "..."
+```
 
 ---
 
