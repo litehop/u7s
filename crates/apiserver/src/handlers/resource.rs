@@ -652,6 +652,16 @@ pub(crate) async fn do_patch<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
+    // reject any patch attempt.  Real kube-apiserver returns 422 "Invalid".
+    if group.is_empty() && (plural == "secrets" || plural == "configmaps") {
+        if current.body["immutable"] == serde_json::Value::Bool(true) {
+            return Err(Status::unprocessable_entity(format!(
+                "{plural}/{name} is immutable and cannot be updated"
+            )));
+        }
+    }
+
     // Capture spec before patch for generation tracking on workload resources.
     let spec_before_patch = if super::defaults::is_workload_resource(group, plural) {
         Some(current.body["spec"].clone())
@@ -1338,11 +1348,12 @@ pub async fn replace_namespaced_resource<S: Store>(
 
     let key = group_object_key(&group, &plural, Some(&ns), &name);
 
-    // Read the stored object once: capture spec (for generation increment on workload
-    // resources) and status (to restore after stripping — controllers update status
-    // via the /status subresource; a full PUT must not wipe it out).
-    let needs_stored_read =
-        super::defaults::is_workload_resource(&group, &plural) || meta.has_status_subresource;
+    // Read the stored object once: used for (a) immutability enforcement on
+    // Secrets/ConfigMaps, (b) generation tracking on workload resources, and
+    // (c) status restoration when the resource has a dedicated status subresource.
+    let needs_stored_read = super::defaults::is_workload_resource(&group, &plural)
+        || meta.has_status_subresource
+        || (group.is_empty() && (plural == "secrets" || plural == "configmaps"));
     let (spec_before_replace, stored_status) = if needs_stored_read {
         let parsed = state
             .store
@@ -1350,6 +1361,32 @@ pub async fn replace_namespaced_resource<S: Store>(
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .and_then(|stored| serde_json::from_slice::<serde_json::Value>(&stored.value).ok());
+
+        // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
+        // reject any update that modifies data/binaryData/stringData or clears the
+        // immutable flag.  Real kube-apiserver returns 422 "Invalid" in this case.
+        if group.is_empty() && (plural == "secrets" || plural == "configmaps") {
+            if let Some(ref stored) = parsed {
+                if stored["immutable"] == serde_json::Value::Bool(true) {
+                    let new_immutable = &obj.body["immutable"];
+                    let immutable_cleared =
+                        new_immutable == &serde_json::Value::Bool(false) || new_immutable.is_null();
+                    let data_changed = obj.body["data"] != stored["data"];
+                    let binary_data_changed = obj.body["binaryData"] != stored["binaryData"];
+                    let string_data_changed = obj.body["stringData"] != stored["stringData"];
+                    if immutable_cleared
+                        || data_changed
+                        || binary_data_changed
+                        || string_data_changed
+                    {
+                        return Err(Status::unprocessable_entity(format!(
+                            "{plural}/{name} is immutable and cannot be updated"
+                        )));
+                    }
+                }
+            }
+        }
+
         let spec = if super::defaults::is_workload_resource(&group, &plural) {
             parsed.as_ref().map(|v| v["spec"].clone())
         } else {
@@ -9729,5 +9766,164 @@ mod tests {
             "unmatched lease must not be patched — labelSelector filtering is broken \
              if this fails"
         );
+    }
+
+    /// PUT on a Secret with `immutable: true` must return 422 Invalid when the caller
+    /// attempts to modify the data field.
+    ///
+    /// The conformance test "should be immutable if `immutable` field is set" (secrets_volume.go:407)
+    /// creates an immutable Secret then PUTs an update to its data.  Real kube-apiserver returns
+    /// 422 "Invalid"; without this check u7s returns 200 OK, causing the test to fail with
+    /// "expected 'invalid' as error, got instead: <nil>".
+    ///
+    /// This test fails if the immutability check is removed from replace_namespaced_resource.
+    #[tokio::test]
+    async fn replace_immutable_secret_returns_422() {
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // Step 1: create the secret with immutable:true via PUT (upsert)
+        let secret_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "my-immutable", "namespace": "default" },
+            "immutable": true,
+            "data": { "key1": "dmFsdWUx" }
+        });
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "my-immutable".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&secret_v1).unwrap()),
+        )
+        .await;
+        let _ = result
+            .expect("initial secret create must succeed")
+            .into_response();
+
+        // Step 2: try to modify data — must be rejected with 422
+        let secret_v2 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "my-immutable", "namespace": "default" },
+            "immutable": true,
+            "data": { "key1": "bmV3dmFsdWU=" }  // different value
+        });
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "my-immutable".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&secret_v2).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PUT on immutable secret with changed data must return 422 Invalid — without this \
+                 check u7s accepts the update and the conformance test 'should be immutable if \
+                 immutable field is set' fails with 'expected invalid as error, got nil'"
+            ),
+            Ok(_) => panic!(
+                "PUT on immutable secret must return 422, not 200 — immutability enforcement is \
+                 missing from replace_namespaced_resource"
+            ),
+        }
+    }
+
+    /// PATCH on a Secret with `immutable: true` must return 422 Invalid.
+    ///
+    /// Mirrors the PUT test above but for PATCH (merge-patch).  Immutable secrets must reject
+    /// all modification attempts regardless of the HTTP method used.
+    ///
+    /// This test fails if the immutability check is removed from do_patch.
+    #[tokio::test]
+    async fn patch_immutable_secret_returns_422() {
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // Step 1: create the secret with immutable:true
+        let secret_v1 = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "patched-immutable", "namespace": "default" },
+            "immutable": true,
+            "data": { "key1": "dmFsdWUx" }
+        });
+        let result = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "patched-immutable".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&secret_v1).unwrap()),
+        )
+        .await;
+        let _ = result
+            .expect("initial secret create must succeed")
+            .into_response();
+
+        // Step 2: PATCH to modify data — must be rejected with 422
+        let patch = serde_json::json!({ "data": { "key1": "bmV3dmFsdWU=" } });
+        let mut merge_headers = json_headers();
+        merge_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                String::new(),
+                "v1".into(),
+                "default".into(),
+                "secrets".into(),
+                "patched-immutable".into(),
+            )),
+            Query(PatchQuery::default()),
+            test_user(),
+            merge_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "PATCH on immutable secret must return 422 Invalid — immutability must be \
+                 enforced for all write methods, not just PUT"
+            ),
+            Ok(_) => panic!(
+                "PATCH on immutable secret must return 422 — immutability check is missing \
+                 from do_patch"
+            ),
+        }
     }
 }

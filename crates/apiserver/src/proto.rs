@@ -364,13 +364,32 @@ struct Probe {
     failure_threshold: i32,
 }
 
+/// KeyToPath — api-core-v1-generated.proto message KeyToPath
+/// Maps a ConfigMap or Secret key to a file path within a volume.
+/// field 1 = key (string), field 2 = path (string), field 3 = mode (int32, optional)
+#[derive(Clone, PartialEq, Message)]
+struct KeyToPath {
+    /// key (field 1, string) — key in the ConfigMap or Secret to project
+    #[prost(string, tag = "1")]
+    key: String,
+    /// path (field 2, string) — relative path of the file within the volume
+    #[prost(string, tag = "2")]
+    path: String,
+    /// mode (field 3, int32) — optional per-file permission bits
+    #[prost(int32, tag = "3")]
+    mode: i32,
+}
+
 /// SecretVolumeSource — api-core-v1-generated.proto message SecretVolumeSource
-/// Only secretName (field 1) is decoded; items/defaultMode/optional are skipped.
+/// field 1 = secretName (string), field 2 = items (repeated KeyToPath)
 #[derive(Clone, PartialEq, Message)]
 struct SecretVolumeSource {
     /// secretName (field 1, string) — name of the Secret in the pod's namespace
     #[prost(string, tag = "1")]
     secret_name: String,
+    /// items (field 2, repeated KeyToPath) — key-to-path mappings within the volume
+    #[prost(message, repeated, tag = "2")]
+    items: Vec<KeyToPath>,
 }
 
 /// LocalObjectReference — api-core-v1-generated.proto message LocalObjectReference
@@ -383,13 +402,15 @@ struct LocalObjectReference {
 }
 
 /// ConfigMapVolumeSource — api-core-v1-generated.proto message ConfigMapVolumeSource
-/// The configMap name is embedded via LocalObjectReference at field 1.
-/// items/defaultMode/optional are skipped.
+/// field 1 = localObjectReference (message, name), field 2 = items (repeated KeyToPath)
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMapVolumeSource {
     /// localObjectReference (field 1, message) — contains the configMap name
     #[prost(message, tag = "1")]
     local_object_reference: Option<LocalObjectReference>,
+    /// items (field 2, repeated KeyToPath) — key-to-path mappings within the volume
+    #[prost(message, repeated, tag = "2")]
+    items: Vec<KeyToPath>,
 }
 
 /// EmptyDirVolumeSource — api-core-v1-generated.proto message EmptyDirVolumeSource
@@ -512,22 +533,28 @@ struct ServiceAccountTokenProjection {
 
 /// SecretProjection — api-core-v1-generated.proto message SecretProjection
 /// Projects a Secret into a projected volume.
-/// localObjectReference (field 1): provides the secret name via LocalObjectReference.
+/// field 1 = localObjectReference (name), field 2 = items (repeated KeyToPath)
 #[derive(Clone, PartialEq, Message)]
 struct SecretProjection {
     /// localObjectReference (field 1, message) — secret name
     #[prost(message, tag = "1")]
     local_object_reference: Option<LocalObjectReference>,
+    /// items (field 2, repeated KeyToPath) — key-to-path mappings within the projection
+    #[prost(message, repeated, tag = "2")]
+    items: Vec<KeyToPath>,
 }
 
 /// ConfigMapProjection — api-core-v1-generated.proto message ConfigMapProjection
 /// Projects a ConfigMap into a projected volume.
-/// localObjectReference (field 1): provides the configMap name via LocalObjectReference.
+/// field 1 = localObjectReference (name), field 2 = items (repeated KeyToPath)
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMapProjection {
     /// localObjectReference (field 1, message) — configMap name
     #[prost(message, tag = "1")]
     local_object_reference: Option<LocalObjectReference>,
+    /// items (field 2, repeated KeyToPath) — key-to-path mappings within the projection
+    #[prost(message, repeated, tag = "2")]
+    items: Vec<KeyToPath>,
 }
 
 /// VolumeProjection — api-core-v1-generated.proto message VolumeProjection
@@ -3778,6 +3805,28 @@ fn downward_api_volume_source_to_json(
     serde_json::Value::Object(m)
 }
 
+/// Serialize a slice of `KeyToPath` items into a JSON array.
+/// Each item becomes `{"key": k, "path": p}`, with `"mode"` included only when non-zero.
+fn key_to_path_items_to_json(items: Vec<KeyToPath>) -> serde_json::Value {
+    let arr: Vec<serde_json::Value> = items
+        .into_iter()
+        .filter(|it| !it.key.is_empty())
+        .map(|it| {
+            let mut m = serde_json::Map::new();
+            m.insert("key".to_string(), serde_json::Value::String(it.key));
+            m.insert("path".to_string(), serde_json::Value::String(it.path));
+            if it.mode != 0 {
+                m.insert(
+                    "mode".to_string(),
+                    serde_json::Value::Number(it.mode.into()),
+                );
+            }
+            serde_json::Value::Object(m)
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
 /// Convert a decoded `ProjectedVolumeSource` into a JSON object.
 /// Called for spec.volumes[].projected.
 fn projected_volume_source_to_json(proj: ProjectedVolumeSource) -> serde_json::Value {
@@ -3791,10 +3840,16 @@ fn projected_volume_source_to_json(proj: ProjectedVolumeSource) -> serde_json::V
                 if let Some(s) = src.secret {
                     if let Some(lor) = s.local_object_reference {
                         if !lor.name.is_empty() {
-                            sm.insert(
-                                "secret".to_string(),
-                                serde_json::json!({ "name": lor.name }),
-                            );
+                            let mut secret_map = serde_json::Map::new();
+                            secret_map
+                                .insert("name".to_string(), serde_json::Value::String(lor.name));
+                            if !s.items.is_empty() {
+                                secret_map.insert(
+                                    "items".to_string(),
+                                    key_to_path_items_to_json(s.items),
+                                );
+                            }
+                            sm.insert("secret".to_string(), serde_json::Value::Object(secret_map));
                         }
                     }
                 }
@@ -3807,10 +3862,15 @@ fn projected_volume_source_to_json(proj: ProjectedVolumeSource) -> serde_json::V
                 if let Some(cm) = src.config_map {
                     if let Some(lor) = cm.local_object_reference {
                         if !lor.name.is_empty() {
-                            sm.insert(
-                                "configMap".to_string(),
-                                serde_json::json!({ "name": lor.name }),
-                            );
+                            let mut cm_map = serde_json::Map::new();
+                            cm_map.insert("name".to_string(), serde_json::Value::String(lor.name));
+                            if !cm.items.is_empty() {
+                                cm_map.insert(
+                                    "items".to_string(),
+                                    key_to_path_items_to_json(cm.items),
+                                );
+                            }
+                            sm.insert("configMap".to_string(), serde_json::Value::Object(cm_map));
                         }
                     }
                 }
@@ -4197,10 +4257,18 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
                     }
                     if let Some(s) = src.secret {
                         if !s.secret_name.is_empty() {
-                            vm.insert(
-                                "secret".to_string(),
-                                serde_json::json!({ "secretName": s.secret_name }),
+                            let mut secret_map = serde_json::Map::new();
+                            secret_map.insert(
+                                "secretName".to_string(),
+                                serde_json::Value::String(s.secret_name),
                             );
+                            if !s.items.is_empty() {
+                                secret_map.insert(
+                                    "items".to_string(),
+                                    key_to_path_items_to_json(s.items),
+                                );
+                            }
+                            vm.insert("secret".to_string(), serde_json::Value::Object(secret_map));
                         }
                     }
                     if let Some(pvc) = src.persistent_volume_claim {
@@ -4229,9 +4297,20 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
                     if let Some(cm) = src.config_map {
                         if let Some(lor) = cm.local_object_reference {
                             if !lor.name.is_empty() {
+                                let mut cm_map = serde_json::Map::new();
+                                cm_map.insert(
+                                    "name".to_string(),
+                                    serde_json::Value::String(lor.name),
+                                );
+                                if !cm.items.is_empty() {
+                                    cm_map.insert(
+                                        "items".to_string(),
+                                        key_to_path_items_to_json(cm.items),
+                                    );
+                                }
                                 vm.insert(
                                     "configMap".to_string(),
-                                    serde_json::json!({ "name": lor.name }),
+                                    serde_json::Value::Object(cm_map),
                                 );
                             }
                         }
@@ -12458,5 +12537,263 @@ mod tests {
              resets generation to 2 (same as the previous spec update), waitForStatus returns \
              before KCM processes the new spec, and updateRevision points to the old revision"
         );
+    }
+
+    /// A projected configMap source with `items` (KeyToPath mappings) must survive proto decode.
+    ///
+    /// When the conformance test "should be consumable from pods in volume with mappings" creates
+    /// a pod via protobuf with a projected configMap that maps key "data-2" to path "path/to/data-2",
+    /// the `items` array must appear in the decoded JSON. Without it, the kubelet mounts the configMap
+    /// without path mappings, the expected file at the mapped path is absent, and the container exits 1.
+    ///
+    /// This test fails if:
+    /// - `KeyToPath` struct is removed from proto.rs
+    /// - `items` field (tag 2) is removed from `ConfigMapProjection`
+    /// - `key_to_path_items_to_json` is removed or the items serialization block in
+    ///   `projected_volume_source_to_json` is removed
+    #[test]
+    fn projected_configmap_items_survive_proto_decode() {
+        // KeyToPath { key (field 1) = "data-2", path (field 2) = "path/to/data-2" }
+        let mut key_to_path = encode_length_delimited(1, b"data-2");
+        key_to_path.extend_from_slice(&encode_length_delimited(2, b"path/to/data-2"));
+
+        // LocalObjectReference { name (field 1) = "test-configmap" }
+        let lor = encode_length_delimited(1, b"test-configmap");
+
+        // ConfigMapProjection { localObjectReference (field 1), items (field 2) = [KeyToPath] }
+        let mut cm_proj = encode_length_delimited(1, &lor);
+        cm_proj.extend_from_slice(&encode_length_delimited(2, &key_to_path));
+
+        // VolumeProjection { configMap (field 3) = ConfigMapProjection }
+        let proj_entry = encode_length_delimited(3, &cm_proj);
+
+        // ProjectedVolumeSource { sources (field 1) = [VolumeProjection] }
+        let proj_src = encode_length_delimited(1, &proj_entry);
+
+        // VolumeSource { projected (field 26) = ProjectedVolumeSource }
+        let volume_source = encode_length_delimited(26, &proj_src);
+
+        // Volume { name (field 1) = "projected-vol", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"projected-vol");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with projected configMap volume");
+
+        let sources = result["spec"]["volumes"][0]["projected"]["sources"]
+            .as_array()
+            .expect("projected.sources must be present in decoded JSON");
+        assert_eq!(sources.len(), 1, "one projection source must decode");
+
+        let cm = &sources[0]["configMap"];
+        assert_eq!(
+            cm["name"], "test-configmap",
+            "configMap.name must survive proto decode — kubelet uses it to fetch the ConfigMap"
+        );
+
+        let items = cm["items"].as_array().expect(
+            "configMap.items must be present in projected volume — without it the kubelet mounts \
+             the configMap without path mappings so 'path/to/data-2' is absent and the container \
+             exits 1 (conformance: 'should be consumable from pods in volume with mappings')",
+        );
+        assert_eq!(items.len(), 1, "one KeyToPath item must decode");
+        assert_eq!(
+            items[0]["key"], "data-2",
+            "items[0].key must be 'data-2' — kubelet reads the key from the ConfigMap data"
+        );
+        assert_eq!(
+            items[0]["path"], "path/to/data-2",
+            "items[0].path must be 'path/to/data-2' — kubelet writes the file at this relative \
+             path within the mounted volume; if missing the container cannot find the file"
+        );
+    }
+
+    /// A projected secret source with `items` (KeyToPath mappings) must survive proto decode.
+    ///
+    /// Mirrors the configMap case above but for projected secret volumes.  The conformance test
+    /// "should be consumable from pods in volume with mappings as non-root" uses a projected
+    /// secret with items.  Without items in the decoded JSON, the kubelet mounts the secret
+    /// without path mappings and the expected file at the mapped path is absent.
+    ///
+    /// This test fails if:
+    /// - `items` field (tag 2) is removed from `SecretProjection`
+    /// - the items serialization block for secrets in `projected_volume_source_to_json` is removed
+    #[test]
+    fn projected_secret_items_survive_proto_decode() {
+        // KeyToPath { key (field 1) = "secret-key", path (field 2) = "new-path-data-1" }
+        let mut key_to_path = encode_length_delimited(1, b"secret-key");
+        key_to_path.extend_from_slice(&encode_length_delimited(2, b"new-path-data-1"));
+
+        // LocalObjectReference { name (field 1) = "test-secret" }
+        let lor = encode_length_delimited(1, b"test-secret");
+
+        // SecretProjection { localObjectReference (field 1), items (field 2) = [KeyToPath] }
+        let mut sec_proj = encode_length_delimited(1, &lor);
+        sec_proj.extend_from_slice(&encode_length_delimited(2, &key_to_path));
+
+        // VolumeProjection { secret (field 1) = SecretProjection }
+        let proj_entry = encode_length_delimited(1, &sec_proj);
+
+        // ProjectedVolumeSource { sources (field 1) = [VolumeProjection] }
+        let proj_src = encode_length_delimited(1, &proj_entry);
+
+        // VolumeSource { projected (field 26) = ProjectedVolumeSource }
+        let volume_source = encode_length_delimited(26, &proj_src);
+
+        // Volume { name (field 1) = "projected-sec", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"projected-sec");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with projected secret volume");
+
+        let sources = result["spec"]["volumes"][0]["projected"]["sources"]
+            .as_array()
+            .expect("projected.sources must be present in decoded JSON");
+        assert_eq!(sources.len(), 1, "one projection source must decode");
+
+        let sec = &sources[0]["secret"];
+        assert_eq!(
+            sec["name"], "test-secret",
+            "secret.name must survive proto decode"
+        );
+
+        let items = sec["items"].as_array().expect(
+            "secret.items must be present in projected volume — without it the kubelet mounts \
+             the secret without path mappings so 'new-path-data-1' is absent and the container \
+             exits 1 (conformance: projected secret volume with mappings)",
+        );
+        assert_eq!(items.len(), 1, "one KeyToPath item must decode");
+        assert_eq!(
+            items[0]["key"], "secret-key",
+            "items[0].key must be 'secret-key'"
+        );
+        assert_eq!(
+            items[0]["path"], "new-path-data-1",
+            "items[0].path must be 'new-path-data-1'"
+        );
+    }
+
+    /// A flat (non-projected) configMap volume with `items` must survive proto decode.
+    ///
+    /// This test fails if:
+    /// - `items` field (tag 2) is removed from `ConfigMapVolumeSource`
+    /// - the items serialization block for configMap in `pod_spec_to_json` is removed
+    #[test]
+    fn flat_configmap_volume_items_survive_proto_decode() {
+        // KeyToPath { key (field 1) = "ca.crt", path (field 2) = "ca.crt" }
+        let mut key_to_path = encode_length_delimited(1, b"ca.crt");
+        key_to_path.extend_from_slice(&encode_length_delimited(2, b"ca.crt"));
+
+        // LocalObjectReference { name (field 1) = "kube-root-ca.crt" }
+        let lor = encode_length_delimited(1, b"kube-root-ca.crt");
+
+        // ConfigMapVolumeSource { localObjectReference (field 1), items (field 2) = [KeyToPath] }
+        let mut cm_vol_src = encode_length_delimited(1, &lor);
+        cm_vol_src.extend_from_slice(&encode_length_delimited(2, &key_to_path));
+
+        // VolumeSource { configMap (field 19) = ConfigMapVolumeSource }
+        let volume_source = encode_length_delimited(19, &cm_vol_src);
+
+        // Volume { name (field 1) = "ca-vol", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"ca-vol");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with flat configMap volume with items");
+
+        let cm = &result["spec"]["volumes"][0]["configMap"];
+        assert_eq!(
+            cm["name"], "kube-root-ca.crt",
+            "configMap.name must survive proto decode"
+        );
+
+        let items = cm["items"].as_array().expect(
+            "configMap.items must survive proto decode — without it kubelet mounts the whole \
+             configMap instead of only the mapped keys",
+        );
+        assert_eq!(items.len(), 1, "one item must decode");
+        assert_eq!(items[0]["key"], "ca.crt", "key must be 'ca.crt'");
+        assert_eq!(items[0]["path"], "ca.crt", "path must be 'ca.crt'");
+    }
+
+    /// A flat (non-projected) secret volume with `items` must survive proto decode.
+    ///
+    /// This test fails if:
+    /// - `items` field (tag 2) is removed from `SecretVolumeSource`
+    /// - the items serialization block for secret in `pod_spec_to_json` is removed
+    #[test]
+    fn flat_secret_volume_items_survive_proto_decode() {
+        // KeyToPath { key (field 1) = "tls.crt", path (field 2) = "tls.crt" }
+        let mut key_to_path = encode_length_delimited(1, b"tls.crt");
+        key_to_path.extend_from_slice(&encode_length_delimited(2, b"tls.crt"));
+
+        // SecretVolumeSource { secretName (field 1) = "tls-secret", items (field 2) = [KeyToPath] }
+        let mut sec_vol_src = encode_length_delimited(1, b"tls-secret");
+        sec_vol_src.extend_from_slice(&encode_length_delimited(2, &key_to_path));
+
+        // VolumeSource { secret (field 6) = SecretVolumeSource }
+        let volume_source = encode_length_delimited(6, &sec_vol_src);
+
+        // Volume { name (field 1) = "tls-vol", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"tls-vol");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with flat secret volume with items");
+
+        let sec = &result["spec"]["volumes"][0]["secret"];
+        assert_eq!(
+            sec["secretName"], "tls-secret",
+            "secret.secretName must survive proto decode"
+        );
+
+        let items = sec["items"].as_array().expect(
+            "secret.items must survive proto decode — without it kubelet mounts all secret keys \
+             instead of only the mapped subset",
+        );
+        assert_eq!(items.len(), 1, "one item must decode");
+        assert_eq!(items[0]["key"], "tls.crt", "key must be 'tls.crt'");
+        assert_eq!(items[0]["path"], "tls.crt", "path must be 'tls.crt'");
     }
 }
