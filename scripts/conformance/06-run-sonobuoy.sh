@@ -40,9 +40,69 @@ if ! kubectl --kubeconfig="$KUBECONFIG" get nodes 2>/dev/null | grep -q "$VM_NAM
   echo "error: $VM_NAME not registered — run scripts/conformance/lima-start.sh first" >&2; exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Namespace TTL watchdog — runs host-side via kubectl to force-delete test
+# namespaces that get stuck terminating or are simply too old.
+#
+# Thresholds:
+#   5 min  — force-delete Active namespaces (namespace leak / stuck creation)
+#   10 min — force-delete ANY non-system namespace regardless of phase
+#
+# System namespaces excluded: default, kube-*, sonobuoy
+# ---------------------------------------------------------------------------
+watchdog_loop() {
+  local kubeconfig="$1"
+  while true; do
+    sleep 30
+    local now
+    now=$(date -u +%s)
+
+    # Fetch all namespaces as JSON for reliable macOS-host parsing.
+    local ns_json
+    ns_json=$(kubectl --kubeconfig="$kubeconfig" get ns -o json 2>/dev/null) || continue
+
+    while IFS= read -r line; do
+      local ns phase created age_s
+      ns=$(     printf '%s' "$line" | jq -r '.name')
+      phase=$(  printf '%s' "$line" | jq -r '.phase')
+      created=$(printf '%s' "$line" | jq -r '.created')
+
+      # Skip system namespaces.
+      case "$ns" in
+        default|sonobuoy|kube-*) continue ;;
+      esac
+
+      # Convert RFC3339 creationTimestamp to epoch seconds on macOS.
+      local created_s
+      created_s=$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "${created}" "+%s" 2>/dev/null) || continue
+      age_s=$(( now - created_s ))
+
+      local should_delete=0 reason=""
+      if [ "$phase" = "Active" ] && [ "$age_s" -ge 300 ]; then
+        should_delete=1
+        reason="Active for ${age_s}s (>= 5m threshold)"
+      elif [ "$age_s" -ge 600 ]; then
+        should_delete=1
+        reason="age=${age_s}s (>= 10m threshold, phase=${phase})"
+      fi
+
+      if [ "$should_delete" -eq 1 ]; then
+        echo "[watchdog] $(date -u +%Y-%m-%dT%H:%M:%SZ) force-deleting namespace '${ns}' (${reason})"
+        # Strip finalizers first so the API server will honour the delete.
+        kubectl --kubeconfig="$kubeconfig" patch ns "$ns" \
+          -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+        kubectl --kubeconfig="$kubeconfig" delete ns "$ns" \
+          --grace-period=0 --force 2>/dev/null || true
+      fi
+    done < <(printf '%s' "$ns_json" \
+      | jq -c '.items[] | {name: .metadata.name, phase: .status.phase, created: .metadata.creationTimestamp}')
+  done
+}
+
 # Rewrite kubeconfig server address for in-VM use
 REWRITTEN=$(mktemp)
-trap 'rm -f "$REWRITTEN"' EXIT
+_WATCHDOG_PID=""
+trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true' EXIT
 sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "$KUBECONFIG" > "$REWRITTEN"
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
 
@@ -59,6 +119,12 @@ done
 SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
 
 echo "Running sonobuoy inside $VM_NAME..."
+# Start the namespace TTL watchdog in the background now that sonobuoy is
+# creating test namespaces.  The EXIT trap kills it when we leave this script.
+watchdog_loop "$KUBECONFIG" &
+_WATCHDOG_PID=$!
+echo "[watchdog] started (pid=${_WATCHDOG_PID})"
+
 if [ -n "$FOCUS" ]; then
   # shellcheck disable=SC2086
   limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "--e2e-focus=$FOCUS"
