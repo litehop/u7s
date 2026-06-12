@@ -72,7 +72,10 @@ if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
     echo "Port $HOST_IP:$PORT in use — killing existing apiserver before restart ..." >&2
     API_PID=$(lsof -ti tcp:"$PORT" 2>/dev/null || true)
     [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null || true
-    sleep 1
+    for i in $(seq 1 10); do
+      nc -z "$HOST_IP" "$PORT" 2>/dev/null || break
+      sleep 1
+    done
   else
     echo "error: port $HOST_IP:$PORT is already in use." >&2
     echo "If u7s is already running, set KUBECONFIG=$WORKDIR/kubeconfig and use it." >&2
