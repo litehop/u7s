@@ -5073,7 +5073,8 @@ struct AdmissionLabelSelector {
 /// ValidatingWebhook — k8s.io/api/admissionregistration/v1/generated.proto
 /// field 1=name, field 2=clientConfig, field 3=rules, field 4=failurePolicy,
 /// field 5=namespaceSelector, field 6=sideEffects, field 7=timeoutSeconds,
-/// field 8=admissionReviewVersions, field 9=matchPolicy, field 10=objectSelector
+/// field 8=admissionReviewVersions, field 9=matchPolicy, field 10=objectSelector,
+/// field 11=matchConditions
 #[derive(Clone, PartialEq, Message)]
 struct ValidatingWebhook {
     #[prost(string, tag = "1")]
@@ -5096,6 +5097,51 @@ struct ValidatingWebhook {
     match_policy: String,
     #[prost(message, tag = "10")]
     object_selector: Option<AdmissionLabelSelector>,
+    #[prost(message, repeated, tag = "11")]
+    match_conditions: Vec<AdmissionMatchCondition>,
+}
+
+/// MatchCondition — k8s.io/api/admissionregistration/v1/generated.proto
+/// field 1=name (string), field 2=expression (string)
+#[derive(Clone, PartialEq, Message)]
+struct AdmissionMatchCondition {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(string, tag = "2")]
+    expression: String,
+}
+
+/// MutatingWebhook — k8s.io/api/admissionregistration/v1/generated.proto
+/// field 1=name, field 2=clientConfig, field 3=rules, field 4=failurePolicy,
+/// field 5=namespaceSelector, field 6=sideEffects, field 7=timeoutSeconds,
+/// field 8=admissionReviewVersions, field 9=matchPolicy, field 10=reinvocationPolicy,
+/// field 11=objectSelector, field 12=matchConditions
+#[derive(Clone, PartialEq, Message)]
+struct MutatingWebhook {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(message, tag = "2")]
+    client_config: Option<WebhookClientConfig>,
+    #[prost(message, repeated, tag = "3")]
+    rules: Vec<AdmissionRuleWithOperations>,
+    #[prost(string, tag = "4")]
+    failure_policy: String,
+    #[prost(message, tag = "5")]
+    namespace_selector: Option<AdmissionLabelSelector>,
+    #[prost(string, tag = "6")]
+    side_effects: String,
+    #[prost(int32, tag = "7")]
+    timeout_seconds: i32,
+    #[prost(string, repeated, tag = "8")]
+    admission_review_versions: Vec<String>,
+    #[prost(string, tag = "9")]
+    match_policy: String,
+    #[prost(string, tag = "10")]
+    reinvocation_policy: String,
+    #[prost(message, tag = "11")]
+    object_selector: Option<AdmissionLabelSelector>,
+    #[prost(message, repeated, tag = "12")]
+    match_conditions: Vec<AdmissionMatchCondition>,
 }
 
 /// ValidatingWebhookConfiguration — k8s.io/api/admissionregistration/v1/generated.proto
@@ -5110,12 +5156,14 @@ struct ValidatingWebhookConfiguration {
 }
 
 /// MutatingWebhookConfiguration — k8s.io/api/admissionregistration/v1/generated.proto
-/// Only the metadata field is decoded; the spec is opaque to u7s.
 #[derive(Clone, PartialEq, Message)]
 struct MutatingWebhookConfiguration {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// webhooks (field 2, repeated MutatingWebhook)
+    #[prost(message, repeated, tag = "2")]
+    webhooks: Vec<MutatingWebhook>,
 }
 
 /// Convert an AdmissionLabelSelector (which may include matchExpressions) to JSON.
@@ -5221,6 +5269,99 @@ fn admission_webhook_to_json(w: ValidatingWebhook) -> serde_json::Value {
     if let Some(os) = w.object_selector {
         entry["objectSelector"] = label_selector_to_json(os);
     }
+    if !w.match_conditions.is_empty() {
+        let conds: Vec<serde_json::Value> = w
+            .match_conditions
+            .into_iter()
+            .map(|c| serde_json::json!({"name": c.name, "expression": c.expression}))
+            .collect();
+        entry["matchConditions"] = serde_json::Value::Array(conds);
+    }
+    entry
+}
+
+fn mutating_webhook_to_json(w: MutatingWebhook) -> serde_json::Value {
+    let client_config = w
+        .client_config
+        .map(|cc| {
+            let mut cfg = serde_json::json!({});
+            if !cc.ca_bundle.is_empty() {
+                cfg["caBundle"] = serde_json::Value::String(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &cc.ca_bundle,
+                ));
+            }
+            if let Some(svc) = cc.service {
+                let mut s = serde_json::json!({
+                    "namespace": svc.namespace,
+                    "name": svc.name,
+                });
+                if !svc.path.is_empty() {
+                    s["path"] = serde_json::Value::String(svc.path);
+                }
+                if svc.port != 0 {
+                    s["port"] = serde_json::Value::Number(serde_json::Number::from(svc.port));
+                }
+                cfg["service"] = s;
+            }
+            if !cc.url.is_empty() {
+                cfg["url"] = serde_json::Value::String(cc.url);
+            }
+            cfg
+        })
+        .unwrap_or(serde_json::json!({}));
+
+    let rules: Vec<serde_json::Value> = w
+        .rules
+        .into_iter()
+        .map(|r| {
+            let rule = r.rule.unwrap_or_default();
+            serde_json::json!({
+                "operations": r.operations,
+                "apiGroups": rule.api_groups,
+                "apiVersions": rule.api_versions,
+                "resources": rule.resources,
+                "scope": if rule.scope.is_empty() { "*".to_string() } else { rule.scope },
+            })
+        })
+        .collect();
+
+    let mut entry = serde_json::json!({
+        "name": w.name,
+        "clientConfig": client_config,
+        "rules": rules,
+        "admissionReviewVersions": w.admission_review_versions,
+    });
+    if !w.failure_policy.is_empty() {
+        entry["failurePolicy"] = serde_json::Value::String(w.failure_policy);
+    }
+    if !w.match_policy.is_empty() {
+        entry["matchPolicy"] = serde_json::Value::String(w.match_policy);
+    }
+    if !w.side_effects.is_empty() {
+        entry["sideEffects"] = serde_json::Value::String(w.side_effects);
+    }
+    if w.timeout_seconds != 0 {
+        entry["timeoutSeconds"] =
+            serde_json::Value::Number(serde_json::Number::from(w.timeout_seconds));
+    }
+    if !w.reinvocation_policy.is_empty() {
+        entry["reinvocationPolicy"] = serde_json::Value::String(w.reinvocation_policy);
+    }
+    if let Some(ns) = w.namespace_selector {
+        entry["namespaceSelector"] = label_selector_to_json(ns);
+    }
+    if let Some(os) = w.object_selector {
+        entry["objectSelector"] = label_selector_to_json(os);
+    }
+    if !w.match_conditions.is_empty() {
+        let conds: Vec<serde_json::Value> = w
+            .match_conditions
+            .into_iter()
+            .map(|c| serde_json::json!({"name": c.name, "expression": c.expression}))
+            .collect();
+        entry["matchConditions"] = serde_json::Value::Array(conds);
+    }
     entry
 }
 
@@ -5255,10 +5396,16 @@ pub fn decode_validatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_
 pub fn decode_mutatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = MutatingWebhookConfiguration::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let webhooks: Vec<serde_json::Value> = obj
+        .webhooks
+        .into_iter()
+        .map(mutating_webhook_to_json)
+        .collect();
     Some(serde_json::json!({
         "apiVersion": "admissionregistration.k8s.io/v1",
         "kind": "MutatingWebhookConfiguration",
-        "metadata": meta
+        "metadata": meta,
+        "webhooks": webhooks,
     }))
 }
 
@@ -10536,6 +10683,96 @@ mod tests {
         assert_eq!(result["kind"], "MutatingWebhookConfiguration");
         assert_eq!(result["apiVersion"], "admissionregistration.k8s.io/v1");
         assert_eq!(result["metadata"]["name"], "e2e-test-mutating");
+    }
+
+    /// matchConditions in a ValidatingWebhookConfiguration proto must be decoded and round-trip
+    /// back in the JSON response. Without field 11 on ValidatingWebhook, the decoded JSON
+    /// has no matchConditions key and the conformance test GET shows an empty array.
+    #[test]
+    fn decode_validatingwebhookconfiguration_proto_preserves_match_conditions() {
+        // Build MatchCondition: field 1=name, field 2=expression
+        let mut match_cond: Vec<u8> = Vec::new();
+        match_cond.extend_from_slice(&encode_length_delimited(1, b"check-name"));
+        match_cond.extend_from_slice(&encode_length_delimited(
+            2,
+            b"object.metadata.name == \"test\"",
+        ));
+
+        // Build ValidatingWebhook: field 1=name, field 11=matchConditions
+        let mut webhook: Vec<u8> = Vec::new();
+        webhook.extend_from_slice(&encode_length_delimited(1, b"test-webhook.k8s.io"));
+        webhook.extend_from_slice(&encode_length_delimited(11, &match_cond));
+
+        // Build ValidatingWebhookConfiguration: field 1=metadata, field 2=webhooks
+        let meta_name = encode_length_delimited(1, b"test-vwc");
+        let meta = encode_length_delimited(1, &meta_name);
+        let mut proto = meta;
+        proto.extend_from_slice(&encode_length_delimited(2, &webhook));
+
+        let result = decode_validatingwebhookconfiguration_proto(&proto)
+            .expect("ValidatingWebhookConfiguration must decode");
+
+        let webhooks = result["webhooks"]
+            .as_array()
+            .expect("webhooks must be present");
+        assert_eq!(webhooks.len(), 1);
+        let conditions = webhooks[0]["matchConditions"]
+            .as_array()
+            .expect("matchConditions must be present in decoded webhook — without field 11 on ValidatingWebhook, the GET response omits matchConditions and the conformance test fails");
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(
+            conditions[0]["name"], "check-name",
+            "matchCondition name must round-trip through proto decode"
+        );
+        assert_eq!(
+            conditions[0]["expression"], "object.metadata.name == \"test\"",
+            "matchCondition expression must round-trip through proto decode"
+        );
+    }
+
+    /// matchConditions in a MutatingWebhookConfiguration proto must be decoded and round-trip
+    /// back in the JSON response. Without MutatingWebhook struct and field 12, the decoded JSON
+    /// has no webhooks and no matchConditions; the conformance test GET shows an empty array.
+    #[test]
+    fn decode_mutatingwebhookconfiguration_proto_preserves_match_conditions() {
+        // Build MatchCondition: field 1=name, field 2=expression
+        let mut match_cond: Vec<u8> = Vec::new();
+        match_cond.extend_from_slice(&encode_length_delimited(1, b"check-env"));
+        match_cond.extend_from_slice(&encode_length_delimited(
+            2,
+            b"request.namespace != \"kube-system\"",
+        ));
+
+        // Build MutatingWebhook: field 1=name, field 12=matchConditions
+        let mut webhook: Vec<u8> = Vec::new();
+        webhook.extend_from_slice(&encode_length_delimited(1, b"mutating-webhook.k8s.io"));
+        webhook.extend_from_slice(&encode_length_delimited(12, &match_cond));
+
+        // Build MutatingWebhookConfiguration: field 1=metadata, field 2=webhooks
+        let meta_name = encode_length_delimited(1, b"test-mwc");
+        let meta = encode_length_delimited(1, &meta_name);
+        let mut proto = meta;
+        proto.extend_from_slice(&encode_length_delimited(2, &webhook));
+
+        let result = decode_mutatingwebhookconfiguration_proto(&proto)
+            .expect("MutatingWebhookConfiguration must decode");
+
+        let webhooks = result["webhooks"]
+            .as_array()
+            .expect("webhooks must be present in MutatingWebhookConfiguration — without MutatingWebhook struct, webhooks are lost on proto decode");
+        assert_eq!(webhooks.len(), 1);
+        let conditions = webhooks[0]["matchConditions"]
+            .as_array()
+            .expect("matchConditions must be present in decoded mutating webhook — without field 12 on MutatingWebhook, the GET response omits matchConditions");
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(
+            conditions[0]["name"], "check-env",
+            "matchCondition name must round-trip through proto decode"
+        );
+        assert_eq!(
+            conditions[0]["expression"], "request.namespace != \"kube-system\"",
+            "matchCondition expression must round-trip through proto decode"
+        );
     }
 
     // ---------------------------------------------------------------------------
