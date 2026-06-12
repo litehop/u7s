@@ -1343,19 +1343,36 @@ pub async fn openapi_v2<S: Store>(
             let reversed: String = group.split('.').rev().collect::<Vec<_>>().join(".");
             for ver in &crd.spec.versions {
                 let key = format!("{}.{}.{}", reversed, ver.name, kind);
-                definitions.insert(
-                    key,
-                    serde_json::json!({
-                        "type": "object",
-                        "x-kubernetes-group-version-kind": [
-                            {
-                                "group": group,
-                                "version": ver.name,
-                                "kind": kind
-                            }
-                        ]
-                    }),
-                );
+                let mut def = serde_json::json!({
+                    "type": "object",
+                    "x-kubernetes-group-version-kind": [
+                        {
+                            "group": group,
+                            "version": ver.name,
+                            "kind": kind
+                        }
+                    ]
+                });
+                if let Some(schema) = ver
+                    .schema
+                    .as_ref()
+                    .and_then(|s| s.get("openAPIV3Schema"))
+                    .and_then(|s| s.as_object())
+                {
+                    for field in &[
+                        "type",
+                        "properties",
+                        "items",
+                        "description",
+                        "format",
+                        "required",
+                    ] {
+                        if let Some(v) = schema.get(*field) {
+                            def[field] = v.clone();
+                        }
+                    }
+                }
+                definitions.insert(key, def);
             }
         }
     }
@@ -2975,6 +2992,56 @@ mod tests {
         assert_eq!(gvk["group"], "example.io");
         assert_eq!(gvk["version"], "v1");
         assert_eq!(gvk["kind"], "Foo");
+    }
+
+    // /openapi/v2 definitions must include the CRD's openAPIV3Schema properties so that
+    // kubectl apply can validate CRD instances against their schema. Without property
+    // translation, tools like Argo CD and the CustomResourcePublishOpenAPI conformance
+    // test see only "type: object" with no fields and cannot validate or generate clients.
+    #[tokio::test]
+    async fn openapi_v2_crd_definition_includes_schema_properties() {
+        let state = make_state();
+
+        let body = crd_bytes_with_schema("stable.example.com", "crontabs", "CronTab", "v1");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await
+        .expect("create_crd must succeed");
+
+        let resp = openapi_v2(State(state), axum::http::HeaderMap::new()).await;
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let defs = doc["definitions"]
+            .as_object()
+            .expect("definitions must be present");
+
+        // com.example.stable.v1.CronTab — reversed group + version + kind
+        let key = "com.example.stable.v1.CronTab";
+        let def = defs.get(key).unwrap_or_else(|| {
+            panic!(
+                "definition '{key}' must exist; got: {:?}",
+                defs.keys().collect::<Vec<_>>()
+            )
+        });
+
+        assert_eq!(
+            def["properties"]["spec"]["type"].as_str(),
+            Some("object"),
+            "spec property must be type=object — without schema translation, \
+             kubectl apply cannot validate CRD instances because the definition has no fields"
+        );
+        assert_eq!(
+            def["properties"]["spec"]["properties"]["replicas"]["type"].as_str(),
+            Some("integer"),
+            "spec.replicas must be type=integer — CRD schema properties must survive \
+             the openAPIV3Schema→Swagger 2.0 translation for field-level validation to work"
+        );
     }
 
     // create_crd must stamp status.conditions Established=True and NamesAccepted=True
