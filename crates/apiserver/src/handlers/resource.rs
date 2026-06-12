@@ -654,12 +654,13 @@ pub(crate) async fn do_patch<S: Store>(
 
     // Immutability check: if the stored Secret or ConfigMap has `immutable: true`,
     // reject any patch attempt.  Real kube-apiserver returns 422 "Invalid".
-    if group.is_empty() && (plural == "secrets" || plural == "configmaps") {
-        if current.body["immutable"] == serde_json::Value::Bool(true) {
-            return Err(Status::unprocessable_entity(format!(
-                "{plural}/{name} is immutable and cannot be updated"
-            )));
-        }
+    if group.is_empty()
+        && (plural == "secrets" || plural == "configmaps")
+        && current.body["immutable"] == serde_json::Value::Bool(true)
+    {
+        return Err(Status::unprocessable_entity(format!(
+            "{plural}/{name} is immutable and cannot be updated"
+        )));
     }
 
     // Capture spec before patch for generation tracking on workload resources.
