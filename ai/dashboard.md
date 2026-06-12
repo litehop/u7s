@@ -1,12 +1,11 @@
 # Dashboard
-2026-06-12T — #514 merged. Label selector bug fixed. Svc-latency hang resolved.
+2026-06-12T04:11Z — #522 #523 #524 merged. No workers in-flight. Queue: 5 open beads.
 
 Resume: `bd prime`
 
 ## Operator attention needed
 
-Run focused conformance to verify svc-latency hang is gone:
-`scripts/conformance/run-all.sh --focus "Service endpoints latency should not be very high"`
+None.
 
 ## In-flight workers
 
@@ -17,27 +16,34 @@ None.
 None.
 
 ## Recent merges
-- #514 fix(watch): implement DoesNotExist/Exists/NotEquals label selector operators (mayor-p97u)
-- #513 fix(apiserver): StatefulSet conformance — collection PATCH, canary partition, rollback revision (eywo+w2x6+j8w8)
-- #512 fix(proto): decode StatefulSet status.conditions from protobuf body (mayor-hdaz)
-- #511 fix(proto): decode ContainerPort from pod proto; add eviction handler (mayor-27ix)
-- #510 fix(scripts): --port flag for apiserver port isolation (mayor-fuwy)
-- #509 fix(proto): spec.replicas unconditional in workload decoders (mayor-b7y4)
+- #524 fix(apiserver): increment generation and add GET on ephemeralcontainers (mayor-d74k)
+- #523 fix(proto): regression test for GRPC probe decode (mayor-ephx)
+- #522 fix(apiserver): DNS pod exec 404 routing fix (mayor-7cjk + mayor-pbwj)
+- #521 fix(watch): suppress store BOOKMARK events when allowWatchBookmarks=false (mayor-4oqo)
+- #520 fix(apiserver): include CRD schemas in /openapi/v2 definitions (mayor-slc2)
 
 ## VM port assignment
-| Slot | Port | Who |
-|---|---|---|
-| mayor | 6443 | Mayor (lima-node) |
-| worker-1 | 6444 | free (lima-node-smoke, running) |
-| worker-2 | 6445 | free (lima-node-2, stopped) |
+| Slot | VM | Port | Who |
+|---|---|---|---|
+| mayor | lima-node | 6443 | Mayor |
+| worker-1 | lima-node-smoke | 6444 | free (running) |
+| worker-2 | lima-node-2 | 6445 | free (running) |
+| worker-3 | — | 6446 | free |
+| worker-4 | — | 6447 | free |
+| worker-5 | — | 6448 | free |
+
+## Queued
+- mayor-352r (P2) — namespace TTL watchdog (scripts)
+- mayor-ewnt (P2) — scheduling predicates (VM required)
+- mayor-rzmf (P2) — webhooks (large missing feature)
+- mayor-2zo1 (P2) — ResourceQuota admission (large missing feature)
+- mayor-zhr6 (P3) — projected volumes
+- mayor-l5hs (P3) — sonobuoy stall detector (blocked on mayor-352r)
 
 ## Loops running (session-only, expire 7 days)
-- :07 hourly — posture reread (2c38f451)
-- :11 hourly — worktree hygiene (0e661092)
-- :17 every 2h — cluster review (6b504dfd)
-- :23 every 2h — merge pass (ea2ece0d)
-- :43 hourly — bead dispatch pass (96a4b06d)
-- :53 hourly — dashboard refresh (2169b806)
-
-## Deferred
-mayor-52wo · mayor-j7to · mayor-rvkq
+- :07 hourly — posture reread (2ea6d18f)
+- :11 hourly — worktree hygiene (ff60a583)
+- :17 every 2h — cluster review (a4d9857a)
+- :23 every 2h — merge pass (28f6d4ef)
+- :43 hourly — bead dispatch pass (53ca77a8)
+- :53 hourly — dashboard refresh (c5b70796)

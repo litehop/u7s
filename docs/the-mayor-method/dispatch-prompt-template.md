@@ -383,7 +383,8 @@ Your assigned worktree: <ASSIGNED_WORKTREE>
 
 You have exclusive use of this VM for this bead. Do NOT use `lima-node` or
 port `6443` — those belong to the mayor. All workers bind to `127.0.0.1` and
-use `--port` for isolation.
+use `--port` for isolation. Use exactly the port assigned above — do not
+pick a different port even if you think the assigned one is in use.
 
 Read `ai/prompts/vm-operations.md` IN FULL before issuing any build or stack
 command. It is the canonical reference for every operation below.
