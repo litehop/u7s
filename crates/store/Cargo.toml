@@ -13,3 +13,6 @@ thiserror       = "2"
 tracing         = "0.1"
 async-stream    = "0.3"
 futures-core    = "0.3"
+
+[dev-dependencies]
+futures-util    = "0.3"

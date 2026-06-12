@@ -121,16 +121,23 @@ impl SqliteStore {
             guard.insert(event.key.clone(), Arc::clone(&event));
         }
         // Best-effort broadcast of the specific event.
+        let event_revision = event.revision;
         let _ = self.tx.send(event);
         // Broadcast a global bookmark (key="") to advance all informers' sync RVs.
         // KCM's ConsistencyStore.EnsureReady() checks each informer's
         // LastStoreSyncResourceVersion against the RV of writes the controller made.
         // A StatefulSet watch only sees StatefulSet events — without a global bookmark,
         // its sync RV lags pod write RVs and EnsureReady requeues indefinitely.
-        let global_revision = self.last_written_revision.load(Ordering::Acquire);
+        //
+        // Use this event's own revision (not last_written_revision) so that concurrent
+        // writes cannot inject a higher RV into this event's bookmark.  If write-B
+        // commits and bumps last_written_revision to N+1 before write-A calls
+        // last_written_revision.load(), write-A's bookmark would carry rv=N+1, advancing
+        // watchers' last_replayed to N+1 before write-B's event(rv=N+1) is broadcast —
+        // causing write-B's event to be dedup-skipped and silently dropped.
         let _ = self.tx.send(Arc::new(InternalEvent {
             key: String::new(),
-            revision: global_revision,
+            revision: event_revision,
             value: None,
             is_create: false,
             deleted_body: None,
@@ -1053,5 +1060,102 @@ pub(crate) fn internal_to_watch(event: &InternalEvent) -> WatchEvent {
             revision: event.revision,
             body: event.deleted_body.clone(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    fn svc_value(name: &str, rv: u64) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"apiVersion":"v1","kind":"Service","metadata":{{"name":"{name}","namespace":"default","resourceVersion":"{rv}"}}}}"#,
+            name = name,
+            rv = rv
+        ))
+    }
+
+    /// Verify that a global bookmark carrying a higher revision (from a concurrent write that
+    /// already committed and bumped `last_written_revision`) does NOT cause a subsequent
+    /// specific event at that same revision to be dedup-skipped.
+    ///
+    /// Why it matters: before the fix, push_event read last_written_revision AFTER the commit,
+    /// so if write-B (rv=2) committed between write-A's commit and write-A's push_event call,
+    /// write-A's bookmark would carry rv=2.  A watcher receiving event(svc-a,rv=1) then
+    /// bookmark(rv=2) then event(svc-b,rv=2) would skip svc-b (rv=2 <= last_replayed=2).
+    /// The controller watching services would never see svc-b — it disappears silently.
+    ///
+    /// The fix: use the event's own revision for the global bookmark so concurrent writes
+    /// cannot contaminate each other's bookmarks.
+    #[tokio::test]
+    async fn watch_bookmark_race_loses_event_without_fix() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // Subscribe the watcher before any writes so it enters the live-event loop.
+        let stream = store
+            .watch("/registry/services/", 0)
+            .await
+            .expect("watch failed");
+        futures_util::pin_mut!(stream);
+
+        // Simulate the race: write-B (rv=2) has already committed and bumped
+        // last_written_revision to 2 before write-A calls push_event for rv=1.
+        // With the bug, push_event reads last_written_revision=2 and broadcasts
+        // bookmark(rv=2) — a revision higher than write-A's own event.
+        store.last_written_revision.store(2, Ordering::Release);
+
+        // push_event for svc-a (rv=1).
+        // BUG:   broadcasts event(svc-a,rv=1) + bookmark(rv=2)  [reads last_written_revision=2]
+        // FIX:   broadcasts event(svc-a,rv=1) + bookmark(rv=1)  [uses event.revision]
+        store.push_event(Arc::new(InternalEvent {
+            key: "/registry/services/default/svc-a".into(),
+            revision: 1,
+            value: Some(svc_value("svc-a", 1)),
+            is_create: true,
+            deleted_body: None,
+        }));
+
+        // push_event for svc-b (rv=2) — the concurrent write.
+        // Broadcasts event(svc-b,rv=2) + bookmark(rv=2).
+        store.push_event(Arc::new(InternalEvent {
+            key: "/registry/services/default/svc-b".into(),
+            revision: 2,
+            value: Some(svc_value("svc-b", 2)),
+            is_create: true,
+            deleted_body: None,
+        }));
+
+        // Collect Added events for a short window.
+        // With BUG:  watcher sees event(svc-a,rv=1)→Added, bookmark(rv=2)→last_replayed=2,
+        //            event(svc-b,rv=2)→rv<=last_replayed→SKIP.  svc-b is never delivered.
+        // With FIX:  watcher sees event(svc-a,rv=1)→Added, bookmark(rv=1), then
+        //            event(svc-b,rv=2)→rv>last_replayed=1→Added.  Both delivered.
+        let mut added_keys: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Added(obj))) => {
+                    added_keys.push(obj.key.clone());
+                }
+                Ok(Some(WatchEvent::Bookmark { .. })) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => break, // timeout
+            }
+        }
+
+        assert!(
+            added_keys.contains(&"/registry/services/default/svc-a".to_string()),
+            "svc-a must be delivered as Added; without this a watcher misses the service entirely"
+        );
+        assert!(
+            added_keys.contains(&"/registry/services/default/svc-b".to_string()),
+            "svc-b must be delivered as Added; push_event must use event.revision for the global \
+             bookmark, not last_written_revision — otherwise a concurrent write that commits first \
+             causes the bookmark to carry a future rv, advancing last_replayed and dedup-skipping \
+             svc-b's event so controllers never see it"
+        );
     }
 }
