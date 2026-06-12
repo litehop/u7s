@@ -154,7 +154,12 @@ fn default_service(obj: &mut serde_json::Value) {
     }
 
     // 3. ExternalName services must not have ClusterIP-family fields.
+    // When a service changes type to ExternalName (e.g. NodePort → ExternalName),
+    // any previously assigned clusterIP and clusterIPs must be cleared.
+    // Without this, GET after the type-change PATCH still returns the old IP.
     if svc_type == "ExternalName" {
+        obj["spec"]["clusterIP"] = serde_json::Value::String(String::new());
+        obj["spec"]["clusterIPs"] = serde_json::json!([]);
         return;
     }
 
@@ -1610,13 +1615,15 @@ mod tests {
             obj["spec"]["ipFamilies"].is_null(),
             "ExternalName service must not have ipFamilies — it has no cluster IP"
         );
-        assert!(
-            obj["spec"]["clusterIPs"].is_null(),
-            "ExternalName service must not have clusterIPs — it has no cluster IP"
+        assert_eq!(
+            obj["spec"]["clusterIPs"],
+            serde_json::json!([]),
+            "ExternalName service must have clusterIPs cleared to [] — it has no cluster IP"
         );
-        assert!(
-            obj["spec"]["clusterIP"].is_null(),
-            "ExternalName service must not have clusterIP set by defaults"
+        assert_eq!(
+            obj["spec"]["clusterIP"],
+            serde_json::Value::String(String::new()),
+            "ExternalName service must have clusterIP cleared to empty string — it has no cluster IP"
         );
     }
 
@@ -1698,6 +1705,44 @@ mod tests {
         assert_eq!(
             obj["spec"]["type"], "ExternalName",
             "spec.type=ExternalName must not be overwritten to ClusterIP"
+        );
+    }
+
+    /// A Service patched from NodePort to ExternalName must have clusterIP and clusterIPs cleared.
+    ///
+    /// When a NodePort service (with an allocated clusterIP) is PATCHed to type=ExternalName,
+    /// the conformance test expects GET to return an empty clusterIP.
+    /// Without clearing, GET returns the old allocated IP and the test fails with
+    /// "unexpected Spec.ClusterIP (10.96.x.x) for ExternalName service, expected empty".
+    #[test]
+    fn service_type_change_to_external_name_clears_cluster_ip() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "svc", "namespace": "default" },
+            "spec": {
+                "type": "ExternalName",
+                "externalName": "db.example.com",
+                "clusterIP": "10.96.0.8",
+                "clusterIPs": ["10.96.0.8"],
+                "ipFamilies": ["IPv4"],
+                "ipFamilyPolicy": "SingleStack"
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["clusterIP"],
+            serde_json::Value::String(String::new()),
+            "clusterIP must be cleared when type changes to ExternalName — \
+             conformance test fails with 'unexpected Spec.ClusterIP' if old IP is retained"
+        );
+        assert_eq!(
+            obj["spec"]["clusterIPs"],
+            serde_json::json!([]),
+            "clusterIPs must be cleared when type changes to ExternalName — \
+             retaining old IPs would leave stale routing entries for a service with no cluster IP"
         );
     }
 
