@@ -393,9 +393,11 @@ pub(crate) fn decode_continue(
     })?;
     let age = unix_now().saturating_sub(issued_at);
     if age > CONTINUE_TOKEN_TTL_SECS {
-        // Include a fresh start-of-list token so clients can restart pagination from the
-        // beginning without issuing an extra list call (Kubernetes chunking conformance).
-        let fresh_token = encode_continue("", signing_key);
+        // Preserve the original cursor key so clients continue from where they left off rather
+        // than restarting from the beginning — matching etcd compaction behaviour where the fresh
+        // token points to the compaction boundary, not the list head.
+        let original_key = payload["k"].as_str().unwrap_or("");
+        let fresh_token = encode_continue(original_key, signing_key);
         return Err(Status::expired_with_continue(
             format!(
                 "continue token expired: issued {age}s ago (TTL is {CONTINUE_TOKEN_TTL_SECS}s); \
@@ -989,17 +991,17 @@ mod tests {
     #[test]
     fn expired_continue_token_error_includes_new_continue_token_in_metadata() {
         // Kubernetes chunking conformance: when a paginated list uses an expired continue
-        // token the 410 response body must include `metadata.continue` with a fresh token
-        // pointing to the start of the list (key == "").  Without this, the client cannot
-        // resume pagination and must re-issue an un-paginated list request.
+        // token the 410 response body must include `metadata.continue` with a fresh token.
+        // Without this, the client cannot resume pagination and must re-issue an un-paginated
+        // list request.
         //
         // This test MUST FAIL if the `Status::expired_with_continue` path is removed or
         // if the error no longer carries `metadata` — reverting the fix causes the
         // Kubernetes conformance test (chunking.go:202) to fail: the client discards the
         // 410 and cannot proceed to page 2.
+        let original_key = "/registry/podtemplates/default/foo";
         let old_iat = 0u64; // Unix epoch — definitely expired
-        let payload = serde_json::json!({"k": "/registry/podtemplates/default/foo", "t": old_iat})
-            .to_string();
+        let payload = serde_json::json!({"k": original_key, "t": old_iat}).to_string();
         use base64::Engine;
         use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
@@ -1028,12 +1030,58 @@ mod tests {
             "metadata.continue must be a non-empty token, not an empty string"
         );
 
-        // The new token must decode to the empty key (start from beginning).
+        // The fresh token must preserve the original cursor key so clients continue from where
+        // they left off rather than restarting from the beginning — without this the conformance
+        // test (chunking.go:202) accumulates 440 items instead of the expected 400.
         let decoded_key = ok(decode_continue(cont, TEST_KEY));
         assert_eq!(
-            decoded_key, "",
-            "the new continue token in metadata.continue must point to the start of the list \
-             (empty key), not to the middle of the collection"
+            decoded_key, original_key,
+            "the new continue token in metadata.continue must preserve the original cursor key \
+             so clients can continue listing from where they were (not restart from the beginning)"
+        );
+    }
+
+    #[test]
+    fn expired_continue_token_fresh_token_preserves_cursor_not_empty_key() {
+        // When an expired but HMAC-valid continue token is rejected, the fresh token in the
+        // 410 response must carry the ORIGINAL cursor key, not an empty string.
+        //
+        // If the fresh token has key="" the client restarts from the list head and double-counts
+        // items already retrieved, producing 440 items where 400 are expected
+        // (Kubernetes conformance: chunking.go:202).
+        //
+        // This test FAILS if the fix is reverted to encode_continue("", signing_key).
+        let cursor = "/registry/pods/default/cursor-pod";
+        let old_iat = 0u64;
+        let payload = serde_json::json!({"k": cursor, "t": old_iat}).to_string();
+        use base64::Engine;
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload_b64 = b64.encode(payload.as_bytes());
+        let mut mac = <Hmac<Sha256>>::new_from_slice(TEST_KEY).expect("HMAC accepts any key size");
+        mac.update(payload.as_bytes());
+        let sig = mac.finalize().into_bytes();
+        let expired_token = format!("{payload_b64}.{}", b64.encode(sig));
+
+        let err = decode_continue(&expired_token, TEST_KEY).unwrap_err();
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GONE,
+            "must be 410 Gone for expired token"
+        );
+
+        let meta = err.1.metadata.as_ref().expect("must include metadata");
+        let fresh = meta["continue"]
+            .as_str()
+            .expect("must include metadata.continue");
+        let fresh_key = ok(decode_continue(fresh, TEST_KEY));
+
+        assert_eq!(
+            fresh_key, cursor,
+            "fresh continue token must point to the original cursor, not the list head; \
+             a key of \"\" restarts the list from scratch, causing item count inflation \
+             (chunking.go:202 fails with 440 instead of 400)"
         );
     }
 
