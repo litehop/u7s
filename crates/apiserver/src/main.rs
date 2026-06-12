@@ -2052,9 +2052,53 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
 
+    // kube-system/coredns ConfigMap — holds the Corefile that tells CoreDNS to serve
+    // kubernetes cluster.local DNS.  Without the kubernetes plugin, CoreDNS returns
+    // NOERROR with an empty ANSWER section for service names (e.g.
+    // e2e-test-webhook.webhook-N.svc), which resolves as "no such host" inside pods
+    // and breaks any admission webhook backed by a Service.
+    let cm_key = keys::object_key("configmaps", "kube-system", "coredns");
+    let corefile = concat!(
+        ".:53 {\n",
+        "    errors\n",
+        "    health\n",
+        "    ready\n",
+        "    kubernetes cluster.local in-addr.arpa ip6.arpa {\n",
+        "        pods insecure\n",
+        "        fallthrough in-addr.arpa ip6.arpa\n",
+        "    }\n",
+        "    forward . /etc/resolv.conf\n",
+        "    cache 30\n",
+        "    loop\n",
+        "    reload\n",
+        "    loadbalance\n",
+        "}\n"
+    );
+    let cm_body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "coredns",
+            "namespace": "kube-system",
+            "uid": "00000000-0000-0000-0000-000000000031",
+            "creationTimestamp": "2024-01-01T00:00:00Z"
+        },
+        "data": { "Corefile": corefile }
+    });
+    match store
+        .put(&cm_key, Bytes::from(cm_body.to_string()), Some(0))
+        .await
+    {
+        Ok(_) => tracing::info!("seeded ConfigMap: kube-system/coredns"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(anyhow::anyhow!("seed ConfigMap kube-system/coredns: {e}")),
+    }
+
     // kube-system/coredns Deployment — provides in-cluster DNS resolution.
     // kubelet injects 10.96.0.10 (kube-dns Service) into every pod's /etc/resolv.conf;
     // without a running CoreDNS pod behind that Service, DNS lookups fail inside pods.
+    // The Corefile ConfigMap above is mounted at /etc/coredns so the kubernetes plugin
+    // is active and service A records resolve correctly.
     let key = keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
     let mut body = serde_json::json!({
         "apiVersion": "apps/v1",
@@ -2075,10 +2119,23 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
                     "containers": [{
                         "name": "coredns",
                         "image": "registry.k8s.io/coredns/coredns:v1.11.1",
+                        "args": ["-conf", "/etc/coredns/Corefile"],
                         "ports": [
                             { "containerPort": 53, "protocol": "UDP", "name": "dns" },
                             { "containerPort": 53, "protocol": "TCP", "name": "dns-tcp" }
-                        ]
+                        ],
+                        "volumeMounts": [{
+                            "name": "config-volume",
+                            "mountPath": "/etc/coredns",
+                            "readOnly": true
+                        }]
+                    }],
+                    "volumes": [{
+                        "name": "config-volume",
+                        "configMap": {
+                            "name": "coredns",
+                            "items": [{ "key": "Corefile", "path": "Corefile" }]
+                        }
                     }]
                 }
             }
@@ -3722,6 +3779,75 @@ mod tests {
         assert!(
             protocols.contains(&"TCP"),
             "CoreDNS must expose TCP port 53 for large DNS responses"
+        );
+        // Container must pass -conf so it reads the mounted Corefile instead of
+        // the default (.:53 only, no kubernetes plugin).
+        let args = containers[0]["args"]
+            .as_array()
+            .expect("args must be an array");
+        assert!(
+            args.iter().any(|a| a.as_str() == Some("-conf")),
+            "CoreDNS container must pass -conf to load the Corefile from the mounted ConfigMap; \
+             without it CoreDNS uses the built-in default (no kubernetes plugin) and service \
+             A records resolve as NXDOMAIN"
+        );
+        // Container must mount the config-volume so the Corefile is accessible.
+        let mounts = containers[0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts must be an array");
+        assert!(
+            mounts
+                .iter()
+                .any(|m| m["name"].as_str() == Some("config-volume")),
+            "CoreDNS container must mount config-volume at /etc/coredns so the Corefile \
+             (with the kubernetes plugin) is readable by the CoreDNS process"
+        );
+        // Deployment must declare the config-volume backed by the coredns ConfigMap.
+        let volumes = parsed["spec"]["template"]["spec"]["volumes"]
+            .as_array()
+            .expect("volumes must be an array");
+        assert!(
+            volumes
+                .iter()
+                .any(|v| v["name"].as_str() == Some("config-volume")
+                    && v["configMap"]["name"].as_str() == Some("coredns")),
+            "Deployment must declare a config-volume backed by the coredns ConfigMap so \
+             the Corefile is projected into the pod filesystem"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_coredns_creates_corefile_configmap_with_kubernetes_plugin() {
+        // The coredns ConfigMap must exist and contain the kubernetes plugin.
+        // Without it, CoreDNS returns NOERROR with an empty ANSWER section for
+        // service names (e.g. e2e-test-webhook.webhook-N.svc), which the resolver
+        // treats as "no such host".  Admission webhook calls then fail.
+        let store = make_store();
+        seed_coredns(&store).await.expect("seed must not fail");
+
+        let cm_key = keys::object_key("configmaps", "kube-system", "coredns");
+        let cm_obj = store.get(&cm_key).await.expect("get must not fail");
+        assert!(
+            cm_obj.is_some(),
+            "ConfigMap kube-system/coredns must exist after seeding — \
+             CoreDNS reads its Corefile from this ConfigMap"
+        );
+        let cm: serde_json::Value =
+            serde_json::from_slice(&cm_obj.unwrap().value).expect("valid json");
+        assert_eq!(cm["kind"].as_str(), Some("ConfigMap"));
+        assert_eq!(cm["metadata"]["namespace"].as_str(), Some("kube-system"));
+        let corefile = cm["data"]["Corefile"]
+            .as_str()
+            .expect("Corefile key must be a string in ConfigMap data");
+        assert!(
+            corefile.contains("kubernetes cluster.local"),
+            "Corefile must include 'kubernetes cluster.local' so service A records resolve; \
+             without this plugin dig @10.96.0.10 returns an empty ANSWER section"
+        );
+        assert!(
+            corefile.contains("pods insecure"),
+            "kubernetes plugin must include 'pods insecure' so pod hostname DNS resolves; \
+             admission webhooks look up service DNS which requires this configuration"
         );
     }
 

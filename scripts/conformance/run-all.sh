@@ -11,6 +11,7 @@
 #
 # Usage:
 #   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--vm <name>]
+#                                  [--binary <path>] [--port <N>] [--workdir <path>]
 #
 #   --reset   Run reset.sh before building — kills host processes, deletes the
 #             lima-node VM, and wipes temp/u7s/ for a fully clean run.
@@ -25,6 +26,15 @@
 #             run multiple workers in parallel without port collisions. Exports
 #             U7S_HOST_IP so u7s-start.sh uses the correct address.
 #             Also settable via U7S_HOST_IP env var.
+#   --binary  Path to the pre-built u7s-apiserver binary. Skips the build step
+#             (01-build.sh) and sets U7S_BINARY so u7s-start.sh uses this binary.
+#             Useful for running conformance against a worktree build without
+#             polluting the main target directory.
+#   --port    Apiserver listen port (default: 6443). Forwarded to u7s-start.sh and
+#             lima-start.sh via U7S_PORT so both sides use the same port.
+#   --workdir Directory for apiserver state (DB, certs, kubeconfig). Forwarded to
+#             u7s-start.sh and child scripts via U7S_WORKDIR. Defaults to the
+#             standard temp/u7s[-<vm>]/ path.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -37,6 +47,8 @@ else
 fi
 FOCUS="${SONOBUOY_FOCUS:-}"
 RESET=0
+BINARY=""
+PORT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,6 +56,9 @@ while [[ $# -gt 0 ]]; do
     --focus) FOCUS="$2"; shift 2 ;;
     --vm) U7S_VM_NAME="$2"; export U7S_VM_NAME; shift 2 ;;
     --ip) U7S_HOST_IP="$2"; export U7S_HOST_IP; shift 2 ;;
+    --binary) BINARY="$2"; shift 2 ;;
+    --port) PORT="$2"; shift 2 ;;
+    --workdir) WORKDIR="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -55,19 +70,35 @@ banner() {
   echo "============================================================"
 }
 
+# Propagate binary override via env var (u7s-start.sh reads U7S_BINARY).
+if [ -n "$BINARY" ]; then
+  export U7S_BINARY="$BINARY"
+fi
+
+# Build optional CLI args for child scripts that accept --port / --workdir.
+_PORT_ARG=""
+_WORKDIR_ARG=""
+[ -n "$PORT" ]    && _PORT_ARG="--port $PORT"
+[ -n "$WORKDIR" ] && _WORKDIR_ARG="--workdir $WORKDIR"
+
 if [ "$RESET" -eq 1 ]; then
   banner "Reset: tearing down stale state"
   bash "$DIR/reset.sh"
 fi
 
-# Step 01: Build
-banner "Step 1/6: Build"
-bash "$DIR/01-build.sh"
+# Step 01: Build — skipped when --binary is supplied (caller provides the binary).
+if [ -n "$BINARY" ]; then
+  banner "Step 1/6: Build (skipped — using pre-built binary)"
+else
+  banner "Step 1/6: Build"
+  bash "$DIR/01-build.sh"
+fi
 
 # Step 02: Start apiserver — source so KUBECONFIG export propagates.
 banner "Step 2/6: Start apiserver"
 # shellcheck source=02-start-apiserver.sh
-source "$DIR/02-start-apiserver.sh"
+# shellcheck disable=SC2086
+source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_WORKDIR_ARG}
 
 # KUBECONFIG is now set (either from the running instance or newly started).
 if [ -z "${KUBECONFIG:-}" ]; then
@@ -78,11 +109,13 @@ echo "Using KUBECONFIG=$KUBECONFIG"
 
 # Step 03: Start lima VM and join kubelet.
 banner "Step 3/6: Start lima VM"
-bash "$DIR/lima-start.sh"
+# shellcheck disable=SC2086
+bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_WORKDIR_ARG}
 
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"
-bash "$DIR/04-start-kcm.sh"
+# shellcheck disable=SC2086
+bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG}
 
 # Step 05: Start scheduler inside VM.
 banner "Step 5/6: Start u7s-scheduler"
@@ -91,6 +124,7 @@ bash "$DIR/05-start-scheduler.sh"
 # Step 06: Run sonobuoy.
 banner "Step 6/6: Run sonobuoy"
 export SONOBUOY_FOCUS="$FOCUS"
-bash "$DIR/06-run-sonobuoy.sh"
+# shellcheck disable=SC2086
+bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG}
 
 banner "Done"

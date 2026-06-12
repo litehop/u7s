@@ -14,7 +14,20 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 # Mirror the WORKDIR derivation from u7s-start.sh so KUBECONFIG is correct.
 _VM="${U7S_VM_NAME:-lima-node}"
-if [ "$_VM" = "lima-node" ]; then
+
+_PORT_OVERRIDE=""
+_WORKDIR_OVERRIDE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --port) _PORT_OVERRIDE="$2"; shift 2 ;;
+    --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [ -n "$_WORKDIR_OVERRIDE" ]; then
+  WORKDIR="$_WORKDIR_OVERRIDE"
+elif [ "$_VM" = "lima-node" ]; then
   WORKDIR="$REPO/temp/u7s"
 else
   WORKDIR="$REPO/temp/u7s-${_VM}"
@@ -22,7 +35,12 @@ fi
 
 echo "=== [02] Start apiserver ==="
 
-bash "$REPO/scripts/u7s-start.sh" --background
+EXTRA_ARGS=""
+[ -n "$_PORT_OVERRIDE" ]    && EXTRA_ARGS="$EXTRA_ARGS --port $_PORT_OVERRIDE"
+[ -n "$_WORKDIR_OVERRIDE" ] && EXTRA_ARGS="$EXTRA_ARGS --workdir $_WORKDIR_OVERRIDE"
+
+# shellcheck disable=SC2086
+bash "$REPO/scripts/u7s-start.sh" --background $EXTRA_ARGS
 
 export KUBECONFIG="$WORKDIR/kubeconfig"
 echo "KUBECONFIG=$KUBECONFIG"
