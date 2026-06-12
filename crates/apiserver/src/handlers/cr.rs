@@ -436,7 +436,25 @@ pub async fn list_cr<S: Store>(
     query: super::generic::CollectionQuery,
     username: String,
 ) -> Result<Response, crate::status::StatusError> {
-    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    // When no CRD exists for this group, return 406 if Table format was requested
+    // (the resource is registered via APIService but Table is not implementable without
+    // a CRD or proxy backend) rather than 404 Not Found.
+    let ctx = match find_crd(&state, &group, &version, &plural).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            if super::table::wants_table(accept) {
+                return Err(Status::not_acceptable(format!(
+                    "the server does not support Table format for {group}/{version}/{plural}"
+                )));
+            }
+            return Err(err);
+        }
+    };
 
     // When version != storage_version, list from the storage version's key prefix.
     // Watch streams are not converted (watch conversion is out of scope).
@@ -454,10 +472,6 @@ pub async fn list_cr<S: Store>(
     // so prefix without namespace matches all of them.
     let prefix = cr_list_prefix(&group, list_version, &plural, None);
 
-    let accept = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
     let pom = wants_partial_object_metadata(accept);
 
     if query.watch == Some(true) {
@@ -529,6 +543,10 @@ pub async fn list_cr<S: Store>(
             "items": pom_items
         });
         return Ok(Json(body).into_response());
+    }
+
+    if super::table::wants_table(accept) {
+        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
     }
 
     let body = super::generic::build_list_response(
@@ -765,7 +783,25 @@ pub async fn list_cr_namespaced<S: Store>(
     query: super::generic::CollectionQuery,
     username: String,
 ) -> Result<Response, crate::status::StatusError> {
-    let ctx = find_crd(&state, &group, &version, &plural).await?;
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    // When no CRD exists for this group, return 406 if Table format was requested
+    // rather than 404 Not Found (the group may be registered via APIService but
+    // Table is not implementable without a CRD or proxy backend).
+    let ctx = match find_crd(&state, &group, &version, &plural).await {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            if super::table::wants_table(accept) {
+                return Err(Status::not_acceptable(format!(
+                    "the server does not support Table format for {group}/{version}/{plural}"
+                )));
+            }
+            return Err(err);
+        }
+    };
 
     if !ctx.namespaced {
         return Err(Status::not_found(
@@ -785,10 +821,6 @@ pub async fn list_cr_namespaced<S: Store>(
 
     let prefix = cr_list_prefix(&group, list_version, &plural, Some(&ns));
 
-    let accept = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
     let pom = wants_partial_object_metadata(accept);
 
     if query.watch == Some(true) {
@@ -859,6 +891,10 @@ pub async fn list_cr_namespaced<S: Store>(
             "items": pom_items
         });
         return Ok(Json(body).into_response());
+    }
+
+    if super::table::wants_table(accept) {
+        return Ok(Json(super::table::build_table(&group, &plural, items)).into_response());
     }
 
     let body = super::generic::build_list_response(

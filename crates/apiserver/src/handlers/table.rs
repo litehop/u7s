@@ -4,6 +4,30 @@ pub fn wants_table(accept: &str) -> bool {
     accept.contains("as=Table")
 }
 
+/// Extract the Table version from an Accept header, e.g.
+/// `application/json;as=Table;g=meta.k8s.io;v=v1beta1,application/json` → `Some("v1beta1")`.
+/// Returns None when no Table preference is present.
+///
+/// Only the first `as=Table` media-type in the header is inspected (clients list
+/// preferences in priority order; the first match is authoritative).
+pub fn table_accept_version(accept: &str) -> Option<&str> {
+    for part in accept.split(',') {
+        let part = part.trim();
+        if !part.contains("as=Table") {
+            continue;
+        }
+        for param in part.split(';') {
+            let param = param.trim();
+            if let Some(version) = param.strip_prefix("v=") {
+                return Some(version);
+            }
+        }
+        // as=Table present but no v= param — treat as v1.
+        return Some("v1");
+    }
+    None
+}
+
 pub fn build_table(
     group: &str,
     plural: &str,
@@ -1750,6 +1774,52 @@ mod tests {
         assert_eq!(
             cells[6], "nginx:latest,envoy:v1",
             "IMAGES must match container order so they correspond to the right container"
+        );
+    }
+
+    // table_accept_version must correctly parse the Table API version from the Accept header
+    // so that handlers can reject v1beta1 with 406 rather than serving an incompatible format.
+    #[test]
+    fn table_accept_version_extracts_version() {
+        assert_eq!(
+            table_accept_version("application/json;as=Table;g=meta.k8s.io;v=v1"),
+            Some("v1"),
+            "v1 Table Accept must be recognised — kubectl get relies on v1 Table"
+        );
+        assert_eq!(
+            table_accept_version(
+                "application/json;as=Table;g=meta.k8s.io;v=v1beta1,application/json"
+            ),
+            Some("v1beta1"),
+            "v1beta1 Table must be detected so handlers can return 406 instead of wrong format"
+        );
+        assert_eq!(
+            table_accept_version("application/json;as=Table;g=meta.k8s.io;v=v1,application/json"),
+            Some("v1"),
+            "v1 Table with fallback must still be detected as v1"
+        );
+        assert_eq!(
+            table_accept_version("application/json"),
+            None,
+            "plain JSON must not be treated as a Table request"
+        );
+        assert_eq!(
+            table_accept_version(
+                "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json"
+            ),
+            None,
+            "PartialObjectMetadata must not be detected as Table"
+        );
+    }
+
+    // table_accept_version must return Some("v1") when as=Table is present but no v= param,
+    // so that we don't silently treat versionless requests as unsupported.
+    #[test]
+    fn table_accept_version_defaults_to_v1_when_no_version_param() {
+        assert_eq!(
+            table_accept_version("application/json;as=Table;g=meta.k8s.io"),
+            Some("v1"),
+            "as=Table without v= must default to v1 — some older clients omit the version"
         );
     }
 }
