@@ -5955,4 +5955,77 @@ mod tests {
             "fallback body must have status=Failure per Kubernetes Status schema"
         );
     }
+
+    /// GET /api/v1/namespaces/{ns}/pods/{name} must reach the pod handler, not the fallback.
+    ///
+    /// dns-common.go:495 polls this exact path to verify a pod exists before exec-ing into it.
+    /// If the fallback fires instead of the pod handler, the client receives
+    /// "the server could not find the requested resource" which is different from the
+    /// "Pod ... not found" the pod handler returns.  DNS conformance burns 614 s retrying.
+    ///
+    /// This test fails if the pod GET route is mis-registered so axum hits fallback_handler:
+    /// the body message would be "the server could not find the requested resource" not
+    /// Pod "..." not found".
+    #[tokio::test]
+    async fn get_pod_with_uuid_name_reaches_pod_handler_not_fallback() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+        use u7s_store::Store;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed the namespace so parse_namespace does not reject it.
+        let ns_key = keys::cluster_object_key("namespaces", "dns-2235");
+        let ns_body = serde_json::json!({
+            "apiVersion": "v1", "kind": "Namespace",
+            "metadata": { "name": "dns-2235" }
+        });
+        store
+            .put(&ns_key, bytes::Bytes::from(ns_body.to_string()), Some(0))
+            .await
+            .expect("seed namespace must succeed");
+
+        let mut router = build_router(state);
+
+        // UUID-style name — exactly what the DNS conformance test uses.
+        let pod_name = "dns-test-99675610-b3d2-4d11-af4a-b660a620ab98";
+        let uri = format!("/api/v1/namespaces/dns-2235/pods/{pod_name}");
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&uri)
+            .body(axum::body::Body::empty())
+            .expect("request must build");
+        let resp = router.call(req).await.expect("router must not error");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET {uri} must return 404 — pod was not seeded, but fallback fires with wrong message"
+        );
+
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let val: serde_json::Value = serde_json::from_slice(&body).expect("response must be JSON");
+
+        // The pod handler returns `Pod "..." not found`.
+        // The fallback returns `the server could not find the requested resource`.
+        // Only the pod handler message proves the route is registered correctly.
+        let message = val["message"].as_str().unwrap_or("");
+        assert!(
+            message.starts_with("Pod"),
+            "GET {uri} must return 'Pod ... not found', not '{}' — \
+             if the fallback fires dns-common.go will never see the pod and burns 614 s",
+            message
+        );
+    }
 }
