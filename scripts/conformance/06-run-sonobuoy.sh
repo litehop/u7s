@@ -41,6 +41,68 @@ if ! kubectl --kubeconfig="$KUBECONFIG" get nodes 2>/dev/null | grep -q "$VM_NAM
 fi
 
 # ---------------------------------------------------------------------------
+# Sonobuoy progress stall detector — kills the entire sonobuoy run if
+# result-counts (passed + failed) has not incremented for 15 minutes.
+#
+# This is a second independent kill switch that operates at the sonobuoy
+# level, complementing the namespace TTL watchdog.  It catches the case where
+# the apiserver is completely unresponsive and the namespace watchdog cannot
+# unblock a stuck test.
+#
+# Lifecycle:
+#   - Start after sonobuoy run begins.
+#   - Skip the first 30s while sonobuoy initialises.
+#   - Guard against sonobuoy not yet running: skip iterations where status
+#     returns no valid JSON or no plugins array.
+#   - Kill on EXIT trap alongside the namespace watchdog.
+# ---------------------------------------------------------------------------
+stall_watchdog_loop() {
+  local vm_name="$1"
+  local last_count=0
+  local last_progress_time
+  last_progress_time=$(date +%s)
+  local stall_threshold=900  # 15 minutes in seconds
+
+  # Initial delay — sonobuoy needs time to initialise before we start polling.
+  sleep 30
+
+  while true; do
+    sleep 60
+
+    # Poll sonobuoy status from inside the VM.
+    local status_json
+    status_json=$(limactl shell "$vm_name" sudo sonobuoy status --json \
+      --kubeconfig /tmp/sonobuoy-kubeconfig 2>/dev/null) || { continue; }
+
+    # Guard: skip if output is not valid JSON or has no plugins array.
+    if ! printf '%s' "$status_json" | jq -e '.plugins' &>/dev/null; then
+      continue
+    fi
+
+    # Sum result-counts.passed and result-counts.failed across all plugins.
+    local current_count
+    current_count=$(printf '%s' "$status_json" \
+      | jq '[.plugins[]? | (."result-counts".passed // 0) + (."result-counts".failed // 0)] | add // 0')
+
+    local now
+    now=$(date +%s)
+
+    if [ "$current_count" -gt "$last_count" ]; then
+      last_count=$current_count
+      last_progress_time=$now
+    else
+      local stall_s=$(( now - last_progress_time ))
+      if [ "$stall_s" -ge "$stall_threshold" ]; then
+        echo "[stall-watchdog] $(date -u +%Y-%m-%dT%H:%M:%SZ) no sonobuoy progress for ${stall_s}s (passed+failed=${current_count}) — killing run"
+        limactl shell "$vm_name" sudo sonobuoy delete --all --wait \
+          --kubeconfig /tmp/sonobuoy-kubeconfig 2>/dev/null || true
+        return 0
+      fi
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Namespace TTL watchdog — runs host-side via kubectl to force-delete test
 # namespaces that get stuck terminating or are simply too old.
 #
@@ -102,7 +164,8 @@ watchdog_loop() {
 # Rewrite kubeconfig server address for in-VM use
 REWRITTEN=$(mktemp)
 _WATCHDOG_PID=""
-trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true' EXIT
+_STALL_WATCHDOG_PID=""
+trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true; [ -n "$_STALL_WATCHDOG_PID" ] && kill "$_STALL_WATCHDOG_PID" 2>/dev/null || true' EXIT
 sed 's|https://127.0.0.1:6443|https://host.lima.internal:6443|g' "$KUBECONFIG" > "$REWRITTEN"
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
 
@@ -125,12 +188,23 @@ watchdog_loop "$KUBECONFIG" &
 _WATCHDOG_PID=$!
 echo "[watchdog] started (pid=${_WATCHDOG_PID})"
 
+stall_watchdog_loop "$VM_NAME" &
+_STALL_WATCHDOG_PID=$!
+echo "[stall-watchdog] started (pid=${_STALL_WATCHDOG_PID})"
+
+# Run sonobuoy.  Allow non-zero exit so that a stall-detector kill (which
+# causes sonobuoy --wait to exit with an error) does not abort the script
+# before partial results are retrieved.
+SONOBUOY_EXIT=0
 if [ -n "$FOCUS" ]; then
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "--e2e-focus=$FOCUS"
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS "--e2e-focus=$FOCUS" || SONOBUOY_EXIT=$?
 else
   # shellcheck disable=SC2086
-  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=non-disruptive-conformance
+  limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=non-disruptive-conformance || SONOBUOY_EXIT=$?
+fi
+if [ "$SONOBUOY_EXIT" -ne 0 ]; then
+  echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} (stall-detector kill or other error) — attempting partial result retrieval"
 fi
 
 # Evacuate pod logs immediately — before namespace GC removes them.
@@ -152,6 +226,10 @@ TARBALL_NAME=$(kubectl --kubeconfig="$KUBECONFIG" logs -n sonobuoy sonobuoy 2>/d
   | grep -oE '[^ /]+\.tar\.gz')
 
 if [ -z "$TARBALL_NAME" ]; then
+  if [ "${SONOBUOY_EXIT:-0}" -ne 0 ]; then
+    echo "warning: no results tarball found in sonobuoy logs (run was killed before completion)" >&2
+    exit "${SONOBUOY_EXIT}"
+  fi
   echo "error: could not find results tarball name in sonobuoy logs" >&2; exit 1
 fi
 
@@ -165,6 +243,10 @@ HOST_PATH=$(limactl shell "$VM_NAME" sudo find \
     -name "$TARBALL_NAME" 2>/dev/null | head -1)
 
 if [ -z "$HOST_PATH" ]; then
+  if [ "${SONOBUOY_EXIT:-0}" -ne 0 ]; then
+    echo "warning: results tarball not found under kubelet pod volume (run was killed before completion)" >&2
+    exit "${SONOBUOY_EXIT}"
+  fi
   echo "error: tarball not found under kubelet pod volume for uid=${POD_UID}" >&2; exit 1
 fi
 
