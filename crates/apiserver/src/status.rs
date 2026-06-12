@@ -190,6 +190,21 @@ impl Status {
         )
     }
 
+    pub fn not_acceptable(message: String) -> StatusError {
+        StatusError(
+            StatusCode::NOT_ACCEPTABLE,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "NotAcceptable",
+                code: 406,
+                metadata: None,
+            },
+        )
+    }
+
     pub fn forbidden(message: String) -> StatusError {
         StatusError(
             StatusCode::FORBIDDEN,
@@ -238,5 +253,31 @@ impl Status {
                 metadata: None,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    // not_acceptable must produce HTTP 406 with reason "NotAcceptable" so client-go's
+    // errors.IsNotAcceptable() returns true and the conformance test for Table 406 passes.
+    #[test]
+    fn not_acceptable_produces_406_with_correct_reason() {
+        let StatusError(http_code, status) = Status::not_acceptable("test message".into());
+        assert_eq!(
+            http_code,
+            StatusCode::NOT_ACCEPTABLE,
+            "HTTP status must be 406 so client-go recognises Not Acceptable"
+        );
+        assert_eq!(
+            status.code, 406,
+            "Status.code must be 406 so Status().Code in conformance test equals int32(406)"
+        );
+        assert_eq!(
+            status.reason, "NotAcceptable",
+            "reason must be NotAcceptable so errors.IsNotAcceptable() returns true"
+        );
     }
 }

@@ -140,8 +140,23 @@ pub async fn list_pods<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
     Query(query): Query<CollectionQuery>,
+    headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
+    // Detect as=Table before namespace validation: a v1beta1 Table request must return
+    // 406 Not Acceptable regardless of namespace validity (the format is not supported).
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(version) = super::table::table_accept_version(accept) {
+        if version != "v1" {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{version}\" is not supported; only meta.k8s.io/v1 is accepted"
+            )));
+        }
+    }
+
     let ns = parse_namespace(&raw_ns, &state).await?;
     let prefix = list_prefix("pods", ns.as_str());
 
@@ -235,6 +250,11 @@ pub async fn list_pods<S: Store>(
     } else {
         items
     };
+
+    // Return Table format when as=Table;v=v1 is requested (v1beta1 was rejected above).
+    if super::table::wants_table(accept) {
+        return Ok(Json(super::table::build_table("", "pods", items)).into_response());
+    }
 
     let body = serde_json::json!({
         "kind": "PodList",
