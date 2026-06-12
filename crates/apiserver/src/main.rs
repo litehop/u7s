@@ -2169,6 +2169,8 @@ async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
     // kube-system/coredns Deployment — provides in-cluster DNS resolution.
     // kubelet injects 10.96.0.10 (kube-dns Service) into every pod's /etc/resolv.conf;
     // without a running CoreDNS pod behind that Service, DNS lookups fail inside pods.
+    // The Corefile ConfigMap above is mounted at /etc/coredns so the kubernetes plugin
+    // is active and service A records resolve correctly.
     let key = keys::group_object_key("apps", "deployments", Some("kube-system"), "coredns");
     let mut body = serde_json::json!({
         "apiVersion": "apps/v1",
