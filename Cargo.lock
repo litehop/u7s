@@ -3150,6 +3150,7 @@ dependencies = [
  "async-stream",
  "bytes",
  "futures-core",
+ "futures-util",
  "rusqlite",
  "serde",
  "serde_json",
