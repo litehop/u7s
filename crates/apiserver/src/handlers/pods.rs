@@ -1497,6 +1497,12 @@ pub fn apply_status_patch(
 /// Merge a patch conditions array into stored conditions, keyed by `type`.
 /// Fields present in the patch condition update the stored condition; fields absent
 /// in the patch are left as-is in the stored condition.
+///
+/// Exception: when a patch changes the `status` field of a condition, `reason` and
+/// `message` are reset to empty string if the patch omits them.  This prevents stale
+/// values (e.g. reason=Unschedulable from the initial False condition) from surviving
+/// into an updated True condition when the patcher (e.g. a scheduler) sends only the
+/// `status` field and relies on the server to clear the diagnosis fields.
 fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_json::Value) {
     let Some(patch_arr) = patch_conditions.as_array() else {
         return;
@@ -1511,12 +1517,24 @@ fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_jso
             continue;
         };
         if let Some(existing) = stored_arr.iter_mut().find(|c| c["type"] == cond_type) {
-            // Merge patch fields into the existing condition, skipping null values.
-            if let Some(patch_obj) = patch_cond.as_object() {
-                for (k, v) in patch_obj {
-                    if !v.is_null() {
-                        existing[k] = v.clone();
-                    }
+            let patch_obj = match patch_cond.as_object() {
+                Some(o) => o,
+                None => continue,
+            };
+            let status_changes = patch_obj
+                .get("status")
+                .is_some_and(|v| *v != existing["status"]);
+            for (k, v) in patch_obj {
+                if !v.is_null() {
+                    existing[k] = v.clone();
+                }
+            }
+            if status_changes {
+                if !patch_obj.contains_key("reason") {
+                    existing["reason"] = serde_json::json!("");
+                }
+                if !patch_obj.contains_key("message") {
+                    existing["message"] = serde_json::json!("");
                 }
             }
         } else {
@@ -2197,6 +2215,56 @@ mod status_tests {
              only hostNetwork pods share the node IP"
         );
     }
+
+    /// apply_status_patch must clear stale reason/message when PodScheduled status changes.
+    ///
+    /// A scheduler that patches only {"type":"PodScheduled","status":"True"} (without
+    /// reason/message) must not result in PodScheduled=True + reason=Unschedulable.
+    /// That contradictory state causes conformance tests (e.g. Variable Expansion) to see
+    /// PodScheduled=True while also seeing Unschedulable — an impossible combination that
+    /// confuses watchers checking whether a pod was successfully scheduled.
+    #[test]
+    fn status_patch_clears_stale_reason_when_pod_scheduled_status_changes() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "p", "namespace": "ns", "resourceVersion": "1"},
+            "spec": {},
+            "status": {
+                "phase": "Pending",
+                "conditions": [{
+                    "type": "PodScheduled",
+                    "status": "False",
+                    "reason": "Unschedulable",
+                    "message": "pod not yet scheduled",
+                    "lastTransitionTime": "2024-01-01T00:00:00Z"
+                }]
+            }
+        });
+        let patch = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "PodScheduled", "status": "True"}]
+            }
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+
+        let conditions = result["status"]["conditions"]
+            .as_array()
+            .expect("conditions array");
+        let scheduled = conditions
+            .iter()
+            .find(|c| c["type"] == "PodScheduled")
+            .expect("PodScheduled condition must survive patch");
+        assert_eq!(
+            scheduled["status"], "True",
+            "PodScheduled status must be updated to True by the patch"
+        );
+        assert_ne!(
+            scheduled["reason"], "Unschedulable",
+            "PodScheduled=True must not carry reason=Unschedulable — that contradictory \
+             state causes conformance tests to see an impossible scheduling outcome"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2403,15 +2471,19 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     //
     // Idempotent: the condition is only inserted when status.conditions is absent or
     // does not already contain a PodScheduled entry.
+    if !pod["status"].is_object() {
+        pod["status"] = serde_json::json!({});
+    }
+    if pod["status"]["phase"].is_null() {
+        pod["status"]["phase"] = serde_json::json!("Pending");
+    }
+
     let conditions_absent = pod["status"]["conditions"].is_null()
         || pod["status"]["conditions"].as_array().is_none_or(|arr| {
             arr.iter()
                 .all(|c| c["type"].as_str() != Some("PodScheduled"))
         });
     if conditions_absent {
-        if !pod["status"].is_object() {
-            pod["status"] = serde_json::json!({});
-        }
         let now = crate::util::utc_now_rfc3339();
         let scheduled_false = serde_json::json!({
             "type": "PodScheduled",
@@ -3212,6 +3284,51 @@ mod create_defaults_tests {
         assert_eq!(
             scheduled["status"], "True",
             "pre-existing PodScheduled=True must not be overwritten to False"
+        );
+    }
+
+    /// apply_pod_create_defaults must set status.phase=Pending on a newly-created pod.
+    ///
+    /// Conformance tests (e.g. Variable Expansion) check `pod.status.phase == "Pending"`
+    /// immediately after create.  A missing phase causes tests to fail with
+    /// "got a pod with no phase set" because the pod never reports its lifecycle state.
+    #[test]
+    fn pod_create_defaults_sets_status_phase_pending() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "phase-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        apply_pod_create_defaults(&mut pod);
+
+        assert_eq!(
+            pod["status"]["phase"], "Pending",
+            "status.phase must be Pending after create — tests that wait for phase=Pending \
+             fail with 'no phase set' if this field is absent"
+        );
+    }
+
+    /// apply_pod_create_defaults must not overwrite a pre-existing status.phase.
+    ///
+    /// Idempotency: a pod already carrying a phase (e.g. Running from a webhook)
+    /// must not have its phase overwritten to Pending.
+    #[test]
+    fn pod_create_defaults_does_not_overwrite_existing_phase() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "phase-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"phase": "Running"}
+        });
+
+        apply_pod_create_defaults(&mut pod);
+
+        assert_eq!(
+            pod["status"]["phase"], "Running",
+            "pre-existing status.phase must not be overwritten to Pending"
         );
     }
 }
