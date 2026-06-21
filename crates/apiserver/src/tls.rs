@@ -491,6 +491,7 @@ mod tests {
             advertise_address: advertise_address.map(str::to_owned),
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             konnectivity_proxy_addr: None,
         }
     }
@@ -629,6 +630,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             konnectivity_proxy_addr: None,
         };
 
@@ -759,6 +761,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             konnectivity_proxy_addr: None,
         };
 
@@ -893,6 +896,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             konnectivity_proxy_addr: None,
         };
         let result = generate_tls(&args);
@@ -941,6 +945,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             konnectivity_proxy_addr: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
@@ -1007,6 +1012,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             konnectivity_proxy_addr: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
@@ -1047,6 +1053,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             konnectivity_proxy_addr: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");
@@ -1108,6 +1115,7 @@ mod tests {
             advertise_address: None,
             service_cluster_ip_range: "10.96.0.0/12".into(),
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             konnectivity_proxy_addr: None,
         };
         let tls = generate_tls(&args).expect("generate_tls must succeed");

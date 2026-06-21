@@ -2,7 +2,7 @@
 # Manage a named worker VM for isolated conformance testing.
 #
 # Usage:
-#   scripts/worker-vm.sh start <vm-name> [<host-ip>]   # Provision VM if needed, start it
+#   scripts/worker-vm.sh start <vm-name> [<host-ip> [<kubelet-port>]]  # Provision VM if needed, start it
 #   scripts/worker-vm.sh stop <vm-name>                 # Stop the VM
 #   scripts/worker-vm.sh delete <vm-name>               # Delete the VM entirely
 #   scripts/worker-vm.sh list                           # List all worker VMs with IPs
@@ -16,10 +16,15 @@
 #   - The IP is stored in ~/.config/u7s-workers/<vm-name>.ip for later use
 #   - Set U7S_HOST_IP=<host-ip> when running scripts/u7s-start.sh and run-all.sh
 #
+# When <kubelet-port> is provided to start (default: 10250):
+#   - The VM's portForward hostPort for guest 10250 is set to <kubelet-port>
+#   - Pass --kubelet-port <kubelet-port> to run-all.sh / u7s-start.sh so the apiserver
+#     dials the correct host port for log/exec/attach requests
+#
 # Example (in a worker dispatch brief):
 #   export U7S_VM_NAME=lima-node-2
-#   scripts/worker-vm.sh start lima-node-2 127.0.0.2
-#   U7S_HOST_IP=127.0.0.2 SONOBUOY_FOCUS='...' scripts/conformance/run-all.sh
+#   scripts/worker-vm.sh start lima-node-2 127.0.0.1 10251
+#   scripts/conformance/run-all.sh --vm lima-node-2 --port 6444 --kubelet-port 10251
 #   scripts/worker-vm.sh stop lima-node-2
 #
 # Resource requirements per VM: ~4 GB RAM, ~20 GB disk.
@@ -53,6 +58,7 @@ case "$COMMAND" in
     fi
     NAME="$1"
     IP="${2:-127.0.0.1}"
+    KUBELET_PORT="${3:-10250}"
 
     # Add loopback alias when using a non-default IP.
     if [ "$IP" != "127.0.0.1" ]; then
@@ -74,20 +80,23 @@ case "$COMMAND" in
         echo "error: lima config not found at $LIMA_YAML" >&2; exit 1
       fi
       echo "Provisioning VM '$NAME' (first run, takes ~5 min)..."
-      if [ "$IP" != "127.0.0.1" ]; then
-        limactl start --tty=false --name="$NAME" \
-          --set ".portForwards[0].hostIP = \"$IP\"" \
-          "$LIMA_YAML"
+      SET_ARGS=""
+      [ "$IP" != "127.0.0.1" ] && SET_ARGS="$SET_ARGS --set .portForwards[0].hostIP=\"$IP\""
+      [ "$KUBELET_PORT" != "10250" ] && SET_ARGS="$SET_ARGS --set .portForwards[0].hostPort=$KUBELET_PORT"
+      if [ -n "$SET_ARGS" ]; then
+        # shellcheck disable=SC2086
+        limactl start --tty=false --name="$NAME" $SET_ARGS "$LIMA_YAML"
       else
         limactl start --tty=false --name="$NAME" "$LIMA_YAML"
       fi
       echo "VM '$NAME' provisioned and started."
     fi
 
-    # Store the IP so other scripts can read it.
+    # Store the IP and kubelet port so other scripts can read them.
     mkdir -p "$STATE_DIR"
     echo "$IP" > "$STATE_DIR/${NAME}.ip"
-    echo "Host IP $IP stored in $STATE_DIR/${NAME}.ip"
+    echo "$KUBELET_PORT" > "$STATE_DIR/${NAME}.kubelet-port"
+    echo "Host IP $IP and kubelet port $KUBELET_PORT stored in $STATE_DIR/${NAME}.*"
     ;;
 
   stop)

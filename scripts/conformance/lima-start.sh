@@ -42,20 +42,37 @@ LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
 
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
+_KUBELET_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) U7S_VM_NAME="$2"; shift 2 ;;
     --kubeconfig) KUBECONFIG="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
+    --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 PORT="${_PORT_OVERRIDE:-6443}"
+KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
 
 # For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
 # instead — it skips VM provisioning and just reconnects the kubelet.
 VM_NAME="${U7S_VM_NAME:-lima-node}"
+
+# When a non-default kubelet port is requested, write a patched yaml with the
+# correct hostPort into the worktree temp dir so each worker VM uses its own
+# host-side port and parallel workers don't collide on 10250.
+if [ "$KUBELET_PORT" != "10250" ]; then
+  if [ -n "$_WORKDIR_OVERRIDE" ]; then
+    _YAML_DIR="$_WORKDIR_OVERRIDE"
+  else
+    _YAML_DIR="$PWD/temp/u7s"
+  fi
+  mkdir -p "$_YAML_DIR"
+  sed "s/hostPort: 10250/hostPort: ${KUBELET_PORT}/" "$LIMA_YAML" > "$_YAML_DIR/kubelet-patched.yaml"
+  LIMA_YAML="$_YAML_DIR/kubelet-patched.yaml"
+fi
 # --workdir sets the kubeconfig path. Takes priority over ambient $KUBECONFIG so
 # that workers on non-default VMs are not silently routed to the mayor's apiserver.
 if [ -n "$_WORKDIR_OVERRIDE" ]; then

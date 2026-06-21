@@ -154,9 +154,10 @@ pub async fn pod_log<S: Store>(
     };
 
     // 5. Build the kubelet URL.
-    //    Kubelet log endpoint: https://<node-ip>:10250/containerLogs/<ns>/<pod>/<container>
+    //    Kubelet log endpoint: https://<node-ip>:<port>/containerLogs/<ns>/<pod>/<container>
+    let kp = state.kubelet_port;
     let mut kubelet_url =
-        format!("https://{node_ip}:10250/containerLogs/{raw_ns}/{pod_name}/{container}");
+        format!("https://{node_ip}:{kp}/containerLogs/{raw_ns}/{pod_name}/{container}");
 
     // Forward query parameters.
     let mut params: Vec<(&str, String)> = Vec::new();
@@ -328,8 +329,9 @@ pub async fn resolve_attach_target<S: Store>(
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("&");
+    let kp = state.kubelet_port;
     let kubelet_ws_url =
-        format!("wss://{node_ip}:10250/attach/{raw_ns}/{pod_name}/{container}?{qs}");
+        format!("wss://{node_ip}:{kp}/attach/{raw_ns}/{pod_name}/{container}?{qs}");
 
     let tls_config = build_kubelet_tls_config(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
@@ -669,10 +671,11 @@ pub async fn resolve_exec_target<S: Store>(
         params.push("tty=1".to_owned());
     }
     let qs = params.join("&");
+    let kp = state.kubelet_port;
     let kubelet_ws_url = if qs.is_empty() {
-        format!("wss://{node_ip}:10250/exec/{raw_ns}/{pod_name}/{container}")
+        format!("wss://{node_ip}:{kp}/exec/{raw_ns}/{pod_name}/{container}")
     } else {
-        format!("wss://{node_ip}:10250/exec/{raw_ns}/{pod_name}/{container}?{qs}")
+        format!("wss://{node_ip}:{kp}/exec/{raw_ns}/{pod_name}/{container}?{qs}")
     };
 
     let tls_config = build_kubelet_tls_config(
@@ -931,9 +934,10 @@ pub(crate) async fn validate_portforward<S: Store>(
     }
 
     // 5. Build the kubelet portForward URL.
-    //    wss://<node-ip>:10250/portForward/<ns>/<pod>[?ports=<port>]
+    //    wss://<node-ip>:<port>/portForward/<ns>/<pod>[?ports=<port>]
+    let kp = state.kubelet_port;
     let ports_qs = ports.map(|p| format!("?ports={p}")).unwrap_or_default();
-    let kubelet_url = format!("wss://{node_ip}:10250/portForward/{ns}/{pod_name}{ports_qs}");
+    let kubelet_url = format!("wss://{node_ip}:{kp}/portForward/{ns}/{pod_name}{ports_qs}");
 
     Ok(PortforwardParams {
         kubelet_url,
@@ -1056,7 +1060,8 @@ pub async fn resolve_node_proxy_target<S: Store>(
     )
     .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
 
-    let kubelet_url = format!("https://{node_ip}:10250/{path_suffix}");
+    let kp = state.kubelet_port;
+    let kubelet_url = format!("https://{node_ip}:{kp}/{path_suffix}");
     Ok((kubelet_url, client))
 }
 
@@ -1373,6 +1378,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         });
@@ -1421,7 +1427,7 @@ mod tests {
             target
                 .kubelet_ws_url
                 .starts_with("wss://10.0.0.1:10250/exec/ns1/mypod/app"),
-            "kubelet exec URL must use wss scheme, port 10250, /exec/<ns>/<pod>/<container>: {}",
+            "kubelet exec URL must use wss scheme, configured port, /exec/<ns>/<pod>/<container>: {}",
             target.kubelet_ws_url
         );
         assert!(
@@ -1437,6 +1443,87 @@ mod tests {
         assert!(
             target.kubelet_ws_url.contains("input=1"),
             "kubelet exec URL must translate stdin to input=1: {}",
+            target.kubelet_ws_url
+        );
+    }
+
+    /// kubelet_port is threaded into all dial URLs — a non-default port must appear
+    /// in the kubelet URL instead of the hardcoded 10250.
+    ///
+    /// Without this test, reverting any of the five `:10250` → `:{kp}` sites in
+    /// proxy.rs would silently break per-worktree kubelet isolation: the apiserver
+    /// would keep dialing port 10250 regardless of the --kubelet-port flag, routing
+    /// parallel workers' kubectl logs/exec/attach to the wrong VM.
+    #[tokio::test]
+    async fn kubelet_port_override_is_used_in_dial_url() {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: Some("127.0.0.1".into()),
+            kubelet_port: 10260,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+        });
+
+        let node = serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": "test-node", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        let pod = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "testpod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"nodeName": "test-node", "containers": [{"name": "app", "image": "busybox"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "test-node"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "testpod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let target = resolve_exec_target(
+            &state,
+            "default",
+            "testpod",
+            Some("app"),
+            "command=id&stdout=1",
+        )
+        .await
+        .expect("resolve must succeed");
+
+        assert!(
+            target.kubelet_ws_url.contains(":10260/"),
+            "kubelet dial URL must use the configured kubelet_port (10260), not the hardcoded 10250 — \
+             parallel workers dial the wrong VM if this regresses: {}",
+            target.kubelet_ws_url
+        );
+        assert!(
+            !target.kubelet_ws_url.contains(":10250/"),
+            "kubelet dial URL must NOT contain the old hardcoded port 10250 when kubelet_port=10260 — \
+             revert of any dial site breaks per-worktree isolation: {}",
             target.kubelet_ws_url
         );
     }
@@ -1605,6 +1692,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         });
@@ -1660,7 +1748,7 @@ mod tests {
             target
                 .kubelet_ws_url
                 .starts_with("wss://10.0.0.1:10250/attach/ns1/mypod/app"),
-            "kubelet URL must use wss scheme on port 10250: {}",
+            "kubelet URL must use wss scheme on configured port: {}",
             target.kubelet_ws_url
         );
         assert!(
@@ -1810,6 +1898,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         });
@@ -1857,7 +1946,7 @@ mod tests {
 
         assert_eq!(
             params.kubelet_url, "wss://10.0.0.1:10250/portForward/default/mypod?ports=8080",
-            "kubelet URL must use wss:// scheme, InternalIP, port 10250, \
+            "kubelet URL must use wss:// scheme, InternalIP, configured port, \
              /portForward/<ns>/<pod> path, and the ports query string"
         );
     }
@@ -2101,6 +2190,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         });
@@ -2198,6 +2288,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         });
@@ -2263,6 +2354,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         });
