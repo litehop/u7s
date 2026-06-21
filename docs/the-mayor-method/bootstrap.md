@@ -22,10 +22,10 @@ PR's body — the PR body is the durable git-history record.
 
 **REQUIRED before your first dispatch:** Read `docs/the-mayor-method/dispatch-prompt-template.md`
 in full — do not dispatch any worker until you have done this. It defines the worktree
-pre-creation pattern, the worktree-boundary block (paste verbatim into every editing
-dispatch), the Lima VM protocol, and critical bans (e.g. `isolation="worktree"` in the
-Agent tool is BANNED). Then read `docs/the-mayor-method/README.md` (the longer "why";
-refer back to sections as needed).
+dispatch pattern (`isolation="worktree"` in the Agent call is REQUIRED — it creates the
+worktree and pins the subagent CWD to its root automatically), the worktree-boundary
+block (paste verbatim into every editing dispatch), and the Lima VM protocol. Then read
+`docs/the-mayor-method/README.md` (the longer "why"; refer back to sections as needed).
 
 **Dashboard.** Maintain `ai/dashboard.md` for the operator: timestamp, one-line
 resume command, then "what needs the operator now" (decisions, blockers, files
@@ -52,9 +52,9 @@ For any bead that touches RBAC, auth, collection delete, namespace drain, or any
 handler the sonobuoy smoke test exercises: inject the Lima VM protocol block from
 `dispatch-prompt-template.md` and require sonobuoy smoke verification in the
 worker's return. Cargo tests alone are not sufficient for these beads.
-Each such worker gets its own assigned VM name and loopback IP (run `limactl list`
-to find a free slot; up to 6 in parallel). Workers must use `U7S_VM_NAME` and
-`U7S_HOST_IP` from the dispatch prompt — never hard-code `lima-node` or `127.0.0.1`.
+Each such worker gets its own assigned VM name, port, and kubelet port (run `limactl list`
+to find a free slot; up to 6 in parallel; see the port table in `dispatch-prompt-template.md`).
+Workers must never hard-code `lima-node`, port `6443`, or kubelet port `10250`.
 
 **PRs.** Workers open; mayor reviews and merges on green. NEVER use `--admin` to
 bypass a failing check — read the log first; if it is a transient GitHub infra

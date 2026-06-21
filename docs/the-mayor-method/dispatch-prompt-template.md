@@ -116,10 +116,11 @@ to do.
 ## Mayor pre-dispatch checklist (run BEFORE calling Agent)
 
 ```bash
-# For VM-requiring beads only: assign an unused VM + port from the table above.
+# For VM-requiring beads only: assign an unused VM + port + kubelet port from the table above.
 #   Check which VMs are in use: limactl list
-#   Pick an unused or stopped VM; assign the next available port (6444–6448).
-#   Include --port <PORT> in dispatch. Workers always bind to 127.0.0.1.
+#   Pick an unused or stopped VM; assign the matching port pair (6444+10251 … 6448+10255).
+#   Include --port <PORT> and --kubelet-port <KUBELET_PORT> in dispatch.
+#   Workers always bind to 127.0.0.1; port is the only isolation boundary.
 ```
 
 No pre-create needed: `isolation="worktree"` in the Agent call creates the
@@ -321,28 +322,35 @@ limit: ~4 GiB RAM per VM).
 
 **Available VMs and their assigned ports:**
 
-| VM name | Host port | Notes |
-|---|---|---|
-| `lima-node` | `6443` | Mayor's VM — never assign to workers |
-| slot 1 | `6444` | |
-| slot 2 | `6445` | |
-| slot 3 | `6446` | |
-| slot 4 | `6447` | |
-| slot 5 | `6448` | |
+| VM name | Host port | Kubelet port | Notes |
+|---|---|---|---|
+| `lima-node` | `6443` | `10250` | Mayor's VM — never assign to workers |
+| slot 1 | `6444` | `10251` | |
+| slot 2 | `6445` | `10252` | |
+| slot 3 | `6446` | `10253` | |
+| slot 4 | `6447` | `10254` | |
+| slot 5 | `6448` | `10255` | |
 
 All workers bind to `127.0.0.1` — port is the isolation boundary between parallel
 workers. Different loopback IPs are NOT reliably reachable from inside Lima VMs via
 `host.lima.internal`; port is the only safe differentiator.
 
+**Kubelet port** is the host-side port-forward for guest port 10250. Each slot must use
+a distinct kubelet port so parallel workers don't collide on log/exec/attach requests.
+Pass `--kubelet-port <N>` to `run-all.sh` and provision the VM with:
+`scripts/worker-vm.sh start <vm-name> 127.0.0.1 <kubelet-port>`
+
 The MCP server name mirrors the VM name: `mcp__lima-node-smoke__run_shell_command`
 for `lima-node-smoke`, etc.
 
 **Mayor assigns VM and port at dispatch time.** Run `limactl list` to see which VMs are
-running; pick an unused or stopped one. Pass the VM name and port in the dispatch prompt:
+running; pick an unused or stopped one. Pass the VM name, port, and kubelet port in the
+dispatch prompt:
 
 ```
 Your assigned VM: lima-node-smoke
 Your assigned port: 6444
+Your assigned kubelet port: 10251
 ```
 
 The worker uses these to invoke the conformance stack:
@@ -373,13 +381,14 @@ skips VM verification is shipping untested code.
 
 ### The block (paste verbatim into applicable dispatch prompts)
 
-Fill in `<VM_NAME>` and `<PORT>` from the mayor's assignment before pasting.
+Fill in `<VM_NAME>`, `<PORT>`, and `<KUBELET_PORT>` from the mayor's assignment before pasting.
 
 ```
 ## Lima VM protocol — MANDATORY for this bead
 
 Your assigned VM: <VM_NAME>
 Your assigned port: <PORT>
+Your assigned kubelet port: <KUBELET_PORT>
 Your assigned worktree: <ASSIGNED_WORKTREE>
 
 You have exclusive use of this VM for this bead. Do NOT use `lima-node` or
@@ -402,18 +411,24 @@ sonobuoy exercises. You must verify against the live server.
 
 Verification sequence (do not skip any step):
 
-1. Build from your worktree into your worktree's target dir:
+1. Provision the VM with its assigned kubelet port (first run only):
+   ```bash
+   scripts/worker-vm.sh start <VM_NAME> 127.0.0.1 <KUBELET_PORT>
+   ```
+   If the VM already exists and is running, skip this step.
+
+2. Build from your worktree into your worktree's target dir:
    ```bash
    cargo build -p u7s-apiserver --release \
      --manifest-path <ASSIGNED_WORKTREE>/Cargo.toml \
      --target-dir <ASSIGNED_WORKTREE>/target
    ```
 
-2. Run the full conformance stack. **First run must use `--reset`** — the VM may
+3. Run the full conformance stack. **First run must use `--reset`** — the VM may
    have stale state from its previous owner:
    ```bash
    scripts/conformance/run-all.sh \
-     --vm <VM_NAME> --port <PORT> \
+     --vm <VM_NAME> --port <PORT> --kubelet-port <KUBELET_PORT> \
      --binary <ASSIGNED_WORKTREE>/target/release/u7s-apiserver \
      --workdir <ASSIGNED_WORKTREE>/temp/u7s \
      --reset \
@@ -487,11 +502,16 @@ When a worker returns from a VM/sonobuoy-touching bead:
   `mcp__<VM_NAME>__*` and `limactl shell <VM_NAME>` are both available. Inject
   the Lima VM protocol block for any bead touching `scripts/conformance/`,
   `scripts/*-start.sh`, or sonobuoy-exercised handlers.
-- **Workers hard-code `lima-node` or port `6443`.** Each worker gets an
-  assigned VM name and port from the mayor. Hard-coding the defaults causes
-  collisions when multiple workers run in parallel. Always use `U7S_VM_NAME`
-  and `--port <PORT>` from the dispatch prompt. Workers always bind to
-  `127.0.0.1`; port is the only isolation boundary.
+- **Workers hard-code `lima-node`, port `6443`, or kubelet port `10250`.** Each worker gets an
+  assigned VM name, port, and kubelet port from the mayor. Hard-coding the defaults causes
+  collisions when multiple workers run in parallel. Always use the values from the dispatch
+  prompt. Workers always bind to `127.0.0.1`; port is the only isolation boundary.
+- **Worker skips `--reset` on first run.** The first `run-all.sh` call in a worktree
+  must use `--reset` — the VM may have stale certs or port-forward config from a previous
+  owner. Omitting it on the first run risks inheriting stale VM state. Subsequent calls
+  in the same worktree should omit `--reset` to avoid the ~5 min VM reprovision penalty,
+  but using it again is safe (everything regenerates consistently). The Lima VM protocol
+  block states this explicitly; enforce it at return-review time.
 - **Workers embed bead IDs and task refs in source comments.** These rot
   immediately as beads close and PRs age. The common preamble bans bead IDs
   in source. Enforce it at review time — if a diff contains `(mayor-`, send

@@ -14,6 +14,7 @@ Never use absolute paths; they break the permission allowlist and are not portab
 
 - `<VM>` — your assigned Lima VM name, e.g. `lima-node-2`
 - `<PORT>` — your assigned host port, e.g. `6444` (mayor owns `6443`)
+- `<KUBELET_PORT>` — your assigned kubelet host port, e.g. `10251` (mayor owns `10250`)
 - `<FOCUS>` — sonobuoy test filter regex, e.g. `AdmissionWebhook`
 
 **Networking note**: all apiservers bind to `127.0.0.1:<PORT>` (host loopback). Port
@@ -21,6 +22,14 @@ is the isolation boundary between parallel workers — different loopback IPs ar
 reliably reachable from inside Lima VMs via `host.lima.internal`. Inside the Lima VM
 the host is reachable at `host.lima.internal` (QEMU NAT gateway). The scripts handle
 the address rewrite automatically when given `--port <PORT>`.
+
+`<KUBELET_PORT>` is the host-side port-forward for the kubelet's guest port 10250.
+Each worker VM forwards to a different host port so parallel log/exec/attach requests
+don't collide. Always pass `--kubelet-port <KUBELET_PORT>` to `run-all.sh` and
+`u7s-start.sh`. Provision the VM with its kubelet port before the first run:
+```bash
+scripts/worker-vm.sh start <VM> 127.0.0.1 <KUBELET_PORT>
+```
 
 ---
 
@@ -36,8 +45,9 @@ owner. Takes longer due to VM reprovisioning.
 
 ```bash
 scripts/conformance/run-all.sh \
-  --vm    <VM> \
-  --port  <PORT> \
+  --vm           <VM> \
+  --port         <PORT> \
+  --kubelet-port <KUBELET_PORT> \
   --reset \
   --focus "<FOCUS>"
 ```
@@ -47,8 +57,9 @@ Reuses the existing CA, kubeconfig, and VM — significantly faster.
 
 ```bash
 scripts/conformance/run-all.sh \
-  --vm    <VM> \
-  --port  <PORT> \
+  --vm           <VM> \
+  --port         <PORT> \
+  --kubelet-port <KUBELET_PORT> \
   --focus "<FOCUS>"
 ```
 
@@ -63,8 +74,9 @@ cargo build -p u7s-apiserver --release \
   --target-dir    target
 
 scripts/conformance/run-all.sh \
-  --vm     <VM> \
-  --port   <PORT> \
+  --vm           <VM> \
+  --port         <PORT> \
+  --kubelet-port <KUBELET_PORT> \
   --binary target/release/u7s-apiserver \
   --reset \
   --focus  "<FOCUS>"
@@ -90,8 +102,9 @@ Binary: `target/release/u7s-apiserver`. The worktree `target/` is gitignored.
 
 ```bash
 scripts/u7s-start.sh \
-  --vm     <VM> \
-  --port   <PORT> \
+  --vm           <VM> \
+  --port         <PORT> \
+  --kubelet-port <KUBELET_PORT> \
   --binary target/release/u7s-apiserver \
   --background
 
@@ -108,8 +121,9 @@ server address), and starts konnectivity-server. To start fully fresh, delete `t
 
 ```bash
 scripts/conformance/lima-start.sh \
-  --vm   <VM> \
-  --port <PORT>
+  --vm           <VM> \
+  --port         <PORT> \
+  --kubelet-port <KUBELET_PORT>
 ```
 
 This provisions the VM (if needed) or reconnects the kubelet. Handles:
