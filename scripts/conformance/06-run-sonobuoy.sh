@@ -196,16 +196,15 @@ done
 SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
 
 echo "Running sonobuoy inside $VM_NAME..."
-# FIXME: these don't seem to work correctly
 # Start the namespace TTL watchdog in the background now that sonobuoy is
 # creating test namespaces.  The EXIT trap kills it when we leave this script.
-# watchdog_loop "$KUBECONFIG" &
-# _WATCHDOG_PID=$!
-# echo "[watchdog] started (pid=${_WATCHDOG_PID})"
+watchdog_loop "$KUBECONFIG" &
+_WATCHDOG_PID=$!
+echo "[watchdog] started (pid=${_WATCHDOG_PID})"
 
-# stall_watchdog_loop "$VM_NAME" &
-# _STALL_WATCHDOG_PID=$!
-# echo "[stall-watchdog] started (pid=${_STALL_WATCHDOG_PID})"
+stall_watchdog_loop "$VM_NAME" &
+_STALL_WATCHDOG_PID=$!
+echo "[stall-watchdog] started (pid=${_STALL_WATCHDOG_PID})"
 
 # Run sonobuoy.  Allow non-zero exit so that a stall-detector kill (which
 # causes sonobuoy --wait to exit with an error) does not abort the script
