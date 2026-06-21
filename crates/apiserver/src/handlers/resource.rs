@@ -6011,6 +6011,7 @@ mod tests {
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         });
@@ -6121,6 +6122,7 @@ mod tests {
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         })
@@ -7485,6 +7487,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: Some(signing_key),
             konnectivity_proxy_addr: None,
         });
@@ -7566,6 +7569,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: Some(signing_key),
             konnectivity_proxy_addr: None,
         });
@@ -7651,6 +7655,7 @@ mod tests {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: Some(signing_key),
             konnectivity_proxy_addr: None,
         });

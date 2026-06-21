@@ -6,7 +6,7 @@
 # restart without re-provisioning the VM.
 #
 # Usage:
-#   scripts/u7s-start.sh [--reset] [--background] [--port <N>]
+#   scripts/u7s-start.sh [--reset] [--background] [--port <N>] [--kubelet-port <N>]
 #
 #   --reset       Wipe ./temp/u7s/ and start fresh (rotates CA — kubelet will need
 #                 to be re-joined via scripts/conformance/lima-start.sh after this).
@@ -14,6 +14,9 @@
 #                 any existing apiserver on the port and starts the new binary.
 #   --port        Port for the apiserver to listen on (default: 6443). Use a different
 #                 port to run multiple workers in parallel without collisions.
+#   --kubelet-port  Host-side port the kubelet is reachable on (default: 10250). Override
+#                 when the lima port-forward maps guest 10250 to a different host port
+#                 for per-worktree isolation.
 #
 # Environment variables:
 #   U7S_HOST_IP   IP to bind and advertise (default: 127.0.0.1).
@@ -31,6 +34,7 @@ RESET=0
 BACKGROUND=0
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
+_KUBELET_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
@@ -40,10 +44,12 @@ while [[ $# -gt 0 ]]; do
     --binary) U7S_BINARY="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
+    --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 PORT="${_PORT_OVERRIDE:-6443}"
+KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
 
 # Derive WORKDIR and runtime vars after arg parsing so flags override env.
 _VM="${U7S_VM_NAME:-lima-node}"
@@ -70,7 +76,7 @@ pkill -f "konnectivity-server.*${WORKDIR}" 2>/dev/null || true
 if nc -z "$HOST_IP" "$PORT" 2>/dev/null; then
   if [ "$BACKGROUND" -eq 1 ]; then
     echo "Port $HOST_IP:$PORT in use — killing existing apiserver before restart ..." >&2
-    API_PID=$(lsof -ti tcp:"$PORT" 2>/dev/null || true)
+    API_PID=$(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
     [ -n "$API_PID" ] && kill "$API_PID" 2>/dev/null || true
     for i in $(seq 1 10); do
       nc -z "$HOST_IP" "$PORT" 2>/dev/null || break
@@ -167,6 +173,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
     --ca-key     "$WORKDIR/ca.key" \
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "$HOST_IP" \
+    --kubelet-port "$KUBELET_PORT" \
     --service-cluster-ip-range "10.96.0.0/12" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
@@ -184,6 +191,7 @@ else
     --ca-key     "$WORKDIR/ca.key" \
     --ca-cert    "$WORKDIR/ca.crt" \
     --kubelet-preferred-address "$HOST_IP" \
+    --kubelet-port "$KUBELET_PORT" \
     --service-cluster-ip-range "10.96.0.0/12" \
     $PROXY_ARG \
     $ADVERTISE_ARG \
@@ -270,6 +278,7 @@ EXTEOF
       --ca-key     "$WORKDIR/ca.key" \
       --ca-cert    "$WORKDIR/ca.crt" \
       --kubelet-preferred-address "$HOST_IP" \
+      --kubelet-port "$KUBELET_PORT" \
       --service-cluster-ip-range "10.96.0.0/12" \
       --konnectivity-proxy-addr "$HOST_IP:$KONNECTIVITY_PROXY_PORT" \
       $ADVERTISE_ARG \

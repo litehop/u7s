@@ -111,6 +111,10 @@ pub struct AppState<S = SqliteStore> {
     /// requests. Needed when the apiserver runs on a different host than the kubelet
     /// (e.g. Mac host + Lima VM) and the node's InternalIP is not reachable from the host.
     pub kubelet_preferred_address: Option<Arc<String>>,
+    /// Host-side port the kubelet is reachable on. The kubelet always serves on 10250 inside
+    /// the VM; this field carries the host port-forward target when it differs (per-worktree
+    /// isolation). Default: 10250.
+    pub kubelet_port: u16,
     /// Service CIDR allocator. None means auto-allocation is disabled.
     pub service_ip_allocator: Option<Arc<ServiceIpAllocator>>,
     /// 32-byte HMAC-SHA256 signing key for continue tokens.
@@ -148,6 +152,9 @@ pub struct AppStateConfig<S> {
     /// In production: `kubelet_client_cert_pem + kubelet_client_key_pem` from `TlsMaterial`.
     pub kubelet_client_identity_pem: Option<Vec<u8>>,
     pub kubelet_preferred_address: Option<String>,
+    /// Host-side port for kubelet proxy requests. Defaults to 10250. Override when the
+    /// lima port-forward maps guest 10250 to a different host port (per-worktree isolation).
+    pub kubelet_port: u16,
     /// 32-byte HMAC-SHA256 signing key for continue tokens.
     /// Pass `None` to generate a fresh random key.
     pub continue_token_key: Option<[u8; 32]>,
@@ -173,6 +180,7 @@ impl<S> Clone for AppState<S> {
             cluster_ca_der: self.cluster_ca_der.clone(),
             kubelet_client_identity_pem: self.kubelet_client_identity_pem.clone(),
             kubelet_preferred_address: self.kubelet_preferred_address.clone(),
+            kubelet_port: self.kubelet_port,
             service_ip_allocator: self.service_ip_allocator.clone(),
             continue_token_key: self.continue_token_key.clone(),
             konnectivity_proxy_addr: self.konnectivity_proxy_addr.clone(),
@@ -203,6 +211,7 @@ impl<S: Store> AppState<S> {
             service_ip_allocator: None,
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         })
@@ -310,6 +319,7 @@ impl<S: Store> AppState<S> {
             cluster_ca_der: cfg.cluster_ca_der.map(Arc::new),
             kubelet_client_identity_pem: cfg.kubelet_client_identity_pem.map(Arc::new),
             kubelet_preferred_address: cfg.kubelet_preferred_address.map(Arc::new),
+            kubelet_port: cfg.kubelet_port,
             service_ip_allocator: cfg.service_ip_allocator.map(Arc::new),
             continue_token_key: Arc::new(continue_token_key),
             konnectivity_proxy_addr: cfg.konnectivity_proxy_addr,
@@ -1244,6 +1254,7 @@ mod tests {
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         })

@@ -95,6 +95,13 @@ struct Args {
     #[arg(long)]
     kubelet_preferred_address: Option<String>,
 
+    /// Host-side port the kubelet is reachable on for proxy requests (log, exec, attach,
+    /// port-forward). The kubelet always serves on 10250 inside the VM; override this when
+    /// the lima port-forward maps guest 10250 to a different host port for per-worktree
+    /// isolation. Must match the hostPort in lima/kubelet.yaml portForwards.
+    #[arg(long, default_value = "10250")]
+    kubelet_port: u16,
+
     /// Address of a konnectivity-server HTTP CONNECT proxy used to route admission webhook
     /// calls through the tunnel so that pod IPs inside the Lima VM are reachable from the
     /// Mac host. Format: "host:port" (e.g. "127.0.0.1:8135"). Omit to disable proxying.
@@ -241,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
         service_ip_allocator,
         kubelet_client_identity_pem: Some(kubelet_client_identity_pem),
         kubelet_preferred_address: args.kubelet_preferred_address,
+        kubelet_port: args.kubelet_port,
         continue_token_key: None, // fresh random key generated at startup
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
     });
@@ -5213,6 +5221,7 @@ mod tests {
             service_ip_allocator: Some(alloc),
             kubelet_client_identity_pem: None,
             kubelet_preferred_address: None,
+            kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
         })
