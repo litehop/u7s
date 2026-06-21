@@ -22,7 +22,7 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "services") = (group, plural) {
         default_service(obj);
     }
-    if let ("", "events") = (group, plural) {
+    if plural == "events" && (group.is_empty() || group == "events.k8s.io") {
         normalize_event_timestamps(obj);
     }
     if let ("", "persistentvolumeclaims") = (group, plural) {
@@ -940,6 +940,50 @@ mod tests {
         assert_eq!(
             obj["eventTime"], "2017-09-20T13:49:16.999999Z",
             "existing sub-second precision must not be overwritten"
+        );
+    }
+
+    /// events.k8s.io/v1 Event eventTime without microseconds must be normalized.
+    ///
+    /// client-go sends eventTime in RFC3339 second precision (e.g. "2024-01-15T10:00:00Z").
+    /// Without normalization to microsecond precision, client-go's MicroTime codec parses
+    /// it as the zero time (0001-01-01T00:00:00Z), making every event appear to have no time.
+    /// This test fails when the group check in apply_defaults excludes "events.k8s.io".
+    #[test]
+    fn events_k8s_io_v1_event_time_normalized_to_microsecond_precision() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "events.k8s.io/v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "eventTime": "2024-01-15T10:00:00Z",
+            "action": "Started",
+            "reason": "TestReason"
+        });
+
+        apply_defaults("events.k8s.io", "events", &mut obj);
+
+        assert_eq!(
+            obj["eventTime"], "2024-01-15T10:00:00.000000Z",
+            "eventTime must have .000000 suffix so client-go MicroTime parses it; \
+             without normalization events.k8s.io/v1 events show 0001-01-01 as their timestamp"
+        );
+    }
+
+    /// events.k8s.io/v1 Event with already-precise eventTime must not be modified.
+    #[test]
+    fn events_k8s_io_v1_event_time_already_precise_is_unchanged() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "events.k8s.io/v1",
+            "kind": "Event",
+            "metadata": { "name": "my-event", "namespace": "default" },
+            "eventTime": "2024-01-15T10:00:00.123456Z"
+        });
+
+        apply_defaults("events.k8s.io", "events", &mut obj);
+
+        assert_eq!(
+            obj["eventTime"], "2024-01-15T10:00:00.123456Z",
+            "already-precise eventTime must not be overwritten"
         );
     }
 
