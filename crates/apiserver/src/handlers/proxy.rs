@@ -22,6 +22,7 @@ use serde::Deserialize;
 use u7s_store::Store;
 
 use crate::{
+    admission::{run_validating_webhooks, AdmissionContext},
     handlers::stream::{splice, AxumWs, BiStream, BiStreamReader, BiStreamWriter, TungsteniteWs},
     keys::{cluster_object_key, object_key},
     state::AppState,
@@ -332,6 +333,18 @@ pub async fn resolve_attach_target<S: Store>(
     let kp = state.kubelet_port;
     let kubelet_ws_url =
         format!("wss://{node_ip}:{kp}/attach/{raw_ns}/{pod_name}/{container}?{qs}");
+
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "pods/attach",
+        name: pod_name,
+        namespace: Some(raw_ns),
+        operation: "CONNECT",
+        user_info: None,
+        dry_run: false,
+    };
+    run_validating_webhooks(state, &pod, &admission_ctx).await?;
 
     let tls_config = build_kubelet_tls_config(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
@@ -2650,6 +2663,153 @@ mod tests {
         assert!(
             !is_exec_status_frame(&frame),
             "empty frame must not be absorbed — is_some_and returns false for None"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_attach: admission webhook check before websocket upgrade
+    //
+    // The attach handler must run validating webhooks BEFORE upgrading to
+    // websocket. Without this, a webhook denial cannot return HTTP 403 — instead
+    // the client receives websocket close 1006 (abnormal closure), which the
+    // conformance test does not accept.
+    // -----------------------------------------------------------------------
+
+    /// A validating webhook that denies pods/attach CONNECT must cause
+    /// resolve_attach_target to return HTTP 403 before the websocket upgrade.
+    ///
+    /// Without the admission check in resolve_attach_target, the denial cannot
+    /// be surfaced as a clean HTTP error — it arrives only after the websocket
+    /// handshake completes, producing close code 1006 (abnormal closure) instead
+    /// of 403. This test fails if the run_validating_webhooks call is removed.
+    #[tokio::test]
+    async fn pod_attach_validating_webhook_denial_returns_403_before_websocket_upgrade() {
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let denial_router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": false,
+                        "status": {
+                            "code": 403,
+                            "message": "attaching to pod 'to-be-attached-pod' is not allowed"
+                        }
+                    }
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let webhook_url = format!("http://{addr}/webhook");
+        tokio::spawn(async move {
+            axum::serve(listener, denial_router).await.ok();
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "deny-attach"},
+            "webhooks": [{
+                "name": "deny-attach.example.com",
+                "clientConfig": {"url": webhook_url},
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["pods/attach"],
+                    "operations": ["CONNECT"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/deny-attach",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "to-be-attached-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "to-be-attached-pod"),
+                bytes::Bytes::from(pod.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let query = AttachQuery {
+            container: None,
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            tty: None,
+        };
+        let result = resolve_attach_target(&state, "default", "to-be-attached-pod", &query).await;
+        let err = match result {
+            Ok(_) => panic!(
+                "resolve_attach_target must return an error when a validating webhook denies \
+                 the attach request — without this, a denial can only be sent after the websocket \
+                 upgrade, producing close 1006 instead of HTTP 403"
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.0.as_u16(),
+            403,
+            "webhook denial on pods/attach must produce HTTP 403 Forbidden, not {} — \
+             the conformance test expects the client to receive an error message, not \
+             an abnormal websocket close code 1006",
+            err.0.as_u16()
+        );
+        let body_json = serde_json::to_string(&err.1).unwrap_or_default();
+        assert!(
+            body_json.contains("is not allowed"),
+            "the denial message from the webhook must be propagated to the client: {}",
+            body_json
         );
     }
 }
