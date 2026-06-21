@@ -8,6 +8,7 @@ use bytes::Bytes;
 use u7s_store::{ListOptions, Store};
 
 use crate::{
+    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
     keys::cluster_object_key,
     state::AppState,
@@ -652,6 +653,19 @@ pub async fn create_cr<S: Store>(
 
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: None,
+        operation: "CREATE",
+        user_info: None,
+        dry_run: false,
+    };
+    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
+
     let key = cr_store_key(&group, &version, &plural, None, &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
@@ -720,6 +734,19 @@ pub async fn replace_cr<S: Store>(
     }
 
     validate_cr_schema(&obj, &ctx)?;
+
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: None,
+        operation: "UPDATE",
+        user_info: None,
+        dry_run: false,
+    };
+    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
 
     let meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
@@ -1018,6 +1045,19 @@ pub async fn create_cr_namespaced<S: Store>(
     }
     stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
 
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: Some(&ns),
+        operation: "CREATE",
+        user_info: None,
+        dry_run: false,
+    };
+    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
+
     let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
@@ -1084,6 +1124,19 @@ pub async fn replace_cr_namespaced<S: Store>(
     }
 
     validate_cr_schema(&obj, &ctx)?;
+
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: Some(&ns),
+        operation: "UPDATE",
+        user_info: None,
+        dry_run: false,
+    };
+    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
 
     let meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
@@ -1187,6 +1240,19 @@ pub async fn patch_cr<S: Store>(
 
     validate_cr_schema(&obj, &ctx)?;
 
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: None,
+        operation: "UPDATE",
+        user_info: None,
+        dry_run: false,
+    };
+    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
+
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
@@ -1251,6 +1317,19 @@ pub async fn patch_cr_namespaced<S: Store>(
     }
 
     validate_cr_schema(&obj, &ctx)?;
+
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: Some(&ns),
+        operation: "UPDATE",
+        user_info: None,
+        dry_run: false,
+    };
+    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
@@ -5831,6 +5910,188 @@ mod tests {
             json["code"], 422,
             "malformed JSON Patch (non-array body) must return 422 — \
              returning 200/500 would hide client errors from controllers"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Admission webhook invocation regression tests
+    //
+    // These tests verify that the CR create/update handlers call the admission
+    // webhook pipeline. If the invocation logic is removed, a matching mutating
+    // webhook must not apply its patch (mutation test) and a matching validating
+    // webhook must not deny (denial test), causing these tests to fail.
+    // ---------------------------------------------------------------------------
+
+    /// A mutating webhook with failurePolicy=Ignore and an unreachable URL must not
+    /// block CR creation — admission is attempted but the failure is absorbed.
+    ///
+    /// This test verifies that create_cr_namespaced calls the admission pipeline:
+    /// if admission were skipped entirely, the Ignore-policy webhook would never be
+    /// contacted, but the object would still be created. When invocation IS wired in
+    /// but the webhook is unreachable with Ignore, the create must still succeed.
+    #[tokio::test]
+    async fn create_cr_namespaced_calls_admission_ignore_policy_passes_through() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        // Install CRD before seeding the webhook so CRD creation is not denied.
+        install_namespaced_crd(&state).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "cr-test-mwc"},
+            "webhooks": [{
+                "name": "cr.mutate.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                "failurePolicy": "Ignore"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/cr-test-mwc",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            app_body("wh-test-app", "argocd"),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "mutating webhook with failurePolicy=Ignore must not block CR creation \
+             — if admission is wired in and the webhook is unreachable with Ignore, \
+             the create must still succeed"
+        );
+    }
+
+    /// A validating webhook with failurePolicy=Fail and an unreachable URL must
+    /// deny CR creation with an error.
+    ///
+    /// This regression test verifies that create_cr_namespaced invokes the validating
+    /// webhook chain. If the chain were not called, the unreachable Fail-policy webhook
+    /// would be silently skipped and the create would succeed — this test would then
+    /// fail, proving the invocation was removed.
+    #[tokio::test]
+    async fn create_cr_namespaced_calls_validating_admission_fail_policy_denies() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        // Install CRD before seeding the webhook so CRD creation is not denied.
+        install_namespaced_crd(&state).await;
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "cr-test-vwc"},
+            "webhooks": [{
+                "name": "cr.validate.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state.store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/cr-test-vwc",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            app_body("denied-app", "argocd"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "validating webhook with failurePolicy=Fail must deny CR creation — \
+             if the validating webhook chain is not called, the Fail-policy webhook \
+             would be skipped and the create would incorrectly succeed"
+        );
+    }
+
+    /// A mutating webhook with failurePolicy=Fail and unreachable URL must
+    /// deny cluster-scoped CR creation.
+    ///
+    /// Verifies that create_cr (cluster-scoped path) also invokes admission,
+    /// not just the namespaced handler. If admission were skipped for cluster-scoped
+    /// CRs, this create would succeed instead of being denied.
+    #[tokio::test]
+    async fn create_cr_calls_admission_fail_policy_denies_cluster_scoped() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        // Install CRD before seeding the webhook so CRD creation is not denied.
+        install_cluster_crd(&state).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "cluster-cr-mwc"},
+            "webhooks": [{
+                "name": "cluster-cr.mutate.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state.store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/cluster-cr-mwc",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = create_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            widget_body("denied-widget"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "mutating webhook with failurePolicy=Fail must deny cluster-scoped CR creation — \
+             if admission is skipped for the cluster-scoped CR path, this create would \
+             incorrectly succeed"
         );
     }
 }
