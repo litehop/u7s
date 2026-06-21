@@ -37,85 +37,6 @@ if ! kubectl --kubeconfig="$KUBECONFIG" get nodes 2>/dev/null | grep -q "$VM_NAM
 fi
 
 # ---------------------------------------------------------------------------
-# Sonobuoy progress stall detector — kills the entire sonobuoy run if the
-# live progress signal has not advanced for 15 minutes.
-#
-# WHY progress.* and NOT result-counts: for the e2e plugin, 'sonobuoy status
-# --json' returns result-counts: null for the ENTIRE run — it is only
-# populated when the plugin finishes and writes its tarball at the very end.
-# Keying on result-counts therefore reads 0 the whole run and fires the kill
-# at 900s on healthy runs (mayor-f73c regression). The live signal lives under
-# .plugins[].progress: .completed increments as specs finish, and .msg changes
-# on every state transition. Because fast specs can leave .completed at 0 (and
-# .total can even reset to 0), .msg-change is the robust liveness signal — we
-# reset the timer when EITHER .completed increases OR .msg changes.
-#
-# This is a second independent kill switch that operates at the sonobuoy
-# level, complementing the namespace TTL watchdog.  It catches the case where
-# the apiserver is completely unresponsive and the namespace watchdog cannot
-# unblock a stuck test.
-#
-# Lifecycle:
-#   - Start after sonobuoy run begins.
-#   - Skip the first 30s while sonobuoy initialises.
-#   - Guard against sonobuoy not yet running: skip iterations where status
-#     returns no valid JSON or no plugins array.
-#   - Kill on EXIT trap alongside the namespace watchdog.
-# ---------------------------------------------------------------------------
-stall_watchdog_loop() {
-  local vm_name="$1"
-  local last_count=0
-  local last_msg=""
-  local last_progress_time
-  last_progress_time=$(date +%s)
-  local stall_threshold=900  # 15 minutes in seconds
-
-  # Initial delay — sonobuoy needs time to initialise before we start polling.
-  sleep 30
-
-  while true; do
-    sleep 60
-
-    # Poll sonobuoy status from inside the VM.
-    local status_json
-    status_json=$(limactl shell "$vm_name" sudo sonobuoy status --json \
-      --kubeconfig /tmp/sonobuoy-kubeconfig 2>/dev/null) || { continue; }
-
-    # Guard: skip if output is not valid JSON or has no plugins array.
-    if ! printf '%s' "$status_json" | jq -e '.plugins' &>/dev/null; then
-      continue
-    fi
-
-    # Live progress signal: sum of progress.completed and the joined progress.msg
-    # across all plugins.  result-counts is deliberately NOT read (null mid-run).
-    local current_count current_msg
-    current_count=$(printf '%s' "$status_json" \
-      | jq '[.plugins[]?.progress.completed // 0] | add // 0')
-    current_msg=$(printf '%s' "$status_json" \
-      | jq -r '[.plugins[]?.progress.msg // ""] | join("|")')
-
-    local now
-    now=$(date +%s)
-
-    # Reset the stall timer when completed INCREASES or msg CHANGES vs the
-    # previous iteration — either proves the run is still making progress.
-    if [ "$current_count" -gt "$last_count" ] || [ "$current_msg" != "$last_msg" ]; then
-      last_count=$current_count
-      last_msg=$current_msg
-      last_progress_time=$now
-    else
-      local stall_s=$(( now - last_progress_time ))
-      if [ "$stall_s" -ge "$stall_threshold" ]; then
-        echo "[stall-watchdog] $(date -u +%Y-%m-%dT%H:%M:%SZ) no sonobuoy progress for ${stall_s}s (completed=${current_count}, msg='${current_msg}') — killing run"
-        limactl shell "$vm_name" sudo sonobuoy delete --all --wait \
-          --kubeconfig /tmp/sonobuoy-kubeconfig 2>/dev/null || true
-        return 0
-      fi
-    fi
-  done
-}
-
-# ---------------------------------------------------------------------------
 # Namespace TTL watchdog — runs host-side via kubectl to force-delete test
 # namespaces that get stuck terminating or are simply too old.
 #
@@ -177,8 +98,7 @@ watchdog_loop() {
 # Rewrite kubeconfig server address for in-VM use
 REWRITTEN=$(mktemp)
 _WATCHDOG_PID=""
-_STALL_WATCHDOG_PID=""
-trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true; [ -n "$_STALL_WATCHDOG_PID" ] && kill "$_STALL_WATCHDOG_PID" 2>/dev/null || true' EXIT
+trap 'rm -f "$REWRITTEN"; [ -n "$_WATCHDOG_PID" ] && kill "$_WATCHDOG_PID" 2>/dev/null || true' EXIT
 sed "s|https://127.0.0.1:${PORT}|https://host.lima.internal:${PORT}|g" "$KUBECONFIG" > "$REWRITTEN"
 limactl shell "$VM_NAME" sudo rm -f /tmp/sonobuoy-kubeconfig
 limactl copy "$REWRITTEN" "${VM_NAME}:/tmp/sonobuoy-kubeconfig"
@@ -202,13 +122,8 @@ watchdog_loop "$KUBECONFIG" &
 _WATCHDOG_PID=$!
 echo "[watchdog] started (pid=${_WATCHDOG_PID})"
 
-stall_watchdog_loop "$VM_NAME" &
-_STALL_WATCHDOG_PID=$!
-echo "[stall-watchdog] started (pid=${_STALL_WATCHDOG_PID})"
-
-# Run sonobuoy.  Allow non-zero exit so that a stall-detector kill (which
-# causes sonobuoy --wait to exit with an error) does not abort the script
-# before partial results are retrieved.
+# Run sonobuoy.  Allow non-zero exit so that partial results are retrieved
+# even when the run fails.
 SONOBUOY_EXIT=0
 if [ -n "$FOCUS" ]; then
   # shellcheck disable=SC2086
@@ -218,7 +133,7 @@ else
   limactl shell "$VM_NAME" sudo sonobuoy $SONOBUOY_BASE_ARGS --mode=non-disruptive-conformance || SONOBUOY_EXIT=$?
 fi
 if [ "$SONOBUOY_EXIT" -ne 0 ]; then
-  echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} (stall-detector kill or other error) — attempting partial result retrieval"
+  echo "[06] sonobuoy exited with status ${SONOBUOY_EXIT} — attempting partial result retrieval"
 fi
 
 # Evacuate pod logs immediately — before namespace GC removes them.
