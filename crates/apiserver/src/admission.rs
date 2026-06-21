@@ -1848,6 +1848,26 @@ pub(crate) fn validate_webhook_match_conditions_cel(obj: &serde_json::Value) -> 
                      invalid CEL expression: {expr:?}"
                 ));
             }
+            let valid_start = matches!(
+                tokens[0],
+                CelToken::Ident(_)
+                    | CelToken::Str(_)
+                    | CelToken::Int(_)
+                    | CelToken::Float(_)
+                    | CelToken::Bool(_)
+                    | CelToken::Null
+                    | CelToken::LBrace
+                    | CelToken::LBracket
+                    | CelToken::LParen
+                    | CelToken::Bang
+                    | CelToken::Minus
+            );
+            if !valid_start {
+                return Err(format!(
+                    "webhooks[{wi}].matchConditions[{ci}].expression: \
+                     compilation error: invalid CEL expression: {expr:?}"
+                ));
+            }
         }
     }
     Ok(())
@@ -5226,6 +5246,23 @@ mod tests {
         assert!(
             validate_webhook_match_conditions_cel(&obj).is_ok(),
             "webhook without matchConditions must pass validation — matchConditions is optional"
+        );
+    }
+
+    /// The exact expression used by the conformance test must be rejected.
+    /// The expression "... [] bad expression" tokenizes to non-empty tokens but starts with
+    /// Dot which is not a valid CEL primary — accepting it causes the conformance test
+    /// 'should reject mutating/validating webhook configurations with invalid match conditions'
+    /// to fail (apiserver returns 200 instead of 422).
+    #[test]
+    fn validate_webhook_match_conditions_cel_rejects_dot_start_expression() {
+        let obj = json!({
+            "webhooks": [{"matchConditions": [{"name": "invalid-expression-1", "expression": "... [] bad expression"}]}]
+        });
+        assert!(
+            validate_webhook_match_conditions_cel(&obj).is_err(),
+            "expression starting with '.' must be rejected; the conformance test uses \
+             '... [] bad expression' which tokenizes to tokens but is not valid CEL"
         );
     }
 
