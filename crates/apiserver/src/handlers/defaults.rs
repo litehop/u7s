@@ -2273,6 +2273,60 @@ mod tests {
         );
     }
 
+    /// A MutatingWebhookConfiguration with the exact expression used by the conformance test
+    /// must be rejected. The conformance test uses "... [] bad expression" which tokenizes to
+    /// non-empty tokens but starts with Dot — not a valid CEL primary start.
+    #[test]
+    fn mutating_webhook_configuration_rejects_conformance_test_invalid_expression() {
+        let obj = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "test"},
+            "webhooks": [{
+                "name": "test.example.com",
+                "matchConditions": [{"name": "invalid-expression-1", "expression": "... [] bad expression"}]
+            }]
+        });
+        let result = validate_resource(
+            "admissionregistration.k8s.io",
+            "mutatingwebhookconfigurations",
+            &obj,
+        );
+        assert!(
+            result.is_err(),
+            "MutatingWebhookConfiguration with '... [] bad expression' must be rejected; \
+             the conformance test 'should reject mutating webhook configurations with invalid match conditions' \
+             POSTs this exact expression and expects 422, not 200"
+        );
+    }
+
+    /// A ValidatingWebhookConfiguration with the exact expression used by the conformance test
+    /// must be rejected. Matches the 'should reject validating webhook configurations with invalid
+    /// match conditions' conformance test.
+    #[test]
+    fn validating_webhook_configuration_rejects_conformance_test_invalid_expression() {
+        let obj = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "test"},
+            "webhooks": [{
+                "name": "test.example.com",
+                "matchConditions": [{"name": "invalid-expression-1", "expression": "... [] bad expression"}]
+            }]
+        });
+        let result = validate_resource(
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations",
+            &obj,
+        );
+        assert!(
+            result.is_err(),
+            "ValidatingWebhookConfiguration with '... [] bad expression' must be rejected; \
+             the conformance test 'should reject validating webhook configurations with invalid match conditions' \
+             POSTs this exact expression and expects 422, not 200"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Regression tests: ConfigMap/Secret empty data key rejection
     // ---------------------------------------------------------------------------
