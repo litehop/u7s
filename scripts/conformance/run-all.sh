@@ -83,7 +83,7 @@ _WORKDIR_ARG=""
 _VM_ARG=""
 [ -n "$PORT" ]         && _PORT_ARG="--port $PORT"
 [ -n "$KUBELET_PORT" ] && _KUBELET_PORT_ARG="--kubelet-port $KUBELET_PORT"
-[ -n "$WORKDIR" ]      && _WORKDIR_ARG="--workdir $WORKDIR"
+_WORKDIR_ARG="--workdir $WORKDIR"
 [ -n "${U7S_VM_NAME:-}" ] && _VM_ARG="--vm $U7S_VM_NAME"
 
 if [ "$RESET" -eq 1 ]; then
