@@ -531,9 +531,7 @@ fn build_webhook_call_client(
 
 /// Call the webhook and return the response, or `None` on network/parse error.
 /// The bool indicates whether the failure was a timeout (true) vs other error (false).
-/// Callers use this to produce "deadline exceeded" vs "failed to respond" error messages,
-/// matching the Kubernetes apiserver's error convention so conformance tests can identify
-/// webhook timeout by checking for "deadline" in the error string.
+/// Callers use this to return HTTP 504 on timeout vs HTTP 500 on other failures.
 async fn call_webhook(
     client: &reqwest::Client,
     url: &str,
@@ -728,11 +726,10 @@ async fn invoke_mutating_webhook<S: Store>(
                 );
                 Ok((object.clone(), false))
             } else if timed_out {
-                // Use "deadline exceeded" phrasing so tests can detect webhook timeout
-                // by checking for "deadline" in the error string (Kubernetes convention).
-                Err(Status::internal(format!(
-                    "admission webhook \"{}\" request deadline exceeded",
-                    webhook.name
+                let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
+                Err(Status::gateway_timeout(format!(
+                    "Timeout: request did not complete within requested timeout {}s",
+                    secs
                 )))
             } else {
                 Err(Status::internal(format!(
@@ -2504,9 +2501,10 @@ pub async fn run_validating_webhooks<S: Store>(
                         webhook.name
                     );
                 } else if timed_out {
-                    return Err(Status::internal(format!(
-                        "admission webhook \"{}\" request deadline exceeded",
-                        webhook.name
+                    let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
+                    return Err(Status::gateway_timeout(format!(
+                        "Timeout: request did not complete within requested timeout {}s",
+                        secs
                     )));
                 } else {
                     return Err(Status::internal(format!(
@@ -3267,6 +3265,100 @@ mod tests {
         assert!(
             result.is_err(),
             "failurePolicy=Fail must reject when webhook is unreachable"
+        );
+    }
+
+    /// A validating webhook that exceeds its configured timeout must return HTTP 504.
+    ///
+    /// The conformance test `should honor timeout` expects an HTTP/dial-level timeout
+    /// error (gateway timeout), not a generic 500. Without the fix the error is 500
+    /// "request deadline exceeded" and the conformance check fails.
+    #[tokio::test]
+    async fn validating_webhook_timeout_returns_504_not_500() {
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let slow_router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                axum::Json(json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {"uid": "x", "allowed": true}
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, slow_router)
+                .await
+                .expect("slow webhook server must not fail");
+        });
+
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "slow-vwc"},
+            "webhooks": [{
+                "name": "slow.validating.example.com",
+                "clientConfig": {"url": format!("http://{addr}/webhook")},
+                "rules": [{
+                    "apiGroups": ["apps"],
+                    "apiVersions": ["v1"],
+                    "resources": ["deployments"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "timeoutSeconds": 1
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/slow-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "my-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+
+        let err = result.expect_err("a timed-out webhook must return an error");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            "webhook timeout must produce 504 Gateway Timeout so conformance \
+             `should honor timeout` recognises it as a network/dial timeout — \
+             returning 500 causes the conformance test to fail"
+        );
+        assert!(
+            err.1.message.contains("Timeout:"),
+            "timeout message must start with 'Timeout:' matching kube-apiserver convention, got: {}",
+            err.1.message
         );
     }
 
