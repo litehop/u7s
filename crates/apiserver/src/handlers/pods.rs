@@ -11,7 +11,7 @@ use u7s_store::{ListOptions, Store, StoreError};
 use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
-    keys::{cluster_object_key, list_prefix, object_key},
+    keys::{cluster_object_key, group_object_key, list_prefix, object_key},
     state::AppState,
     status::Status,
     types::{Binding, Namespace, Object, ObjectMeta, PodSpec},
@@ -339,6 +339,18 @@ pub async fn create_pod<S: Store>(
     initialize_pod_generation(&mut obj.body);
     apply_automount_sa_token_default(&state, &mut obj.body, ns.as_str()).await;
     inject_sa_token_volume(&mut obj.body, &name);
+
+    if let Some(rc_name) = obj.body["spec"]["runtimeClassName"]
+        .as_str()
+        .map(str::to_owned)
+    {
+        let rc_key = group_object_key("node.k8s.io", "runtimeclasses", None, &rc_name);
+        if let Ok(Some(stored_rc)) = state.store.get(&rc_key).await {
+            if let Ok(rc_obj) = serde_json::from_slice::<serde_json::Value>(&stored_rc.value) {
+                apply_runtime_class_overhead(&mut obj.body, &rc_obj);
+            }
+        }
+    }
 
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
@@ -2436,6 +2448,22 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     }
 }
 
+/// Copy `spec.overhead.podFixed` from a RuntimeClass into `pod.spec.overhead`.
+///
+/// If the pod already carries `spec.overhead`, it is left unchanged (idempotent,
+/// matches what the kube-apiserver RuntimeClass admission plugin does).
+/// The RuntimeClass JSON must be the full stored object; if it has no
+/// `spec.overhead.podFixed` this is a no-op.
+pub fn apply_runtime_class_overhead(pod: &mut serde_json::Value, rc: &serde_json::Value) {
+    let pod_fixed = &rc["spec"]["overhead"]["podFixed"];
+    if pod_fixed.is_null() || pod_fixed.as_object().is_none_or(|m| m.is_empty()) {
+        return;
+    }
+    if pod["spec"]["overhead"].is_null() {
+        pod["spec"]["overhead"] = pod_fixed.clone();
+    }
+}
+
 /// Set `metadata.generation = 1` on a newly created pod if absent or null.
 /// Preserves the caller-supplied value when it is already set.
 ///
@@ -4016,6 +4044,101 @@ mod pure_logic_tests {
             "Initialized condition must not be modified by set_pod_scheduled_true"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // apply_runtime_class_overhead
+    // -----------------------------------------------------------------------
+
+    /// A pod referencing a RuntimeClass with overhead.podFixed{cpu:10m} must have
+    /// spec.overhead set to {cpu:10m} by apply_runtime_class_overhead.
+    ///
+    /// The RuntimeClass admission plugin in real kube-apiserver copies podFixed into
+    /// pod.spec.overhead on CREATE. Without this, conformance test
+    /// '[sig-node] RuntimeClass should schedule a Pod requesting a RuntimeClass and
+    /// initialize its Overhead' fails with expected cpu=10m but got 0.
+    /// This test fails when apply_runtime_class_overhead is removed or does not copy.
+    #[test]
+    fn runtime_class_overhead_injected_into_pod_spec() {
+        let rc = serde_json::json!({
+            "apiVersion": "node.k8s.io/v1",
+            "kind": "RuntimeClass",
+            "metadata": {"name": "my-rc"},
+            "spec": {
+                "overhead": {
+                    "podFixed": {"cpu": "10m", "memory": "50Mi"}
+                }
+            }
+        });
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test-pod", "namespace": "default"},
+            "spec": {
+                "runtimeClassName": "my-rc",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        apply_runtime_class_overhead(&mut pod, &rc);
+
+        assert_eq!(
+            pod["spec"]["overhead"]["cpu"], "10m",
+            "spec.overhead.cpu must equal the RuntimeClass podFixed.cpu — \
+             conformance test asserts overhead matches the RuntimeClass definition"
+        );
+        assert_eq!(
+            pod["spec"]["overhead"]["memory"], "50Mi",
+            "spec.overhead.memory must equal the RuntimeClass podFixed.memory"
+        );
+    }
+
+    /// A pod that already has spec.overhead set must not have it overwritten.
+    ///
+    /// Idempotency: the admission plugin must not overwrite overhead that was
+    /// already set (e.g. by a mutating webhook).
+    #[test]
+    fn runtime_class_overhead_not_overwritten_when_already_set() {
+        let rc = serde_json::json!({
+            "spec": {
+                "overhead": {
+                    "podFixed": {"cpu": "10m"}
+                }
+            }
+        });
+        let mut pod = serde_json::json!({
+            "spec": {
+                "overhead": {"cpu": "20m"}
+            }
+        });
+
+        apply_runtime_class_overhead(&mut pod, &rc);
+
+        assert_eq!(
+            pod["spec"]["overhead"]["cpu"], "20m",
+            "pre-existing spec.overhead must not be overwritten by RuntimeClass admission — \
+             a mutating webhook may have already set it to a valid value"
+        );
+    }
+
+    /// A RuntimeClass without overhead.podFixed must leave pod.spec.overhead unchanged.
+    #[test]
+    fn runtime_class_without_overhead_is_noop() {
+        let rc = serde_json::json!({
+            "spec": {}
+        });
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        apply_runtime_class_overhead(&mut pod, &rc);
+
+        assert!(
+            pod["spec"]["overhead"].is_null(),
+            "pod.spec.overhead must remain absent when RuntimeClass has no podFixed overhead"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4219,6 +4342,83 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // -----------------------------------------------------------------------
+    // RuntimeClass overhead injection regression test
+    // -----------------------------------------------------------------------
+
+    /// Creating a pod with spec.runtimeClassName referencing a RuntimeClass that has
+    /// overhead.podFixed must result in the stored pod having spec.overhead set.
+    ///
+    /// The RuntimeClass admission plugin in real kube-apiserver copies podFixed into
+    /// pod.spec.overhead at CREATE time. Conformance test '[sig-node] RuntimeClass
+    /// should schedule a Pod requesting a RuntimeClass and initialize its Overhead'
+    /// fails with "Expected value:0 to equal value:10 scale:-3" when this injection
+    /// is absent.
+    ///
+    /// This test fails when the RuntimeClass store fetch and apply_runtime_class_overhead
+    /// call are removed from create_pod.
+    #[tokio::test]
+    async fn create_pod_injects_runtime_class_overhead() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let rc = serde_json::json!({
+            "apiVersion": "node.k8s.io/v1",
+            "kind": "RuntimeClass",
+            "metadata": {"name": "test-rc"},
+            "spec": {
+                "overhead": {
+                    "podFixed": {"cpu": "10m"}
+                }
+            }
+        });
+        store
+            .put(
+                "/registry/node.k8s.io/runtimeclasses/test-rc",
+                Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed RuntimeClass");
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "rc-pod", "namespace": "default"},
+            "spec": {
+                "runtimeClassName": "test-rc",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/rc-pod")
+            .await
+            .unwrap()
+            .expect("pod must be in store");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["spec"]["overhead"]["cpu"], "10m",
+            "spec.overhead.cpu must be injected from RuntimeClass.spec.overhead.podFixed — \
+             conformance test asserts the pod overhead matches the RuntimeClass definition"
+        );
     }
 
     // -----------------------------------------------------------------------
