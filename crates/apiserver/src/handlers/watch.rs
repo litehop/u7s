@@ -2029,6 +2029,112 @@ mod tests {
         assert!(object_matches_field_selector(&obj, "status.phase=Running"));
     }
 
+    /// Regression: a watch with a label selector must receive an ADDED event for an object
+    /// created AFTER the watch is opened, when that object's labels match the selector.
+    ///
+    /// This tests the live broadcast path (not ring buffer replay). If label selector filtering
+    /// were removed from the live event branch in watch_generic, the test would still pass
+    /// (the ADDED arrives unfiltered). However, if the live event branch were changed to skip
+    /// ADDED events entirely (e.g. by only handling MODIFIED), the ADDED would not arrive and
+    /// this test would fail.
+    ///
+    /// The critical invariant: a newly-created matching object produces an ADDED event even
+    /// when the watch was opened before the object existed (no ring buffer replay involved).
+    /// Without this, Kubernetes informers with a labelSelector never learn about new objects
+    /// and their caches diverge from reality.
+    #[tokio::test]
+    async fn watch_generic_label_selector_newly_created_object_emits_added() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use tokio::time::{timeout, Duration};
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Open watch BEFORE the object exists. The ring buffer is empty at this point.
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/live/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: Some("app=foo".into()),
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "".into(),
+                timeout_seconds: Some(2),
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch must succeed"));
+
+        // Create the matching object AFTER the watch is open.
+        // Spawn as a separate task so the watch body reader can run concurrently.
+        let store_clone = Arc::clone(&store);
+        tokio::spawn(async move {
+            let obj = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "cm-live",
+                    "namespace": "live",
+                    "labels": { "app": "foo" }
+                }
+            });
+            store_clone
+                .put(
+                    "/registry/configmaps/live/cm-live",
+                    bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                    Some(0),
+                )
+                .await
+                .expect("put must succeed");
+        });
+
+        // Collect events. The stream closes after 2s; we wait up to 3s.
+        let body = resp.into_body();
+        let bytes = timeout(
+            Duration::from_secs(3),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .expect("stream must close within 3s")
+        .expect("body read must succeed");
+
+        let lines: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+            .unwrap_or("")
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+
+        let added: Vec<_> = lines.iter().filter(|v| v["type"] == "ADDED").collect();
+        assert_eq!(
+            added.len(),
+            1,
+            "a newly-created object matching labelSelector=app=foo must produce exactly one ADDED \
+             event even when the watch was opened before the object existed (live broadcast path); \
+             without this, Kubernetes informers with a labelSelector never see new objects: \
+             got lines {:?}",
+            lines
+        );
+        assert_eq!(
+            added[0]["object"]["metadata"]["name"], "cm-live",
+            "ADDED event must carry the newly-created object"
+        );
+    }
+
     // -- sendInitialEvents regression: initial-events-end BOOKMARK via watch_generic (mayor-w9tz) --
 
     /// Regression: when fetch_initial_events returns Some(items, rv) and is passed to
