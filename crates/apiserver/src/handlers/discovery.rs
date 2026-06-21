@@ -2207,6 +2207,47 @@ mod tests {
         );
     }
 
+    // GET /openapi/v2 must return Content-Type: application/json.
+    //
+    // kubectl performs client-side validation by fetching /openapi/v2 and checking the
+    // Content-Type header. If the server returns a different Content-Type (or none at all),
+    // kubectl fails with:
+    //   "error validating data: the server was unable to respond with a content type
+    //    that the client supports"
+    // This blocks `kubectl apply` and `kubectl create` in the [sig-cli] and [sig-api-machinery]
+    // conformance tests.
+    //
+    // This test fails on revert: if openapi_v2 were changed to return a plain Response with
+    // no Content-Type header, this assertion would fail.
+    #[tokio::test]
+    async fn openapi_v2_returns_content_type_application_json() {
+        let state = make_state();
+        let app = Router::new()
+            .route("/openapi/v2", get(openapi_v2))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/openapi/v2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("application/json"),
+            "GET /openapi/v2 must return Content-Type: application/json — kubectl \
+             client-side validation fails with 'unable to respond with a content type \
+             that the client supports' if this header is absent or wrong; got: '{ct}'"
+        );
+    }
+
     // HTTP-level: GET /openapi/v3 must return 200 with a "paths" key.
     // This verifies the route is wired — kubectl 1.28+ calls /openapi/v3
     // first and falls back to /openapi/v2 only if it gets a valid response.
