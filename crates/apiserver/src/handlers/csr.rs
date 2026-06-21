@@ -26,6 +26,7 @@ use x509_cert::request::CertReq;
 use u7s_store::{ListOptions, Store};
 
 use crate::{
+    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     handlers::{
         generic::{
@@ -222,7 +223,7 @@ pub async fn get_csr<S: Store>(
 /// storing. Returns 422 on validation failure, 201 on success.
 pub async fn create_csr<S: Store>(
     State(state): State<AppState<S>>,
-    Extension(_user): Extension<UserInfo>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -234,6 +235,23 @@ pub async fn create_csr<S: Store>(
 
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
+
+    let admission_ctx = AdmissionContext {
+        group: GROUP,
+        version: VERSION,
+        resource: PLURAL,
+        name: &name,
+        namespace: None,
+        operation: "CREATE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
+        dry_run: false,
+    };
+    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
 
     // Strip status from incoming body — spec is immutable after create.
     if let Some(map) = obj.body.as_object_mut() {
@@ -795,6 +813,119 @@ mod tests {
             "GET CSR list must return 200 — a 500 indicates the route panicked due to \
              wrong path param count (regression: literal route wired to handler expecting \
              Path captures)"
+        );
+    }
+
+    /// A validating webhook that denies CSR creates must cause create_csr to return 403.
+    ///
+    /// Without admission wiring in create_csr, the webhook is never called and
+    /// policy-denied requests are silently admitted — a security regression.
+    #[tokio::test]
+    async fn create_csr_validating_webhook_denial_returns_403() {
+        use std::sync::Arc;
+
+        use axum::{routing::post, Router};
+        use tokio::net::TcpListener;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let deny_router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": false,
+                        "status": {"code": 403, "message": "denied by test webhook"}
+                    }
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, deny_router)
+                .await
+                .expect("mock webhook server must not fail");
+        });
+        let url = format!("http://{addr}");
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "deny-csr"},
+            "webhooks": [{
+                "name": "deny-csr.test.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{
+                    "apiGroups": ["certificates.k8s.io"],
+                    "apiVersions": ["v1"],
+                    "resources": ["certificatesigningrequests"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/deny-csr",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed ValidatingWebhookConfiguration");
+
+        let b64 = valid_csr_b64();
+        let csr_body = serde_json::json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": "denied-csr"},
+            "spec": {
+                "request": b64,
+                "signerName": "kubernetes.io/kube-apiserver-client"
+            }
+        });
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+
+        let result = create_csr(
+            axum::extract::State(state),
+            axum::Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
+        )
+        .await;
+
+        let err = result
+            .map(|r| {
+                use axum::response::IntoResponse;
+                r.into_response()
+            })
+            .expect_err("validating webhook denial must cause create_csr to return an error");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::FORBIDDEN,
+            "a denying validating webhook must produce 403 — \
+             without admission wiring the webhook is never called and policy is bypassed"
         );
     }
 }

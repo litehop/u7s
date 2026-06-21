@@ -235,6 +235,21 @@ impl Status {
         )
     }
 
+    pub fn gateway_timeout(message: String) -> StatusError {
+        StatusError(
+            StatusCode::GATEWAY_TIMEOUT,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "Timeout",
+                code: 504,
+                metadata: None,
+            },
+        )
+    }
+
     /// 410 Gone — the resource existed but was permanently deleted.
     ///
     /// Informers (client-go reflector) distinguish 410 Gone from 404 Not Found:
