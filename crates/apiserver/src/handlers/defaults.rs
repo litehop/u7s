@@ -153,13 +153,18 @@ fn default_service(obj: &mut serde_json::Value) {
         }
     }
 
-    // 3. ExternalName services must not have ClusterIP-family fields.
+    // 3. ExternalName services must not have ClusterIP-family fields or NodePorts.
     // When a service changes type to ExternalName (e.g. NodePort → ExternalName),
-    // any previously assigned clusterIP and clusterIPs must be cleared.
-    // Without this, GET after the type-change PATCH still returns the old IP.
+    // any previously assigned clusterIP, clusterIPs, and nodePort fields must be cleared.
+    // Without this, GET after the type-change PATCH still returns the old IP/nodePort.
     if svc_type == "ExternalName" {
         obj["spec"]["clusterIP"] = serde_json::Value::String(String::new());
         obj["spec"]["clusterIPs"] = serde_json::json!([]);
+        if let Some(ports) = obj["spec"]["ports"].as_array_mut() {
+            for port in ports.iter_mut() {
+                port["nodePort"] = serde_json::Value::Number(0.into());
+            }
+        }
         return;
     }
 
@@ -303,6 +308,27 @@ pub fn validate_resource(group: &str, plural: &str, obj: &serde_json::Value) -> 
             || plural == "mutatingwebhookconfigurations")
     {
         crate::admission::validate_webhook_match_conditions_cel(obj)?;
+    }
+    if group.is_empty() && (plural == "configmaps" || plural == "secrets") {
+        validate_data_keys(obj, plural)?;
+    }
+    Ok(())
+}
+
+fn validate_data_keys(obj: &serde_json::Value, plural: &str) -> Result<(), String> {
+    let kind = if plural == "configmaps" {
+        "ConfigMap"
+    } else {
+        "Secret"
+    };
+    for field in &["data", "binaryData"] {
+        if let Some(map) = obj[field].as_object() {
+            if map.contains_key("") {
+                return Err(format!(
+                    "{kind}.{field}: Invalid value: \"\": a valid config key must consist of alphanumeric characters, '-', '_' or '.'"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1685,6 +1711,45 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // Regression tests: NodePort clearing on ExternalName transition (mayor-c6ek)
+    // ---------------------------------------------------------------------------
+
+    /// A service patched from NodePort to ExternalName must have nodePort zeroed on all ports.
+    ///
+    /// Conformance test [sig-network] Services should be able to change the type from NodePort
+    /// to ExternalName checks that ports[].nodePort == 0 after the type transition.
+    /// Without clearing, GET returns the old nodePort value and the conformance test fails
+    /// with "expected nodePort to be 0".
+    ///
+    /// This test fails on revert: removing the nodePort clearing from default_service means
+    /// nodePort=30000 is retained after the type change.
+    #[test]
+    fn nodeport_to_external_name_clears_node_ports() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "svc", "namespace": "default"},
+            "spec": {
+                "type": "ExternalName",
+                "externalName": "example.com",
+                "clusterIP": "10.96.0.8",
+                "clusterIPs": ["10.96.0.8"],
+                "ports": [{"port": 80, "protocol": "TCP", "nodePort": 30000}]
+            }
+        });
+
+        apply_defaults("", "services", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["ports"][0]["nodePort"],
+            serde_json::Value::Number(0.into()),
+            "nodePort must be 0 after type transitions to ExternalName — conformance test \
+             [sig-network] Services should be able to change the type from NodePort to \
+             ExternalName checks nodePort==0 and fails if the old value is retained"
+        );
+    }
+
     /// ExternalName service must get spec.type defaulted correctly when type is explicit.
     ///
     /// spec.type="ExternalName" is preserved (not overwritten to ClusterIP).
@@ -2205,6 +2270,80 @@ mod tests {
             result.is_ok(),
             "MutatingWebhookConfiguration with a valid CEL expression must pass validation; \
              invalid CEL in a mutating webhook must be rejected at admission-config time, not silently stored"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: ConfigMap/Secret empty data key rejection
+    // ---------------------------------------------------------------------------
+
+    /// A ConfigMap with an empty string key in data must be rejected with a validation error.
+    ///
+    /// Kubernetes conformance test [sig-node] ConfigMap should fail to create ConfigMap with
+    /// empty key posts data: {"": "value"} and expects HTTP 422. Without this check our
+    /// apiserver returns 200 and stores an object that kubectl and conformance tests reject.
+    ///
+    /// This test fails on revert: removing validate_data_keys makes validate_resource return
+    /// Ok(()) for the empty-key ConfigMap, and the test panics on the unwrap_err().
+    #[test]
+    fn configmap_with_empty_data_key_rejected() {
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "bad", "namespace": "default"},
+            "data": {"": "value"}
+        });
+        let result = validate_resource("", "configmaps", &obj);
+        assert!(
+            result.is_err(),
+            "ConfigMap with empty string data key must be rejected — conformance test \
+             [sig-node] ConfigMap should fail to create ConfigMap with empty key expects 422"
+        );
+        assert!(
+            result.unwrap_err().contains("ConfigMap.data"),
+            "error must reference ConfigMap.data"
+        );
+    }
+
+    /// A ConfigMap with valid data keys must pass validation.
+    ///
+    /// Ensures the empty-key check does not regress on valid ConfigMaps.
+    #[test]
+    fn configmap_with_valid_data_keys_passes_validation() {
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "ok", "namespace": "default"},
+            "data": {"key": "value", "another-key": "v2"}
+        });
+        assert!(
+            validate_resource("", "configmaps", &obj).is_ok(),
+            "ConfigMap with valid data keys must pass validation"
+        );
+    }
+
+    /// A Secret with an empty string key in data must be rejected.
+    ///
+    /// Same rule as ConfigMap: empty keys are invalid in Kubernetes API semantics.
+    /// If the check is removed, secrets with invalid keys are accepted and stored,
+    /// breaking clients that iterate over data keys.
+    #[test]
+    fn secret_with_empty_data_key_rejected() {
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": "bad", "namespace": "default"},
+            "data": {"": "dmFsdWU="}
+        });
+        let result = validate_resource("", "secrets", &obj);
+        assert!(
+            result.is_err(),
+            "Secret with empty string data key must be rejected — empty keys are invalid \
+             in Kubernetes API; storing them breaks clients that iterate over secret data"
+        );
+        assert!(
+            result.unwrap_err().contains("Secret.data"),
+            "error must reference Secret.data"
         );
     }
 
