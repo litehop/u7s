@@ -366,6 +366,12 @@ fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
             "metadata.name \"{name}\" contains invalid characters (must be a DNS label)"
         )));
     }
+    let is_alnum = |c: char| c.is_ascii_alphanumeric();
+    if !name.starts_with(is_alnum) || !name.ends_with(is_alnum) {
+        return Err(Status::bad_request(format!(
+            "metadata.name \"{name}\" must start and end with an alphanumeric character"
+        )));
+    }
     Ok(())
 }
 
@@ -2332,6 +2338,30 @@ mod tests {
             validate_cr_name("foo123").is_ok(),
             "alphanumeric name must be accepted"
         );
+    }
+
+    // kube-apiserver rejects CR names whose first or last character is a hyphen or dot
+    // because they violate DNS label rules and break label-selector round-trips.
+    #[test]
+    fn validate_cr_name_rejects_leading_hyphen() {
+        let err = validate_cr_name("-foo").expect_err("leading hyphen in CR name must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400, "leading hyphen must return 400");
+    }
+
+    #[test]
+    fn validate_cr_name_rejects_trailing_hyphen() {
+        let err =
+            validate_cr_name("foo-").expect_err("trailing hyphen in CR name must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400, "trailing hyphen must return 400");
+    }
+
+    #[test]
+    fn validate_cr_name_rejects_leading_dot() {
+        let err = validate_cr_name(".bar").expect_err("leading dot in CR name must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400, "leading dot must return 400");
     }
 
     // resolve_cr_metadata must copy uid from stored into incoming when incoming
