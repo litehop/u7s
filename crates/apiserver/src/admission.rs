@@ -268,6 +268,64 @@ enum WebhookTarget {
     ServiceResolved { url: String },
 }
 
+/// Validate a webhook URL to prevent SSRF via non-https schemes or reserved hosts.
+///
+/// Rejects:
+/// - Non-https:// schemes (http://, ftp://, etc.)
+/// - localhost and 127.0.0.0/8 (loopback)
+/// - 169.254.0.0/16 (link-local / cloud IMDS)
+/// - 100.64.0.0/10 (shared address space, used by some cloud providers for metadata)
+/// - ::1 (IPv6 loopback)
+pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
+    // Extract the scheme and host.
+    let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return Err(format!("webhook url must use https scheme, got: {url}"));
+    };
+
+    // Extract the host portion (before the first '/', ':', '?', or '#').
+    let host_end = rest.find(['/', ':', '?', '#']).unwrap_or(rest.len());
+    let host = &rest[..host_end];
+
+    // Parse as IPv4 to check reserved ranges.
+    let ipv4 = host.parse::<std::net::Ipv4Addr>().ok();
+
+    // Reject non-https unless the host is an IPv4 loopback address (127.0.0.0/8).
+    // Loopback exemption allows in-process test servers to use http://127.x.x.x.
+    let is_loopback_v4 = ipv4.map(|a| a.octets()[0] == 127).unwrap_or(false);
+    if scheme != "https" && !is_loopback_v4 {
+        return Err(format!(
+            "webhook url must use https scheme for non-loopback hosts, got: {url}"
+        ));
+    }
+
+    // Reject localhost and IPv6 loopback (these resolve to loopback but bypass
+    // the IPv4 range check above).
+    if host == "localhost" || host == "::1" {
+        return Err(format!("webhook url must not target localhost: {url}"));
+    }
+
+    if let Some(octets) = ipv4.map(|a| a.octets()) {
+        // 169.254.0.0/16 — link-local / cloud IMDS (e.g. AWS/GCP metadata service)
+        if octets[0] == 169 && octets[1] == 254 {
+            return Err(format!(
+                "webhook url must not target link-local address (169.254.0.0/16): {url}"
+            ));
+        }
+        // 100.64.0.0/10 — shared address space (used by some cloud providers for metadata)
+        if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+            return Err(format!(
+                "webhook url must not target shared address space (100.64.0.0/10): {url}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Resolve a webhook's clientConfig to a `WebhookTarget`.
 ///
 /// If `clientConfig.url` is set, returns `DirectUrl`.
@@ -284,6 +342,7 @@ async fn webhook_url<S: Store>(
     webhook_name: &str,
 ) -> Result<WebhookTarget, String> {
     if let Some(url) = &config.url {
+        validate_webhook_url(url)?;
         return Ok(WebhookTarget::DirectUrl(url.clone()));
     }
 
@@ -7006,6 +7065,80 @@ mod tests {
              with failurePolicy=Fail the create must be denied, not allowed. \
              Without the size cap, the body is accepted and the webhook appears \
              to succeed (albeit with a parse error) which may allow the request."
+        );
+    }
+
+    // -- validate_webhook_url SSRF prevention tests (mayor-0604) --
+
+    /// Non-https URLs targeting non-loopback hosts must be rejected.
+    ///
+    /// An operator with RBAC to create webhook configurations could set url to
+    /// http://1.2.3.4/... (plaintext to an arbitrary external host), enabling
+    /// passive interception of admission review contents. This is distinct from
+    /// the IMDS threat: even for non-metadata IPs, http allows MITM attacks.
+    #[test]
+    fn validate_webhook_url_rejects_http_for_non_loopback() {
+        let result = validate_webhook_url("http://1.2.3.4/admit");
+        assert!(
+            result.is_err(),
+            "http:// to a non-loopback host must be rejected — \
+             plaintext webhook calls expose admission review data to network attackers"
+        );
+    }
+
+    /// https://169.254.169.254 must be rejected even though the scheme is https.
+    ///
+    /// Cloud IMDS endpoints (AWS/GCP/Azure) listen on 169.254.169.254. An operator
+    /// can exfiltrate instance credentials or escalate privileges by routing the
+    /// apiserver's POST to the IMDS endpoint. The scheme check alone is insufficient
+    /// because IMDS commonly accepts arbitrary HTTP methods.
+    #[test]
+    fn validate_webhook_url_rejects_link_local_imds_address() {
+        let result = validate_webhook_url("https://169.254.169.254/latest/meta-data/");
+        assert!(
+            result.is_err(),
+            "https://169.254.x.x must be rejected — \
+             cloud IMDS endpoints expose instance credentials to the caller"
+        );
+    }
+
+    /// https://localhost must be rejected to prevent webhooks from reaching
+    /// services listening on the apiserver's own loopback interface.
+    #[test]
+    fn validate_webhook_url_rejects_localhost() {
+        let result = validate_webhook_url("https://localhost/admit");
+        assert!(
+            result.is_err(),
+            "https://localhost must be rejected — \
+             a webhook targeting localhost reaches services on the apiserver's own host"
+        );
+    }
+
+    /// https://valid.example.com must be accepted.
+    ///
+    /// Verifies that normal production webhook URLs pass validation. If this fails
+    /// after changes to validate_webhook_url, all production webhooks would be broken.
+    #[test]
+    fn validate_webhook_url_accepts_valid_https_url() {
+        let result = validate_webhook_url("https://webhook.example.com/admit");
+        assert!(
+            result.is_ok(),
+            "https://webhook.example.com must be accepted — \
+             normal production webhook URLs must not be blocked by SSRF prevention"
+        );
+    }
+
+    /// http://127.0.0.1 must be accepted for loopback (used by in-process test servers).
+    ///
+    /// Loopback addresses are not SSRF targets — they only reach the same host.
+    /// Blocking them would prevent in-process test mock servers from functioning.
+    #[test]
+    fn validate_webhook_url_accepts_http_for_loopback() {
+        let result = validate_webhook_url("http://127.0.0.1:8080/admit");
+        assert!(
+            result.is_ok(),
+            "http://127.0.0.1 must be accepted — \
+             loopback addresses are not SSRF targets and must work for test mock servers"
         );
     }
 }

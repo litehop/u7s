@@ -8,7 +8,9 @@ use bytes::Bytes;
 use u7s_store::{ListOptions, Store};
 
 use crate::{
-    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
+    admission::{
+        run_mutating_webhooks, run_validating_webhooks, validate_webhook_url, AdmissionContext,
+    },
     auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
     keys::cluster_object_key,
@@ -131,6 +133,8 @@ async fn resolve_conversion_webhook_url<S: Store>(
     client_config: &serde_json::Value,
 ) -> Result<String, crate::status::StatusError> {
     if let Some(url) = client_config["url"].as_str() {
+        validate_webhook_url(url)
+            .map_err(|e| Status::bad_request(format!("invalid conversion webhook url: {e}")))?;
         return Ok(url.to_string());
     }
 
