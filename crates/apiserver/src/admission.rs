@@ -1572,14 +1572,14 @@ fn tokenize_cel(input: &str) -> Option<Vec<CelToken>> {
                 i += 2;
             }
             '&' => {
-                i += 1;
+                return None;
             }
             '|' if i + 1 < chars.len() && chars[i + 1] == '|' => {
                 tokens.push(CelToken::Pipe);
                 i += 2;
             }
             '|' => {
-                i += 1;
+                return None;
             }
             '?' => {
                 tokens.push(CelToken::Question);
@@ -5377,6 +5377,69 @@ mod tests {
             result.unwrap(),
             serde_json::Value::Null,
             "missing field access on `object` must evaluate to Null, not panic"
+        );
+    }
+
+    /// A lone & in a CEL expression must cause tokenize_cel to return None.
+    /// A silent skip would allow "a & always_true" to evaluate only "always_true",
+    /// bypassing the intended conjunction and defeating matchCondition policy checks.
+    #[test]
+    fn tokenize_cel_single_ampersand_returns_none() {
+        assert!(
+            tokenize_cel("a & b").is_none(),
+            "lone & must be a tokenizer error, not silently skipped; \
+             silent skip allows policy bypass via crafted matchCondition expressions"
+        );
+    }
+
+    /// A lone | in a CEL expression must cause tokenize_cel to return None.
+    /// A silent skip would allow "false | always_false" to evaluate only "false",
+    /// producing incorrect disjunction semantics and defeating matchCondition policy checks.
+    #[test]
+    fn tokenize_cel_single_pipe_returns_none() {
+        assert!(
+            tokenize_cel("a | b").is_none(),
+            "lone | must be a tokenizer error, not silently skipped; \
+             silent skip causes incorrect disjunction semantics in matchCondition expressions"
+        );
+    }
+
+    /// Double-ampersand && is valid CEL and must tokenize successfully.
+    /// Rejecting && would break all conjunction matchCondition expressions.
+    #[test]
+    fn tokenize_cel_double_ampersand_is_valid() {
+        let tokens = tokenize_cel("a && b");
+        assert!(
+            tokens.is_some(),
+            "&& is valid CEL conjunction and must tokenize successfully; \
+             rejecting it would break all conjunction-based matchCondition expressions"
+        );
+    }
+
+    /// Double-pipe || is valid CEL and must tokenize successfully.
+    /// Rejecting || would break all disjunction matchCondition expressions.
+    #[test]
+    fn tokenize_cel_double_pipe_is_valid() {
+        let tokens = tokenize_cel("a || b");
+        assert!(
+            tokens.is_some(),
+            "|| is valid CEL disjunction and must tokenize successfully; \
+             rejecting it would break all disjunction-based matchCondition expressions"
+        );
+    }
+
+    /// A webhook matchCondition containing a lone & must be rejected at creation time.
+    /// If accepted, the expression silently evaluates only the left operand, allowing
+    /// a crafted webhook to bypass the intended policy conjunction.
+    #[test]
+    fn validate_webhook_match_conditions_cel_rejects_single_ampersand_expression() {
+        let obj = json!({
+            "webhooks": [{"matchConditions": [{"name": "check", "expression": "request.userInfo.username == 'admin' & true"}]}]
+        });
+        assert!(
+            validate_webhook_match_conditions_cel(&obj).is_err(),
+            "matchCondition with lone & must be rejected at creation time; \
+             silent acceptance allows policy bypass via malformed conjunction expressions"
         );
     }
 
