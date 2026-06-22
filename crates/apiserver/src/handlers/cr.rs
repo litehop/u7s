@@ -1282,10 +1282,18 @@ pub async fn patch_cr<S: Store>(
         crate::handlers::json_patch::PatchType::Json => {
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
         }
-        _ => {
+        crate::handlers::json_patch::PatchType::StrategicMerge => {
             let mut patch = patch;
-            // When the CRD declares a status subresource, the main PATCH endpoint must not
-            // update .status — clients must use PATCH /status for that.
+            if ctx.has_status_subresource {
+                if let Some(map) = patch.as_object_mut() {
+                    map.remove("status");
+                }
+            }
+            crate::patch::strategic_merge_patch(&mut obj, &patch)
+                .map_err(|e| Status::bad_request(e.to_string()))?;
+        }
+        crate::handlers::json_patch::PatchType::Merge => {
+            let mut patch = patch;
             if ctx.has_status_subresource {
                 if let Some(map) = patch.as_object_mut() {
                     map.remove("status");
@@ -1365,10 +1373,18 @@ pub async fn patch_cr_namespaced<S: Store>(
         crate::handlers::json_patch::PatchType::Json => {
             crate::handlers::json_patch::apply_json_patch(&mut obj, &patch)?;
         }
-        _ => {
+        crate::handlers::json_patch::PatchType::StrategicMerge => {
             let mut patch = patch;
-            // When the CRD declares a status subresource, the main PATCH endpoint must not
-            // update .status — clients must use PATCH /status for that.
+            if ctx.has_status_subresource {
+                if let Some(map) = patch.as_object_mut() {
+                    map.remove("status");
+                }
+            }
+            crate::patch::strategic_merge_patch(&mut obj, &patch)
+                .map_err(|e| Status::bad_request(e.to_string()))?;
+        }
+        crate::handlers::json_patch::PatchType::Merge => {
+            let mut patch = patch;
             if ctx.has_status_subresource {
                 if let Some(map) = patch.as_object_mut() {
                     map.remove("status");
@@ -6408,6 +6424,160 @@ mod tests {
             Some("admin"),
             "userInfo.username must match the authenticated caller — \
              a blank username means the webhook cannot distinguish users"
+        );
+    }
+
+    fn strategic_merge_patch_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/strategic-merge-patch+json"),
+        );
+        h
+    }
+
+    /// A cluster-scoped CR PATCH with strategic-merge-patch Content-Type and a
+    /// $patch:delete directive must remove the targeted field. Before the fix,
+    /// $patch directives were silently ignored because merge_patch was called
+    /// regardless of patch type.
+    #[tokio::test]
+    async fn cluster_cr_strategic_merge_patch_delete_removes_field() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let initial = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "smp-widget" },
+                "spec": { "color": "blue", "size": "large" }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                initial,
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch = serde_json::json!({"spec": {"size": null}});
+        let patch_body = Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let resp = patch_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "smp-widget".to_string(),
+            )),
+            test_user(),
+            strategic_merge_patch_headers(),
+            patch_body,
+        )
+        .await
+        .expect("strategic-merge-patch on cluster CR must return 200");
+
+        let resp = resp.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            obj["spec"]["size"].is_null(),
+            "strategic-merge-patch with null value must remove the field — \
+             without the fix merge_patch is called and the field is silently left unchanged"
+        );
+        assert_eq!(
+            obj["spec"]["color"], "blue",
+            "strategic-merge-patch must preserve unpatched fields"
+        );
+    }
+
+    /// A namespaced CR PATCH with strategic-merge-patch Content-Type and a null
+    /// value must remove the targeted field. Before the fix, $patch directives
+    /// were silently ignored because merge_patch was called for all non-JSON-Patch
+    /// content types including strategic-merge-patch.
+    #[tokio::test]
+    async fn namespaced_cr_strategic_merge_patch_delete_removes_field() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let ns = "default".to_string();
+        let initial = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "argoproj.io/v1alpha1",
+                "kind": "Application",
+                "metadata": { "name": "smp-app", "namespace": ns },
+                "spec": { "destination": { "namespace": "default" }, "project": "default" }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((
+                    "argoproj.io".to_string(),
+                    "v1alpha1".to_string(),
+                    ns.clone(),
+                    "applications".to_string(),
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                initial,
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let patch = serde_json::json!({"spec": {"project": null}});
+        let patch_body = Bytes::from(serde_json::to_vec(&patch).unwrap());
+
+        let resp = patch_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                ns.clone(),
+                "applications".to_string(),
+                "smp-app".to_string(),
+            )),
+            test_user(),
+            strategic_merge_patch_headers(),
+            patch_body,
+        )
+        .await
+        .expect("strategic-merge-patch on namespaced CR must return 200");
+
+        let resp = resp.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            obj["spec"]["project"].is_null(),
+            "strategic-merge-patch with null value must remove the field — \
+             without the fix merge_patch is called and the field is silently left unchanged"
+        );
+        assert_eq!(
+            obj["spec"]["destination"]["namespace"], "default",
+            "strategic-merge-patch must preserve unpatched fields"
         );
     }
 }
