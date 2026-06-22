@@ -409,10 +409,14 @@ pub(crate) async fn watch_generic<S: Store>(
         let mut bookmark_tick = interval(Duration::from_secs(60));
         bookmark_tick.tick().await; // skip initial immediate tick
 
-        // Use the client-requested timeout, defaulting to 5 minutes when absent.
+        // Use the client-requested timeout. When absent, default to 30 minutes
+        // (1800s) to match the Kubernetes apiserver --min-request-timeout default.
+        // The 5-minute value that was here caused watch streams to expire 6× more
+        // often than a real apiserver, driving excessive reconnections under load and
+        // context-canceled cascades in multi-hour conformance runs.
         // Watches must never be subject to a shorter general request timeout —
         // the client's timeoutSeconds is the only server-side close trigger.
-        let stream_timeout_secs = timeout_seconds.unwrap_or(5 * 60);
+        let stream_timeout_secs = timeout_seconds.unwrap_or(30 * 60);
         let mut max_duration = pin!(sleep(Duration::from_secs(stream_timeout_secs)));
         let mut last_rv: u64 = from_revision;
 
@@ -2912,6 +2916,67 @@ mod tests {
              of (or before) DELETE, causing conformance tests to fail with \
              'expected DELETE, but got BOOKMARK'; got lines {:?}",
             lines
+        );
+    }
+
+    /// Regression test: a watch with timeout_seconds=None must stay open longer than 5 minutes.
+    /// This catches a revert to unwrap_or(5 * 60) by verifying the stream does NOT close
+    /// within 2 seconds — the stream_timeout_secs branch only fires after the configured
+    /// duration, so a 2s check is safe as long as the default is >> 2s.
+    ///
+    /// Without the fix, the 5-minute default caused client-go's retrywatcher to reconnect
+    /// 72 times over a 6h conformance run; under load those reconnections fail with
+    /// "context canceled", degrading all long-running controllers that rely on watch streams.
+    #[tokio::test]
+    async fn watch_generic_no_timeout_seconds_stream_stays_open_past_two_seconds() {
+        use crate::state::AppState;
+        use std::sync::Arc;
+        use tokio::time::{timeout, Duration};
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let resp = watch_generic(
+            state,
+            WatchConfig {
+                prefix: "/registry/configmaps/default/".into(),
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                from_revision: 0,
+                initial_items: None,
+                label_selector: None,
+                field_selector: None,
+                allow_watch_bookmarks: false,
+                username: "test-user".into(),
+                as_partial_object_metadata: false,
+                group: "".into(),
+                plural: "configmaps".into(),
+                timeout_seconds: None,
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("watch_generic must succeed with timeout_seconds=None"));
+
+        let body = resp.into_body();
+        let still_open_after_2s = timeout(
+            Duration::from_millis(2100),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .is_err();
+
+        assert!(
+            still_open_after_2s,
+            "watch stream with timeout_seconds=None must NOT close within 2s; \
+             if the server default is <= 2s, watch streams expire faster than client-go can \
+             reconnect, causing context-canceled cascades in long conformance runs"
         );
     }
 }
