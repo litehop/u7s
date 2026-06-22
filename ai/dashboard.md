@@ -1,53 +1,54 @@
 # Dashboard
-2026-06-12T11:48Z — 1 worker in-flight (yno6, BLOCKED on startup). No open PRs.
+2026-06-22T03:23Z — No in-flight workers. No open PRs. Queue empty. 0 P1s.
 
 Resume: `bd prime`
 
 ## Operator attention needed
 
-**yno6 worker is stuck** using inline-env / individual-script invocation instead of `run-all.sh --flags`. Mayor drafted a correction message but operator paused it. Decide: send the run-all.sh correction to unblock it?
+**Queue is empty** — run a fresh broad conformance run to replenish beads.
 
-**Doc root cause:** dispatch-prompt-template.md §351 + project-stance.md §40 still show the broken `U7S_VM_NAME=... ./run-all.sh` inline-env pattern (+ stale U7S_HOST_IP). vm-operations.md is correct (flags). This conflict keeps misleading workers — needs a small doc-fix worker.
+Suggested: `scripts/conformance/06-run-sonobuoy.sh` (no `--focus`, lima-node-smoke or lima-node-2 slot, full non-disruptive-conformance mode).
 
-**GitHub branch protection still off.** Recommend enabling.
-
-**mayor-91p3 (P1 admission enforcement)** — still needs audit-first decision.
+**Stance** — pre-alpha Kubernetes apiserver in Rust. Correctness > breadth. Merge-on-green. No back-compat shims.
 
 ## In-flight workers
-| Worker | Bead | Surface | VM | State |
-|---|---|---|---|---|
-| adbbbdacf00490f89 | mayor-yno6 (P1) | apiserver pod PATCH path | lima-node-smoke:6444 | blocked on stack startup |
+None.
 
 ## Open PRs
 None.
 
-## Recent merges
-- #533 fix(apiserver): validate matchConditions CEL on MutatingWebhookConfiguration (mayor-b69i) — additive test only
-- #535 fix(apiserver): AND-evaluate involvedObject field selectors for Events (mayor-giem)
-- #534 fix(apiserver): accept application/json-patch+json on custom resources (mayor-1mp5)
-- #532 fix(scripts): stall-watchdog keys on progress.completed/msg (mayor-f73c) — partial; see yno6
-- #531 fix(apiserver): seed CoreDNS Corefile w/ kubernetes plugin (mayor-mm5q)
+## Recent merges (this session)
+- #558 feat(apiserver): ResourceQuota status.used background reconciler (mayor-lym4)
+- #557 fix(apiserver): SSRR non_resource_rules always empty (mayor-29lw)
+- #556 fix(apiserver): strategic-merge-patch routed to correct handler (mayor-33m1)
+- #555 fix(apiserver): merge_conditions handles $patch:delete (mayor-s4lo)
+- #554 fix(apiserver): validate_cr_name rejects uppercase and leading/trailing punctuation (mayor-f26s/3vgq)
+- #553 fix(apiserver): CEL tokenizer single & and | return parse failure (mayor-ksix)
+- #552 fix(apiserver): admission hardening — response cap, SSRF, oldObject, userInfo (mayor-uabj/p5kq/0604/8qqp/gx4t)
+- #551 fix(apiserver): EndpointSlice reconciler — skip redundant writes, shutdown signal, backoff (mayor-m7sy/05kd)
+- #550 fix(apiserver): sync Endpoints to match EndpointSlice (mayor-r5u3)
+- #549 fix(apiserver): pod phase=Pending on create, self-consistent PodScheduled condition (mayor-5asj)
+- #548 fix(conformance): remove unreliable stall watchdog from sonobuoy run script (mayor-xhhg)
+- #547 fix(apiserver): RuntimeClass overhead injection + Event timestamp round-trip (mayor-y4ll/7jli)
+- #546 fix(apiserver): check admission webhooks before websocket upgrade on pod attach (mayor-iv82)
+- #545 fix(apiserver): CSR admission wiring + webhook timeout HTTP 504 (mayor-shi8/scgr)
+- #544 fix(apiserver): ADDED watch event regression test for label-selector path (mayor-0ck0)
+- #543 feat(apiserver): invoke admission webhooks during CR admission (mayor-91p3)
+- #542 fix(apiserver): matchConditions CEL validation enforced on webhook create (mayor-zbqc)
+- #541 fix(conformance): re-enable watchdog loops (mayor-sz6b)
+- #540 fix(apiserver): ConfigMap empty-key 422, OpenAPI content-type, NodePort→ExternalName
+- #539 fix(scripts): always propagate --workdir to child scripts (mayor-apfa)
 
 ## VM port assignment
-| Slot | VM | Port | Who |
-|---|---|---|---|
-| mayor | lima-node | 6443 | operator (live conformance run) |
-| worker-1 | lima-node-smoke | 6444 | yno6 |
-| worker-2 | lima-node-2 | 6445 | free |
-| worker-3 | — | 6446 | free |
+| Slot | VM | Port | Kubelet | Who |
+|---|---|---|---|---|
+| mayor | lima-node | 6443 | 10250 | operator |
+| worker-1 | lima-node-smoke | 6444 | 10251 | free |
+| worker-2 | lima-node-2 | 6445 | 10252 | free |
+| worker-3 | — | 6446 | 10253 | free |
 
 ## Queued beads
-- mayor-91p3 (P1) — admission webhook enforcement (DECISION: audit first?)
-- mayor-y4ll (P2) — RuntimeClass .overhead not injected into pod.spec.overhead
-- mayor-5asj (P2) — pod contradictory scheduling state / phase unset (investigate)
-- mayor-yno6 (P1) — IN FLIGHT — aggregator annotation PATCH 200s but doesn't persist (frozen progress)
-- mayor-7jli (P3) — Event timestamps zero (0001-01-01); breaks kubectl LAST SEEN
+None — queue empty.
 
-## Key learnings this session
-- ROOT CAUSE of frozen sonobuoy progress + watchdog false-kills: aggregator PATCHes pod annotation, apiserver 200s, but value doesn't persist (kubectl annotate of OTHER keys works → specific to aggregator's patch shape). yno6 investigating with debug logging.
-- Conflict-status & existing-key-overwrite hypotheses both FALSIFIED by live probing — capture the actual request body, don't infer.
-- kubelet heartbeat = PATCH /pods/<n>/status (subresource); aggregator = PATCH /pods/<n> (main). Log has no client id/body → must add debug logging.
-- run-all.sh: use FLAGS (--vm --port --workdir --binary), never inline env vars, never individual numbered scripts.
-
-## Loops (session-only)
+## Session loops
 - :07 posture · :11 worktree hygiene · :17/2h cluster · :23/2h merge · :43 dispatch · :53 dashboard
