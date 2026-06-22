@@ -41,6 +41,8 @@ pub struct AdmissionRequest {
     pub namespace: Option<String>,
     pub operation: String,
     pub object: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_info: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -439,6 +441,7 @@ fn build_review(
             namespace: ctx.namespace.map(|s| s.to_string()),
             operation: ctx.operation.to_string(),
             object: object.clone(),
+            user_info: ctx.user_info.clone(),
         }),
         response: None,
     }

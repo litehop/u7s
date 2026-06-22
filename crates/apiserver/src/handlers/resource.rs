@@ -239,6 +239,7 @@ pub async fn create_resource<S: Store>(
             return super::cr::create_cr(
                 State(state),
                 Path((group, version, plural)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -353,6 +354,7 @@ pub async fn replace_resource<S: Store>(
             return super::cr::replace_cr(
                 State(state),
                 Path((group, version, plural, name)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -834,6 +836,7 @@ pub async fn patch_resource<S: Store>(
             return super::cr::patch_cr(
                 State(state),
                 Path((group, version, plural, name)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -1090,6 +1093,7 @@ pub async fn create_namespaced_resource<S: Store>(
             return super::cr::create_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -1340,6 +1344,7 @@ pub async fn replace_namespaced_resource<S: Store>(
             return super::cr::replace_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -1633,6 +1638,7 @@ pub async fn patch_namespaced_resource<S: Store>(
             return super::cr::patch_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
+                Extension(user),
                 headers,
                 body,
             )
