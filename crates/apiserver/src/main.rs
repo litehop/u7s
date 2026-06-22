@@ -259,6 +259,21 @@ async fn main() -> anyhow::Result<()> {
     // 10b. Seed service IP hint from already-allocated sentinels in the store.
     state.init_service_ip_hint().await;
 
+    // 10c. Keep the kubernetes EndpointSlice in sync with the kubernetes Endpoints.
+    // KCM's endpointslice-controller may update the EndpointSlice with the apiserver
+    // address from its own kubeconfig (e.g. a Lima VM gateway IP), which differs from
+    // the loopback address in the Endpoints. This reconciler overwrites those changes
+    // so EndpointSlice.addresses always equals Endpoints.subsets[*].addresses[*].ip.
+    {
+        let reconcile_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            loop {
+                reconcile_kubernetes_endpointslice(&reconcile_store).await;
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+
     // 11. Build axum router and attach tower layers.
     //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
     //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
@@ -2016,6 +2031,119 @@ async fn seed_services(
     }
 
     Ok(())
+}
+
+/// Extract all IP addresses from the kubernetes Endpoints subsets.
+pub fn kubernetes_endpoints_addrs(ep: &serde_json::Value) -> Vec<String> {
+    ep["subsets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|s| s["addresses"].as_array().into_iter().flatten())
+        .filter_map(|a| a["ip"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Extract all IP addresses from the kubernetes EndpointSlice endpoints array.
+pub fn kubernetes_endpointslice_addrs(eps: &serde_json::Value) -> Vec<String> {
+    eps["endpoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|e| e["addresses"].as_array().into_iter().flatten())
+        .filter_map(|a| a.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Reconcile the kubernetes Endpoints to match the kubernetes EndpointSlice.
+///
+/// kube-controller-manager's endpointslice-controller runs inside the Lima VM and
+/// patches the kubernetes EndpointSlice with the apiserver address from its kubeconfig
+/// (e.g. the Lima VM gateway IP 192.168.5.2) and the actual apiserver port (e.g. 6445).
+/// This leaves the EndpointSlice with different addresses and ports than the Endpoints
+/// (which only has the loopback 127.0.0.1 and port 443 from seeding), causing the
+/// conformance test to fail with:
+///   "EndpointSlice addresses do not match Endpoints addresses"
+///   "EndpointSlice ports do not match Endpoints ports"
+///
+/// The correct fix is to update the Endpoints to match the EndpointSlice addresses AND
+/// ports. This ensures:
+///   1. The conformance test passes (Endpoints and EndpointSlice agree on both)
+///   2. kube-proxy routing works (EndpointSlice unchanged; 192.168.5.2:6445 stays as backend)
+///
+/// Concretely: when KCM sets EndpointSlice to addresses=[127.0.0.1, 192.168.5.2], port=6445,
+/// this reconciler updates Endpoints to the same addresses and port, making them equal.
+pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    let ep_key = keys::object_key("endpoints", "default", "kubernetes");
+    let eps_key = keys::group_object_key(
+        "discovery.k8s.io",
+        "endpointslices",
+        Some("default"),
+        "kubernetes",
+    );
+
+    let ep_obj = match store.get(&ep_key).await {
+        Ok(Some(o)) => o,
+        _ => return,
+    };
+    let mut ep: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&ep_obj.value)
+    {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let eps = match store.get(&eps_key).await {
+        Ok(Some(o)) => match serde_json::from_slice::<serde_json::Value>(&o.value) {
+            Ok(v) => v,
+            Err(_) => return,
+        },
+        _ => return,
+    };
+
+    let mut ep_addrs = kubernetes_endpoints_addrs(&ep);
+    let mut eps_addrs = kubernetes_endpointslice_addrs(&eps);
+    ep_addrs.sort();
+    eps_addrs.sort();
+
+    // Extract ports from the EndpointSlice (top-level ports field).
+    let eps_ports = eps["ports"].as_array().cloned().unwrap_or_default();
+
+    // Extract ports from the Endpoints (first subset ports field).
+    let ep_ports = ep["subsets"]
+        .as_array()
+        .and_then(|s| s.first())
+        .and_then(|s| s["ports"].as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Build sorted port-number lists for comparison.
+    let mut ep_port_nums: Vec<u64> = ep_ports.iter().filter_map(|p| p["port"].as_u64()).collect();
+    let mut eps_port_nums: Vec<u64> = eps_ports
+        .iter()
+        .filter_map(|p| p["port"].as_u64())
+        .collect();
+    ep_port_nums.sort();
+    eps_port_nums.sort();
+
+    if ep_addrs == eps_addrs && ep_port_nums == eps_port_nums {
+        return;
+    }
+
+    // Update Endpoints subsets to match EndpointSlice addresses and ports.
+    let target_addr_objects: Vec<serde_json::Value> = eps_addrs
+        .iter()
+        .map(|ip| serde_json::json!({ "ip": ip }))
+        .collect();
+
+    ep["subsets"] = serde_json::json!([{
+        "addresses": target_addr_objects,
+        "ports": eps_ports
+    }]);
+
+    let _ = store.put(&ep_key, Bytes::from(ep.to_string()), None).await;
 }
 
 async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
@@ -3803,6 +3931,132 @@ mod tests {
             ports[0]["port"].as_u64(),
             Some(6443),
             "EndpointSlice port must be the actual apiserver port, not the service port 443"
+        );
+    }
+
+    /// reconcile_kubernetes_endpointslice must propagate EndpointSlice addresses AND ports
+    /// into the kubernetes Endpoints so both objects agree.
+    ///
+    /// kube-controller-manager's endpointslice-controller runs inside the Lima VM and
+    /// patches the kubernetes EndpointSlice with the apiserver address as seen from the VM
+    /// (e.g. the Lima gateway IP 192.168.5.2) and the actual apiserver port (e.g. 6443).
+    /// This leaves the EndpointSlice with addresses and ports that don't match the Endpoints
+    /// (which has only 127.0.0.1 and port 443 from seeding). The conformance test
+    /// [sig-network] API Server 'should have Endpoints and EndpointSlices pointing to
+    /// API Server' checks BOTH addresses and ports, and fails when they disagree.
+    ///
+    /// The reconciler MUST update Endpoints (not EndpointSlice) because:
+    ///   - kube-proxy reads EndpointSlice to program IPVS; removing 192.168.5.2 from the
+    ///     EndpointSlice would route all pod→kubernetes traffic to 127.0.0.1:6443 (the VM
+    ///     loopback, unreachable), breaking pod connectivity.
+    ///   - Updating Endpoints to match EndpointSlice satisfies the conformance assertion
+    ///     without breaking kube-proxy routing.
+    ///
+    /// This test fails if reconcile_kubernetes_endpointslice is removed or inverted:
+    ///   - Removed → EndpointSlice keeps 192.168.5.2 and port 6443, Endpoints keeps only
+    ///     127.0.0.1 and port 443, both conformance assertions fire.
+    ///   - Inverted (remove 192.168.5.2 from EndpointSlice) → kube-proxy loses the only
+    ///     reachable backend, pod→kubernetes service connections time out.
+    #[tokio::test]
+    async fn reconcile_kubernetes_endpointslice_syncs_endpoints_to_match_endpointslice() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        let store = make_store();
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
+        seed_services(&store, "127.0.0.1", 6443)
+            .await
+            .expect("seed must not fail");
+
+        let ep_key = keys::object_key("endpoints", "default", "kubernetes");
+        let eps_key = keys::group_object_key(
+            "discovery.k8s.io",
+            "endpointslices",
+            Some("default"),
+            "kubernetes",
+        );
+
+        // Simulate KCM patching the EndpointSlice to add the Lima VM gateway IP and use
+        // the actual apiserver port (6443 — the port KCM connects to from inside the VM).
+        let eps_obj = store
+            .get(&eps_key)
+            .await
+            .expect("get must not fail")
+            .unwrap();
+        let mut eps: serde_json::Value =
+            serde_json::from_slice(&eps_obj.value).expect("valid json");
+        eps["endpoints"] = serde_json::json!([{
+            "addresses": ["127.0.0.1", "192.168.5.2"],
+            "conditions": { "ready": true, "serving": true, "terminating": false }
+        }]);
+        // KCM also sets the port to the actual apiserver port.
+        eps["ports"] = serde_json::json!([{ "name": "https", "port": 6443, "protocol": "TCP" }]);
+        store
+            .put(&eps_key, Bytes::from(eps.to_string()), None)
+            .await
+            .expect("put must not fail");
+
+        // Reconcile — should update Endpoints to match EndpointSlice (addresses AND ports).
+        reconcile_kubernetes_endpointslice(&store).await;
+
+        // EndpointSlice must be UNCHANGED (still has both addresses and port 6443).
+        let eps_after = store
+            .get(&eps_key)
+            .await
+            .expect("get must not fail")
+            .unwrap();
+        let eps_val: serde_json::Value =
+            serde_json::from_slice(&eps_after.value).expect("valid json");
+        let mut eps_addrs: Vec<&str> = eps_val["endpoints"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|e| e["addresses"].as_array().into_iter().flatten())
+            .filter_map(|a| a.as_str())
+            .collect();
+        eps_addrs.sort();
+        assert_eq!(
+            eps_addrs,
+            vec!["127.0.0.1", "192.168.5.2"],
+            "EndpointSlice must retain 192.168.5.2 so kube-proxy programs a reachable IPVS \
+             backend; removing it would route pod→kubernetes traffic to 127.0.0.1 (VM loopback)"
+        );
+        assert_eq!(
+            eps_val["ports"][0]["port"].as_u64(),
+            Some(6443),
+            "EndpointSlice port must remain unchanged at 6443"
+        );
+
+        // Endpoints must now match EndpointSlice addresses AND ports.
+        let ep_after = store
+            .get(&ep_key)
+            .await
+            .expect("get must not fail")
+            .unwrap();
+        let ep_val: serde_json::Value =
+            serde_json::from_slice(&ep_after.value).expect("valid json");
+        let mut ep_addrs: Vec<&str> = ep_val["subsets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|s| s["addresses"].as_array().into_iter().flatten())
+            .filter_map(|a| a["ip"].as_str())
+            .collect();
+        ep_addrs.sort();
+        assert_eq!(
+            ep_addrs,
+            vec!["127.0.0.1", "192.168.5.2"],
+            "Endpoints must be updated to match EndpointSlice addresses — the conformance test \
+             'should have Endpoints and EndpointSlices pointing to API Server' requires them equal"
+        );
+        let ep_port = ep_val["subsets"][0]["ports"][0]["port"].as_u64();
+        assert_eq!(
+            ep_port,
+            Some(6443),
+            "Endpoints port must be updated to match EndpointSlice port — the conformance test \
+             checks both addresses and ports must match"
         );
     }
 
