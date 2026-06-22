@@ -239,6 +239,7 @@ pub async fn create_resource<S: Store>(
             return super::cr::create_cr(
                 State(state),
                 Path((group, version, plural)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -284,8 +285,8 @@ pub async fn create_resource<S: Store>(
         })),
         dry_run: false,
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // Dry-run: validation and admission passed; return the would-be created object without persisting.
     if create_query.is_dry_run() {
@@ -353,6 +354,7 @@ pub async fn replace_resource<S: Store>(
             return super::cr::replace_cr(
                 State(state),
                 Path((group, version, plural, name)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -419,8 +421,8 @@ pub async fn replace_resource<S: Store>(
         })),
         dry_run: false,
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // Restore the stored status: controllers write status via /status; a full PUT on
     // the main endpoint must preserve whatever the controller last wrote.
@@ -757,8 +759,8 @@ pub(crate) async fn do_patch<S: Store>(
         user_info,
         dry_run: false,
     };
-    current.body = run_mutating_webhooks(state, current.body, &admission_ctx).await?;
-    run_validating_webhooks(state, &current.body, &admission_ctx).await?;
+    current.body = run_mutating_webhooks(state, current.body, None, &admission_ctx).await?;
+    run_validating_webhooks(state, &current.body, None, &admission_ctx).await?;
 
     // A user PATCH on an Endpoints object signals that the endpoints are now user-managed.
     // Clear the annotation the KCM endpoints-controller stamps; the mirroring controller
@@ -834,6 +836,7 @@ pub async fn patch_resource<S: Store>(
             return super::cr::patch_cr(
                 State(state),
                 Path((group, version, plural, name)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -1090,6 +1093,7 @@ pub async fn create_namespaced_resource<S: Store>(
             return super::cr::create_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -1158,8 +1162,8 @@ pub async fn create_namespaced_resource<S: Store>(
         })),
         dry_run: false,
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // LimitRange: inject defaults then validate min/max bounds (pods only).
     obj.body = limit_range::apply_limit_ranges(&state, obj.body, &ns, &plural).await?;
@@ -1340,6 +1344,7 @@ pub async fn replace_namespaced_resource<S: Store>(
             return super::cr::replace_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
+                Extension(user),
                 headers,
                 body,
             )
@@ -1450,8 +1455,8 @@ pub async fn replace_namespaced_resource<S: Store>(
         })),
         dry_run: false,
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     if let Some(ref spec_before) = spec_before_replace {
         super::defaults::increment_workload_generation_if_spec_changed(&mut obj.body, spec_before);
@@ -1633,6 +1638,7 @@ pub async fn patch_namespaced_resource<S: Store>(
             return super::cr::patch_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
+                Extension(user),
                 headers,
                 body,
             )

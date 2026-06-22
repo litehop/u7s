@@ -344,7 +344,7 @@ pub async fn resolve_attach_target<S: Store>(
         user_info: None,
         dry_run: false,
     };
-    run_validating_webhooks(state, &pod, &admission_ctx).await?;
+    run_validating_webhooks(state, &pod, None, &admission_ctx).await?;
 
     let tls_config = build_kubelet_tls_config(
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),

@@ -269,8 +269,8 @@ pub async fn create_namespace<S: Store>(
         })),
         dry_run: false,
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     let key = cluster_object_key("namespaces", &name);
     let new_rv = state

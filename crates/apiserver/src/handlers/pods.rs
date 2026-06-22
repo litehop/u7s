@@ -367,8 +367,8 @@ pub async fn create_pod<S: Store>(
         })),
         dry_run: false,
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // LimitRange: inject defaults then validate min/max bounds.
     obj.body =
@@ -463,8 +463,8 @@ pub async fn replace_pod<S: Store>(
         })),
         dry_run: false,
     };
-    obj.body = run_mutating_webhooks(&state, obj.body, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj.body, &admission_ctx).await?;
+    obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     increment_pod_generation_if_spec_changed(&mut obj.body, &spec_before);
 

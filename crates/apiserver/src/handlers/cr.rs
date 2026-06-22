@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -8,7 +8,10 @@ use bytes::Bytes;
 use u7s_store::{ListOptions, Store};
 
 use crate::{
-    admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
+    admission::{
+        run_mutating_webhooks, run_validating_webhooks, validate_webhook_url, AdmissionContext,
+    },
+    auth::UserInfo,
     handlers::crd::{deleted_group_tombstone_key, CustomResourceDefinition},
     keys::cluster_object_key,
     state::AppState,
@@ -17,6 +20,11 @@ use crate::{
 };
 
 const CRD_LIST_PREFIX: &str = "/registry/apiextensions.k8s.io/customresourcedefinitions/";
+
+/// Maximum conversion webhook response body size. Responses larger than this are
+/// treated as a webhook failure (500). Prevents a malicious conversion webhook from
+/// exhausting apiserver memory via unbounded allocation.
+const MAX_CONVERSION_RESPONSE_BYTES: usize = 1024 * 1024; // 1 MiB
 
 // ---------------------------------------------------------------------------
 // CRD conversion webhook
@@ -61,10 +69,30 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
         .await
         .map_err(|e| Status::internal(format!("conversion webhook call failed: {e}")))?;
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| Status::internal(format!("conversion webhook response read error: {e}")))?;
+    // Bounded read: treat oversized responses as a webhook failure so the apiserver
+    // returns 500 rather than exhausting memory. The 1 MiB cap matches the admission
+    // webhook limit in admission.rs.
+    let mut buf = Vec::with_capacity(4096);
+    let mut resp = resp;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > MAX_CONVERSION_RESPONSE_BYTES {
+                    return Err(Status::internal(
+                        "conversion webhook response exceeded 1 MiB size limit".into(),
+                    ));
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "conversion webhook response read error: {e}"
+                )))
+            }
+        }
+    }
+    let bytes = bytes::Bytes::from(buf);
 
     let resp_val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
         Status::internal(format!("conversion webhook response JSON parse error: {e}"))
@@ -105,6 +133,8 @@ async fn resolve_conversion_webhook_url<S: Store>(
     client_config: &serde_json::Value,
 ) -> Result<String, crate::status::StatusError> {
     if let Some(url) = client_config["url"].as_str() {
+        validate_webhook_url(url)
+            .map_err(|e| Status::bad_request(format!("invalid conversion webhook url: {e}")))?;
         return Ok(url.to_string());
     }
 
@@ -624,6 +654,7 @@ pub async fn get_cr<S: Store>(
 pub async fn create_cr<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -660,11 +691,15 @@ pub async fn create_cr<S: Store>(
         name: &name,
         namespace: None,
         operation: "CREATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
-    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
     let key = cr_store_key(&group, &version, &plural, None, &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
@@ -684,6 +719,7 @@ pub async fn create_cr<S: Store>(
 pub async fn replace_cr<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -742,11 +778,15 @@ pub async fn replace_cr<S: Store>(
         name: &name,
         namespace: None,
         operation: "UPDATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
-    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
     let meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
@@ -996,6 +1036,7 @@ pub async fn get_cr_namespaced<S: Store>(
 pub async fn create_cr_namespaced<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1052,11 +1093,15 @@ pub async fn create_cr_namespaced<S: Store>(
         name: &name,
         namespace: Some(&ns),
         operation: "CREATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
-    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
     let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
@@ -1076,6 +1121,7 @@ pub async fn create_cr_namespaced<S: Store>(
 pub async fn replace_cr_namespaced<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1132,11 +1178,15 @@ pub async fn replace_cr_namespaced<S: Store>(
         name: &name,
         namespace: Some(&ns),
         operation: "UPDATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
-    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
     let meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].clone()).unwrap_or_default();
@@ -1196,6 +1246,7 @@ pub async fn delete_cr_namespaced<S: Store>(
 pub async fn patch_cr<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1247,11 +1298,15 @@ pub async fn patch_cr<S: Store>(
         name: &name,
         namespace: None,
         operation: "UPDATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
-    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
@@ -1274,6 +1329,7 @@ pub async fn patch_cr<S: Store>(
 pub async fn patch_cr_namespaced<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1325,11 +1381,15 @@ pub async fn patch_cr_namespaced<S: Store>(
         name: &name,
         namespace: Some(&ns),
         operation: "UPDATE",
-        user_info: None,
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
         dry_run: false,
     };
-    obj = run_mutating_webhooks(&state, obj, &admission_ctx).await?;
-    run_validating_webhooks(&state, &obj, &admission_ctx).await?;
+    obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+    run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
@@ -1647,6 +1707,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
@@ -1779,6 +1840,7 @@ mod tests {
                     "ns-a".to_string(),
                     "applications".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body("app-in-ns-a", "ns-a"),
             )
@@ -1795,6 +1857,7 @@ mod tests {
                     "ns-b".to_string(),
                     "applications".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body("app-in-ns-b", "ns-b"),
             )
@@ -1894,6 +1957,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
@@ -1906,6 +1970,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group, version, ns.clone(), plural)),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
@@ -1958,6 +2023,7 @@ mod tests {
                     "v1".to_string(),
                     "widgets".to_string()
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body("my-widget"),
             )
@@ -1998,6 +2064,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body("app-one", &ns),
             )
@@ -2037,6 +2104,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
@@ -2091,6 +2159,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
@@ -2115,6 +2184,7 @@ mod tests {
                 plural.clone(),
                 name.clone(),
             )),
+            test_user(),
             headers,
             patch_body,
         )
@@ -2157,6 +2227,7 @@ mod tests {
                     "things".to_string(),
                     "my-thing".to_string(),
                 )),
+                test_user(),
                 headers,
                 patch_body,
             )
@@ -2192,6 +2263,7 @@ mod tests {
                     "applications".to_string(),
                     "my-app".to_string(),
                 )),
+                test_user(),
                 headers,
                 patch_body,
             )
@@ -2536,6 +2608,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
@@ -2567,6 +2640,7 @@ mod tests {
                     plural.clone(),
                     name.clone(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 update_body,
             )
@@ -2624,6 +2698,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
@@ -2653,6 +2728,7 @@ mod tests {
                     plural.clone(),
                     name.clone(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 update_body,
             )
@@ -2720,6 +2796,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 create_body,
             )
@@ -2819,6 +2896,7 @@ mod tests {
             create_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 create_body,
             )
@@ -2933,6 +3011,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
@@ -2964,6 +3043,7 @@ mod tests {
                     plural.clone(),
                     name.clone(),
                 )),
+                test_user(),
                 headers,
                 patch_body,
             )
@@ -3227,6 +3307,7 @@ mod tests {
                 "default".to_string(),
                 "widgets".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             cr_body,
         )
@@ -3308,6 +3389,7 @@ mod tests {
                     "default".to_string(),
                     "widgets".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 cr_body,
             )
@@ -3401,6 +3483,7 @@ mod tests {
                     "default".to_string(),
                     "widgets".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 cr_body,
             )
@@ -3439,6 +3522,7 @@ mod tests {
                 "argocd".to_string(),
                 "applications".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             cr_body,
         )
@@ -3470,6 +3554,7 @@ mod tests {
             create_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body(&name),
             )
@@ -3492,6 +3577,7 @@ mod tests {
             replace_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 update_body,
             )
@@ -3532,6 +3618,7 @@ mod tests {
                     "widgets".to_string(),
                     "nonexistent".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 Bytes::from(
                     serde_json::json!({
@@ -3568,6 +3655,7 @@ mod tests {
                     "v1".to_string(),
                     "widgets".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body("actual-name"),
             )
@@ -3586,6 +3674,7 @@ mod tests {
                     "widgets".to_string(),
                     "actual-name".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 Bytes::from(
                     serde_json::json!({
@@ -3624,6 +3713,7 @@ mod tests {
                     "applications".to_string(),
                     "my-app".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 Bytes::from(
                     serde_json::json!({
@@ -3660,6 +3750,7 @@ mod tests {
             create_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body(&name),
             )
@@ -3683,6 +3774,7 @@ mod tests {
             replace_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 update_body,
             )
@@ -3725,6 +3817,7 @@ mod tests {
             create_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body(&name),
             )
@@ -3823,6 +3916,7 @@ mod tests {
             create_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body(&name),
             )
@@ -3843,6 +3937,7 @@ mod tests {
             patch_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                test_user(),
                 headers,
                 patch_body,
             )
@@ -3887,6 +3982,7 @@ mod tests {
                     "widgets".to_string(),
                     "my-widget".to_string(),
                 )),
+                test_user(),
                 headers,
                 Bytes::from(b"{}".to_vec()),
             )
@@ -3919,6 +4015,7 @@ mod tests {
                     "widgets".to_string(),
                     "nonexistent".to_string(),
                 )),
+                test_user(),
                 headers,
                 Bytes::from(serde_json::json!({ "spec": {} }).to_string()),
             )
@@ -3952,6 +4049,7 @@ mod tests {
                     "applications".to_string(),
                     "my-app".to_string(),
                 )),
+                test_user(),
                 headers,
                 Bytes::from(serde_json::json!({ "spec": {} }).to_string()),
             )
@@ -3980,6 +4078,7 @@ mod tests {
             create_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body(&name),
             )
@@ -4005,6 +4104,7 @@ mod tests {
             patch_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                test_user(),
                 headers,
                 patch_body,
             )
@@ -4048,6 +4148,7 @@ mod tests {
             create_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body(&name),
             )
@@ -4191,6 +4292,7 @@ mod tests {
                     "v1".to_string(),
                     "widgets".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body("listed-widget"),
             )
@@ -4289,6 +4391,7 @@ mod tests {
             create_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body(&name),
             )
@@ -4314,6 +4417,7 @@ mod tests {
         let result = replace_cr(
             State(state.clone()),
             Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+            test_user(),
             axum::http::HeaderMap::new(),
             update_body,
         )
@@ -4355,6 +4459,7 @@ mod tests {
             create_cr_namespaced(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body(&name, &ns),
             )
@@ -4386,6 +4491,7 @@ mod tests {
                     plural.clone(),
                     name.clone(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 stale_body,
             )
@@ -4887,6 +4993,44 @@ mod tests {
         );
     }
 
+    /// call_conversion_webhook must return Err when the response body exceeds 1 MiB.
+    ///
+    /// Without the size cap, resp.bytes().await accumulates the full response — a
+    /// compromised or misbehaving conversion webhook can return a gigabyte and exhaust
+    /// apiserver memory. Returning Err here causes the CR request to fail with 500,
+    /// which is safer than OOM-killing the apiserver.
+    #[tokio::test]
+    async fn call_conversion_webhook_rejects_oversized_response() {
+        use axum::routing::post;
+        use axum::Router;
+
+        // Return 2 MiB of data to exceed the 1 MiB cap.
+        let router = Router::new().route(
+            "/convert",
+            post(|| async {
+                let two_mb = "x".repeat(2 * 1024 * 1024);
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    format!("\"{}\"", two_mb),
+                )
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when response body exceeds 1 MiB — \
+             without the size cap, a malicious webhook can exhaust apiserver memory"
+        );
+    }
+
     /// find_crd must NOT extract conversion config when strategy is None (no conversion).
     #[tokio::test]
     async fn find_crd_no_conversion_config_when_strategy_is_none() {
@@ -5010,6 +5154,7 @@ mod tests {
                     "v1".to_string(),
                     "widgets".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body("pom-widget"),
             )
@@ -5096,6 +5241,7 @@ mod tests {
                     "v1".to_string(),
                     "widgets".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body("watch-pom-widget"),
             )
@@ -5532,6 +5678,7 @@ mod tests {
                 "dying-ns".to_string(),
                 "applications".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             app_body("my-app", "dying-ns"),
         )
@@ -5715,6 +5862,7 @@ mod tests {
                     "v1".to_string(),
                     "widgets".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body("my-widget"),
             )
@@ -5736,6 +5884,7 @@ mod tests {
                 "widgets".to_string(),
                 "my-widget".to_string(),
             )),
+            test_user(),
             json_patch_headers(),
             patch_body,
         )
@@ -5771,6 +5920,7 @@ mod tests {
                     ns.clone(),
                     "applications".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 app_body("my-app", &ns),
             )
@@ -5793,6 +5943,7 @@ mod tests {
                 "applications".to_string(),
                 "my-app".to_string(),
             )),
+            test_user(),
             json_patch_headers(),
             patch_body,
         )
@@ -5825,6 +5976,7 @@ mod tests {
                     "v1".to_string(),
                     "widgets".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body("merge-widget"),
             )
@@ -5844,6 +5996,7 @@ mod tests {
                 "widgets".to_string(),
                 "merge-widget".to_string(),
             )),
+            test_user(),
             merge_patch_headers(),
             patch_body,
         )
@@ -5877,6 +6030,7 @@ mod tests {
                     "v1".to_string(),
                     "widgets".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 widget_body("bad-patch-widget"),
             )
@@ -5898,6 +6052,7 @@ mod tests {
                     "widgets".to_string(),
                     "bad-patch-widget".to_string(),
                 )),
+                test_user(),
                 json_patch_headers(),
                 patch_body,
             )
@@ -5968,6 +6123,7 @@ mod tests {
                 "argocd".to_string(),
                 "applications".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             app_body("wh-test-app", "argocd"),
         )
@@ -6026,6 +6182,7 @@ mod tests {
                 "argocd".to_string(),
                 "applications".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             app_body("denied-app", "argocd"),
         )
@@ -6082,6 +6239,7 @@ mod tests {
                 "v1".to_string(),
                 "widgets".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             widget_body("denied-widget"),
         )
@@ -6092,6 +6250,115 @@ mod tests {
             "mutating webhook with failurePolicy=Fail must deny cluster-scoped CR creation — \
              if admission is skipped for the cluster-scoped CR path, this create would \
              incorrectly succeed"
+        );
+    }
+
+    /// The admission review sent by create_cr_namespaced must contain a non-null
+    /// `userInfo` field with the authenticated user's username.
+    ///
+    /// Without this, validating admission policies (VAP) and webhook authorizers
+    /// that inspect `request.userInfo` receive empty/null identity — allowing
+    /// privilege-escalation attacks where an anonymous call is treated as the
+    /// service-account identity the webhook expects.
+    #[tokio::test]
+    async fn create_cr_namespaced_admission_review_contains_user_info() {
+        use axum::routing::post;
+        use axum::Router;
+        use bytes::Bytes;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+        use u7s_store::Store;
+
+        // Capture the raw admission review body sent by the handler.
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        let router = Router::new().route(
+            "/admit",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured_clone = Arc::clone(&captured_clone);
+                async move {
+                    *captured_clone.lock().unwrap() = Some(body.clone());
+                    // Return an allow response so the create proceeds.
+                    let uid = body["request"]["uid"].as_str().unwrap_or("").to_string();
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": { "uid": uid, "allowed": true }
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("mock admission server must not fail");
+        });
+        let webhook_url = format!("http://{addr}/admit");
+
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "user-info-test-mwc"},
+            "webhooks": [{
+                "name": "user-info.test.example.com",
+                "clientConfig": { "url": webhook_url },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/user-info-test-mwc",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body("user-info-test-app", "argocd"),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "create_cr_namespaced must succeed when the mutating webhook allows the request"
+        );
+
+        let review =
+            captured.lock().unwrap().take().expect(
+                "webhook must have been called — if not, userInfo can never reach the webhook",
+            );
+
+        let user_info = &review["request"]["userInfo"];
+        assert!(
+            !user_info.is_null(),
+            "admission review must contain non-null userInfo — \
+             VAP expressions and webhook authorizers that inspect request.userInfo \
+             receive empty identity if this field is absent"
+        );
+        assert_eq!(
+            user_info["username"].as_str(),
+            Some("admin"),
+            "userInfo.username must match the authenticated caller — \
+             a blank username means the webhook cannot distinguish users"
         );
     }
 }
