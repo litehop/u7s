@@ -19,6 +19,11 @@ use crate::{
 
 const CRD_LIST_PREFIX: &str = "/registry/apiextensions.k8s.io/customresourcedefinitions/";
 
+/// Maximum conversion webhook response body size. Responses larger than this are
+/// treated as a webhook failure (500). Prevents a malicious conversion webhook from
+/// exhausting apiserver memory via unbounded allocation.
+const MAX_CONVERSION_RESPONSE_BYTES: usize = 1024 * 1024; // 1 MiB
+
 // ---------------------------------------------------------------------------
 // CRD conversion webhook
 // ---------------------------------------------------------------------------
@@ -62,10 +67,30 @@ pub(crate) async fn call_conversion_webhook<S: Store>(
         .await
         .map_err(|e| Status::internal(format!("conversion webhook call failed: {e}")))?;
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| Status::internal(format!("conversion webhook response read error: {e}")))?;
+    // Bounded read: treat oversized responses as a webhook failure so the apiserver
+    // returns 500 rather than exhausting memory. The 1 MiB cap matches the admission
+    // webhook limit in admission.rs.
+    let mut buf = Vec::with_capacity(4096);
+    let mut resp = resp;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > MAX_CONVERSION_RESPONSE_BYTES {
+                    return Err(Status::internal(
+                        "conversion webhook response exceeded 1 MiB size limit".into(),
+                    ));
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "conversion webhook response read error: {e}"
+                )))
+            }
+        }
+    }
+    let bytes = bytes::Bytes::from(buf);
 
     let resp_val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
         Status::internal(format!("conversion webhook response JSON parse error: {e}"))
@@ -4961,6 +4986,44 @@ mod tests {
         assert!(
             result.is_err(),
             "call_conversion_webhook must return Err when response is not valid JSON"
+        );
+    }
+
+    /// call_conversion_webhook must return Err when the response body exceeds 1 MiB.
+    ///
+    /// Without the size cap, resp.bytes().await accumulates the full response — a
+    /// compromised or misbehaving conversion webhook can return a gigabyte and exhaust
+    /// apiserver memory. Returning Err here causes the CR request to fail with 500,
+    /// which is safer than OOM-killing the apiserver.
+    #[tokio::test]
+    async fn call_conversion_webhook_rejects_oversized_response() {
+        use axum::routing::post;
+        use axum::Router;
+
+        // Return 2 MiB of data to exceed the 1 MiB cap.
+        let router = Router::new().route(
+            "/convert",
+            post(|| async {
+                let two_mb = "x".repeat(2 * 1024 * 1024);
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    format!("\"{}\"", two_mb),
+                )
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_conversion_server(router).await;
+        let state = make_state_for_conversion();
+        let client_config = serde_json::json!({ "url": format!("{base_url}/convert") });
+        let objects = vec![serde_json::json!({"apiVersion": "example.io/v1", "kind": "Widget"})];
+
+        let result =
+            call_conversion_webhook(&state, &client_config, objects, "example.io/v2").await;
+        assert!(
+            result.is_err(),
+            "call_conversion_webhook must return Err when response body exceeds 1 MiB — \
+             without the size cap, a malicious webhook can exhaust apiserver memory"
         );
     }
 

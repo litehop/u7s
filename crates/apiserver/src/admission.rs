@@ -15,6 +15,11 @@ use u7s_store::{ListOptions, Store};
 use crate::state::AppState;
 use crate::status::{Status, StatusError};
 
+/// Maximum webhook response body size. Responses larger than this are treated as
+/// a failurePolicy failure — the webhook is unreachable from the apiserver's perspective.
+/// Prevents a compromised or misbehaving webhook from exhausting apiserver memory.
+const MAX_WEBHOOK_RESPONSE_BYTES: usize = 1024 * 1024; // 1 MiB
+
 // ---------------------------------------------------------------------------
 // AdmissionReview types (matches Kubernetes API schema)
 // ---------------------------------------------------------------------------
@@ -553,10 +558,24 @@ async fn call_webhook(
         Ok(r) => r,
         Err(e) => return (None, e.is_timeout()),
     };
-    let Ok(bytes) = resp.bytes().await else {
-        return (None, false);
-    };
-    let response = serde_json::from_slice::<AdmissionReview>(&bytes)
+    // Bounded read: treat oversized responses as a network failure so the
+    // caller can apply failurePolicy (Fail or Ignore). This prevents a
+    // compromised webhook from exhausting apiserver memory.
+    let mut buf = Vec::with_capacity(4096);
+    let mut resp = resp;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > MAX_WEBHOOK_RESPONSE_BYTES {
+                    return (None, false);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return (None, false),
+        }
+    }
+    let response = serde_json::from_slice::<AdmissionReview>(&buf)
         .ok()
         .and_then(|r| r.response);
     (response, false)
@@ -6911,6 +6930,82 @@ mod tests {
              'object.spec.replicas > 1' — if the store round-trip loses replicas, \
              the VAP wrongly denies valid UPDATE operations. Error: {:?}",
             result.err()
+        );
+    }
+
+    /// A webhook returning a 2 MiB body must be treated as a network failure.
+    ///
+    /// Without the size cap, resp.bytes().await accumulates the full body into memory.
+    /// A compromised webhook can return a gigabyte and exhaust apiserver memory. With
+    /// failurePolicy=Fail the oversized response should deny the request (failure counted
+    /// as unreachable), not allow it.
+    #[tokio::test]
+    async fn call_webhook_oversized_response_treated_as_failure() {
+        use axum::routing::post;
+        use axum::Router;
+
+        // Return 2 MiB of valid JSON to exceed the 1 MiB cap.
+        // The body is valid UTF-8 but larger than MAX_WEBHOOK_RESPONSE_BYTES.
+        let router = Router::new().route(
+            "/admit",
+            post(|| async {
+                let two_mb = "x".repeat(2 * 1024 * 1024);
+                // Return a large JSON string — parseable but over the limit.
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    format!("\"{}\"", two_mb),
+                )
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_webhook_server(router).await;
+
+        let state = make_state();
+
+        // Seed a MutatingWebhookConfiguration with failurePolicy=Fail pointing at the
+        // oversized-response server. When call_webhook returns None (size exceeded),
+        // run_mutating_webhooks must reject the request.
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "oversize-test-mwc"},
+            "webhooks": [{
+                "name": "oversize.test.example.com",
+                "clientConfig": { "url": format!("{base_url}/admit") },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/oversize-test-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = serde_json::json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "test-pod"}});
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "test-pod",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_mutating_webhooks(&state, obj, &ctx).await;
+        assert!(
+            result.is_err(),
+            "a webhook returning 2 MiB must be treated as unreachable — \
+             with failurePolicy=Fail the create must be denied, not allowed. \
+             Without the size cap, the body is accepted and the webhook appears \
+             to succeed (albeit with a parse error) which may allow the request."
         );
     }
 }
