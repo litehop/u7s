@@ -360,13 +360,13 @@ fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
     // DNS label: lowercase alphanumeric and hyphens, must start/end with alphanumeric.
     if !name
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
     {
         return Err(Status::bad_request(format!(
             "metadata.name \"{name}\" contains invalid characters (must be a DNS label)"
         )));
     }
-    let is_alnum = |c: char| c.is_ascii_alphanumeric();
+    let is_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
     if !name.starts_with(is_alnum) || !name.ends_with(is_alnum) {
         return Err(Status::bad_request(format!(
             "metadata.name \"{name}\" must start and end with an alphanumeric character"
@@ -2362,6 +2362,25 @@ mod tests {
         let err = validate_cr_name(".bar").expect_err("leading dot in CR name must be rejected");
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 400, "leading dot must return 400");
+    }
+
+    // kube-apiserver rejects CR names with uppercase letters because DNS labels
+    // are case-insensitive by spec but Kubernetes requires lowercase to avoid
+    // objects that differ only by case, which would collide on case-insensitive filesystems.
+    #[test]
+    fn validate_cr_name_rejects_uppercase() {
+        let err = validate_cr_name("MyWidget")
+            .expect_err("uppercase letters in CR name must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400, "uppercase name must return 400");
+    }
+
+    #[test]
+    fn validate_cr_name_accepts_lowercase_with_version() {
+        assert!(
+            validate_cr_name("widget-v2").is_ok(),
+            "lowercase name with digit suffix must be accepted"
+        );
     }
 
     // resolve_cr_metadata must copy uid from stored into incoming when incoming
