@@ -65,9 +65,12 @@ pub fn extract_body(bytes: &Bytes, content_type: &str) -> Bytes {
         return Bytes::from(env.raw);
     }
     // For all other cases (empty or explicit protobuf contentType), raw bytes are proto-encoded.
-    // Try type-specific decoders first.
+    // Try type-specific decoders first, using apiVersion to disambiguate kinds like "Event"
+    // that exist in multiple API groups (core/v1 vs events.k8s.io/v1).
     if !env.kind.is_empty() {
-        if let Some(json_val) = proto::decode_core_proto_by_kind(&env.kind, &env.raw) {
+        if let Some(json_val) =
+            proto::decode_proto_by_kind_and_version(&env.kind, &env.api_version, &env.raw)
+        {
             if let Ok(json_bytes) = serde_json::to_vec(&json_val) {
                 return Bytes::from(json_bytes);
             }

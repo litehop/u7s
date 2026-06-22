@@ -2303,6 +2303,9 @@ pub struct ProtoEnvelope {
     /// The Kubernetes kind extracted from the TypeMeta (field 1 of the envelope), e.g.
     /// "Namespace" or "ConfigMap". Empty string if absent.
     pub kind: String,
+    /// The apiVersion extracted from the TypeMeta (field 1 of the envelope), e.g.
+    /// "v1" or "events.k8s.io/v1". Empty string if absent.
+    pub api_version: String,
 }
 
 /// Attempt to decode the Kubernetes protobuf envelope and return both the raw payload and its
@@ -2325,10 +2328,15 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
     if unknown.raw.is_empty() {
         return None;
     }
+    let (api_version, kind) = unknown
+        .type_meta
+        .map(|t| (t.api_version, t.kind))
+        .unwrap_or_default();
     Some(ProtoEnvelope {
         raw: unknown.raw,
         content_type: unknown.content_type,
-        kind: unknown.type_meta.map(|t| t.kind).unwrap_or_default(),
+        kind,
+        api_version,
     })
 }
 
@@ -6019,6 +6027,197 @@ pub fn decode_validatingadmissionpolicybinding_proto(data: &[u8]) -> Option<serd
 
 // --- k8s.io/api/networking/v1/generated.proto ---
 
+/// ServiceBackendPort — networking.k8s.io/v1/generated.proto
+/// field 1: name (string), field 2: number (int32)
+#[derive(Clone, PartialEq, Message)]
+struct ServiceBackendPort {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(int32, tag = "2")]
+    number: i32,
+}
+
+/// IngressServiceBackend — networking.k8s.io/v1/generated.proto
+/// field 1: name (string), field 2: port (ServiceBackendPort)
+#[derive(Clone, PartialEq, Message)]
+struct IngressServiceBackend {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(message, tag = "2")]
+    port: Option<ServiceBackendPort>,
+}
+
+/// IngressBackend — networking.k8s.io/v1/generated.proto
+/// field 1: service (IngressServiceBackend), field 2: resource (TypedLocalObjectReference — skipped)
+#[derive(Clone, PartialEq, Message)]
+struct IngressBackend {
+    #[prost(message, tag = "1")]
+    service: Option<IngressServiceBackend>,
+}
+
+/// HTTPIngressPath — networking.k8s.io/v1/generated.proto
+/// field 1: path (string), field 2: pathType (string), field 3: backend (IngressBackend)
+#[derive(Clone, PartialEq, Message)]
+struct HTTPIngressPath {
+    #[prost(string, tag = "1")]
+    path: String,
+    #[prost(string, tag = "2")]
+    path_type: String,
+    #[prost(message, tag = "3")]
+    backend: Option<IngressBackend>,
+}
+
+/// HTTPIngressRuleValue — networking.k8s.io/v1/generated.proto
+/// field 1: paths (repeated HTTPIngressPath)
+#[derive(Clone, PartialEq, Message)]
+struct HTTPIngressRuleValue {
+    #[prost(message, repeated, tag = "1")]
+    paths: Vec<HTTPIngressPath>,
+}
+
+/// IngressRule — networking.k8s.io/v1/generated.proto
+/// field 1: host (string), field 2: http (HTTPIngressRuleValue)
+#[derive(Clone, PartialEq, Message)]
+struct IngressRule {
+    #[prost(string, tag = "1")]
+    host: String,
+    #[prost(message, tag = "2")]
+    http: Option<HTTPIngressRuleValue>,
+}
+
+/// IngressTLS — networking.k8s.io/v1/generated.proto
+/// field 1: hosts (repeated string), field 2: secretName (string)
+#[derive(Clone, PartialEq, Message)]
+struct IngressTLS {
+    #[prost(string, repeated, tag = "1")]
+    hosts: Vec<String>,
+    #[prost(string, tag = "2")]
+    secret_name: String,
+}
+
+/// IngressSpec — networking.k8s.io/v1/generated.proto
+/// field 1: ingressClassName (string), field 2: defaultBackend (IngressBackend),
+/// field 3: tls (repeated IngressTLS), field 4: rules (repeated IngressRule)
+#[derive(Clone, PartialEq, Message)]
+struct IngressSpec {
+    #[prost(string, tag = "1")]
+    ingress_class_name: String,
+    #[prost(message, tag = "2")]
+    default_backend: Option<IngressBackend>,
+    #[prost(message, repeated, tag = "3")]
+    tls: Vec<IngressTLS>,
+    #[prost(message, repeated, tag = "4")]
+    rules: Vec<IngressRule>,
+}
+
+/// Ingress — networking.k8s.io/v1/generated.proto
+/// field 1: metadata (ObjectMeta), field 2: spec (IngressSpec), field 3: status (skipped)
+#[derive(Clone, PartialEq, Message)]
+struct Ingress {
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    #[prost(message, tag = "2")]
+    spec: Option<IngressSpec>,
+}
+
+fn ingress_backend_to_json(b: IngressBackend) -> serde_json::Value {
+    let mut out = serde_json::json!({});
+    if let Some(svc) = b.service {
+        let mut svc_json = serde_json::json!({ "name": svc.name });
+        if let Some(p) = svc.port {
+            let mut port_json = serde_json::json!({});
+            if !p.name.is_empty() {
+                port_json["name"] = serde_json::Value::String(p.name);
+            }
+            if p.number != 0 {
+                port_json["number"] = serde_json::Value::Number(serde_json::Number::from(p.number));
+            }
+            svc_json["port"] = port_json;
+        }
+        out["service"] = svc_json;
+    }
+    out
+}
+
+/// Decode a proto-encoded Ingress into a serde_json::Value.
+///
+/// kubectl/client-go POSTs Ingress with Content-Type: application/vnd.kubernetes.protobuf.
+/// Without this decoder, extract_body returns raw proto bytes and the handler returns
+/// 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_ingress_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = Ingress::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::json!({});
+        if !spec.ingress_class_name.is_empty() {
+            spec_json["ingressClassName"] = serde_json::Value::String(spec.ingress_class_name);
+        }
+        if let Some(db) = spec.default_backend {
+            spec_json["defaultBackend"] = ingress_backend_to_json(db);
+        }
+        if !spec.tls.is_empty() {
+            let tls_arr: Vec<serde_json::Value> = spec
+                .tls
+                .into_iter()
+                .map(|t| {
+                    let mut tj = serde_json::json!({});
+                    if !t.hosts.is_empty() {
+                        tj["hosts"] = serde_json::Value::Array(
+                            t.hosts.into_iter().map(serde_json::Value::String).collect(),
+                        );
+                    }
+                    if !t.secret_name.is_empty() {
+                        tj["secretName"] = serde_json::Value::String(t.secret_name);
+                    }
+                    tj
+                })
+                .collect();
+            spec_json["tls"] = serde_json::Value::Array(tls_arr);
+        }
+        if !spec.rules.is_empty() {
+            let rules_arr: Vec<serde_json::Value> = spec
+                .rules
+                .into_iter()
+                .map(|r| {
+                    let mut rj = serde_json::json!({});
+                    if !r.host.is_empty() {
+                        rj["host"] = serde_json::Value::String(r.host);
+                    }
+                    if let Some(http) = r.http {
+                        let paths_arr: Vec<serde_json::Value> = http
+                            .paths
+                            .into_iter()
+                            .map(|p| {
+                                let mut pj = serde_json::json!({});
+                                if !p.path.is_empty() {
+                                    pj["path"] = serde_json::Value::String(p.path);
+                                }
+                                if !p.path_type.is_empty() {
+                                    pj["pathType"] = serde_json::Value::String(p.path_type);
+                                }
+                                if let Some(b) = p.backend {
+                                    pj["backend"] = ingress_backend_to_json(b);
+                                }
+                                pj
+                            })
+                            .collect();
+                        rj["http"] = serde_json::json!({ "paths": paths_arr });
+                    }
+                    rj
+                })
+                .collect();
+            spec_json["rules"] = serde_json::Value::Array(rules_arr);
+        }
+        out["spec"] = spec_json;
+    }
+    Some(out)
+}
+
 /// IngressClassSpec — networking.k8s.io/v1/generated.proto
 /// Source: k8s.io/api/networking/v1/generated.proto message IngressClassSpec
 /// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
@@ -6059,6 +6258,375 @@ pub fn decode_ingressclass_proto(data: &[u8]) -> Option<serde_json::Value> {
     });
     if let Some(spec) = obj.spec {
         out["spec"] = serde_json::json!({ "controller": spec.controller });
+    }
+    Some(out)
+}
+
+// --- k8s.io/api/discovery/v1/generated.proto ---
+
+/// DiscoveryEndpointConditions — discovery.k8s.io/v1/generated.proto
+/// field 1: ready (bool), field 2: serving (bool), field 3: terminating (bool)
+#[derive(Clone, PartialEq, Message)]
+struct DiscoveryEndpointConditions {
+    #[prost(bool, tag = "1")]
+    ready: bool,
+    #[prost(bool, tag = "2")]
+    serving: bool,
+    #[prost(bool, tag = "3")]
+    terminating: bool,
+}
+
+/// DiscoveryEndpoint — discovery.k8s.io/v1/generated.proto
+/// field 1: addresses (repeated string), field 2: conditions, field 3: hostname,
+/// field 4: targetRef (ObjectReference), field 6: nodeName, field 7: zone (string wrapper — skipped)
+#[derive(Clone, PartialEq, Message)]
+struct DiscoveryEndpoint {
+    #[prost(string, repeated, tag = "1")]
+    addresses: Vec<String>,
+    #[prost(message, tag = "2")]
+    conditions: Option<DiscoveryEndpointConditions>,
+    #[prost(string, tag = "3")]
+    hostname: String,
+    #[prost(message, tag = "4")]
+    target_ref: Option<ObjectReference>,
+    #[prost(string, tag = "6")]
+    node_name: String,
+}
+
+/// DiscoveryEndpointPort — discovery.k8s.io/v1/generated.proto
+/// field 1: name (string), field 2: protocol (string), field 3: port (int32),
+/// field 4: appProtocol (string)
+#[derive(Clone, PartialEq, Message)]
+struct DiscoveryEndpointPort {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(string, tag = "2")]
+    protocol: String,
+    #[prost(int32, tag = "3")]
+    port: i32,
+    #[prost(string, tag = "4")]
+    app_protocol: String,
+}
+
+/// EndpointSlice — discovery.k8s.io/v1/generated.proto
+/// field 1: metadata (ObjectMeta), field 2: addressType (string),
+/// field 3: endpoints (repeated DiscoveryEndpoint), field 4: ports (repeated DiscoveryEndpointPort)
+#[derive(Clone, PartialEq, Message)]
+struct EndpointSlice {
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    #[prost(string, tag = "2")]
+    address_type: String,
+    #[prost(message, repeated, tag = "3")]
+    endpoints: Vec<DiscoveryEndpoint>,
+    #[prost(message, repeated, tag = "4")]
+    ports: Vec<DiscoveryEndpointPort>,
+}
+
+/// Decode a proto-encoded EndpointSlice into a serde_json::Value.
+///
+/// The EndpointSlice conformance test POSTs/PATCHes with Content-Type: application/vnd.kubernetes.protobuf.
+/// Without this decoder, the handler returns 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_endpointslice_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = EndpointSlice::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": meta,
+        "addressType": obj.address_type
+    });
+    let endpoints_arr: Vec<serde_json::Value> = obj
+        .endpoints
+        .into_iter()
+        .map(|ep| {
+            let mut ej = serde_json::json!({
+                "addresses": ep.addresses
+            });
+            if let Some(c) = ep.conditions {
+                ej["conditions"] = serde_json::json!({
+                    "ready": c.ready,
+                    "serving": c.serving,
+                    "terminating": c.terminating
+                });
+            }
+            if !ep.hostname.is_empty() {
+                ej["hostname"] = serde_json::Value::String(ep.hostname);
+            }
+            if let Some(r) = ep.target_ref {
+                let mut rj = serde_json::json!({});
+                if !r.kind.is_empty() {
+                    rj["kind"] = serde_json::Value::String(r.kind);
+                }
+                if !r.namespace.is_empty() {
+                    rj["namespace"] = serde_json::Value::String(r.namespace);
+                }
+                if !r.name.is_empty() {
+                    rj["name"] = serde_json::Value::String(r.name);
+                }
+                if !r.uid.is_empty() {
+                    rj["uid"] = serde_json::Value::String(r.uid);
+                }
+                ej["targetRef"] = rj;
+            }
+            if !ep.node_name.is_empty() {
+                ej["nodeName"] = serde_json::Value::String(ep.node_name);
+            }
+            ej
+        })
+        .collect();
+    out["endpoints"] = serde_json::Value::Array(endpoints_arr);
+    let ports_arr: Vec<serde_json::Value> = obj
+        .ports
+        .into_iter()
+        .map(|p| {
+            let mut pj = serde_json::json!({});
+            if !p.name.is_empty() {
+                pj["name"] = serde_json::Value::String(p.name);
+            }
+            if !p.protocol.is_empty() {
+                pj["protocol"] = serde_json::Value::String(p.protocol);
+            }
+            pj["port"] = serde_json::Value::Number(serde_json::Number::from(p.port));
+            if !p.app_protocol.is_empty() {
+                pj["appProtocol"] = serde_json::Value::String(p.app_protocol);
+            }
+            pj
+        })
+        .collect();
+    out["ports"] = serde_json::Value::Array(ports_arr);
+    Some(out)
+}
+
+// --- k8s.io/api/events/v1/generated.proto ---
+
+/// EventSeries (events.k8s.io/v1) — discovery.k8s.io/v1/generated.proto
+/// field 1: count (int32), field 2: lastObservedTime (MicroTime)
+#[derive(Clone, PartialEq, Message)]
+struct EventsV1EventSeries {
+    #[prost(int32, tag = "1")]
+    count: i32,
+    #[prost(message, tag = "2")]
+    last_observed_time: Option<MicroTime>,
+}
+
+/// Event (events.k8s.io/v1) — events/v1/generated.proto
+/// field 1: metadata, field 2: eventTime, field 3: series, field 4: reportingController,
+/// field 5: reportingInstance, field 6: action, field 7: reason, field 8: regarding,
+/// field 9: related, field 10: note, field 11: type,
+/// field 12: deprecatedSource, field 13: deprecatedFirstTimestamp, field 14: deprecatedLastTimestamp,
+/// field 15: deprecatedCount
+#[derive(Clone, PartialEq, Message)]
+struct EventsV1Event {
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    #[prost(message, tag = "2")]
+    event_time: Option<MicroTime>,
+    #[prost(message, tag = "3")]
+    series: Option<EventsV1EventSeries>,
+    #[prost(string, tag = "4")]
+    reporting_controller: String,
+    #[prost(string, tag = "5")]
+    reporting_instance: String,
+    #[prost(string, tag = "6")]
+    action: String,
+    #[prost(string, tag = "7")]
+    reason: String,
+    #[prost(message, tag = "8")]
+    regarding: Option<ObjectReference>,
+    #[prost(message, tag = "9")]
+    related: Option<ObjectReference>,
+    #[prost(string, tag = "10")]
+    note: String,
+    #[prost(string, tag = "11")]
+    r#type: String,
+    #[prost(message, tag = "12")]
+    deprecated_source: Option<EventSource>,
+    #[prost(message, tag = "13")]
+    deprecated_first_timestamp: Option<Time>,
+    #[prost(message, tag = "14")]
+    deprecated_last_timestamp: Option<Time>,
+    #[prost(int32, tag = "15")]
+    deprecated_count: i32,
+}
+
+/// Decode a proto-encoded events.k8s.io/v1 Event into a serde_json::Value.
+///
+/// The Events API conformance test POSTs events.k8s.io/v1 Event objects with
+/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder, the handler
+/// returns 400 "invalid JSON: expected value at line 1 column 1".
+pub fn decode_events_v1_event_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let ev = EventsV1Event::decode(data).ok()?;
+    let meta = object_meta_to_json(ev.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "events.k8s.io/v1",
+        "kind": "Event",
+        "metadata": meta
+    });
+    if let Some(t) = ev.event_time {
+        if t.seconds > 0 {
+            let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
+                t.seconds as u64,
+            ));
+            out["eventTime"] = serde_json::Value::String(ts);
+        }
+    }
+    if let Some(s) = ev.series {
+        let mut sj = serde_json::json!({});
+        if s.count != 0 {
+            sj["count"] = serde_json::Value::Number(serde_json::Number::from(s.count));
+        }
+        if let Some(t) = s.last_observed_time {
+            if t.seconds > 0 {
+                let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
+                    t.seconds as u64,
+                ));
+                sj["lastObservedTime"] = serde_json::Value::String(ts);
+            }
+        }
+        out["series"] = sj;
+    }
+    if !ev.reporting_controller.is_empty() {
+        out["reportingController"] = serde_json::Value::String(ev.reporting_controller);
+    }
+    if !ev.reporting_instance.is_empty() {
+        out["reportingInstance"] = serde_json::Value::String(ev.reporting_instance);
+    }
+    if !ev.action.is_empty() {
+        out["action"] = serde_json::Value::String(ev.action);
+    }
+    if !ev.reason.is_empty() {
+        out["reason"] = serde_json::Value::String(ev.reason);
+    }
+    if let Some(r) = ev.regarding {
+        let mut rj = serde_json::json!({});
+        if !r.api_version.is_empty() {
+            rj["apiVersion"] = serde_json::Value::String(r.api_version);
+        }
+        if !r.kind.is_empty() {
+            rj["kind"] = serde_json::Value::String(r.kind);
+        }
+        if !r.namespace.is_empty() {
+            rj["namespace"] = serde_json::Value::String(r.namespace);
+        }
+        if !r.name.is_empty() {
+            rj["name"] = serde_json::Value::String(r.name);
+        }
+        if !r.uid.is_empty() {
+            rj["uid"] = serde_json::Value::String(r.uid);
+        }
+        out["regarding"] = rj;
+    }
+    if let Some(r) = ev.related {
+        let mut rj = serde_json::json!({});
+        if !r.kind.is_empty() {
+            rj["kind"] = serde_json::Value::String(r.kind);
+        }
+        if !r.namespace.is_empty() {
+            rj["namespace"] = serde_json::Value::String(r.namespace);
+        }
+        if !r.name.is_empty() {
+            rj["name"] = serde_json::Value::String(r.name);
+        }
+        out["related"] = rj;
+    }
+    if !ev.note.is_empty() {
+        out["note"] = serde_json::Value::String(ev.note);
+    }
+    if !ev.r#type.is_empty() {
+        out["type"] = serde_json::Value::String(ev.r#type);
+    }
+    if ev.deprecated_count != 0 {
+        out["deprecatedCount"] =
+            serde_json::Value::Number(serde_json::Number::from(ev.deprecated_count));
+    }
+    Some(out)
+}
+
+// --- k8s.io/api/certificates/v1/generated.proto ---
+
+/// CertificateSigningRequestSpec — certificates.k8s.io/v1/generated.proto
+/// field 1: request (bytes), field 2: signerName (string), field 3: expirationSeconds (int32),
+/// field 4: usages (repeated string), field 5: username, field 6: uid,
+/// field 7: groups (repeated string)
+#[derive(Clone, PartialEq, Message)]
+struct CertificateSigningRequestSpecProto {
+    #[prost(bytes = "vec", tag = "1")]
+    request: Vec<u8>,
+    #[prost(string, tag = "2")]
+    signer_name: String,
+    #[prost(int32, tag = "3")]
+    expiration_seconds: i32,
+    #[prost(string, repeated, tag = "4")]
+    usages: Vec<String>,
+    #[prost(string, tag = "5")]
+    username: String,
+    #[prost(string, tag = "6")]
+    uid: String,
+    #[prost(string, repeated, tag = "7")]
+    groups: Vec<String>,
+}
+
+/// CertificateSigningRequest — certificates.k8s.io/v1/generated.proto
+/// field 1: metadata (ObjectMeta), field 2: spec, field 3: status (skipped)
+#[derive(Clone, PartialEq, Message)]
+struct CertificateSigningRequestProto {
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    #[prost(message, tag = "2")]
+    spec: Option<CertificateSigningRequestSpecProto>,
+}
+
+/// Decode a proto-encoded CertificateSigningRequest into a serde_json::Value.
+///
+/// The CSR conformance test POSTs/PUTs with Content-Type: application/vnd.kubernetes.protobuf.
+/// Without this decoder, the handler returns 400 "invalid JSON: expected value at line 1 column 1".
+/// spec.request (bytes) is base64-encoded in JSON; we use standard base64 to match Kubernetes.
+pub fn decode_csr_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let obj = CertificateSigningRequestProto::decode(data).ok()?;
+    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
+    let mut out = serde_json::json!({
+        "apiVersion": "certificates.k8s.io/v1",
+        "kind": "CertificateSigningRequest",
+        "metadata": meta
+    });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::json!({});
+        if !spec.request.is_empty() {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&spec.request);
+            spec_json["request"] = serde_json::Value::String(b64);
+        }
+        if !spec.signer_name.is_empty() {
+            spec_json["signerName"] = serde_json::Value::String(spec.signer_name);
+        }
+        if spec.expiration_seconds != 0 {
+            spec_json["expirationSeconds"] =
+                serde_json::Value::Number(serde_json::Number::from(spec.expiration_seconds));
+        }
+        if !spec.usages.is_empty() {
+            spec_json["usages"] = serde_json::Value::Array(
+                spec.usages
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
+        if !spec.username.is_empty() {
+            spec_json["username"] = serde_json::Value::String(spec.username);
+        }
+        if !spec.uid.is_empty() {
+            spec_json["uid"] = serde_json::Value::String(spec.uid);
+        }
+        if !spec.groups.is_empty() {
+            spec_json["groups"] = serde_json::Value::Array(
+                spec.groups
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            );
+        }
+        out["spec"] = spec_json;
     }
     Some(out)
 }
@@ -6173,6 +6741,14 @@ pub fn decode_controllerrevision_proto(data: &[u8]) -> Option<serde_json::Value>
 /// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
 /// known types; `None` for unknown kinds or malformed input.
 pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::Value> {
+    decode_proto_by_kind_and_version(kind, "", raw)
+}
+
+pub fn decode_proto_by_kind_and_version(
+    kind: &str,
+    api_version: &str,
+    raw: &[u8],
+) -> Option<serde_json::Value> {
     match kind {
         "CustomResourceDefinition" => decode_crd_proto(raw),
         "Namespace" => decode_namespace_proto(raw),
@@ -6186,7 +6762,13 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "PersistentVolume" => decode_persistentvolume_proto(raw),
         "Lease" => decode_lease_proto(raw),
         "CSINode" => decode_csinode_proto(raw),
-        "Event" => decode_event_proto(raw),
+        "Event" => {
+            if api_version == "events.k8s.io/v1" {
+                decode_events_v1_event_proto(raw)
+            } else {
+                decode_event_proto(raw)
+            }
+        }
         "ClusterRole" => decode_clusterrole_proto(raw),
         "ClusterRoleBinding" => decode_clusterrolebinding_proto(raw),
         "Role" => decode_role_proto(raw),
@@ -6219,6 +6801,9 @@ pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::V
         "ValidatingAdmissionPolicy" => decode_validatingadmissionpolicy_proto(raw),
         "ValidatingAdmissionPolicyBinding" => decode_validatingadmissionpolicybinding_proto(raw),
         "IngressClass" => decode_ingressclass_proto(raw),
+        "Ingress" => decode_ingress_proto(raw),
+        "EndpointSlice" => decode_endpointslice_proto(raw),
+        "CertificateSigningRequest" => decode_csr_proto(raw),
         "PriorityClass" => decode_priorityclass_proto(raw),
         "ControllerRevision" => decode_controllerrevision_proto(raw),
         _ => None,
@@ -11868,6 +12453,290 @@ mod tests {
     #[test]
     fn decode_ingressclass_proto_returns_none_for_garbage() {
         assert!(decode_ingressclass_proto(&[0xff, 0xff, 0xff]).is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_ingress_proto / decode_core_proto_by_kind Ingress
+    // ---------------------------------------------------------------------------
+
+    /// decode_proto_by_kind_and_version must dispatch Ingress proto and extract metadata,
+    /// spec.ingressClassName, and spec.rules. Without this decoder, client-go POSTing an
+    /// Ingress with Content-Type: application/vnd.kubernetes.protobuf gets 400
+    /// "invalid JSON: expected value at line 1 column 1".
+    #[test]
+    fn decode_proto_by_kind_and_version_dispatches_ingress() {
+        let obj_meta = encode_length_delimited(1, b"test-ingress"); // ObjectMeta.name
+
+        // IngressSpec: field 1 = ingressClassName (string), field 4 = rules (repeated IngressRule)
+        // IngressRule proto bytes: field 1 = host (string "example.com")
+        let rule = encode_length_delimited(1, b"example.com"); // IngressRule: field 1 = host
+
+        let mut spec_proto = encode_length_delimited(1, b"nginx"); // field 1 = ingressClassName
+        spec_proto.extend_from_slice(&encode_length_delimited(4, &rule)); // field 4 = rules
+
+        // Ingress: field 1 = ObjectMeta, field 2 = IngressSpec
+        let mut ingress_proto = encode_length_delimited(1, &obj_meta);
+        ingress_proto.extend_from_slice(&encode_length_delimited(2, &spec_proto));
+
+        let result =
+            decode_proto_by_kind_and_version("Ingress", "networking.k8s.io/v1", &ingress_proto)
+                .expect(
+                    "Ingress must decode via decode_proto_by_kind_and_version — \
+                 without this decoder, client-go POST returns 400 on Ingress create",
+                );
+
+        assert_eq!(
+            result["kind"], "Ingress",
+            "kind must be Ingress so Object::from_bytes can store the object"
+        );
+        assert_eq!(result["apiVersion"], "networking.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "test-ingress",
+            "name must survive proto round-trip — the object is keyed by name"
+        );
+        assert_eq!(
+            result["spec"]["ingressClassName"], "nginx",
+            "ingressClassName must be extracted — ingress controllers discover their class by this field"
+        );
+        assert_eq!(
+            result["spec"]["rules"][0]["host"], "example.com",
+            "rules[].host must survive proto round-trip — routing rules are the core of Ingress"
+        );
+    }
+
+    /// decode_ingress_proto must decode a backend with service name and port number.
+    /// Conformance tests POST Ingress with defaultBackend pointing at a Service — the backend
+    /// must survive the decode so the ingress controller can route traffic correctly.
+    #[test]
+    fn decode_ingress_proto_extracts_default_backend() {
+        // ServiceBackendPort: field 2 = number (int32 varint)
+        let mut port_proto: Vec<u8> = Vec::new();
+        port_proto.push(0x10); // tag: field 2, wire type 0
+        port_proto.extend_from_slice(&encode_varint(80));
+
+        // IngressServiceBackend: field 1 = name, field 2 = port
+        let mut svc_backend = encode_length_delimited(1, b"my-service");
+        svc_backend.extend_from_slice(&encode_length_delimited(2, &port_proto));
+
+        // IngressBackend: field 1 = service
+        let backend = encode_length_delimited(1, &svc_backend);
+
+        // IngressSpec: field 2 = defaultBackend
+        let spec = encode_length_delimited(2, &backend);
+
+        // Ingress: field 1 = ObjectMeta (minimal), field 2 = spec
+        let obj_meta = encode_length_delimited(1, b"backend-ingress");
+        let mut ingress_proto = encode_length_delimited(1, &obj_meta);
+        ingress_proto.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result = decode_ingress_proto(&ingress_proto)
+            .expect("Ingress with defaultBackend must decode successfully");
+
+        assert_eq!(
+            result["spec"]["defaultBackend"]["service"]["name"], "my-service",
+            "defaultBackend.service.name must survive decode — ingress controller needs it to route"
+        );
+        assert_eq!(
+            result["spec"]["defaultBackend"]["service"]["port"]["number"], 80,
+            "defaultBackend.service.port.number must survive decode — port is required for routing"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_endpointslice_proto / decode_proto_by_kind_and_version EndpointSlice
+    // ---------------------------------------------------------------------------
+
+    /// decode_proto_by_kind_and_version must dispatch EndpointSlice proto and extract
+    /// addressType, endpoints, and ports. Without this decoder, client-go POSTing an
+    /// EndpointSlice with Content-Type: application/vnd.kubernetes.protobuf gets 400.
+    #[test]
+    fn decode_proto_by_kind_and_version_dispatches_endpointslice() {
+        let obj_meta = encode_length_delimited(1, b"test-slice"); // ObjectMeta.name
+
+        // EndpointSlice: field 2 = addressType, field 3 = endpoints, field 4 = ports
+        // DiscoveryEndpoint: field 1 = addresses (repeated string)
+        let ep_addr = encode_length_delimited(1, b"10.0.0.1");
+        let endpoint = encode_length_delimited(3, &ep_addr); // field 3 = endpoints
+
+        // DiscoveryEndpointPort: field 1 = name, field 2 = protocol, field 3 = port (varint)
+        let mut port_proto = encode_length_delimited(1, b"http");
+        port_proto.extend_from_slice(&encode_length_delimited(2, b"TCP"));
+        port_proto.push(0x18); // tag: field 3, wire type 0
+        port_proto.extend_from_slice(&encode_varint(8080));
+
+        let mut eps_proto = encode_length_delimited(1, &obj_meta);
+        eps_proto.extend_from_slice(&encode_length_delimited(2, b"IPv4")); // field 2 = addressType
+        eps_proto.extend_from_slice(&endpoint);
+        eps_proto.extend_from_slice(&encode_length_delimited(4, &port_proto)); // field 4 = ports
+
+        let result =
+            decode_proto_by_kind_and_version("EndpointSlice", "discovery.k8s.io/v1", &eps_proto)
+                .expect(
+                    "EndpointSlice must decode via decode_proto_by_kind_and_version — \
+                 without this, client-go POST returns 400 on EndpointSlice create",
+                );
+
+        assert_eq!(result["kind"], "EndpointSlice");
+        assert_eq!(result["apiVersion"], "discovery.k8s.io/v1");
+        assert_eq!(
+            result["addressType"], "IPv4",
+            "addressType must survive decode — required field for EndpointSlice routing"
+        );
+        assert_eq!(
+            result["endpoints"][0]["addresses"][0], "10.0.0.1",
+            "endpoint address must survive decode — without this, load balancing breaks"
+        );
+        assert_eq!(
+            result["ports"][0]["name"], "http",
+            "port name must survive decode — kube-proxy uses port names for service routing"
+        );
+        assert_eq!(
+            result["ports"][0]["port"], 8080,
+            "port number must survive decode — required for traffic forwarding"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_events_v1_event_proto / decode_proto_by_kind_and_version events.k8s.io/v1 Event
+    // ---------------------------------------------------------------------------
+
+    /// decode_proto_by_kind_and_version must use apiVersion to distinguish events.k8s.io/v1 Event
+    /// from core/v1 Event. Without the apiVersion disambiguation, events.k8s.io/v1 events are
+    /// decoded with the wrong proto field layout, corrupting fields.
+    #[test]
+    fn decode_proto_by_kind_and_version_dispatches_events_v1_event() {
+        let obj_meta = encode_length_delimited(1, b"test-event");
+
+        // events.k8s.io/v1 Event:
+        //   field 4 = reportingController (string)
+        //   field 6 = action (string)
+        //   field 7 = reason (string)
+        //   field 11 = type (string)
+        let mut ev_proto = encode_length_delimited(1, &obj_meta);
+        ev_proto.extend_from_slice(&encode_length_delimited(4, b"test-controller"));
+        ev_proto.extend_from_slice(&encode_length_delimited(6, b"Started"));
+        ev_proto.extend_from_slice(&encode_length_delimited(7, b"TestReason"));
+        ev_proto.extend_from_slice(&encode_length_delimited(11, b"Normal"));
+
+        let result = decode_proto_by_kind_and_version("Event", "events.k8s.io/v1", &ev_proto)
+            .expect(
+                "events.k8s.io/v1 Event must decode via decode_proto_by_kind_and_version — \
+                 without this, client-go POST returns 400 on events.k8s.io/v1 Event create",
+            );
+
+        assert_eq!(
+            result["apiVersion"], "events.k8s.io/v1",
+            "apiVersion must be events.k8s.io/v1 — clients check this to distinguish from core/v1 Event"
+        );
+        assert_eq!(result["kind"], "Event");
+        assert_eq!(
+            result["reportingController"], "test-controller",
+            "reportingController must survive decode — events.k8s.io/v1 field 4"
+        );
+        assert_eq!(
+            result["action"], "Started",
+            "action must survive decode — events.k8s.io/v1 field 6"
+        );
+        assert_eq!(
+            result["reason"], "TestReason",
+            "reason must survive decode — events.k8s.io/v1 field 7"
+        );
+        assert_eq!(
+            result["type"], "Normal",
+            "type must survive decode — events.k8s.io/v1 field 11"
+        );
+    }
+
+    /// decode_proto_by_kind_and_version with empty apiVersion still routes Event to core/v1 decoder.
+    /// Backward compat: existing callers that don't provide apiVersion must still work.
+    #[test]
+    fn decode_proto_by_kind_and_version_routes_event_without_apiversion_to_core_v1() {
+        let obj_meta = encode_length_delimited(1, b"core-event");
+
+        // core/v1 Event: field 3 = reason, field 4 = message, field 9 = type
+        let mut ev_proto = encode_length_delimited(1, &obj_meta);
+        ev_proto.extend_from_slice(&encode_length_delimited(3, b"SomeReason"));
+        ev_proto.extend_from_slice(&encode_length_delimited(4, b"something happened"));
+        ev_proto.extend_from_slice(&encode_length_delimited(9, b"Warning"));
+
+        let result = decode_proto_by_kind_and_version("Event", "", &ev_proto)
+            .expect("core/v1 Event must decode when apiVersion is empty");
+
+        assert_eq!(
+            result["apiVersion"], "v1",
+            "apiVersion must be v1 for core/v1 Event when called without apiVersion"
+        );
+        assert_eq!(
+            result["reason"], "SomeReason",
+            "core/v1 Event.reason (field 3) must survive decode"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_csr_proto / decode_proto_by_kind_and_version CertificateSigningRequest
+    // ---------------------------------------------------------------------------
+
+    /// decode_proto_by_kind_and_version must dispatch CertificateSigningRequest proto and extract
+    /// spec.request (base64), spec.signerName, and spec.usages. Without this decoder,
+    /// client-go POSTing a CSR with Content-Type: application/vnd.kubernetes.protobuf gets 400.
+    #[test]
+    fn decode_proto_by_kind_and_version_dispatches_csr() {
+        let obj_meta = encode_length_delimited(1, b"test-csr");
+
+        // CertificateSigningRequestSpec:
+        //   field 1 = request (bytes) — raw PEM bytes
+        //   field 2 = signerName (string)
+        //   field 4 = usages (repeated string)
+        let fake_csr_bytes =
+            b"-----BEGIN CERTIFICATE REQUEST-----\nfake\n-----END CERTIFICATE REQUEST-----";
+        let mut spec_proto = encode_length_delimited(1, fake_csr_bytes); // request bytes
+        spec_proto.extend_from_slice(&encode_length_delimited(
+            2,
+            b"kubernetes.io/kube-apiserver-client",
+        ));
+        spec_proto.extend_from_slice(&encode_length_delimited(4, b"client auth")); // usages
+
+        // CertificateSigningRequest: field 1 = metadata, field 2 = spec
+        let mut csr_proto = encode_length_delimited(1, &obj_meta);
+        csr_proto.extend_from_slice(&encode_length_delimited(2, &spec_proto));
+
+        let result = decode_proto_by_kind_and_version(
+            "CertificateSigningRequest",
+            "certificates.k8s.io/v1",
+            &csr_proto,
+        )
+        .expect(
+            "CertificateSigningRequest must decode via decode_proto_by_kind_and_version — \
+             without this, client-go POST returns 400 on CSR create",
+        );
+
+        assert_eq!(result["kind"], "CertificateSigningRequest");
+        assert_eq!(result["apiVersion"], "certificates.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "test-csr",
+            "CSR name must survive decode — objects are keyed by name"
+        );
+        assert_eq!(
+            result["spec"]["signerName"], "kubernetes.io/kube-apiserver-client",
+            "signerName must survive decode — signer controllers route by signerName"
+        );
+        assert_eq!(
+            result["spec"]["usages"][0], "client auth",
+            "usages must survive decode — signers validate allowed key usages"
+        );
+
+        let request_b64 = result["spec"]["request"]
+            .as_str()
+            .expect("spec.request must be a base64 string in JSON");
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(request_b64)
+            .expect("spec.request must be valid base64");
+        assert_eq!(
+            decoded, fake_csr_bytes,
+            "spec.request bytes must survive base64 encode/decode round-trip — \
+             the signer controller needs the raw DER bytes"
+        );
     }
 
     // ---------------------------------------------------------------------------
