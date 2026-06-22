@@ -264,12 +264,24 @@ async fn main() -> anyhow::Result<()> {
     // address from its own kubeconfig (e.g. a Lima VM gateway IP), which differs from
     // the loopback address in the Endpoints. This reconciler overwrites those changes
     // so EndpointSlice.addresses always equals Endpoints.subsets[*].addresses[*].ip.
+    let (_reconciler_shutdown_tx, mut reconciler_shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let reconcile_store = Arc::clone(&store);
         tokio::spawn(async move {
+            let mut consecutive_errors: u32 = 0;
             loop {
-                reconcile_kubernetes_endpointslice(&reconcile_store).await;
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let ok = reconcile_kubernetes_endpointslice(&reconcile_store).await;
+                if ok {
+                    consecutive_errors = 0;
+                } else {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                }
+                // Exponential backoff: 5s, 10s, 20s, 40s, 80s, 160s, capped at 300s.
+                let delay_secs = (5u64 << consecutive_errors.min(6)).min(300);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                    _ = reconciler_shutdown_rx.changed() => break,
+                }
             }
         });
     }
@@ -2073,7 +2085,7 @@ pub fn kubernetes_endpointslice_addrs(eps: &serde_json::Value) -> Vec<String> {
 ///
 /// Concretely: when KCM sets EndpointSlice to addresses=[127.0.0.1, 192.168.5.2], port=6445,
 /// this reconciler updates Endpoints to the same addresses and port, making them equal.
-pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) {
+pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) -> bool {
     use bytes::Bytes;
     use u7s_store::Store;
 
@@ -2087,20 +2099,23 @@ pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) {
 
     let ep_obj = match store.get(&ep_key).await {
         Ok(Some(o)) => o,
-        _ => return,
+        Ok(None) => return true,
+        Err(_) => return false,
     };
+    let ep_revision = ep_obj.revision;
     let mut ep: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&ep_obj.value)
     {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     let eps = match store.get(&eps_key).await {
         Ok(Some(o)) => match serde_json::from_slice::<serde_json::Value>(&o.value) {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => return false,
         },
-        _ => return,
+        Ok(None) => return true,
+        Err(_) => return false,
     };
 
     let mut ep_addrs = kubernetes_endpoints_addrs(&ep);
@@ -2129,7 +2144,7 @@ pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) {
     eps_port_nums.sort();
 
     if ep_addrs == eps_addrs && ep_port_nums == eps_port_nums {
-        return;
+        return true;
     }
 
     // Update Endpoints subsets to match EndpointSlice addresses and ports.
@@ -2143,7 +2158,10 @@ pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) {
         "ports": eps_ports
     }]);
 
-    let _ = store.put(&ep_key, Bytes::from(ep.to_string()), None).await;
+    store
+        .put(&ep_key, Bytes::from(ep.to_string()), Some(ep_revision))
+        .await
+        .is_ok()
 }
 
 async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
@@ -4057,6 +4075,72 @@ mod tests {
             Some(6443),
             "Endpoints port must be updated to match EndpointSlice port — the conformance test \
              checks both addresses and ports must match"
+        );
+    }
+
+    /// reconcile_kubernetes_endpointslice must not call store.put when Endpoints already
+    /// matches EndpointSlice — unconditional writes generate spurious MODIFIED watch events
+    /// every 5 seconds, causing all Endpoints informers to resync unnecessarily.
+    #[tokio::test]
+    async fn reconcile_kubernetes_endpointslice_skips_put_when_already_in_sync() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        let store = make_store();
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
+        seed_services(&store, "127.0.0.1", 6443)
+            .await
+            .expect("seed must not fail");
+
+        let ep_key = keys::object_key("endpoints", "default", "kubernetes");
+        let eps_key = keys::group_object_key(
+            "discovery.k8s.io",
+            "endpointslices",
+            Some("default"),
+            "kubernetes",
+        );
+
+        // Patch EndpointSlice so it differs from seeded Endpoints.
+        let eps_obj = store
+            .get(&eps_key)
+            .await
+            .expect("get must not fail")
+            .unwrap();
+        let mut eps: serde_json::Value =
+            serde_json::from_slice(&eps_obj.value).expect("valid json");
+        eps["endpoints"] =
+            serde_json::json!([{ "addresses": ["192.168.5.2"], "conditions": { "ready": true } }]);
+        eps["ports"] = serde_json::json!([{ "name": "https", "port": 6443, "protocol": "TCP" }]);
+        store
+            .put(&eps_key, Bytes::from(eps.to_string()), None)
+            .await
+            .expect("put must not fail");
+
+        // First reconcile — Endpoints differ from EndpointSlice, so store.put must be called.
+        reconcile_kubernetes_endpointslice(&store).await;
+        let revision_after_first = store
+            .get(&ep_key)
+            .await
+            .expect("get must not fail")
+            .unwrap()
+            .revision;
+
+        // Second reconcile — Endpoints now match EndpointSlice; store.put must NOT be called.
+        // If it were called, the revision would increment, generating a spurious MODIFIED event.
+        reconcile_kubernetes_endpointslice(&store).await;
+        let revision_after_second = store
+            .get(&ep_key)
+            .await
+            .expect("get must not fail")
+            .unwrap()
+            .revision;
+
+        assert_eq!(
+            revision_after_first, revision_after_second,
+            "second reconcile must not write to the store when Endpoints already matches \
+             EndpointSlice — spurious writes generate MODIFIED watch events every 5 seconds"
         );
     }
 
@@ -6474,6 +6558,70 @@ mod tests {
             "GET {uri} must return 'Pod ... not found', not '{}' — \
              if the fallback fires dns-common.go will never see the pod and burns 614 s",
             message
+        );
+    }
+
+    /// The reconciler task must exit promptly when the shutdown signal fires.
+    /// Without a shutdown channel the task runs forever and blocks graceful server shutdown,
+    /// leaving orphaned background work that cannot be cancelled or awaited.
+    #[tokio::test]
+    async fn reconciler_task_exits_on_shutdown_signal() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let store = Arc::new(make_store());
+        let reconcile_count = Arc::new(AtomicU32::new(0));
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let count = Arc::clone(&reconcile_count);
+        let reconcile_store = Arc::clone(&store);
+        let handle = tokio::spawn(async move {
+            let mut consecutive_errors: u32 = 0;
+            loop {
+                let ok = reconcile_kubernetes_endpointslice(&reconcile_store).await;
+                count.fetch_add(1, Ordering::Relaxed);
+                if ok {
+                    consecutive_errors = 0;
+                } else {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                }
+                let delay_secs = (5u64 << consecutive_errors.min(6)).min(300);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                    _ = shutdown_rx.changed() => break,
+                }
+            }
+        });
+
+        // Wait for the first reconcile to complete before sending shutdown.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if reconcile_count.load(Ordering::Relaxed) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("reconciler must complete first cycle within 5 s");
+
+        let count_before_shutdown = reconcile_count.load(Ordering::Relaxed);
+
+        // Signal shutdown — the task is sleeping (delay_secs = 5) so this must interrupt
+        // the sleep and cause the task to exit without running another reconcile cycle.
+        shutdown_tx.send(true).expect("send must succeed");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("reconciler task must exit within 1 s of receiving shutdown signal")
+            .expect("task must not panic");
+
+        let count_after_shutdown = reconcile_count.load(Ordering::Relaxed);
+        assert_eq!(
+            count_before_shutdown, count_after_shutdown,
+            "reconciler must not run another cycle after shutdown signal — \
+             without select! the task sleeps 5 s and cannot be cancelled"
         );
     }
 }
