@@ -90,6 +90,13 @@ pub(crate) fn validate_name(label: &str, value: &str) -> Result<(), crate::statu
             value
         )));
     }
+    let is_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    if !value.starts_with(is_alnum) || !value.ends_with(is_alnum) {
+        return Err(Status::bad_request(format!(
+            "invalid {label} '{}': must start and end with a lowercase alphanumeric character",
+            value
+        )));
+    }
     Ok(())
 }
 
@@ -1781,6 +1788,36 @@ mod resolve_name_tests {
         assert!(validate_name("namespace", "kube-system").is_ok());
         assert!(validate_name("name", "foo.example.com").is_ok());
         assert!(validate_name("name", "a123").is_ok());
+    }
+
+    // kube-apiserver rejects names whose first or last character is a hyphen or dot
+    // because they violate DNS label rules and break label-selector round-trips.
+    #[test]
+    fn validate_name_rejects_leading_hyphen() {
+        let err = validate_name("name", "-foo").expect_err("leading hyphen must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400, "leading hyphen must return 400");
+    }
+
+    #[test]
+    fn validate_name_rejects_trailing_hyphen() {
+        let err = validate_name("name", "foo-").expect_err("trailing hyphen must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400, "trailing hyphen must return 400");
+    }
+
+    #[test]
+    fn validate_name_rejects_trailing_dot() {
+        let err = validate_name("name", "foo.").expect_err("trailing dot must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400, "trailing dot must return 400");
+    }
+
+    #[test]
+    fn validate_name_rejects_leading_dot() {
+        let err = validate_name("name", ".bar").expect_err("leading dot must be rejected");
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(json["code"], 400, "leading dot must return 400");
     }
 }
 
