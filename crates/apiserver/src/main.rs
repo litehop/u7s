@@ -2089,6 +2089,7 @@ pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) {
         Ok(Some(o)) => o,
         _ => return,
     };
+    let ep_revision = ep_obj.revision;
     let mut ep: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&ep_obj.value)
     {
         Ok(v) => v,
@@ -2143,7 +2144,9 @@ pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) {
         "ports": eps_ports
     }]);
 
-    let _ = store.put(&ep_key, Bytes::from(ep.to_string()), None).await;
+    let _ = store
+        .put(&ep_key, Bytes::from(ep.to_string()), Some(ep_revision))
+        .await;
 }
 
 async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
@@ -4057,6 +4060,72 @@ mod tests {
             Some(6443),
             "Endpoints port must be updated to match EndpointSlice port — the conformance test \
              checks both addresses and ports must match"
+        );
+    }
+
+    /// reconcile_kubernetes_endpointslice must not call store.put when Endpoints already
+    /// matches EndpointSlice — unconditional writes generate spurious MODIFIED watch events
+    /// every 5 seconds, causing all Endpoints informers to resync unnecessarily.
+    #[tokio::test]
+    async fn reconcile_kubernetes_endpointslice_skips_put_when_already_in_sync() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        let store = make_store();
+        seed_namespaces(&store)
+            .await
+            .expect("namespaces must be seeded first");
+        seed_services(&store, "127.0.0.1", 6443)
+            .await
+            .expect("seed must not fail");
+
+        let ep_key = keys::object_key("endpoints", "default", "kubernetes");
+        let eps_key = keys::group_object_key(
+            "discovery.k8s.io",
+            "endpointslices",
+            Some("default"),
+            "kubernetes",
+        );
+
+        // Patch EndpointSlice so it differs from seeded Endpoints.
+        let eps_obj = store
+            .get(&eps_key)
+            .await
+            .expect("get must not fail")
+            .unwrap();
+        let mut eps: serde_json::Value =
+            serde_json::from_slice(&eps_obj.value).expect("valid json");
+        eps["endpoints"] =
+            serde_json::json!([{ "addresses": ["192.168.5.2"], "conditions": { "ready": true } }]);
+        eps["ports"] = serde_json::json!([{ "name": "https", "port": 6443, "protocol": "TCP" }]);
+        store
+            .put(&eps_key, Bytes::from(eps.to_string()), None)
+            .await
+            .expect("put must not fail");
+
+        // First reconcile — Endpoints differ from EndpointSlice, so store.put must be called.
+        reconcile_kubernetes_endpointslice(&store).await;
+        let revision_after_first = store
+            .get(&ep_key)
+            .await
+            .expect("get must not fail")
+            .unwrap()
+            .revision;
+
+        // Second reconcile — Endpoints now match EndpointSlice; store.put must NOT be called.
+        // If it were called, the revision would increment, generating a spurious MODIFIED event.
+        reconcile_kubernetes_endpointslice(&store).await;
+        let revision_after_second = store
+            .get(&ep_key)
+            .await
+            .expect("get must not fail")
+            .unwrap()
+            .revision;
+
+        assert_eq!(
+            revision_after_first, revision_after_second,
+            "second reconcile must not write to the store when Endpoints already matches \
+             EndpointSlice — spurious writes generate MODIFIED watch events every 5 seconds"
         );
     }
 
