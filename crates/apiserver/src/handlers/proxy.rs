@@ -1178,7 +1178,7 @@ pub async fn resolve_pod_proxy_target<S: Store>(
 fn build_pod_proxy_client(konnectivity_proxy_addr: Option<&str>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
     if let Some(addr) = konnectivity_proxy_addr {
-        let proxy_url = format!("https://{addr}");
+        let proxy_url = format!("http://{addr}");
         if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
             builder = builder.proxy(proxy);
         }
