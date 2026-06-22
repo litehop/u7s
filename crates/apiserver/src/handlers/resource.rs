@@ -221,6 +221,7 @@ pub async fn get_resource<S: Store>(
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
     super::defaults::apply_defaults(&group, &plural, &mut obj);
+    inject_type_meta(&mut obj, &group, &version, &meta.kind);
     Ok(Json(obj).into_response())
 }
 
@@ -1060,6 +1061,7 @@ pub async fn get_namespaced_resource<S: Store>(
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
     super::defaults::apply_defaults(&group, &plural, &mut obj);
+    inject_type_meta(&mut obj, &group, &version, &meta.kind);
     Ok(Json(obj).into_response())
 }
 
@@ -8202,6 +8204,69 @@ mod tests {
         assert_eq!(
             v["apiVersion"], "resource.k8s.io/v1",
             "response must have apiVersion=resource.k8s.io/v1 — required by Kubernetes API contract"
+        );
+    }
+
+    // GET for a registry-backed resource (DRA) must include kind and apiVersion even when
+    // the stored bytes omit them (client-go omits TypeMeta fields when they are zero-valued).
+    // Without inject_type_meta in get_resource, the GET response returns the raw stored bytes
+    // which may lack kind/apiVersion, causing client-go to return "Object Kind is missing".
+    // Removing the inject_type_meta call from get_resource must make this test fail.
+    #[tokio::test]
+    async fn get_resource_slice_response_has_type_meta() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // Store a ResourceSlice without kind/apiVersion, simulating what happens when
+        // client-go omits TypeMeta and the stored bytes are the raw client body.
+        let stored_body = serde_json::json!({
+            "metadata": {
+                "name": "slice-without-meta",
+                "resourceVersion": "1"
+            },
+            "spec": {
+                "driver": "test.csi.k8s.io",
+                "pool": { "name": "p", "generation": 0, "resourceSliceCount": 1 },
+                "nodeName": "node1",
+                "devices": []
+            }
+        });
+        state
+            .store
+            .put(
+                "/registry/resource.k8s.io/resourceslices/slice-without-meta",
+                bytes::Bytes::from(serde_json::to_vec(&stored_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("store put must succeed");
+
+        let resp = get_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "resource.k8s.io".to_string(),
+                "v1".to_string(),
+                "resourceslices".to_string(),
+                "slice-without-meta".to_string(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("GET must succeed"))
+        .into_response();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            v["kind"], "ResourceSlice",
+            "GET response must include kind=ResourceSlice even when stored bytes lack it — \
+             client-go typed clients fail with 'Object Kind is missing' without this"
+        );
+        assert_eq!(
+            v["apiVersion"], "resource.k8s.io/v1",
+            "GET response must include apiVersion even when stored bytes lack it"
         );
     }
 
