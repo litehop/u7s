@@ -28,6 +28,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "persistentvolumeclaims") = (group, plural) {
         default_pvc(obj);
     }
+    if let ("coordination.k8s.io", "leases") = (group, plural) {
+        default_lease(obj);
+    }
 
     if is_workload_resource(group, plural) {
         initialize_workload_generation(obj);
@@ -110,6 +113,18 @@ fn default_pvc(obj: &mut serde_json::Value) {
             obj["status"] = serde_json::json!({});
         }
         obj["status"]["phase"] = serde_json::Value::String("Pending".to_string());
+    }
+}
+
+/// Default `spec.leaseTransitions` to `0` on a Lease when absent.
+///
+/// Real Kubernetes represents leaseTransitions as `*int32` (pointer-to-zero).
+/// When omitted by the client the field is null in JSON, but the Lease conformance
+/// test reads it back and expects `0`. Without this default, the field stays null
+/// and the test fails with "unexpected leaseTransitions: <nil>".
+fn default_lease(obj: &mut serde_json::Value) {
+    if obj["spec"]["leaseTransitions"].is_null() {
+        obj["spec"]["leaseTransitions"] = serde_json::json!(0i32);
     }
 }
 
@@ -2442,6 +2457,59 @@ mod tests {
         assert!(
             result.unwrap_err().contains("Secret.data"),
             "error must reference Secret.data"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: Lease spec.leaseTransitions defaulting
+    // ---------------------------------------------------------------------------
+
+    /// A Lease created without spec.leaseTransitions must have it defaulted to 0.
+    ///
+    /// Real Kubernetes uses *int32 for this field (pointer-to-zero). The Lease
+    /// conformance test reads it back and expects 0; without this default the field
+    /// is null and the test fails with "unexpected leaseTransitions: <nil>".
+    /// Reverting default_lease makes this test fail.
+    #[test]
+    fn lease_transitions_defaults_to_zero() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "my-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node1", "leaseDurationSeconds": 40 }
+        });
+
+        apply_defaults("coordination.k8s.io", "leases", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["leaseTransitions"],
+            serde_json::Value::Number(0.into()),
+            "spec.leaseTransitions must default to 0 — the Lease conformance test \
+             reads it back and fails when the field is null"
+        );
+    }
+
+    /// An existing spec.leaseTransitions must not be overwritten.
+    ///
+    /// A Lease that has been renewed multiple times carries a non-zero
+    /// leaseTransitions count. Overwriting it to 0 would break holder-identity
+    /// tracking used by the node lease controller.
+    #[test]
+    fn lease_transitions_existing_value_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "my-lease", "namespace": "kube-node-lease" },
+            "spec": { "holderIdentity": "node1", "leaseDurationSeconds": 40, "leaseTransitions": 5 }
+        });
+
+        apply_defaults("coordination.k8s.io", "leases", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["leaseTransitions"],
+            serde_json::Value::Number(5.into()),
+            "existing spec.leaseTransitions must not be overwritten — \
+             resetting the transition count breaks holder-identity tracking"
         );
     }
 
