@@ -148,7 +148,7 @@ struct SelfSubjectRulesReviewResponse {
 #[serde(rename_all = "camelCase")]
 struct RulesReviewStatus {
     resource_rules: Vec<ResourceRule>,
-    non_resource_rules: Vec<serde_json::Value>,
+    non_resource_rules: Vec<NonResourceRule>,
     incomplete: bool,
 }
 
@@ -158,6 +158,13 @@ struct ResourceRule {
     verbs: Vec<String>,
     api_groups: Vec<String>,
     resources: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct NonResourceRule {
+    verbs: Vec<String>,
+    #[serde(rename = "nonResourceURLs")]
+    non_resource_urls: Vec<String>,
 }
 
 pub async fn self_subject_rules_review<S: Store>(
@@ -189,21 +196,29 @@ pub async fn self_subject_rules_review<S: Store>(
         .rbac_index
         .enumerate_rules(&user.username, &user.groups, namespace);
 
-    let resource_rules = policy_rules
-        .into_iter()
-        .map(|r| ResourceRule {
-            verbs: r.verbs,
-            api_groups: r.api_groups,
-            resources: r.resources,
-        })
-        .collect();
+    let mut resource_rules: Vec<ResourceRule> = Vec::new();
+    let mut non_resource_rules: Vec<NonResourceRule> = Vec::new();
+    for r in policy_rules {
+        if r.non_resource_urls.is_empty() {
+            resource_rules.push(ResourceRule {
+                verbs: r.verbs,
+                api_groups: r.api_groups,
+                resources: r.resources,
+            });
+        } else {
+            non_resource_rules.push(NonResourceRule {
+                verbs: r.verbs,
+                non_resource_urls: r.non_resource_urls,
+            });
+        }
+    }
 
     let resp = SelfSubjectRulesReviewResponse {
         api_version: "authorization.k8s.io/v1",
         kind: "SelfSubjectRulesReview",
         status: RulesReviewStatus {
             resource_rules,
-            non_resource_rules: vec![],
+            non_resource_rules,
             incomplete: false,
         },
     };
@@ -1186,6 +1201,68 @@ mod handler_tests {
         assert_eq!(
             val["status"]["incomplete"], false,
             "incomplete must be false when enumeration completed normally"
+        );
+    }
+
+    /// SSRR must populate nonResourceRules for a user whose ClusterRole grants
+    /// nonResourceURLs. Without this, `kubectl auth can-i --list` silently
+    /// underreports permissions for users who have e.g. GET /metrics access.
+    #[tokio::test]
+    async fn ssrr_populates_non_resource_rules_for_non_resource_url_grant() {
+        let state = make_state_with_binding(
+            serde_json::json!([{
+                "nonResourceURLs": ["/metrics"],
+                "verbs": ["get"]
+            }]),
+            "alice",
+        );
+
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+                post(self_subject_rules_review),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "namespace": "default" } });
+        let req = json_req(
+            "POST",
+            "/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+            body,
+            user("alice", &[]),
+        );
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let non_resource = val["status"]["nonResourceRules"].as_array().unwrap();
+        assert_eq!(
+            non_resource.len(),
+            1,
+            "a nonResourceURL grant must appear in nonResourceRules — \
+             kubectl auth can-i --list would miss GET /metrics otherwise"
+        );
+        assert!(
+            non_resource[0]["nonResourceURLs"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("/metrics")),
+            "/metrics must appear in the nonResourceURLs of the returned rule"
+        );
+        assert!(
+            non_resource[0]["verbs"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("get")),
+            "get verb must appear in the returned non-resource rule"
+        );
+        let resource_rules = val["status"]["resourceRules"].as_array().unwrap();
+        assert!(
+            resource_rules.is_empty(),
+            "a nonResourceURL-only rule must not leak into resourceRules"
         );
     }
 
