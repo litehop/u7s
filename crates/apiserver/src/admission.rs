@@ -47,6 +47,8 @@ pub struct AdmissionRequest {
     pub operation: String,
     pub object: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_object: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user_info: Option<serde_json::Value>,
 }
 
@@ -482,7 +484,15 @@ fn build_review(
     uid: &str,
     ctx: &AdmissionContext<'_>,
     object: &serde_json::Value,
+    old_object: Option<&serde_json::Value>,
 ) -> AdmissionReview {
+    // Populate oldObject for UPDATE and DELETE so policy engines (Kyverno, OPA Gatekeeper)
+    // can enforce immutability rules and detect what changed. Without oldObject, immutability
+    // checks silently pass on every UPDATE because there is nothing to compare against.
+    let old_object = match ctx.operation {
+        "UPDATE" | "DELETE" => old_object.cloned(),
+        _ => None,
+    };
     AdmissionReview {
         api_version: "admission.k8s.io/v1".to_string(),
         kind: "AdmissionReview".to_string(),
@@ -505,6 +515,7 @@ fn build_review(
             namespace: ctx.namespace.map(|s| s.to_string()),
             operation: ctx.operation.to_string(),
             object: object.clone(),
+            old_object,
             user_info: ctx.user_info.clone(),
         }),
         response: None,
@@ -660,6 +671,7 @@ async fn invoke_mutating_webhook<S: Store>(
     state: &AppState<S>,
     webhook: &WebhookEntry,
     object: &serde_json::Value,
+    old_object: Option<&serde_json::Value>,
     ctx: &AdmissionContext<'_>,
     is_reinvocation: bool,
 ) -> Result<(serde_json::Value, bool), StatusError> {
@@ -743,7 +755,7 @@ async fn invoke_mutating_webhook<S: Store>(
     };
 
     let uid = uuid::Uuid::new_v4().to_string();
-    let review = build_review(&uid, ctx, object);
+    let review = build_review(&uid, ctx, object, old_object);
 
     // DirectUrl webhooks go to an external endpoint: do not route through the
     // konnectivity proxy (which only reaches pod IPs inside the VM) and do not
@@ -2081,6 +2093,7 @@ fn is_webhook_configuration_resource(ctx: &AdmissionContext<'_>) -> bool {
 pub async fn run_mutating_webhooks<S: Store>(
     state: &AppState<S>,
     mut object: serde_json::Value,
+    old_object: Option<&serde_json::Value>,
     ctx: &AdmissionContext<'_>,
 ) -> Result<serde_json::Value, StatusError> {
     // Skip the webhook pipeline for webhook configuration resources themselves
@@ -2113,7 +2126,7 @@ pub async fn run_mutating_webhooks<S: Store>(
     let mut any_patched = false;
     for webhook in &all_webhooks {
         let (new_obj, patched) =
-            invoke_mutating_webhook(state, webhook, &object, ctx, false).await?;
+            invoke_mutating_webhook(state, webhook, &object, old_object, ctx, false).await?;
         if patched {
             any_patched = true;
         }
@@ -2123,7 +2136,8 @@ pub async fn run_mutating_webhooks<S: Store>(
     // Reinvocation pass: if any patch was applied, re-run IfNeeded webhooks once.
     if any_patched {
         for webhook in &all_webhooks {
-            let (new_obj, _) = invoke_mutating_webhook(state, webhook, &object, ctx, true).await?;
+            let (new_obj, _) =
+                invoke_mutating_webhook(state, webhook, &object, old_object, ctx, true).await?;
             object = new_obj;
         }
     }
@@ -2441,6 +2455,7 @@ async fn run_validating_admission_policies<S: Store>(
 pub async fn run_validating_webhooks<S: Store>(
     state: &AppState<S>,
     object: &serde_json::Value,
+    old_object: Option<&serde_json::Value>,
     ctx: &AdmissionContext<'_>,
 ) -> Result<(), StatusError> {
     // Skip the webhook pipeline for webhook configuration resources themselves
@@ -2532,7 +2547,7 @@ pub async fn run_validating_webhooks<S: Store>(
         };
 
         let uid = uuid::Uuid::new_v4().to_string();
-        let review = build_review(&uid, ctx, object);
+        let review = build_review(&uid, ctx, object, old_object);
 
         // DirectUrl webhooks go to an external endpoint: do not route through the
         // konnectivity proxy (which only reaches pod IPs inside the VM) and do not
@@ -2703,7 +2718,7 @@ mod tests {
             dry_run: false,
         };
         // Must succeed without invoking any webhook (skipped by deadlock prevention).
-        let result = run_mutating_webhooks(&state, new_mwc.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, new_mwc.clone(), None, &ctx).await;
         assert!(
             result.is_ok(),
             "MutatingWebhookConfiguration create must bypass admission pipeline to prevent deadlock"
@@ -2766,7 +2781,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_validating_webhooks(&state, &new_vwc, &ctx).await;
+        let result = run_validating_webhooks(&state, &new_vwc, None, &ctx).await;
         assert!(
             result.is_ok(),
             "ValidatingWebhookConfiguration create must bypass admission pipeline to prevent deadlock"
@@ -2894,7 +2909,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
         assert!(result.is_ok(), "no webhooks must not fail");
         let returned = result.unwrap_or_else(|_| panic!("no webhooks must not fail"));
         assert_eq!(returned, obj, "object must be unchanged when no webhooks");
@@ -2917,7 +2932,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
         assert!(result.is_ok(), "no webhooks must return Ok");
     }
 
@@ -3036,6 +3051,7 @@ mod tests {
             "uid-1",
             &ctx,
             &json!({"kind": "Deployment", "metadata": {"name": "test-deploy"}}),
+            None,
         );
         let resp = mock_call_webhook(allow_handler(), &review).await;
         assert!(resp.is_some(), "allow webhook must return a response");
@@ -3062,6 +3078,7 @@ mod tests {
             "uid-2",
             &ctx,
             &json!({"kind": "Deployment", "metadata": {"name": "test-deploy"}}),
+            None,
         );
         let resp = mock_call_webhook(deny_handler(), &review).await;
         assert!(resp.is_some(), "deny webhook must return a response");
@@ -3088,7 +3105,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let review = build_review("uid-3", &ctx, &obj);
+        let review = build_review("uid-3", &ctx, &obj, None);
         let resp = mock_call_webhook(patch_handler(), &review).await;
         assert!(resp.is_some(), "patch webhook must return a response");
         let r = resp.unwrap();
@@ -3161,7 +3178,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
         assert!(
             result.is_ok(),
@@ -3225,7 +3242,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
         assert!(
             result.is_err(),
@@ -3283,7 +3300,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
         assert!(
             result.is_ok(),
@@ -3341,7 +3358,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
         assert!(
             result.is_err(),
@@ -3426,7 +3443,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
         let err = result.expect_err("a timed-out webhook must return an error");
         assert_eq!(
@@ -3496,7 +3513,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
         assert!(
             result.is_ok(),
@@ -3723,7 +3740,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
         assert!(
             result.is_ok(),
@@ -3810,7 +3827,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
         assert!(
             result.is_err(),
@@ -3884,7 +3901,7 @@ mod tests {
         // The webhook is invoked at https://my-webhook-svc.webhook-ns.svc:8443/mutate,
         // fails to connect (no cluster in unit tests), but failurePolicy=Ignore means
         // the pipeline succeeds.
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
         assert!(
             result.is_ok(),
             "service-based webhook with failurePolicy=Ignore must succeed when connection fails"
@@ -4076,7 +4093,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_mutating_webhooks(&state, obj, &ctx).await;
+        let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
         assert!(result.is_ok(), "mutating webhook pipeline must succeed");
 
         // Pass 1: both A and B fire once.
@@ -4175,7 +4192,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_mutating_webhooks(&state, obj, &ctx).await;
+        let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
         assert!(
             result.is_ok(),
             "pipeline must succeed when no patch applied"
@@ -4247,7 +4264,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
         assert!(
             result.is_err(),
             "service not found with failurePolicy=Fail must return an error"
@@ -4354,7 +4371,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_mutating_webhooks(&state, configmap, &ctx).await;
+        let result = run_mutating_webhooks(&state, configmap, None, &ctx).await;
 
         assert!(
             result.is_ok(),
@@ -4539,7 +4556,7 @@ mod tests {
             "kind": "Deployment",
             "metadata": {"name": "my-deploy"}
         });
-        let review = build_review("uid-kind-test", &ctx, &obj);
+        let review = build_review("uid-kind-test", &ctx, &obj, None);
         let req = review.request.expect("request must be set");
         assert_eq!(
             req.kind.kind, "Deployment",
@@ -4575,7 +4592,7 @@ mod tests {
         };
         // Object without a "kind" field.
         let obj = serde_json::json!({"metadata": {"name": "my-pod"}});
-        let review = build_review("uid-no-kind", &ctx, &obj);
+        let review = build_review("uid-no-kind", &ctx, &obj, None);
         let req = review.request.expect("request must be set");
         assert_eq!(
             req.kind.kind, "",
@@ -4724,7 +4741,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
         assert!(
             result.is_ok(),
@@ -4799,7 +4816,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_mutating_webhooks(&state, obj.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
 
         assert!(
             result.is_err(),
@@ -4867,7 +4884,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
 
         assert!(
             result.is_ok(),
@@ -5055,7 +5072,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_mutating_webhooks(&state, deployment, &ctx).await;
+        let result = run_mutating_webhooks(&state, deployment, None, &ctx).await;
         assert!(
             result.is_ok(),
             "MutatingAdmissionPolicy evaluation must not fail the CREATE request"
@@ -5133,7 +5150,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_mutating_webhooks(&state, cm.clone(), &ctx).await;
+        let result = run_mutating_webhooks(&state, cm.clone(), None, &ctx).await;
         assert!(
             result.is_ok(),
             "pipeline must succeed for non-matching resource"
@@ -5545,7 +5562,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_validating_webhooks(&state, &deploy_even, &ctx).await;
+        let result = run_validating_webhooks(&state, &deploy_even, None, &ctx).await;
         assert!(
             result.is_err(),
             "Deployment with even replicas (2) must be denied by VAP; \
@@ -5650,7 +5667,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_validating_webhooks(&state, &deploy_odd, &ctx).await;
+        let result = run_validating_webhooks(&state, &deploy_odd, None, &ctx).await;
         assert!(
             result.is_ok(),
             "Deployment with odd replicas (3) > 1 must be allowed by the odd-replicas VAP; \
@@ -5855,7 +5872,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result = run_validating_webhooks(&state, &new_vap, &ctx).await;
+        let result = run_validating_webhooks(&state, &new_vap, None, &ctx).await;
         assert!(
             result.is_ok(),
             "admissionregistration.k8s.io resources must be exempt from VAP evaluation \
@@ -5941,7 +5958,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
         assert!(
             result.is_err(),
             "VAP with expression=false must deny the request"
@@ -6066,7 +6083,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_validating_webhooks(&state, &obj, &ctx).await;
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
         assert!(
             result.is_err(),
             "VAP with reason=Forbidden and expression=false must deny the request"
@@ -6197,7 +6214,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_validating_webhooks(&state, &deploy, &ctx).await;
+        let result = run_validating_webhooks(&state, &deploy, None, &ctx).await;
         assert!(
             result.is_ok(),
             "VAP binding with namespaceSelector env=test must not apply to namespace 'no-label-ns' \
@@ -6290,7 +6307,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_validating_webhooks(&state, &node, &ctx).await;
+        let result = run_validating_webhooks(&state, &node, None, &ctx).await;
         assert!(
             result.is_ok(),
             "VAP binding with namespaceSelector must never apply to cluster-scoped resources \
@@ -6388,7 +6405,7 @@ mod tests {
             })),
             dry_run: false,
         };
-        let result_matching = run_validating_webhooks(&state, &node, &ctx_matching).await;
+        let result_matching = run_validating_webhooks(&state, &node, None, &ctx_matching).await;
         assert!(
             result_matching.is_ok(),
             "VAP with request.userInfo.username == 'system:node:worker-1' must allow that user; \
@@ -6410,7 +6427,7 @@ mod tests {
             })),
             dry_run: false,
         };
-        let result_other = run_validating_webhooks(&state, &node, &ctx_other).await;
+        let result_other = run_validating_webhooks(&state, &node, None, &ctx_other).await;
         assert!(
             result_other.is_err(),
             "VAP with request.userInfo.username == 'system:node:worker-1' must deny other users; \
@@ -6501,7 +6518,7 @@ mod tests {
             user_info: Some(json!({"username": "alice", "uid": "", "groups": []})),
             dry_run: false,
         };
-        let result_alice = run_validating_webhooks(&state, &cm, &ctx_alice).await;
+        let result_alice = run_validating_webhooks(&state, &cm, None, &ctx_alice).await;
         assert!(
             result_alice.is_ok(),
             "VAP must allow alice when user_info is threaded through AdmissionContext; \
@@ -6519,7 +6536,7 @@ mod tests {
             user_info: None,
             dry_run: false,
         };
-        let result_none = run_validating_webhooks(&state, &cm, &ctx_none).await;
+        let result_none = run_validating_webhooks(&state, &cm, None, &ctx_none).await;
         assert!(
             result_none.is_err(),
             "VAP must deny when user_info is None (handlers not threading identity); \
@@ -6648,7 +6665,7 @@ mod tests {
         // The marker Deployment (replicas=3) must be ALLOWED because 3 > 1 = true.
         // If this fails, the policy wrongly denies valid workloads and the conformance
         // test "should validate against a Deployment" cannot complete its wait-for-marker step.
-        let result = run_validating_webhooks(&state, &marker, &ctx).await;
+        let result = run_validating_webhooks(&state, &marker, None, &ctx).await;
         assert!(
             result.is_ok(),
             "Deployment with spec.replicas=3 must be allowed by 'object.spec.replicas > 1' \
@@ -6672,7 +6689,7 @@ mod tests {
             }
         });
         apply_defaults("apps", "deployments", &mut bad_deploy);
-        let bad_result = run_validating_webhooks(&state, &bad_deploy, &ctx).await;
+        let bad_result = run_validating_webhooks(&state, &bad_deploy, None, &ctx).await;
         assert!(
             bad_result.is_err(),
             "Deployment with spec.replicas=1 must be denied by 'object.spec.replicas > 1' \
@@ -6810,7 +6827,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_validating_webhooks(&state, &marker, &ctx).await;
+        let result = run_validating_webhooks(&state, &marker, None, &ctx).await;
         assert!(
             result.is_ok(),
             "Deployment with replicas=3 (odd, > 1) must be allowed by the conformance VAP \
@@ -6834,7 +6851,7 @@ mod tests {
             }
         });
         apply_defaults("apps", "deployments", &mut even_deploy);
-        let even_result = run_validating_webhooks(&state, &even_deploy, &ctx).await;
+        let even_result = run_validating_webhooks(&state, &even_deploy, None, &ctx).await;
         assert!(
             even_result.is_err(),
             "Deployment with replicas=2 (even) must be denied by the conformance VAP \
@@ -6982,7 +6999,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_validating_webhooks(&state, &retrieved, &ctx).await;
+        let result = run_validating_webhooks(&state, &retrieved, None, &ctx).await;
         assert!(
             result.is_ok(),
             "Deployment retrieved from store with spec.replicas=2 must be allowed by \
@@ -7058,7 +7075,7 @@ mod tests {
             dry_run: false,
         };
 
-        let result = run_mutating_webhooks(&state, obj, &ctx).await;
+        let result = run_mutating_webhooks(&state, obj, None, &ctx).await;
         assert!(
             result.is_err(),
             "a webhook returning 2 MiB must be treated as unreachable — \
@@ -7139,6 +7156,112 @@ mod tests {
             result.is_ok(),
             "http://127.0.0.1 must be accepted — \
              loopback addresses are not SSRF targets and must work for test mock servers"
+        );
+    }
+
+    // -- build_review oldObject tests (mayor-8qqp) --
+
+    /// A validating webhook must receive a non-null request.oldObject on UPDATE.
+    ///
+    /// Policy engines (Kyverno, OPA Gatekeeper) use request.oldObject to enforce
+    /// immutability rules (e.g. "spec.replicas must not decrease"). Without oldObject,
+    /// these checks silently pass on every UPDATE because there is nothing to compare
+    /// against — an immutability policy becomes a no-op.
+    #[tokio::test]
+    async fn validating_webhook_receives_old_object_on_update() {
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::{Arc, Mutex};
+
+        // Capture the raw admission review body.
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        let router = Router::new().route(
+            "/admit",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured_clone = Arc::clone(&captured_clone);
+                async move {
+                    *captured_clone.lock().unwrap() = Some(body.clone());
+                    let uid = body["request"]["uid"].as_str().unwrap_or("").to_string();
+                    axum::Json(serde_json::json!({
+                        "apiVersion": "admission.k8s.io/v1",
+                        "kind": "AdmissionReview",
+                        "response": {"uid": uid, "allowed": true}
+                    }))
+                }
+            }),
+        );
+
+        let (base_url, _handle) = start_mock_webhook_server(router).await;
+        let state = make_state();
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "old-object-test-vwc"},
+            "webhooks": [{
+                "name": "old-object.test.example.com",
+                "clientConfig": { "url": format!("{base_url}/admit") },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["UPDATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/old-object-test-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let new_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "test-cm"},
+            "data": {"key": "new-value"}
+        });
+        let old_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "test-cm"},
+            "data": {"key": "old-value"}
+        });
+
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "test-cm",
+            namespace: Some("default"),
+            operation: "UPDATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_validating_webhooks(&state, &new_obj, Some(&old_obj), &ctx).await;
+        assert!(result.is_ok(), "validating webhook must allow the UPDATE");
+
+        let review = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("webhook must have been called");
+
+        let old_object = &review["request"]["oldObject"];
+        assert!(
+            !old_object.is_null(),
+            "request.oldObject must be non-null on UPDATE — \
+             immutability policy engines compare old vs new object; \
+             a null oldObject causes them to silently approve all mutations"
+        );
+        assert_eq!(
+            old_object["data"]["key"].as_str(),
+            Some("old-value"),
+            "request.oldObject must contain the pre-update object data — \
+             a blank oldObject cannot be used to detect what changed"
         );
     }
 }
