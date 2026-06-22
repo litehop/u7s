@@ -462,6 +462,14 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/namespaces/{ns}/pods/{name}/portforward",
             get(handlers::proxy::pod_portforward).post(handlers::proxy::pod_portforward),
         )
+        // Pods — proxy subresource: forward to pod IP at http://{podIP}:{containerPort}/{path}
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/proxy/{*path}",
+            get(handlers::proxy::pod_proxy)
+                .post(handlers::proxy::pod_proxy)
+                .put(handlers::proxy::pod_proxy)
+                .delete(handlers::proxy::pod_proxy),
+        )
         // Nodes — proxy subresource: forward to kubelet at https://<node-ip>:10250/<path>
         .route(
             "/api/v1/nodes/{name}/proxy/{*path}",
