@@ -1127,6 +1127,121 @@ pub async fn node_proxy<S: Store>(
 }
 
 // ---------------------------------------------------------------------------
+// /api/v1/namespaces/{ns}/pods/{name}/proxy/{*path} — forward to pod IP
+// ---------------------------------------------------------------------------
+
+/// Resolve pod IP and container port for the pod proxy subresource.
+///
+/// Returns (pod_ip, port, konnectivity_proxy_addr) for the caller to build the
+/// forward URL and HTTP client. Separated from the handler for unit-testability.
+pub async fn resolve_pod_proxy_target<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    pod_name: &str,
+) -> Result<(String, u16, Option<String>), crate::status::StatusError> {
+    let pod_key = object_key("pods", ns, pod_name);
+    let stored = state
+        .store
+        .get(&pod_key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(pod_name, "Pod"))?;
+
+    let pod: serde_json::Value = serde_json::from_slice(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored pod: {e}")))?;
+
+    let pod_ip = pod["status"]["podIP"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Status::service_unavailable(format!(
+                "pod \"{pod_name}\" has no podIP yet — pod is not ready"
+            ))
+        })?
+        .to_owned();
+
+    let port = pod["spec"]["containers"][0]["ports"][0]["containerPort"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(80);
+
+    let proxy_addr = state.konnectivity_proxy_addr.clone();
+
+    Ok((pod_ip, port, proxy_addr))
+}
+
+/// Build a plain HTTP reqwest client for pod proxy requests.
+///
+/// When `konnectivity_proxy_addr` is set, an HTTP CONNECT proxy is configured so
+/// requests to pod IPs (which are only reachable within the node's CNI network)
+/// are tunnelled through the konnectivity-server → konnectivity-agent path.
+fn build_pod_proxy_client(konnectivity_proxy_addr: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(addr) = konnectivity_proxy_addr {
+        let proxy_url = format!("https://{addr}");
+        if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build().unwrap_or_default()
+}
+
+/// Proxy a request to the pod's IP and containerPort.
+///
+/// GET /api/v1/namespaces/{ns}/pods/{name}/proxy/{*path} → http://{podIP}:{port}/{path}
+///
+/// Uses plain HTTP (not TLS) because pod IPs are cluster-internal.
+/// When konnectivity_proxy_addr is configured, the request is tunnelled through
+/// the konnectivity-server so that pod IPs unreachable from the host are still reachable.
+/// Returns 404 if the pod is not in the store, 503 if status.podIP is empty.
+pub async fn pod_proxy<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, pod_name, path_suffix)): Path<(String, String, String)>,
+    req: axum::http::Request<Body>,
+) -> Result<Response, crate::status::StatusError> {
+    let (pod_ip, port, proxy_addr) = resolve_pod_proxy_target(&state, &ns, &pod_name).await?;
+
+    let target_url = format!("http://{pod_ip}:{port}/{path_suffix}");
+
+    let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
+        .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
+
+    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
+
+    let client = build_pod_proxy_client(proxy_addr.as_deref());
+
+    let pod_resp = client
+        .request(method, &target_url)
+        .body(body_bytes)
+        .send()
+        .await
+        .map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("pod unreachable: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                },
+            )
+        })?;
+
+    let pod_status = pod_resp.status();
+    let body = Body::from_stream(pod_resp.bytes_stream());
+
+    Response::builder()
+        .status(pod_status.as_u16())
+        .body(body)
+        .map_err(|e| Status::internal(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -2132,6 +2247,199 @@ mod tests {
             404,
             "node proxy must return 404 when the node is not in the store — \
              a 502 or 500 would mislead the caller into thinking the kubelet is down"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_proxy: resolve_pod_proxy_target unit tests
+    //
+    // The DNS conformance test reads pod results via the pod proxy subresource.
+    // resolve_pod_proxy_target handles the pre-flight checks. We test it directly
+    // because the handler is a thin wrapper around this function.
+    // -----------------------------------------------------------------------
+
+    /// pod proxy must return 404 when the pod does not exist.
+    ///
+    /// A 404 tells the caller the pod is gone rather than suggesting the pod
+    /// is unreachable (502) or that there is an internal error (500).
+    #[tokio::test]
+    async fn pod_proxy_missing_pod_returns_404() {
+        let state = make_state();
+        let result = resolve_pod_proxy_target(&state, "default", "ghost").await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            404,
+            "pod proxy must return 404 when the pod is not in the store — \
+             a 502 or 500 would mislead the caller into thinking the pod IP is unreachable"
+        );
+    }
+
+    /// pod proxy must return 503 when the pod exists but has no podIP.
+    ///
+    /// A pod without a podIP has not been assigned an IP by the network plugin yet;
+    /// returning 503 tells the caller to retry rather than suggesting the pod is missing.
+    #[tokio::test]
+    async fn pod_proxy_no_pod_ip_returns_503() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pending", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "pending"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let result = resolve_pod_proxy_target(&state, "default", "pending").await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            503,
+            "pod proxy must return 503 when status.podIP is empty — \
+             the pod is not yet ready to serve traffic; 404 would incorrectly imply the pod is gone"
+        );
+    }
+
+    /// resolve_pod_proxy_target returns the pod IP and container port on the happy path.
+    ///
+    /// The handler constructs the forward URL from these values; an incorrect IP or port
+    /// would silently route requests to the wrong destination.
+    #[tokio::test]
+    async fn pod_proxy_resolves_ip_and_port() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 8080}]}]
+            },
+            "status": {"podIP": "10.1.2.3"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let (ip, port, _) = resolve_pod_proxy_target(&state, "default", "mypod")
+            .await
+            .expect("resolve must succeed for a running pod with podIP");
+        assert_eq!(
+            ip, "10.1.2.3",
+            "pod proxy must use status.podIP as the target — using any other address \
+             would route to the wrong pod"
+        );
+        assert_eq!(
+            port, 8080,
+            "pod proxy must use the first containerPort as the target port — \
+             using port 80 when 8080 is configured routes to the wrong port"
+        );
+    }
+
+    /// resolve_pod_proxy_target defaults to port 80 when no containerPort is configured.
+    ///
+    /// Port 80 is the conventional HTTP port; defaulting to it avoids breaking pods
+    /// that expose HTTP without an explicit containerPort declaration.
+    #[tokio::test]
+    async fn pod_proxy_defaults_to_port_80() {
+        let state = make_state();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            },
+            "status": {"podIP": "10.1.2.3"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let (ip, port, _) = resolve_pod_proxy_target(&state, "default", "mypod")
+            .await
+            .expect("resolve must succeed");
+        assert_eq!(ip, "10.1.2.3");
+        assert_eq!(
+            port, 80,
+            "pod proxy must default to port 80 when no containerPort is declared — \
+             a pod serving HTTP on port 80 without explicit port config must still be reachable"
+        );
+    }
+
+    /// resolve_pod_proxy_target returns the konnectivity proxy address from state.
+    ///
+    /// The konnectivity proxy enables the apiserver (on the host) to reach pod IPs
+    /// that are only accessible within the node's CNI network. If the proxy address
+    /// is not threaded through, pod proxy requests fail with 502 when pod IPs are
+    /// unreachable from the host.
+    #[tokio::test]
+    async fn pod_proxy_threads_konnectivity_proxy_addr() {
+        let store = Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: None,
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: Some("127.0.0.1:8132".to_owned()),
+        });
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"podIP": "10.1.2.3"}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let (_, _, proxy_addr) = resolve_pod_proxy_target(&state, "default", "mypod")
+            .await
+            .expect("resolve must succeed");
+        assert_eq!(
+            proxy_addr.as_deref(),
+            Some("127.0.0.1:8132"),
+            "pod proxy must thread the konnectivity_proxy_addr from state — \
+             without it, pod IPs unreachable from the host produce 502 instead of succeeding"
         );
     }
 
