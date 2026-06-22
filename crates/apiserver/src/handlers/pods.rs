@@ -1516,6 +1516,10 @@ fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_jso
         let Some(cond_type) = patch_cond["type"].as_str() else {
             continue;
         };
+        if patch_cond.get("$patch").and_then(|v| v.as_str()) == Some("delete") {
+            stored_arr.retain(|c| c["type"] != cond_type);
+            continue;
+        }
         if let Some(existing) = stored_arr.iter_mut().find(|c| c["type"] == cond_type) {
             let patch_obj = match patch_cond.as_object() {
                 Some(o) => o,
@@ -2130,6 +2134,43 @@ mod status_tests {
         assert!(
             containers_ready.is_some(),
             "ContainersReady condition must be added by the patch"
+        );
+    }
+
+    /// A strategic-merge-patch with `$patch: delete` on a condition must remove that
+    /// condition from the stored list, not store a literal `$patch` key inside it.
+    /// Without this, a PATCH intended to remove the Ready condition would instead corrupt
+    /// the condition object, and consumers reading conditions would see spurious entries.
+    #[test]
+    fn patch_delete_directive_removes_condition() {
+        let mut stored = serde_json::json!([
+            {"type": "Ready", "status": "True"},
+            {"type": "Initialized", "status": "True"}
+        ]);
+        let patch = serde_json::json!([
+            {"type": "Ready", "$patch": "delete"}
+        ]);
+
+        merge_conditions(&mut stored, &patch);
+
+        let arr = stored.as_array().expect("conditions must remain an array");
+        assert!(
+            arr.iter().all(|c| c["type"] != "Ready"),
+            "$patch:delete must remove the Ready condition — without this, the literal \
+             $patch key is stored inside the condition object instead of removing it"
+        );
+        assert_eq!(
+            arr.len(),
+            1,
+            "only the non-deleted condition must remain after $patch:delete"
+        );
+        assert_eq!(
+            arr[0]["type"], "Initialized",
+            "Initialized condition must survive the delete of Ready"
+        );
+        assert!(
+            arr[0].get("$patch").is_none(),
+            "no $patch key must appear on unrelated conditions"
         );
     }
 
