@@ -472,8 +472,15 @@ pub async fn patch_namespace<S: Store>(
 pub async fn finalize_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let body = crate::util::extract_body(&body, ct);
+
     // Parse the finalizers from the request body.
     // KCM sends the finalizers in spec.finalizers. We also accept metadata.finalizers
     // as a fallback for clients that write the field in standard metadata position.
@@ -728,21 +735,49 @@ pub async fn delete_namespace<S: Store>(
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     if let Some(mut soft) = apply_delete_policy(&mut obj) {
-        // Soft-delete: set phase=Terminating, persist, return the namespace object.
         soft["status"] = serde_json::to_value(NamespaceStatus {
             phase: Some(NamespacePhase::Terminating),
             rest: serde_json::Value::Object(Default::default()),
         })
         .map_err(|e| Status::internal(format!("failed to serialize NamespaceStatus: {e}")))?;
+
+        // u7s has no namespace lifecycle controller, so we immediately remove the
+        // "kubernetes" finalizer (acting as the namespace controller). External
+        // controllers that added their own finalizers remain responsible for removing them.
+        let remaining: Vec<serde_json::Value> = soft["spec"]["finalizers"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|f| f.as_str() != Some("kubernetes"))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        soft["spec"]["finalizers"] = serde_json::Value::Array(remaining.clone());
         obj.body = soft;
-        let expected_rv = parse_resource_version(obj.resource_version())?;
-        let new_rv = state
-            .store
-            .put(&key, obj.to_bytes(), expected_rv)
-            .await
-            .map_err(|e| store_err_to_status(e, &name))?;
-        delete_namespace_scoped_crds(&state, &name).await;
-        obj.set_resource_version(new_rv);
+
+        if remaining.is_empty() {
+            // No remaining finalizers — hard-delete now.
+            delete_namespace_scoped_crds(&state, &name).await;
+            if let Err(e) = state.store.delete_namespace_resources(&name).await {
+                tracing::warn!("namespace {name}: cascade delete failed: {e}");
+            }
+            state
+                .store
+                .delete(&key, None)
+                .await
+                .map_err(|e| store_err_to_status(e, &name))?;
+        } else {
+            // External controllers still have finalizers — persist Terminating state.
+            delete_namespace_scoped_crds(&state, &name).await;
+            let expected_rv = parse_resource_version(obj.resource_version())?;
+            let new_rv = state
+                .store
+                .put(&key, obj.to_bytes(), expected_rv)
+                .await
+                .map_err(|e| store_err_to_status(e, &name))?;
+            obj.set_resource_version(new_rv);
+        }
         return Ok(Json(obj.body).into_response());
     }
 
@@ -1262,16 +1297,13 @@ mod tests {
         );
     }
 
-    // delete_namespace on a namespace created via create_namespace must soft-delete:
-    // set phase=Terminating + deletionTimestamp and keep the namespace in the store
-    // until the KCM removes the "kubernetes" finalizer.
-    //
-    // create_namespace stamps the "kubernetes" finalizer at creation time so that
-    // every namespace goes through the drain lifecycle. Without this, a race between
-    // namespace creation and the KCM watching for ADDED events can cause the finalizer
-    // to be absent, resulting in an immediate hard-delete that skips resource drain.
+    // delete_namespace on a namespace created via create_namespace must hard-delete
+    // immediately. u7s acts as its own namespace lifecycle controller: it removes the
+    // "kubernetes" finalizer and hard-deletes in a single request without waiting for KCM.
+    // Without this, the namespace stays Terminating forever because u7s has no KCM-style
+    // background controller to remove the finalizer.
     #[tokio::test]
-    async fn delete_namespace_soft_deletes_to_terminating() {
+    async fn delete_namespace_hard_deletes_immediately() {
         let state = make_state();
 
         assert!(
@@ -1293,23 +1325,129 @@ mod tests {
             "delete must succeed"
         );
 
-        // The namespace must still exist in Terminating state.
-        // Hard-delete only happens after the KCM removes the "kubernetes" finalizer.
+        // The namespace must be gone — u7s removes the kubernetes finalizer and hard-deletes
+        // immediately. Without this fix the namespace stays Terminating forever.
         let stored = state
             .store
             .get(&crate::keys::cluster_object_key("namespaces", "del-ns"))
             .await
-            .expect("store get must not error")
-            .expect("namespace must still exist after delete — waiting for KCM to drain");
-        let body: serde_json::Value =
-            serde_json::from_slice(&stored.value).expect("parse stored namespace");
-        assert_eq!(
-            body["status"]["phase"], "Terminating",
-            "namespace must be Terminating after delete while kubernetes finalizer is present"
+            .expect("store get must not error");
+        assert!(
+            stored.is_none(),
+            "namespace must be hard-deleted immediately — u7s has no background controller \
+             to remove the kubernetes finalizer, so delete_namespace must do it synchronously. \
+             Without this fix the namespace stays Terminating forever."
+        );
+    }
+
+    // delete_namespace with external finalizers must remove only the "kubernetes" finalizer,
+    // persist in Terminating state, and let the external controller remove its own finalizer.
+    // Only after the external finalizer is also removed (via finalize endpoint) should the
+    // namespace hard-delete. This is the conformance test flow for "should apply a finalizer".
+    #[tokio::test]
+    async fn delete_namespace_with_external_finalizer_stays_terminating_until_cleared() {
+        let state = make_state();
+
+        // Create with kubernetes finalizer (stamped by create_namespace).
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("ext-fin-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Simulate an external controller adding its own finalizer via PUT /finalize.
+        let add_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "ext-fin-ns" },
+                "spec": { "finalizers": ["kubernetes", "e2e.example.com"] }
+            })
+            .to_string(),
         );
         assert!(
-            body["metadata"]["deletionTimestamp"].is_string(),
-            "deletionTimestamp must be set after delete"
+            finalize_namespace(
+                State(state.clone()),
+                Path("ext-fin-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                add_body,
+            )
+            .await
+            .is_ok(),
+            "adding e2e finalizer must succeed"
+        );
+
+        // Delete the namespace — kubernetes finalizer is removed, e2e finalizer remains.
+        // Namespace must stay in Terminating state.
+        assert!(
+            delete_namespace(State(state.clone()), Path("ext-fin-ns".to_string()))
+                .await
+                .is_ok(),
+            "delete must succeed"
+        );
+
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "ext-fin-ns"))
+            .await
+            .expect("store get must not error")
+            .expect("namespace must still exist — external finalizer keeps it alive");
+        let body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            body["status"]["phase"], "Terminating",
+            "namespace must be Terminating while external finalizer is present"
+        );
+        let finalizers = body["spec"]["finalizers"].as_array().unwrap();
+        assert_eq!(
+            finalizers.len(),
+            1,
+            "only the external finalizer must remain after delete removes kubernetes"
+        );
+        assert_eq!(
+            finalizers[0].as_str(),
+            Some("e2e.example.com"),
+            "kubernetes finalizer must be removed by delete_namespace; external finalizer stays"
+        );
+
+        // External controller removes its finalizer via PUT /finalize.
+        let remove_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "ext-fin-ns" },
+                "spec": { "finalizers": [] }
+            })
+            .to_string(),
+        );
+        assert!(
+            finalize_namespace(
+                State(state.clone()),
+                Path("ext-fin-ns".to_string()),
+                axum::http::HeaderMap::new(),
+                remove_body,
+            )
+            .await
+            .is_ok(),
+            "removing external finalizer must succeed"
+        );
+
+        // Namespace must now be gone.
+        let after = state
+            .store
+            .get(&crate::keys::cluster_object_key("namespaces", "ext-fin-ns"))
+            .await
+            .expect("store get must not error");
+        assert!(
+            after.is_none(),
+            "namespace must hard-delete once all finalizers are removed — \
+             this is the conformance test flow: add external finalizer, delete namespace, \
+             remove external finalizer, namespace disappears"
         );
     }
 
@@ -1765,14 +1903,12 @@ mod tests {
         )
     }
 
-    // delete_namespace with finalizers present must NOT hard-delete — it must set
-    // phase=Terminating + deletionTimestamp and return the namespace object.
-    //
-    // Real Kubernetes: a namespace with the "kubernetes" finalizer enters Terminating
-    // and only hard-deletes after the namespace controller drains child resources.
-    // Instant hard-delete breaks Argo CD's GC logic and causes stale object collisions.
+    // delete_namespace with the "kubernetes" finalizer must hard-delete immediately.
+    // u7s acts as its own namespace lifecycle controller — it removes the finalizer
+    // synchronously rather than waiting for KCM. Without this, the namespace stays
+    // Terminating forever because there is no background controller to drain it.
     #[tokio::test]
-    async fn delete_namespace_with_finalizers_transitions_to_terminating() {
+    async fn delete_namespace_with_finalizers_hard_deletes_immediately() {
         let state = make_state();
 
         assert!(
@@ -1787,7 +1923,6 @@ mod tests {
             "create must succeed"
         );
 
-        // Delete should return the namespace in Terminating state, NOT a 404.
         assert!(
             delete_namespace(State(state.clone()), Path("fin-ns".to_string()))
                 .await
@@ -1795,30 +1930,17 @@ mod tests {
             "delete with finalizers must not error"
         );
 
-        // The namespace must still exist in the store — it was not hard-deleted.
+        // The namespace must be gone — u7s removes the kubernetes finalizer and hard-deletes.
         let stored = state
             .store
             .get(&crate::keys::cluster_object_key("namespaces", "fin-ns"))
             .await
-            .expect("store get must not error")
-            .expect("namespace must still exist after soft-delete");
-        let body: serde_json::Value =
-            serde_json::from_slice(&stored.value).expect("parse stored namespace");
-
-        assert_eq!(
-            body["status"]["phase"], "Terminating",
-            "phase must be Terminating after soft-delete with finalizers present"
-        );
+            .expect("store get must not error");
         assert!(
-            body["metadata"]["deletionTimestamp"].is_string(),
-            "deletionTimestamp must be set after soft-delete"
-        );
-        assert!(
-            body["spec"]["finalizers"]
-                .as_array()
-                .is_some_and(|f| !f.is_empty()),
-            "spec.finalizers must remain present until the controller removes them — \
-             namespace finalizers live in spec, not metadata"
+            stored.is_none(),
+            "namespace must be hard-deleted even when kubernetes finalizer is present — \
+             u7s acts as namespace lifecycle controller, removing the finalizer synchronously. \
+             Without this fix the namespace stays Terminating forever."
         );
     }
 
@@ -2000,39 +2122,37 @@ mod tests {
     }
 
     // patch_namespace must trigger hard-delete when deletionTimestamp is set and
-    // finalizers become empty after the patch.
-    //
-    // This is the mechanism the namespace controller uses: it patches to remove the
-    // finalizer, which causes the apiserver to hard-delete the namespace. Without this
-    // the namespace stays in Terminating forever even after the controller removes
-    // the finalizer.
+    // finalizers become empty after the patch. This covers the case where a namespace
+    // was written directly to the store in Terminating state (e.g. migrated from an
+    // older version) and a client clears the finalizer via PATCH.
     #[tokio::test]
     async fn patch_namespace_hard_deletes_when_finalizers_cleared_with_deletion_ts() {
+        use u7s_store::Store;
         let state = make_state();
 
-        // Create with finalizer.
-        assert!(
-            create_namespace(
-                State(state.clone()),
-                test_user(),
-                axum::http::HeaderMap::new(),
-                namespace_body_with_finalizers("drain-ns", &["kubernetes"]),
-            )
+        // Write a namespace directly to the store with deletionTimestamp set and a
+        // custom finalizer (not "kubernetes") to simulate a namespace that is already
+        // Terminating and being drained by an external controller.
+        let key = crate::keys::cluster_object_key("namespaces", "drain-ns");
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "drain-ns",
+                "uid": "00000000-0000-0000-0000-000000000001",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["other-controller"] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(ns.to_string()), Some(0))
             .await
-            .is_ok(),
-            "create must succeed"
-        );
-
-        // Soft-delete to set deletionTimestamp.
-        assert!(
-            delete_namespace(State(state.clone()), Path("drain-ns".to_string()))
-                .await
-                .is_ok(),
-            "soft-delete must succeed"
-        );
+            .expect("direct store write must succeed");
 
         // Remove the finalizer via merge-patch — this must trigger a hard-delete.
-        // Namespace finalizers live in spec.finalizers, not metadata.finalizers.
         let patch_body =
             Bytes::from(serde_json::json!({ "spec": { "finalizers": [] } }).to_string());
         let mut headers = axum::http::HeaderMap::new();
@@ -2124,48 +2244,37 @@ mod tests {
     // finalize_namespace (PUT /api/v1/namespaces/{name}/finalize) must hard-delete
     // the namespace when deletionTimestamp is set and spec.finalizers is empty.
     //
-    // This is the exact call the KCM namespace controller makes after draining all
-    // resources. Without this endpoint the namespace stays Terminating forever.
+    // This endpoint still exists for KCM compatibility. Since u7s now removes the
+    // kubernetes finalizer synchronously in delete_namespace, KCM may still call it
+    // in some race scenarios or for non-kubernetes finalizers. The behavior must be
+    // correct regardless of how the namespace entered the Terminating state.
     #[tokio::test]
     async fn finalize_namespace_hard_deletes_when_spec_finalizers_empty_with_deletion_ts() {
+        use u7s_store::Store;
         let state = make_state();
 
-        // Create with the kubernetes finalizer.
-        assert!(
-            create_namespace(
-                State(state.clone()),
-                test_user(),
-                axum::http::HeaderMap::new(),
-                namespace_body_with_finalizers("finalize-ns", &["kubernetes"]),
-            )
+        // Write a namespace directly to the store with deletionTimestamp already set
+        // and a custom finalizer, simulating a namespace in Terminating state.
+        let key = crate::keys::cluster_object_key("namespaces", "finalize-ns");
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "finalize-ns",
+                "uid": "00000000-0000-0000-0000-000000000002",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["other-controller"] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(ns.to_string()), Some(0))
             .await
-            .is_ok(),
-            "create must succeed"
-        );
+            .expect("direct store write must succeed");
 
-        // Soft-delete to set deletionTimestamp + phase=Terminating.
-        assert!(
-            delete_namespace(State(state.clone()), Path("finalize-ns".to_string()))
-                .await
-                .is_ok(),
-            "soft-delete must succeed"
-        );
-
-        // The namespace must still be in the store (Terminating, not hard-deleted).
-        assert!(
-            state
-                .store
-                .get(&crate::keys::cluster_object_key(
-                    "namespaces",
-                    "finalize-ns"
-                ))
-                .await
-                .unwrap()
-                .is_some(),
-            "namespace must still exist after soft-delete"
-        );
-
-        // KCM calls PUT /finalize with spec.finalizers: [] to remove the finalizer.
+        // PUT /finalize with spec.finalizers: [] to remove the finalizer.
         // This must trigger a hard-delete.
         let finalize_body = Bytes::from(
             serde_json::json!({
@@ -2181,6 +2290,7 @@ mod tests {
             finalize_namespace(
                 State(state.clone()),
                 Path("finalize-ns".to_string()),
+                axum::http::HeaderMap::new(),
                 finalize_body,
             )
             .await
@@ -2200,48 +2310,47 @@ mod tests {
         assert!(
             stored.is_none(),
             "PUT /finalize with empty spec.finalizers while deletionTimestamp is set \
-             must hard-delete the namespace — without this the namespace stays Terminating forever. \
-             This is the critical path the KCM uses to complete namespace termination."
+             must hard-delete the namespace — without this the namespace stays Terminating forever."
         );
     }
 
     // finalize_namespace must only update finalizers and persist (not hard-delete)
     // when spec.finalizers is non-empty after the PUT.
     //
-    // The KCM may call finalize with some finalizers remaining if multiple controllers
-    // registered finalizers. Only the last removal (empty finalizers) triggers hard-delete.
+    // Only the last removal (empty finalizers) triggers hard-delete.
     #[tokio::test]
     async fn finalize_namespace_persists_when_spec_finalizers_non_empty() {
+        use u7s_store::Store;
         let state = make_state();
 
-        // Create with two finalizers.
-        assert!(
-            create_namespace(
-                State(state.clone()),
-                test_user(),
-                axum::http::HeaderMap::new(),
-                namespace_body_with_finalizers("multi-fin-ns", &["kubernetes", "other"]),
-            )
+        // Write a namespace directly to the store with deletionTimestamp already set
+        // and two custom finalizers, simulating a namespace with multiple controllers.
+        let key = crate::keys::cluster_object_key("namespaces", "multi-fin-ns");
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "multi-fin-ns",
+                "uid": "00000000-0000-0000-0000-000000000003",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["controller-a", "controller-b"] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(ns.to_string()), Some(0))
             .await
-            .is_ok(),
-            "create must succeed"
-        );
+            .expect("direct store write must succeed");
 
-        // Soft-delete to set deletionTimestamp.
-        assert!(
-            delete_namespace(State(state.clone()), Path("multi-fin-ns".to_string()))
-                .await
-                .is_ok(),
-            "soft-delete must succeed"
-        );
-
-        // Call finalize with one finalizer remaining (kubernetes removed, other stays).
+        // Call finalize with one finalizer remaining (controller-a removed, controller-b stays).
         let finalize_body = Bytes::from(
             serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Namespace",
                 "metadata": { "name": "multi-fin-ns" },
-                "spec": { "finalizers": ["other"] }
+                "spec": { "finalizers": ["controller-b"] }
             })
             .to_string(),
         );
@@ -2250,6 +2359,7 @@ mod tests {
             finalize_namespace(
                 State(state.clone()),
                 Path("multi-fin-ns".to_string()),
+                axum::http::HeaderMap::new(),
                 finalize_body,
             )
             .await
@@ -2276,12 +2386,12 @@ mod tests {
         assert_eq!(
             finalizers.len(),
             1,
-            "after finalize with spec.finalizers=[other], only one finalizer must remain"
+            "after finalize with spec.finalizers=[controller-b], only one finalizer must remain"
         );
         assert_eq!(
             finalizers[0].as_str(),
-            Some("other"),
-            "the remaining finalizer must be 'other'"
+            Some("controller-b"),
+            "the remaining finalizer must be 'controller-b'"
         );
     }
 
@@ -2304,6 +2414,7 @@ mod tests {
         let result = finalize_namespace(
             State(state.clone()),
             Path("no-such-ns".to_string()),
+            axum::http::HeaderMap::new(),
             finalize_body,
         )
         .await;
@@ -2320,54 +2431,50 @@ mod tests {
     }
 
     // replace_namespace must trigger hard-delete when deletionTimestamp is set and
-    // finalizers become empty after the PUT.
-    //
-    // The u7s namespace controller uses GET + PUT to remove the "kubernetes" finalizer.
-    // Without this hard-delete trigger, the namespace stays Terminating forever even
-    // after the controller finishes draining resources.
+    // finalizers become empty after the PUT. This covers namespaces written directly
+    // to the store in Terminating state (e.g. migrated from an older version).
     #[tokio::test]
     async fn replace_namespace_hard_deletes_when_finalizers_cleared_with_deletion_ts() {
+        use u7s_store::Store;
         let state = make_state();
 
-        // Create with finalizer.
-        assert!(
-            create_namespace(
-                State(state.clone()),
-                test_user(),
-                axum::http::HeaderMap::new(),
-                namespace_body_with_finalizers("put-drain-ns", &["kubernetes"]),
-            )
-            .await
-            .is_ok(),
-            "create must succeed"
-        );
-
-        // Soft-delete to set deletionTimestamp.
-        assert!(
-            delete_namespace(State(state.clone()), Path("put-drain-ns".to_string()))
-                .await
-                .is_ok(),
-            "soft-delete must succeed"
-        );
-
-        // Fetch the stored state so we have the right resourceVersion.
-        let stored = state
+        // Write a namespace directly to the store with deletionTimestamp already set
+        // and a custom finalizer, simulating a Terminating namespace.
+        let key = crate::keys::cluster_object_key("namespaces", "put-drain-ns");
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "put-drain-ns",
+                "uid": "00000000-0000-0000-0000-000000000004",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["other-controller"] },
+            "status": { "phase": "Terminating" }
+        });
+        state
             .store
-            .get(&crate::keys::cluster_object_key(
-                "namespaces",
-                "put-drain-ns",
-            ))
+            .put(&key, bytes::Bytes::from(ns.to_string()), Some(0))
             .await
-            .expect("store get must not error")
-            .expect("must exist");
-        let mut ns: serde_json::Value =
-            serde_json::from_slice(&stored.value).expect("parse stored");
+            .expect("direct store write must succeed");
 
         // Remove the finalizer from the body and PUT — this must trigger hard-delete.
-        // Namespace finalizers live in spec.finalizers, not metadata.finalizers.
-        ns["spec"]["finalizers"] = serde_json::json!([]);
-
-        let replace_body = Bytes::from(ns.to_string());
+        let replace_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "put-drain-ns",
+                    "uid": "00000000-0000-0000-0000-000000000004",
+                    "resourceVersion": "1",
+                    "deletionTimestamp": "2024-01-01T00:00:00Z"
+                },
+                "spec": { "finalizers": [] },
+                "status": { "phase": "Terminating" }
+            })
+            .to_string(),
+        );
 
         assert!(
             replace_namespace(
@@ -2393,7 +2500,8 @@ mod tests {
         assert!(
             after.is_none(),
             "namespace must be hard-deleted when all finalizers are removed via PUT while \
-             deletionTimestamp is set"
+             deletionTimestamp is set — without this, Terminating namespaces migrated from \
+             older versions never complete deletion"
         );
     }
 
