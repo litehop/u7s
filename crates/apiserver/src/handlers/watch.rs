@@ -437,7 +437,10 @@ pub(crate) async fn watch_generic<S: Store>(
                 let emit = if as_partial_object_metadata {
                     to_partial_object_metadata(&item)
                 } else {
-                    item
+                    let mut v = item;
+                    v["apiVersion"] = serde_json::Value::String(api_version.clone());
+                    v["kind"] = serde_json::Value::String(kind.clone());
+                    v
                 };
                 let line = format!(
                     "{{\"type\":\"ADDED\",\"object\":{}}}\n",
@@ -520,6 +523,8 @@ pub(crate) async fn watch_generic<S: Store>(
                                         let emit = if as_partial_object_metadata {
                                             to_partial_object_metadata(&parsed)
                                         } else {
+                                            parsed["apiVersion"] = serde_json::Value::String(api_version.clone());
+                                            parsed["kind"] = serde_json::Value::String(kind.clone());
                                             parsed
                                         };
                                         let line = format!(

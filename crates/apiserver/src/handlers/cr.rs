@@ -635,9 +635,11 @@ pub async fn get_cr<S: Store>(
             let desired_api_version = format!("{group}/{version}");
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
-            let converted_obj = converted
+            let mut converted_obj = converted
                 .pop()
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
+            converted_obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+            converted_obj["kind"] = serde_json::Value::String(ctx.kind.clone());
             let bytes =
                 serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
             return Ok((
@@ -649,12 +651,11 @@ pub async fn get_cr<S: Store>(
         }
     }
 
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        stored.value,
-    )
-        .into_response())
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+    obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+    Ok(Json(obj).into_response())
 }
 
 pub async fn create_cr<S: Store>(
@@ -1017,9 +1018,11 @@ pub async fn get_cr_namespaced<S: Store>(
             let desired_api_version = format!("{group}/{version}");
             let mut converted =
                 call_conversion_webhook(&state, cfg, vec![obj], &desired_api_version).await?;
-            let converted_obj = converted
+            let mut converted_obj = converted
                 .pop()
                 .ok_or_else(|| Status::internal("conversion webhook returned no objects".into()))?;
+            converted_obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+            converted_obj["kind"] = serde_json::Value::String(ctx.kind.clone());
             let bytes =
                 serde_json::to_vec(&converted_obj).map_err(|e| Status::internal(e.to_string()))?;
             return Ok((
@@ -1031,12 +1034,11 @@ pub async fn get_cr_namespaced<S: Store>(
         }
     }
 
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        stored.value,
-    )
-        .into_response())
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+    obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+    Ok(Json(obj).into_response())
 }
 
 pub async fn create_cr_namespaced<S: Store>(
@@ -1550,12 +1552,11 @@ pub async fn get_cr_status<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
 
-    Ok((
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        stored.value,
-    )
-        .into_response())
+    let mut obj: serde_json::Value =
+        serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
+    obj["apiVersion"] = serde_json::Value::String(format!("{group}/{version}"));
+    obj["kind"] = serde_json::Value::String(ctx.kind.clone());
+    Ok(Json(obj).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -6578,6 +6579,104 @@ mod tests {
         assert_eq!(
             obj["spec"]["destination"]["namespace"], "default",
             "strategic-merge-patch must preserve unpatched fields"
+        );
+    }
+
+    // GET for a namespaced CR must include kind and apiVersion in the response.
+    // client-go typed clients assert these fields; missing them causes
+    // "Object Kind is missing" errors in DRA and CRD conformance tests.
+    #[tokio::test]
+    async fn get_cr_namespaced_response_includes_type_meta() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "my-app".to_string();
+
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let resp = get_cr_namespaced(
+            State(state.clone()),
+            Path((group, version, ns, plural, name)),
+        )
+        .await
+        .expect("get must succeed after create");
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["kind"], "Application",
+            "GET response must include kind — client-go returns 'Object Kind is missing' without it"
+        );
+        assert_eq!(
+            obj["apiVersion"], "argoproj.io/v1alpha1",
+            "GET response must include apiVersion — required by Kubernetes API contract"
+        );
+    }
+
+    // GET for a cluster-scoped CR must include kind and apiVersion.
+    // Removing the TypeMeta injection from get_cr must make this test fail.
+    #[tokio::test]
+    async fn get_cr_cluster_scoped_response_includes_type_meta() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string()
+                )),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body("my-widget"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let resp = get_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+                "my-widget".to_string(),
+            )),
+        )
+        .await
+        .expect("get must succeed after create");
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            obj["kind"], "Widget",
+            "cluster-scoped GET response must include kind — client-go returns 'Object Kind is missing' without it"
+        );
+        assert_eq!(
+            obj["apiVersion"], "example.io/v1",
+            "cluster-scoped GET response must include apiVersion"
         );
     }
 }
