@@ -286,6 +286,33 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // 10d. Keep ResourceQuota status.used in sync with live object counts.
+    let (_quota_reconciler_shutdown_tx, mut quota_reconciler_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+    {
+        let reconcile_store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut consecutive_errors: u32 = 0;
+            loop {
+                let ok = reconcile_quota_status(&reconcile_store).await;
+                if ok {
+                    consecutive_errors = 0;
+                } else {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                }
+                let delay_secs = if consecutive_errors == 0 {
+                    30
+                } else {
+                    (5u64 << consecutive_errors.min(6)).min(300)
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                    _ = quota_reconciler_shutdown_rx.changed() => break,
+                }
+            }
+        });
+    }
+
     // 11. Build axum router and attach tower layers.
     //     Order (outermost first): body_limit → inflight → auth → content_type → handler.
     //     DefaultBodyLimit must be outermost so unauthenticated requests are rejected before
@@ -2162,6 +2189,68 @@ pub async fn reconcile_kubernetes_endpointslice(store: &SqliteStore) -> bool {
         .put(&ep_key, Bytes::from(ep.to_string()), Some(ep_revision))
         .await
         .is_ok()
+}
+
+/// Update `status.used` on every ResourceQuota in the store to reflect live object counts.
+///
+/// Lists all ResourceQuota objects, computes usage via `count_quota_usage`, and writes back
+/// only when `status.used` differs from the live count. Uses optimistic concurrency
+/// (`Some(revision)`) so a concurrent write wins and the next reconcile cycle corrects it.
+///
+/// Returns `true` if no storage errors occurred, `false` otherwise.
+pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
+    use bytes::Bytes;
+    use u7s_store::{ListOptions, Store};
+
+    let prefix = keys::group_list_prefix("", "resourcequotas", None);
+    let quotas = match store.list(&prefix, ListOptions::default()).await {
+        Ok(resp) => resp.items,
+        Err(e) => {
+            tracing::warn!("quota reconciler: failed to list ResourceQuotas: {e}");
+            return false;
+        }
+    };
+
+    let mut all_ok = true;
+    for item in quotas {
+        let revision = item.revision;
+        let mut quota: serde_json::Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let key = item.key.clone();
+
+        let live_used = quota::count_quota_usage(store, &quota).await;
+
+        let current_used = quota["status"]["used"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("0").to_string()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        if live_used == current_used {
+            continue;
+        }
+
+        let used_json: serde_json::Value = live_used
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        quota["status"]["used"] = used_json;
+
+        if let Err(e) = store
+            .put(&key, Bytes::from(quota.to_string()), Some(revision))
+            .await
+        {
+            tracing::warn!("quota reconciler: failed to update {key}: {e}");
+            all_ok = false;
+        }
+    }
+
+    all_ok
 }
 
 async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
@@ -6622,6 +6711,179 @@ mod tests {
             count_before_shutdown, count_after_shutdown,
             "reconciler must not run another cycle after shutdown signal — \
              without select! the task sleeps 5 s and cannot be cancelled"
+        );
+    }
+
+    /// After creating a pod against a quota, reconcile_quota_status must update status.used.pods.
+    /// Without this reconciler kubectl describe quota always shows 0 used, breaking observability.
+    #[tokio::test]
+    async fn reconcile_quota_status_updates_used_after_pod_created() {
+        use bytes::Bytes;
+
+        let store = Arc::new(make_store());
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "test-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } },
+            "status": { "used": { "pods": "0" } }
+        });
+        store
+            .put(
+                "/registry/resourcequotas/default/test-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod-0", "namespace": "default" }
+        });
+        store
+            .put(
+                "/registry/pods/default/pod-0",
+                Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let ok = reconcile_quota_status(&store).await;
+        assert!(ok, "reconciler must succeed");
+
+        let item = store
+            .get("/registry/resourcequotas/default/test-quota")
+            .await
+            .unwrap()
+            .expect("quota must still exist");
+        let updated: serde_json::Value = serde_json::from_slice(&item.value).unwrap();
+        assert_eq!(
+            updated["status"]["used"]["pods"].as_str(),
+            Some("1"),
+            "status.used.pods must reflect the live pod count — \
+             without the reconciler kubectl describe quota shows stale 0"
+        );
+    }
+
+    /// When status.used already matches live counts, reconcile_quota_status must not write.
+    /// Unnecessary writes increment the resource version and trigger spurious watches.
+    #[tokio::test]
+    async fn reconcile_quota_status_skips_write_when_already_in_sync() {
+        use bytes::Bytes;
+
+        let store = Arc::new(make_store());
+
+        let quota = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "synced-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } },
+            "status": { "used": { "pods": "1" } }
+        });
+        store
+            .put(
+                "/registry/resourcequotas/default/synced-quota",
+                Bytes::from(serde_json::to_vec(&quota).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "pod-0", "namespace": "default" }
+        });
+        store
+            .put(
+                "/registry/pods/default/pod-0",
+                Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let revision_before = store
+            .get("/registry/resourcequotas/default/synced-quota")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        reconcile_quota_status(&store).await;
+
+        let revision_after = store
+            .get("/registry/resourcequotas/default/synced-quota")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+
+        assert_eq!(
+            revision_before, revision_after,
+            "reconciler must not write when status.used already matches live counts — \
+             spurious writes trigger watches and increment resourceVersion unnecessarily"
+        );
+    }
+
+    /// The quota reconciler task must exit promptly when the shutdown signal fires.
+    #[tokio::test]
+    async fn quota_reconciler_task_exits_on_shutdown_signal() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let store = Arc::new(make_store());
+        let reconcile_count = Arc::new(AtomicU32::new(0));
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let count = Arc::clone(&reconcile_count);
+        let reconcile_store = Arc::clone(&store);
+        let handle = tokio::spawn(async move {
+            let mut consecutive_errors: u32 = 0;
+            loop {
+                let ok = reconcile_quota_status(&reconcile_store).await;
+                count.fetch_add(1, Ordering::Relaxed);
+                if ok {
+                    consecutive_errors = 0;
+                } else {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                }
+                let delay_secs = (5u64 << consecutive_errors.min(6)).min(300);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(delay_secs)) => {}
+                    _ = shutdown_rx.changed() => break,
+                }
+            }
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if reconcile_count.load(Ordering::Relaxed) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("quota reconciler must complete first cycle within 5 s");
+
+        let count_before = reconcile_count.load(Ordering::Relaxed);
+        shutdown_tx.send(true).expect("send must succeed");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("quota reconciler task must exit within 1 s of receiving shutdown signal")
+            .expect("task must not panic");
+
+        assert_eq!(
+            count_before,
+            reconcile_count.load(Ordering::Relaxed),
+            "quota reconciler must not run another cycle after shutdown — \
+             without select! the sleeping task cannot be cancelled"
         );
     }
 }

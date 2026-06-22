@@ -137,6 +137,43 @@ fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
     }
 }
 
+/// Compute live usage counts for all hard-limit entries in a single ResourceQuota object.
+///
+/// Returns a map from quota resource name (e.g. `"pods"`, `"count/deployments.apps"`) to
+/// a string count (e.g. `"3"`). Only entries whose resource name is known to
+/// `quota_resource_to_group_plural` are counted; unknown entries are omitted.
+///
+/// This function is pure with respect to writes — it only reads from the store.
+pub async fn count_quota_usage<S: Store>(
+    store: &S,
+    quota: &Value,
+) -> std::collections::BTreeMap<String, String> {
+    let namespace = match quota["metadata"]["namespace"].as_str() {
+        Some(ns) => ns,
+        None => return std::collections::BTreeMap::new(),
+    };
+    let hard = match quota["spec"]["hard"].as_object() {
+        Some(m) => m,
+        None => return std::collections::BTreeMap::new(),
+    };
+
+    let mut used = std::collections::BTreeMap::new();
+    for (resource_name, _) in hard {
+        if let Some((group, plural)) = quota_resource_to_group_plural(resource_name) {
+            let prefix = group_list_prefix(group, plural, Some(namespace));
+            let count = match store.list(&prefix, ListOptions::default()).await {
+                Ok(resp) => resp.items.len() as u64,
+                Err(e) => {
+                    tracing::warn!("quota: failed to count {plural} in {namespace}: {e}");
+                    0
+                }
+            };
+            used.insert(resource_name.clone(), count.to_string());
+        }
+    }
+    used
+}
+
 /// Check ResourceQuota constraints before a CREATE operation.
 ///
 /// Fetches all ResourceQuota objects in `namespace` and, for each hard limit that
