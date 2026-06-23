@@ -146,6 +146,41 @@ else
   limactl start --tty=false --name="$VM_NAME" "$LIMA_YAML"
 fi
 
+# Cap syslog growth: rotate at 2GB (keep 2 rotations = max 6GB) so a long conformance
+# run does not exhaust disk. Overwrites the distro rsyslog config to split syslog
+# (size-based) from the remaining logs (weekly). Written on every start so it survives
+# VM reprovisions.
+limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/logrotate.d/rsyslog' <<'LOGROTATEOF'
+/var/log/syslog {
+    size 2G
+    rotate 2
+    compress
+    delaycompress
+    missingok
+    notifempty
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate
+    endscript
+}
+/var/log/mail.log
+/var/log/kern.log
+/var/log/auth.log
+/var/log/user.log
+/var/log/cron.log
+{
+    rotate 4
+    weekly
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate
+    endscript
+}
+LOGROTATEOF
+
 # Rewrite server address to host.lima.internal for in-VM use.
 # Match any loopback alias (127.0.0.1, 127.0.0.2, …) so parallel workers work correctly.
 echo "Copying kubeconfig into VM..."
