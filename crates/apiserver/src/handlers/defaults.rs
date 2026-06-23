@@ -19,6 +19,12 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("apps", "daemonsets") = (group, plural) {
         default_daemonset(obj);
     }
+    if let ("batch", "jobs") = (group, plural) {
+        default_job(obj);
+    }
+    if let ("batch", "cronjobs") = (group, plural) {
+        default_cronjob(obj);
+    }
     if let ("", "services") = (group, plural) {
         default_service(obj);
     }
@@ -36,7 +42,7 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
         initialize_workload_generation(obj);
     }
 
-    // Strip null creationTimestamp from pod template metadata on apps workloads.
+    // Strip null creationTimestamp from pod template metadata on workloads.
     // KCM's FindNewReplicaSet uses EqualIgnoreHash(RS.spec.template, Deployment.spec.template).
     // Our JSON serialization of ObjectMeta emits "creationTimestamp: null" but KCM omits this
     // field when creating the RS — causing EqualIgnoreHash to see different metadata and return
@@ -49,6 +55,14 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
             | ("apps", "daemonsets")
     ) {
         strip_null_template_metadata(obj);
+    }
+    // For Jobs the pod template is also at spec.template; strip there too.
+    if let ("batch", "jobs") = (group, plural) {
+        strip_null_template_metadata(obj);
+    }
+    // For CronJobs the pod template is nested under spec.jobTemplate.spec.template.
+    if let ("batch", "cronjobs") = (group, plural) {
+        strip_null_cronjob_template_metadata(obj);
     }
 }
 
@@ -459,6 +473,44 @@ fn default_daemonset(obj: &mut serde_json::Value) {
 /// Only operates on `spec.template.metadata`; no other part of the object is changed.
 fn strip_null_template_metadata(obj: &mut serde_json::Value) {
     if let Some(meta) = obj["spec"]["template"]["metadata"].as_object_mut() {
+        meta.retain(|_, v| !v.is_null());
+    }
+}
+
+fn default_pod_template(template: &mut serde_json::Value) {
+    if !template["metadata"].is_object() {
+        template["metadata"] = serde_json::json!({});
+    }
+    if template["metadata"]["labels"].is_null() {
+        template["metadata"]["labels"] = serde_json::json!({});
+    }
+    if template["metadata"]["annotations"].is_null() {
+        template["metadata"]["annotations"] = serde_json::json!({});
+    }
+    if !template["spec"].is_object() {
+        template["spec"] = serde_json::json!({});
+    }
+    if template["spec"]["enableServiceLinks"].is_null() {
+        template["spec"]["enableServiceLinks"] = serde_json::Value::Bool(true);
+    }
+}
+
+fn default_job(obj: &mut serde_json::Value) {
+    default_pod_template(&mut obj["spec"]["template"]);
+    if obj["spec"]["backoffLimit"].is_null() {
+        obj["spec"]["backoffLimit"] = serde_json::Value::Number(6.into());
+    }
+    if obj["spec"]["parallelism"].is_null() {
+        obj["spec"]["parallelism"] = serde_json::Value::Number(1.into());
+    }
+}
+
+fn default_cronjob(obj: &mut serde_json::Value) {
+    default_pod_template(&mut obj["spec"]["jobTemplate"]["spec"]["template"]);
+}
+
+fn strip_null_cronjob_template_metadata(obj: &mut serde_json::Value) {
+    if let Some(meta) = obj["spec"]["jobTemplate"]["spec"]["template"]["metadata"].as_object_mut() {
         meta.retain(|_, v| !v.is_null());
     }
 }
@@ -2510,6 +2562,222 @@ mod tests {
             serde_json::Value::Number(5.into()),
             "existing spec.leaseTransitions must not be overwritten — \
              resetting the transition count breaks holder-identity tracking"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: Job/CronJob defaulting and pod template labels (mayor-md7t)
+    // ---------------------------------------------------------------------------
+
+    /// A Job with no spec.template.metadata.labels must have them defaulted to {}.
+    ///
+    /// KCM's job_controller merges "job-name" and "job-uid" into spec.template.metadata.labels
+    /// at job_controller.go:1067. If the map is nil (null in JSON) it panics with a nil pointer
+    /// dereference, killing the entire KCM process — so no default ServiceAccounts are created
+    /// in any subsequent test namespace, causing 168 cascading [BeforeEach] failures.
+    #[test]
+    fn job_pod_template_labels_defaults_to_empty_map() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"],
+            serde_json::json!({}),
+            "spec.template.metadata.labels must default to {{}} — nil map panics KCM \
+             job_controller at job_controller.go:1067, killing the entire KCM process"
+        );
+    }
+
+    /// A Job must have spec.backoffLimit defaulted to 6.
+    ///
+    /// Kubernetes default is 6 retries before marking the Job as failed. Without this
+    /// default, the field is null and clients reading it get nil instead of the expected integer.
+    #[test]
+    fn job_backoff_limit_defaults_to_6() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": { "spec": { "containers": [] } }
+            }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["backoffLimit"],
+            serde_json::Value::Number(6.into()),
+            "spec.backoffLimit must default to 6 — Kubernetes default for job retry limit"
+        );
+    }
+
+    /// A Job must have spec.parallelism defaulted to 1.
+    #[test]
+    fn job_parallelism_defaults_to_1() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": { "spec": { "containers": [] } }
+            }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["parallelism"],
+            serde_json::Value::Number(1.into()),
+            "spec.parallelism must default to 1"
+        );
+    }
+
+    /// Existing Job spec fields must not be overwritten (idempotency).
+    #[test]
+    fn job_existing_spec_fields_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "backoffLimit": 3,
+                "parallelism": 4,
+                "template": {
+                    "metadata": { "labels": { "app": "my-job" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["backoffLimit"],
+            serde_json::Value::Number(3.into()),
+            "existing spec.backoffLimit must not be overwritten"
+        );
+        assert_eq!(
+            obj["spec"]["parallelism"],
+            serde_json::Value::Number(4.into()),
+            "existing spec.parallelism must not be overwritten"
+        );
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"],
+            serde_json::json!({ "app": "my-job" }),
+            "existing template labels must not be overwritten"
+        );
+    }
+
+    /// A Job must have spec.template.spec.enableServiceLinks defaulted to true.
+    ///
+    /// Pod spec enableServiceLinks defaults to true in upstream Kubernetes. Without this
+    /// default, conformance tests reading pod.spec.enableServiceLinks get nil instead of true.
+    #[test]
+    fn job_pod_template_enable_service_links_defaults_to_true() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": { "spec": { "containers": [] } }
+            }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["template"]["spec"]["enableServiceLinks"],
+            serde_json::Value::Bool(true),
+            "spec.template.spec.enableServiceLinks must default to true — \
+             conformance tests read this field and fail when it is nil"
+        );
+    }
+
+    /// A Job must get metadata.generation=1 set by apply_defaults.
+    ///
+    /// KCM's job controller uses generation to gate reconciliation; null generation
+    /// means the job is never reconciled and pods are never scheduled.
+    #[test]
+    fn job_create_sets_generation_1() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": { "template": { "spec": { "containers": [] } } }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 1,
+            "metadata.generation must be 1 on Job create — KCM job controller skips \
+             Jobs with null generation, causing pods to never be scheduled"
+        );
+    }
+
+    /// A CronJob must have its nested pod template labels defaulted to {}.
+    ///
+    /// CronJobs create Jobs whose pod template is nested at
+    /// spec.jobTemplate.spec.template. Without labels defaulted here, KCM's
+    /// job_controller nil-panics when merging job-name/job-uid labels.
+    #[test]
+    fn cronjob_pod_template_labels_defaults_to_empty_map() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "schedule": "* * * * *",
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                        }
+                    }
+                }
+            }
+        });
+
+        apply_defaults("batch", "cronjobs", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["jobTemplate"]["spec"]["template"]["metadata"]["labels"],
+            serde_json::json!({}),
+            "spec.jobTemplate.spec.template.metadata.labels must default to {{}} — \
+             KCM job_controller nil-panics on a null labels map when the CronJob spawns a Job"
+        );
+    }
+
+    /// A CronJob must get metadata.generation=1 set by apply_defaults.
+    #[test]
+    fn cronjob_create_sets_generation_1() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "schedule": "* * * * *",
+                "jobTemplate": { "spec": { "template": { "spec": { "containers": [] } } } }
+            }
+        });
+
+        apply_defaults("batch", "cronjobs", &mut obj);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 1,
+            "metadata.generation must be 1 on CronJob create — KCM cronjob controller \
+             skips CronJobs with null generation"
         );
     }
 
