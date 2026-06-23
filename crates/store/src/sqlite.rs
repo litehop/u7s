@@ -744,12 +744,29 @@ fn paginate_in_memory(
 impl Store for SqliteStore {
     async fn get(&self, key: &str) -> Result<Option<StoreObject>> {
         let conn = self.read_conn.clone();
-        let key = key.to_string();
-        tokio::task::spawn_blocking(move || {
+        let key_str = key.to_string();
+        let obj = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            get_sync(&conn, &key)
+            get_sync(&conn, &key_str)
         })
-        .await?
+        .await??;
+
+        // Guard: if the returned object's revision is older than the most recently committed
+        // write, the WAL read connection returned a stale view. Retry via the write connection
+        // to ensure read-after-write consistency — a GET immediately after a PUT must never
+        // return an older resourceVersion than what the PUT returned.
+        let min_rev = self.last_written_revision.load(Ordering::Acquire);
+        if obj.as_ref().is_some_and(|o| o.revision < min_rev) {
+            let write_conn = self.write_conn.clone();
+            let key_str2 = key.to_string();
+            return tokio::task::spawn_blocking(move || {
+                let conn = write_conn.blocking_lock();
+                get_sync(&conn, &key_str2)
+            })
+            .await?;
+        }
+
+        Ok(obj)
     }
 
     async fn list(&self, prefix: &str, opts: ListOptions) -> Result<ListResponse> {
@@ -1246,6 +1263,48 @@ mod tests {
              (from a different resource's write) arrives before the service event; \
              if global bookmarks advance last_replayed, the service event is dedup-skipped \
              and controllers like KCM never create EndpointSlices for the service"
+        );
+    }
+
+    /// GET after PUT must return a revision >= the revision returned by PUT.
+    ///
+    /// KCM tracks the last revision it wrote and rejects reads whose resourceVersion is lower
+    /// ("read version N is not as new as written version M"). Without the stale-read guard on
+    /// get(), the WAL read connection can return an older object revision, triggering repeated
+    /// optimistic concurrency failures in the controller reconcile loop.
+    ///
+    /// The guard fires when obj.revision < last_written_revision, retrying via the write
+    /// connection. This test verifies the invariant holds: get after put returns the written rv.
+    #[tokio::test]
+    async fn get_after_put_returns_at_least_written_revision() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/apps/replicasets/default/rs-a";
+        let value = Bytes::from(
+            r#"{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"rs-a","namespace":"default"}}"#,
+        );
+
+        let written_rv = store.put(key, value, None).await.expect("put must succeed");
+
+        // Simulate a concurrent write that bumped last_written_revision above written_rv.
+        // On a file-backed WAL store, the read connection may not have replayed the latest
+        // WAL frame yet, causing get() to return an object with revision < last_written_revision.
+        // The guard must detect this and retry via the write connection.
+        store
+            .last_written_revision
+            .store(written_rv + 1, Ordering::Release);
+
+        let obj = store
+            .get(key)
+            .await
+            .expect("get must not error")
+            .expect("object must exist after put");
+
+        assert!(
+            obj.revision >= written_rv,
+            "get must return revision >= the revision returned by put ({written_rv}); \
+             returning a lower revision causes KCM optimistic concurrency failures: \
+             'read version {} is not as new as written version {written_rv}'",
+            obj.revision
         );
     }
 }
