@@ -6736,14 +6736,6 @@ pub fn decode_controllerrevision_proto(data: &[u8]) -> Option<serde_json::Value>
     Some(out)
 }
 
-/// Decode a proto-encoded core Kubernetes object by kind.
-///
-/// Dispatches to the appropriate type-specific decoder based on `kind`. Returns `Some(json)` for
-/// known types; `None` for unknown kinds or malformed input.
-pub fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::Value> {
-    decode_proto_by_kind_and_version(kind, "", raw)
-}
-
 pub fn decode_proto_by_kind_and_version(
     kind: &str,
     api_version: &str,
@@ -6813,6 +6805,10 @@ pub fn decode_proto_by_kind_and_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_core_proto_by_kind(kind: &str, raw: &[u8]) -> Option<serde_json::Value> {
+        decode_proto_by_kind_and_version(kind, "", raw)
+    }
 
     // ---------------------------------------------------------------------------
     // Varint encoder — used only in tests to build synthetic protobuf payloads
