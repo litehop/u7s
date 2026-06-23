@@ -2430,6 +2430,20 @@ pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
             .collect();
         obj["data"] = serde_json::Value::Object(data_map);
     }
+    if !cm.binary_data.is_empty() {
+        let binary_data_map: serde_json::Map<String, serde_json::Value> = cm
+            .binary_data
+            .into_iter()
+            .map(|(k, v)| {
+                use base64::Engine;
+                (
+                    k,
+                    serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&v)),
+                )
+            })
+            .collect();
+        obj["binaryData"] = serde_json::Value::Object(binary_data_map);
+    }
     Some(obj)
 }
 
@@ -7210,6 +7224,43 @@ mod tests {
         assert_eq!(result["metadata"]["namespace"], "smoke-test");
         assert_eq!(result["data"]["key"], "value");
         assert!(result["metadata"]["creationTimestamp"].is_null());
+    }
+
+    /// decode_configmap_proto must preserve binaryData from the proto-encoded ConfigMap.
+    ///
+    /// kubectl sends ConfigMaps with binaryData via proto (field 3, map<string,bytes>).
+    /// Without emitting binaryData into the JSON, the kubelet fetches the ConfigMap via GET
+    /// and sees no binaryData entries, so it never writes binary-keyed files into the volume
+    /// (e.g. dump.bin). The conformance test then fails with "No such file or directory".
+    /// This test FAILS if the binary_data emission block is removed from decode_configmap_proto.
+    #[test]
+    fn decode_configmap_proto_preserves_binary_data() {
+        let mut obj_meta = encode_length_delimited(1, b"bin-cm");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+
+        // binaryData map entry (field 3 of ConfigMap): { key="dump.bin", value=b"hello" }
+        let mut binary_entry = encode_length_delimited(1, b"dump.bin");
+        binary_entry.extend_from_slice(&encode_length_delimited(2, b"hello"));
+
+        let mut configmap_proto = encode_length_delimited(1, &obj_meta);
+        configmap_proto.extend_from_slice(&encode_length_delimited(3, &binary_entry));
+
+        let result = decode_configmap_proto(&configmap_proto).expect("must decode configmap proto");
+
+        assert_eq!(result["kind"], "ConfigMap");
+        assert_eq!(result["metadata"]["name"], "bin-cm");
+
+        let binary_data = result["binaryData"]["dump.bin"]
+            .as_str()
+            .expect("binaryData.dump.bin must be a base64 string — missing means the kubelet never writes the file into the volume");
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(binary_data)
+            .expect("binaryData value must be valid base64");
+        assert_eq!(
+            decoded, b"hello",
+            "binaryData must decode to the original bytes — corrupt data means the pod cannot read the file"
+        );
     }
 
     /// decode_core_proto_by_kind must dispatch to the correct decoder.
