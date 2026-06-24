@@ -5411,7 +5411,7 @@ mod tests {
     /// POST /apis/discovery.k8s.io/v1/namespaces/{ns}/endpointslices with a valid JSON body
     /// must return 201, not 400 "invalid JSON: expected value at line 1 column 1".
     ///
-    /// Regression test for mayor-t3w7: the conformance test
+    /// The conformance test
     /// "[sig-network] EndpointSlice [It] should support creating EndpointSlice API operations"
     /// POSTs a new EndpointSlice with Content-Type: application/json and gets HTTP 400.
     /// The error "expected value at line 1 column 1" from Object::from_bytes means the body
@@ -5504,7 +5504,7 @@ mod tests {
     /// POST /apis/discovery.k8s.io/v1/namespaces/{ns}/endpointslices with a
     /// Content-Type: application/vnd.kubernetes.protobuf body must return 201.
     ///
-    /// Regression test for mayor-t3w7: client-go typed client sends EndpointSlice
+    /// client-go typed client sends EndpointSlice
     /// creates using protobuf encoding. The proto envelope should be decoded by
     /// extract_body before Object::from_bytes is called.
     #[tokio::test]

@@ -12700,7 +12700,7 @@ mod tests {
         );
         assert_eq!(
             result["endpoints"][0]["conditions"]["ready"], true,
-            "conditions.ready must survive decode — regression for mayor-t3w7"
+            "conditions.ready must survive decode — EndpointSlice POST returns 400 if this field is dropped"
         );
         assert_eq!(result["ports"][0]["port"], 80, "port must survive decode");
         assert_eq!(
