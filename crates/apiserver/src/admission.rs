@@ -7158,8 +7158,6 @@ mod tests {
         );
     }
 
-    // -- build_webhook_call_client proxy regression tests (mayor-qtj5) --
-
     /// When caBundle is absent, the konnectivity proxy must still be applied.
     ///
     /// The bug: `build_webhook_call_client` returned early with a plain client
