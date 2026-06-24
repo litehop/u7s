@@ -96,6 +96,15 @@ where
                 return Ok(resp);
             }
 
+            // OpenAPI endpoints use their own content-type negotiation and must
+            // always return application/json.  Passing them through the proto
+            // re-encode path can set the wrong Content-Type and cause kubectl to
+            // report "unable to respond with a content type that the client supports".
+            if uri.starts_with("/openapi/") {
+                tracing::info!(method = %method, uri = %uri, status, "request openapi passthrough");
+                return Ok(resp);
+            }
+
             // Only re-encode GET responses.
             //
             // For write operations (POST/PUT/PATCH), client-go's protobuf decoder
@@ -895,5 +904,71 @@ mod tests {
             !body_bytes.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
             "watch stream body must not start with k8s proto magic"
         );
+    }
+
+    /// OpenAPI endpoints must pass through with Content-Type: application/json unchanged,
+    /// even when the client sends Accept: application/vnd.kubernetes.protobuf.
+    ///
+    /// If the ContentTypeLayer were to change the Content-Type on /openapi/v2 or /openapi/v3
+    /// responses, kubectl would receive an unexpected Content-Type and report:
+    ///   "the server was unable to respond with a content type that the client supports"
+    /// aborting resource validation and breaking `kubectl create` / `kubectl apply`.
+    ///
+    /// This test fails on revert: if the openapi path exclusion is removed from
+    /// ContentTypeLayer, the middleware enters its collection path and may interfere
+    /// with the Content-Type header set by the openapi handlers.
+    #[tokio::test]
+    async fn openapi_paths_pass_through_content_type_unchanged() {
+        let openapi_v2_body = r#"{"swagger":"2.0","info":{"title":"u7s","version":"v1"},"paths":{},"definitions":{}}"#;
+        let openapi_v3_body = r#"{"paths":{}}"#;
+
+        for (uri, body) in [
+            ("/openapi/v2", openapi_v2_body),
+            ("/openapi/v3", openapi_v3_body),
+        ] {
+            let svc = FixedService {
+                status: StatusCode::OK,
+                content_type: "application/json",
+                body,
+            };
+            let mut layer_svc = ContentTypeLayer.layer(svc);
+
+            // Simulate kubectl sending the standard k8s proto Accept header on an openapi
+            // endpoint — this happens when kubectl probes discovery endpoints before creating
+            // resources.
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(
+                    "accept",
+                    "application/vnd.kubernetes.protobuf, application/json",
+                )
+                .body(Body::empty())
+                .unwrap();
+
+            let resp = layer_svc.call(req).await.unwrap();
+
+            let ct = resp
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(
+                ct, "application/json",
+                "{uri} must return Content-Type: application/json even when client sends \
+                 proto Accept — wrong Content-Type causes kubectl to report 'unable to respond \
+                 with a content type that the client supports'"
+            );
+
+            let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                resp_body.as_ref(),
+                body.as_bytes(),
+                "{uri} body must be unchanged — ContentTypeLayer must not modify openapi responses"
+            );
+        }
     }
 }
