@@ -5408,6 +5408,200 @@ mod tests {
         );
     }
 
+    /// POST /apis/discovery.k8s.io/v1/namespaces/{ns}/endpointslices with a valid JSON body
+    /// must return 201, not 400 "invalid JSON: expected value at line 1 column 1".
+    ///
+    /// Regression test for mayor-t3w7: the conformance test
+    /// "[sig-network] EndpointSlice [It] should support creating EndpointSlice API operations"
+    /// POSTs a new EndpointSlice with Content-Type: application/json and gets HTTP 400.
+    /// The error "expected value at line 1 column 1" from Object::from_bytes means the body
+    /// reaching the handler is empty — this test verifies that the body is decoded correctly
+    /// and the create succeeds with 201.
+    #[tokio::test]
+    async fn endpointslice_post_with_json_body_returns_201_not_400() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        seed_namespaces(&store).await.expect("seed namespaces");
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        let eps_json = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "test-eps",
+                "namespace": "default"
+            },
+            "addressType": "IPv4",
+            "endpoints": [
+                {
+                    "addresses": ["10.0.0.1"],
+                    "conditions": {"ready": true}
+                }
+            ],
+            "ports": [
+                {
+                    "name": "http",
+                    "protocol": "TCP",
+                    "port": 80
+                }
+            ]
+        });
+        let body_bytes = serde_json::to_vec(&eps_json).expect("json serialize");
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/apis/discovery.k8s.io/v1/namespaces/default/endpointslices")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body_bytes))
+            .expect("request must build");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "test".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
+        let resp = router.call(req).await.expect("router must not error");
+
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let body_str = String::from_utf8_lossy(&body);
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "POST EndpointSlice with valid JSON body must return 201 — \
+             before the fix it returned 400 'invalid JSON: expected value at line 1 column 1' \
+             because the body was empty when it reached Object::from_bytes; body: {body_str}"
+        );
+
+        let val: serde_json::Value =
+            serde_json::from_slice(&body).expect("response must be valid JSON");
+        assert_eq!(
+            val["kind"], "EndpointSlice",
+            "response kind must be EndpointSlice"
+        );
+        assert_eq!(
+            val["metadata"]["name"], "test-eps",
+            "name must be preserved"
+        );
+        assert_eq!(
+            val["addressType"], "IPv4",
+            "addressType must be preserved — required field for EndpointSlice routing"
+        );
+    }
+
+    /// POST /apis/discovery.k8s.io/v1/namespaces/{ns}/endpointslices with a
+    /// Content-Type: application/vnd.kubernetes.protobuf body must return 201.
+    ///
+    /// Regression test for mayor-t3w7: client-go typed client sends EndpointSlice
+    /// creates using protobuf encoding. The proto envelope should be decoded by
+    /// extract_body before Object::from_bytes is called.
+    #[tokio::test]
+    async fn endpointslice_post_with_proto_body_returns_201_not_400() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        seed_namespaces(&store).await.expect("seed namespaces");
+        let state = state::AppState::new(
+            std::sync::Arc::clone(&store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        // Build a minimal proto-encoded EndpointSlice matching what client-go sends.
+        // Reuse the encode helpers from the proto module tests via the same encoding logic.
+        fn encode_varint(mut v: u64) -> Vec<u8> {
+            let mut out = Vec::new();
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+            out
+        }
+        fn encode_ld(field_number: u64, payload: &[u8]) -> Vec<u8> {
+            let tag = (field_number << 3) | 2;
+            let mut out = encode_varint(tag);
+            out.extend_from_slice(&encode_varint(payload.len() as u64));
+            out.extend_from_slice(payload);
+            out
+        }
+
+        // ObjectMeta: field 1 = name, field 3 = namespace, field 8 = creationTimestamp
+        let mut meta = encode_ld(1, b"proto-eps");
+        meta.extend_from_slice(&encode_ld(3, b"default"));
+        meta.extend_from_slice(&encode_ld(8, &[]));
+
+        // EndpointSlice: field 1 = metadata, field 2 = addressType
+        let mut eps_proto = encode_ld(1, &meta);
+        eps_proto.extend_from_slice(&encode_ld(2, b"IPv4"));
+
+        // k8s proto envelope: magic + Unknown{TypeMeta, raw, no contentType}
+        const MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];
+        let mut type_meta = encode_ld(1, b"discovery.k8s.io/v1");
+        type_meta.extend_from_slice(&encode_ld(2, b"EndpointSlice"));
+        let mut unknown = encode_ld(1, &type_meta);
+        unknown.extend_from_slice(&encode_ld(2, &eps_proto));
+        let mut body_bytes = MAGIC.to_vec();
+        body_bytes.extend_from_slice(&unknown);
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/apis/discovery.k8s.io/v1/namespaces/default/endpointslices")
+            .header("content-type", "application/vnd.kubernetes.protobuf")
+            .body(axum::body::Body::from(body_bytes))
+            .expect("request must build");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "test".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
+        let resp = router.call(req).await.expect("router must not error");
+
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body collect must not fail");
+        let body_str = String::from_utf8_lossy(&body);
+
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "POST EndpointSlice with proto body must return 201 — \
+             client-go typed client sends EndpointSlice creates with Content-Type: \
+             application/vnd.kubernetes.protobuf; body: {body_str}"
+        );
+
+        let val: serde_json::Value =
+            serde_json::from_slice(&body).expect("response must be valid JSON");
+        assert_eq!(val["kind"], "EndpointSlice");
+        assert_eq!(val["metadata"]["name"], "proto-eps");
+        assert_eq!(
+            val["addressType"], "IPv4",
+            "addressType must survive proto decode — required field for EndpointSlice"
+        );
+    }
+
     /// DELETE /apis/rbac.authorization.k8s.io/v1/clusterrolebindings must return 200,
     /// not 405 Method Not Allowed.
     ///
