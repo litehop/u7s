@@ -1291,39 +1291,22 @@ fn scheduling_v1_resources() -> serde_json::Value {
 // OpenAPI stub endpoints
 // ---------------------------------------------------------------------------
 
-const PROTO_OPENAPI_V2_TYPE: &str = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf";
-
 /// Swagger 2.0 document with synthesized definitions for installed CRDs.
 /// Polls the store at request time so that newly-created CRDs appear without
 /// a restart — required by the CustomResourcePublishOpenAPI conformance test.
+///
+/// Always returns `Content-Type: application/json` regardless of the Accept header.
+/// u7s does not implement protobuf serialisation for the OpenAPI schema; returning
+/// 406 Not Acceptable when the client sends a proto-only Accept causes kubectl to
+/// report "the server was unable to respond with a content type that the client
+/// supports" and abort resource validation. Instead we serve JSON unconditionally —
+/// client-go always includes "application/json" as a fallback in its Accept list, and
+/// even if it only sent the protobuf MIME type, receiving JSON is harmless because
+/// client-go's OpenAPI parser accepts JSON.
 pub async fn openapi_v2<S: Store>(
     State(state): State<AppState<S>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Response {
-    let accept = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if !accept.is_empty() {
-        let wants_proto = accept.contains(PROTO_OPENAPI_V2_TYPE);
-        let wants_json = accept.contains("application/json") || accept.contains("*/*");
-        if wants_proto && !wants_json {
-            return (
-                StatusCode::NOT_ACCEPTABLE,
-                Json(serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "Status",
-                    "status": "Failure",
-                    "message": "only application/json is supported for /openapi/v2",
-                    "reason": "NotAcceptable",
-                    "code": 406
-                })),
-            )
-                .into_response();
-        }
-    }
-
     let mut definitions = serde_json::Map::new();
 
     if let Ok(resp) = state
@@ -1377,16 +1360,19 @@ pub async fn openapi_v2<S: Store>(
         }
     }
 
-    Json(serde_json::json!({
-        "swagger": "2.0",
-        "info": {"title": "u7s", "version": "v1"},
-        "paths": {},
-        "definitions": definitions
-    }))
-    .into_response()
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        Json(serde_json::json!({
+            "swagger": "2.0",
+            "info": {"title": "u7s", "version": "v1"},
+            "paths": {},
+            "definitions": definitions
+        })),
+    )
+        .into_response()
 }
 
-pub async fn openapi_v3<S: Store>(State(state): State<AppState<S>>) -> Json<serde_json::Value> {
+pub async fn openapi_v3<S: Store>(State(state): State<AppState<S>>) -> Response {
     let mut paths = serde_json::Map::new();
 
     if let Ok(resp) = state
@@ -1413,7 +1399,11 @@ pub async fn openapi_v3<S: Store>(State(state): State<AppState<S>>) -> Json<serd
         }
     }
 
-    Json(serde_json::json!({ "paths": paths }))
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        Json(serde_json::json!({ "paths": paths })),
+    )
+        .into_response()
 }
 
 pub async fn openapi_v3_group<S: Store>(
@@ -2159,7 +2149,11 @@ mod tests {
     #[tokio::test]
     async fn openapi_v3_returns_paths_key() {
         let state = make_state();
-        let Json(val) = openapi_v3(State(state)).await;
+        let resp = openapi_v3(State(state)).await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(
             val.get("paths").is_some(),
             "/openapi/v3 must contain a \"paths\" key so kubectl can fall back to /openapi/v2"
@@ -2281,6 +2275,45 @@ mod tests {
             val.get("paths").is_some(),
             "/openapi/v3 JSON must contain a \"paths\" key so kubectl falls back to /openapi/v2 \
              rather than erroring out"
+        );
+    }
+
+    // GET /openapi/v3 must return Content-Type: application/json.
+    //
+    // kubectl 1.28+ fetches /openapi/v3 before /openapi/v2 to get the schema index.
+    // If the Content-Type is missing or wrong, kubectl reports "the server was unable
+    // to respond with a content type that the client supports" and aborts validation,
+    // causing `kubectl create` and `kubectl apply` to fail with a validation error.
+    //
+    // This test fails on revert: if openapi_v3 is changed back to returning
+    // Json<serde_json::Value> without an explicit Content-Type header and the header
+    // is somehow stripped, this assertion catches it.
+    #[tokio::test]
+    async fn openapi_v3_returns_content_type_application_json() {
+        let state = make_state();
+        let app = Router::new()
+            .route("/openapi/v3", get(openapi_v3))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/openapi/v3")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("application/json"),
+            "GET /openapi/v3 must return Content-Type: application/json — kubectl \
+             client-side validation fails with 'unable to respond with a content type \
+             that the client supports' if this header is absent or wrong; got: '{ct}'"
         );
     }
 
@@ -3140,12 +3173,21 @@ mod tests {
         );
     }
 
-    // GET /openapi/v2 with a proto-only Accept must return 406 so that client-go retries
-    // with JSON. Without this, client-go ignores Content-Type: application/json and
-    // proto-decodes the JSON body, producing "invalid wire-format data" and blocking
-    // all kubectl apply / validate operations.
+    // GET /openapi/v2 with a proto-only Accept must return 200 with Content-Type:
+    // application/json — NOT 406. Returning 406 causes kubectl to report "the server
+    // was unable to respond with a content type that the client supports", which aborts
+    // resource validation and breaks `kubectl create` / `kubectl apply`.
+    //
+    // u7s does not implement protobuf serialisation for the OpenAPI schema; the correct
+    // behaviour is to serve JSON unconditionally. client-go always includes
+    // "application/json" as a fallback in its Accept list, and even if it only sent the
+    // protobuf MIME type, receiving JSON is harmless — client-go's OpenAPI parser reads
+    // JSON successfully.
+    //
+    // This test fails on revert: if the 406 response is re-introduced, the assertion on
+    // StatusCode::OK fails, and the "unable to respond with a content type" error returns.
     #[tokio::test]
-    async fn openapi_v2_proto_only_accept_returns_406() {
+    async fn openapi_v2_proto_only_accept_returns_200_json() {
         let state = make_state();
         let app = Router::new()
             .route("/openapi/v2", get(openapi_v2))
@@ -3164,10 +3206,31 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
             resp.status(),
-            axum::http::StatusCode::NOT_ACCEPTABLE,
-            "proto-only Accept on /openapi/v2 must return 406 — \
-             client-go ignores Content-Type and proto-decodes JSON, producing \
-             'invalid wire-format data' and breaking kubectl apply"
+            axum::http::StatusCode::OK,
+            "proto-only Accept on /openapi/v2 must return 200 JSON — returning 406 causes \
+             kubectl to report 'unable to respond with a content type that the client \
+             supports', aborting resource validation and breaking kubectl create/apply"
+        );
+
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("application/json"),
+            "Content-Type must be application/json for proto-only Accept; got: '{ct}'"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value =
+            serde_json::from_slice(&body).expect("body must be valid JSON");
+        assert_eq!(
+            val.get("swagger").and_then(|v| v.as_str()),
+            Some("2.0"),
+            "response must be a Swagger 2.0 document even when proto-only Accept is sent"
         );
     }
 
@@ -3261,7 +3324,11 @@ mod tests {
         .await
         .expect("create must succeed");
 
-        let Json(val) = openapi_v3(State(state)).await;
+        let resp = openapi_v3(State(state)).await;
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         let paths = val["paths"].as_object().expect("paths must be an object");
         assert!(
             paths.contains_key("apis/probe.example.com/v1"),
