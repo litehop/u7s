@@ -165,7 +165,14 @@ fn open_conn(path: &str) -> Result<Connection> {
         PRAGMA synchronous  = NORMAL;
         PRAGMA cache_size   = -8000;
         PRAGMA busy_timeout = 5000;
-        PRAGMA wal_autocheckpoint = 1000;
+        -- Keep the WAL file small so read connections do not fall far behind write connections.
+        -- At 1000 (the SQLite default), the WAL can hold 1000 pages before checkpointing.
+        -- Under high write bursts (conformance runs), the read connection lags and the
+        -- stale-read guard in get()/list() must retry via the write connection repeatedly,
+        -- causing KCM's RS controller to log 'read version N is not as new as written version M'
+        -- and requeue in a tight loop for up to 15 minutes.  At 100, checkpoints are more
+        -- frequent so the read connection stays within ~100 pages of the write head.
+        PRAGMA wal_autocheckpoint = 100;
     ",
     )?;
     Ok(conn)
@@ -1305,6 +1312,50 @@ mod tests {
              returning a lower revision causes KCM optimistic concurrency failures: \
              'read version {} is not as new as written version {written_rv}'",
             obj.revision
+        );
+    }
+
+    /// LIST after PUT must return a snapshot revision >= the revision returned by PUT.
+    ///
+    /// Under high write bursts with a large WAL (wal_autocheckpoint=1000), the read connection
+    /// lags behind the write connection and list() returns a stale snapshot revision.
+    /// KCM's RS controller compares the list resourceVersion against its last written revision
+    /// and requeues in a tight loop for up to 15 minutes when the list RV is lower.
+    ///
+    /// The stale-read guard in list() detects this (resp.revision < last_written_revision)
+    /// and retries via the write connection which always reflects the latest committed state.
+    /// This test verifies the guard fires and the returned revision is current.
+    #[tokio::test]
+    async fn list_after_put_returns_at_least_written_revision() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/apps/replicasets/";
+        let key = "/registry/apps/replicasets/default/rs-a";
+        let value = Bytes::from(
+            r#"{"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{"name":"rs-a","namespace":"default"}}"#,
+        );
+
+        let written_rv = store.put(key, value, None).await.expect("put must succeed");
+
+        // Simulate WAL lag: bump last_written_revision above written_rv, as if a concurrent write
+        // committed but the read connection's WAL snapshot has not yet replayed those frames.
+        // On a file-backed WAL store under high write bursts, wal_autocheckpoint=1000 means the
+        // read connection can trail the write connection by up to 1000 pages.
+        store
+            .last_written_revision
+            .store(written_rv + 1, Ordering::Release);
+
+        let resp = store
+            .list(prefix, ListOptions::default())
+            .await
+            .expect("list must not error");
+
+        assert!(
+            resp.revision >= written_rv,
+            "list must return snapshot revision >= the revision returned by put ({written_rv}); \
+             a lower revision causes KCM's RS controller to log \
+             'read version {} is not as new as written version {written_rv}' \
+             and requeue in a tight loop for up to 15 minutes",
+            resp.revision
         );
     }
 }
