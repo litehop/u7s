@@ -181,6 +181,19 @@ limactl shell "$VM_NAME" sudo bash -c 'cat > /etc/logrotate.d/rsyslog' <<'LOGROT
 }
 LOGROTATEOF
 
+# Override the logrotate systemd timer to fire every 2 hours instead of daily.
+# The size-based trigger in logrotate.d/rsyslog only acts when logrotate runs;
+# with the default daily schedule a 10-hour conformance run can exhaust 2GB before
+# midnight and evict the e2e pod. OnCalendar= (empty) clears the inherited value.
+limactl shell "$VM_NAME" sudo bash -c 'mkdir -p /etc/systemd/system/logrotate.timer.d && cat > /etc/systemd/system/logrotate.timer.d/override.conf' <<'EOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* *:00/2:00
+RandomizedDelaySec=0
+EOF
+limactl shell "$VM_NAME" sudo systemctl daemon-reload
+limactl shell "$VM_NAME" sudo systemctl restart logrotate.timer
+
 # Rewrite server address to host.lima.internal for in-VM use.
 # Match any loopback alias (127.0.0.1, 127.0.0.2, …) so parallel workers work correctly.
 echo "Copying kubeconfig into VM..."
