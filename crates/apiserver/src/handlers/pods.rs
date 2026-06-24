@@ -1403,6 +1403,33 @@ pub async fn replace_pod_status<S: Store>(
 
     current_obj.body["status"] = incoming["status"].clone();
 
+    // Merge metadata from the incoming PUT body (labels, annotations, finalizers, etc.),
+    // preserving identity fields that cannot change via the status subresource.
+    if incoming["metadata"].is_object() {
+        let saved: Vec<(&str, serde_json::Value)> = [
+            "name",
+            "namespace",
+            "uid",
+            "creationTimestamp",
+            "resourceVersion",
+            "generation",
+        ]
+        .iter()
+        .filter_map(|&k| {
+            let v = &current_obj.body["metadata"][k];
+            if v.is_null() {
+                None
+            } else {
+                Some((k, v.clone()))
+            }
+        })
+        .collect();
+        crate::patch::merge_patch(&mut current_obj.body["metadata"], &incoming["metadata"]);
+        for (k, v) in saved {
+            current_obj.body["metadata"][k] = v;
+        }
+    }
+
     let expected_rv = parse_resource_version(current_obj.resource_version())?;
     let new_rv = state
         .store
@@ -1423,10 +1450,9 @@ fn accepts_patch_content_type(ct: &str) -> bool {
         || ct.contains("application/merge-patch+json")
 }
 
-/// Apply only the `.status` portion of `patch` to `stored`, returning the full updated pod.
-///
-/// Fields outside `.status` in the patch body (e.g. `.spec`) are ignored — the status
-/// subresource cannot modify spec. This is the Kubernetes API contract for status subresources.
+/// Apply the `.status` and `.metadata` portions of `patch` to `stored`, returning the full
+/// updated pod. `.spec` in the patch body is ignored — the status subresource cannot modify spec.
+/// This is the Kubernetes API contract for status subresources.
 ///
 /// For array fields with registered strategic-merge keys (conditions, podIPs,
 /// containerStatuses, etc.) the patch is applied using strategic-merge semantics so
@@ -1474,6 +1500,36 @@ pub fn apply_status_patch(
             result["status"] = patch_status.clone();
         }
     }
+    // Apply metadata changes from the patch body (labels, annotations, finalizers, etc.).
+    // Identity fields (name, namespace, uid, creationTimestamp, resourceVersion, generation)
+    // are preserved from the stored object — the status subresource cannot change them.
+    if let Some(patch_meta) = patch.get("metadata") {
+        if patch_meta.is_object() {
+            let saved: Vec<(&str, serde_json::Value)> = [
+                "name",
+                "namespace",
+                "uid",
+                "creationTimestamp",
+                "resourceVersion",
+                "generation",
+            ]
+            .iter()
+            .filter_map(|&k| {
+                let v = &result["metadata"][k];
+                if v.is_null() {
+                    None
+                } else {
+                    Some((k, v.clone()))
+                }
+            })
+            .collect();
+            crate::patch::merge_patch(&mut result["metadata"], patch_meta);
+            for (k, v) in saved {
+                result["metadata"][k] = v;
+            }
+        }
+    }
+
     // Enforce hostNetwork invariant: a pod sharing the host network namespace has
     // the node's IP as its pod IP, not a pod-CIDR address.  The kubelet sets
     // status.podIP from the CNI sandbox result, which for hostNetwork pods is
@@ -7141,6 +7197,133 @@ mod admission_tests {
             v["metadata"]["labels"]["admitted"], "yes",
             "mutating webhook label must be present after replace_pod — \
              without the fix, replace_pod bypassed admission and the label was never injected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_patch_metadata_tests {
+    use super::apply_status_patch;
+
+    /// PATCH /pods/{name}/status with metadata.annotations must persist the annotation.
+    /// Kubelet and controllers annotate pods via the status subresource; dropping annotations
+    /// from the patch body causes the CronJob and Job conformance tests to fail because they
+    /// read back annotations that were set via /status.
+    #[test]
+    fn apply_status_patch_persists_metadata_annotations() {
+        let stored = serde_json::json!({
+            "metadata": { "name": "mypod", "namespace": "default", "uid": "pod-uid-1" },
+            "spec": { "containers": [{"name": "c", "image": "busybox"}] },
+            "status": {}
+        });
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { "xzmpcheck": "ok" } },
+            "status": { "phase": "Running" }
+        });
+        let result = apply_status_patch(&stored, &patch);
+        assert_eq!(
+            result["metadata"]["annotations"]["xzmpcheck"], "ok",
+            "annotation from the patch body must survive apply_status_patch; \
+             dropping it causes controllers and conformance tests that set annotations via /status to fail"
+        );
+        assert_eq!(
+            result["status"]["phase"], "Running",
+            "status must be applied"
+        );
+        assert_eq!(
+            result["spec"]["containers"][0]["name"], "c",
+            "spec must not be modified by a status patch"
+        );
+    }
+
+    /// PATCH /pods/{name}/status must NOT change the pod uid even if the patch carries one.
+    /// uid is an immutable identity field; changing it via /status would break GC and admission.
+    #[test]
+    fn apply_status_patch_does_not_overwrite_uid() {
+        let stored = serde_json::json!({
+            "metadata": { "name": "mypod", "uid": "real-uid", "namespace": "default" },
+            "spec": {},
+            "status": {}
+        });
+        let patch = serde_json::json!({
+            "metadata": { "uid": "attacker-uid", "annotations": { "safe": "yes" } },
+            "status": { "phase": "Failed" }
+        });
+        let result = apply_status_patch(&stored, &patch);
+        assert_eq!(
+            result["metadata"]["uid"], "real-uid",
+            "uid must not be overwritten by a status patch; \
+             uid changes via /status would corrupt object identity and break GC"
+        );
+        assert_eq!(
+            result["metadata"]["annotations"]["safe"], "yes",
+            "non-identity annotations must still land"
+        );
+    }
+
+    /// PATCH /pods/{name}/status with a spec field must leave spec unchanged.
+    /// spec cannot be modified via the status subresource — this is the API isolation guarantee.
+    #[test]
+    fn apply_status_patch_ignores_spec_in_patch() {
+        let stored = serde_json::json!({
+            "metadata": { "name": "mypod" },
+            "spec": { "nodeName": "node-1" },
+            "status": {}
+        });
+        let patch = serde_json::json!({
+            "spec": { "nodeName": "node-evil" },
+            "status": { "phase": "Pending" }
+        });
+        let result = apply_status_patch(&stored, &patch);
+        assert_eq!(
+            result["spec"]["nodeName"], "node-1",
+            "spec must not change via a status patch; \
+             a controller that accidentally includes spec in its /status PATCH must not corrupt scheduling"
+        );
+    }
+
+    /// Existing conditions merge logic must still work after adding metadata support.
+    /// Kubelet updates conditions via strategic-merge-patch; losing this breaks pod readiness.
+    #[test]
+    fn apply_status_patch_still_merges_conditions() {
+        let stored = serde_json::json!({
+            "metadata": { "name": "mypod" },
+            "spec": {},
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "False"},
+                    {"type": "Initialized", "status": "True"}
+                ]
+            }
+        });
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { "k": "v" } },
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let result = apply_status_patch(&stored, &patch);
+        let conds = result["status"]["conditions"]
+            .as_array()
+            .expect("conditions must be array");
+        let ready = conds
+            .iter()
+            .find(|c| c["type"] == "Ready")
+            .expect("Ready condition must exist");
+        assert_eq!(
+            ready["status"], "True",
+            "Ready condition must be updated by status patch; \
+             if conditions merge breaks, kubelet cannot mark pods ready and pods stay unscheduled"
+        );
+        let init = conds.iter().find(|c| c["type"] == "Initialized");
+        assert!(
+            init.is_some(),
+            "Initialized condition must be preserved from stored object; \
+             strategic merge on conditions must not drop unpatched conditions"
+        );
+        assert_eq!(
+            result["metadata"]["annotations"]["k"], "v",
+            "metadata annotation must also land"
         );
     }
 }

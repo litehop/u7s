@@ -596,6 +596,32 @@ pub async fn put_namespace_status<S: Store>(
         }
     }
 
+    // Merge metadata from the incoming PUT body, preserving identity fields.
+    if incoming.body["metadata"].is_object() {
+        let saved: Vec<(&str, serde_json::Value)> = [
+            "name",
+            "namespace",
+            "uid",
+            "creationTimestamp",
+            "resourceVersion",
+            "generation",
+        ]
+        .iter()
+        .filter_map(|&k| {
+            let v = &current.body["metadata"][k];
+            if v.is_null() {
+                None
+            } else {
+                Some((k, v.clone()))
+            }
+        })
+        .collect();
+        crate::patch::merge_patch(&mut current.body["metadata"], &incoming.body["metadata"]);
+        for (k, v) in saved {
+            current.body["metadata"][k] = v;
+        }
+    }
+
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
         .store
@@ -651,6 +677,33 @@ pub async fn patch_namespace_status<S: Store>(
                                 .map_err(|e| Status::bad_request(e.to_string()))?;
                         }
                         PatchType::Json => unreachable!(),
+                    }
+                }
+            }
+            // Merge metadata from the patch body, preserving identity fields.
+            if let Some(patch_meta) = patch.get("metadata") {
+                if patch_meta.is_object() {
+                    let saved: Vec<(&str, serde_json::Value)> = [
+                        "name",
+                        "namespace",
+                        "uid",
+                        "creationTimestamp",
+                        "resourceVersion",
+                        "generation",
+                    ]
+                    .iter()
+                    .filter_map(|&k| {
+                        let v = &current.body["metadata"][k];
+                        if v.is_null() {
+                            None
+                        } else {
+                            Some((k, v.clone()))
+                        }
+                    })
+                    .collect();
+                    crate::patch::merge_patch(&mut current.body["metadata"], patch_meta);
+                    for (k, v) in saved {
+                        current.body["metadata"][k] = v;
                     }
                 }
             }
