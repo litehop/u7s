@@ -503,6 +503,37 @@ fn default_job(obj: &mut serde_json::Value) {
     if obj["spec"]["parallelism"].is_null() {
         obj["spec"]["parallelism"] = serde_json::Value::Number(1.into());
     }
+
+    // Generate selector and inject controller-uid/job-name labels into the pod template
+    // when the client did not supply a selector and did not opt in to manualSelector.
+    //
+    // Upstream kube-apiserver does this in pkg/registry/batch/job/strategy.go
+    // (generateSelector). Without it, spec.template.metadata.labels is empty and
+    // KCM's RealPodControl.createPods returns "unable to create pods, no labels",
+    // so Job pods are never created and every Job conformance test times out.
+    //
+    // Guard: idempotent on GET/LIST/WATCH paths (selector already populated after create).
+    let manual_selector = obj["spec"]["manualSelector"] == serde_json::Value::Bool(true);
+    if obj["spec"]["selector"].is_null() && !manual_selector {
+        let uid = obj["metadata"]["uid"].as_str().unwrap_or("").to_string();
+        let name = obj["metadata"]["name"].as_str().unwrap_or("").to_string();
+        // Only generate when uid is present (create path always has uid via stamp_metadata).
+        if !uid.is_empty() {
+            // Inject 4 labels into the pod template (prefixed + legacy, matching upstream).
+            let labels = &mut obj["spec"]["template"]["metadata"]["labels"];
+            labels["batch.kubernetes.io/controller-uid"] = serde_json::Value::String(uid.clone());
+            labels["batch.kubernetes.io/job-name"] = serde_json::Value::String(name.clone());
+            labels["controller-uid"] = serde_json::Value::String(uid.clone());
+            labels["job-name"] = serde_json::Value::String(name.clone());
+
+            // Set spec.selector.matchLabels to the prefixed controller-uid label.
+            obj["spec"]["selector"] = serde_json::json!({
+                "matchLabels": {
+                    "batch.kubernetes.io/controller-uid": uid
+                }
+            });
+        }
+    }
 }
 
 fn default_cronjob(obj: &mut serde_json::Value) {
@@ -2778,6 +2809,140 @@ mod tests {
             obj["metadata"]["generation"], 1,
             "metadata.generation must be 1 on CronJob create — KCM cronjob controller \
              skips CronJobs with null generation"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests: Job selector + controller-uid/job-name label generation
+    // ---------------------------------------------------------------------------
+
+    /// A Job without spec.selector and without manualSelector must get auto-generated
+    /// selector and controller-uid/job-name labels injected into the pod template.
+    ///
+    /// KCM's RealPodControl.createPods returns "unable to create pods, no labels" when
+    /// len(pod.Labels) == 0. The pod is built from job.spec.template.metadata.labels.
+    /// Without the selector/label generation step (upstream generateSelector in
+    /// pkg/registry/batch/job/strategy.go), every Job conformance test times out because
+    /// KCM never creates pods. This test MUST FAIL if the uid-guarded generation block in
+    /// default_job is removed.
+    #[test]
+    fn job_without_selector_gets_generated_selector_and_labels() {
+        let uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let name = "my-job";
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": name, "namespace": "default", "uid": uid },
+            "spec": {
+                "template": {
+                    "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+                }
+            }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"]["batch.kubernetes.io/controller-uid"],
+            uid,
+            "batch.kubernetes.io/controller-uid label must be injected into pod template — \
+             KCM RealPodControl.createPods errors 'unable to create pods, no labels' when \
+             this label is absent, so Job pods are never created and every Job conformance test times out"
+        );
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"]["batch.kubernetes.io/job-name"], name,
+            "batch.kubernetes.io/job-name label must be injected into pod template — \
+             KCM uses this label to identify pods belonging to the Job"
+        );
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"]["controller-uid"],
+            uid,
+            "legacy controller-uid label must be injected for compatibility with older KCM versions"
+        );
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"]["job-name"], name,
+            "legacy job-name label must be injected for compatibility with older KCM versions"
+        );
+        assert_eq!(
+            obj["spec"]["selector"]["matchLabels"]["batch.kubernetes.io/controller-uid"], uid,
+            "spec.selector.matchLabels must contain batch.kubernetes.io/controller-uid — \
+             without the selector, KCM cannot identify which pods belong to the Job"
+        );
+    }
+
+    /// A Job with manualSelector: true must NOT have selector or labels auto-generated.
+    ///
+    /// When manualSelector is true the user owns the selector and label set.
+    /// Overwriting them would cause the Job controller to match the wrong pods.
+    #[test]
+    fn job_with_manual_selector_does_not_get_generated_labels() {
+        let uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "my-job", "namespace": "default", "uid": uid },
+            "spec": {
+                "manualSelector": true,
+                "selector": { "matchLabels": { "custom": "label" } },
+                "template": {
+                    "metadata": { "labels": { "custom": "label" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert!(
+            obj["spec"]["template"]["metadata"]["labels"]["batch.kubernetes.io/controller-uid"]
+                .is_null(),
+            "batch.kubernetes.io/controller-uid must NOT be injected when manualSelector=true — \
+             user owns the selector and label set; overwriting breaks pod ownership"
+        );
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "matchLabels": { "custom": "label" } }),
+            "existing spec.selector must be preserved when manualSelector=true"
+        );
+    }
+
+    /// A Job that already has spec.selector set must not have it overwritten.
+    ///
+    /// apply_defaults is called on GET/LIST/WATCH paths in addition to create.
+    /// A Job that was already stored with the generated selector must not have
+    /// the selector or labels regenerated on subsequent reads (idempotency).
+    #[test]
+    fn job_with_existing_selector_is_not_modified() {
+        let uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let mut obj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": { "name": "my-job", "namespace": "default", "uid": uid },
+            "spec": {
+                "selector": { "matchLabels": { "batch.kubernetes.io/controller-uid": uid } },
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "batch.kubernetes.io/controller-uid": uid,
+                            "batch.kubernetes.io/job-name": "my-job"
+                        }
+                    },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("batch", "jobs", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"]["matchLabels"]["batch.kubernetes.io/controller-uid"], uid,
+            "existing spec.selector must be preserved — apply_defaults is idempotent on \
+             GET/LIST paths; overwriting would corrupt already-stored Jobs"
+        );
+        assert_eq!(
+            obj["spec"]["template"]["metadata"]["labels"]["batch.kubernetes.io/controller-uid"],
+            uid,
+            "existing controller-uid label must not be overwritten on re-apply"
         );
     }
 
