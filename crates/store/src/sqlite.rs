@@ -763,7 +763,7 @@ impl Store for SqliteStore {
         // to ensure read-after-write consistency — a GET immediately after a PUT must never
         // return an older resourceVersion than what the PUT returned.
         let min_rev = self.last_written_revision.load(Ordering::Acquire);
-        if obj.as_ref().is_some_and(|o| o.revision < min_rev) {
+        if obj.as_ref().is_some_and(|o| o.revision < min_rev) || (obj.is_none() && min_rev > 0) {
             let write_conn = self.write_conn.clone();
             let key_str2 = key.to_string();
             return tokio::task::spawn_blocking(move || {
@@ -1312,6 +1312,96 @@ mod tests {
              returning a lower revision causes KCM optimistic concurrency failures: \
              'read version {} is not as new as written version {written_rv}'",
             obj.revision
+        );
+    }
+
+    /// GET for an existing pod must not return None when the WAL read snapshot predates the
+    /// pod's creation.
+    ///
+    /// Without this fix, a GET that 404s an existing pod makes the kubelet tear down and
+    /// recreate the sandbox ~1/sec, so Job pods never hold Running and every Job conformance
+    /// test times out. The apiserver logged 105,684 pod-GET 404s in 5 min for only 6 pods.
+    ///
+    /// The stale-read guard must cover the None case (obj is None AND min_rev > 0), not just
+    /// the Some(stale) case (obj.revision < min_rev).
+    ///
+    /// This test constructs a SqliteStore with a stale read_conn (empty in-memory DB that
+    /// has no rows) and a write_conn that has the pod committed. last_written_revision is set
+    /// to 1, signalling that writes have occurred that the read snapshot cannot see.
+    /// With the fix: get() detects None + min_rev > 0 and retries via write_conn → Some.
+    /// Without the fix: get() returns None directly → assertion fails → test fails on revert.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_returns_some_when_stale_read_snapshot_misses_creation() {
+        use std::collections::{HashMap, VecDeque};
+        use std::sync::RwLock;
+        use tokio::sync::broadcast;
+
+        let key = "/registry/core/pods/job-ns/foo-d1a7f";
+        let pod_value = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"foo-d1a7f","namespace":"job-ns"}}"#,
+        );
+
+        // Build a write connection with the full schema and the pod committed.
+        let write_raw = Connection::open_in_memory().expect("write conn");
+        write_raw
+            .execute_batch(
+                "CREATE TABLE objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, \
+                 revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID; \
+                 CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');",
+            )
+            .expect("schema");
+        let last_written = Arc::new(AtomicU64::new(0));
+        let written_rv = {
+            put_sync(&write_raw, key, pod_value, None, &last_written)
+                .expect("put_sync")
+                .0
+        };
+        let write_conn = Arc::new(Mutex::new(write_raw));
+
+        // Build a STALE read connection: a separate in-memory DB with the schema but NO rows.
+        // This simulates the WAL read connection whose snapshot predates the pod's creation.
+        let stale_raw = Connection::open_in_memory().expect("stale read conn");
+        stale_raw
+            .execute_batch(
+                "CREATE TABLE objects (key TEXT NOT NULL PRIMARY KEY, value BLOB NOT NULL, \
+                 revision INTEGER NOT NULL, ns TEXT, obj_name TEXT) WITHOUT ROWID; \
+                 CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL); \
+                 INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');",
+            )
+            .expect("stale schema");
+        let read_conn = Arc::new(Mutex::new(stale_raw));
+
+        // Confirm the stale read returns None — this is the production symptom.
+        let stale_result =
+            tokio::task::block_in_place(|| get_sync(&read_conn.blocking_lock(), key))
+                .expect("get_sync on stale conn must not error");
+        assert!(
+            stale_result.is_none(),
+            "stale read connection must return None (no rows) — test setup broken"
+        );
+
+        // Assemble the store with the stale read_conn and write_conn that has the pod.
+        let (tx, _) = broadcast::channel(16);
+        let store = SqliteStore {
+            write_conn,
+            read_conn,
+            tx,
+            ring: Arc::new(RwLock::new(VecDeque::new())),
+            deletion_log: Arc::new(RwLock::new(HashMap::new())),
+            compaction_horizon: Arc::new(AtomicU64::new(0)),
+            last_written_revision: last_written,
+        };
+
+        // last_written_revision is already written_rv (set by put_sync).
+        // get() must detect: obj == None AND min_rev == written_rv > 0 → retry via write_conn.
+        let obj = store.get(key).await.expect("get must not error");
+
+        assert!(
+            obj.is_some(),
+            "get must return Some for an existing pod (written at rv={written_rv}), not None; \
+             a None response causes the kubelet to 404 the pod and tear down the sandbox ~1/sec, \
+             so Job pods never hold Running and Job conformance tests time out"
         );
     }
 
