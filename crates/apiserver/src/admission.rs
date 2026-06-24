@@ -531,7 +531,7 @@ fn build_review(
 /// The proxy and timeout are always applied regardless of whether caBundle is present.
 /// Service-based webhook calls route through the konnectivity proxy to reach pod IPs
 /// inside the Lima VM from the Mac host. Dropping the proxy when caBundle is absent
-/// means every service webhook fails with a DNS resolution error (mayor-qtj5).
+/// means every service webhook fails with a DNS resolution error.
 ///
 /// `tls_certs_only` is used instead of `add_root_certificate` so that the macOS platform
 /// verifier (SecureTransport) is bypassed. The macOS verifier enforces Extended Key Usage
@@ -7223,8 +7223,6 @@ mod tests {
              pods inside the VM"
         );
     }
-
-    // -- validate_webhook_url SSRF prevention tests (mayor-0604) --
 
     /// Non-https URLs targeting non-loopback hosts must be rejected.
     ///
