@@ -1469,6 +1469,14 @@ pub fn apply_status_patch(
             // Merge fields individually so we can handle arrays with strategic merge keys.
             if let Some(patch_obj) = patch_status.as_object() {
                 for (key, val) in patch_obj {
+                    if key.starts_with('$') {
+                        // Strategic-merge-patch directives ($setElementOrder/*, $patch, etc.)
+                        // are client-side instructions consumed during merge; they must not be
+                        // stored in the object. Storing $setElementOrder/podIPs causes the
+                        // kubelet to detect a phantom diff on every GET and continuously
+                        // recreate the pod sandbox, preventing Job pods from ever completing.
+                        continue;
+                    }
                     if key == "conditions" {
                         // Strategic merge by .type — patch conditions override stored ones by type,
                         // but stored conditions not present in the patch are preserved.
@@ -2360,6 +2368,56 @@ mod status_tests {
             scheduled["reason"], "Unschedulable",
             "PodScheduled=True must not carry reason=Unschedulable — that contradictory \
              state causes conformance tests to see an impossible scheduling outcome"
+        );
+    }
+
+    /// apply_status_patch must not store $setElementOrder/* or any other $ directive key.
+    ///
+    /// Kubelet strategic-merge-patch bodies include $setElementOrder/conditions and
+    /// $setElementOrder/podIPs to specify desired array ordering. These are client-side
+    /// merge instructions, not status fields. If stored literally in the pod object,
+    /// the kubelet reads them back on the next GET and detects a phantom diff — causing
+    /// it to continuously update podIPs by creating new sandboxes, so Job pods never
+    /// hold Running state and every Job conformance test times out.
+    #[test]
+    fn set_element_order_directives_are_not_stored() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "job-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {},
+            "status": {
+                "phase": "Running",
+                "podIP": "10.85.0.5",
+                "podIPs": [{"ip": "10.85.0.5"}],
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let patch = serde_json::json!({
+            "status": {
+                "podIP": "10.85.0.5",
+                "podIPs": [{"ip": "10.85.0.5"}],
+                "$setElementOrder/podIPs": [{"ip": "10.85.0.5"}],
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "$setElementOrder/conditions": [{"type": "Ready"}]
+            }
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+        let status = result["status"].as_object().expect("status must be object");
+
+        assert!(
+            !status.contains_key("$setElementOrder/podIPs"),
+            "$setElementOrder/podIPs must not be stored — it is a merge directive, not a \
+             status field; storing it causes kubelet to detect a phantom podIPs diff on \
+             every GET and recreate the pod sandbox, so Job pods never complete"
+        );
+        assert!(
+            !status.contains_key("$setElementOrder/conditions"),
+            "$setElementOrder/conditions must not be stored — same phantom-diff mechanism"
+        );
+        assert_eq!(
+            result["status"]["podIP"], "10.85.0.5",
+            "real status fields must still be applied"
         );
     }
 }
