@@ -12643,6 +12643,72 @@ mod tests {
         );
     }
 
+    /// Reproduce the conformance test scenario: decode_endpointslice_proto must succeed
+    /// for an EndpointSlice with generateName, addressType, endpoint with conditions,
+    /// and port without a name.
+    ///
+    /// The conformance test "[sig-network] EndpointSlice should support creating EndpointSlice
+    /// API operations" uses the typed client (protobuf). The proto includes conditions and
+    /// ports without names. If decode_endpointslice_proto returns None for this input, the
+    /// handler receives the raw proto envelope bytes (starting with 'k') and returns 400
+    /// "invalid JSON: expected value at line 1 column 1".
+    #[test]
+    fn decode_endpointslice_proto_conformance_test_scenario() {
+        // ObjectMeta with generateName at field 2 (not name at field 1)
+        let obj_meta = encode_length_delimited(2, b"e2e-"); // generateName
+
+        // EndpointConditions: field 1 = ready (bool = true)
+        let conditions_proto = vec![0x08u8, 0x01]; // field 1, wire type 0 (varint), value = true
+        let conditions = encode_length_delimited(2, &conditions_proto); // field 2 of DiscoveryEndpoint
+
+        // DiscoveryEndpoint: field 1 = addresses, field 2 = conditions
+        let mut endpoint_content = encode_length_delimited(1, b"10.0.0.1"); // addresses[0]
+        endpoint_content.extend_from_slice(&conditions);
+
+        // DiscoveryEndpointPort: field 2 = protocol, field 3 = port (no name)
+        let mut port_content = encode_length_delimited(2, b"TCP"); // protocol
+        port_content.push(0x18); // field 3, wire type 0 (varint)
+        port_content.push(0x50); // value = 80
+
+        // EndpointSlice: field 1 = metadata, field 2 = addressType, field 3 = endpoint, field 4 = port
+        let mut eps_proto = encode_length_delimited(1, &obj_meta);
+        eps_proto.extend_from_slice(&encode_length_delimited(2, b"IPv4")); // addressType
+        eps_proto.extend_from_slice(&encode_length_delimited(3, &endpoint_content)); // endpoints[0]
+        eps_proto.extend_from_slice(&encode_length_delimited(4, &port_content)); // ports[0]
+
+        let result = decode_endpointslice_proto(&eps_proto).expect(
+            "decode_endpointslice_proto must succeed for a valid EndpointSlice with \
+                 conditions and port — if it returns None, the handler gets raw proto bytes \
+                 and returns 400 'invalid JSON: expected value at line 1 column 1', \
+                 failing the conformance test",
+        );
+
+        assert_eq!(result["kind"], "EndpointSlice");
+        assert_eq!(result["apiVersion"], "discovery.k8s.io/v1");
+        assert_eq!(
+            result["addressType"], "IPv4",
+            "addressType must be preserved"
+        );
+        assert!(
+            result["metadata"]["generateName"].as_str() == Some("e2e-"),
+            "generateName must be in JSON so resolve_name can use it; got: {:?}",
+            result["metadata"]["generateName"]
+        );
+        assert_eq!(
+            result["endpoints"][0]["addresses"][0], "10.0.0.1",
+            "endpoint address must survive decode"
+        );
+        assert_eq!(
+            result["endpoints"][0]["conditions"]["ready"], true,
+            "conditions.ready must survive decode — EndpointSlice POST returns 400 if this field is dropped"
+        );
+        assert_eq!(result["ports"][0]["port"], 80, "port must survive decode");
+        assert_eq!(
+            result["ports"][0]["protocol"], "TCP",
+            "protocol must survive decode"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Tests — decode_events_v1_event_proto / decode_proto_by_kind_and_version events.k8s.io/v1 Event
     // ---------------------------------------------------------------------------
