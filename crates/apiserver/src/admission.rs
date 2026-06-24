@@ -526,7 +526,12 @@ fn build_review(
 /// Returns `None` on network/parse error (caller applies failurePolicy).
 /// Build a reqwest::Client for a single webhook call using the webhook's own caBundle.
 /// Each webhook ships with its own CA that signed its TLS cert — not the cluster CA.
-/// Falls back to the shared client when caBundle is absent or malformed.
+/// When caBundle is absent or malformed, uses a plain client without CA pinning.
+///
+/// The proxy and timeout are always applied regardless of whether caBundle is present.
+/// Service-based webhook calls route through the konnectivity proxy to reach pod IPs
+/// inside the Lima VM from the Mac host. Dropping the proxy when caBundle is absent
+/// means every service webhook fails with a DNS resolution error.
 ///
 /// `tls_certs_only` is used instead of `add_root_certificate` so that the macOS platform
 /// verifier (SecureTransport) is bypassed. The macOS verifier enforces Extended Key Usage
@@ -550,49 +555,55 @@ fn build_webhook_call_client(
 ) -> reqwest::Client {
     let request_timeout =
         std::time::Duration::from_secs(timeout_seconds.unwrap_or(10).max(1) as u64);
-    let Some(b64) = ca_bundle_b64 else {
-        // Even when returning the fallback we want per-webhook timeout.
-        // Build a minimal client with the right timeouts instead of cloning fallback,
-        // so that the connect_timeout is always applied.
-        return reqwest::Client::builder()
-            .timeout(request_timeout)
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| fallback.clone());
-    };
-    let Ok(pem_bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-    else {
-        tracing::warn!(
-            "webhook client: caBundle base64 decode failed for webhook — using cluster CA fallback"
-        );
-        return reqwest::Client::builder()
-            .timeout(request_timeout)
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| fallback.clone());
-    };
-    let Ok(cert) = reqwest::Certificate::from_pem(&pem_bytes) else {
-        tracing::warn!(
-            "webhook client: caBundle PEM parse failed for webhook — using cluster CA fallback"
-        );
-        return reqwest::Client::builder()
-            .timeout(request_timeout)
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| fallback.clone());
-    };
-    // Collect trusted CAs: the webhook's own CA and the cluster CA (for proxy TLS).
-    // tls_certs_only bypasses the macOS platform verifier so EKU is not enforced.
-    let mut certs = vec![cert];
-    if let Some(der) = cluster_ca_der {
-        if let Ok(cluster_cert) = reqwest::Certificate::from_der(der) {
-            certs.push(cluster_cert);
+
+    // Resolve the webhook CA certificate from caBundle. Failures are non-fatal:
+    // we fall back to the cluster CA (or no pinned CA) rather than refusing the
+    // call, but we always apply the proxy and timeout regardless.
+    let webhook_cert: Option<reqwest::Certificate> = ca_bundle_b64.and_then(|b64| {
+        let pem_bytes = match base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            b64,
+        ) {
+            Ok(b) => b,
+            Err(_) => {
+                tracing::warn!(
+                    "webhook client: caBundle base64 decode failed for webhook — using cluster CA fallback"
+                );
+                return None;
+            }
+        };
+        match reqwest::Certificate::from_pem(&pem_bytes) {
+            Ok(c) => Some(c),
+            Err(_) => {
+                tracing::warn!(
+                    "webhook client: caBundle PEM parse failed for webhook — using cluster CA fallback"
+                );
+                None
+            }
         }
-    }
-    let mut builder = reqwest::Client::builder()
-        .timeout(request_timeout)
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .tls_certs_only(certs);
+    });
+
+    // When a webhook-specific CA is available, pin to it (+ cluster CA for proxy TLS).
+    // tls_certs_only bypasses the macOS platform verifier so EKU is not enforced.
+    // The proxy and timeout are applied regardless of whether a CA bundle is present:
+    // without the proxy, service-based webhook calls never reach the in-cluster pod.
+    let mut builder = if let Some(cert) = webhook_cert {
+        let mut certs = vec![cert];
+        if let Some(der) = cluster_ca_der {
+            if let Ok(cluster_cert) = reqwest::Certificate::from_der(der) {
+                certs.push(cluster_cert);
+            }
+        }
+        reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .tls_certs_only(certs)
+    } else {
+        reqwest::Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(std::time::Duration::from_secs(5))
+    };
+
     if let Some(pem) = webhook_identity_pem {
         if let Ok(identity) = reqwest::Identity::from_pem(pem) {
             builder = builder.identity(identity);
@@ -4452,23 +4463,23 @@ mod tests {
         drop(client);
     }
 
-    /// build_webhook_call_client must return a clone of the fallback when caBundle is absent.
-    /// Webhooks without a caBundle use the shared cluster-CA client.
+    /// build_webhook_call_client must not panic when caBundle is absent.
+    /// Webhooks without a caBundle get a plain client with the default timeout.
     #[test]
-    fn build_webhook_call_client_no_bundle_returns_fallback() {
+    fn build_webhook_call_client_no_bundle_does_not_panic() {
         let fallback = reqwest::Client::new();
         let client = build_webhook_call_client(None, None, None, None, &fallback, None);
         drop(client);
     }
 
-    /// build_webhook_call_client must return the fallback when caBundle is malformed base64.
+    /// build_webhook_call_client must not crash when caBundle is malformed base64.
     /// A webhook with a corrupt caBundle must not crash the apiserver — and must emit a
     /// warning so operators can diagnose the misconfiguration. Without logging, a corrupt
     /// caBundle silently bypasses per-webhook CA pinning with no observable signal.
     #[test]
-    fn build_webhook_call_client_invalid_b64_returns_fallback() {
+    fn build_webhook_call_client_invalid_b64_does_not_panic() {
         let fallback = reqwest::Client::new();
-        // Invalid base64 must return fallback (not panic) so the apiserver keeps running.
+        // Invalid base64 must return a usable client (not panic) so the apiserver keeps running.
         let client = build_webhook_call_client(
             Some("!!!not-valid-base64!!!"),
             None,
@@ -4477,7 +4488,6 @@ mod tests {
             &fallback,
             None,
         );
-        // Returned client must be usable — it is the fallback clone.
         drop(client);
     }
 
@@ -7148,7 +7158,71 @@ mod tests {
         );
     }
 
-    // -- validate_webhook_url SSRF prevention tests (mayor-0604) --
+    /// When caBundle is absent, the konnectivity proxy must still be applied.
+    ///
+    /// The bug: `build_webhook_call_client` returned early with a plain client
+    /// (no proxy) when `ca_bundle_b64` was `None`. Service-based webhook calls
+    /// route through konnectivity (an HTTP CONNECT proxy) to reach pod IPs inside
+    /// the Lima VM from the Mac host. If the proxy is dropped, every service webhook
+    /// call fails with a DNS resolution error because the service DNS name doesn't
+    /// resolve on the Mac host.
+    ///
+    /// The test verifies the fix by configuring an unreachable proxy. With the bug
+    /// (proxy dropped), the client connects directly to the webhook server and
+    /// SUCCEEDS. With the fix (proxy applied), the client tries to connect to the
+    /// unreachable proxy and FAILS — proving the proxy is used.
+    #[tokio::test]
+    async fn build_webhook_call_client_no_bundle_with_proxy_routes_through_proxy() {
+        // Start a real webhook server that responds to admission reviews.
+        let router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                axum::Json(json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {"uid": "test-uid", "allowed": true}
+                }))
+            }),
+        );
+        let (base_url, _handle) = start_mock_webhook_server(router).await;
+
+        let fallback = reqwest::Client::new();
+
+        // Use port 1 as the proxy addr — guaranteed unreachable (OS refuses connections).
+        let client = build_webhook_call_client(
+            None,                // no caBundle — the pre-fix bug dropped the proxy here
+            Some("127.0.0.1:1"), // unreachable proxy
+            None,
+            None,
+            &fallback,
+            Some(1), // 1s timeout so the test doesn't hang
+        );
+
+        let obj = json!({"kind": "Pod", "metadata": {"name": "test"}});
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "pods",
+            name: "test",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let review = build_review("uid-proxy-test", &ctx, &obj, None);
+        let webhook_url = format!("{base_url}/webhook");
+
+        let (response, _timed_out) = call_webhook(&client, &webhook_url, &review).await;
+
+        assert!(
+            response.is_none(),
+            "when proxy is applied and unreachable, the call must fail — \
+             if the call succeeds (response is Some), the proxy was dropped: \
+             the pre-fix bug returned a plain client without proxy when caBundle is absent, \
+             causing service-based webhook calls to bypass konnectivity and fail to reach \
+             pods inside the VM"
+        );
+    }
 
     /// Non-https URLs targeting non-loopback hosts must be rejected.
     ///
