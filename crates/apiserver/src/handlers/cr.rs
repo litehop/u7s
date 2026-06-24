@@ -1489,7 +1489,7 @@ pub async fn put_cr_status<S: Store>(
     let mut current: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
 
-    // Replace only the .status field; leave .spec and .metadata unchanged.
+    // Replace .status and merge .metadata; leave .spec and identity fields unchanged.
     match &incoming["status"] {
         serde_json::Value::Null => {
             if let Some(map) = current.as_object_mut() {
@@ -1498,6 +1498,32 @@ pub async fn put_cr_status<S: Store>(
         }
         v => {
             current["status"] = v.clone();
+        }
+    }
+
+    // Merge metadata from the incoming PUT body, preserving identity fields.
+    if incoming["metadata"].is_object() {
+        let saved: Vec<(&str, serde_json::Value)> = [
+            "name",
+            "namespace",
+            "uid",
+            "creationTimestamp",
+            "resourceVersion",
+            "generation",
+        ]
+        .iter()
+        .filter_map(|&k| {
+            let v = &current["metadata"][k];
+            if v.is_null() {
+                None
+            } else {
+                Some((k, v.clone()))
+            }
+        })
+        .collect();
+        crate::patch::merge_patch(&mut current["metadata"], &incoming["metadata"]);
+        for (k, v) in saved {
+            current["metadata"][k] = v;
         }
     }
 

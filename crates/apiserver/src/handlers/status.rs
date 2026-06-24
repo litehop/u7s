@@ -19,6 +19,44 @@ use super::generic::{lookup, store_err, validate_name};
 use super::json_patch::{apply_json_patch, detect_patch_type, PatchType};
 use super::resource::{get_namespaced_resource, get_resource};
 
+/// Merge incoming metadata onto the current object's metadata, preserving identity
+/// fields that must never change via a status subresource write.
+///
+/// Upstream contract: PATCH/PUT on /status may update metadata (labels, annotations,
+/// finalizers, etc.) and status, but must NOT change spec or identity fields.
+fn merge_incoming_metadata(current: &mut serde_json::Value, incoming: &serde_json::Value) {
+    let incoming_meta = &incoming["metadata"];
+    if !incoming_meta.is_object() {
+        return;
+    }
+    // Snapshot identity fields before the merge so we can restore them after.
+    let saved: Vec<(&str, serde_json::Value)> = [
+        "name",
+        "namespace",
+        "uid",
+        "creationTimestamp",
+        "resourceVersion",
+        "generation",
+    ]
+    .iter()
+    .filter_map(|&k| {
+        let v = &current["metadata"][k];
+        if v.is_null() {
+            None
+        } else {
+            Some((k, v.clone()))
+        }
+    })
+    .collect();
+
+    crate::patch::merge_patch(&mut current["metadata"], incoming_meta);
+
+    // Restore identity fields — they cannot be changed via the status subresource.
+    for (k, v) in saved {
+        current["metadata"][k] = v;
+    }
+}
+
 // -- cluster-scoped --
 
 pub async fn get_resource_status<S: Store>(
@@ -52,7 +90,7 @@ pub async fn put_resource_status<S: Store>(
     let mut current = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    // Replace only the status field; leave spec and metadata (except resourceVersion) untouched.
+    // Replace status and merge metadata; leave spec and identity fields untouched.
     match &incoming.body["status"] {
         serde_json::Value::Null => {
             current.body.as_object_mut().map(|m| m.remove("status"));
@@ -61,6 +99,7 @@ pub async fn put_resource_status<S: Store>(
             current.body["status"] = v.clone();
         }
     }
+    merge_incoming_metadata(&mut current.body, &incoming.body);
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -103,7 +142,7 @@ pub async fn patch_resource_status<S: Store>(
             apply_json_patch(&mut current.body, &patch)?;
         }
         _ => {
-            // Merge and strategic merge: only patch the status portion.
+            // Merge and strategic merge: apply status and metadata from the patch body.
             if let Some(status_patch) = patch.get("status") {
                 let entry = current.body.as_object_mut().map(|m| {
                     m.entry("status")
@@ -120,6 +159,7 @@ pub async fn patch_resource_status<S: Store>(
                     }
                 }
             }
+            merge_incoming_metadata(&mut current.body, &patch);
         }
     }
 
@@ -194,6 +234,7 @@ pub async fn put_namespaced_resource_status<S: Store>(
             current.body["status"] = v.clone();
         }
     }
+    merge_incoming_metadata(&mut current.body, &incoming.body);
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -248,7 +289,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
             apply_json_patch(&mut current.body, &patch)?;
         }
         _ => {
-            // Merge and strategic merge: only patch the status portion.
+            // Merge and strategic merge: apply status and metadata from the patch body.
             if let Some(status_patch) = patch.get("status") {
                 let entry = current.body.as_object_mut().map(|m| {
                     m.entry("status")
@@ -265,6 +306,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
                     }
                 }
             }
+            merge_incoming_metadata(&mut current.body, &patch);
         }
     }
 
@@ -1788,6 +1830,348 @@ mod tests {
             conditions[0]["type"], "PatchStatusFailed",
             "conformance test polls for a custom status condition after PATCH /status; \
              if write_vap_status overwrites it the test sees Ready instead of PatchStatusFailed and fails"
+        );
+    }
+
+    /// PUT /status with metadata.annotations must persist the annotation.
+    /// Controllers (e.g. CronJob) set annotations via /status; dropping them causes
+    /// the CronJob conformance test to fail because it asserts the annotation is present
+    /// after the PUT returns 200.
+    #[tokio::test]
+    async fn put_namespaced_status_persists_metadata_annotations() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let cronjob = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "test-cj",
+                "namespace": "default",
+                "uid": "abc-123",
+                "resourceVersion": "1"
+            },
+            "spec": { "schedule": "* * * * *" },
+            "status": {}
+        });
+        let key = "/registry/batch/cronjobs/default/test-cj";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&cronjob).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let put_body = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "test-cj",
+                "namespace": "default",
+                "annotations": { "patchedstatus": "true" }
+            },
+            "status": { "active": [] }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "batch".into(),
+                "v1".into(),
+                "default".into(),
+                "cronjobs".into(),
+                "test-cj".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PUT /status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["annotations"]["patchedstatus"], "true",
+            "annotation set via PUT /status must be stored; \
+             dropping it breaks CronJob conformance which sets annotations this way"
+        );
+        assert_eq!(
+            v["status"]["active"],
+            serde_json::json!([]),
+            "status must be updated"
+        );
+        assert_eq!(
+            v["spec"]["schedule"], "* * * * *",
+            "spec must not be modified by /status PUT"
+        );
+        assert_eq!(
+            v["metadata"]["uid"], "abc-123",
+            "uid must not change via /status PUT"
+        );
+    }
+
+    /// PATCH /status (merge-patch) with metadata.annotations must persist the annotation.
+    /// Same contract as PUT; this is the path taken by kubectl patch --subresource=status.
+    #[tokio::test]
+    async fn patch_namespaced_status_persists_metadata_annotations() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let cronjob = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "ann-cj",
+                "namespace": "default",
+                "uid": "def-456",
+                "resourceVersion": "1"
+            },
+            "spec": { "schedule": "*/5 * * * *" },
+            "status": {}
+        });
+        let key = "/registry/batch/cronjobs/default/ann-cj";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&cronjob).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { "xzmpcheck": "ok" } },
+            "status": { "lastScheduleTime": "2024-01-01T00:00:00Z" }
+        });
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "batch".into(),
+                "v1".into(),
+                "default".into(),
+                "cronjobs".into(),
+                "ann-cj".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PATCH /status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["annotations"]["xzmpcheck"], "ok",
+            "annotation set via PATCH /status must be stored; \
+             dropping it breaks kubectl patch --subresource=status and CronJob conformance"
+        );
+        assert_eq!(
+            v["status"]["lastScheduleTime"], "2024-01-01T00:00:00Z",
+            "status must also be updated alongside metadata"
+        );
+        assert_eq!(
+            v["spec"]["schedule"], "*/5 * * * *",
+            "spec must not change from /status PATCH"
+        );
+        assert_eq!(
+            v["metadata"]["uid"], "def-456",
+            "uid must not change via /status PATCH"
+        );
+    }
+
+    /// PATCH /status must NOT apply spec even if the body contains a spec field.
+    /// A controller that accidentally includes spec in its /status PATCH must not
+    /// corrupt the stored spec — spec isolation is what makes the status subresource safe.
+    #[tokio::test]
+    async fn patch_namespaced_status_ignores_spec_in_body() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "safe-deploy", "namespace": "default", "resourceVersion": "1" },
+            "spec": { "replicas": 3 },
+            "status": {}
+        });
+        let key = "/registry/apps/deployments/default/safe-deploy";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "spec": { "replicas": 99 },
+            "status": { "readyReplicas": 3 }
+        });
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "safe-deploy".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PATCH /status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["replicas"], 3,
+            "spec must be unchanged after PATCH /status even when spec is in the patch body; \
+             status subresource isolation prevents controllers from corrupting spec"
+        );
+        assert_eq!(v["status"]["readyReplicas"], 3, "status must be updated");
+    }
+
+    /// PUT /status must NOT apply spec from the incoming body.
+    /// The stored spec must survive — status subresource writes only touch status+metadata.
+    #[tokio::test]
+    async fn put_resource_status_ignores_spec_in_body() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "specguard-node", "resourceVersion": "1" },
+            "spec": { "drivers": [{"name": "csi.io"}] }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/specguard-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let put_body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "specguard-node", "annotations": { "x": "y" } },
+            "spec": { "drivers": [] },
+            "status": { "ready": true }
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "specguard-node".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PUT /status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["drivers"][0]["name"], "csi.io",
+            "spec from the stored object must survive a PUT /status that contains a different spec"
+        );
+        assert_eq!(
+            v["metadata"]["annotations"]["x"], "y",
+            "annotation from PUT body must be applied"
+        );
+        assert_eq!(v["status"]["ready"], true, "status must be updated");
+    }
+
+    /// PUT /status must not let a status write overwrite immutable identity (uid).
+    /// If uid could be changed via /status, a compromised controller could silently
+    /// re-point a resource to a different object identity, breaking GC and admission.
+    #[tokio::test]
+    async fn put_namespaced_status_does_not_overwrite_uid() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "uid-guard", "namespace": "default", "uid": "real-uid-1", "resourceVersion": "1" },
+            "spec": { "replicas": 1 },
+            "status": {}
+        });
+        let key = "/registry/apps/deployments/default/uid-guard";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let put_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "uid-guard", "namespace": "default", "uid": "attacker-uid", "annotations": { "safe": "yes" } },
+            "status": { "readyReplicas": 1 }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "uid-guard".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PUT /status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["uid"], "real-uid-1",
+            "uid must not be overwritten by a status write; \
+             allowing uid changes via /status would break GC and object identity guarantees"
+        );
+        assert_eq!(
+            v["metadata"]["annotations"]["safe"], "yes",
+            "non-identity annotations must still land"
         );
     }
 }
