@@ -19,41 +19,51 @@ use super::generic::{lookup, store_err, validate_name};
 use super::json_patch::{apply_json_patch, detect_patch_type, PatchType};
 use super::resource::{get_namespaced_resource, get_resource};
 
-/// Merge incoming metadata onto the current object's metadata, preserving identity
-/// fields that must never change via a status subresource write.
+/// Merge incoming metadata onto the current object's metadata, preserving fields that
+/// must never change via a status subresource write.
 ///
-/// Upstream contract: PATCH/PUT on /status may update metadata (labels, annotations,
-/// finalizers, etc.) and status, but must NOT change spec or identity fields.
-fn merge_incoming_metadata(current: &mut serde_json::Value, incoming: &serde_json::Value) {
+/// Protected fields: identity fields (name, namespace, uid, creationTimestamp,
+/// resourceVersion, generation) AND lifecycle-control fields (finalizers,
+/// deletionTimestamp). A status write that changes finalizers can restore a finalizer
+/// a peer controller just removed, causing livelock where the object stays Terminating
+/// forever.
+///
+/// Restore semantics: if the field was absent (null) in the stored object, the field is
+/// removed after merge even if the incoming body added it. If it was present, it is
+/// restored to its stored value unconditionally.
+pub(crate) fn merge_incoming_metadata(
+    current: &mut serde_json::Value,
+    incoming: &serde_json::Value,
+) {
     let incoming_meta = &incoming["metadata"];
     if !incoming_meta.is_object() {
         return;
     }
-    // Snapshot identity fields before the merge so we can restore them after.
-    let saved: Vec<(&str, serde_json::Value)> = [
+    const PROTECTED: &[&str] = &[
         "name",
         "namespace",
         "uid",
         "creationTimestamp",
         "resourceVersion",
         "generation",
-    ]
-    .iter()
-    .filter_map(|&k| {
-        let v = &current["metadata"][k];
-        if v.is_null() {
-            None
-        } else {
-            Some((k, v.clone()))
-        }
-    })
-    .collect();
+        "finalizers",
+        "deletionTimestamp",
+    ];
+    let saved: Vec<(&str, serde_json::Value)> = PROTECTED
+        .iter()
+        .map(|&k| (k, current["metadata"][k].clone()))
+        .collect();
 
     crate::patch::merge_patch(&mut current["metadata"], incoming_meta);
 
-    // Restore identity fields — they cannot be changed via the status subresource.
     for (k, v) in saved {
-        current["metadata"][k] = v;
+        if v.is_null() {
+            if let Some(meta_obj) = current["metadata"].as_object_mut() {
+                meta_obj.remove(k);
+            }
+        } else {
+            current["metadata"][k] = v;
+        }
     }
 }
 
@@ -2172,6 +2182,154 @@ mod tests {
         assert_eq!(
             v["metadata"]["annotations"]["safe"], "yes",
             "non-identity annotations must still land"
+        );
+    }
+
+    /// PUT /status on a cluster-scoped resource must not overwrite finalizers or deletionTimestamp.
+    /// A status PUT that clears finalizers can race with a peer controller that just removed a
+    /// finalizer, restoring it and causing the object to be stuck Terminating forever (livelock).
+    #[tokio::test]
+    async fn put_resource_status_preserves_finalizers_and_deletion_timestamp() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "fin-node",
+                "resourceVersion": "1",
+                "finalizers": ["storage.kubernetes.io/csinode-protection"],
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "drivers": [] }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/fin-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let put_body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": {
+                "name": "fin-node",
+                "finalizers": [],
+                "deletionTimestamp": "2099-12-31T00:00:00Z"
+            },
+            "status": { "ready": true }
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "fin-node".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PUT /status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["finalizers"][0], "storage.kubernetes.io/csinode-protection",
+            "finalizers must survive PUT /status — a status PUT that clears finalizers can \
+             restore a just-removed finalizer causing the object to be stuck Terminating forever (livelock)"
+        );
+        assert_eq!(
+            v["metadata"]["deletionTimestamp"], "2024-01-01T00:00:00Z",
+            "deletionTimestamp must survive PUT /status — changing it via status would allow \
+             a controller to bypass the graceful deletion lifecycle"
+        );
+    }
+
+    /// PUT /status on a namespaced resource must not overwrite finalizers or deletionTimestamp.
+    /// Same livelock risk as the cluster-scoped path: if a controller PUT /status and the body
+    /// reflects an older version of the object that still has a finalizer a peer just removed,
+    /// the finalizer is restored and the object is stuck Terminating forever.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_preserves_finalizers_and_deletion_timestamp() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let obj = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "fin-deploy",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "finalizers": ["foregroundDeletion"],
+                "deletionTimestamp": "2024-06-01T00:00:00Z"
+            },
+            "spec": { "replicas": 1 },
+            "status": {}
+        });
+        let key = "/registry/apps/deployments/default/fin-deploy";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let put_body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "fin-deploy",
+                "namespace": "default",
+                "finalizers": [],
+                "deletionTimestamp": "2099-01-01T00:00:00Z"
+            },
+            "status": { "readyReplicas": 1 }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "fin-deploy".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PUT /status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["finalizers"][0], "foregroundDeletion",
+            "finalizers must survive PUT /namespaced/status — a status PUT that clears finalizers \
+             can restore a just-removed finalizer causing the object to be stuck Terminating forever (livelock)"
+        );
+        assert_eq!(
+            v["metadata"]["deletionTimestamp"], "2024-06-01T00:00:00Z",
+            "deletionTimestamp must survive PUT /namespaced/status"
         );
     }
 }

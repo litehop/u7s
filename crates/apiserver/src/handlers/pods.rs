@@ -1427,32 +1427,7 @@ pub async fn replace_pod_status<S: Store>(
 
     current_obj.body["status"] = incoming["status"].clone();
 
-    // Merge metadata from the incoming PUT body (labels, annotations, finalizers, etc.),
-    // preserving identity fields that cannot change via the status subresource.
-    if incoming["metadata"].is_object() {
-        let saved: Vec<(&str, serde_json::Value)> = [
-            "name",
-            "namespace",
-            "uid",
-            "creationTimestamp",
-            "resourceVersion",
-            "generation",
-        ]
-        .iter()
-        .filter_map(|&k| {
-            let v = &current_obj.body["metadata"][k];
-            if v.is_null() {
-                None
-            } else {
-                Some((k, v.clone()))
-            }
-        })
-        .collect();
-        crate::patch::merge_patch(&mut current_obj.body["metadata"], &incoming["metadata"]);
-        for (k, v) in saved {
-            current_obj.body["metadata"][k] = v;
-        }
-    }
+    crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming);
 
     let expected_rv = parse_resource_version(current_obj.resource_version())?;
     let new_rv = state
@@ -6137,6 +6112,76 @@ mod handler_tests {
             "PUT /status on non-existent pod must return 404 — \
              the status subresource cannot create new pods"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_pod_status — finalizer and deletionTimestamp protection
+    // -----------------------------------------------------------------------
+
+    /// PUT /pods/:name/status must not overwrite finalizers or deletionTimestamp.
+    /// The kubelet sends a PUT /status whose body reflects the last pod state it observed.
+    /// If KCM just removed the job-tracking finalizer, the kubelet's stale body still carries it.
+    /// Without protection, the PUT restores the finalizer and the pod is stuck Terminating forever
+    /// (livelock — exactly the class of bug fixed by apply_status_patch, now also fixed here).
+    #[tokio::test]
+    async fn replace_pod_status_preserves_finalizers_and_deletion_timestamp() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(
+            &store,
+            "default",
+            "fin-pod",
+            serde_json::json!({
+                "metadata": {
+                    "finalizers": ["batch.kubernetes.io/job-tracking"],
+                    "deletionTimestamp": "2024-01-01T00:00:00Z"
+                }
+            }),
+        )
+        .await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "fin-pod",
+                "namespace": "default",
+                "finalizers": [],
+                "deletionTimestamp": "2099-12-31T00:00:00Z"
+            },
+            "status": {"phase": "Succeeded"}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/fin-pod/status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "PUT /status must succeed");
+
+        let key = "/registry/pods/default/fin-pod";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["finalizers"][0], "batch.kubernetes.io/job-tracking",
+            "finalizers must survive PUT /pods/status — the kubelet's stale body restoring a \
+             just-removed job-tracking finalizer causes the pod to be stuck Terminating forever (livelock)"
+        );
+        assert_eq!(
+            v["metadata"]["deletionTimestamp"], "2024-01-01T00:00:00Z",
+            "deletionTimestamp must survive PUT /pods/status"
+        );
+        assert_eq!(v["status"]["phase"], "Succeeded", "status must be updated");
     }
 
     // -----------------------------------------------------------------------
