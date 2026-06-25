@@ -1,27 +1,65 @@
 # Sonobuoy failure investigation: `<FOCUS>`
 
-A sonobuoy e2e run has already been captured. The results are in `temp/e2e/` — find the most recent directory matching `*-<focus-lowercase>*` (e.g. `temp/e2e/0529-1524-limitrange/`).
+A sonobuoy e2e run has been captured under `temp/e2e/` (relative to your worktree).
+Find the most recent directory matching `*-<focus-lowercase>*`
+(e.g. `temp/e2e/0529-1524-limitrange/`).
 
-## Environment
+## Read the RIGHT result file
 
-- u7s apiserver runs locally on the Mac (`target/release/u7s-apiserver`, port 6443)
-- kubelet and kube-controller-manager run in the lima VM (`lima-node`)
-- `kubectl --kubeconfig temp/u7s/kubeconfig` gives cluster access (relative to CWD / active worktree)
-- kcm logs: `/tmp/kcm.log` inside the VM (accessible via lima-node MCP)
-- Restart apiserver: `scripts/u7s-start.sh --background` (kills existing, starts fresh, logs to `temp/u7s/apiserver.log`)
-- Re-run sonobuoy: `SONOBUOY_FOCUS=<Focus> scripts/conformance/run-all.sh` — extracts results into `temp/e2e/` and prints the tarball path
+The full test timeline (what it created, waited for, asserted, and the actual
+failure line) is in:
+
+```
+temp/e2e/<run>/podlogs/sonobuoy/<sonobuoy-e2e-...>/logs/e2e.txt
+```
+
+NOT `plugins/e2e/results/global/e2e.log` — that file omits the test body and will
+mislead you into thinking the harness produced no output.
+
+## Verify with kubectl FIRST; reserve sonobuoy for the final gate
+
+A `sonobuoy --focus` run is 5+ minutes and can hang to 20 (the watchdog reaps the
+test namespace at 5 min, then ginkgo flails against the dead namespace until its
+own timeout). Do NOT iterate diagnosis on sonobuoy runs. Almost everything a
+single conformance test asserts is reproducible in seconds with `kubectl`.
+
+1. **Read the failing test's source** (`test/e2e/...` in kubernetes/kubernetes at
+   the matching version tag) to learn its exact API sequence — create what, wait
+   for what, assert what, delete/GC what. The failure line in e2e.txt tells you
+   which step failed.
+2. **Reproduce that sequence with kubectl** against the running stack:
+   `kubectl --kubeconfig temp/u7s/kubeconfig ...` — create the object,
+   `get -o yaml` / `-o jsonpath` / `get -w` the relevant field, delete and check
+   GC. Inspect controller behavior with `limactl shell <VM> sudo tail /tmp/kcm.log`
+   (KCM is where Job/GC/endpoint/SA controllers live; its errors — e.g.
+   `resource version mismatch`, nil panics — are usually the root cause).
+3. **Root-cause and fix using the kubectl loop.** If you need apiserver-side
+   visibility, bring the stack up with `--verbose` (debug logs) — never add
+   `tracing::debug!` + manual rebuild/restart by hand; `run-all.sh --verbose`
+   does it correctly.
+4. **Run `--focus` sonobuoy ONCE as the final gate**, after kubectl confirms the
+   fix. Read the PASS from e2e.txt (see above).
+
+## Bringing up / running the stack
+
+See `ai/prompts/vm-operations.md` for the canonical commands (the one allowlisted
+`run-all.sh` form, build via `--binary` omission, `--verbose` for debug logs, VM
+provisioning, and per-component restarts). Do not restart the apiserver by hand or
+pass `SONOBUOY_FOCUS=` inline. Prefer a unique no-metacharacter substring for
+`--focus` (e.g. `should delete a job`) to avoid regex-escaping pitfalls.
 
 ## Workflow
 
-1. Read the junit XML and e2e.log from the captured results to identify the failing test and error
-2. Use `kubectl` and `sqlite3 temp/u7s/state.db` (relative to CWD) to reproduce and diagnose locally before touching code
-3. File a bead (`bd create`) before starting a fix
-4. When you need visibility into runtime behaviour, add `tracing::debug!` lines, rebuild (`cargo build -p u7s-apiserver --release`), restart, and re-run sonobuoy — don't guess
-5. Fix, add regression tests (Rule 14: test must fail if fix is reverted), run `cargo test`, re-run sonobuoy to confirm `failures="0"`
-6. Close the bead, commit, push
+1. Read e2e.txt to identify the failing test + exact failure step.
+2. Read the test source; reproduce + diagnose with kubectl + `/tmp/kcm.log` before touching code.
+3. File a bead (`bd create`) before starting a fix.
+4. Fix; add a regression test (Rule 14: must fail if the fix is reverted); run `cargo test` + clippy.
+5. Re-verify with kubectl, then run sonobuoy ONCE — confirm PASS in e2e.txt.
+6. Close the bead, commit (source only — not `.beads/issues.jsonl`), push.
 
 ## Rules that matter most here
 
-- Reference `crates/apiserver/proto/` for proto field numbers — don't guess; download missing files from GitHub into that folder if needed
-- Prefer `jq` over python for JSON in shell
-- Use `--kubeconfig temp/u7s/kubeconfig` not `KUBECONFIG=`
+- Reference `crates/apiserver/proto/` for proto field numbers — don't guess; download missing files from GitHub into that folder if needed.
+- Prefer `jq` over python for JSON in shell.
+- Use `--kubeconfig temp/u7s/kubeconfig`, never `KUBECONFIG=` inline.
+- Never hard-code `lima-node` / port `6443` / kubelet `10250` — those are the mayor's; use your assigned VM/ports.
