@@ -165,6 +165,22 @@ You are implementing bead **<BEAD_ID>** in <project description>.
 - These are not preferences — violating them triggers permission prompts that
   stall the session. Use the right tool the first time.
 
+## Evidence & time discipline (mandatory)
+
+- Before asserting WHEN something happened or what a time gap MEANS, confirm it
+  against an actual timestamp — never infer ordering from memory or vibes.
+  Sources of truth: the log line's own timestamp, the run-directory name
+  (e.g. `temp/e2e/0625-0927-...`), `gh pr view <n> --json mergedAt`, the
+  binary/commit time. Run `date -u +"%Y-%m-%dT%H:%MZ"` before writing any
+  timestamp; don't guess from session progress.
+- Do NOT say "in a previous run", "this predates PR #X", "stale binary", or
+  "N minutes later" unless you have checked the timestamps. A line from 20
+  seconds ago in the run you just executed is THIS run, not a previous one.
+- Watch timezones: apiserver logs are UTC; ginkgo/e2e logs and run-dir names are
+  often local time. Normalize before comparing, or a delta is meaningless.
+- Quote the evidence for any claim ("apiserver.log 09:35:01 shows…"), and if you
+  did not verify it, say so explicitly rather than stating it as fact (Rule 12).
+
 ## Code style rules (mandatory)
 
 - Write no comments by default. Only add one when the WHY is non-obvious: a hidden
@@ -485,6 +501,16 @@ When a worker returns from a VM/sonobuoy-touching bead:
   `python3 -c` for JSON, `cat`/`head` for file reads, `sed`/`awk` for edits
   — all trigger permission prompts and slow the session. Always inject the
   common preamble verbatim.
+- **Agents (and the mayor) fabricate temporal claims instead of checking timestamps.**
+  Observed repeatedly: an agent calls a log line "from a previous run" when it was
+  20 seconds earlier in the run it just executed; the mayor asserts evidence
+  "predates PR #X" without checking `mergedAt`, conflating runs across different
+  binaries and chasing the wrong root cause for hours. Before any "when / before /
+  after / previous / stale" claim, verify against the log timestamp, run-dir name,
+  `gh pr view --json mergedAt`, or commit time — and normalize timezones (apiserver
+  UTC vs ginkgo/run-dir local). At review time, distrust any temporal claim in a
+  worker's return that isn't backed by a quoted timestamp. See the "Evidence & time
+  discipline" block — inject it via the common preamble.
 - **Workers burn 5–20 min per sonobuoy run when kubectl would answer in seconds.**
   A `--focus` run is slow and can hang (watchdog reaps the namespace at 5 min,
   ginkgo then flails ~15 more min). Iterating diagnosis on sonobuoy is the single
