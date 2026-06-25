@@ -1501,31 +1501,7 @@ pub async fn put_cr_status<S: Store>(
         }
     }
 
-    // Merge metadata from the incoming PUT body, preserving identity fields.
-    if incoming["metadata"].is_object() {
-        let saved: Vec<(&str, serde_json::Value)> = [
-            "name",
-            "namespace",
-            "uid",
-            "creationTimestamp",
-            "resourceVersion",
-            "generation",
-        ]
-        .iter()
-        .filter_map(|&k| {
-            let v = &current["metadata"][k];
-            if v.is_null() {
-                None
-            } else {
-                Some((k, v.clone()))
-            }
-        })
-        .collect();
-        crate::patch::merge_patch(&mut current["metadata"], &incoming["metadata"]);
-        for (k, v) in saved {
-            current["metadata"][k] = v;
-        }
-    }
+    crate::handlers::status::merge_incoming_metadata(&mut current, &incoming);
 
     let current_meta: crate::types::ObjectMeta =
         serde_json::from_value(current["metadata"].clone()).unwrap_or_default();
@@ -6704,5 +6680,104 @@ mod tests {
             obj["apiVersion"], "example.io/v1",
             "cluster-scoped GET response must include apiVersion"
         );
+    }
+
+    /// PUT /apis/{group}/{version}/{plural}/{name}/status must not overwrite finalizers or
+    /// deletionTimestamp on a cluster-scoped CR. If a status PUT restores a finalizer that a peer
+    /// controller just removed, the object is stuck Terminating forever (livelock).
+    #[tokio::test]
+    async fn put_cr_status_preserves_finalizers_and_deletion_timestamp() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        // Create a widget CR.
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "fin-widget" },
+                "spec": { "color": "blue" }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path(("example.io".into(), "v1".into(), "widgets".into())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                create_body,
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Directly stamp finalizers and deletionTimestamp into the stored object to simulate
+        // a controller having added them.
+        let key = "/registry/cr/example.io/v1/widgets/fin-widget";
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let mut obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        obj["metadata"]["finalizers"] = serde_json::json!(["example.io/protection"]);
+        obj["metadata"]["deletionTimestamp"] = serde_json::json!("2024-01-01T00:00:00Z");
+        let rv: u64 = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        state
+            .store
+            .put(
+                key,
+                Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(rv),
+            )
+            .await
+            .unwrap();
+
+        // PUT /status with a body that tries to clear finalizers and change deletionTimestamp.
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "fin-widget",
+                    "finalizers": [],
+                    "deletionTimestamp": "2099-01-01T00:00:00Z"
+                },
+                "spec": { "color": "blue" },
+                "status": { "ready": true }
+            })
+            .to_string(),
+        );
+        assert!(
+            put_cr_status(
+                State(state.clone()),
+                Path((
+                    "example.io".into(),
+                    "v1".into(),
+                    "widgets".into(),
+                    "fin-widget".into()
+                )),
+                axum::http::HeaderMap::new(),
+                put_body,
+            )
+            .await
+            .is_ok(),
+            "PUT /status must succeed"
+        );
+
+        let after = state.store.get(key).await.unwrap().unwrap();
+        let after_obj: serde_json::Value = serde_json::from_slice(&after.value).unwrap();
+        assert_eq!(
+            after_obj["metadata"]["finalizers"][0], "example.io/protection",
+            "finalizers must survive PUT /cr/status — a status write that clears finalizers can \
+             restore a just-removed finalizer causing the object to be stuck Terminating forever (livelock)"
+        );
+        assert_eq!(
+            after_obj["metadata"]["deletionTimestamp"], "2024-01-01T00:00:00Z",
+            "deletionTimestamp must survive PUT /cr/status"
+        );
+        assert_eq!(after_obj["status"]["ready"], true, "status must be updated");
     }
 }

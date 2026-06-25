@@ -596,31 +596,7 @@ pub async fn put_namespace_status<S: Store>(
         }
     }
 
-    // Merge metadata from the incoming PUT body, preserving identity fields.
-    if incoming.body["metadata"].is_object() {
-        let saved: Vec<(&str, serde_json::Value)> = [
-            "name",
-            "namespace",
-            "uid",
-            "creationTimestamp",
-            "resourceVersion",
-            "generation",
-        ]
-        .iter()
-        .filter_map(|&k| {
-            let v = &current.body["metadata"][k];
-            if v.is_null() {
-                None
-            } else {
-                Some((k, v.clone()))
-            }
-        })
-        .collect();
-        crate::patch::merge_patch(&mut current.body["metadata"], &incoming.body["metadata"]);
-        for (k, v) in saved {
-            current.body["metadata"][k] = v;
-        }
-    }
+    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body);
 
     let expected_rv = parse_resource_version(current.resource_version())?;
     let new_rv = state
@@ -680,33 +656,7 @@ pub async fn patch_namespace_status<S: Store>(
                     }
                 }
             }
-            // Merge metadata from the patch body, preserving identity fields.
-            if let Some(patch_meta) = patch.get("metadata") {
-                if patch_meta.is_object() {
-                    let saved: Vec<(&str, serde_json::Value)> = [
-                        "name",
-                        "namespace",
-                        "uid",
-                        "creationTimestamp",
-                        "resourceVersion",
-                        "generation",
-                    ]
-                    .iter()
-                    .filter_map(|&k| {
-                        let v = &current.body["metadata"][k];
-                        if v.is_null() {
-                            None
-                        } else {
-                            Some((k, v.clone()))
-                        }
-                    })
-                    .collect();
-                    crate::patch::merge_patch(&mut current.body["metadata"], patch_meta);
-                    for (k, v) in saved {
-                        current.body["metadata"][k] = v;
-                    }
-                }
-            }
+            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch);
         }
     }
 
@@ -3012,6 +2962,157 @@ mod tests {
              AppState was destroyed — the _store_keepalive fix in watch_generic is needed to \
              keep the store alive for the stream's lifetime (mayor-8tiu)",
             elapsed.as_millis()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status subresource metadata-protection tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use std::sync::Arc;
+    use u7s_store::SqliteStore;
+
+    fn make_state(store: Arc<SqliteStore>) -> crate::state::AppState {
+        crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    fn json_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        h
+    }
+
+    fn merge_patch_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+        h
+    }
+
+    /// PUT /api/v1/namespaces/{name}/status must not overwrite finalizers or deletionTimestamp.
+    /// Namespace finalizers live in spec.finalizers, but metadata.finalizers are also protected.
+    /// A status PUT that restores a just-removed metadata finalizer causes livelock where the
+    /// namespace stays Terminating forever — exactly the bug fixed by the 8-field helper.
+    #[tokio::test]
+    async fn put_namespace_status_preserves_finalizers_and_deletion_timestamp() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "fin-ns",
+                "resourceVersion": "1",
+                "finalizers": ["some-controller.io/protection"],
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["kubernetes"] },
+            "status": {}
+        });
+        let key = "/registry/namespaces/fin-ns";
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&ns).unwrap()), None)
+            .await
+            .unwrap();
+        let state = make_state(store.clone());
+
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "fin-ns",
+                "finalizers": [],
+                "deletionTimestamp": "2099-01-01T00:00:00Z"
+            },
+            "status": { "phase": "Terminating" }
+        });
+        let result = put_namespace_status(
+            State(state),
+            Path("fin-ns".to_string()),
+            json_headers(),
+            Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PUT /namespaces/status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["finalizers"][0], "some-controller.io/protection",
+            "metadata.finalizers must survive PUT /namespaces/status — restoring a just-removed \
+             finalizer via a status write causes the namespace to be stuck Terminating forever (livelock)"
+        );
+        assert_eq!(
+            v["metadata"]["deletionTimestamp"], "2024-01-01T00:00:00Z",
+            "deletionTimestamp must survive PUT /namespaces/status"
+        );
+    }
+
+    /// PATCH /api/v1/namespaces/{name}/status must not overwrite finalizers or deletionTimestamp.
+    /// Same livelock risk as PUT: a merge-patch status body carrying an older snapshot of the
+    /// object restores a finalizer a peer controller just removed.
+    #[tokio::test]
+    async fn patch_namespace_status_preserves_finalizers_and_deletion_timestamp() {
+        let store = Arc::new(SqliteStore::new(":memory:").unwrap());
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "fin-ns-patch",
+                "resourceVersion": "1",
+                "finalizers": ["some-controller.io/protection"],
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["kubernetes"] },
+            "status": {}
+        });
+        let key = "/registry/namespaces/fin-ns-patch";
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&ns).unwrap()), None)
+            .await
+            .unwrap();
+        let state = make_state(store.clone());
+
+        let patch = serde_json::json!({
+            "metadata": {
+                "finalizers": [],
+                "deletionTimestamp": "2099-01-01T00:00:00Z"
+            },
+            "status": { "phase": "Terminating" }
+        });
+        let result = patch_namespace_status(
+            State(state),
+            Path("fin-ns-patch".to_string()),
+            merge_patch_headers(),
+            Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(result.is_ok(), "PATCH /namespaces/status must succeed");
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["metadata"]["finalizers"][0], "some-controller.io/protection",
+            "metadata.finalizers must survive PATCH /namespaces/status — restoring a just-removed \
+             finalizer via a status patch causes the namespace to be stuck Terminating forever (livelock)"
+        );
+        assert_eq!(
+            v["metadata"]["deletionTimestamp"], "2024-01-01T00:00:00Z",
+            "deletionTimestamp must survive PATCH /namespaces/status"
         );
     }
 }
