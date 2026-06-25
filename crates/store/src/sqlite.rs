@@ -111,14 +111,42 @@ impl SqliteStore {
                 }
             }
         }
-        // Also persist deletion tombstones to the deletion_log independently of the main ring.
-        // When the main ring compacts and evicts old entries, deletion events can be lost.
-        // The deletion_log maps each store key to its latest DELETED event. Using a HashMap
-        // ensures tombstones are never evicted by unrelated writes: a namespace deleted early
-        // in a long conformance run retains its tombstone regardless of write volume.
-        if event.value.is_none() {
+        // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
+        // compaction can still receive DELETED events for objects deleted before compaction.
+        //
+        // Eviction policy (two-pronged to bound memory without dropping needed tombstones):
+        //
+        // 1. Evict-on-recreate: when a PUT event arrives for a key that has a tombstone in
+        //    deletion_log, remove it. The tombstone is stale — the key now exists again, so
+        //    any watcher reconnecting will see the live object in a fresh list response. Keeping
+        //    a DELETED tombstone for a live key would cause a watcher to emit a spurious DELETED
+        //    event for the current incarnation.
+        //
+        // 2. Cap at 2×RING_CAPACITY: after inserting a new tombstone, if the map exceeds the
+        //    cap, evict the entry with the lowest revision. The cap is generous enough (2×1000)
+        //    to cover any watcher within the ring window; tombstones evicted by this path are
+        //    for keys deleted more than 2000 writes ago, which any active watcher has already
+        //    processed via the broadcast channel.
+        {
             let mut guard = self.deletion_log.write().expect("deletion_log poisoned");
-            guard.insert(event.key.clone(), Arc::clone(&event));
+            if event.value.is_none() {
+                // Deletion: insert tombstone then cap the map.
+                guard.insert(event.key.clone(), Arc::clone(&event));
+                const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
+                if guard.len() > DELETION_LOG_CAP {
+                    // Find and remove the entry with the smallest revision.
+                    if let Some(oldest_key) = guard
+                        .iter()
+                        .min_by_key(|(_, e)| e.revision)
+                        .map(|(k, _)| k.clone())
+                    {
+                        guard.remove(&oldest_key);
+                    }
+                }
+            } else {
+                // Creation/update: evict any stale tombstone for this key.
+                guard.remove(&event.key);
+            }
         }
         // Best-effort broadcast of the specific event.
         let event_revision = event.revision;
@@ -180,10 +208,16 @@ fn open_conn(path: &str) -> Result<Connection> {
 
 /// Stamps metadata.resourceVersion into the stored JSON.
 /// Parses the JSON, sets the field, re-serializes.
-fn stamp_resource_version(value: &Bytes, revision: u64) -> Result<Bytes> {
+/// Also extracts ns and obj_name from the single parse to avoid a second deserialization.
+fn stamp_resource_version(
+    value: &Bytes,
+    revision: u64,
+) -> Result<(Bytes, Option<String>, Option<String>)> {
     let mut obj: serde_json::Value = serde_json::from_slice(value)?;
+    let ns = obj["metadata"]["namespace"].as_str().map(str::to_owned);
+    let obj_name = obj["metadata"]["name"].as_str().map(str::to_owned);
     obj["metadata"]["resourceVersion"] = serde_json::Value::String(revision.to_string());
-    Ok(Bytes::from(serde_json::to_vec(&obj)?))
+    Ok((Bytes::from(serde_json::to_vec(&obj)?), ns, obj_name))
 }
 
 // Full write procedure — runs inside spawn_blocking.
@@ -250,18 +284,11 @@ fn put_sync(
         |r| r.get::<_, i64>(0).map(|v| v as u64),
     )?;
 
-    // 6. Stamp metadata.resourceVersion in the JSON value.
-    let stamped_value = stamp_resource_version(&value, new_revision)?;
+    // 6. Stamp metadata.resourceVersion in the JSON value and extract indexed columns
+    //    from the single parse, avoiding a second deserialization of the stamped bytes.
+    let (stamped_value, ns, obj_name) = stamp_resource_version(&value, new_revision)?;
 
-    // 7. Extract ns and obj_name for indexed columns.
-    let (ns, obj_name) = {
-        let obj: serde_json::Value = serde_json::from_slice(&stamped_value)?;
-        let ns = obj["metadata"]["namespace"].as_str().map(str::to_owned);
-        let obj_name = obj["metadata"]["name"].as_str().map(str::to_owned);
-        (ns, obj_name)
-    };
-
-    // 8. Upsert the object.
+    // 7. Upsert the object.
     conn.execute(
         "INSERT INTO objects (key, value, revision, ns, obj_name) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, revision = excluded.revision,
@@ -433,7 +460,7 @@ fn prefix_upper_bound(prefix: &str) -> String {
 }
 
 fn query_all(conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Result<Vec<StoreObject>> {
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt
         .query_map(p, |r| {
             Ok(StoreObject {
@@ -1447,5 +1474,210 @@ mod tests {
              and requeue in a tight loop for up to 15 minutes",
             resp.revision
         );
+    }
+
+    /// Repeated list() calls must return consistent results — verifies prepare_cached does not
+    /// corrupt query state across calls.
+    ///
+    /// Why it matters: prepare_cached reuses the cached statement handle; if the handle is
+    /// left in a bad state (rows not consumed, reset not called), a subsequent list on the same
+    /// connection returns wrong results or errors, breaking any controller that lists repeatedly.
+    #[tokio::test]
+    async fn repeated_list_returns_consistent_results() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/core/configmaps/";
+
+        for i in 0..5u32 {
+            let key = format!("/registry/core/configmaps/default/cm-{i}");
+            let val = Bytes::from(format!(
+                r#"{{"apiVersion":"v1","kind":"ConfigMap","metadata":{{"name":"cm-{i}","namespace":"default"}}}}"#
+            ));
+            store.put(&key, val, None).await.expect("put must succeed");
+        }
+
+        let first = store
+            .list(prefix, ListOptions::default())
+            .await
+            .expect("first list");
+        let second = store
+            .list(prefix, ListOptions::default())
+            .await
+            .expect("second list");
+
+        assert_eq!(
+            first.items.len(),
+            second.items.len(),
+            "repeated list() must return the same item count; a mismatch means prepare_cached \
+             left the statement in a corrupted state, causing controllers to see inconsistent \
+             object counts across reflector resyncs"
+        );
+        assert_eq!(
+            first.items.len(),
+            5,
+            "list must return all 5 inserted configmaps; returning fewer breaks reflector \
+             initial list completeness"
+        );
+    }
+
+    /// PUT followed by GET must return the correctly stamped resourceVersion and the identical
+    /// ns/obj_name that were in the original value — verifying that extracting indexed columns
+    /// from the pre-stamp parse yields the same result as extracting from the stamped bytes.
+    ///
+    /// Why it matters: if the single-parse optimization extracts ns/obj_name from the wrong
+    /// JSON document (e.g. before namespace is set, or from a stale value), the indexed columns
+    /// in SQLite diverge from the stored object, breaking field-selector queries by namespace
+    /// or name — controllers that list pods by nodeName or services by namespace never find
+    /// their objects and reconcile loops stall indefinitely.
+    #[tokio::test]
+    async fn put_stamps_rv_and_preserves_ns_obj_name() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/pods/prod/web-abc";
+        let raw = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"web-abc","namespace":"prod"}}"#,
+        );
+
+        let rv = store.put(key, raw, None).await.expect("put must succeed");
+
+        let obj = store
+            .get(key)
+            .await
+            .expect("get must not error")
+            .expect("object must exist after put");
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&obj.value).expect("stored value must be valid JSON");
+
+        assert_eq!(
+            parsed["metadata"]["resourceVersion"].as_str(),
+            Some(rv.to_string().as_str()),
+            "stored object must have resourceVersion stamped to the revision returned by put; \
+             a mismatch means the stamp did not propagate to the stored bytes"
+        );
+        assert_eq!(
+            parsed["metadata"]["namespace"].as_str(),
+            Some("prod"),
+            "namespace must survive the single-parse stamp path; if extraction reads from the \
+             wrong parse result the indexed ns column is wrong and namespace-scoped list queries \
+             return empty results"
+        );
+        assert_eq!(
+            parsed["metadata"]["name"].as_str(),
+            Some("web-abc"),
+            "name must survive the single-parse stamp path; if extraction reads from the wrong \
+             parse result the indexed obj_name column is wrong and name field-selector queries \
+             return empty results"
+        );
+
+        // Verify the indexed columns are queryable via field selector (proves SQLite columns match).
+        let by_ns = store
+            .list(
+                "/registry/core/pods/",
+                ListOptions {
+                    field_selector: Some(FieldSelector {
+                        field: "metadata.namespace".to_string(),
+                        value: "prod".to_string(),
+                        negated: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list by namespace");
+
+        assert_eq!(
+            by_ns.items.len(),
+            1,
+            "field-selector list by namespace=prod must return 1 pod; returning 0 means the \
+             ns indexed column was not correctly populated by the single-parse put path, \
+             breaking all namespace-scoped list queries"
+        );
+    }
+
+    /// deletion_log must NOT retain a tombstone after the deleted key is re-created via PUT.
+    ///
+    /// Why it matters: keeping a DELETED tombstone for a live key causes a watcher reconnecting
+    /// after compaction to receive a spurious DELETED event for the current (live) incarnation
+    /// of the key, making controllers believe the object was deleted and stop reconciling —
+    /// an unbounded deletion_log also leaks one Arc<InternalEvent> (full object body) per
+    /// ever-deleted key, growing without bound on a long-running server.
+    #[tokio::test]
+    async fn deletion_log_evicts_tombstone_on_recreate() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/namespaces/ns-a";
+        let val =
+            Bytes::from(r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-a"}}"#);
+
+        // Create, then delete the key — tombstone enters deletion_log.
+        store
+            .put(key, val.clone(), None)
+            .await
+            .expect("put must succeed");
+        store.delete(key, None).await.expect("delete must succeed");
+
+        {
+            let guard = store.deletion_log.read().expect("deletion_log poisoned");
+            assert!(
+                guard.contains_key(key),
+                "deletion_log must contain tombstone for deleted key; test setup broken"
+            );
+        }
+
+        // Re-create the key via PUT — tombstone must be evicted.
+        store
+            .put(key, val, None)
+            .await
+            .expect("recreate must succeed");
+
+        {
+            let guard = store.deletion_log.read().expect("deletion_log poisoned");
+            assert!(
+                !guard.contains_key(key),
+                "deletion_log must NOT retain tombstone after key is re-created; retaining it \
+                 causes watchers reconnecting after compaction to receive a spurious DELETED event \
+                 for the live object, making controllers stop reconciling the re-created resource"
+            );
+        }
+    }
+
+    /// deletion_log must retain tombstones for recently-deleted keys that have not been
+    /// re-created, so a watcher reconnecting after compaction still receives DELETED events.
+    ///
+    /// Why it matters: evicting too aggressively drops DELETED events a watcher needs —
+    /// a watcher that reconnects after the ring is compacted relies on deletion_log to
+    /// receive tombstones for objects deleted during the compaction window; without them
+    /// the watcher deadlocks waiting for a DELETED event that never arrives.
+    #[tokio::test]
+    async fn deletion_log_retains_tombstone_for_deleted_key_not_recreated() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // Delete several keys without re-creating them — all tombstones must survive.
+        for i in 0..5u32 {
+            let key = format!("/registry/core/namespaces/ns-{i}");
+            let val = Bytes::from(format!(
+                r#"{{"apiVersion":"v1","kind":"Namespace","metadata":{{"name":"ns-{i}"}}}}"#
+            ));
+            store.put(&key, val, None).await.expect("put must succeed");
+            store.delete(&key, None).await.expect("delete must succeed");
+        }
+
+        // Perform additional writes (non-deletions) that do NOT touch the deleted keys.
+        for i in 0..10u32 {
+            let key = format!("/registry/core/configmaps/default/cm-{i}");
+            let val = Bytes::from(format!(
+                r#"{{"apiVersion":"v1","kind":"ConfigMap","metadata":{{"name":"cm-{i}","namespace":"default"}}}}"#
+            ));
+            store.put(&key, val, None).await.expect("put must succeed");
+        }
+
+        let guard = store.deletion_log.read().expect("deletion_log poisoned");
+        for i in 0..5u32 {
+            let key = format!("/registry/core/namespaces/ns-{i}");
+            assert!(
+                guard.contains_key(&key),
+                "deletion_log must retain tombstone for ns-{i} (not re-created); evicting it \
+                 would cause a reconnecting watcher to miss the DELETED event, deadlocking any \
+                 controller waiting for the namespace deletion to complete"
+            );
+        }
     }
 }
