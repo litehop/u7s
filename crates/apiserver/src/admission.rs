@@ -323,6 +323,24 @@ pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
                 "webhook url must not target shared address space (100.64.0.0/10): {url}"
             ));
         }
+        // 10.0.0.0/8 — RFC1918 private range (cluster-internal)
+        if octets[0] == 10 {
+            return Err(format!(
+                "webhook url must not target private address (10.0.0.0/8): {url}"
+            ));
+        }
+        // 172.16.0.0/12 — RFC1918 private range
+        if octets[0] == 172 && (octets[1] & 0xF0) == 16 {
+            return Err(format!(
+                "webhook url must not target private address (172.16.0.0/12): {url}"
+            ));
+        }
+        // 192.168.0.0/16 — RFC1918 private range
+        if octets[0] == 192 && octets[1] == 168 {
+            return Err(format!(
+                "webhook url must not target private address (192.168.0.0/16): {url}"
+            ));
+        }
     }
 
     Ok(())
@@ -7317,6 +7335,43 @@ mod tests {
             result.is_ok(),
             "http://127.0.0.1 must be accepted — \
              loopback addresses are not SSRF targets and must work for test mock servers"
+        );
+    }
+
+    // -- RFC1918 private IP blocking tests --
+
+    /// RFC1918 addresses must be rejected to prevent webhooks from reaching cluster-internal services.
+    ///
+    /// A webhook targeting 10.x.x.x / 172.16-31.x.x / 192.168.x.x can reach ClusterIPs, pod
+    /// IPs, or node-local services that are not intended to be reachable from webhook configs.
+    /// Blocking these ranges closes the SSRF path that bypasses the cloud-IMDS block.
+    #[test]
+    fn validate_webhook_url_rejects_rfc1918_10_range() {
+        let result = validate_webhook_url("https://10.96.0.1/x");
+        assert!(
+            result.is_err(),
+            "https://10.96.0.1 must be rejected — \
+             unblocked RFC1918 lets webhooks reach cluster-internal services"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_rfc1918_172_range() {
+        let result = validate_webhook_url("https://172.16.5.5/x");
+        assert!(
+            result.is_err(),
+            "https://172.16.5.5 must be rejected — \
+             unblocked RFC1918 lets webhooks reach cluster-internal services"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_rfc1918_192_range() {
+        let result = validate_webhook_url("https://192.168.1.1/x");
+        assert!(
+            result.is_err(),
+            "https://192.168.1.1 must be rejected — \
+             unblocked RFC1918 lets webhooks reach cluster-internal services"
         );
     }
 
