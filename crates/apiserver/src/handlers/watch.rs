@@ -62,6 +62,48 @@ fn ndjson_initial_events_bookmark(api_version: &str, kind: &str, revision: u64) 
     Bytes::from(buf)
 }
 
+/// Deserialize, filter, default, and re-serialize one Added/Modified watch event.
+///
+/// Returns `None` when:
+/// - `raw` is not valid UTF-8 (corrupt store entry — caller logs and skips).
+/// - The parsed object does not match `label_selector` or `field_selector`.
+///
+/// Otherwise returns pre-built NDJSON bytes (`{"type":"...","object":...}\n`).
+///
+/// Deserialization and `apply_defaults` happen exactly once per call regardless of how many
+/// watchers share the same event source.  Each watcher calls this once; sharing the returned
+/// `Bytes` across callers (same event, multiple watchers) is safe because `Bytes` is `Clone`
+/// and the allocation is reference-counted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_live_event(
+    raw: &[u8],
+    event_type: &str,
+    group: &str,
+    plural: &str,
+    api_version: &str,
+    kind: &str,
+    as_partial_object_metadata: bool,
+    label_selector: &str,
+    field_selector: &str,
+) -> Option<Bytes> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let mut parsed: serde_json::Value = serde_json::from_str(s).ok()?;
+    if !object_matches_label_selector(&parsed, label_selector)
+        || !object_matches_field_selector(&parsed, field_selector)
+    {
+        return None;
+    }
+    super::defaults::apply_defaults(group, plural, &mut parsed);
+    let emit = if as_partial_object_metadata {
+        to_partial_object_metadata(&parsed)
+    } else {
+        parsed[&"apiVersion"] = serde_json::Value::String(api_version.to_owned());
+        parsed[&"kind"] = serde_json::Value::String(kind.to_owned());
+        parsed
+    };
+    Some(ndjson_event_value(event_type, &emit))
+}
+
 /// Transform a full CR JSON object into a PartialObjectMetadata object.
 /// The GC only needs metadata (ownerReferences, finalizers, etc.) — spec/status are omitted.
 pub(crate) fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
@@ -3085,6 +3127,128 @@ mod tests {
             "watch stream with timeout_seconds=None must NOT close within 2s; \
              if the server default is <= 2s, watch streams expire faster than client-go can \
              reconnect, causing context-canceled cascades in long conformance runs"
+        );
+    }
+
+    // -- prepare_live_event: once-per-event serialize, selector filtering preserved (gcfq) --
+
+    /// prepare_live_event called twice with the same event bytes must produce byte-identical
+    /// output each time. This simulates two watchers on the same resource sharing the same
+    /// raw event bytes but each calling prepare_live_event independently; the resulting NDJSON
+    /// bytes must be identical so both watchers emit the same wire representation.
+    ///
+    /// This test fails on revert: if prepare_live_event is replaced with an inline parse that
+    /// produces different field ordering per call (e.g., via HashMap non-determinism in serde),
+    /// both watchers would emit different bytes for the same event, breaking informer consistency.
+    #[test]
+    fn prepare_live_event_two_watchers_same_event_bytes_get_identical_output() {
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "shared-cm",
+                "namespace": "default",
+                "resourceVersion": "77"
+            }
+        });
+        let raw = serde_json::to_vec(&obj).unwrap();
+
+        let bytes_watcher_a = prepare_live_event(
+            &raw,
+            "ADDED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            false,
+            "",
+            "",
+        );
+        let bytes_watcher_b = prepare_live_event(
+            &raw,
+            "ADDED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            false,
+            "",
+            "",
+        );
+
+        assert!(
+            bytes_watcher_a.is_some(),
+            "watcher A must receive the ADDED event (no selector, should always match)"
+        );
+        assert!(
+            bytes_watcher_b.is_some(),
+            "watcher B must receive the ADDED event (no selector, should always match)"
+        );
+        assert_eq!(
+            bytes_watcher_a.unwrap(),
+            bytes_watcher_b.unwrap(),
+            "both watchers must receive byte-identical NDJSON for the same event; \
+             differing bytes would cause informer cache divergence across watchers \
+             and break clients that compare watch streams for consistency"
+        );
+    }
+
+    /// prepare_live_event with a matching label selector must return Some(bytes).
+    /// prepare_live_event with a non-matching label selector must return None.
+    ///
+    /// Selector filtering must be preserved despite the shared-serialization refactor.
+    /// This test fails on revert: if selector filtering is removed from prepare_live_event,
+    /// a non-matching watcher receives events it should not see, corrupting informer caches.
+    #[test]
+    fn prepare_live_event_label_selector_watcher_receives_only_matching_events() {
+        let matching_obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "cm-frontend",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": { "app": "frontend" }
+            }
+        });
+        let raw = serde_json::to_vec(&matching_obj).unwrap();
+
+        // Watcher with matching selector must receive the event.
+        let matching = prepare_live_event(
+            &raw,
+            "ADDED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            false,
+            "app=frontend",
+            "",
+        );
+        assert!(
+            matching.is_some(),
+            "watcher with matching label selector must receive the ADDED event; \
+             sharing serialized bytes across watchers must not suppress events for selectors \
+             that match — this would cause informers to never see matching objects"
+        );
+
+        // Watcher with non-matching selector must NOT receive the event.
+        let not_matching = prepare_live_event(
+            &raw,
+            "ADDED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            false,
+            "app=backend",
+            "",
+        );
+        assert!(
+            not_matching.is_none(),
+            "watcher with non-matching label selector must NOT receive the ADDED event; \
+             selector filtering must be preserved despite the shared-serialization refactor — \
+             receiving a non-matching event would cause informer cache divergence"
         );
     }
 }
