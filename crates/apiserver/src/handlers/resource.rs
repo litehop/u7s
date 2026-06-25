@@ -1613,6 +1613,27 @@ pub async fn delete_namespaced_resource<S: Store>(
         }
     }
 
+    // Remove the job-tracking finalizer from pods owned by a deleted Job.
+    //
+    // Kubernetes KCM's job-controller (1.36) adds `batch.kubernetes.io/job-tracking` to
+    // pods it creates, then removes the finalizer once each pod reaches a terminal state.
+    // When a Job is deleted and immediately hard-deleted (no finalizers on the Job object),
+    // KCM's syncJob returns early ("job not found") without removing pod finalizers.
+    // The pods are then stuck Terminating forever: they have deletionTimestamp (from the
+    // kubelet's DELETE) but the tracking finalizer is never cleared, so GC cannot complete.
+    //
+    // Fix: when we hard-delete a Job, synchronously remove the tracking finalizer from all
+    // owned pods. If a pod now has deletionTimestamp + no finalizers, hard-delete it too.
+    if group == "batch" && plural == "jobs" {
+        let job_uid = obj.body["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if !job_uid.is_empty() {
+            remove_job_tracking_finalizer_from_pods(&state, &ns, &job_uid).await;
+        }
+    }
+
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
@@ -2081,6 +2102,144 @@ async fn delete_replicasets_owned_by<S: Store>(
             crate::keys::group_object_key("apps", "replicasets", Some(namespace), &rs_name);
         if let Err(e) = state.store.delete(&rs_key, None).await {
             tracing::warn!("cascade-delete replicaset {namespace}/{rs_name}: {e}");
+        }
+    }
+}
+
+/// Called after a Job hard-delete to remove the `batch.kubernetes.io/job-tracking`
+/// finalizer from all pods owned by the deleted Job.
+///
+/// KCM's job-controller (Kubernetes 1.36) adds this finalizer to each pod it creates,
+/// and removes it when the pod reaches a terminal state.  When a Job is immediately
+/// hard-deleted (no finalizers on the Job object), KCM's syncJob returns early
+/// ("job not found") without cleaning up pod finalizers.  The pods are then stuck
+/// Terminating forever: they carry deletionTimestamp (set by the kubelet's DELETE)
+/// but the tracking finalizer is never removed, so the GC cascade never completes
+/// and the conformance test "should delete a job" times out.
+///
+/// Fix: we act as KCM here and synchronously remove the tracking finalizer from all
+/// pods owned by the deleted Job.  If removing the finalizer leaves a pod with
+/// deletionTimestamp and no remaining finalizers, we hard-delete it immediately so
+/// the GC sees a clean DELETED event rather than a pod stuck in Terminating.
+async fn remove_job_tracking_finalizer_from_pods<S: Store>(
+    state: &crate::state::AppState<S>,
+    namespace: &str,
+    job_uid: &str,
+) {
+    const TRACKING_FINALIZER: &str = "batch.kubernetes.io/job-tracking";
+
+    let prefix = crate::keys::group_list_prefix("", "pods", Some(namespace));
+    let resp = match state
+        .store
+        .list(&prefix, u7s_store::ListOptions::default())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("job-tracking cleanup in {namespace}: list pods failed: {e}");
+            return;
+        }
+    };
+
+    for item in resp.items {
+        let mut pod: serde_json::Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Only act on pods owned by the deleted Job.
+        let owned = pod["metadata"]["ownerReferences"]
+            .as_array()
+            .map(|refs| {
+                refs.iter().any(|r| {
+                    r["uid"].as_str() == Some(job_uid) && r["kind"].as_str() == Some("Job")
+                })
+            })
+            .unwrap_or(false);
+        if !owned {
+            continue;
+        }
+
+        // Only act on pods that have the tracking finalizer.
+        let finalizers = pod["metadata"]["finalizers"].as_array().cloned();
+        let has_tracking = finalizers
+            .as_ref()
+            .map(|f| f.iter().any(|v| v.as_str() == Some(TRACKING_FINALIZER)))
+            .unwrap_or(false);
+        if !has_tracking {
+            continue;
+        }
+
+        let pod_name = pod["metadata"]["name"].as_str().unwrap_or("").to_string();
+        if pod_name.is_empty() {
+            continue;
+        }
+        let pod_key = crate::keys::group_object_key("", "pods", Some(namespace), &pod_name);
+
+        // Remove the tracking finalizer.
+        let new_finalizers: Vec<serde_json::Value> = finalizers
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|v| v.as_str() != Some(TRACKING_FINALIZER))
+            .collect();
+
+        let deletion_ts_set = !pod["metadata"]["deletionTimestamp"].is_null();
+        let finalizers_empty = new_finalizers.is_empty();
+
+        if finalizers_empty {
+            pod["metadata"]
+                .as_object_mut()
+                .map(|m| m.remove("finalizers"));
+        } else {
+            pod["metadata"]["finalizers"] = serde_json::Value::Array(new_finalizers);
+        }
+
+        // If the pod already has deletionTimestamp and now has no finalizers, hard-delete it.
+        if deletion_ts_set && finalizers_empty {
+            tracing::info!(
+                namespace,
+                pod = %pod_name,
+                "job-tracking cleanup: hard-deleting pod (deletionTimestamp set, finalizers empty)"
+            );
+            if let Err(e) = state.store.delete(&pod_key, None).await {
+                tracing::warn!("job-tracking cleanup: hard-delete pod {namespace}/{pod_name}: {e}");
+            }
+            continue;
+        }
+
+        // Otherwise, update the pod with the finalizer removed.
+        // Use parse_resource_version to get the expected revision for optimistic concurrency.
+        let rv_str = pod["metadata"]["resourceVersion"].as_str().unwrap_or("0");
+        let expected_rv = match rv_str.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(
+                    "job-tracking cleanup: invalid resourceVersion for pod {namespace}/{pod_name}"
+                );
+                continue;
+            }
+        };
+        let pod_bytes = match serde_json::to_vec(&pod) {
+            Ok(b) => bytes::Bytes::from(b),
+            Err(e) => {
+                tracing::warn!("job-tracking cleanup: serialize pod {namespace}/{pod_name}: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = state
+            .store
+            .put(&pod_key, pod_bytes, Some(expected_rv))
+            .await
+        {
+            tracing::warn!(
+                "job-tracking cleanup: update pod {namespace}/{pod_name} finalizer: {e}"
+            );
+        } else {
+            tracing::info!(
+                namespace,
+                pod = %pod_name,
+                "job-tracking cleanup: removed tracking finalizer from pod"
+            );
         }
     }
 }
@@ -10030,5 +10189,128 @@ mod tests {
                  from do_patch"
             ),
         }
+    }
+
+    /// Deleting a Job must remove the `batch.kubernetes.io/job-tracking` finalizer from
+    /// owned pods so the GC cascade can complete.
+    ///
+    /// Without this fix KCM's job-controller receives a hard-delete event for the job,
+    /// returns early from syncJob ("job not found"), and never removes the tracking
+    /// finalizer from pods.  The pods are then stuck Terminating forever — GC cannot
+    /// complete because the finalizer-holder (KCM) never acts.
+    #[tokio::test]
+    async fn delete_job_removes_tracking_finalizer_from_owned_pods() {
+        let state = make_state();
+        let job_uid = "job-uid-abc123";
+        let ns = "test-ns";
+
+        // Create a pod with batch.kubernetes.io/job-tracking finalizer, owned by the job.
+        let pod_key = crate::keys::group_object_key("", "pods", Some(ns), "pod-1");
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "pod-1",
+                "namespace": ns,
+                "resourceVersion": "1",
+                "uid": "pod-uid-1",
+                "finalizers": ["batch.kubernetes.io/job-tracking"],
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": "my-job",
+                    "uid": job_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .expect("create pod");
+
+        // Act: remove the tracking finalizer (simulating job hard-delete).
+        remove_job_tracking_finalizer_from_pods(&state, ns, job_uid).await;
+
+        // Assert: pod still exists but finalizers are cleared.
+        let stored = state
+            .store
+            .get(&pod_key)
+            .await
+            .expect("store get")
+            .expect("pod must still exist — no deletionTimestamp, so not hard-deleted");
+        let stored_pod: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("deserialize pod");
+        let finalizers = stored_pod["metadata"]["finalizers"].as_array();
+        assert!(
+            finalizers.is_none() || finalizers.unwrap().is_empty(),
+            "job-tracking finalizer must be removed from the pod so the GC cascade can \
+             complete — without this, pods are stuck Terminating forever: \
+             got finalizers = {:?}",
+            stored_pod["metadata"]["finalizers"]
+        );
+    }
+
+    /// When a job is deleted and a pod owned by it already has deletionTimestamp set AND
+    /// has only the tracking finalizer (no other finalizers), the pod must be hard-deleted
+    /// immediately so the GC sees a clean DELETED event.
+    ///
+    /// Without this: the pod is stuck in Terminating state indefinitely — deletionTimestamp
+    /// is set but the finalizer prevents hard-delete, and no controller removes the finalizer.
+    #[tokio::test]
+    async fn delete_job_hard_deletes_terminating_pod_with_only_tracking_finalizer() {
+        let state = make_state();
+        let job_uid = "job-uid-xyz789";
+        let ns = "test-ns2";
+
+        // Create a pod that is already Terminating (has deletionTimestamp) + tracking finalizer.
+        let pod_key = crate::keys::group_object_key("", "pods", Some(ns), "pod-term");
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "pod-term",
+                "namespace": ns,
+                "resourceVersion": "5",
+                "uid": "pod-uid-term",
+                "deletionTimestamp": "2026-01-01T00:00:00Z",
+                "finalizers": ["batch.kubernetes.io/job-tracking"],
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": "my-job2",
+                    "uid": job_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .expect("create pod");
+
+        // Act: remove the tracking finalizer.
+        remove_job_tracking_finalizer_from_pods(&state, ns, job_uid).await;
+
+        // Assert: pod must be hard-deleted (not found in store).
+        let result = state.store.get(&pod_key).await.expect("store get");
+        assert!(
+            result.is_none(),
+            "pod with deletionTimestamp + only tracking finalizer must be hard-deleted \
+             when the job is deleted — without this, the GC cascade never completes and \
+             the pod stays Terminating forever"
+        );
     }
 }

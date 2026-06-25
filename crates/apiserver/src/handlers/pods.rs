@@ -595,71 +595,95 @@ pub async fn patch_pod<S: Store>(
     let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
-
-    let mut current_obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let spec_before = current_obj.body["spec"].clone();
 
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    match patch_type {
-        super::json_patch::PatchType::StrategicMerge => {
-            crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
-                .map_err(|e| Status::bad_request(e.to_string()))?;
-        }
-        super::json_patch::PatchType::Merge => {
-            crate::patch::merge_patch(&mut current_obj.body, &patch);
-        }
-        super::json_patch::PatchType::Json => {
-            super::json_patch::apply_json_patch(&mut current_obj.body, &patch)?;
-        }
-    }
-
-    increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
-
-    // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
-    let post_patch_meta: ObjectMeta =
-        serde_json::from_value(current_obj.body["metadata"].clone()).unwrap_or_default();
-    let deletion_ts_set = post_patch_meta.deletion_timestamp.is_some();
-    let finalizers_empty = post_patch_meta
-        .finalizers
-        .as_ref()
-        .is_none_or(|f| f.is_empty());
-
-    if deletion_ts_set && finalizers_empty {
-        state
+    // Retry loop: PATCH semantics are "apply this change to the current state". If a
+    // concurrent write (e.g. kubelet status patch) advances the stored resourceVersion
+    // between the server's read and write, re-read the fresh object and re-apply the
+    // patch rather than returning 409 to the client. Without this loop KCM's
+    // finalizer-removal PATCH never converges: the kubelet patches status faster than
+    // KCM can complete a single round-trip, so every attempt conflicts and the
+    // batch.kubernetes.io/job-tracking finalizer is never removed, leaving pods stuck
+    // Terminating forever and Job GC never completing.
+    loop {
+        let stored = state
             .store
-            .delete(&key, None)
+            .get(&key)
             .await
-            .map_err(|e| store_err_to_status(e, &name))?;
-        return Ok(Json(current_obj.body));
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+        let mut current_obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+        let spec_before = current_obj.body["spec"].clone();
+
+        match patch_type {
+            super::json_patch::PatchType::StrategicMerge => {
+                crate::patch::strategic_merge_patch(&mut current_obj.body, &patch)
+                    .map_err(|e| Status::bad_request(e.to_string()))?;
+            }
+            super::json_patch::PatchType::Merge => {
+                crate::patch::merge_patch(&mut current_obj.body, &patch);
+            }
+            super::json_patch::PatchType::Json => {
+                super::json_patch::apply_json_patch(&mut current_obj.body, &patch)?;
+            }
+        }
+
+        increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
+
+        // Post-patch: if deletionTimestamp is set and finalizers are now empty, hard-delete.
+        let post_patch_meta: ObjectMeta =
+            serde_json::from_value(current_obj.body["metadata"].clone()).unwrap_or_default();
+        let deletion_ts_set = post_patch_meta.deletion_timestamp.is_some();
+        let finalizers_empty = post_patch_meta
+            .finalizers
+            .as_ref()
+            .is_none_or(|f| f.is_empty());
+
+        tracing::debug!(
+            name = %name,
+            deletion_ts_set,
+            finalizers_empty,
+            "patch_pod: post-patch hard-delete check"
+        );
+        if deletion_ts_set && finalizers_empty {
+            tracing::debug!(name = %name, "patch_pod: hard-deleting pod (deletionTimestamp set, finalizers empty)");
+            state
+                .store
+                .delete(&key, None)
+                .await
+                .map_err(|e| store_err_to_status(e, &name))?;
+            return Ok(Json(current_obj.body));
+        }
+
+        // Dry-run: validation passed; return the would-be patched object without persisting.
+        if patch_query.is_dry_run() {
+            return Ok(Json(current_obj.body));
+        }
+
+        let expected_revision = parse_resource_version(current_obj.resource_version())?;
+
+        match state
+            .store
+            .put(&key, current_obj.to_bytes(), expected_revision)
+            .await
+        {
+            Ok(new_rv) => {
+                current_obj.set_resource_version(new_rv);
+                return Ok(Json(current_obj.body));
+            }
+            Err(StoreError::RevisionMismatch { .. }) => {
+                // A concurrent write advanced the stored revision between our read and write.
+                // Re-read the fresh object and re-apply the patch.
+                continue;
+            }
+            Err(e) => return Err(store_err_to_status(e, &name)),
+        }
     }
-
-    // Dry-run: validation passed; return the would-be patched object without persisting.
-    if patch_query.is_dry_run() {
-        return Ok(Json(current_obj.body));
-    }
-
-    // Extract expected revision from current object (after patch may have changed it)
-    let expected_revision = parse_resource_version(current_obj.resource_version())?;
-
-    let new_rv = state
-        .store
-        .put(&key, current_obj.to_bytes(), expected_revision)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
-
-    current_obj.set_resource_version(new_rv);
-
-    Ok(Json(current_obj.body))
 }
 
 use crate::util::utc_now_rfc3339;
@@ -1476,8 +1500,7 @@ pub fn apply_status_patch(
                         // kubelet to detect a phantom diff on every GET and continuously
                         // recreate the pod sandbox, preventing Job pods from ever completing.
                         continue;
-                    }
-                    if key == "conditions" {
+                    } else if key == "conditions" {
                         // Strategic merge by .type — patch conditions override stored ones by type,
                         // but stored conditions not present in the patch are preserved.
                         // Fields within a matched condition are merged; missing fields in the
@@ -1503,37 +1526,66 @@ pub fn apply_status_patch(
                         crate::patch::merge_patch(&mut result["status"][key], val);
                     }
                 }
+                // Second pass: apply $setElementOrder/conditions AFTER merge_conditions has run.
+                // Map iteration order is not guaranteed, so the ordering directive may appear
+                // before "conditions" in the first pass. Applying it in a separate pass ensures
+                // the merged array exists before we sort it.
+                if let Some(order_val) = patch_obj.get("$setElementOrder/conditions") {
+                    if let (Some(order_arr), Some(conds)) = (
+                        order_val.as_array(),
+                        result["status"]["conditions"].as_array_mut(),
+                    ) {
+                        let order: Vec<&str> = order_arr
+                            .iter()
+                            .filter_map(|v| v["type"].as_str())
+                            .collect();
+                        conds.sort_by_key(|c| {
+                            let t = c["type"].as_str().unwrap_or("");
+                            order.iter().position(|&o| o == t).unwrap_or(usize::MAX)
+                        });
+                    }
+                }
             }
         } else {
             result["status"] = patch_status.clone();
         }
     }
-    // Apply metadata changes from the patch body (labels, annotations, finalizers, etc.).
-    // Identity fields (name, namespace, uid, creationTimestamp, resourceVersion, generation)
-    // are preserved from the stored object — the status subresource cannot change them.
+    // Apply metadata changes from the patch body (labels, annotations, etc.).
+    // Identity fields and lifecycle-control fields are preserved from the stored object —
+    // the status subresource cannot change them.  In particular, `finalizers` and
+    // `deletionTimestamp` must never be changed via /status: the kubelet's status patch
+    // body reflects the pod the kubelet last saw (which may still carry the job-tracking
+    // finalizer), so without this guard every kubelet status update would restore the
+    // finalizer that KCM just removed, causing a livelock where the finalizer is never
+    // permanently removed and pods stay Terminating forever.
     if let Some(patch_meta) = patch.get("metadata") {
         if patch_meta.is_object() {
-            let saved: Vec<(&str, serde_json::Value)> = [
+            // Immutable or lifecycle-control fields: capture current value (may be null)
+            // and restore unconditionally after merge so the patch cannot change them.
+            const PROTECTED: &[&str] = &[
                 "name",
                 "namespace",
                 "uid",
                 "creationTimestamp",
                 "resourceVersion",
                 "generation",
-            ]
-            .iter()
-            .filter_map(|&k| {
-                let v = &result["metadata"][k];
-                if v.is_null() {
-                    None
-                } else {
-                    Some((k, v.clone()))
-                }
-            })
-            .collect();
+                "finalizers",
+                "deletionTimestamp",
+            ];
+            let saved: Vec<(&str, serde_json::Value)> = PROTECTED
+                .iter()
+                .map(|&k| (k, result["metadata"][k].clone()))
+                .collect();
             crate::patch::merge_patch(&mut result["metadata"], patch_meta);
             for (k, v) in saved {
-                result["metadata"][k] = v;
+                if v.is_null() {
+                    // Field was absent in stored object; remove it if the patch added it.
+                    if let Some(meta_obj) = result["metadata"].as_object_mut() {
+                        meta_obj.remove(k);
+                    }
+                } else {
+                    result["metadata"][k] = v;
+                }
             }
         }
     }
@@ -1632,31 +1684,39 @@ pub async fn patch_pod_status<S: Store>(
     let ns = parse_namespace(&raw_ns, &state).await?;
 
     let key = object_key("pods", ns.as_str(), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
-
-    let mut current_obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
 
-    current_obj.body = apply_status_patch(&current_obj.body, &patch);
+    // Retry on RevisionMismatch: PATCH is not a conditional operation — re-read and
+    // re-apply when a concurrent write advances the stored rv between our read and write.
+    loop {
+        let stored = state
+            .store
+            .get(&key)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .ok_or_else(|| Status::not_found(&name, "Pod"))?;
 
-    let expected_rv = parse_resource_version(current_obj.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, current_obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| store_err_to_status(e, &name))?;
+        let mut current_obj = Object::from_bytes(&stored.value)
+            .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
-    current_obj.set_resource_version(new_rv);
+        current_obj.body = apply_status_patch(&current_obj.body, &patch);
 
-    Ok(Json(current_obj.body))
+        let expected_rv = parse_resource_version(current_obj.resource_version())?;
+        match state
+            .store
+            .put(&key, current_obj.to_bytes(), expected_rv)
+            .await
+        {
+            Ok(new_rv) => {
+                current_obj.set_resource_version(new_rv);
+                return Ok(Json(current_obj.body));
+            }
+            Err(StoreError::RevisionMismatch { .. }) => continue,
+            Err(e) => return Err(store_err_to_status(e, &name)),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2418,6 +2478,69 @@ mod status_tests {
         assert_eq!(
             result["status"]["podIP"], "10.85.0.5",
             "real status fields must still be applied"
+        );
+    }
+
+    /// apply_status_patch must reorder conditions to match $setElementOrder/conditions.
+    ///
+    /// The kubelet sends $setElementOrder/conditions on every status PATCH requesting a
+    /// specific condition ordering. Without honouring this ordering, the kubelet sees a
+    /// different order on each GET and re-sends PATCH, causing ~1-2 reconcile cycles per
+    /// second. This continuous churn prevents Job pods from holding Running phase long
+    /// enough for conformance tests to pass.
+    #[test]
+    fn set_element_order_conditions_reorders_stored_conditions() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "job-pod", "namespace": "default", "resourceVersion": "5"},
+            "spec": {},
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"},
+                    {"type": "Initialized", "status": "True"},
+                    {"type": "ContainersReady", "status": "True"},
+                    {"type": "Ready", "status": "True"}
+                ]
+            }
+        });
+        let patch = serde_json::json!({
+            "status": {
+                "conditions": [
+                    {"type": "PodReadyToStartContainers", "status": "True"},
+                    {"type": "Initialized", "status": "True"},
+                    {"type": "Ready", "status": "True"},
+                    {"type": "ContainersReady", "status": "True"},
+                    {"type": "PodScheduled", "status": "True"}
+                ],
+                "$setElementOrder/conditions": [
+                    {"type": "PodReadyToStartContainers"},
+                    {"type": "Initialized"},
+                    {"type": "Ready"},
+                    {"type": "ContainersReady"},
+                    {"type": "PodScheduled"}
+                ]
+            }
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+        let conds = result["status"]["conditions"]
+            .as_array()
+            .expect("conditions must be an array");
+
+        assert_eq!(
+            conds[0]["type"], "PodReadyToStartContainers",
+            "PodReadyToStartContainers must be first per $setElementOrder — \
+             without this, kubelet detects ordering mismatch on every GET and \
+             re-sends PATCH causing ~1-2 reconciles/sec preventing Job pods from \
+             holding Running phase"
+        );
+        assert_eq!(conds[1]["type"], "Initialized");
+        assert_eq!(conds[2]["type"], "Ready");
+        assert_eq!(conds[3]["type"], "ContainersReady");
+        assert_eq!(
+            conds[4]["type"], "PodScheduled",
+            "PodScheduled must be last per $setElementOrder"
         );
     }
 }
@@ -6468,6 +6591,216 @@ mod handler_tests {
             "PATCH /resize on non-existent pod must return 404"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // patch_pod — retry on RevisionMismatch (Job finalizer-removal convergence)
+    // ---------------------------------------------------------------------------
+
+    /// A store wrapper that injects a single RevisionMismatch on the first put() after
+    /// arm() is called, then delegates all subsequent calls to the inner SqliteStore.
+    ///
+    /// This simulates a concurrent kubelet status patch that advances the stored
+    /// resourceVersion between the PATCH handler's internal read and write.
+    struct ConflictInjectStore {
+        inner: Arc<SqliteStore>,
+        inject_next: std::sync::atomic::AtomicBool,
+    }
+
+    impl ConflictInjectStore {
+        fn new(inner: Arc<SqliteStore>) -> Self {
+            Self {
+                inner,
+                inject_next: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.inject_next
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl u7s_store::Store for ConflictInjectStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inject = self
+                .inject_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move {
+                if inject {
+                    // Simulate concurrent kubelet status patch advancing the rv.
+                    // Perform the actual write first so the retry reads fresh data.
+                    let _ = inner.put(&key, value, None).await;
+                    Err(u7s_store::StoreError::RevisionMismatch {
+                        expected: 1,
+                        current: 99,
+                    })
+                } else {
+                    inner.put(&key, value, expected_revision).await
+                }
+            }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, Bytes)>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+    }
+
+    /// patch_pod must retry internally on RevisionMismatch rather than returning 409 to the
+    /// client. Without the retry loop, KCM's finalizer-removal PATCH conflicts with concurrent
+    /// kubelet status patches and the batch.kubernetes.io/job-tracking finalizer is never
+    /// removed: pods stay stuck Terminating forever and Job GC never completes.
+    ///
+    /// This test injects a RevisionMismatch on the first put() inside patch_pod, simulating a
+    /// concurrent write that advances the stored rv between the handler's read and write. The
+    /// handler must retry, re-read the fresh object, re-apply the patch, and succeed (200).
+    #[tokio::test]
+    async fn patch_pod_retries_on_revision_mismatch_so_finalizer_removal_converges() {
+        let inner = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let conflict_store = Arc::new(ConflictInjectStore::new(Arc::clone(&inner)));
+
+        // Seed namespace and a pod with a finalizer and deletionTimestamp.
+        let ns_key = "/registry/namespaces/default";
+        inner
+            .put(
+                ns_key,
+                Bytes::from(
+                    serde_json::to_vec(
+                        &serde_json::json!({"kind":"Namespace","metadata":{"name":"default"}}),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod_key = "/registry/pods/default/job-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "job-pod",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2025-01-01T00:00:00Z",
+                "finalizers": ["batch.kubernetes.io/job-tracking"]
+            },
+            "spec": {}
+        });
+        inner
+            .put(
+                pod_key,
+                Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Arm the store: first put() inside patch_pod will return RevisionMismatch.
+        conflict_store.arm();
+
+        let state = AppState::new(
+            Arc::clone(&conflict_store),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods/{name}", patch(patch_pod))
+            .with_state(state);
+
+        // KCM removes the job-tracking finalizer via a merge PATCH.
+        let patch_body = serde_json::json!({"metadata": {"finalizers": []}});
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/pods/job-pod")
+            .header(header::CONTENT_TYPE, "application/merge-patch+json")
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "patch_pod must retry on RevisionMismatch and succeed (200) rather than returning \
+             409 Conflict; without the retry loop KCM's finalizer-removal PATCH never converges \
+             when the kubelet patches status concurrently, leaving Job pods stuck Terminating"
+        );
+
+        // Pod must be hard-deleted: deletionTimestamp was set and finalizers are now empty.
+        let stored = inner.get(pod_key).await.unwrap();
+        assert!(
+            stored.is_none(),
+            "pod must be hard-deleted after finalizer removal (deletionTimestamp set, \
+             finalizers empty); if patch_pod 409-conflicts on RevisionMismatch instead of \
+             retrying, the finalizer stays and Job GC never completes"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7382,6 +7715,63 @@ mod status_patch_metadata_tests {
         assert_eq!(
             result["metadata"]["annotations"]["k"], "v",
             "metadata annotation must also land"
+        );
+    }
+
+    /// PATCH /pods/{name}/status must NOT change finalizers even if the kubelet includes them.
+    /// The kubelet constructs its status patch from the pod it last saw. If the kubelet's cache
+    /// still has the job-tracking finalizer, the patch body carries it. Without this guard,
+    /// every kubelet status update restores the finalizer KCM just removed, causing a livelock
+    /// where the finalizer is never permanently cleared and pods stay Terminating forever.
+    #[test]
+    fn apply_status_patch_does_not_restore_finalizers() {
+        let stored = serde_json::json!({
+            "metadata": {
+                "name": "job-pod",
+                "namespace": "test",
+                "uid": "uid-1",
+                "finalizers": []
+            },
+            "spec": {},
+            "status": { "phase": "Succeeded" }
+        });
+        let patch = serde_json::json!({
+            "metadata": {
+                "finalizers": ["batch.kubernetes.io/job-tracking"]
+            },
+            "status": { "phase": "Succeeded", "conditions": [] }
+        });
+        let result = apply_status_patch(&stored, &patch);
+        let finalizers = result["metadata"]["finalizers"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(
+            finalizers, 0,
+            "status subresource must not restore finalizers from the patch body; \
+             if it does, KCM's finalizer removal and kubelet status updates create a livelock \
+             that keeps pods stuck Terminating forever"
+        );
+    }
+
+    /// PATCH /pods/{name}/status must NOT set deletionTimestamp from the patch body.
+    /// deletionTimestamp is stamped by the delete handler; a status patch must not add or remove it.
+    #[test]
+    fn apply_status_patch_does_not_set_deletion_timestamp() {
+        let stored = serde_json::json!({
+            "metadata": { "name": "mypod", "uid": "uid-1" },
+            "spec": {},
+            "status": {}
+        });
+        let patch = serde_json::json!({
+            "metadata": { "deletionTimestamp": "2026-06-25T00:00:00Z" },
+            "status": { "phase": "Running" }
+        });
+        let result = apply_status_patch(&stored, &patch);
+        assert!(
+            result["metadata"]["deletionTimestamp"].is_null(),
+            "status subresource must not set deletionTimestamp; \
+             only the delete handler may stamp it, otherwise soft-delete semantics break"
         );
     }
 }

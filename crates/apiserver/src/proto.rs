@@ -1680,8 +1680,8 @@ struct RoleBinding {
 /// JobSpec — k8s.io/api/batch/v1/generated.proto
 /// Source: k8s.io/api/batch/v1/generated.proto message JobSpec
 /// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-/// Only scalar/string fields are decoded; template (field 5, PodTemplateSpec) is skipped —
-/// PodSpec is deeply nested and the same strategy as PodTemplate applies.
+/// Only scalar/string fields are decoded; template (field 6, PodTemplateSpec) is decoded
+/// as a nested message so container definitions are preserved and pods can start.
 #[derive(Clone, PartialEq, Message)]
 struct JobSpec {
     /// parallelism (field 1, int32)
@@ -1699,9 +1699,9 @@ struct JobSpec {
     /// manualSelector (field 5, bool)
     #[prost(bool, tag = "5")]
     manual_selector: bool,
-    /// template (field 6, PodTemplateSpec) — decoded as raw bytes; PodSpec is deeply nested
-    #[prost(bytes = "vec", tag = "6")]
-    template: Vec<u8>,
+    /// template (field 6, PodTemplateSpec) — decoded as nested message to preserve containers
+    #[prost(message, tag = "6")]
+    template: Option<AppsPodTemplateSpec>,
     /// backoffLimit (field 7, int32)
     #[prost(int32, tag = "7")]
     backoff_limit: i32,
@@ -3556,8 +3556,6 @@ pub fn decode_token_review_proto(data: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// Convert a prost JobSpec into a serde_json::Value object.
-/// The template field (PodTemplateSpec) is omitted — PodSpec is deeply nested and
-/// the same pattern as PodTemplate applies: store as empty object so the schema is valid.
 fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if spec.parallelism != 0 {
@@ -3623,11 +3621,20 @@ fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
             serde_json::Value::String(spec.managed_by),
         );
     }
-    // template is always present as an empty object — required by the k8s schema
-    m.insert(
-        "template".to_string(),
-        serde_json::Value::Object(serde_json::Map::new()),
-    );
+    // Decode the pod template so containers are preserved; fall back to empty object.
+    let tmpl_json = if let Some(tmpl) = spec.template {
+        let mut t = serde_json::json!({});
+        if let Some(meta) = tmpl.metadata {
+            t["metadata"] = object_meta_to_json(meta);
+        }
+        if let Some(pod_spec) = tmpl.spec {
+            t["spec"] = pod_spec_to_json(pod_spec);
+        }
+        t
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+    m.insert("template".to_string(), tmpl_json);
     serde_json::Value::Object(m)
 }
 
@@ -9741,7 +9748,13 @@ mod tests {
                         // when the struct has template at tag=5 and backoffLimit at tag=6,
                         // because kubectl puts template at wire field 6 (LEN type) which
                         // collides with the mislocated backoffLimit (int32, varint type).
-                        template: vec![0x0a, 0x02, 0x08, 0x01], // minimal PodTemplateSpec bytes
+                        template: Some(AppsPodTemplateSpec {
+                            metadata: Some(ObjectMeta {
+                                name: "pod-tmpl".to_string(),
+                                ..Default::default()
+                            }),
+                            spec: None,
+                        }),
                         backoff_limit: 3,
                         ..Default::default()
                     }),
@@ -9947,6 +9960,80 @@ mod tests {
         assert_eq!(result["metadata"]["name"], "success-policy-job");
         assert_eq!(result["spec"]["completionMode"], "Indexed");
         assert_eq!(result["spec"]["completions"], 3);
+    }
+
+    /// decode_job_proto must preserve spec.template.spec.containers from the proto body.
+    ///
+    /// KCM creates Jobs from a proto-encoded JobSpec where spec.template contains a full
+    /// PodTemplateSpec with containers. If job_spec_to_json stores template as an empty {}
+    /// object (discarding all container definitions), KCM creates Job pods with containers:null.
+    /// The kubelet cannot start pods with no containers — it churns the sandbox ~1-2/sec and
+    /// pods never reach Running, so conformance tests time out waiting at "Ensuring active pods
+    /// == parallelism" rather than the GC phase.
+    #[test]
+    fn decode_job_proto_preserves_template_containers() {
+        use prost::Message as _;
+
+        let job = Job {
+            metadata: Some(ObjectMeta {
+                name: "batch-job".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(JobSpec {
+                parallelism: 2,
+                completions: 4,
+                backoff_limit: 6,
+                template: Some(AppsPodTemplateSpec {
+                    metadata: None,
+                    spec: Some(PodSpec {
+                        containers: vec![Container {
+                            name: "main".to_string(),
+                            image: "registry.k8s.io/pause:3.10.1".to_string(),
+                            ..Default::default()
+                        }],
+                        restart_policy: "Never".to_string(),
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_job_proto(&buf).expect(
+            "decode_job_proto must return Some for a Job with a template containing containers",
+        );
+
+        assert_eq!(result["kind"], "Job");
+        let tmpl = &result["spec"]["template"];
+        assert!(
+            tmpl.is_object() && !tmpl.as_object().unwrap().is_empty(),
+            "spec.template must be decoded from proto, not stored as an empty {{}} object; \
+             an empty template discards container definitions and the kubelet cannot start pods"
+        );
+        let containers = tmpl["spec"]["containers"]
+            .as_array()
+            .expect("spec.template.spec.containers must be an array");
+        assert_eq!(
+            containers.len(),
+            1,
+            "spec.template.spec.containers must preserve all containers from proto; \
+             if containers are lost, Job pods have containers:null, the kubelet churns \
+             the sandbox ~1-2/sec and pods never reach Running"
+        );
+        assert_eq!(
+            containers[0]["name"], "main",
+            "container name must survive proto decode"
+        );
+        assert_eq!(
+            containers[0]["image"], "registry.k8s.io/pause:3.10.1",
+            "container image must survive proto decode — without this the kubelet \
+             cannot pull the image and pods stay stuck in Pending"
+        );
     }
 
     // ---------------------------------------------------------------------------
