@@ -111,14 +111,42 @@ impl SqliteStore {
                 }
             }
         }
-        // Also persist deletion tombstones to the deletion_log independently of the main ring.
-        // When the main ring compacts and evicts old entries, deletion events can be lost.
-        // The deletion_log maps each store key to its latest DELETED event. Using a HashMap
-        // ensures tombstones are never evicted by unrelated writes: a namespace deleted early
-        // in a long conformance run retains its tombstone regardless of write volume.
-        if event.value.is_none() {
+        // Maintain the deletion_log: persist tombstones so watchers that reconnect after ring
+        // compaction can still receive DELETED events for objects deleted before compaction.
+        //
+        // Eviction policy (two-pronged to bound memory without dropping needed tombstones):
+        //
+        // 1. Evict-on-recreate: when a PUT event arrives for a key that has a tombstone in
+        //    deletion_log, remove it. The tombstone is stale — the key now exists again, so
+        //    any watcher reconnecting will see the live object in a fresh list response. Keeping
+        //    a DELETED tombstone for a live key would cause a watcher to emit a spurious DELETED
+        //    event for the current incarnation.
+        //
+        // 2. Cap at 2×RING_CAPACITY: after inserting a new tombstone, if the map exceeds the
+        //    cap, evict the entry with the lowest revision. The cap is generous enough (2×1000)
+        //    to cover any watcher within the ring window; tombstones evicted by this path are
+        //    for keys deleted more than 2000 writes ago, which any active watcher has already
+        //    processed via the broadcast channel.
+        {
             let mut guard = self.deletion_log.write().expect("deletion_log poisoned");
-            guard.insert(event.key.clone(), Arc::clone(&event));
+            if event.value.is_none() {
+                // Deletion: insert tombstone then cap the map.
+                guard.insert(event.key.clone(), Arc::clone(&event));
+                const DELETION_LOG_CAP: usize = 2 * RING_CAPACITY;
+                if guard.len() > DELETION_LOG_CAP {
+                    // Find and remove the entry with the smallest revision.
+                    if let Some(oldest_key) = guard
+                        .iter()
+                        .min_by_key(|(_, e)| e.revision)
+                        .map(|(k, _)| k.clone())
+                    {
+                        guard.remove(&oldest_key);
+                    }
+                }
+            } else {
+                // Creation/update: evict any stale tombstone for this key.
+                guard.remove(&event.key);
+            }
         }
         // Best-effort broadcast of the specific event.
         let event_revision = event.revision;
@@ -1563,5 +1591,93 @@ mod tests {
              ns indexed column was not correctly populated by the single-parse put path, \
              breaking all namespace-scoped list queries"
         );
+    }
+
+    /// deletion_log must NOT retain a tombstone after the deleted key is re-created via PUT.
+    ///
+    /// Why it matters: keeping a DELETED tombstone for a live key causes a watcher reconnecting
+    /// after compaction to receive a spurious DELETED event for the current (live) incarnation
+    /// of the key, making controllers believe the object was deleted and stop reconciling —
+    /// an unbounded deletion_log also leaks one Arc<InternalEvent> (full object body) per
+    /// ever-deleted key, growing without bound on a long-running server.
+    #[tokio::test]
+    async fn deletion_log_evicts_tombstone_on_recreate() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/namespaces/ns-a";
+        let val =
+            Bytes::from(r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"ns-a"}}"#);
+
+        // Create, then delete the key — tombstone enters deletion_log.
+        store
+            .put(key, val.clone(), None)
+            .await
+            .expect("put must succeed");
+        store.delete(key, None).await.expect("delete must succeed");
+
+        {
+            let guard = store.deletion_log.read().expect("deletion_log poisoned");
+            assert!(
+                guard.contains_key(key),
+                "deletion_log must contain tombstone for deleted key; test setup broken"
+            );
+        }
+
+        // Re-create the key via PUT — tombstone must be evicted.
+        store
+            .put(key, val, None)
+            .await
+            .expect("recreate must succeed");
+
+        {
+            let guard = store.deletion_log.read().expect("deletion_log poisoned");
+            assert!(
+                !guard.contains_key(key),
+                "deletion_log must NOT retain tombstone after key is re-created; retaining it \
+                 causes watchers reconnecting after compaction to receive a spurious DELETED event \
+                 for the live object, making controllers stop reconciling the re-created resource"
+            );
+        }
+    }
+
+    /// deletion_log must retain tombstones for recently-deleted keys that have not been
+    /// re-created, so a watcher reconnecting after compaction still receives DELETED events.
+    ///
+    /// Why it matters: evicting too aggressively drops DELETED events a watcher needs —
+    /// a watcher that reconnects after the ring is compacted relies on deletion_log to
+    /// receive tombstones for objects deleted during the compaction window; without them
+    /// the watcher deadlocks waiting for a DELETED event that never arrives.
+    #[tokio::test]
+    async fn deletion_log_retains_tombstone_for_deleted_key_not_recreated() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        // Delete several keys without re-creating them — all tombstones must survive.
+        for i in 0..5u32 {
+            let key = format!("/registry/core/namespaces/ns-{i}");
+            let val = Bytes::from(format!(
+                r#"{{"apiVersion":"v1","kind":"Namespace","metadata":{{"name":"ns-{i}"}}}}"#
+            ));
+            store.put(&key, val, None).await.expect("put must succeed");
+            store.delete(&key, None).await.expect("delete must succeed");
+        }
+
+        // Perform additional writes (non-deletions) that do NOT touch the deleted keys.
+        for i in 0..10u32 {
+            let key = format!("/registry/core/configmaps/default/cm-{i}");
+            let val = Bytes::from(format!(
+                r#"{{"apiVersion":"v1","kind":"ConfigMap","metadata":{{"name":"cm-{i}","namespace":"default"}}}}"#
+            ));
+            store.put(&key, val, None).await.expect("put must succeed");
+        }
+
+        let guard = store.deletion_log.read().expect("deletion_log poisoned");
+        for i in 0..5u32 {
+            let key = format!("/registry/core/namespaces/ns-{i}");
+            assert!(
+                guard.contains_key(&key),
+                "deletion_log must retain tombstone for ns-{i} (not re-created); evicting it \
+                 would cause a reconnecting watcher to miss the DELETED event, deadlocking any \
+                 controller waiting for the namespace deletion to complete"
+            );
+        }
     }
 }
