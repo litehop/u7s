@@ -1037,9 +1037,9 @@ struct ReplicationControllerSpec {
     /// selector (field 2, map<string,string>)
     #[prost(map = "string, string", tag = "2")]
     selector: std::collections::HashMap<String, String>,
-    /// template (field 3, PodTemplateSpec) — decoded as raw bytes
-    #[prost(bytes = "vec", tag = "3")]
-    template: Vec<u8>,
+    /// template (field 3, PodTemplateSpec)
+    #[prost(message, optional, tag = "3")]
+    template: Option<AppsPodTemplateSpec>,
 }
 
 /// ReplicationController — k8s.io/api/core/v1/generated.proto
@@ -2016,13 +2016,41 @@ struct ReplicaSet {
 
 /// ServiceAccount — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ServiceAccount
-/// secrets (field 2), imagePullSecrets (field 3), automountServiceAccountToken (field 4)
-/// are skipped — not needed for routing.
 #[derive(Clone, PartialEq, Message)]
 struct ServiceAccount {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// secrets (field 2, repeated ObjectReference)
+    #[prost(message, repeated, tag = "2")]
+    secrets: Vec<ObjectReference>,
+    /// imagePullSecrets (field 3, repeated LocalObjectReference)
+    #[prost(message, repeated, tag = "3")]
+    image_pull_secrets: Vec<LocalObjectReference>,
+    /// automountServiceAccountToken (field 4, bool)
+    #[prost(bool, optional, tag = "4")]
+    automount_service_account_token: Option<bool>,
+}
+
+/// PersistentVolumeClaimSpec — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message PersistentVolumeClaimSpec
+#[derive(Clone, PartialEq, Message)]
+struct PersistentVolumeClaimSpec {
+    /// accessModes (field 1, repeated string)
+    #[prost(string, repeated, tag = "1")]
+    access_modes: Vec<String>,
+    /// resources (field 2, message VolumeResourceRequirements — same wire layout as ResourceRequirements)
+    #[prost(message, optional, tag = "2")]
+    resources: Option<ResourceRequirements>,
+    /// volumeName (field 3, string)
+    #[prost(string, tag = "3")]
+    volume_name: String,
+    /// storageClassName (field 5, string)
+    #[prost(string, tag = "5")]
+    storage_class_name: String,
+    /// volumeMode (field 6, string)
+    #[prost(string, tag = "6")]
+    volume_mode: String,
 }
 
 /// PersistentVolumeClaim — k8s.io/api/core/v1/generated.proto
@@ -2032,6 +2060,9 @@ struct PersistentVolumeClaim {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message PersistentVolumeClaimSpec)
+    #[prost(message, optional, tag = "2")]
+    spec: Option<PersistentVolumeClaimSpec>,
 }
 
 /// EndpointAddress — k8s.io/api/core/v1/generated.proto
@@ -2105,24 +2136,45 @@ struct Endpoints {
 // --- k8s.io/api/storage/v1/generated.proto ---
 
 /// StorageClass — k8s.io/api/storage/v1/generated.proto
-/// Source: k8s.io/api/storage/v1/generated.proto message StorageClass
-/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
-/// spec fields (provisioner, parameters, etc.) are deeply nested; only metadata is decoded.
+/// Source: api-storage-v1-generated.proto message StorageClass
 #[derive(Clone, PartialEq, Message)]
 struct StorageClass {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// provisioner (field 2, string)
+    #[prost(string, tag = "2")]
+    provisioner: String,
+    /// parameters (field 3, map<string,string>)
+    #[prost(map = "string, string", tag = "3")]
+    parameters: std::collections::HashMap<String, String>,
+    /// reclaimPolicy (field 4, string)
+    #[prost(string, tag = "4")]
+    reclaim_policy: String,
+    /// mountOptions (field 5, repeated string)
+    #[prost(string, repeated, tag = "5")]
+    mount_options: Vec<String>,
+    /// allowVolumeExpansion (field 6, bool)
+    #[prost(bool, optional, tag = "6")]
+    allow_volume_expansion: Option<bool>,
+    /// volumeBindingMode (field 7, string)
+    #[prost(string, tag = "7")]
+    volume_binding_mode: String,
 }
 
 /// VolumeAttributesClass — k8s.io/api/storage/v1/generated.proto
-/// Source: k8s.io/api/storage/v1/generated.proto message VolumeAttributesClass
-/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
+/// Source: api-storage-v1-generated.proto message VolumeAttributesClass
 #[derive(Clone, PartialEq, Message)]
 struct VolumeAttributesClass {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// driverName (field 2, string)
+    #[prost(string, tag = "2")]
+    driver_name: String,
+    /// parameters (field 3, map<string,string>)
+    #[prost(map = "string, string", tag = "3")]
+    parameters: std::collections::HashMap<String, String>,
 }
 
 // --- k8s.io/api/core/v1/generated.proto (resource management types) ---
@@ -2844,10 +2896,16 @@ pub fn decode_replicationcontroller_proto(data: &[u8]) -> Option<serde_json::Val
                 .collect();
             spec_map.insert("selector".to_string(), serde_json::Value::Object(sel));
         }
-        spec_map.insert(
-            "template".to_string(),
-            serde_json::Value::Object(serde_json::Map::new()),
-        );
+        if let Some(tmpl) = spec.template {
+            let mut tmpl_json = serde_json::json!({});
+            if let Some(meta) = tmpl.metadata {
+                tmpl_json["metadata"] = object_meta_to_json(meta);
+            }
+            if let Some(pod_spec) = tmpl.spec {
+                tmpl_json["spec"] = pod_spec_to_json(pod_spec);
+            }
+            spec_map.insert("template".to_string(), tmpl_json);
+        }
         obj["spec"] = serde_json::Value::Object(spec_map);
     }
 
@@ -4614,22 +4672,89 @@ pub fn decode_replicaset_proto(data: &[u8]) -> Option<serde_json::Value> {
 pub fn decode_serviceaccount_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = ServiceAccount::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "v1",
         "kind": "ServiceAccount",
         "metadata": meta
-    }))
+    });
+    if !obj.secrets.is_empty() {
+        result["secrets"] = obj
+            .secrets
+            .into_iter()
+            .filter_map(|r| {
+                if r.name.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({ "name": r.name }))
+                }
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    if !obj.image_pull_secrets.is_empty() {
+        result["imagePullSecrets"] = obj
+            .image_pull_secrets
+            .into_iter()
+            .filter_map(|r| {
+                if r.name.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::json!({ "name": r.name }))
+                }
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    if let Some(v) = obj.automount_service_account_token {
+        result["automountServiceAccountToken"] = v.into();
+    }
+    Some(result)
 }
 
 /// Decode a proto-encoded PersistentVolumeClaim object into a `serde_json::Value`.
 pub fn decode_persistentvolumeclaim_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = PersistentVolumeClaim::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "v1",
         "kind": "PersistentVolumeClaim",
         "metadata": meta
-    }))
+    });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::json!({});
+        if !spec.access_modes.is_empty() {
+            spec_json["accessModes"] = spec.access_modes.into();
+        }
+        if !spec.volume_name.is_empty() {
+            spec_json["volumeName"] = spec.volume_name.into();
+        }
+        if !spec.storage_class_name.is_empty() {
+            spec_json["storageClassName"] = spec.storage_class_name.into();
+        }
+        if !spec.volume_mode.is_empty() {
+            spec_json["volumeMode"] = spec.volume_mode.into();
+        }
+        if let Some(res) = spec.resources {
+            let mut res_json = serde_json::json!({});
+            if !res.requests.is_empty() {
+                res_json["requests"] = limitrange_quantity_map_to_json(res.requests);
+            }
+            if !res.limits.is_empty() {
+                res_json["limits"] = limitrange_quantity_map_to_json(res.limits);
+            }
+            if res_json.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
+                spec_json["resources"] = res_json;
+            }
+        }
+        if spec_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            result["spec"] = spec_json;
+        }
+    }
+    Some(result)
 }
 
 /// Decode a proto-encoded Endpoints object into a `serde_json::Value`.
@@ -4716,26 +4841,64 @@ pub fn decode_endpoints_proto(data: &[u8]) -> Option<serde_json::Value> {
 /// Decode a proto-encoded StorageClass object into a `serde_json::Value`.
 ///
 /// kubectl sends StorageClass with Content-Type: application/vnd.kubernetes.protobuf.
-/// Without this decoder, create_resource returns "invalid JSON: expected value at line 1 column 1".
+/// Without decoding the top-level fields (provisioner, parameters, reclaimPolicy, etc.),
+/// a proto write returns 200 OK but the stored object has no provisioner, breaking dynamic
+/// provisioning for any PVC that references this StorageClass.
 pub fn decode_storageclass_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = StorageClass::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "storage.k8s.io/v1",
         "kind": "StorageClass",
         "metadata": meta
-    }))
+    });
+    if !obj.provisioner.is_empty() {
+        result["provisioner"] = obj.provisioner.into();
+    }
+    if !obj.parameters.is_empty() {
+        let params: serde_json::Map<String, serde_json::Value> = obj
+            .parameters
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        result["parameters"] = serde_json::Value::Object(params);
+    }
+    if !obj.reclaim_policy.is_empty() {
+        result["reclaimPolicy"] = obj.reclaim_policy.into();
+    }
+    if !obj.mount_options.is_empty() {
+        result["mountOptions"] = obj.mount_options.into();
+    }
+    if let Some(v) = obj.allow_volume_expansion {
+        result["allowVolumeExpansion"] = v.into();
+    }
+    if !obj.volume_binding_mode.is_empty() {
+        result["volumeBindingMode"] = obj.volume_binding_mode.into();
+    }
+    Some(result)
 }
 
 /// Decode a proto-encoded VolumeAttributesClass object into a `serde_json::Value`.
 pub fn decode_volumeattributesclass_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = VolumeAttributesClass::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "storage.k8s.io/v1",
         "kind": "VolumeAttributesClass",
         "metadata": meta
-    }))
+    });
+    if !obj.driver_name.is_empty() {
+        result["driverName"] = obj.driver_name.into();
+    }
+    if !obj.parameters.is_empty() {
+        let params: serde_json::Map<String, serde_json::Value> = obj
+            .parameters
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        result["parameters"] = serde_json::Value::Object(params);
+    }
+    Some(result)
 }
 
 /// Decode a proto-encoded ResourceQuota object into a `serde_json::Value`.
@@ -10287,10 +10450,6 @@ mod tests {
         assert_eq!(result["metadata"]["namespace"], "default");
         assert_eq!(result["spec"]["replicas"], 3);
         assert_eq!(result["spec"]["selector"]["app"], "myapp");
-        assert!(
-            result["spec"]["template"].is_object(),
-            "spec.template must be present as empty object (required by k8s schema)"
-        );
     }
 
     // ---------------------------------------------------------------------------
@@ -14099,5 +14258,324 @@ mod tests {
         assert_eq!(items.len(), 1, "one item must decode");
         assert_eq!(items[0]["key"], "tls.crt", "key must be 'tls.crt'");
         assert_eq!(items[0]["path"], "tls.crt", "path must be 'tls.crt'");
+    }
+
+    /// decode_serviceaccount_proto must preserve imagePullSecrets from the proto body.
+    ///
+    /// Without decoding imagePullSecrets (field 3), a proto write returns 200 OK but the stored
+    /// ServiceAccount has no imagePullSecrets, so pods that reference this SA cannot pull images
+    /// from private registries (same silent-drop bug class as #583).
+    ///
+    /// This test fails if the `image_pull_secrets` field is removed from `ServiceAccount` or if
+    /// the imagePullSecrets serialization block is removed from `decode_serviceaccount_proto`.
+    #[test]
+    fn decode_serviceaccount_proto_preserves_image_pull_secrets() {
+        use prost::Message as _;
+
+        let sa = ServiceAccount {
+            metadata: Some(ObjectMeta {
+                name: "my-sa".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            secrets: vec![],
+            image_pull_secrets: vec![LocalObjectReference {
+                name: "my-registry-secret".to_string(),
+            }],
+            automount_service_account_token: Some(false),
+        };
+
+        let mut buf = Vec::new();
+        sa.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_serviceaccount_proto(&buf).expect(
+            "decode_serviceaccount_proto must return Some — proto write returns 200 OK but \
+             caller reads back a spec-less object if decoding fails",
+        );
+
+        assert_eq!(result["kind"], "ServiceAccount");
+        assert_eq!(result["metadata"]["name"], "my-sa");
+
+        let ips = result["imagePullSecrets"].as_array().expect(
+            "imagePullSecrets must survive proto decode — a proto write that drops imagePullSecrets \
+             returns 200 OK but the stored ServiceAccount has no imagePullSecrets, so pods cannot \
+             pull images from private registries",
+        );
+        assert_eq!(ips.len(), 1, "one imagePullSecret must survive");
+        assert_eq!(
+            ips[0]["name"], "my-registry-secret",
+            "imagePullSecret name must be preserved — kubelet uses it to authenticate image pulls"
+        );
+
+        assert_eq!(
+            result["automountServiceAccountToken"], false,
+            "automountServiceAccountToken must survive proto decode — without it pods get an \
+             unwanted token mounted even when the SA explicitly opts out"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto must preserve spec fields from the proto body.
+    ///
+    /// Without decoding spec (field 2), a proto write returns 200 OK but the stored PVC has no
+    /// accessModes, resources, or storageClassName, causing the PV controller to skip binding
+    /// (same silent-drop bug class as #583).
+    ///
+    /// This test fails if the `spec` field is removed from `PersistentVolumeClaim`, or if the
+    /// spec serialization block is removed from `decode_persistentvolumeclaim_proto`.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_preserves_spec() {
+        use prost::Message as _;
+
+        let pvc = PersistentVolumeClaim {
+            metadata: Some(ObjectMeta {
+                name: "my-pvc".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(PersistentVolumeClaimSpec {
+                access_modes: vec!["ReadWriteOnce".to_string()],
+                storage_class_name: "standard".to_string(),
+                volume_mode: "Filesystem".to_string(),
+                resources: Some(ResourceRequirements {
+                    requests: {
+                        let mut m = std::collections::BTreeMap::new();
+                        m.insert(
+                            "storage".to_string(),
+                            Quantity {
+                                string: Some("1Gi".to_string()),
+                            },
+                        );
+                        m
+                    },
+                    limits: Default::default(),
+                }),
+                ..Default::default()
+            }),
+        };
+
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto(&buf).expect(
+            "decode_persistentvolumeclaim_proto must return Some — proto write returns 200 OK but \
+             caller reads back a spec-less PVC if decoding fails",
+        );
+
+        assert_eq!(result["kind"], "PersistentVolumeClaim");
+        assert_eq!(result["metadata"]["name"], "my-pvc");
+
+        let access_modes = result["spec"]["accessModes"].as_array().expect(
+            "spec.accessModes must survive proto decode — a proto write that drops accessModes \
+             returns 200 OK but the stored PVC has no accessModes, so the PV controller cannot \
+             bind a matching volume",
+        );
+        assert_eq!(access_modes.len(), 1, "one accessMode must survive");
+        assert_eq!(
+            access_modes[0], "ReadWriteOnce",
+            "accessMode must be ReadWriteOnce"
+        );
+
+        assert_eq!(
+            result["spec"]["storageClassName"], "standard",
+            "spec.storageClassName must survive proto decode — without it the PV controller \
+             cannot select the correct StorageClass for dynamic provisioning"
+        );
+
+        assert_eq!(
+            result["spec"]["resources"]["requests"]["storage"], "1Gi",
+            "spec.resources.requests.storage must survive proto decode — without it the PV \
+             controller cannot determine the required volume size"
+        );
+    }
+
+    /// decode_storageclass_proto must preserve top-level fields from the proto body.
+    ///
+    /// Without decoding provisioner, parameters, and reclaimPolicy, a proto write returns 200 OK
+    /// but the stored StorageClass has no provisioner, breaking dynamic provisioning for any PVC
+    /// that references this StorageClass (same silent-drop bug class as #583).
+    ///
+    /// This test fails if the `provisioner`, `parameters`, or `reclaim_policy` fields are removed
+    /// from `StorageClass`, or if the serialization block is removed from `decode_storageclass_proto`.
+    #[test]
+    fn decode_storageclass_proto_preserves_provisioner_and_parameters() {
+        use prost::Message as _;
+
+        let sc = StorageClass {
+            metadata: Some(ObjectMeta {
+                name: "fast".to_string(),
+                ..Default::default()
+            }),
+            provisioner: "kubernetes.io/no-provisioner".to_string(),
+            parameters: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("type".to_string(), "gp2".to_string());
+                m
+            },
+            reclaim_policy: "Retain".to_string(),
+            volume_binding_mode: "WaitForFirstConsumer".to_string(),
+            allow_volume_expansion: Some(true),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        sc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_storageclass_proto(&buf).expect(
+            "decode_storageclass_proto must return Some — proto write returns 200 OK but caller \
+             reads back a provisioner-less StorageClass if decoding fails",
+        );
+
+        assert_eq!(result["kind"], "StorageClass");
+        assert_eq!(result["metadata"]["name"], "fast");
+
+        assert_eq!(
+            result["provisioner"], "kubernetes.io/no-provisioner",
+            "provisioner must survive proto decode — a proto write that drops provisioner returns \
+             200 OK but the stored StorageClass has no provisioner, breaking dynamic provisioning \
+             for any PVC that references this StorageClass"
+        );
+        assert_eq!(
+            result["parameters"]["type"], "gp2",
+            "parameters must survive proto decode — CSI drivers use parameters to configure volumes"
+        );
+        assert_eq!(
+            result["reclaimPolicy"], "Retain",
+            "reclaimPolicy must survive proto decode — without it dynamically provisioned PVs \
+             default to Delete, causing unexpected data loss"
+        );
+        assert_eq!(
+            result["volumeBindingMode"], "WaitForFirstConsumer",
+            "volumeBindingMode must survive proto decode"
+        );
+        assert_eq!(
+            result["allowVolumeExpansion"], true,
+            "allowVolumeExpansion must survive proto decode"
+        );
+    }
+
+    /// decode_volumeattributesclass_proto must preserve driverName and parameters.
+    ///
+    /// Without decoding driverName (field 2) and parameters (field 3), a proto write returns
+    /// 200 OK but the stored VolumeAttributesClass has no driverName, so the CSI driver cannot
+    /// apply the attributes to the volume (same silent-drop bug class as #583).
+    ///
+    /// This test fails if the `driver_name` or `parameters` fields are removed from
+    /// `VolumeAttributesClass`, or if the serialization block is removed from
+    /// `decode_volumeattributesclass_proto`.
+    #[test]
+    fn decode_volumeattributesclass_proto_preserves_driver_name_and_parameters() {
+        use prost::Message as _;
+
+        let vac = VolumeAttributesClass {
+            metadata: Some(ObjectMeta {
+                name: "silver".to_string(),
+                ..Default::default()
+            }),
+            driver_name: "pd.csi.storage.gke.io".to_string(),
+            parameters: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("iops".to_string(), "3000".to_string());
+                m
+            },
+        };
+
+        let mut buf = Vec::new();
+        vac.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_volumeattributesclass_proto(&buf).expect(
+            "decode_volumeattributesclass_proto must return Some — proto write returns 200 OK but \
+             caller reads back a driverName-less VolumeAttributesClass if decoding fails",
+        );
+
+        assert_eq!(result["kind"], "VolumeAttributesClass");
+        assert_eq!(result["metadata"]["name"], "silver");
+
+        assert_eq!(
+            result["driverName"], "pd.csi.storage.gke.io",
+            "driverName must survive proto decode — a proto write that drops driverName returns \
+             200 OK but the stored VolumeAttributesClass has no driverName, so the CSI driver \
+             cannot apply the attributes to the volume"
+        );
+        assert_eq!(
+            result["parameters"]["iops"], "3000",
+            "parameters must survive proto decode — CSI driver uses them to configure the volume"
+        );
+    }
+
+    /// decode_replicationcontroller_proto must preserve spec.template.spec.containers.
+    ///
+    /// Without decoding the template (field 3 of ReplicationControllerSpec), a proto write
+    /// returns 200 OK but the stored RC has an empty template, so the RC controller creates
+    /// pods with no containers — they can never reach Running phase (same silent-drop bug
+    /// class as #583 for Jobs).
+    ///
+    /// This test fails if the `template` field of `ReplicationControllerSpec` is changed back
+    /// to raw bytes, or if the template decoding block is removed from
+    /// `decode_replicationcontroller_proto`.
+    #[test]
+    fn decode_replicationcontroller_proto_preserves_template_containers() {
+        use prost::Message as _;
+
+        let rc = ReplicationController {
+            metadata: Some(ObjectMeta {
+                name: "my-rc".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(ReplicationControllerSpec {
+                replicas: 2,
+                selector: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("app".to_string(), "web".to_string());
+                    m
+                },
+                template: Some(AppsPodTemplateSpec {
+                    metadata: None,
+                    spec: Some(PodSpec {
+                        containers: vec![Container {
+                            name: "web".to_string(),
+                            image: "nginx:latest".to_string(),
+                            ..Default::default()
+                        }],
+                        restart_policy: "Always".to_string(),
+                        ..Default::default()
+                    }),
+                }),
+            }),
+            status: Vec::new(),
+        };
+
+        let mut buf = Vec::new();
+        rc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_replicationcontroller_proto(&buf).expect(
+            "decode_replicationcontroller_proto must return Some for RC with template — \
+             proto write returns 200 OK but RC has no containers if template is not decoded",
+        );
+
+        assert_eq!(result["kind"], "ReplicationController");
+        assert_eq!(result["metadata"]["name"], "my-rc");
+        assert_eq!(result["spec"]["replicas"], 2);
+
+        let containers = result["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .expect(
+                "spec.template.spec.containers must be an array — without it the RC controller \
+                 creates pods with no containers and they can never reach Running phase (same \
+                 silent-drop bug class as #583 for Jobs)",
+            );
+        assert_eq!(
+            containers.len(),
+            1,
+            "one container must survive proto decode"
+        );
+        assert_eq!(
+            containers[0]["name"], "web",
+            "container name must survive proto decode — RC controller uses it to create pod specs"
+        );
+        assert_eq!(
+            containers[0]["image"], "nginx:latest",
+            "container image must survive proto decode — without it pods run nothing"
+        );
     }
 }
