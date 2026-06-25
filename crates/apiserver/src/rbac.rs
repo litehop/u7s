@@ -190,6 +190,16 @@ impl RbacIndex {
         inner.cluster_roles.get(name).cloned().unwrap_or_default()
     }
 
+    /// Return a copy of the rules for the named Role in the given namespace, or empty if unknown.
+    pub fn role_rules(&self, namespace: &str, name: &str) -> Vec<PolicyRule> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner
+            .roles
+            .get(&(namespace.to_owned(), name.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Return true if any ClusterRoleBinding references the named ClusterRole.
     ///
     /// Used by escalation prevention: when a ClusterRole is created or updated
@@ -318,6 +328,60 @@ pub fn user_holds_all_rules(
             }
         }
         // Verify nonResourceURL permissions are also held by the caller.
+        for url in &rule.non_resource_urls {
+            for verb in &rule.verbs {
+                let req = AuthzRequest {
+                    username,
+                    groups,
+                    verb,
+                    api_group: "",
+                    resource: "",
+                    subresource: "",
+                    namespace: None,
+                    name: None,
+                    non_resource_url: Some(url),
+                };
+                if !rbac.is_allowed(&req) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Like `user_holds_all_rules` but checks permissions in a specific namespace.
+///
+/// Used by RoleBinding escalation prevention: a caller may only bind to a
+/// Role/ClusterRole if they already hold all its rules IN the target namespace.
+pub fn user_holds_all_rules_in_namespace(
+    username: &str,
+    groups: &[String],
+    role_rules: &[PolicyRule],
+    namespace: &str,
+    rbac: &RbacIndex,
+) -> bool {
+    for rule in role_rules {
+        for api_group in &rule.api_groups {
+            for resource in &rule.resources {
+                for verb in &rule.verbs {
+                    let req = AuthzRequest {
+                        username,
+                        groups,
+                        verb,
+                        api_group,
+                        resource,
+                        subresource: "",
+                        namespace: Some(namespace),
+                        name: None,
+                        non_resource_url: None,
+                    };
+                    if !rbac.is_allowed(&req) {
+                        return false;
+                    }
+                }
+            }
+        }
         for url in &rule.non_resource_urls {
             for verb in &rule.verbs {
                 let req = AuthzRequest {

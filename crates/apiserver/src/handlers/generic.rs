@@ -5,7 +5,7 @@ use u7s_store::Store;
 
 use crate::{
     auth::UserInfo,
-    rbac::user_holds_all_rules,
+    rbac::{user_holds_all_rules, user_holds_all_rules_in_namespace},
     state::AppState,
     status::Status,
     types::{NamespaceSpec, Object, ObjectMeta, ResourceKey},
@@ -498,6 +498,7 @@ pub(crate) fn stamp_metadata(obj: &mut Object) {
 pub(crate) const RBAC_GROUP: &str = "rbac.authorization.k8s.io";
 const CLUSTER_ROLE_BINDINGS: &str = "clusterrolebindings";
 pub(crate) const CLUSTER_ROLES: &str = "clusterroles";
+const ROLE_BINDINGS: &str = "rolebindings";
 
 /// Escalation prevention for ClusterRoleBinding writes.
 ///
@@ -577,6 +578,61 @@ pub(crate) fn check_clusterrole_escalation<S: Store>(
     if !user_holds_all_rules(&user.username, &user.groups, &role_rules, &state.rbac_index) {
         return Err(Status::forbidden(
             "cannot escalate privileges: ClusterRole is already bound and user does not hold all its rules".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Escalation prevention for namespaced RoleBinding writes.
+///
+/// A user may only create or update a RoleBinding if they already hold every
+/// permission enumerated in the referenced Role or ClusterRole, scoped to the
+/// target namespace.  Without this check a user with `create rolebindings`
+/// in a namespace can bind any subject to cluster-admin (or any other role)
+/// without holding those permissions.
+///
+/// The referenced role is resolved:
+/// - roleRef.kind = "Role"        → rules from the namespaced Role
+/// - roleRef.kind = "ClusterRole" → rules from the ClusterRole (applied in ns)
+///
+/// Returns `Ok(())` if the check passes (or is not applicable), or
+/// `Err(StatusError)` with 403 Forbidden if the check fails.
+pub(crate) fn check_rb_escalation<S: Store>(
+    plural: &str,
+    group: &str,
+    namespace: &str,
+    user: &UserInfo,
+    body: &serde_json::Value,
+    state: &AppState<S>,
+) -> Result<(), crate::status::StatusError> {
+    if group != RBAC_GROUP || plural != ROLE_BINDINGS {
+        return Ok(());
+    }
+    let binding = match serde_json::from_value::<crate::rbac::RbacBinding>(body.clone()) {
+        Ok(b) => b,
+        Err(_) => return Ok(()),
+    };
+    let role_ref = &binding.role_ref;
+    if role_ref.api_group != RBAC_GROUP {
+        return Ok(());
+    }
+    let role_rules = match role_ref.kind.as_str() {
+        "Role" => state.rbac_index.role_rules(namespace, &role_ref.name),
+        "ClusterRole" => state.rbac_index.cluster_role_rules(&role_ref.name),
+        _ => return Ok(()),
+    };
+    if role_rules.is_empty() {
+        return Ok(());
+    }
+    if !user_holds_all_rules_in_namespace(
+        &user.username,
+        &user.groups,
+        &role_rules,
+        namespace,
+        &state.rbac_index,
+    ) {
+        return Err(Status::forbidden(
+            "cannot escalate privileges: user does not hold all rules of the referenced Role in this namespace".to_string(),
         ));
     }
     Ok(())
