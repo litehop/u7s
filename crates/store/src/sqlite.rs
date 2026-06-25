@@ -433,7 +433,7 @@ fn prefix_upper_bound(prefix: &str) -> String {
 }
 
 fn query_all(conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Result<Vec<StoreObject>> {
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare_cached(sql)?;
     let rows = stmt
         .query_map(p, |r| {
             Ok(StoreObject {
@@ -1446,6 +1446,49 @@ mod tests {
              'read version {} is not as new as written version {written_rv}' \
              and requeue in a tight loop for up to 15 minutes",
             resp.revision
+        );
+    }
+
+    /// Repeated list() calls must return consistent results — verifies prepare_cached does not
+    /// corrupt query state across calls.
+    ///
+    /// Why it matters: prepare_cached reuses the cached statement handle; if the handle is
+    /// left in a bad state (rows not consumed, reset not called), a subsequent list on the same
+    /// connection returns wrong results or errors, breaking any controller that lists repeatedly.
+    #[tokio::test]
+    async fn repeated_list_returns_consistent_results() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let prefix = "/registry/core/configmaps/";
+
+        for i in 0..5u32 {
+            let key = format!("/registry/core/configmaps/default/cm-{i}");
+            let val = Bytes::from(format!(
+                r#"{{"apiVersion":"v1","kind":"ConfigMap","metadata":{{"name":"cm-{i}","namespace":"default"}}}}"#
+            ));
+            store.put(&key, val, None).await.expect("put must succeed");
+        }
+
+        let first = store
+            .list(prefix, ListOptions::default())
+            .await
+            .expect("first list");
+        let second = store
+            .list(prefix, ListOptions::default())
+            .await
+            .expect("second list");
+
+        assert_eq!(
+            first.items.len(),
+            second.items.len(),
+            "repeated list() must return the same item count; a mismatch means prepare_cached \
+             left the statement in a corrupted state, causing controllers to see inconsistent \
+             object counts across reflector resyncs"
+        );
+        assert_eq!(
+            first.items.len(),
+            5,
+            "list must return all 5 inserted configmaps; returning fewer breaks reflector \
+             initial list completeness"
         );
     }
 }
