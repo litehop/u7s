@@ -2015,7 +2015,7 @@ async fn maybe_allocate_cluster_ip<S: Store>(
     Ok(())
 }
 
-fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
+pub(crate) fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
     format!("/apis/{group}/{version}/{plural}/{name}")
 }
 
@@ -2546,7 +2546,13 @@ fn inject_type_meta(body: &mut serde_json::Value, group: &str, version: &str, ki
     body["apiVersion"] = serde_json::Value::String(api_version);
 }
 
-fn rbac_namespaced_key(group: &str, version: &str, ns: &str, plural: &str, name: &str) -> String {
+pub(crate) fn rbac_namespaced_key(
+    group: &str,
+    version: &str,
+    ns: &str,
+    plural: &str,
+    name: &str,
+) -> String {
     format!("/apis/{group}/{version}/namespaces/{ns}/{plural}/{name}")
 }
 
