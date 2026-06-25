@@ -1680,8 +1680,8 @@ struct RoleBinding {
 /// JobSpec — k8s.io/api/batch/v1/generated.proto
 /// Source: k8s.io/api/batch/v1/generated.proto message JobSpec
 /// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-/// Only scalar/string fields are decoded; template (field 5, PodTemplateSpec) is skipped —
-/// PodSpec is deeply nested and the same strategy as PodTemplate applies.
+/// Only scalar/string fields are decoded; template (field 6, PodTemplateSpec) is decoded
+/// as a nested message so container definitions are preserved and pods can start.
 #[derive(Clone, PartialEq, Message)]
 struct JobSpec {
     /// parallelism (field 1, int32)
