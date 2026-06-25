@@ -180,10 +180,16 @@ fn open_conn(path: &str) -> Result<Connection> {
 
 /// Stamps metadata.resourceVersion into the stored JSON.
 /// Parses the JSON, sets the field, re-serializes.
-fn stamp_resource_version(value: &Bytes, revision: u64) -> Result<Bytes> {
+/// Also extracts ns and obj_name from the single parse to avoid a second deserialization.
+fn stamp_resource_version(
+    value: &Bytes,
+    revision: u64,
+) -> Result<(Bytes, Option<String>, Option<String>)> {
     let mut obj: serde_json::Value = serde_json::from_slice(value)?;
+    let ns = obj["metadata"]["namespace"].as_str().map(str::to_owned);
+    let obj_name = obj["metadata"]["name"].as_str().map(str::to_owned);
     obj["metadata"]["resourceVersion"] = serde_json::Value::String(revision.to_string());
-    Ok(Bytes::from(serde_json::to_vec(&obj)?))
+    Ok((Bytes::from(serde_json::to_vec(&obj)?), ns, obj_name))
 }
 
 // Full write procedure — runs inside spawn_blocking.
@@ -250,18 +256,11 @@ fn put_sync(
         |r| r.get::<_, i64>(0).map(|v| v as u64),
     )?;
 
-    // 6. Stamp metadata.resourceVersion in the JSON value.
-    let stamped_value = stamp_resource_version(&value, new_revision)?;
+    // 6. Stamp metadata.resourceVersion in the JSON value and extract indexed columns
+    //    from the single parse, avoiding a second deserialization of the stamped bytes.
+    let (stamped_value, ns, obj_name) = stamp_resource_version(&value, new_revision)?;
 
-    // 7. Extract ns and obj_name for indexed columns.
-    let (ns, obj_name) = {
-        let obj: serde_json::Value = serde_json::from_slice(&stamped_value)?;
-        let ns = obj["metadata"]["namespace"].as_str().map(str::to_owned);
-        let obj_name = obj["metadata"]["name"].as_str().map(str::to_owned);
-        (ns, obj_name)
-    };
-
-    // 8. Upsert the object.
+    // 7. Upsert the object.
     conn.execute(
         "INSERT INTO objects (key, value, revision, ns, obj_name) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, revision = excluded.revision,
@@ -1489,6 +1488,80 @@ mod tests {
             5,
             "list must return all 5 inserted configmaps; returning fewer breaks reflector \
              initial list completeness"
+        );
+    }
+
+    /// PUT followed by GET must return the correctly stamped resourceVersion and the identical
+    /// ns/obj_name that were in the original value — verifying that extracting indexed columns
+    /// from the pre-stamp parse yields the same result as extracting from the stamped bytes.
+    ///
+    /// Why it matters: if the single-parse optimization extracts ns/obj_name from the wrong
+    /// JSON document (e.g. before namespace is set, or from a stale value), the indexed columns
+    /// in SQLite diverge from the stored object, breaking field-selector queries by namespace
+    /// or name — controllers that list pods by nodeName or services by namespace never find
+    /// their objects and reconcile loops stall indefinitely.
+    #[tokio::test]
+    async fn put_stamps_rv_and_preserves_ns_obj_name() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let key = "/registry/core/pods/prod/web-abc";
+        let raw = Bytes::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"web-abc","namespace":"prod"}}"#,
+        );
+
+        let rv = store.put(key, raw, None).await.expect("put must succeed");
+
+        let obj = store
+            .get(key)
+            .await
+            .expect("get must not error")
+            .expect("object must exist after put");
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&obj.value).expect("stored value must be valid JSON");
+
+        assert_eq!(
+            parsed["metadata"]["resourceVersion"].as_str(),
+            Some(rv.to_string().as_str()),
+            "stored object must have resourceVersion stamped to the revision returned by put; \
+             a mismatch means the stamp did not propagate to the stored bytes"
+        );
+        assert_eq!(
+            parsed["metadata"]["namespace"].as_str(),
+            Some("prod"),
+            "namespace must survive the single-parse stamp path; if extraction reads from the \
+             wrong parse result the indexed ns column is wrong and namespace-scoped list queries \
+             return empty results"
+        );
+        assert_eq!(
+            parsed["metadata"]["name"].as_str(),
+            Some("web-abc"),
+            "name must survive the single-parse stamp path; if extraction reads from the wrong \
+             parse result the indexed obj_name column is wrong and name field-selector queries \
+             return empty results"
+        );
+
+        // Verify the indexed columns are queryable via field selector (proves SQLite columns match).
+        let by_ns = store
+            .list(
+                "/registry/core/pods/",
+                ListOptions {
+                    field_selector: Some(FieldSelector {
+                        field: "metadata.namespace".to_string(),
+                        value: "prod".to_string(),
+                        negated: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list by namespace");
+
+        assert_eq!(
+            by_ns.items.len(),
+            1,
+            "field-selector list by namespace=prod must return 1 pod; returning 0 means the \
+             ns indexed column was not correctly populated by the single-parse put path, \
+             breaking all namespace-scoped list queries"
         );
     }
 }
