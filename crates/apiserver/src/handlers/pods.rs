@@ -1526,10 +1526,10 @@ pub fn apply_status_patch(
                         crate::patch::merge_patch(&mut result["status"][key], val);
                     }
                 }
-                // Second pass: apply $setElementOrder/conditions AFTER merge_conditions has run.
-                // Map iteration order is not guaranteed, so the ordering directive may appear
-                // before "conditions" in the first pass. Applying it in a separate pass ensures
-                // the merged array exists before we sort it.
+                // Apply $setElementOrder/conditions: reorder the merged conditions array
+                // to match the order the kubelet requested. Without this, the kubelet
+                // detects a conditions ordering mismatch on every GET and re-sends PATCH,
+                // causing continuous reconcile churn that prevents pods from progressing.
                 if let Some(order_val) = patch_obj.get("$setElementOrder/conditions") {
                     if let (Some(order_arr), Some(conds)) = (
                         order_val.as_array(),
@@ -2484,10 +2484,10 @@ mod status_tests {
     /// apply_status_patch must reorder conditions to match $setElementOrder/conditions.
     ///
     /// The kubelet sends $setElementOrder/conditions on every status PATCH requesting a
-    /// specific condition ordering. Without honouring this ordering, the kubelet sees a
-    /// different order on each GET and re-sends PATCH, causing ~1-2 reconcile cycles per
-    /// second. This continuous churn prevents Job pods from holding Running phase long
-    /// enough for conformance tests to pass.
+    /// specific condition ordering (e.g. PodReadyToStartContainers first, PodScheduled last).
+    /// Without honouring this ordering, the kubelet sees a different order on each GET and
+    /// re-sends PATCH, causing ~1-2 reconcile cycles per second. This continuous churn
+    /// prevented Job pods from holding Running phase long enough for conformance tests to pass.
     #[test]
     fn set_element_order_conditions_reorders_stored_conditions() {
         let stored = serde_json::json!({
@@ -2504,6 +2504,8 @@ mod status_tests {
                 ]
             }
         });
+        // Kubelet sends the conditions in its preferred order, with $setElementOrder requesting
+        // [PodReadyToStartContainers, Initialized, Ready, ContainersReady, PodScheduled].
         let patch = serde_json::json!({
             "status": {
                 "conditions": [

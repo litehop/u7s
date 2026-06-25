@@ -3621,7 +3621,8 @@ fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
             serde_json::Value::String(spec.managed_by),
         );
     }
-    // Decode the pod template so containers are preserved; fall back to empty object.
+    // Decode and include the pod template so containers are preserved.
+    // An empty template object is used as fallback so the k8s schema remains valid.
     let tmpl_json = if let Some(tmpl) = spec.template {
         let mut t = serde_json::json!({});
         if let Some(meta) = tmpl.metadata {
@@ -9749,10 +9750,7 @@ mod tests {
                         // because kubectl puts template at wire field 6 (LEN type) which
                         // collides with the mislocated backoffLimit (int32, varint type).
                         template: Some(AppsPodTemplateSpec {
-                            metadata: Some(ObjectMeta {
-                                name: "pod-tmpl".to_string(),
-                                ..Default::default()
-                            }),
+                            metadata: None,
                             spec: None,
                         }),
                         backoff_limit: 3,
@@ -9964,38 +9962,35 @@ mod tests {
 
     /// decode_job_proto must preserve spec.template.spec.containers from the proto body.
     ///
-    /// KCM creates Jobs from a proto-encoded JobSpec where spec.template contains a full
-    /// PodTemplateSpec with containers. If job_spec_to_json stores template as an empty {}
-    /// object (discarding all container definitions), KCM creates Job pods with containers:null.
-    /// The kubelet cannot start pods with no containers — it churns the sandbox ~1-2/sec and
-    /// pods never reach Running, so conformance tests time out waiting at "Ensuring active pods
-    /// == parallelism" rather than the GC phase.
+    /// Before this fix, job_spec_to_json stored `template` as an empty `{}` object,
+    /// discarding containers. KCM then created Job pods with `containers: null` (because
+    /// the job template had no containers), preventing pods from ever reaching Running phase
+    /// and causing `[sig-apps] Job should delete a job [Conformance]` to time out.
     #[test]
     fn decode_job_proto_preserves_template_containers() {
         use prost::Message as _;
 
         let job = Job {
             metadata: Some(ObjectMeta {
-                name: "batch-job".to_string(),
+                name: "pi".to_string(),
                 namespace: "default".to_string(),
                 ..Default::default()
             }),
             spec: Some(JobSpec {
-                parallelism: 2,
-                completions: 4,
-                backoff_limit: 6,
+                completions: 1,
                 template: Some(AppsPodTemplateSpec {
                     metadata: None,
                     spec: Some(PodSpec {
                         containers: vec![Container {
-                            name: "main".to_string(),
-                            image: "registry.k8s.io/pause:3.10.1".to_string(),
+                            name: "pi".to_string(),
+                            image: "perl:5.34".to_string(),
                             ..Default::default()
                         }],
                         restart_policy: "Never".to_string(),
                         ..Default::default()
                     }),
                 }),
+                backoff_limit: 4,
                 ..Default::default()
             }),
             ..Default::default()
@@ -10005,34 +10000,37 @@ mod tests {
         job.encode(&mut buf).expect("prost encode must succeed");
 
         let result = decode_job_proto(&buf).expect(
-            "decode_job_proto must return Some for a Job with a template containing containers",
+            "decode_job_proto must return Some for Job with template containing containers — \
+             if None is returned, Job creation via proto fails with 400",
         );
 
         assert_eq!(result["kind"], "Job");
-        let tmpl = &result["spec"]["template"];
+        assert_eq!(result["metadata"]["name"], "pi");
         assert!(
-            tmpl.is_object() && !tmpl.as_object().unwrap().is_empty(),
-            "spec.template must be decoded from proto, not stored as an empty {{}} object; \
-             an empty template discards container definitions and the kubelet cannot start pods"
+            result["spec"]["template"]["spec"]["containers"].is_array(),
+            "spec.template.spec.containers must be an array — if this is null/absent, \
+             KCM creates Job pods with containers:null and pods can never reach Running phase, \
+             causing [sig-apps] Job should delete a job [Conformance] to time out"
         );
-        let containers = tmpl["spec"]["containers"]
+        let containers = result["spec"]["template"]["spec"]["containers"]
             .as_array()
-            .expect("spec.template.spec.containers must be an array");
+            .unwrap();
         assert_eq!(
             containers.len(),
             1,
-            "spec.template.spec.containers must preserve all containers from proto; \
-             if containers are lost, Job pods have containers:null, the kubelet churns \
-             the sandbox ~1-2/sec and pods never reach Running"
+            "one container must survive proto decode — KCM uses this to create pod specs"
         );
         assert_eq!(
-            containers[0]["name"], "main",
-            "container name must survive proto decode"
+            containers[0]["name"], "pi",
+            "container name must be preserved — KCM uses container names to construct pod specs"
         );
         assert_eq!(
-            containers[0]["image"], "registry.k8s.io/pause:3.10.1",
-            "container image must survive proto decode — without this the kubelet \
-             cannot pull the image and pods stay stuck in Pending"
+            containers[0]["image"], "perl:5.34",
+            "container image must be preserved — without it pods run nothing"
+        );
+        assert_eq!(
+            result["spec"]["template"]["spec"]["restartPolicy"], "Never",
+            "restartPolicy must be preserved from the template spec"
         );
     }
 

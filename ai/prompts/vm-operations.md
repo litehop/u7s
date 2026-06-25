@@ -67,20 +67,24 @@ scripts/conformance/run-all.sh \
 in one invocation. It is allowlisted. Do NOT replicate its steps manually unless you need
 a partial restart (see individual steps below).
 
-To build first from the worktree and then run:
-```bash
-cargo build -p u7s-apiserver --release \
-  --manifest-path Cargo.toml \
-  --target-dir    target
+**Omit `--binary` and run-all.sh builds your worktree for you** — you do NOT need a
+separate `cargo build`. Add `--verbose` when you need debug-level apiserver logs
+(it sets `RUST_LOG=debug` correctly inside the script — never `export RUST_LOG=`
+or prefix it inline). Other flags as needed: `--reset`, `--focus "<FOCUS>"`.
 
-scripts/conformance/run-all.sh \
-  --vm           <VM> \
-  --port         <PORT> \
-  --kubelet-port <KUBELET_PORT> \
-  --binary target/release/u7s-apiserver \
-  --reset \
-  --focus  "<FOCUS>"
+Common command forms (copy the EXACT relative form — the allowlist is
+`Bash(scripts/conformance/run-all.sh *)`; never prefix with `bash`, never with a
+`VAR=...` assignment, never an absolute path):
+```bash
+# first run (builds worktree, resets stale VM state, debug logs):
+scripts/conformance/run-all.sh --reset --verbose --vm <VM> --port <PORT> --kubelet-port <KUBELET_PORT> --focus "<FOCUS>"
+
+# subsequent runs (reuse VM/CA/kubeconfig — faster):
+scripts/conformance/run-all.sh --vm <VM> --port <PORT> --kubelet-port <KUBELET_PORT> --focus "<FOCUS>"
 ```
+
+Only pass `--binary <path>` if you deliberately want to skip the build and run a
+pre-built binary; for normal worktree iteration, omit it.
 
 ---
 
@@ -175,19 +179,29 @@ limactl shell <VM> pgrep -a kube-controller    # KCM alive
 
 ---
 
-## Step 6 — Fast kubectl iteration (no sonobuoy)
+## Step 6 — Fast kubectl iteration (DIAGNOSE HERE, not on sonobuoy)
+
+This is where you spend almost all diagnostic time. A `sonobuoy --focus` run is
+5+ min and can hang to 20 (watchdog reaps the test namespace at 5 min, ginkgo
+then flails against the dead namespace). kubectl answers the same question in
+seconds. Read the failing test's source (`test/e2e/...`) to learn its exact API
+sequence, then reproduce it here.
 
 ```bash
-KCF=temp/u7s/kubeconfig
-
-kubectl --kubeconfig "$KCF" apply -f - <<'EOF'
-# ... minimal YAML reproducing the bug ...
+kubectl --kubeconfig temp/u7s/kubeconfig apply -f - <<'EOF'
+# ... minimal YAML reproducing what the test does ...
 EOF
 
-kubectl --kubeconfig "$KCF" get pods -w --request-timeout=60s
+kubectl --kubeconfig temp/u7s/kubeconfig get pods -w --request-timeout=60s
+# inspect exact state: get -o yaml / -o jsonpath; check GC by deleting and watching
+# check controller behaviour (Job/GC/SA/endpoint controllers live in KCM):
+limactl shell <VM> sudo tail -50 /tmp/kcm.log     # rv mismatch, nil panics, sync errors
 ```
 
-Use sonobuoy only when the bead's done-when criterion explicitly requires it.
+Run sonobuoy ONLY as the final pass/fail gate, after kubectl confirms the fix.
+When you do, read the result from
+`temp/e2e/<run>/podlogs/sonobuoy/<...>/logs/e2e.txt` (the full test timeline) —
+NOT `plugins/e2e/results/global/e2e.log`, which omits the test body.
 
 ---
 

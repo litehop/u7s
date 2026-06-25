@@ -165,6 +165,22 @@ You are implementing bead **<BEAD_ID>** in <project description>.
 - These are not preferences — violating them triggers permission prompts that
   stall the session. Use the right tool the first time.
 
+## Evidence & time discipline (mandatory)
+
+- Before asserting WHEN something happened or what a time gap MEANS, confirm it
+  against an actual timestamp — never infer ordering from memory or vibes.
+  Sources of truth: the log line's own timestamp, the run-directory name
+  (e.g. `temp/e2e/0625-0927-...`), `gh pr view <n> --json mergedAt`, the
+  binary/commit time. Run `date -u +"%Y-%m-%dT%H:%MZ"` before writing any
+  timestamp; don't guess from session progress.
+- Do NOT say "in a previous run", "this predates PR #X", "stale binary", or
+  "N minutes later" unless you have checked the timestamps. A line from 20
+  seconds ago in the run you just executed is THIS run, not a previous one.
+- Watch timezones: apiserver logs are UTC; ginkgo/e2e logs and run-dir names are
+  often local time. Normalize before comparing, or a delta is meaningless.
+- Quote the evidence for any claim ("apiserver.log 09:35:01 shows…"), and if you
+  did not verify it, say so explicitly rather than stating it as fact (Rule 12).
+
 ## Code style rules (mandatory)
 
 - Write no comments by default. Only add one when the WHY is non-obvious: a hidden
@@ -371,6 +387,24 @@ inline). Omit `--binary` and the script builds the worktree itself, so no manual
 `U7S_HOST_IP` is no longer used — workers always bind to `127.0.0.1` and use
 `--port` for isolation.
 
+### Verify with kubectl first; reserve sonobuoy for the final gate
+
+A `sonobuoy --focus` run takes 5+ min and can hang for 20 (watchdog reaps the
+namespace at 5 min, then ginkgo flails against the dead namespace). Iterating
+diagnosis on sonobuoy is the single biggest time sink in this work. Almost
+everything a conformance test asserts is reproducible in seconds with `kubectl`
+against the running stack. The mechanics (read the test source → reproduce via
+kubectl + `/tmp/kcm.log` → fix → run sonobuoy once as the gate → read
+`e2e.txt`) are documented in `ai/prompts/vm-operations.md`; a dispatch just needs
+to point the worker there and require kubectl evidence in the return.
+
+Worked example (why this matters): `[sig-apps] Job should delete a job` was chased
+for hours via repeated sonobuoy runs with conflated symptoms. Reading the test
+source revealed it just does create-Job → delete-Job(foreground) → assert-pods-
+GC'd; the kubectl repro reproduced the exact failure (pods stuck Terminating) in
+seconds and exposed the root cause in `/tmp/kcm.log` (`resource version
+mismatch`). Sonobuoy only confirmed what kubectl already proved.
+
 ### When to inject
 
 Inject the block below for **any** bead that touches:
@@ -378,10 +412,12 @@ Inject the block below for **any** bead that touches:
 - RBAC handlers, auth middleware, collection delete, namespace drain (sonobuoy smoke path)
 - Any handler or middleware that the sonobuoy delete/run flow exercises
 
-Cargo tests alone are not sufficient for these beads. `sonobuoy delete --all`
-exercises a runtime code path (RBAC index, label selector filtering, namespace
-termination) that unit tests cannot cover. A worker that passes `cargo test` but
-skips VM verification is shipping untested code.
+Cargo tests alone are not sufficient for these beads. The runtime path (RBAC
+index, label-selector filtering, namespace termination, GC/finalizer cascade,
+optimistic-concurrency convergence) cannot be covered by unit tests. A worker
+that passes `cargo test` but skips live verification is shipping untested code —
+but "live verification" means **kubectl first, sonobuoy only as the final gate**
+(see above), not a sonobuoy run per iteration.
 
 ### The block (paste verbatim into applicable dispatch prompts)
 
@@ -400,63 +436,26 @@ port `6443` — those belong to the mayor. All workers bind to `127.0.0.1` and
 use `--port` for isolation. Use exactly the port assigned above — do not
 pick a different port even if you think the assigned one is in use.
 
-Read `ai/prompts/vm-operations.md` IN FULL before issuing any build or stack
-command. It is the canonical reference for every operation below.
+**Read `ai/prompts/vm-operations.md` IN FULL before any build or stack command.**
+It is the single source of truth for how to build, bring up the stack, iterate,
+and run the gate. Do NOT restate its steps in your dispatch — point the worker at
+it. The essentials it covers (do not duplicate them here, just rely on them):
+`run-all.sh` is the one allowlisted command (it builds, resets, restarts every
+component, runs sonobuoy); omit `--binary` to build the worktree; `--verbose` for
+debug logs; never `cargo build`/`kill`/`curl`/`export RUST_LOG=` by hand;
+**diagnose with kubectl + `/tmp/kcm.log`, run sonobuoy only as the final gate**;
+read the result from `podlogs/sonobuoy/.../logs/e2e.txt`, not `plugins/.../e2e.log`.
 
-**Cargo tests are not sufficient.** This bead touches a runtime path that
-sonobuoy exercises. You must verify against the live server.
+**Cargo tests are not sufficient** for this bead — it touches a runtime path. But
+"verify live" means kubectl-first per vm-operations.md, not a sonobuoy run per
+iteration.
 
-**`run-all.sh` is the ONE command you need — do not reinvent it by hand.**
-It builds the binary, resets stale state, restarts every component (apiserver,
-lima VM, kubelet join, KCM, scheduler), and runs sonobuoy — in one invocation.
-You do NOT need to (and must NOT try to) run `cargo build` separately, `kill`
-processes, `curl` the apiserver, or `export RUST_LOG=` yourself. Those tools are
-not on the Bash allowlist (they can be destructive); attempting them triggers a
-permission prompt and stalls you. Everything you need is a `run-all.sh` flag:
+Your return MUST include: (a) the kubectl before/after reproduction, and (b) the
+sonobuoy PASS line from `e2e.txt`. A return without both will be rejected.
 
-| Need | Flag (NOT a manual command) |
-|---|---|
-| Build the apiserver from your worktree | omit `--binary` → it runs `01-build.sh` for you |
-| Kill stale processes + wipe state + reprovision VM | `--reset` |
-| Debug logging (`RUST_LOG=debug`, set correctly inside the script) | `--verbose` |
-| Narrow to one test | `--focus "<regex>"` |
-| Isolation (your assigned VM/ports) | `--vm <VM_NAME> --port <PORT> --kubelet-port <KUBELET_PORT>` |
-| State dir | `--workdir <ASSIGNED_WORKTREE>/temp/u7s` |
-
-State dir: `<ASSIGNED_WORKTREE>/temp/u7s`. Never use inline env-var prefixes
-(`FOO=bar cargo ...`) — use the flags above instead.
-
-Verification sequence (do not skip any step):
-
-1. Provision the VM with its assigned kubelet port (first run only):
-   ```bash
-   scripts/worker-vm.sh start <VM_NAME> 127.0.0.1 <KUBELET_PORT>
-   ```
-   If the VM already exists and is running, skip this step.
-
-2. Run the full conformance stack in ONE command. **First run must use `--reset`**
-   (the VM may have stale state from its previous owner). Omit `--binary` so the
-   script builds your worktree for you. Add `--verbose` whenever you need debug
-   logs (e.g. to inspect request/response bodies):
-   ```bash
-   scripts/conformance/run-all.sh \
-     --vm <VM_NAME> --port <PORT> --kubelet-port <KUBELET_PORT> \
-     --workdir <ASSIGNED_WORKTREE>/temp/u7s \
-     --reset \
-     [--verbose] \
-     --focus "<regex>"
-   ```
-   Subsequent runs in the same worktree omit `--reset` (reuses CA, kubeconfig, and
-   VM — saves the ~5 min reprovision), but re-using it is always safe.
-
-   Your return MUST include the sonobuoy result output from this command.
-   A return without this output will be rejected.
-
-For script-only beads (no server restart needed):
-1. Run the exact commands manually via `limactl shell <VM_NAME>` first.
-2. Then encode them in the script.
-3. Run the script and verify exit 0.
-4. Include at least one `limactl shell` or mcp tool output in your return.
+For script-only beads (no server restart needed): run the commands via
+`limactl shell <VM_NAME>` first, encode them in the script, run it, verify exit 0,
+and include at least one `limactl shell` / mcp tool output in your return.
 ```
 
 ### Mayor enforcement at return-review time
@@ -502,6 +501,23 @@ When a worker returns from a VM/sonobuoy-touching bead:
   `python3 -c` for JSON, `cat`/`head` for file reads, `sed`/`awk` for edits
   — all trigger permission prompts and slow the session. Always inject the
   common preamble verbatim.
+- **Agents (and the mayor) fabricate temporal claims instead of checking timestamps.**
+  Observed repeatedly: an agent calls a log line "from a previous run" when it was
+  20 seconds earlier in the run it just executed; the mayor asserts evidence
+  "predates PR #X" without checking `mergedAt`, conflating runs across different
+  binaries and chasing the wrong root cause for hours. Before any "when / before /
+  after / previous / stale" claim, verify against the log timestamp, run-dir name,
+  `gh pr view --json mergedAt`, or commit time — and normalize timezones (apiserver
+  UTC vs ginkgo/run-dir local). At review time, distrust any temporal claim in a
+  worker's return that isn't backed by a quoted timestamp. See the "Evidence & time
+  discipline" block — inject it via the common preamble.
+- **Workers burn 5–20 min per sonobuoy run when kubectl would answer in seconds.**
+  A `--focus` run is slow and can hang (watchdog reaps the namespace at 5 min,
+  ginkgo then flails ~15 more min). Iterating diagnosis on sonobuoy is the single
+  biggest time sink. Dispatch must direct the worker to: read the test source,
+  reproduce via `kubectl` against the running stack + `/tmp/kcm.log`, root-cause
+  and fix there, and run sonobuoy ONCE as the final gate. Also tell them the real
+  result is in `podlogs/sonobuoy/.../logs/e2e.txt`, not `plugins/.../e2e.log`.
 - **Workers rebuild the stack by hand and stall on un-permitted tools.** When a
   bead needs a live run (especially with debug logs), workers tend to improvise:
   `cargo build` separately, `kill` stale processes, `curl` the apiserver, then
