@@ -277,7 +277,9 @@ enum WebhookTarget {
 /// - localhost and 127.0.0.0/8 (loopback)
 /// - 169.254.0.0/16 (link-local / cloud IMDS)
 /// - 100.64.0.0/10 (shared address space, used by some cloud providers for metadata)
-/// - ::1 (IPv6 loopback)
+/// - 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 (RFC1918 private ranges)
+/// - IPv6 loopback (::1), unspecified (::), and unique-local (fc00::/7)
+/// - IPv6 bracket notation [::1] which previously bypassed the ::1 check
 pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
     // Extract the scheme and host.
     let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
@@ -288,9 +290,28 @@ pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
         return Err(format!("webhook url must use https scheme, got: {url}"));
     };
 
-    // Extract the host portion (before the first '/', ':', '?', or '#').
-    let host_end = rest.find(['/', ':', '?', '#']).unwrap_or(rest.len());
-    let host = &rest[..host_end];
+    // Extract the host portion.  For IPv6 bracket notation (e.g. [::1]:8443/path),
+    // RFC 3986 §3.2.2 requires the host to be enclosed in '[' ... ']'.
+    // Scanning naively for the first ':' would land inside the address itself,
+    // so we handle the bracket case explicitly.
+    let host: &str;
+    let ipv6: Option<std::net::Ipv6Addr>;
+    if rest.starts_with('[') {
+        // Find the closing bracket.
+        let bracket_end = rest
+            .find(']')
+            .ok_or_else(|| format!("webhook url has unclosed '[' in host: {url}"))?;
+        let bare = &rest[1..bracket_end];
+        let addr = bare
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("webhook url has invalid IPv6 address '{bare}': {url}"))?;
+        host = bare;
+        ipv6 = Some(addr);
+    } else {
+        let host_end = rest.find(['/', ':', '?', '#']).unwrap_or(rest.len());
+        host = &rest[..host_end];
+        ipv6 = host.parse::<std::net::Ipv6Addr>().ok();
+    }
 
     // Parse as IPv4 to check reserved ranges.
     let ipv4 = host.parse::<std::net::Ipv4Addr>().ok();
@@ -304,10 +325,23 @@ pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
         ));
     }
 
-    // Reject localhost and IPv6 loopback (these resolve to loopback but bypass
-    // the IPv4 range check above).
+    // Reject localhost and IPv6 loopback/unspecified/unique-local.
     if host == "localhost" || host == "::1" {
         return Err(format!("webhook url must not target localhost: {url}"));
+    }
+    if let Some(addr) = ipv6 {
+        if addr.is_loopback() || addr.is_unspecified() {
+            return Err(format!(
+                "webhook url must not target IPv6 loopback or unspecified address: {url}"
+            ));
+        }
+        // fc00::/7 — unique-local (analogous to RFC1918 for IPv6)
+        let first = addr.octets()[0];
+        if first & 0xFE == 0xFC {
+            return Err(format!(
+                "webhook url must not target IPv6 unique-local address (fc00::/7): {url}"
+            ));
+        }
     }
 
     if let Some(octets) = ipv4.map(|a| a.octets()) {
@@ -7335,6 +7369,46 @@ mod tests {
             result.is_ok(),
             "http://127.0.0.1 must be accepted — \
              loopback addresses are not SSRF targets and must work for test mock servers"
+        );
+    }
+
+    // -- IPv6 bracket loopback SSRF fix tests --
+
+    /// https://[::1]/admin must be rejected even though it uses https and a bracket-quoted host.
+    ///
+    /// The naive host-extraction scan stopped at the first ':' inside '[::1]', yielding '[' as
+    /// the host, which did not match the "::1" loopback check — so the URL was wrongly accepted.
+    /// An accepted [::1] URL lets a webhook config reach apiserver-host loopback services (SSRF).
+    #[test]
+    fn validate_webhook_url_rejects_ipv6_bracket_loopback() {
+        let result = validate_webhook_url("https://[::1]/admin");
+        assert!(
+            result.is_err(),
+            "https://[::1]/admin must be rejected — \
+             an accepted [::1] URL lets a webhook config reach apiserver-host loopback services (SSRF)"
+        );
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_ipv6_bracket_loopback_with_port() {
+        let result = validate_webhook_url("https://[::1]:8443/x");
+        assert!(
+            result.is_err(),
+            "https://[::1]:8443/x must be rejected — \
+             an accepted [::1] URL lets a webhook config reach apiserver-host loopback services (SSRF)"
+        );
+    }
+
+    /// A legitimate external https URL must still be accepted after the IPv6 bracket fix.
+    ///
+    /// Over-blocking the bracket parser would break real external webhook endpoints.
+    #[test]
+    fn validate_webhook_url_accepts_legitimate_https_url_after_ipv6_fix() {
+        let result = validate_webhook_url("https://webhook.example.com/validate");
+        assert!(
+            result.is_ok(),
+            "https://webhook.example.com/validate must be accepted — \
+             the IPv6 bracket fix must not block legitimate external webhook URLs"
         );
     }
 
