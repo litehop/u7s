@@ -353,19 +353,23 @@ Your assigned port: 6444
 Your assigned kubelet port: 10251
 ```
 
-The worker uses these to invoke the conformance stack:
+The worker uses these to invoke the conformance stack. `run-all.sh` is the single
+entry point — it builds, resets, restarts all components, and runs sonobuoy:
 
 ```bash
 scripts/conformance/run-all.sh \
   --vm lima-node-smoke \
   --port 6444 \
   --workdir ./temp/u7s \
-  [--reset] [--focus <regex>]
+  [--reset] [--verbose] [--focus <regex>]
 ```
 
 `--workdir ./temp/u7s` (relative to CWD = worktree root) is where state lands.
-Workers must not hard-code `lima-node` or `6443` anywhere. `U7S_HOST_IP` is no longer
-used — workers always bind to `127.0.0.1` and use `--port` for isolation.
+`--verbose` turns on `RUST_LOG=debug` (set inside the script — never export it
+inline). Omit `--binary` and the script builds the worktree itself, so no manual
+`cargo build` is needed. Workers must not hard-code `lima-node` or `6443` anywhere.
+`U7S_HOST_IP` is no longer used — workers always bind to `127.0.0.1` and use
+`--port` for isolation.
 
 ### When to inject
 
@@ -402,12 +406,25 @@ command. It is the canonical reference for every operation below.
 **Cargo tests are not sufficient.** This bead touches a runtime path that
 sonobuoy exercises. You must verify against the live server.
 
-**IMPORTANT — paths and env vars:**
-- Build target: `<ASSIGNED_WORKTREE>/target` (in-worktree, gitignored, never /tmp)
-- State dir: `<ASSIGNED_WORKTREE>/temp/u7s` (create with mkdir -p if absent)
-- Never use inline env var prefixes (e.g. `FOO=bar cargo ...`). Set vars with
-  export on a separate line, or use the script flags below — inline prefixes
-  break the Bash allowlist pattern match and trigger permission prompts.
+**`run-all.sh` is the ONE command you need — do not reinvent it by hand.**
+It builds the binary, resets stale state, restarts every component (apiserver,
+lima VM, kubelet join, KCM, scheduler), and runs sonobuoy — in one invocation.
+You do NOT need to (and must NOT try to) run `cargo build` separately, `kill`
+processes, `curl` the apiserver, or `export RUST_LOG=` yourself. Those tools are
+not on the Bash allowlist (they can be destructive); attempting them triggers a
+permission prompt and stalls you. Everything you need is a `run-all.sh` flag:
+
+| Need | Flag (NOT a manual command) |
+|---|---|
+| Build the apiserver from your worktree | omit `--binary` → it runs `01-build.sh` for you |
+| Kill stale processes + wipe state + reprovision VM | `--reset` |
+| Debug logging (`RUST_LOG=debug`, set correctly inside the script) | `--verbose` |
+| Narrow to one test | `--focus "<regex>"` |
+| Isolation (your assigned VM/ports) | `--vm <VM_NAME> --port <PORT> --kubelet-port <KUBELET_PORT>` |
+| State dir | `--workdir <ASSIGNED_WORKTREE>/temp/u7s` |
+
+State dir: `<ASSIGNED_WORKTREE>/temp/u7s`. Never use inline env-var prefixes
+(`FOO=bar cargo ...`) — use the flags above instead.
 
 Verification sequence (do not skip any step):
 
@@ -417,24 +434,20 @@ Verification sequence (do not skip any step):
    ```
    If the VM already exists and is running, skip this step.
 
-2. Build from your worktree into your worktree's target dir:
-   ```bash
-   cargo build -p u7s-apiserver --release \
-     --manifest-path <ASSIGNED_WORKTREE>/Cargo.toml \
-     --target-dir <ASSIGNED_WORKTREE>/target
-   ```
-
-3. Run the full conformance stack. **First run must use `--reset`** — the VM may
-   have stale state from its previous owner:
+2. Run the full conformance stack in ONE command. **First run must use `--reset`**
+   (the VM may have stale state from its previous owner). Omit `--binary` so the
+   script builds your worktree for you. Add `--verbose` whenever you need debug
+   logs (e.g. to inspect request/response bodies):
    ```bash
    scripts/conformance/run-all.sh \
      --vm <VM_NAME> --port <PORT> --kubelet-port <KUBELET_PORT> \
-     --binary <ASSIGNED_WORKTREE>/target/release/u7s-apiserver \
      --workdir <ASSIGNED_WORKTREE>/temp/u7s \
      --reset \
+     [--verbose] \
      --focus "<regex>"
    ```
-   Subsequent runs in the same worktree omit `--reset` (reuses CA, kubeconfig, and VM).
+   Subsequent runs in the same worktree omit `--reset` (reuses CA, kubeconfig, and
+   VM — saves the ~5 min reprovision), but re-using it is always safe.
 
    Your return MUST include the sonobuoy result output from this command.
    A return without this output will be rejected.
@@ -489,6 +502,17 @@ When a worker returns from a VM/sonobuoy-touching bead:
   `python3 -c` for JSON, `cat`/`head` for file reads, `sed`/`awk` for edits
   — all trigger permission prompts and slow the session. Always inject the
   common preamble verbatim.
+- **Workers rebuild the stack by hand and stall on un-permitted tools.** When a
+  bead needs a live run (especially with debug logs), workers tend to improvise:
+  `cargo build` separately, `kill` stale processes, `curl` the apiserver, then
+  `export RUST_LOG=debug` inline — none of which are on the Bash allowlist (they
+  can be destructive), so the worker hits a permission wall and gives up or
+  guesses. `run-all.sh` already does ALL of it via flags: build (omit `--binary`),
+  reset/kill/reprovision (`--reset`), debug logging (`--verbose`), focus
+  (`--focus`). Dispatch must point workers at the single `run-all.sh` command and
+  explicitly forbid the manual path — see the flag table in the Lima VM protocol
+  block. A worker that needs debug logs should add `--verbose`, never `export
+  RUST_LOG=`.
 - **Hook split: pre-commit checks fmt; pre-push checks test+clippy.** Workers
   who only run `cargo fmt` before committing will hit a test failure at push
   time with no stacktrace. Quality gate (test+clippy) must run before commit,
