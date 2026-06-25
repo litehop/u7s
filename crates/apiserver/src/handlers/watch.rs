@@ -75,7 +75,7 @@ fn ndjson_initial_events_bookmark(api_version: &str, kind: &str, revision: u64) 
 /// `Bytes` across callers (same event, multiple watchers) is safe because `Bytes` is `Clone`
 /// and the allocation is reference-counted.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_live_event(
+fn prepare_live_event(
     raw: &[u8],
     event_type: &str,
     group: &str,
