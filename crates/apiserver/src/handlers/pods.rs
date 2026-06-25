@@ -1503,6 +1503,25 @@ pub fn apply_status_patch(
                         crate::patch::merge_patch(&mut result["status"][key], val);
                     }
                 }
+                // Apply $setElementOrder/conditions: reorder the merged conditions array
+                // to match the order the kubelet requested. Without this, the kubelet
+                // detects a conditions ordering mismatch on every GET and re-sends PATCH,
+                // causing continuous reconcile churn that prevents pods from progressing.
+                if let Some(order_val) = patch_obj.get("$setElementOrder/conditions") {
+                    if let (Some(order_arr), Some(conds)) = (
+                        order_val.as_array(),
+                        result["status"]["conditions"].as_array_mut(),
+                    ) {
+                        let order: Vec<&str> = order_arr
+                            .iter()
+                            .filter_map(|v| v["type"].as_str())
+                            .collect();
+                        conds.sort_by_key(|c| {
+                            let t = c["type"].as_str().unwrap_or("");
+                            order.iter().position(|&o| o == t).unwrap_or(usize::MAX)
+                        });
+                    }
+                }
             }
         } else {
             result["status"] = patch_status.clone();
@@ -2418,6 +2437,71 @@ mod status_tests {
         assert_eq!(
             result["status"]["podIP"], "10.85.0.5",
             "real status fields must still be applied"
+        );
+    }
+
+    /// apply_status_patch must reorder conditions to match $setElementOrder/conditions.
+    ///
+    /// The kubelet sends $setElementOrder/conditions on every status PATCH requesting a
+    /// specific condition ordering (e.g. PodReadyToStartContainers first, PodScheduled last).
+    /// Without honouring this ordering, the kubelet sees a different order on each GET and
+    /// re-sends PATCH, causing ~1-2 reconcile cycles per second. This continuous churn
+    /// prevented Job pods from holding Running phase long enough for conformance tests to pass.
+    #[test]
+    fn set_element_order_conditions_reorders_stored_conditions() {
+        let stored = serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": "job-pod", "namespace": "default", "resourceVersion": "5"},
+            "spec": {},
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"},
+                    {"type": "Initialized", "status": "True"},
+                    {"type": "ContainersReady", "status": "True"},
+                    {"type": "Ready", "status": "True"}
+                ]
+            }
+        });
+        // Kubelet sends the conditions in its preferred order, with $setElementOrder requesting
+        // [PodReadyToStartContainers, Initialized, Ready, ContainersReady, PodScheduled].
+        let patch = serde_json::json!({
+            "status": {
+                "conditions": [
+                    {"type": "PodReadyToStartContainers", "status": "True"},
+                    {"type": "Initialized", "status": "True"},
+                    {"type": "Ready", "status": "True"},
+                    {"type": "ContainersReady", "status": "True"},
+                    {"type": "PodScheduled", "status": "True"}
+                ],
+                "$setElementOrder/conditions": [
+                    {"type": "PodReadyToStartContainers"},
+                    {"type": "Initialized"},
+                    {"type": "Ready"},
+                    {"type": "ContainersReady"},
+                    {"type": "PodScheduled"}
+                ]
+            }
+        });
+
+        let result = apply_status_patch(&stored, &patch);
+        let conds = result["status"]["conditions"]
+            .as_array()
+            .expect("conditions must be an array");
+
+        assert_eq!(
+            conds[0]["type"], "PodReadyToStartContainers",
+            "PodReadyToStartContainers must be first per $setElementOrder — \
+             without this, kubelet detects ordering mismatch on every GET and \
+             re-sends PATCH causing ~1-2 reconciles/sec preventing Job pods from \
+             holding Running phase"
+        );
+        assert_eq!(conds[1]["type"], "Initialized");
+        assert_eq!(conds[2]["type"], "Ready");
+        assert_eq!(conds[3]["type"], "ContainersReady");
+        assert_eq!(
+            conds[4]["type"], "PodScheduled",
+            "PodScheduled must be last per $setElementOrder"
         );
     }
 }

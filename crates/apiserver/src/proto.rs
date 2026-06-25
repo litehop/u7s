@@ -1699,9 +1699,9 @@ struct JobSpec {
     /// manualSelector (field 5, bool)
     #[prost(bool, tag = "5")]
     manual_selector: bool,
-    /// template (field 6, PodTemplateSpec) — decoded as raw bytes; PodSpec is deeply nested
-    #[prost(bytes = "vec", tag = "6")]
-    template: Vec<u8>,
+    /// template (field 6, PodTemplateSpec) — decoded as nested message to preserve containers
+    #[prost(message, tag = "6")]
+    template: Option<AppsPodTemplateSpec>,
     /// backoffLimit (field 7, int32)
     #[prost(int32, tag = "7")]
     backoff_limit: i32,
@@ -3556,8 +3556,6 @@ pub fn decode_token_review_proto(data: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// Convert a prost JobSpec into a serde_json::Value object.
-/// The template field (PodTemplateSpec) is omitted — PodSpec is deeply nested and
-/// the same pattern as PodTemplate applies: store as empty object so the schema is valid.
 fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
     let mut m = serde_json::Map::new();
     if spec.parallelism != 0 {
@@ -3623,11 +3621,21 @@ fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
             serde_json::Value::String(spec.managed_by),
         );
     }
-    // template is always present as an empty object — required by the k8s schema
-    m.insert(
-        "template".to_string(),
-        serde_json::Value::Object(serde_json::Map::new()),
-    );
+    // Decode and include the pod template so containers are preserved.
+    // An empty template object is used as fallback so the k8s schema remains valid.
+    let tmpl_json = if let Some(tmpl) = spec.template {
+        let mut t = serde_json::json!({});
+        if let Some(meta) = tmpl.metadata {
+            t["metadata"] = object_meta_to_json(meta);
+        }
+        if let Some(pod_spec) = tmpl.spec {
+            t["spec"] = pod_spec_to_json(pod_spec);
+        }
+        t
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+    m.insert("template".to_string(), tmpl_json);
     serde_json::Value::Object(m)
 }
 
@@ -9741,7 +9749,10 @@ mod tests {
                         // when the struct has template at tag=5 and backoffLimit at tag=6,
                         // because kubectl puts template at wire field 6 (LEN type) which
                         // collides with the mislocated backoffLimit (int32, varint type).
-                        template: vec![0x0a, 0x02, 0x08, 0x01], // minimal PodTemplateSpec bytes
+                        template: Some(AppsPodTemplateSpec {
+                            metadata: None,
+                            spec: None,
+                        }),
                         backoff_limit: 3,
                         ..Default::default()
                     }),
@@ -9947,6 +9958,80 @@ mod tests {
         assert_eq!(result["metadata"]["name"], "success-policy-job");
         assert_eq!(result["spec"]["completionMode"], "Indexed");
         assert_eq!(result["spec"]["completions"], 3);
+    }
+
+    /// decode_job_proto must preserve spec.template.spec.containers from the proto body.
+    ///
+    /// Before this fix, job_spec_to_json stored `template` as an empty `{}` object,
+    /// discarding containers. KCM then created Job pods with `containers: null` (because
+    /// the job template had no containers), preventing pods from ever reaching Running phase
+    /// and causing `[sig-apps] Job should delete a job [Conformance]` to time out.
+    #[test]
+    fn decode_job_proto_preserves_template_containers() {
+        use prost::Message as _;
+
+        let job = Job {
+            metadata: Some(ObjectMeta {
+                name: "pi".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(JobSpec {
+                completions: 1,
+                template: Some(AppsPodTemplateSpec {
+                    metadata: None,
+                    spec: Some(PodSpec {
+                        containers: vec![Container {
+                            name: "pi".to_string(),
+                            image: "perl:5.34".to_string(),
+                            ..Default::default()
+                        }],
+                        restart_policy: "Never".to_string(),
+                        ..Default::default()
+                    }),
+                }),
+                backoff_limit: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_job_proto(&buf).expect(
+            "decode_job_proto must return Some for Job with template containing containers — \
+             if None is returned, Job creation via proto fails with 400",
+        );
+
+        assert_eq!(result["kind"], "Job");
+        assert_eq!(result["metadata"]["name"], "pi");
+        assert!(
+            result["spec"]["template"]["spec"]["containers"].is_array(),
+            "spec.template.spec.containers must be an array — if this is null/absent, \
+             KCM creates Job pods with containers:null and pods can never reach Running phase, \
+             causing [sig-apps] Job should delete a job [Conformance] to time out"
+        );
+        let containers = result["spec"]["template"]["spec"]["containers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            containers.len(),
+            1,
+            "one container must survive proto decode — KCM uses this to create pod specs"
+        );
+        assert_eq!(
+            containers[0]["name"], "pi",
+            "container name must be preserved — KCM uses container names to construct pod specs"
+        );
+        assert_eq!(
+            containers[0]["image"], "perl:5.34",
+            "container image must be preserved — without it pods run nothing"
+        );
+        assert_eq!(
+            result["spec"]["template"]["spec"]["restartPolicy"], "Never",
+            "restartPolicy must be preserved from the template spec"
+        );
     }
 
     // ---------------------------------------------------------------------------
