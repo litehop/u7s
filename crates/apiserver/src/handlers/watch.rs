@@ -4,6 +4,64 @@ use u7s_store::{ListOptions, Store, WatchEvent};
 
 use crate::{state::AppState, status::Status};
 
+/// Serialize `{"type":"<event_type>","object":<value>}\n` into a single heap allocation.
+///
+/// Watch clients parse these bytes; any format change breaks every informer.
+fn ndjson_event_value(event_type: &str, object: &serde_json::Value) -> Bytes {
+    let mut buf = Vec::with_capacity(128);
+    buf.extend_from_slice(b"{\"type\":\"");
+    buf.extend_from_slice(event_type.as_bytes());
+    buf.extend_from_slice(b"\",\"object\":");
+    let _ = serde_json::to_writer(&mut buf, object);
+    buf.extend_from_slice(b"}\n");
+    Bytes::from(buf)
+}
+
+/// Serialize `{"type":"<event_type>","object":<raw_json>}\n` without parsing raw_json.
+///
+/// Watch clients parse these bytes; any format change breaks every informer.
+fn ndjson_event_raw(event_type: &str, raw_object_json: &str) -> Bytes {
+    let mut buf = Vec::with_capacity(12 + event_type.len() + 11 + raw_object_json.len() + 2);
+    buf.extend_from_slice(b"{\"type\":\"");
+    buf.extend_from_slice(event_type.as_bytes());
+    buf.extend_from_slice(b"\",\"object\":");
+    buf.extend_from_slice(raw_object_json.as_bytes());
+    buf.extend_from_slice(b"}\n");
+    Bytes::from(buf)
+}
+
+/// Serialize a BOOKMARK line into a single heap allocation.
+///
+/// Watch clients parse these bytes; any format change breaks every informer.
+fn ndjson_bookmark(api_version: &str, kind: &str, revision: u64) -> Bytes {
+    let mut buf = Vec::with_capacity(128);
+    buf.extend_from_slice(b"{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"");
+    buf.extend_from_slice(api_version.as_bytes());
+    buf.extend_from_slice(b"\",\"kind\":\"");
+    buf.extend_from_slice(kind.as_bytes());
+    buf.extend_from_slice(b"\",\"metadata\":{\"resourceVersion\":\"");
+    let rv_str = revision.to_string();
+    buf.extend_from_slice(rv_str.as_bytes());
+    buf.extend_from_slice(b"\"}}}\n");
+    Bytes::from(buf)
+}
+
+/// Serialize an initial-events-end BOOKMARK line (with the annotation) into a single allocation.
+///
+/// Watch clients parse these bytes; any format change breaks every informer.
+fn ndjson_initial_events_bookmark(api_version: &str, kind: &str, revision: u64) -> Bytes {
+    let mut buf = Vec::with_capacity(200);
+    buf.extend_from_slice(b"{\"type\":\"BOOKMARK\",\"object\":{\"apiVersion\":\"");
+    buf.extend_from_slice(api_version.as_bytes());
+    buf.extend_from_slice(b"\",\"kind\":\"");
+    buf.extend_from_slice(kind.as_bytes());
+    buf.extend_from_slice(b"\",\"metadata\":{\"resourceVersion\":\"");
+    let rv_str = revision.to_string();
+    buf.extend_from_slice(rv_str.as_bytes());
+    buf.extend_from_slice(b"\",\"annotations\":{\"k8s.io/initial-events-end\":\"true\"}}}}\n");
+    Bytes::from(buf)
+}
+
 /// Transform a full CR JSON object into a PartialObjectMetadata object.
 /// The GC only needs metadata (ownerReferences, finalizers, etc.) — spec/status are omitted.
 pub(crate) fn to_partial_object_metadata(obj: &serde_json::Value) -> serde_json::Value {
@@ -30,7 +88,7 @@ pub(crate) fn encode_watch_event(
     kind: &str,
     as_partial_object_metadata: bool,
 ) -> Option<Bytes> {
-    let line = match event {
+    match event {
         WatchEvent::Added(obj) => {
             let object_json = match std::str::from_utf8(&obj.value) {
                 Ok(s) => s,
@@ -43,12 +101,9 @@ pub(crate) fn encode_watch_event(
                 let full: serde_json::Value =
                     serde_json::from_str(object_json).unwrap_or(serde_json::Value::Null);
                 let pom = to_partial_object_metadata(&full);
-                format!(
-                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
-                    serde_json::to_string(&pom).unwrap_or_default()
-                )
+                Some(ndjson_event_value("ADDED", &pom))
             } else {
-                format!("{{\"type\":\"ADDED\",\"object\":{object_json}}}\n")
+                Some(ndjson_event_raw("ADDED", object_json))
             }
         }
         WatchEvent::Modified(obj) => {
@@ -63,12 +118,9 @@ pub(crate) fn encode_watch_event(
                 let full: serde_json::Value =
                     serde_json::from_str(object_json).unwrap_or(serde_json::Value::Null);
                 let pom = to_partial_object_metadata(&full);
-                format!(
-                    "{{\"type\":\"MODIFIED\",\"object\":{}}}\n",
-                    serde_json::to_string(&pom).unwrap_or_default()
-                )
+                Some(ndjson_event_value("MODIFIED", &pom))
             } else {
-                format!("{{\"type\":\"MODIFIED\",\"object\":{object_json}}}\n")
+                Some(ndjson_event_raw("MODIFIED", object_json))
             }
         }
         WatchEvent::Deleted {
@@ -81,10 +133,7 @@ pub(crate) fn encode_watch_event(
                     if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(s) {
                         obj["metadata"]["resourceVersion"] =
                             serde_json::Value::String(revision.to_string());
-                        return Some(Bytes::from(format!(
-                            "{{\"type\":\"DELETED\",\"object\":{}}}\n",
-                            serde_json::to_string(&obj).unwrap_or_default()
-                        )));
+                        return Some(ndjson_event_value("DELETED", &obj));
                     }
                 }
             }
@@ -107,19 +156,11 @@ pub(crate) fn encode_watch_event(
                     }
                 })
             };
-            format!(
-                "{{\"type\":\"DELETED\",\"object\":{}}}\n",
-                serde_json::to_string(&object).unwrap_or_default()
-            )
+            Some(ndjson_event_value("DELETED", &object))
         }
-        WatchEvent::Bookmark { revision } => {
-            format!(
-                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{revision}\"}}}}}}\n"
-            )
-        }
-        WatchEvent::Compacted { .. } => return None,
-    };
-    Some(Bytes::from(line))
+        WatchEvent::Bookmark { revision } => Some(ndjson_bookmark(api_version, kind, *revision)),
+        WatchEvent::Compacted { .. } => None,
+    }
 }
 
 /// Parse the last two path segments of a store key as (name, namespace).
@@ -442,16 +483,9 @@ pub(crate) async fn watch_generic<S: Store>(
                     v["kind"] = serde_json::Value::String(kind.clone());
                     v
                 };
-                let line = format!(
-                    "{{\"type\":\"ADDED\",\"object\":{}}}\n",
-                    serde_json::to_string(&emit).unwrap_or_default()
-                );
-                yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
+                yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("ADDED", &emit));
             }
-            let bookmark = format!(
-                "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
-            );
-            yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+            yield Ok::<Bytes, axum::BoxError>(ndjson_initial_events_bookmark(&api_version, &kind, last_rv));
         }
 
         loop {
@@ -527,11 +561,7 @@ pub(crate) async fn watch_generic<S: Store>(
                                             parsed["kind"] = serde_json::Value::String(kind.clone());
                                             parsed
                                         };
-                                        let line = format!(
-                                            "{{\"type\":\"{event_type}\",\"object\":{}}}\n",
-                                            serde_json::to_string(&emit).unwrap_or_default()
-                                        );
-                                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
+                                        yield Ok::<Bytes, axum::BoxError>(ndjson_event_value(event_type, &emit));
                                     } else if is_modified {
                                         // The object no longer matches the selector after this
                                         // MODIFIED update. Emit a synthetic DELETED so watchers
@@ -561,11 +591,7 @@ pub(crate) async fn watch_generic<S: Store>(
                                                 }
                                             })
                                         };
-                                        let line = format!(
-                                            "{{\"type\":\"DELETED\",\"object\":{}}}\n",
-                                            serde_json::to_string(&tombstone).unwrap_or_default()
-                                        );
-                                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(line));
+                                        yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("DELETED", &tombstone));
                                     }
                                 } else {
                                     tracing::warn!("watch {event_type} event has invalid UTF-8, skipping");
@@ -588,20 +614,14 @@ pub(crate) async fn watch_generic<S: Store>(
                         // StatefulSet watch only sees StatefulSet events, so last_rv stays
                         // stale relative to pod writes — causing endless requeue loops.
                         let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
-                        let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{bookmark_rv}\"}}}}}}\n"
-                        );
-                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                        yield Ok::<Bytes, axum::BoxError>(ndjson_bookmark(&api_version, &kind, bookmark_rv));
                     }
                 }
 
                 _ = &mut max_duration => {
                     if allow_watch_bookmarks {
                         let bookmark_rv = _store_keepalive.current_revision().max(last_rv);
-                        let bookmark = format!(
-                            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{bookmark_rv}\"}}}}}}\n"
-                        );
-                        yield Ok::<Bytes, axum::BoxError>(Bytes::from(bookmark));
+                        yield Ok::<Bytes, axum::BoxError>(ndjson_bookmark(&api_version, &kind, bookmark_rv));
                     }
                     break;
                 }
@@ -787,6 +807,89 @@ mod tests {
             result.is_none(),
             "encode_watch_event must skip (return None) for MODIFIED events with invalid UTF-8, \
              not emit {{\"type\":\"MODIFIED\",\"object\":null}} which breaks Kubernetes watch clients"
+        );
+    }
+
+    // -- per-line emission: single-allocation NDJSON helpers (p2i8) --
+
+    /// ndjson_event_raw must produce bytes byte-identical to the format! equivalent.
+    ///
+    /// Watch clients parse these bytes; any format change breaks every informer. This test
+    /// fails on revert: if the buffer-based helper is replaced with format!+Bytes::from,
+    /// the byte sequence must remain identical or clients will fail to parse the stream.
+    #[test]
+    fn ndjson_event_raw_bytes_match_format_equivalent() {
+        let obj_json = r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm","namespace":"default","resourceVersion":"42"}}"#;
+        let expected = format!("{{\"type\":\"ADDED\",\"object\":{obj_json}}}\n");
+        let got = ndjson_event_raw("ADDED", obj_json);
+        assert_eq!(
+            got.as_ref(),
+            expected.as_bytes(),
+            "ndjson_event_raw must produce byte-identical output to the format! equivalent; \
+             watch clients parse these bytes and any format change breaks every informer"
+        );
+    }
+
+    /// ndjson_event_value must produce bytes byte-identical to format!+to_string equivalent.
+    ///
+    /// Watch clients parse these bytes; any format change breaks every informer.
+    #[test]
+    fn ndjson_event_value_bytes_match_format_equivalent() {
+        let obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "cm", "namespace": "default", "resourceVersion": "99"}
+        });
+        let expected = format!(
+            "{{\"type\":\"MODIFIED\",\"object\":{}}}\n",
+            serde_json::to_string(&obj).unwrap()
+        );
+        let got = ndjson_event_value("MODIFIED", &obj);
+        assert_eq!(
+            got.as_ref(),
+            expected.as_bytes(),
+            "ndjson_event_value must produce byte-identical output to the format!+to_string \
+             equivalent; watch clients parse these bytes and any format change breaks every informer"
+        );
+    }
+
+    /// ndjson_bookmark must produce bytes byte-identical to the format! equivalent.
+    ///
+    /// Watch clients parse these bytes; any format change breaks every informer.
+    #[test]
+    fn ndjson_bookmark_bytes_match_format_equivalent() {
+        let api_version = "apps/v1";
+        let kind = "Deployment";
+        let revision: u64 = 123;
+        let expected = format!(
+            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{revision}\"}}}}}}\n"
+        );
+        let got = ndjson_bookmark(api_version, kind, revision);
+        assert_eq!(
+            got.as_ref(),
+            expected.as_bytes(),
+            "ndjson_bookmark must produce byte-identical output to the format! equivalent; \
+             watch clients parse these bytes and any format change breaks every informer"
+        );
+    }
+
+    /// ndjson_initial_events_bookmark must produce bytes byte-identical to the format! equivalent.
+    ///
+    /// Watch clients parse these bytes; any format change breaks every informer.
+    #[test]
+    fn ndjson_initial_events_bookmark_bytes_match_format_equivalent() {
+        let api_version = "storage.k8s.io/v1";
+        let kind = "CSINode";
+        let last_rv: u64 = 0;
+        let expected = format!(
+            "{{\"type\":\"BOOKMARK\",\"object\":{{\"apiVersion\":\"{api_version}\",\"kind\":\"{kind}\",\"metadata\":{{\"resourceVersion\":\"{last_rv}\",\"annotations\":{{\"k8s.io/initial-events-end\":\"true\"}}}}}}}}\n"
+        );
+        let got = ndjson_initial_events_bookmark(api_version, kind, last_rv);
+        assert_eq!(
+            got.as_ref(),
+            expected.as_bytes(),
+            "ndjson_initial_events_bookmark must produce byte-identical output to the format! \
+             equivalent; watch clients parse these bytes and any format change breaks every informer"
         );
     }
 
