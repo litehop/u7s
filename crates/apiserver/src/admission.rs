@@ -328,6 +328,28 @@ pub(crate) fn validate_webhook_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_service_reference(svc_ref: &ServiceReference) -> Result<(), String> {
+    crate::handlers::generic::validate_name("service name", &svc_ref.name)
+        .map_err(|e| e.1.message.clone())?;
+    crate::handlers::generic::validate_name("service namespace", &svc_ref.namespace)
+        .map_err(|e| e.1.message.clone())?;
+    if let Some(path) = &svc_ref.path {
+        if !path.starts_with('/') {
+            return Err(format!(
+                "invalid service path '{}': must start with '/'",
+                path
+            ));
+        }
+        if path.split('/').any(|seg| seg == "..") {
+            return Err(format!(
+                "invalid service path '{}': must not contain '..' path components",
+                path
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a webhook's clientConfig to a `WebhookTarget`.
 ///
 /// If `clientConfig.url` is set, returns `DirectUrl`.
@@ -350,6 +372,8 @@ async fn webhook_url<S: Store>(
 
     if let Some(svc_ref) = &config.service {
         let svc_port = svc_ref.port.unwrap_or(443);
+
+        validate_service_reference(svc_ref)?;
 
         // With kube-proxy running inside the VM (PR #406), the konnectivity-agent
         // resolves the service DNS name via CoreDNS → ClusterIP, and kube-proxy NATs
@@ -7293,6 +7317,69 @@ mod tests {
             result.is_ok(),
             "http://127.0.0.1 must be accepted — \
              loopback addresses are not SSRF targets and must work for test mock servers"
+        );
+    }
+
+    // -- ServiceReference validation tests --
+
+    /// A ServiceReference with a path-traversal value must be rejected before the URL is built.
+    ///
+    /// Without this check, a stored WebhookClientConfig with path="/../etc" would be injected
+    /// verbatim into the outbound HTTPS URL, producing a request that reaches an unintended path
+    /// on the webhook server.
+    #[test]
+    fn validate_service_reference_rejects_dotdot_path() {
+        let svc_ref = ServiceReference {
+            namespace: "default".into(),
+            name: "my-webhook".into(),
+            port: None,
+            path: Some("/../etc".into()),
+        };
+        let result = validate_service_reference(&svc_ref);
+        assert!(
+            result.is_err(),
+            "a service path containing '..' must be rejected — \
+             unvalidated service fields are injected into the webhook URL"
+        );
+    }
+
+    /// A ServiceReference with an invalid name (contains uppercase) must be rejected.
+    ///
+    /// Without this check, an invalid name is injected verbatim into the URL, producing
+    /// a hostname that violates DNS label rules and may behave unexpectedly.
+    #[test]
+    fn validate_service_reference_rejects_invalid_name() {
+        let svc_ref = ServiceReference {
+            namespace: "default".into(),
+            name: "Invalid_Name".into(),
+            port: None,
+            path: None,
+        };
+        let result = validate_service_reference(&svc_ref);
+        assert!(
+            result.is_err(),
+            "a service name failing DNS label rules must be rejected — \
+             unvalidated service fields are injected into the webhook URL"
+        );
+    }
+
+    /// A well-formed ServiceReference must be accepted.
+    ///
+    /// Over-restrictive validation would break all in-cluster webhook configurations
+    /// that use a ServiceReference.
+    #[test]
+    fn validate_service_reference_accepts_valid_ref() {
+        let svc_ref = ServiceReference {
+            namespace: "kube-system".into(),
+            name: "my-webhook".into(),
+            port: Some(443),
+            path: Some("/validate".into()),
+        };
+        let result = validate_service_reference(&svc_ref);
+        assert!(
+            result.is_ok(),
+            "a valid ServiceReference must be accepted — \
+             over-restrictive validation would break all in-cluster webhook configurations"
         );
     }
 
