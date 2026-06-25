@@ -190,6 +190,20 @@ impl RbacIndex {
         inner.cluster_roles.get(name).cloned().unwrap_or_default()
     }
 
+    /// Return true if any ClusterRoleBinding references the named ClusterRole.
+    ///
+    /// Used by escalation prevention: when a ClusterRole is created or updated
+    /// with rules, we must check whether any binding already points to it so that
+    /// the role-creator also holds those rules.
+    pub fn clusterrole_has_bindings(&self, role_name: &str) -> bool {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        inner.cluster_bindings.iter().any(|(_, b)| {
+            b.role_ref.kind == "ClusterRole"
+                && b.role_ref.api_group == "rbac.authorization.k8s.io"
+                && b.role_ref.name == role_name
+        })
+    }
+
     pub fn is_allowed(&self, req: &AuthzRequest<'_>) -> bool {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
 

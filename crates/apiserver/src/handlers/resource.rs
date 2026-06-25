@@ -20,9 +20,9 @@ use crate::{
 };
 
 use super::generic::{
-    apply_delete_policy, apply_label_selector, build_list_response, check_crb_escalation,
-    decode_continue, lookup, parse_field_selector, parse_label_selector, resolve_name,
-    stamp_metadata, store_err, validate_name, CollectionQuery, RBAC_GROUP,
+    apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
+    check_crb_escalation, decode_continue, lookup, parse_field_selector, parse_label_selector,
+    resolve_name, stamp_metadata, store_err, validate_name, CollectionQuery, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
@@ -264,6 +264,9 @@ pub async fn create_resource<S: Store>(
     // caller already holds all rules of the referenced ClusterRole. This prevents
     // users from granting themselves permissions they don't currently have.
     check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
+    // Escalation prevention for ClusterRole creates: if any CRB already references
+    // this role, the caller must hold all the rules they are about to define.
+    check_clusterrole_escalation(&plural, &group, &user, &obj.body, &state)?;
 
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
@@ -370,6 +373,9 @@ pub async fn replace_resource<S: Store>(
     // Escalation prevention: before updating a ClusterRoleBinding, verify the
     // caller already holds all rules of the referenced ClusterRole.
     check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
+    // Escalation prevention for ClusterRole updates: if any CRB already references
+    // this role, the caller must hold all the rules they are about to define.
+    check_clusterrole_escalation(&plural, &group, &user, &obj.body, &state)?;
 
     let obj_name = obj.name().unwrap_or("").to_string();
     if obj_name != name {
