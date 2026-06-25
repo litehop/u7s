@@ -20,9 +20,10 @@ use crate::{
 };
 
 use super::generic::{
-    apply_delete_policy, apply_label_selector, build_list_response, check_crb_escalation,
-    decode_continue, lookup, parse_field_selector, parse_label_selector, resolve_name,
-    stamp_metadata, store_err, validate_name, CollectionQuery, RBAC_GROUP,
+    apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
+    check_crb_escalation, check_rb_escalation, decode_continue, lookup, parse_field_selector,
+    parse_label_selector, resolve_name, stamp_metadata, store_err, validate_name, CollectionQuery,
+    RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
@@ -264,6 +265,9 @@ pub async fn create_resource<S: Store>(
     // caller already holds all rules of the referenced ClusterRole. This prevents
     // users from granting themselves permissions they don't currently have.
     check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
+    // Escalation prevention for ClusterRole creates: if any CRB already references
+    // this role, the caller must hold all the rules they are about to define.
+    check_clusterrole_escalation(&plural, &group, &user, &obj.body, &state)?;
 
     let name = resolve_name(&mut obj)?;
     stamp_metadata(&mut obj);
@@ -370,6 +374,9 @@ pub async fn replace_resource<S: Store>(
     // Escalation prevention: before updating a ClusterRoleBinding, verify the
     // caller already holds all rules of the referenced ClusterRole.
     check_crb_escalation(&plural, &group, &user, &obj.body, &state)?;
+    // Escalation prevention for ClusterRole updates: if any CRB already references
+    // this role, the caller must hold all the rules they are about to define.
+    check_clusterrole_escalation(&plural, &group, &user, &obj.body, &state)?;
 
     let obj_name = obj.name().unwrap_or("").to_string();
     if obj_name != name {
@@ -1115,6 +1122,10 @@ pub async fn create_namespaced_resource<S: Store>(
         &plural,
     )?;
 
+    // Escalation prevention: before persisting a namespaced RoleBinding, verify the
+    // caller already holds all rules of the referenced Role or ClusterRole in this namespace.
+    check_rb_escalation(&plural, &group, &ns, &user, &obj.body, &state)?;
+
     let name = resolve_name(&mut obj)?;
 
     // Capture RS revision propagation info BEFORE ns_meta processing drops ownerReferences.
@@ -1364,6 +1375,10 @@ pub async fn replace_namespaced_resource<S: Store>(
             "the name of the object ({obj_name}) does not match the name on the URL ({name})"
         )));
     }
+
+    // Escalation prevention: before updating a namespaced RoleBinding, verify the
+    // caller already holds all rules of the referenced Role or ClusterRole in this namespace.
+    check_rb_escalation(&plural, &group, &ns, &user, &obj.body, &state)?;
 
     // Stamp namespace from the URL into the body. If the client omits metadata.namespace
     // in the PUT body, the stored object would have no namespace. A cluster-wide Watch
@@ -10311,6 +10326,199 @@ mod tests {
             "pod with deletionTimestamp + only tracking finalizer must be hard-deleted \
              when the job is deleted — without this, the GC cascade never completes and \
              the pod stays Terminating forever"
+        );
+    }
+
+    // -- RoleBinding escalation prevention (bwm2) --
+
+    /// A user without permission X who creates a RoleBinding granting a Role that contains X
+    /// must get 403 Forbidden.  Without this check, any user with create rolebindings in a
+    /// namespace can self-grant cluster-admin-in-namespace by binding to any powerful Role.
+    #[tokio::test]
+    async fn create_rolebinding_denied_for_user_lacking_role_rules() {
+        use axum::extract::{Extension, Path, State};
+
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+        let ns = "default";
+
+        // Seed a Role in "default" with secret-read rules that "alice" does NOT hold.
+        let secret_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": {"name": "secret-reader", "namespace": ns},
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["get", "list"]
+            }]
+        });
+        let role_key = format!("/apis/{group}/{version}/namespaces/{ns}/roles/secret-reader");
+        state.rbac_index.apply_object(&role_key, &secret_role);
+
+        // "alice" can only create rolebindings — she does NOT have get/list secrets.
+        let alice_cr = serde_json::json!({
+            "rules": [{
+                "apiGroups": [group],
+                "resources": ["rolebindings"],
+                "verbs": ["create"]
+            }]
+        });
+        let alice_crb_key = format!("/apis/{group}/{version}/clusterroles/alice-rb-creator");
+        state.rbac_index.apply_object(&alice_crb_key, &alice_cr);
+        let alice_bind_key =
+            format!("/apis/{group}/{version}/clusterrolebindings/alice-rb-creator-bind");
+        let alice_bind = serde_json::json!({
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {
+                "apiGroup": group,
+                "kind": "ClusterRole",
+                "name": "alice-rb-creator"
+            }
+        });
+        state.rbac_index.apply_object(&alice_bind_key, &alice_bind);
+
+        // alice tries to bind herself to "secret-reader" in "default".
+        let rb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": "alice-secret-reader", "namespace": ns},
+            "subjects": [{"kind": "User", "name": "alice"}],
+            "roleRef": {
+                "apiGroup": group,
+                "kind": "Role",
+                "name": "secret-reader"
+            }
+        });
+        let alice_user = Extension(crate::auth::UserInfo {
+            username: "alice".into(),
+            uid: String::new(),
+            groups: vec![],
+        });
+        let result = create_namespaced_resource(
+            State(state),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                "rolebindings".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            alice_user,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&rb_body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::FORBIDDEN,
+                "missing RB escalation check lets any namespace rolebindings-creator \
+                 self-grant cluster-admin-in-namespace; alice must be denied because \
+                 she does not hold get/list secrets"
+            ),
+            Ok(_) => panic!(
+                "missing RB escalation check lets any namespace rolebindings-creator \
+                 self-grant cluster-admin-in-namespace; alice must be denied because \
+                 she does not hold get/list secrets"
+            ),
+        }
+    }
+
+    /// A user who holds all the rules in a Role must be allowed to create a RoleBinding to it.
+    /// This ensures that users with the right permissions can delegate them within a namespace.
+    #[tokio::test]
+    async fn create_rolebinding_allowed_for_user_holding_role_rules() {
+        use axum::extract::{Extension, Path, State};
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+        let ns = "default";
+
+        // Seed a Role in "default" with pod-read rules.
+        let pod_role = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": {"name": "pod-reader", "namespace": ns},
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get", "list"]
+            }]
+        });
+        let role_key = format!("/apis/{group}/{version}/namespaces/{ns}/roles/pod-reader");
+        state.rbac_index.apply_object(&role_key, &pod_role);
+
+        // Seed cluster-admin and system:masters binding so "admin" passes escalation.
+        let admin_cr = serde_json::json!({
+            "rules": [{"apiGroups": ["*"], "resources": ["*"], "verbs": ["*"]}]
+        });
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/{version}/clusterroles/cluster-admin"),
+            &admin_cr,
+        );
+        let masters_crb = serde_json::json!({
+            "subjects": [{"kind": "Group", "name": "system:masters"}],
+            "roleRef": {
+                "apiGroup": group,
+                "kind": "ClusterRole",
+                "name": "cluster-admin"
+            }
+        });
+        state.rbac_index.apply_object(
+            &format!("/apis/{group}/{version}/clusterrolebindings/system-masters-cluster-admin"),
+            &masters_crb,
+        );
+
+        // "admin" (system:masters) creates a RoleBinding granting pod-reader to "bob".
+        let rb_body = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": {"name": "bob-pod-reader", "namespace": ns},
+            "subjects": [{"kind": "User", "name": "bob"}],
+            "roleRef": {
+                "apiGroup": group,
+                "kind": "Role",
+                "name": "pod-reader"
+            }
+        });
+        let admin_user = Extension(crate::auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec!["system:masters".into()],
+        });
+        let result = create_namespaced_resource(
+            State(state),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                "rolebindings".to_string(),
+            )),
+            axum::extract::Query(CreateQuery::default()),
+            admin_user,
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&rb_body).unwrap()),
+        )
+        .await;
+
+        let status = result
+            .map(|r| r.into_response().status())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "admin with system:masters must be allowed to create RoleBinding; got: {}",
+                    e.1.message
+                )
+            });
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "admin who holds all pod-reader rules must be allowed to create a RoleBinding"
         );
     }
 }
