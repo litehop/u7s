@@ -638,23 +638,12 @@ pub(crate) fn check_rb_escalation<S: Store>(
     Ok(())
 }
 
-/// Build the RBAC index key for a cluster-scoped object.
-#[cfg(test)]
-fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &str) -> String {
-    format!("/apis/{group}/{version}/{plural}/{name}")
-}
-
-/// Build the RBAC index key for a namespaced object.
-#[cfg(test)]
-fn rbac_namespaced_key(group: &str, version: &str, ns: &str, plural: &str, name: &str) -> String {
-    format!("/apis/{group}/{version}/namespaces/{ns}/{plural}/{name}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::json_patch::{
         apply_json_patch, detect_patch_type, json_pointer_segments, PatchType,
     };
+    use super::super::resource::{rbac_cluster_key, rbac_namespaced_key};
     use super::*;
     use axum::http::HeaderMap;
 
