@@ -213,7 +213,12 @@ fn decode_scale_body(
 // spec.replicas.  PUT/PATCH write spec.replicas back to the stored object.
 // ---------------------------------------------------------------------------
 
-const SCALE_RESOURCES: &[&str] = &["deployments", "replicasets", "statefulsets"];
+const SCALE_RESOURCES: &[&str] = &[
+    "deployments",
+    "replicasets",
+    "statefulsets",
+    "replicationcontrollers",
+];
 
 fn require_scale_resource(resource: &str) -> Result<(), crate::status::StatusError> {
     if SCALE_RESOURCES.contains(&resource) {
@@ -443,6 +448,163 @@ pub async fn patch_scale<S: Store>(
 }
 
 // ---------------------------------------------------------------------------
+// ReplicationController scale subresource — GET/PUT/PATCH
+//
+// Routes:
+//   GET    /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
+//   PUT    /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
+//   PATCH  /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
+//
+// RCs are a core/v1 resource stored under /registry/replicationcontrollers/{ns}/{name}
+// (group=""), not under apps/v1. The generic scale handlers hard-code group="apps" in
+// their store key, so RC needs dedicated handlers that pass group="" to group_object_key.
+// ---------------------------------------------------------------------------
+
+/// GET /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
+pub async fn get_rc_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, name)): Path<(String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    let key = group_object_key("", "replicationcontrollers", Some(&ns), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "replicationcontrollers"))?;
+
+    let obj: serde_json::Value = serde_json::from_slice(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let spec_replicas = extract_replicas(&obj);
+    let status_replicas = extract_status_replicas(&obj);
+    let rv = obj["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    Ok(Json(build_scale(&name, &ns, spec_replicas, status_replicas, &rv)).into_response())
+}
+
+/// PUT /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
+pub async fn put_rc_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let scale = decode_scale_body(&body, &headers)?;
+
+    let new_replicas = scale
+        .spec
+        .replicas
+        .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?
+        as i64;
+
+    let key = group_object_key("", "replicationcontrollers", Some(&ns), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "replicationcontrollers"))?;
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let old_replicas = extract_replicas(&obj.body);
+    let status_replicas = extract_status_replicas(&obj.body);
+    obj.body["spec"]["replicas"] = serde_json::Value::Number(new_replicas.into());
+
+    if new_replicas != old_replicas {
+        let gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
+        obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
+    }
+
+    let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, obj.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    Ok(Json(build_scale(
+        &name,
+        &ns,
+        new_replicas,
+        status_replicas,
+        &new_rv.to_string(),
+    )))
+}
+
+/// PATCH /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
+pub async fn patch_rc_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = content_type(&headers);
+    let decoded = extract_body(&body, ct);
+    let patch_body: serde_json::Value =
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&decoded) {
+            v
+        } else if let Some(scale) = try_decode_proto_scale_body(&body) {
+            serde_json::to_value(scale).unwrap_or_default()
+        } else {
+            let e = serde_json::from_slice::<serde_json::Value>(&body)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unrecognised body format".into());
+            return Err(Status::bad_request(format!("invalid JSON: {e}")));
+        };
+    let patch_scale_spec: ScaleSpec =
+        serde_json::from_value(patch_body["spec"].clone()).unwrap_or_default();
+
+    let key = group_object_key("", "replicationcontrollers", Some(&ns), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "replicationcontrollers"))?;
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let old_replicas = extract_replicas(&obj.body);
+    let status_replicas = extract_status_replicas(&obj.body);
+
+    let new_replicas = if let Some(r) = patch_scale_spec.replicas {
+        let r = r as i64;
+        obj.body["spec"]["replicas"] = serde_json::json!(r);
+        r
+    } else {
+        old_replicas
+    };
+
+    if new_replicas != old_replicas {
+        let gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
+        obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
+    }
+
+    let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, obj.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    Ok(Json(build_scale(
+        &name,
+        &ns,
+        new_replicas,
+        status_replicas,
+        &new_rv.to_string(),
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -555,11 +717,12 @@ mod tests {
 
     #[test]
     fn require_scale_resource_accepts_workload_plurals() {
-        // Only the three apps/v1 workload types expose a scale subresource in
-        // Kubernetes; any other resource must return 404.
+        // apps/v1 workloads and core/v1 replicationcontrollers expose a scale
+        // subresource in Kubernetes; any other resource must return 404.
         assert!(require_scale_resource("deployments").is_ok());
         assert!(require_scale_resource("replicasets").is_ok());
         assert!(require_scale_resource("statefulsets").is_ok());
+        assert!(require_scale_resource("replicationcontrollers").is_ok());
     }
 
     #[test]
@@ -1536,6 +1699,156 @@ mod handler_tests {
         assert_eq!(
             json["apiVersion"], "autoscaling/v1",
             "response must be autoscaling/v1 Scale"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ReplicationController scale subresource — core/v1 store key resolution
+    //
+    // RCs are stored at /registry/replicationcontrollers/{ns}/{name} (group=""),
+    // not under apps/v1. These tests verify that the RC-specific handlers use the
+    // correct store key so that HPA and kubectl scale work on RCs.
+    // -----------------------------------------------------------------------
+
+    /// Seed a ReplicationController into the store at the core/v1 key.
+    async fn seed_rc(store: &Arc<SqliteStore>, ns: &str, name: &str, replicas: i64) {
+        // Core/v1 RC store key: /registry/replicationcontrollers/{ns}/{name}
+        let key = format!("/registry/replicationcontrollers/{ns}/{name}");
+        let val = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": {
+                "name": name,
+                "namespace": ns,
+                "resourceVersion": "1",
+                "generation": 1
+            },
+            "spec": { "replicas": replicas },
+            "status": {}
+        });
+        store
+            .put(&key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .expect("seed rc");
+    }
+
+    /// GET scale on a ReplicationController resolves the core/v1 store key and returns
+    /// autoscaling/v1 Scale. This verifies the RC handler does NOT look under apps/v1
+    /// (which would yield 404) — kubectl and HPA use GET scale on RCs.
+    ///
+    /// Fails on revert: if get_rc_scale is removed or uses group="apps", the store lookup
+    /// hits /registry/apps/replicationcontrollers/{ns}/{name} which does not exist → 404.
+    #[tokio::test]
+    async fn replicationcontroller_scale_subresource_resolves_core_rc_so_hpa_and_kubectl_scale_work(
+    ) {
+        let (state, store) = make_state();
+        seed_rc(&store, "default", "my-rc", 2).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/replicationcontrollers/{name}/scale",
+                get(get_rc_scale),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/replicationcontrollers/my-rc/scale")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET scale on an RC must return 200 — before this fix the route was missing \
+             entirely → 404 'could not find the requested resource' (rc.go:302)"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["apiVersion"], "autoscaling/v1");
+        assert_eq!(json["kind"], "Scale");
+        assert_eq!(
+            json["spec"]["replicas"], 2,
+            "spec.replicas must reflect the RC's stored replica count"
+        );
+        assert_eq!(json["metadata"]["name"], "my-rc");
+        assert_eq!(json["metadata"]["namespace"], "default");
+    }
+
+    /// PATCH scale on an RC writes spec.replicas back to the correct core/v1 store key
+    /// and the updated replica count is visible via GET. This verifies the end-to-end
+    /// conformance path: rc.go PATCHes /scale and then reads back to confirm the change.
+    ///
+    /// Fails on revert: if patch_rc_scale uses group="apps", the PUT hits the wrong key
+    /// and the RC's actual spec.replicas is never updated — kubectl scale silently no-ops.
+    #[tokio::test]
+    async fn patch_rc_scale_writes_spec_replicas_to_core_store_key() {
+        let (state, store) = make_state();
+        seed_rc(&store, "default", "my-rc", 1).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/replicationcontrollers/{name}/scale",
+                patch(patch_rc_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "replicas": 3 } });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/default/replicationcontrollers/my-rc/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PATCH scale on an RC must return 200 — conformance test rc.go:302 \
+             'Failed to patch ReplicationControllerScale: the server could not find the \
+             requested resource' was a 404 because the route did not exist"
+        );
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(
+            json["spec"]["replicas"], 3,
+            "response spec.replicas must reflect the patched value"
+        );
+
+        // Confirm the RC in the store was updated at the correct core/v1 key.
+        let key = "/registry/replicationcontrollers/default/my-rc";
+        let stored = store.get(key).await.unwrap().unwrap();
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_obj["spec"]["replicas"], 3,
+            "RC spec.replicas in the store must be updated — if the handler used \
+             group='apps' it would write to the wrong key and the RC would not scale"
+        );
+    }
+
+    /// require_scale_resource must accept replicationcontrollers — without this entry
+    /// the generic path (if ever used for RCs) would return 404.
+    ///
+    /// Fails on revert: removing "replicationcontrollers" from SCALE_RESOURCES causes
+    /// this assertion to fail.
+    #[test]
+    fn require_scale_resource_accepts_replicationcontrollers() {
+        // replicationcontrollers/scale is a core/v1 subresource granted to HPA by RBAC.
+        // The allowlist must include it so the generic validation path does not reject RCs.
+        assert!(
+            require_scale_resource("replicationcontrollers").is_ok(),
+            "replicationcontrollers must be in SCALE_RESOURCES — HPA and kubectl scale \
+             both use the /scale subresource for RCs; without this entry any generic \
+             require_scale_resource check would return 404"
         );
     }
 }
