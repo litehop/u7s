@@ -506,6 +506,14 @@ fn build_router(state: AppState) -> Router {
                 .post(handlers::core::core_create_namespaced_resource)
                 .delete(handlers::core::core_delete_collection_namespaced_resource),
         )
+        // ReplicationController scale subresource — core/v1 RC lives under group="" store key,
+        // so it cannot share the apps/v1 scale route. Registered before the generic catch-all.
+        .route(
+            "/api/v1/namespaces/{ns}/replicationcontrollers/{name}/scale",
+            get(handlers::scale::get_rc_scale)
+                .put(handlers::scale::put_rc_scale)
+                .patch(handlers::scale::patch_rc_scale),
+        )
         // Core group — namespaced named resource
         .route(
             "/api/v1/namespaces/{ns}/{resource}/{name}",
