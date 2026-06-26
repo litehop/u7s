@@ -74,6 +74,7 @@ fn ndjson_initial_events_bookmark(api_version: &str, kind: &str, revision: u64) 
 /// watchers share the same event source.  Each watcher calls this once; sharing the returned
 /// `Bytes` across callers (same event, multiple watchers) is safe because `Bytes` is `Clone`
 /// and the allocation is reference-counted.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn prepare_live_event(
     raw: &[u8],
