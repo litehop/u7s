@@ -345,9 +345,23 @@ pub async fn create_pod<S: Store>(
         .map(str::to_owned)
     {
         let rc_key = group_object_key("node.k8s.io", "runtimeclasses", None, &rc_name);
-        if let Ok(Some(stored_rc)) = state.store.get(&rc_key).await {
-            if let Ok(rc_obj) = serde_json::from_slice::<serde_json::Value>(&stored_rc.value) {
-                apply_runtime_class_overhead(&mut obj.body, &rc_obj);
+        match state.store.get(&rc_key).await {
+            Ok(Some(stored_rc)) => {
+                match serde_json::from_slice::<serde_json::Value>(&stored_rc.value) {
+                    Ok(rc_obj) => {
+                        tracing::debug!(rc = %rc_name, overhead = %rc_obj["overhead"], "injecting RuntimeClass overhead into pod");
+                        apply_runtime_class_overhead(&mut obj.body, &rc_obj);
+                    }
+                    Err(e) => {
+                        tracing::warn!(rc = %rc_name, err = %e, "failed to parse stored RuntimeClass — overhead not injected");
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(rc = %rc_name, key = %rc_key, "RuntimeClass not found in store — overhead not injected");
+            }
+            Err(e) => {
+                tracing::warn!(rc = %rc_name, err = %e, "store error looking up RuntimeClass — overhead not injected");
             }
         }
     }

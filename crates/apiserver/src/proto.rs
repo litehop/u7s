@@ -861,6 +861,7 @@ struct Container {
 ///   field 16 = hostname (string)
 ///   field 17 = subdomain (string)
 ///   field 20 = initContainers (repeated Container)
+///   field 29 = runtimeClassName (optional string)
 #[derive(Clone, PartialEq, Message)]
 struct PodSpec {
     /// volumes (field 1, repeated Volume) — backing volumes for container volumeMounts
@@ -890,6 +891,11 @@ struct PodSpec {
     /// kubelet blocks pod startup if any init container fails or is not decoded
     #[prost(message, repeated, tag = "20")]
     init_containers: Vec<Container>,
+    /// runtimeClassName (field 29, optional string) — references a RuntimeClass object in the
+    /// node.k8s.io group; the apiserver uses this at admission to inject spec.overhead from the
+    /// RuntimeClass.overhead.podFixed field into the pod.
+    #[prost(string, optional, tag = "29")]
+    runtime_class_name: Option<String>,
 }
 
 /// Pod — k8s.io/api/core/v1/generated.proto
@@ -4713,6 +4719,14 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
             serde_json::Value::Array(init_containers),
         );
     }
+    if let Some(rcn) = spec.runtime_class_name {
+        if !rcn.is_empty() {
+            spec_map.insert(
+                "runtimeClassName".to_string(),
+                serde_json::Value::String(rcn),
+            );
+        }
+    }
     serde_json::Value::Object(spec_map)
 }
 
@@ -7872,6 +7886,46 @@ mod tests {
             "protocol must be preserved as TCP"
         );
         assert_eq!(ports[0]["name"], "http", "port name must be preserved");
+    }
+
+    /// decode_pod_proto must preserve spec.runtimeClassName from field 29 of PodSpec.
+    ///
+    /// The conformance test '[sig-node] RuntimeClass should schedule a Pod requesting a
+    /// RuntimeClass and initialize its Overhead' creates a pod via the typed Go client which
+    /// sends protobuf. The pod body contains spec.runtimeClassName. Without decoding field 29,
+    /// runtimeClassName is dropped from the JSON, the overhead injection block in create_pod
+    /// is never entered, and spec.overhead remains absent — failing the assertion that
+    /// pod.Spec.Overhead equals rc.Overhead.PodFixed in the CREATE response.
+    #[test]
+    fn decode_pod_proto_preserves_runtime_class_name() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "rc-pod", namespace: "test-ns" },
+        //   spec: PodSpec {
+        //     containers: [Container { name: "c", image: "img" }],
+        //     runtimeClassName: "my-runtime-class",   // field 29
+        //   }
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"rc-pod");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"test-ns"));
+
+        let mut container = encode_length_delimited(1, b"c");
+        container.extend_from_slice(&encode_length_delimited(2, b"img"));
+
+        let mut pod_spec = encode_length_delimited(2, &container); // containers at field 2
+        pod_spec.extend_from_slice(&encode_length_delimited(29, b"my-runtime-class")); // runtimeClassName at field 29
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed for a pod with runtimeClassName");
+
+        assert_eq!(
+            result["spec"]["runtimeClassName"], "my-runtime-class",
+            "spec.runtimeClassName must survive proto decode — without it the overhead \
+             injection block in create_pod is never entered and spec.overhead stays absent, \
+             causing the RuntimeClass conformance test to fail"
+        );
     }
 
     /// decode_core_proto_by_kind must dispatch Pod proto and return a valid JSON object.
