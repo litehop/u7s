@@ -345,9 +345,23 @@ pub async fn create_pod<S: Store>(
         .map(str::to_owned)
     {
         let rc_key = group_object_key("node.k8s.io", "runtimeclasses", None, &rc_name);
-        if let Ok(Some(stored_rc)) = state.store.get(&rc_key).await {
-            if let Ok(rc_obj) = serde_json::from_slice::<serde_json::Value>(&stored_rc.value) {
-                apply_runtime_class_overhead(&mut obj.body, &rc_obj);
+        match state.store.get(&rc_key).await {
+            Ok(Some(stored_rc)) => {
+                match serde_json::from_slice::<serde_json::Value>(&stored_rc.value) {
+                    Ok(rc_obj) => {
+                        tracing::debug!(rc = %rc_name, overhead = %rc_obj["overhead"], "injecting RuntimeClass overhead into pod");
+                        apply_runtime_class_overhead(&mut obj.body, &rc_obj);
+                    }
+                    Err(e) => {
+                        tracing::warn!(rc = %rc_name, err = %e, "failed to parse stored RuntimeClass — overhead not injected");
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(rc = %rc_name, key = %rc_key, "RuntimeClass not found in store — overhead not injected");
+            }
+            Err(e) => {
+                tracing::warn!(rc = %rc_name, err = %e, "store error looking up RuntimeClass — overhead not injected");
             }
         }
     }
@@ -376,6 +390,9 @@ pub async fn create_pod<S: Store>(
 
     // ResourceQuota: ensure pod count does not exceed hard limits, respecting scope selectors.
     crate::quota::check_resource_quota(&state, ns.as_str(), "", "pods", Some(&obj.body)).await?;
+
+    obj.body["status"]["qosClass"] =
+        serde_json::Value::String(compute_qos_class(&obj.body).to_owned());
 
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state
@@ -2817,19 +2834,85 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     }
 }
 
-/// Copy `spec.overhead.podFixed` from a RuntimeClass into `pod.spec.overhead`.
+/// Copy `overhead.podFixed` from a RuntimeClass into `pod.spec.overhead`.
 ///
 /// If the pod already carries `spec.overhead`, it is left unchanged (idempotent,
 /// matches what the kube-apiserver RuntimeClass admission plugin does).
 /// The RuntimeClass JSON must be the full stored object; if it has no
-/// `spec.overhead.podFixed` this is a no-op.
+/// `overhead.podFixed` this is a no-op.
 pub fn apply_runtime_class_overhead(pod: &mut serde_json::Value, rc: &serde_json::Value) {
-    let pod_fixed = &rc["spec"]["overhead"]["podFixed"];
+    let pod_fixed = &rc["overhead"]["podFixed"];
     if pod_fixed.is_null() || pod_fixed.as_object().is_none_or(|m| m.is_empty()) {
         return;
     }
     if pod["spec"]["overhead"].is_null() {
         pod["spec"]["overhead"] = pod_fixed.clone();
+    }
+}
+
+/// Compute the QoS class for a pod from its container resource requests/limits.
+///
+/// Kubernetes sets `status.qosClass` at admission time based on the resource
+/// declarations across all containers and init containers:
+///
+/// - **Guaranteed**: every container has both cpu AND memory limits set, AND
+///   for each resource where a request is present the request equals the limit.
+///   (If a request is absent for a resource, it is implicitly equal to the limit.)
+/// - **Burstable**: at least one container has any cpu or memory request/limit
+///   set, but the Guaranteed criteria are not met.
+/// - **BestEffort**: no container has any cpu or memory request or limit.
+///
+/// Without this, conformance tests like node/pods.go:200 ("Pods should be
+/// submitted and removed") fail because they create a pod with requests==limits
+/// and assert status.qosClass == "Guaranteed".
+pub fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
+    let containers: Vec<&serde_json::Value> = {
+        let mut v: Vec<&serde_json::Value> = Vec::new();
+        if let Some(arr) = pod["spec"]["containers"].as_array() {
+            v.extend(arr.iter());
+        }
+        if let Some(arr) = pod["spec"]["initContainers"].as_array() {
+            v.extend(arr.iter());
+        }
+        v
+    };
+
+    if containers.is_empty() {
+        return "BestEffort";
+    }
+
+    let mut any_resources = false;
+    let mut all_guaranteed = true;
+
+    for c in &containers {
+        let cpu_limit = c["resources"]["limits"]["cpu"].as_str();
+        let mem_limit = c["resources"]["limits"]["memory"].as_str();
+        let cpu_req = c["resources"]["requests"]["cpu"].as_str();
+        let mem_req = c["resources"]["requests"]["memory"].as_str();
+
+        let has_cpu_limit = cpu_limit.is_some();
+        let has_mem_limit = mem_limit.is_some();
+        let has_any = has_cpu_limit || has_mem_limit || cpu_req.is_some() || mem_req.is_some();
+
+        if has_any {
+            any_resources = true;
+        }
+
+        // Guaranteed requires both limits set and request <= limit (absent request == limit).
+        let cpu_ok = has_cpu_limit && cpu_req.is_none_or(|r| r == cpu_limit.unwrap_or(""));
+        let mem_ok = has_mem_limit && mem_req.is_none_or(|r| r == mem_limit.unwrap_or(""));
+
+        if !cpu_ok || !mem_ok {
+            all_guaranteed = false;
+        }
+    }
+
+    if !any_resources {
+        "BestEffort"
+    } else if all_guaranteed {
+        "Guaranteed"
+    } else {
+        "Burstable"
     }
 }
 
@@ -4477,10 +4560,9 @@ mod pure_logic_tests {
             "apiVersion": "node.k8s.io/v1",
             "kind": "RuntimeClass",
             "metadata": {"name": "my-rc"},
-            "spec": {
-                "overhead": {
-                    "podFixed": {"cpu": "10m", "memory": "50Mi"}
-                }
+            "handler": "my-rc",
+            "overhead": {
+                "podFixed": {"cpu": "10m", "memory": "50Mi"}
             }
         });
         let mut pod = serde_json::json!({
@@ -4513,10 +4595,8 @@ mod pure_logic_tests {
     #[test]
     fn runtime_class_overhead_not_overwritten_when_already_set() {
         let rc = serde_json::json!({
-            "spec": {
-                "overhead": {
-                    "podFixed": {"cpu": "10m"}
-                }
+            "overhead": {
+                "podFixed": {"cpu": "10m"}
             }
         });
         let mut pod = serde_json::json!({
@@ -4538,7 +4618,7 @@ mod pure_logic_tests {
     #[test]
     fn runtime_class_without_overhead_is_noop() {
         let rc = serde_json::json!({
-            "spec": {}
+            "handler": "no-overhead"
         });
         let mut pod = serde_json::json!({
             "spec": {
@@ -4551,6 +4631,139 @@ mod pure_logic_tests {
         assert!(
             pod["spec"]["overhead"].is_null(),
             "pod.spec.overhead must remain absent when RuntimeClass has no podFixed overhead"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compute_qos_class
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod qos_class_tests {
+    use super::*;
+
+    /// A pod whose every container has matching requests==limits for both cpu AND
+    /// memory must be classified Guaranteed so the scheduler and the kubelet eviction
+    /// manager treat it with the highest priority.
+    ///
+    /// Removing or breaking compute_qos_class would cause node/pods.go:200 to fail
+    /// with status.qosClass="" instead of "Guaranteed".
+    #[test]
+    fn qos_class_guaranteed_when_requests_equal_limits_so_scheduler_and_eviction_work() {
+        let pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "100m", "memory": "128Mi"},
+                        "limits":   {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            compute_qos_class(&pod),
+            "Guaranteed",
+            "requests == limits for all resources means Guaranteed — \
+             kubelet eviction and scheduler use this to avoid evicting the pod under pressure"
+        );
+    }
+
+    /// A pod with no resource requests or limits on any container must be BestEffort
+    /// so the kubelet evicts it first when the node is under memory pressure.
+    ///
+    /// Removing compute_qos_class or returning a wrong class breaks eviction ordering:
+    /// BestEffort pods must be evicted before Burstable and Guaranteed.
+    #[test]
+    fn qos_class_best_effort_when_no_resources_set_so_eviction_order_is_correct() {
+        let pod = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        assert_eq!(
+            compute_qos_class(&pod),
+            "BestEffort",
+            "no resource requests/limits means BestEffort — \
+             these pods are first to be evicted; wrong classification disrupts eviction ordering"
+        );
+    }
+
+    /// A pod where requests < limits (or only limits are set without matching requests)
+    /// must be Burstable — it has SOME resource guarantee but not full Guaranteed status.
+    ///
+    /// This covers the case where HPA or a user sets limits without matching requests.
+    #[test]
+    fn qos_class_burstable_when_requests_differ_from_limits_so_partial_guarantee_is_correct() {
+        let pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "50m", "memory": "64Mi"},
+                        "limits":   {"cpu": "200m", "memory": "256Mi"}
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            compute_qos_class(&pod),
+            "Burstable",
+            "requests < limits means Burstable — pod can burst up to limits but is not \
+             guaranteed the full limit; wrong class would misorder kubelet eviction"
+        );
+    }
+
+    /// Init containers are included in QoS computation just as regular containers.
+    /// A Guaranteed pod requires ALL containers (including init) to have matching resources.
+    #[test]
+    fn qos_class_considers_init_containers_so_init_heavy_pods_are_classified_correctly() {
+        let pod = serde_json::json!({
+            "spec": {
+                "initContainers": [{
+                    "name": "init",
+                    "resources": {
+                        "requests": {"cpu": "10m", "memory": "32Mi"},
+                        "limits":   {"cpu": "10m", "memory": "32Mi"}
+                    }
+                }],
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "100m", "memory": "128Mi"},
+                        "limits":   {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            compute_qos_class(&pod),
+            "Guaranteed",
+            "init containers with matching requests==limits must not prevent Guaranteed — \
+             the kubelet treats init containers as part of the pod QoS class"
+        );
+    }
+
+    /// A pod where only limits are set (no requests) and they match: must be Guaranteed.
+    /// Kubernetes treats absent requests as equal to limits for QoS class computation.
+    #[test]
+    fn qos_class_guaranteed_when_only_limits_set_because_absent_requests_equal_limits() {
+        let pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            compute_qos_class(&pod),
+            "Guaranteed",
+            "absent requests default to the limit value for QoS purposes — \
+             Kubernetes docs state: if limits are set and requests are absent, requests == limits"
         );
     }
 }
@@ -4782,10 +4995,9 @@ mod handler_tests {
             "apiVersion": "node.k8s.io/v1",
             "kind": "RuntimeClass",
             "metadata": {"name": "test-rc"},
-            "spec": {
-                "overhead": {
-                    "podFixed": {"cpu": "10m"}
-                }
+            "handler": "test-rc",
+            "overhead": {
+                "podFixed": {"cpu": "10m"}
             }
         });
         store
@@ -4830,7 +5042,7 @@ mod handler_tests {
         let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(
             stored_v["spec"]["overhead"]["cpu"], "10m",
-            "spec.overhead.cpu must be injected from RuntimeClass.spec.overhead.podFixed — \
+            "spec.overhead.cpu must be injected from RuntimeClass.overhead.podFixed — \
              conformance test asserts the pod overhead matches the RuntimeClass definition"
         );
     }
