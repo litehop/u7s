@@ -1337,6 +1337,66 @@ struct CsiNode {
     spec: Option<CsiNodeSpec>,
 }
 
+/// CSIDriverSpec — k8s.io/api/storage/v1/generated.proto
+/// Source: api-storage-v1-generated.proto message CSIDriverSpec
+#[derive(Clone, PartialEq, Message)]
+struct CsiDriverSpec {
+    /// attachRequired (field 1, bool)
+    #[prost(bool, optional, tag = "1")]
+    attach_required: Option<bool>,
+    /// podInfoOnMount (field 2, bool)
+    #[prost(bool, optional, tag = "2")]
+    pod_info_on_mount: Option<bool>,
+    /// volumeLifecycleModes (field 3, repeated string)
+    #[prost(string, repeated, tag = "3")]
+    volume_lifecycle_modes: Vec<String>,
+    /// storageCapacity (field 4, bool)
+    #[prost(bool, optional, tag = "4")]
+    storage_capacity: Option<bool>,
+    /// fsGroupPolicy (field 5, string)
+    #[prost(string, optional, tag = "5")]
+    fs_group_policy: Option<String>,
+    /// requiresRepublish (field 7, bool) — field 6 is tokenRequests (skipped)
+    #[prost(bool, optional, tag = "7")]
+    requires_republish: Option<bool>,
+    /// seLinuxMount (field 8, bool)
+    #[prost(bool, optional, tag = "8")]
+    se_linux_mount: Option<bool>,
+}
+
+/// CSIDriver — k8s.io/api/storage/v1/generated.proto
+/// Source: api-storage-v1-generated.proto message CSIDriver
+#[derive(Clone, PartialEq, Message)]
+struct CsiDriver {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// spec (field 2, message CSIDriverSpec)
+    #[prost(message, tag = "2")]
+    spec: Option<CsiDriverSpec>,
+}
+
+/// CSIStorageCapacity — k8s.io/api/storage/v1/generated.proto
+/// Source: api-storage-v1-generated.proto message CSIStorageCapacity
+#[derive(Clone, PartialEq, Message)]
+struct CsiStorageCapacity {
+    /// metadata (field 1, message ObjectMeta)
+    #[prost(message, tag = "1")]
+    metadata: Option<ObjectMeta>,
+    /// nodeTopology (field 2, message LabelSelector)
+    #[prost(message, tag = "2")]
+    node_topology: Option<AppsLabelSelector>,
+    /// storageClassName (field 3, string)
+    #[prost(string, tag = "3")]
+    storage_class_name: String,
+    /// capacity (field 4, message Quantity)
+    #[prost(message, tag = "4")]
+    capacity: Option<Quantity>,
+    /// maximumVolumeSize (field 5, message Quantity)
+    #[prost(message, tag = "5")]
+    maximum_volume_size: Option<Quantity>,
+}
+
 /// VolumeAttachmentSource — k8s.io/api/storage/v1/generated.proto
 /// Source: k8s.io/api/storage/v1/generated.proto message VolumeAttachmentSource
 /// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
@@ -3151,6 +3211,75 @@ pub fn decode_csinode_proto(data: &[u8]) -> Option<serde_json::Value> {
             "drivers": drivers
         }
     }))
+}
+
+/// Decode a proto-encoded CSIDriver object into a `serde_json::Value`.
+pub fn decode_csidriver_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let csidriver = CsiDriver::decode(data).ok()?;
+    let meta = object_meta_to_json(csidriver.metadata.unwrap_or_default());
+
+    let mut spec = serde_json::json!({});
+    if let Some(s) = csidriver.spec {
+        if let Some(v) = s.attach_required {
+            spec["attachRequired"] = serde_json::Value::Bool(v);
+        }
+        if let Some(v) = s.pod_info_on_mount {
+            spec["podInfoOnMount"] = serde_json::Value::Bool(v);
+        }
+        if !s.volume_lifecycle_modes.is_empty() {
+            spec["volumeLifecycleModes"] = serde_json::json!(s.volume_lifecycle_modes);
+        }
+        if let Some(v) = s.storage_capacity {
+            spec["storageCapacity"] = serde_json::Value::Bool(v);
+        }
+        if let Some(v) = s.fs_group_policy {
+            if !v.is_empty() {
+                spec["fsGroupPolicy"] = serde_json::Value::String(v);
+            }
+        }
+        if let Some(v) = s.requires_republish {
+            spec["requiresRepublish"] = serde_json::Value::Bool(v);
+        }
+        if let Some(v) = s.se_linux_mount {
+            spec["seLinuxMount"] = serde_json::Value::Bool(v);
+        }
+    }
+
+    Some(serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "CSIDriver",
+        "metadata": meta,
+        "spec": spec
+    }))
+}
+
+/// Decode a proto-encoded CSIStorageCapacity object into a `serde_json::Value`.
+pub fn decode_csistoragecapacity_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let csc = CsiStorageCapacity::decode(data).ok()?;
+    let meta = object_meta_to_json(csc.metadata.unwrap_or_default());
+
+    let mut obj = serde_json::json!({
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "CSIStorageCapacity",
+        "metadata": meta,
+        "storageClassName": csc.storage_class_name
+    });
+
+    if let Some(sel) = csc.node_topology {
+        obj["nodeTopology"] = apps_label_selector_to_json(sel);
+    }
+    if let Some(q) = csc.capacity {
+        if let Some(s) = q.string {
+            obj["capacity"] = serde_json::Value::String(s);
+        }
+    }
+    if let Some(q) = csc.maximum_volume_size {
+        if let Some(s) = q.string {
+            obj["maximumVolumeSize"] = serde_json::Value::String(s);
+        }
+    }
+
+    Some(obj)
 }
 
 /// Decode a proto-encoded Event object into a `serde_json::Value`.
@@ -6939,6 +7068,8 @@ pub fn decode_proto_by_kind_and_version(
         "PersistentVolume" => decode_persistentvolume_proto(raw),
         "Lease" => decode_lease_proto(raw),
         "CSINode" => decode_csinode_proto(raw),
+        "CSIDriver" => decode_csidriver_proto(raw),
+        "CSIStorageCapacity" => decode_csistoragecapacity_proto(raw),
         "Event" => {
             if api_version == "events.k8s.io/v1" {
                 decode_events_v1_event_proto(raw)
@@ -9193,6 +9324,139 @@ mod tests {
         assert_eq!(result["kind"], "CSINode");
         assert_eq!(result["metadata"]["name"], "test-node");
         assert!(result["spec"]["drivers"].is_array());
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_csidriver_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_csidriver_proto must extract metadata and spec fields.
+    /// POST /apis/storage.k8s.io/v1/csidrivers from the typed Go client sends proto.
+    /// Without this decoder the server returns 400 and CSI lifecycle conformance tests fail.
+    #[test]
+    fn decode_csidriver_proto_extracts_metadata_and_spec() {
+        // Build: CSIDriver {
+        //   metadata: ObjectMeta { name: "csi.example.com" },
+        //   spec: CSIDriverSpec {
+        //     attachRequired: false (field 1, varint 0),
+        //     podInfoOnMount: true (field 2, varint 1),
+        //     volumeLifecycleModes: ["Ephemeral"] (field 3, string),
+        //   }
+        // }
+        let obj_meta = encode_length_delimited(1, b"csi.example.com");
+
+        // attachRequired = false: field 1, wire type 0 (varint), value 0
+        // podInfoOnMount = true: field 2, wire type 0 (varint), value 1
+        let mut spec = vec![1u8 << 3, 0u8, 2u8 << 3, 1u8];
+        // volumeLifecycleModes = ["Ephemeral"]: field 3, length-delimited
+        spec.extend_from_slice(&encode_length_delimited(3, b"Ephemeral"));
+
+        let mut csidriver_proto = encode_length_delimited(1, &obj_meta);
+        csidriver_proto.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result = decode_csidriver_proto(&csidriver_proto).expect("must decode CSIDriver proto");
+
+        assert_eq!(result["kind"], "CSIDriver");
+        assert_eq!(result["apiVersion"], "storage.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "csi.example.com",
+            "CSIDriver name must survive proto decode — used as the driver identifier in the cluster"
+        );
+        assert_eq!(
+            result["spec"]["attachRequired"], false,
+            "attachRequired must be decoded — scheduler uses it to decide attach/detach"
+        );
+        assert_eq!(
+            result["spec"]["podInfoOnMount"], true,
+            "podInfoOnMount must be decoded — kubelet uses it to pass pod info to the driver"
+        );
+        assert_eq!(
+            result["spec"]["volumeLifecycleModes"][0], "Ephemeral",
+            "volumeLifecycleModes must be decoded — required for CSI inline volume conformance test"
+        );
+    }
+
+    /// decode_proto_by_kind_and_version must dispatch to decode_csidriver_proto for kind="CSIDriver".
+    #[test]
+    fn decode_proto_by_kind_dispatches_csidriver() {
+        let obj_meta = encode_length_delimited(1, b"driver.test.com");
+        let csidriver_proto = encode_length_delimited(1, &obj_meta);
+
+        let result = decode_proto_by_kind_and_version("CSIDriver", "", &csidriver_proto)
+            .expect("CSIDriver must decode via decode_proto_by_kind_and_version");
+
+        assert_eq!(
+            result["kind"], "CSIDriver",
+            "dispatch must route CSIDriver kind to decode_csidriver_proto — \
+             without registration the server cannot decode proto POST bodies"
+        );
+        assert_eq!(result["metadata"]["name"], "driver.test.com");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tests — decode_csistoragecapacity_proto
+    // ---------------------------------------------------------------------------
+
+    /// decode_csistoragecapacity_proto must extract metadata, storageClassName and capacity.
+    /// The CSIStorageCapacity controller POSTs/PATCHes capacity objects with proto encoding.
+    /// Without this decoder the server returns 400 and capacity-aware scheduling is broken.
+    #[test]
+    fn decode_csistoragecapacity_proto_extracts_metadata_and_fields() {
+        // Build: CSIStorageCapacity {
+        //   metadata: ObjectMeta { name: "csisc-abc", namespace: "kube-system" },
+        //   storageClassName: "fast-ssd" (field 3, string),
+        //   capacity: Quantity { string: "100Gi" } (field 4, message),
+        // }
+        let mut obj_meta = encode_length_delimited(1, b"csisc-abc");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"kube-system"));
+
+        // Quantity.string = "100Gi": field 1, length-delimited
+        let capacity_quantity = encode_length_delimited(1, b"100Gi");
+
+        let mut csc_proto = encode_length_delimited(1, &obj_meta);
+        csc_proto.extend_from_slice(&encode_length_delimited(3, b"fast-ssd"));
+        csc_proto.extend_from_slice(&encode_length_delimited(4, &capacity_quantity));
+
+        let result = decode_csistoragecapacity_proto(&csc_proto)
+            .expect("must decode CSIStorageCapacity proto");
+
+        assert_eq!(result["kind"], "CSIStorageCapacity");
+        assert_eq!(result["apiVersion"], "storage.k8s.io/v1");
+        assert_eq!(
+            result["metadata"]["name"], "csisc-abc",
+            "CSIStorageCapacity name must survive proto decode"
+        );
+        assert_eq!(
+            result["metadata"]["namespace"], "kube-system",
+            "CSIStorageCapacity namespace must survive proto decode — it is a namespaced resource"
+        );
+        assert_eq!(
+            result["storageClassName"], "fast-ssd",
+            "storageClassName must be decoded — scheduler uses it to match capacity to StorageClass"
+        );
+        assert_eq!(
+            result["capacity"], "100Gi",
+            "capacity must be decoded — scheduler uses it to filter nodes with insufficient capacity"
+        );
+    }
+
+    /// decode_proto_by_kind_and_version must dispatch to decode_csistoragecapacity_proto.
+    #[test]
+    fn decode_proto_by_kind_dispatches_csistoragecapacity() {
+        let mut obj_meta = encode_length_delimited(1, b"csisc-xyz");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default"));
+        let mut csc_proto = encode_length_delimited(1, &obj_meta);
+        csc_proto.extend_from_slice(&encode_length_delimited(3, b"my-class"));
+
+        let result = decode_proto_by_kind_and_version("CSIStorageCapacity", "", &csc_proto)
+            .expect("CSIStorageCapacity must decode via dispatch");
+
+        assert_eq!(
+            result["kind"], "CSIStorageCapacity",
+            "dispatch must route CSIStorageCapacity to its decoder — \
+             without registration proto POST bodies return 400"
+        );
+        assert_eq!(result["storageClassName"], "my-class");
     }
 
     // ---------------------------------------------------------------------------
