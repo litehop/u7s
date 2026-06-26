@@ -5553,9 +5553,10 @@ mod tests {
         meta.extend_from_slice(&encode_ld(3, b"default"));
         meta.extend_from_slice(&encode_ld(8, &[]));
 
-        // EndpointSlice: field 1 = metadata, field 2 = addressType
+        // EndpointSlice (discovery.k8s.io/v1/generated.proto):
+        //   field 1 = metadata, field 2 = endpoints, field 3 = ports, field 4 = addressType
         let mut eps_proto = encode_ld(1, &meta);
-        eps_proto.extend_from_slice(&encode_ld(2, b"IPv4"));
+        eps_proto.extend_from_slice(&encode_ld(4, b"IPv4")); // field 4 = addressType
 
         // k8s proto envelope: magic + Unknown{TypeMeta, raw, no contentType}
         const MAGIC: &[u8; 4] = &[0x6b, 0x38, 0x73, 0x00];

@@ -6778,18 +6778,18 @@ struct DiscoveryEndpointPort {
 }
 
 /// EndpointSlice — discovery.k8s.io/v1/generated.proto
-/// field 1: metadata (ObjectMeta), field 2: addressType (string),
-/// field 3: endpoints (repeated DiscoveryEndpoint), field 4: ports (repeated DiscoveryEndpointPort)
+/// field 1: metadata (ObjectMeta), field 2: endpoints (repeated DiscoveryEndpoint),
+/// field 3: ports (repeated DiscoveryEndpointPort), field 4: addressType (string)
 #[derive(Clone, PartialEq, Message)]
 struct EndpointSlice {
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
-    #[prost(string, tag = "2")]
-    address_type: String,
-    #[prost(message, repeated, tag = "3")]
+    #[prost(message, repeated, tag = "2")]
     endpoints: Vec<DiscoveryEndpoint>,
-    #[prost(message, repeated, tag = "4")]
+    #[prost(message, repeated, tag = "3")]
     ports: Vec<DiscoveryEndpointPort>,
+    #[prost(string, tag = "4")]
+    address_type: String,
 }
 
 /// Decode a proto-encoded EndpointSlice into a serde_json::Value.
@@ -13412,14 +13412,16 @@ mod tests {
     /// decode_proto_by_kind_and_version must dispatch EndpointSlice proto and extract
     /// addressType, endpoints, and ports. Without this decoder, client-go POSTing an
     /// EndpointSlice with Content-Type: application/vnd.kubernetes.protobuf gets 400.
+    ///
+    /// Field layout per discovery.k8s.io/v1/generated.proto:
+    ///   EndpointSlice: field 1=metadata, field 2=endpoints, field 3=ports, field 4=addressType
     #[test]
     fn decode_proto_by_kind_and_version_dispatches_endpointslice() {
         let obj_meta = encode_length_delimited(1, b"test-slice"); // ObjectMeta.name
 
-        // EndpointSlice: field 2 = addressType, field 3 = endpoints, field 4 = ports
         // DiscoveryEndpoint: field 1 = addresses (repeated string)
         let ep_addr = encode_length_delimited(1, b"10.0.0.1");
-        let endpoint = encode_length_delimited(3, &ep_addr); // field 3 = endpoints
+        let endpoint = encode_length_delimited(2, &ep_addr); // field 2 = endpoints
 
         // DiscoveryEndpointPort: field 1 = name, field 2 = protocol, field 3 = port (varint)
         let mut port_proto = encode_length_delimited(1, b"http");
@@ -13428,9 +13430,9 @@ mod tests {
         port_proto.extend_from_slice(&encode_varint(8080));
 
         let mut eps_proto = encode_length_delimited(1, &obj_meta);
-        eps_proto.extend_from_slice(&encode_length_delimited(2, b"IPv4")); // field 2 = addressType
         eps_proto.extend_from_slice(&endpoint);
-        eps_proto.extend_from_slice(&encode_length_delimited(4, &port_proto)); // field 4 = ports
+        eps_proto.extend_from_slice(&encode_length_delimited(3, &port_proto)); // field 3 = ports
+        eps_proto.extend_from_slice(&encode_length_delimited(4, b"IPv4")); // field 4 = addressType
 
         let result =
             decode_proto_by_kind_and_version("EndpointSlice", "discovery.k8s.io/v1", &eps_proto)
@@ -13468,6 +13470,11 @@ mod tests {
     /// ports without names. If decode_endpointslice_proto returns None for this input, the
     /// handler receives the raw proto envelope bytes (starting with 'k') and returns 400
     /// "invalid JSON: expected value at line 1 column 1".
+    ///
+    /// Field layout per discovery.k8s.io/v1/generated.proto:
+    ///   EndpointSlice: field 1=metadata, field 2=endpoints, field 3=ports, field 4=addressType
+    ///   Endpoint: field 1=addresses, field 2=conditions, field 3=hostname, field 4=targetRef,
+    ///             field 5=deprecatedTopology (map), field 6=nodeName, field 7=zone, field 8=hints
     #[test]
     fn decode_endpointslice_proto_conformance_test_scenario() {
         // ObjectMeta with generateName at field 2 (not name at field 1)
@@ -13486,11 +13493,11 @@ mod tests {
         port_content.push(0x18); // field 3, wire type 0 (varint)
         port_content.push(0x50); // value = 80
 
-        // EndpointSlice: field 1 = metadata, field 2 = addressType, field 3 = endpoint, field 4 = port
+        // EndpointSlice: field 1=metadata, field 2=endpoints, field 3=ports, field 4=addressType
         let mut eps_proto = encode_length_delimited(1, &obj_meta);
-        eps_proto.extend_from_slice(&encode_length_delimited(2, b"IPv4")); // addressType
-        eps_proto.extend_from_slice(&encode_length_delimited(3, &endpoint_content)); // endpoints[0]
-        eps_proto.extend_from_slice(&encode_length_delimited(4, &port_content)); // ports[0]
+        eps_proto.extend_from_slice(&encode_length_delimited(2, &endpoint_content)); // endpoints[0]
+        eps_proto.extend_from_slice(&encode_length_delimited(3, &port_content)); // ports[0]
+        eps_proto.extend_from_slice(&encode_length_delimited(4, b"IPv4")); // addressType
 
         let result = decode_endpointslice_proto(&eps_proto).expect(
             "decode_endpointslice_proto must succeed for a valid EndpointSlice with \
@@ -13503,7 +13510,7 @@ mod tests {
         assert_eq!(result["apiVersion"], "discovery.k8s.io/v1");
         assert_eq!(
             result["addressType"], "IPv4",
-            "addressType must be preserved"
+            "addressType must be preserved — wrong field tag (2 vs 4) causes wrong field to be decoded"
         );
         assert!(
             result["metadata"]["generateName"].as_str() == Some("e2e-"),
