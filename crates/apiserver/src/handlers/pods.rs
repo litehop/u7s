@@ -1607,10 +1607,11 @@ pub fn apply_status_patch(
 /// in the patch are left as-is in the stored condition.
 ///
 /// Exception: when a patch changes the `status` field of a condition, `reason` and
-/// `message` are reset to empty string if the patch omits them.  This prevents stale
-/// values (e.g. reason=Unschedulable from the initial False condition) from surviving
-/// into an updated True condition when the patcher (e.g. a scheduler) sends only the
-/// `status` field and relies on the server to clear the diagnosis fields.
+/// `message` are reset to empty string if the patch omits them OR supplies them as null.
+/// The kubelet sends `"reason":null` (not omitted, but null) for conditions that have no
+/// reason — a null value means "no reason" the same as an absent key.  Keeping the old
+/// reason when status flips produces contradictory conditions like Ready=True with
+/// reason=ContainersNotReady, which breaks webhook readiness checks.
 fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_json::Value) {
     let Some(patch_arr) = patch_conditions.as_array() else {
         return;
@@ -1642,10 +1643,12 @@ fn merge_conditions(stored: &mut serde_json::Value, patch_conditions: &serde_jso
                 }
             }
             if status_changes {
-                if !patch_obj.contains_key("reason") {
+                let patch_reason_non_null = patch_obj.get("reason").is_some_and(|v| !v.is_null());
+                if !patch_reason_non_null {
                     existing["reason"] = serde_json::json!("");
                 }
-                if !patch_obj.contains_key("message") {
+                let patch_message_non_null = patch_obj.get("message").is_some_and(|v| !v.is_null());
+                if !patch_message_non_null {
                     existing["message"] = serde_json::json!("");
                 }
             }
@@ -2462,6 +2465,65 @@ mod status_tests {
             scheduled["reason"], "Unschedulable",
             "PodScheduled=True must not carry reason=Unschedulable — that contradictory \
              state causes conformance tests to see an impossible scheduling outcome"
+        );
+    }
+
+    /// merge_conditions must clear stale reason/message when kubelet sends reason:null
+    /// alongside a status change from False to True.
+    ///
+    /// The kubelet sends `"reason":null` (JSON null, not key-absent) for conditions with no
+    /// reason — e.g. `{"type":"Ready","status":"True","reason":null,"message":null}`.  The
+    /// old code treated null as "key present → don't clear stale reason", producing
+    /// Ready=True + reason=ContainersNotReady.  That contradictory state causes the
+    /// AdmissionWebhook conformance BeforeEach to wait forever for webhook=ready.
+    #[test]
+    fn merge_conditions_null_reason_cleared_on_status_change() {
+        let mut stored = serde_json::json!([
+            {
+                "type": "Ready",
+                "status": "False",
+                "reason": "ContainersNotReady",
+                "message": "containers with unready status: [sample-webhook]"
+            },
+            {
+                "type": "ContainersReady",
+                "status": "False",
+                "reason": "ContainersNotReady",
+                "message": "containers with unready status: [sample-webhook]"
+            }
+        ]);
+        // Kubelet sends reason:null and message:null (not absent, but JSON null) when
+        // containers become ready — serialized from Go's zero-value string fields.
+        let patch = serde_json::json!([
+            {"type": "Ready", "status": "True", "reason": null, "message": null},
+            {"type": "ContainersReady", "status": "True", "reason": null, "message": null}
+        ]);
+
+        merge_conditions(&mut stored, &patch);
+
+        let arr = stored.as_array().expect("conditions array");
+        let ready = arr
+            .iter()
+            .find(|c| c["type"] == "Ready")
+            .expect("Ready condition must survive");
+        assert_eq!(
+            ready["status"], "True",
+            "Ready status must be updated to True"
+        );
+        assert_ne!(
+            ready["reason"], "ContainersNotReady",
+            "Ready=True must not carry reason=ContainersNotReady — kubelet null reason \
+             means no reason; keeping the stale reason produces a contradictory condition \
+             that breaks AdmissionWebhook conformance (BeforeEach never sees webhook=ready)"
+        );
+        let cr = arr
+            .iter()
+            .find(|c| c["type"] == "ContainersReady")
+            .expect("ContainersReady condition must survive");
+        assert_eq!(cr["status"], "True", "ContainersReady status must be True");
+        assert_ne!(
+            cr["reason"], "ContainersNotReady",
+            "ContainersReady=True must not carry reason=ContainersNotReady"
         );
     }
 
