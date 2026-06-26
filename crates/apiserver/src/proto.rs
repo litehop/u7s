@@ -985,6 +985,53 @@ struct ServiceSpec {
     internal_traffic_policy: String,
 }
 
+/// metav1.Condition — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
+/// Field numbers match the official proto exactly.
+#[derive(Clone, PartialEq, Message)]
+struct MetaV1Condition {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(string, tag = "2")]
+    status: String,
+    /// observedGeneration (field 3, int64)
+    #[prost(int64, tag = "3")]
+    observed_generation: i64,
+    /// lastTransitionTime (field 4, Time message) — skipped, not needed for round-trip
+    /// reason (field 5, string)
+    #[prost(string, tag = "5")]
+    reason: String,
+    /// message (field 6, string)
+    #[prost(string, tag = "6")]
+    message: String,
+}
+
+/// LoadBalancerIngress — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct LoadBalancerIngress {
+    #[prost(string, tag = "1")]
+    ip: String,
+    #[prost(string, tag = "2")]
+    hostname: String,
+}
+
+/// LoadBalancerStatus — k8s.io/api/core/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct LoadBalancerStatus {
+    #[prost(message, repeated, tag = "1")]
+    ingress: Vec<LoadBalancerIngress>,
+}
+
+/// ServiceStatus — k8s.io/api/core/v1/generated.proto
+/// field 1 = loadBalancer (LoadBalancerStatus, message)
+/// field 2 = conditions (repeated metav1.Condition, message)
+#[derive(Clone, PartialEq, Message)]
+struct ServiceStatus {
+    #[prost(message, tag = "1")]
+    load_balancer: Option<LoadBalancerStatus>,
+    #[prost(message, repeated, tag = "2")]
+    conditions: Vec<MetaV1Condition>,
+}
+
 /// Service — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message Service
 #[derive(Clone, PartialEq, Message)]
@@ -995,9 +1042,9 @@ struct Service {
     /// spec (field 2, message ServiceSpec)
     #[prost(message, tag = "2")]
     spec: Option<ServiceSpec>,
-    /// status (field 3, bytes) — not decoded on input
-    #[prost(bytes = "vec", tag = "3")]
-    status: Vec<u8>,
+    /// status (field 3, message ServiceStatus)
+    #[prost(message, tag = "3")]
+    status: Option<ServiceStatus>,
 }
 
 /// Secret — k8s.io/api/core/v1/generated.proto
@@ -2886,6 +2933,63 @@ pub fn decode_service_proto(data: &[u8]) -> Option<serde_json::Value> {
         }
 
         obj["spec"] = serde_json::Value::Object(spec_map);
+    }
+
+    if let Some(status) = svc.status {
+        let mut status_map = serde_json::Map::new();
+
+        if let Some(lb) = status.load_balancer {
+            if !lb.ingress.is_empty() {
+                let ingress: Vec<serde_json::Value> = lb
+                    .ingress
+                    .into_iter()
+                    .map(|i| {
+                        let mut im = serde_json::Map::new();
+                        if !i.ip.is_empty() {
+                            im.insert("ip".into(), serde_json::Value::String(i.ip));
+                        }
+                        if !i.hostname.is_empty() {
+                            im.insert("hostname".into(), serde_json::Value::String(i.hostname));
+                        }
+                        serde_json::Value::Object(im)
+                    })
+                    .collect();
+                status_map.insert(
+                    "loadBalancer".into(),
+                    serde_json::json!({ "ingress": ingress }),
+                );
+            }
+        }
+
+        if !status.conditions.is_empty() {
+            status_map.insert(
+                "conditions".into(),
+                status
+                    .conditions
+                    .iter()
+                    .map(|c| {
+                        let mut cond = serde_json::json!({
+                            "type": c.r#type,
+                            "status": c.status,
+                        });
+                        if c.observed_generation != 0 {
+                            cond["observedGeneration"] = c.observed_generation.into();
+                        }
+                        if !c.reason.is_empty() {
+                            cond["reason"] = c.reason.clone().into();
+                        }
+                        if !c.message.is_empty() {
+                            cond["message"] = c.message.clone().into();
+                        }
+                        cond
+                    })
+                    .collect::<serde_json::Value>(),
+            );
+        }
+
+        if !status_map.is_empty() {
+            obj["status"] = serde_json::Value::Object(status_map);
+        }
     }
 
     Some(obj)
@@ -14840,6 +14944,56 @@ mod tests {
         assert_eq!(
             containers[0]["image"], "nginx:latest",
             "container image must survive proto decode — without it pods run nothing"
+        );
+    }
+
+    /// decode_service_proto must preserve status.conditions from a protobuf-encoded body so that
+    /// service status lifecycle watchers converge.
+    ///
+    /// client-go's UpdateStatus (PUT /api/v1/namespaces/{ns}/services/{name}/status) sends
+    /// Content-Type: application/vnd.kubernetes.protobuf. Before this fix, Service.status was
+    /// decoded as raw bytes and silently dropped, so incoming.body["status"] was Null in the
+    /// handler — which then removed the status field from the stored object entirely. The
+    /// conformance watch predicate (svc.Status.Conditions with Type=="StatusUpdate") never matched
+    /// and the test timed out after 60s.
+    #[test]
+    fn service_status_update_preserves_conditions_so_status_lifecycle_watchers_converge() {
+        // Build metav1.Condition { type="StatusUpdate", status="True", reason="E2E", message="Set from e2e test" }
+        // Field 1 = type (string), field 2 = status (string), field 5 = reason (string), field 6 = message (string)
+        let mut cond_bytes = encode_length_delimited(1, b"StatusUpdate");
+        cond_bytes.extend_from_slice(&encode_length_delimited(2, b"True"));
+        cond_bytes.extend_from_slice(&encode_length_delimited(5, b"E2E"));
+        cond_bytes.extend_from_slice(&encode_length_delimited(6, b"Set from e2e test"));
+
+        // Build ServiceStatus { conditions: [cond] }
+        // Field 2 = conditions (repeated message)
+        let status_bytes = encode_length_delimited(2, &cond_bytes);
+
+        // Build Service { metadata: { name: "svc-lifecycle" }, status: ... }
+        let name_bytes = encode_length_delimited(1, b"svc-lifecycle");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(3, &status_bytes));
+
+        let result = decode_core_proto_by_kind("Service", &proto)
+            .expect("Service with status must decode successfully");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "StatusUpdate",
+            "status.conditions[0].type must survive proto decode — without this, UpdateStatus via \
+             protobuf drops the condition, the conformance watch times out at 60s (service status \
+             lifecycle conformance test)"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["status"], "True",
+            "status.conditions[0].status must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["reason"], "E2E",
+            "status.conditions[0].reason must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["message"], "Set from e2e test",
+            "status.conditions[0].message must survive proto decode"
         );
     }
 }
