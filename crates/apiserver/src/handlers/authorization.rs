@@ -13,6 +13,7 @@ use crate::{
     auth::UserInfo,
     rbac::AuthzRequest,
     state::AppState,
+    status::Status,
     util::{content_type, extract_body},
 };
 
@@ -67,6 +68,16 @@ pub async fn self_subject_access_review<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if super::table::wants_table(accept) {
+        return Status::not_acceptable(
+            "selfsubjectaccessreviews does not implement the Table conversion".into(),
+        )
+        .into_response();
+    }
     let body = extract_body(&body, content_type(&headers));
     let req: SelfSubjectAccessReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -173,6 +184,16 @@ pub async fn self_subject_rules_review<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if super::table::wants_table(accept) {
+        return Status::not_acceptable(
+            "selfsubjectrulesreviews does not implement the Table conversion".into(),
+        )
+        .into_response();
+    }
     let body = extract_body(&body, content_type(&headers));
     let req: SelfSubjectRulesReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -259,6 +280,16 @@ pub async fn subject_access_review<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if super::table::wants_table(accept) {
+        return Status::not_acceptable(
+            "subjectaccessreviews does not implement the Table conversion".into(),
+        )
+        .into_response();
+    }
     let body = extract_body(&body, content_type(&headers));
     let parsed: SubjectAccessReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -373,6 +404,16 @@ pub async fn local_subject_access_review<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if super::table::wants_table(accept) {
+        return Status::not_acceptable(
+            "localsubjectaccessreviews does not implement the Table conversion".into(),
+        )
+        .into_response();
+    }
     let body = extract_body(&body, content_type(&headers));
     let mut parsed: SubjectAccessReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -510,6 +551,16 @@ pub async fn token_review<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if super::table::wants_table(accept) {
+        return Status::not_acceptable(
+            "tokenreviews does not implement the Table conversion".into(),
+        )
+        .into_response();
+    }
     let body = extract_body(&body, content_type(&headers));
     let req: TokenReviewRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -1785,6 +1836,52 @@ mod handler_tests {
     // -----------------------------------------------------------------------
     // Regression: Content-Type: application/json must not produce 415
     // -----------------------------------------------------------------------
+
+    /// Conformance test "should return a 406 for a backend which does not implement metadata"
+    /// POSTs a SelfSubjectAccessReview with Accept: application/json;as=Table;v=v1;g=meta.k8s.io
+    /// and expects HTTP 406.  Before the fix the handler ignored Accept entirely, returning 201.
+    /// Without this check, clients that request Table representation receive success with a
+    /// non-Table body, breaking the conformance test and any client that relies on 406 to
+    /// detect resources with no table form.
+    #[tokio::test]
+    async fn selfsubjectaccessreview_with_table_accept_returns_406_so_clients_know_no_table_form_exists(
+    ) {
+        let state = make_state();
+        let app = Router::new()
+            .route(
+                "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                post(self_subject_access_review),
+            )
+            .with_state(state);
+
+        let body_bytes =
+            Bytes::from(serde_json::to_vec(&serde_json::json!({ "spec": {} })).unwrap());
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews")
+            .header("content-type", "application/json")
+            .header("accept", "application/json;as=Table;v=v1;g=meta.k8s.io")
+            .body(Body::from(body_bytes))
+            .unwrap();
+        req.extensions_mut().insert(user("any-user", &[]));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_ACCEPTABLE,
+            "SSAR with Accept: as=Table must return 406 — selfsubjectaccessreviews has no table form; \
+             clients use 406 to detect this and fall back to normal JSON"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            val["code"], 406,
+            "Status.code must be 406 so client-go's error parsing maps it correctly"
+        );
+        assert_eq!(val["reason"], "NotAcceptable");
+    }
 
     /// `kubectl auth can-i` sends POST with Content-Type: application/json and expects
     /// 201 CREATED. Before this fix the axum Json extractor rejected these requests with
