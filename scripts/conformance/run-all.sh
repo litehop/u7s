@@ -12,6 +12,7 @@
 # Usage:
 #   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--vm <name>]
 #                                  [--binary <path>] [--port <N>] [--workdir <path>]
+#                                  [--konnectivity-server-port <N>]
 #
 #   --reset   Run reset.sh before building — kills host processes, deletes the
 #             lima-node VM, and wipes ./temp/u7s/ (relative to CWD) for a fully clean run.
@@ -35,6 +36,10 @@
 #   --kubelet-port  Host-side port the kubelet is reachable on (default: 10250). Must
 #             match the lima portForward hostPort for the assigned VM. Forwarded to
 #             u7s-start.sh so the apiserver dials the correct port for log/exec/attach.
+#   --konnectivity-server-port  Server-facing port for konnectivity-server (default: 8135).
+#             Agent/admin/health ports are derived as server_port-3/server_port-2/server_port-1.
+#             Per-slot scheme: slot N uses 8135+N*100 (slot1→8235, slot2→8335, …).
+#             Forwarded to u7s-start.sh (starts server) and lima-start.sh (agent pod).
 #   --workdir Directory for apiserver state (DB, certs, kubeconfig). Forwarded to
 #             u7s-start.sh and child scripts. Defaults to ./temp/u7s relative to CWD
 #             (the active worktree root when invoked from a worktree).
@@ -48,6 +53,7 @@ RESET=0
 BINARY=""
 PORT=""
 KUBELET_PORT=""
+KONNECTIVITY_SERVER_PORT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -59,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --binary) BINARY="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --kubelet-port) KUBELET_PORT="$2"; shift 2 ;;
+    --konnectivity-server-port) KONNECTIVITY_SERVER_PORT="$2"; shift 2 ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -79,10 +86,12 @@ fi
 # Build optional CLI args for child scripts that accept --port / --workdir.
 _PORT_ARG=""
 _KUBELET_PORT_ARG=""
+_KONNECTIVITY_SERVER_PORT_ARG=""
 _WORKDIR_ARG=""
 _VM_ARG=""
-[ -n "$PORT" ]         && _PORT_ARG="--port $PORT"
-[ -n "$KUBELET_PORT" ] && _KUBELET_PORT_ARG="--kubelet-port $KUBELET_PORT"
+[ -n "$PORT" ]                    && _PORT_ARG="--port $PORT"
+[ -n "$KUBELET_PORT" ]            && _KUBELET_PORT_ARG="--kubelet-port $KUBELET_PORT"
+[ -n "$KONNECTIVITY_SERVER_PORT" ] && _KONNECTIVITY_SERVER_PORT_ARG="--konnectivity-server-port $KONNECTIVITY_SERVER_PORT"
 _WORKDIR_ARG="--workdir $WORKDIR"
 [ -n "${U7S_VM_NAME:-}" ] && _VM_ARG="--vm $U7S_VM_NAME"
 
@@ -104,7 +113,7 @@ fi
 banner "Step 2/6: Start apiserver"
 # shellcheck source=02-start-apiserver.sh
 # shellcheck disable=SC2086
-source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_WORKDIR_ARG}
+source "$DIR/02-start-apiserver.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG}
 
 # KUBECONFIG is now set (either from the running instance or newly started).
 if [ -z "${KUBECONFIG:-}" ]; then
@@ -116,7 +125,7 @@ echo "Using KUBECONFIG=$KUBECONFIG"
 # Step 03: Start lima VM and join kubelet.
 banner "Step 3/6: Start lima VM"
 # shellcheck disable=SC2086
-bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_WORKDIR_ARG}
+bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERVER_PORT_ARG} ${_WORKDIR_ARG}
 
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"

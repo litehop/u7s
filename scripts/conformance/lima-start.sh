@@ -43,6 +43,7 @@ LIMA_YAML="$(dirname "$0")/../../lima/kubelet.yaml"
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
 _KUBELET_PORT_OVERRIDE=""
+_KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) U7S_VM_NAME="$2"; shift 2 ;;
@@ -50,11 +51,15 @@ while [[ $# -gt 0 ]]; do
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
+    --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 PORT="${_PORT_OVERRIDE:-6443}"
 KUBELET_PORT="${_KUBELET_PORT_OVERRIDE:-10250}"
+KONNECTIVITY_SERVER_PORT="${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-8135}"
+# Agent port: server_port-3 (matches the layout 8135/8132 and slot offsets 8235/8232, etc.)
+KONNECTIVITY_AGENT_PORT=$(( KONNECTIVITY_SERVER_PORT - 3 ))
 
 # For day-to-day iteration after initial VM provisioning, use scripts/kubelet-reconnect.sh
 # instead — it skips VM provisioning and just reconnects the kubelet.
@@ -340,7 +345,7 @@ spec:
     args:
     - --logtostderr=true
     - --proxy-server-host=host.lima.internal
-    - --proxy-server-port=8132
+    - --proxy-server-port=${KONNECTIVITY_AGENT_PORT}
     - --ca-cert=/certs/ca.crt
     - --agent-cert=/certs/tls.crt
     - --agent-key=/certs/tls.key

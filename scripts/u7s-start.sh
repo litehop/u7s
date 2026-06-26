@@ -7,6 +7,7 @@
 #
 # Usage:
 #   scripts/u7s-start.sh [--reset] [--background] [--port <N>] [--kubelet-port <N>]
+#                        [--konnectivity-server-port <N>]
 #
 #   --reset       Wipe ./temp/u7s/ and start fresh (rotates CA — kubelet will need
 #                 to be re-joined via scripts/conformance/lima-start.sh after this).
@@ -17,6 +18,11 @@
 #   --kubelet-port  Host-side port the kubelet is reachable on (default: 10250). Override
 #                 when the lima port-forward maps guest 10250 to a different host port
 #                 for per-worktree isolation.
+#   --konnectivity-server-port  Server-facing port for konnectivity-server (default: 8135).
+#                 The other three ports (agent, admin, health) are derived as
+#                 server_port-3, server_port-2, server_port-1 respectively.
+#                 Per-slot scheme: slot N uses 8135+N*100 (slot1→8235, slot2→8335, …)
+#                 so slots never collide with each other or the mayor's 8135 default.
 #
 # Environment variables:
 #   U7S_HOST_IP   IP to bind and advertise (default: 127.0.0.1).
@@ -35,6 +41,7 @@ BACKGROUND=0
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
 _KUBELET_PORT_OVERRIDE=""
+_KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
@@ -45,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
+    --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -97,7 +105,13 @@ fi
 
 mkdir -p "$WORKDIR"
 
-KONNECTIVITY_PROXY_PORT=8135
+KONNECTIVITY_PROXY_PORT="${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-8135}"
+# Derive agent/admin/health ports from the server port: server=N, agent=N-3, admin=N-2, health=N-1.
+# This matches the mayor default layout (8135/8132/8133/8134) and lets each slot pick
+# a unique base (slot1→8235, slot2→8335, …) without colliding with the mayor or each other.
+KONNECTIVITY_AGENT_PORT=$(( KONNECTIVITY_PROXY_PORT - 3 ))
+KONNECTIVITY_ADMIN_PORT=$(( KONNECTIVITY_PROXY_PORT - 2 ))
+KONNECTIVITY_HEALTH_PORT=$(( KONNECTIVITY_PROXY_PORT - 1 ))
 
 if [ -f "$WORKDIR/ca.crt" ]; then
   openssl x509 -inform DER -in "$WORKDIR/ca.crt" -out "$WORKDIR/ca.pem"
@@ -135,11 +149,11 @@ EXTEOF
     --mode=http-connect \
     --server-port=$KONNECTIVITY_PROXY_PORT \
     --server-bind-address="$HOST_IP" \
-    --agent-port=8132 \
+    --agent-port=$KONNECTIVITY_AGENT_PORT \
     --agent-bind-address="$HOST_IP" \
-    --admin-port=8133 \
+    --admin-port=$KONNECTIVITY_ADMIN_PORT \
     --admin-bind-address="$HOST_IP" \
-    --health-port=8134 \
+    --health-port=$KONNECTIVITY_HEALTH_PORT \
     --health-bind-address="$HOST_IP" \
     >> "$WORKDIR/konnectivity-server.log" 2>&1 &
   disown $!
@@ -257,9 +271,9 @@ EXTEOF
     --server-key="$WORKDIR/konnectivity-server.key" \
     --mode=http-connect --server-port=$KONNECTIVITY_PROXY_PORT \
     --server-bind-address="$HOST_IP" \
-    --agent-port=8132 --agent-bind-address="$HOST_IP" \
-    --admin-port=8133 --admin-bind-address="$HOST_IP" \
-    --health-port=8134 --health-bind-address="$HOST_IP" \
+    --agent-port=$KONNECTIVITY_AGENT_PORT --agent-bind-address="$HOST_IP" \
+    --admin-port=$KONNECTIVITY_ADMIN_PORT --admin-bind-address="$HOST_IP" \
+    --health-port=$KONNECTIVITY_HEALTH_PORT --health-bind-address="$HOST_IP" \
     >> "$WORKDIR/konnectivity-server.log" 2>&1 &
   disown $!
   for i in $(seq 1 10); do
