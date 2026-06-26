@@ -15,11 +15,13 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 
 _PORT_OVERRIDE=""
 _KUBELET_PORT_OVERRIDE=""
+_KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 _WORKDIR_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
     --kubelet-port) _KUBELET_PORT_OVERRIDE="$2"; shift 2 ;;
+    --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -34,9 +36,10 @@ fi
 echo "=== [02] Start apiserver ==="
 
 EXTRA_ARGS=""
-[ -n "$_PORT_OVERRIDE" ]         && EXTRA_ARGS="$EXTRA_ARGS --port $_PORT_OVERRIDE"
-[ -n "$_KUBELET_PORT_OVERRIDE" ] && EXTRA_ARGS="$EXTRA_ARGS --kubelet-port $_KUBELET_PORT_OVERRIDE"
-[ -n "$_WORKDIR_OVERRIDE" ]      && EXTRA_ARGS="$EXTRA_ARGS --workdir $_WORKDIR_OVERRIDE"
+[ -n "$_PORT_OVERRIDE" ]                    && EXTRA_ARGS="$EXTRA_ARGS --port $_PORT_OVERRIDE"
+[ -n "$_KUBELET_PORT_OVERRIDE" ]            && EXTRA_ARGS="$EXTRA_ARGS --kubelet-port $_KUBELET_PORT_OVERRIDE"
+[ -n "$_KONNECTIVITY_SERVER_PORT_OVERRIDE" ] && EXTRA_ARGS="$EXTRA_ARGS --konnectivity-server-port $_KONNECTIVITY_SERVER_PORT_OVERRIDE"
+[ -n "$_WORKDIR_OVERRIDE" ]                 && EXTRA_ARGS="$EXTRA_ARGS --workdir $_WORKDIR_OVERRIDE"
 
 # shellcheck disable=SC2086
 bash "$REPO/scripts/u7s-start.sh" --background $EXTRA_ARGS
