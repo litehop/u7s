@@ -1491,6 +1491,15 @@ struct VolumeAttachment {
 
 // --- k8s.io/api/node/v1/generated.proto ---
 
+/// Overhead — k8s.io/api/node/v1/generated.proto message Overhead
+/// podFixed (field 1, map<string, Quantity>) — per-pod resource overhead.
+#[derive(Clone, PartialEq, Message)]
+struct Overhead {
+    /// podFixed (field 1, map<string, Quantity>)
+    #[prost(btree_map = "string, message", tag = "1")]
+    pod_fixed: std::collections::BTreeMap<String, Quantity>,
+}
+
 /// RuntimeClass — k8s.io/api/node/v1/generated.proto
 /// Source: k8s.io/api/node/v1/generated.proto message RuntimeClass
 /// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
@@ -1502,9 +1511,9 @@ struct RuntimeClass {
     /// handler (field 2, string)
     #[prost(string, tag = "2")]
     handler: String,
-    /// overhead (field 3, bytes) — complex message, decoded as raw bytes
-    #[prost(bytes = "vec", tag = "3")]
-    overhead: Vec<u8>,
+    /// overhead (field 3, message Overhead)
+    #[prost(message, tag = "3")]
+    overhead: Option<Overhead>,
     /// scheduling (field 4, bytes) — complex message, decoded as raw bytes
     #[prost(bytes = "vec", tag = "4")]
     scheduling: Vec<u8>,
@@ -3094,6 +3103,14 @@ pub fn decode_runtimeclass_proto(data: &[u8]) -> Option<serde_json::Value> {
         .unwrap_or(true)
     {
         obj["handler"] = serde_json::Value::String(String::new());
+    }
+
+    if let Some(overhead) = rc.overhead {
+        if !overhead.pod_fixed.is_empty() {
+            obj["overhead"] = serde_json::json!({
+                "podFixed": limitrange_quantity_map_to_json(overhead.pod_fixed)
+            });
+        }
     }
 
     Some(obj)
@@ -10849,6 +10866,50 @@ mod tests {
         assert_eq!(result["apiVersion"], "node.k8s.io/v1");
         assert_eq!(result["metadata"]["name"], "myruntime");
         assert_eq!(result["handler"], "myhandler");
+    }
+
+    /// decode_runtimeclass_proto must decode overhead.podFixed so that
+    /// apply_runtime_class_overhead can inject it into pod.spec.overhead at create time.
+    ///
+    /// Conformance test '[sig-node] RuntimeClass should schedule a Pod requesting a RuntimeClass
+    /// and initialize its Overhead' creates a RuntimeClass via proto, then creates a pod using
+    /// it and asserts pod.spec.overhead.cpu == 10m. Without overhead decode, the stored RC has
+    /// no overhead field, so apply_runtime_class_overhead is a no-op and the test fails with
+    /// "Expected {value:0} to equal {value:10 scale:-3}".
+    #[test]
+    fn decode_runtimeclass_proto_includes_overhead_pod_fixed_so_pod_overhead_injection_works() {
+        // Build: RuntimeClass {
+        //   metadata: { name: "test-rc" },
+        //   handler: "test-rc",
+        //   overhead: Overhead { podFixed: {"cpu": Quantity{string: "10m"}} }
+        // }
+        let encode_quantity = |s: &[u8]| -> Vec<u8> { encode_length_delimited(1, s) };
+        let encode_map_entry = |key: &[u8], val_bytes: &[u8]| -> Vec<u8> {
+            let mut entry = encode_length_delimited(1, key);
+            entry.extend_from_slice(&encode_length_delimited(2, val_bytes));
+            entry
+        };
+
+        // Overhead { podFixed: {"cpu": "10m"} }  — field 1 = podFixed map entry
+        let cpu_entry = encode_map_entry(b"cpu", &encode_quantity(b"10m"));
+        let overhead_bytes = encode_length_delimited(1, &cpu_entry);
+
+        let obj_meta = encode_length_delimited(1, b"test-rc");
+        let handler = encode_length_delimited(2, b"test-rc");
+        let mut rc_proto = encode_length_delimited(1, &obj_meta);
+        rc_proto.extend_from_slice(&handler);
+        rc_proto.extend_from_slice(&encode_length_delimited(3, &overhead_bytes)); // field 3 = overhead
+
+        let result = decode_core_proto_by_kind("RuntimeClass", &rc_proto).expect(
+            "RuntimeClass with overhead must decode — conformance creates RuntimeClass via proto \
+             and expects overhead to be present in the stored object",
+        );
+
+        assert_eq!(
+            result["overhead"]["podFixed"]["cpu"], "10m",
+            "overhead.podFixed.cpu must survive proto decode so apply_runtime_class_overhead \
+             can inject it into pod.spec.overhead at pod create time"
+        );
     }
 
     // ---------------------------------------------------------------------------
