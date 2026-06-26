@@ -891,6 +891,11 @@ struct PodSpec {
     /// kubelet blocks pod startup if any init container fails or is not decoded
     #[prost(message, repeated, tag = "20")]
     init_containers: Vec<Container>,
+    /// enableServiceLinks (field 26, optional bool) — controls whether service env vars are
+    /// injected into the pod; the kubelet reads this to build container env; an explicit false
+    /// must survive decode or the kubelet injects vars the user explicitly suppressed.
+    #[prost(bool, optional, tag = "26")]
+    enable_service_links: Option<bool>,
     /// runtimeClassName (field 29, optional string) — references a RuntimeClass object in the
     /// node.k8s.io group; the apiserver uses this at admission to inject spec.overhead from the
     /// RuntimeClass.overhead.podFixed field into the pod.
@@ -4728,6 +4733,12 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
             serde_json::Value::Array(init_containers),
         );
     }
+    if let Some(esl) = spec.enable_service_links {
+        spec_map.insert(
+            "enableServiceLinks".to_string(),
+            serde_json::Value::Bool(esl),
+        );
+    }
     if let Some(rcn) = spec.runtime_class_name {
         if !rcn.is_empty() {
             spec_map.insert(
@@ -7934,6 +7945,75 @@ mod tests {
             "spec.runtimeClassName must survive proto decode — without it the overhead \
              injection block in create_pod is never entered and spec.overhead stays absent, \
              causing the RuntimeClass conformance test to fail"
+        );
+    }
+
+    /// decode_pod_proto must carry enableServiceLinks (field 26) through proto decode.
+    ///
+    /// The conformance var-expansion test creates pods via the typed Go client (protobuf).
+    /// An explicit enableServiceLinks=false must survive the proto path unchanged — if
+    /// field 26 is dropped the field goes absent, the create defaulting stamps it true,
+    /// and service env vars are injected into pods that explicitly suppressed them.
+    /// An absent field must remain absent so the create-path defaulting stamps it true
+    /// (the kubelet requires a non-nil value to build the container env).
+    #[test]
+    fn enable_service_links_survives_proto_decode_so_kubelet_can_build_pod_env() {
+        // Helper: encode a varint field (wire type 0) — used for bool fields.
+        let encode_varint_field = |field_number: u64, value: u64| -> Vec<u8> {
+            let tag = field_number << 3; // wire type 0 = varint
+            let mut out = encode_varint(tag);
+            out.extend_from_slice(&encode_varint(value));
+            out
+        };
+
+        // --- case 1: enableServiceLinks = false (explicit, must survive) ---
+        let mut obj_meta = encode_length_delimited(1, b"esl-pod");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"test-ns"));
+
+        let mut container = encode_length_delimited(1, b"c");
+        container.extend_from_slice(&encode_length_delimited(2, b"img"));
+
+        // PodSpec: containers at field 2, enableServiceLinks=false at field 26
+        let mut pod_spec = encode_length_delimited(2, &container);
+        pod_spec.extend_from_slice(&encode_varint_field(26, 0)); // false
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed for a pod with enableServiceLinks=false");
+
+        assert_eq!(
+            result["spec"]["enableServiceLinks"], false,
+            "enableServiceLinks=false must survive proto decode — if dropped, \
+             create defaulting stamps it true and service vars are injected into pods \
+             that explicitly suppressed them (var-expansion conformance)"
+        );
+
+        // --- case 2: enableServiceLinks absent — must be absent in decoded JSON ---
+        // The create defaulting (apply_pod_create_defaults) reads the typed PodSpec which
+        // defaults the field to true when absent, then writes it back only if null in JSON.
+        // If we emit false when the proto field is absent, apply_pod_create_defaults would
+        // see false and skip writing, leaving it false — incorrect for pods that never set it.
+        let mut container2 = encode_length_delimited(1, b"c");
+        container2.extend_from_slice(&encode_length_delimited(2, b"img"));
+
+        let pod_spec2 = encode_length_delimited(2, &container2); // no field 26
+
+        let mut obj_meta2 = encode_length_delimited(1, b"esl-pod-absent");
+        obj_meta2.extend_from_slice(&encode_length_delimited(3, b"test-ns"));
+
+        let mut pod_proto2 = encode_length_delimited(1, &obj_meta2);
+        pod_proto2.extend_from_slice(&encode_length_delimited(2, &pod_spec2));
+
+        let result2 = decode_pod_proto(&pod_proto2)
+            .expect("decode_pod_proto must succeed for a pod without enableServiceLinks");
+
+        assert!(
+            result2["spec"]["enableServiceLinks"].is_null(),
+            "absent enableServiceLinks must stay absent in decoded JSON so apply_pod_create_defaults \
+             can default it to true — if we emit false here the field stays false for all \
+             proto-created pods that never set it, causing incorrect kubelet env"
         );
     }
 
