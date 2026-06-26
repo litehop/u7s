@@ -12,6 +12,7 @@ use crate::{
     admission::{run_mutating_webhooks, run_validating_webhooks, AdmissionContext},
     auth::UserInfo,
     keys::{cluster_object_key, group_object_key, list_prefix, object_key},
+    limit_range::parse_quantity,
     state::AppState,
     status::Status,
     types::{Binding, Namespace, Object, ObjectMeta, PodSpec},
@@ -2960,9 +2961,12 @@ pub fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
             any_resources = true;
         }
 
-        // Guaranteed requires both limits set and request <= limit (absent request == limit).
-        let cpu_ok = has_cpu_limit && cpu_req.is_none_or(|r| r == cpu_limit.unwrap_or(""));
-        let mem_ok = has_mem_limit && mem_req.is_none_or(|r| r == mem_limit.unwrap_or(""));
+        // Guaranteed requires both limits set and request == limit by value (absent request == limit).
+        // Compare by parsed millivalue so "1" == "1000m" and "1Gi" == "1024Mi".
+        let cpu_ok = has_cpu_limit
+            && cpu_req.is_none_or(|r| parse_quantity(r) == parse_quantity(cpu_limit.unwrap_or("")));
+        let mem_ok = has_mem_limit
+            && mem_req.is_none_or(|r| parse_quantity(r) == parse_quantity(mem_limit.unwrap_or("")));
 
         if !cpu_ok || !mem_ok {
             all_guaranteed = false;
@@ -4826,6 +4830,55 @@ mod qos_class_tests {
             "Guaranteed",
             "absent requests default to the limit value for QoS purposes — \
              Kubernetes docs state: if limits are set and requests are absent, requests == limits"
+        );
+    }
+
+    /// A pod with requests:{cpu:'1'},limits:{cpu:'1000m'} is numerically Guaranteed
+    /// but was previously classified Burstable by string comparison.
+    /// Wrong classification causes the kubelet to evict this pod before truly Burstable
+    /// pods under memory pressure, even though the user pinned all resources.
+    #[test]
+    fn qos_guaranteed_when_request_equals_limit_by_value_not_string_so_eviction_ordering_is_correct(
+    ) {
+        let pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "1", "memory": "1Gi"},
+                        "limits":   {"cpu": "1000m", "memory": "1024Mi"}
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            compute_qos_class(&pod),
+            "Guaranteed",
+            "cpu '1'=='1000m' and memory '1Gi'=='1024Mi' by value — \
+             string comparison misclassified this as Burstable, misplacing it in eviction order"
+        );
+    }
+
+    /// A pod with requests:{cpu:'500m'},limits:{cpu:'1000m'} is truly Burstable
+    /// and must remain Burstable after the value-based comparison fix.
+    #[test]
+    fn qos_burstable_when_request_numerically_less_than_limit_so_partial_guarantee_preserved() {
+        let pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "500m", "memory": "512Mi"},
+                        "limits":   {"cpu": "1000m", "memory": "1Gi"}
+                    }
+                }]
+            }
+        });
+        assert_eq!(
+            compute_qos_class(&pod),
+            "Burstable",
+            "request < limit numerically must remain Burstable — \
+             value-based comparison must not mistakenly promote this to Guaranteed"
         );
     }
 }
