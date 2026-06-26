@@ -63,12 +63,20 @@ pub async fn list_resource<S: Store>(
             .await;
         }
     };
-    let prefix = group_list_prefix(&group, &plural, None);
-
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    if let Some(ver) = super::table::table_accept_version(accept) {
+        if ver != "v1" {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{ver}\" is not supported; only meta.k8s.io/v1 is accepted"
+            )));
+        }
+    }
+
+    let prefix = group_list_prefix(&group, &plural, None);
+
     let pom = wants_partial_object_metadata(accept);
     let table = super::table::wants_table(accept);
 
@@ -890,6 +898,18 @@ pub async fn list_namespaced_resource<S: Store>(
     headers: HeaderMap,
     Extension(user): Extension<UserInfo>,
 ) -> Result<Response, crate::status::StatusError> {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(ver) = super::table::table_accept_version(accept) {
+        if ver != "v1" {
+            return Err(Status::not_acceptable(format!(
+                "Table version \"{ver}\" is not supported; only meta.k8s.io/v1 is accepted"
+            )));
+        }
+    }
+
     validate_name("namespace", &ns)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -906,10 +926,6 @@ pub async fn list_namespaced_resource<S: Store>(
     };
     let prefix = group_list_prefix(&group, &plural, Some(&ns));
 
-    let accept = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
     let pom = wants_partial_object_metadata(accept);
     let table = super::table::wants_table(accept);
 
@@ -10526,5 +10542,120 @@ mod tests {
             StatusCode::CREATED,
             "admin who holds all pod-reader rules must be allowed to create a RoleBinding"
         );
+    }
+
+    // A v1beta1 Table Accept on list_resource must return 406, not 400 or 200.
+    // apimachinery/table_conversion.go:168 calls errors.IsNotAcceptable() on the
+    // response; if we return 400 the check fails and the conformance test fails.
+    #[tokio::test]
+    async fn unsupported_table_version_on_list_resource_returns_406_so_clients_fall_back_to_default_encoding(
+    ) {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let mut accept_headers = axum::http::HeaderMap::new();
+        accept_headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/json;as=Table;g=meta.k8s.io;v=v1beta1,application/json",
+            ),
+        );
+
+        let result = list_resource(
+            State(state),
+            Path(("node.k8s.io".into(), "v1".into(), "runtimeclasses".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            accept_headers,
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::NOT_ACCEPTABLE,
+                "v1beta1 Table Accept on list_resource must return 406 so \
+                 errors.IsNotAcceptable() returns true and clients fall back to JSON"
+            ),
+            Ok(_) => panic!(
+                "v1beta1 Table Accept on list_resource must return 406, not 200; \
+                 returning 200 with a Table body breaks clients expecting 406"
+            ),
+        }
+    }
+
+    // A v1beta1 Table Accept on list_namespaced_resource must return 406 BEFORE namespace
+    // validation so we never return 400 when the client sends an unsupported Table version.
+    // apimachinery/table_conversion.go:168 expects IsNotAcceptable() to return true.
+    #[tokio::test]
+    async fn unsupported_table_version_on_list_namespaced_resource_returns_406_so_clients_fall_back_to_default_encoding(
+    ) {
+        use axum::extract::{Path, Query, State};
+
+        let state = make_state();
+
+        let mut accept_headers = axum::http::HeaderMap::new();
+        accept_headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/json;as=Table;g=meta.k8s.io;v=v1beta1,application/json",
+            ),
+        );
+
+        let result = list_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            accept_headers,
+            Extension(crate::auth::UserInfo {
+                username: "test-user".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::NOT_ACCEPTABLE,
+                "v1beta1 Table Accept on list_namespaced_resource must return 406 so \
+                 errors.IsNotAcceptable() returns true and clients fall back to JSON; \
+                 returning 400 from namespace validation before the Table check was the bug"
+            ),
+            Ok(_) => {
+                panic!("v1beta1 Table Accept on list_namespaced_resource must return 406, not 200")
+            }
+        }
     }
 }
