@@ -113,7 +113,7 @@ until ! limactl shell "$VM_NAME" sudo sonobuoy status \
   sleep 2
 done
 
-SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --plugin-timeout 12h --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
+SONOBUOY_BASE_ARGS="run --plugin e2e --wait --e2e-parallel=true --kubeconfig /tmp/sonobuoy-kubeconfig --skip-preflight=dnscheck"
 
 echo "Running sonobuoy inside $VM_NAME..."
 # Start the namespace TTL watchdog in the background now that sonobuoy is
