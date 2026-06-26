@@ -2817,14 +2817,14 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     }
 }
 
-/// Copy `spec.overhead.podFixed` from a RuntimeClass into `pod.spec.overhead`.
+/// Copy `overhead.podFixed` from a RuntimeClass into `pod.spec.overhead`.
 ///
 /// If the pod already carries `spec.overhead`, it is left unchanged (idempotent,
 /// matches what the kube-apiserver RuntimeClass admission plugin does).
 /// The RuntimeClass JSON must be the full stored object; if it has no
-/// `spec.overhead.podFixed` this is a no-op.
+/// `overhead.podFixed` this is a no-op.
 pub fn apply_runtime_class_overhead(pod: &mut serde_json::Value, rc: &serde_json::Value) {
-    let pod_fixed = &rc["spec"]["overhead"]["podFixed"];
+    let pod_fixed = &rc["overhead"]["podFixed"];
     if pod_fixed.is_null() || pod_fixed.as_object().is_none_or(|m| m.is_empty()) {
         return;
     }
@@ -4477,10 +4477,9 @@ mod pure_logic_tests {
             "apiVersion": "node.k8s.io/v1",
             "kind": "RuntimeClass",
             "metadata": {"name": "my-rc"},
-            "spec": {
-                "overhead": {
-                    "podFixed": {"cpu": "10m", "memory": "50Mi"}
-                }
+            "handler": "my-rc",
+            "overhead": {
+                "podFixed": {"cpu": "10m", "memory": "50Mi"}
             }
         });
         let mut pod = serde_json::json!({
@@ -4513,10 +4512,8 @@ mod pure_logic_tests {
     #[test]
     fn runtime_class_overhead_not_overwritten_when_already_set() {
         let rc = serde_json::json!({
-            "spec": {
-                "overhead": {
-                    "podFixed": {"cpu": "10m"}
-                }
+            "overhead": {
+                "podFixed": {"cpu": "10m"}
             }
         });
         let mut pod = serde_json::json!({
@@ -4538,7 +4535,7 @@ mod pure_logic_tests {
     #[test]
     fn runtime_class_without_overhead_is_noop() {
         let rc = serde_json::json!({
-            "spec": {}
+            "handler": "no-overhead"
         });
         let mut pod = serde_json::json!({
             "spec": {
@@ -4782,10 +4779,9 @@ mod handler_tests {
             "apiVersion": "node.k8s.io/v1",
             "kind": "RuntimeClass",
             "metadata": {"name": "test-rc"},
-            "spec": {
-                "overhead": {
-                    "podFixed": {"cpu": "10m"}
-                }
+            "handler": "test-rc",
+            "overhead": {
+                "podFixed": {"cpu": "10m"}
             }
         });
         store
@@ -4830,7 +4826,7 @@ mod handler_tests {
         let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
         assert_eq!(
             stored_v["spec"]["overhead"]["cpu"], "10m",
-            "spec.overhead.cpu must be injected from RuntimeClass.spec.overhead.podFixed — \
+            "spec.overhead.cpu must be injected from RuntimeClass.overhead.podFixed — \
              conformance test asserts the pod overhead matches the RuntimeClass definition"
         );
     }
