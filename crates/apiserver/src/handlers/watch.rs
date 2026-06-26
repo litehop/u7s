@@ -774,6 +774,78 @@ mod tests {
         assert_eq!(rv, "99");
     }
 
+    /// Regression: DELETED watch event must carry the full last-known object body (including
+    /// .spec) when the store provides it, not a metadata-only tombstone.
+    ///
+    /// Without the body, KCM's replication controller OnDelete converts RC->RS and
+    /// dereferences RC.spec, nil-panicking on a spec-less tombstone — killing the entire
+    /// KCM process. This test fails on revert: if deleted_body is set to None, the emitted
+    /// DELETED event will lack .spec and this assertion fails.
+    ///
+    /// This covers the delete_namespace_resources path (namespace teardown), which previously
+    /// passed deleted_body=None. The same risk exists for any controller's OnDelete that reads
+    /// .spec of a deleted object (deployment, RS, etc.).
+    #[test]
+    fn deleted_watch_event_carries_full_object_so_kcm_controllers_dont_nil_panic_on_delete() {
+        let rc_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": {
+                "name": "my-rc",
+                "namespace": "test-ns",
+                "resourceVersion": "77"
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": {"app": "test"},
+                "template": {
+                    "metadata": {"labels": {"app": "test"}},
+                    "spec": {"containers": [{"name": "pause", "image": "pause"}]}
+                }
+            }
+        });
+        let body_bytes =
+            bytes::Bytes::from(serde_json::to_vec(&rc_body).expect("rc_body serializes"));
+
+        let event = WatchEvent::Deleted {
+            key: "/registry/replicationcontrollers/test-ns/my-rc".into(),
+            revision: 78,
+            body: Some(body_bytes),
+        };
+
+        let chunk = encode_watch_event(&event, "v1", "ReplicationController", false)
+            .expect("DELETED event with body must produce a chunk");
+
+        let decoded: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&chunk).unwrap().trim_end())
+                .expect("chunk must be valid JSON");
+
+        assert_eq!(decoded["type"], "DELETED", "event type must be DELETED");
+
+        assert!(
+            !decoded["object"]["spec"].is_null(),
+            "DELETED event must include .spec from the last-known body; \
+             a metadata-only tombstone (spec=null) causes KCM's replication controller \
+             OnDelete to nil-panic when converting RC->RS, killing the entire KCM process"
+        );
+
+        assert_eq!(
+            decoded["object"]["spec"]["replicas"], 1,
+            "DELETED event .spec.replicas must match the last-known body; \
+             KCM conversion code reads spec fields and panics on nil"
+        );
+
+        assert_eq!(
+            decoded["object"]["metadata"]["name"], "my-rc",
+            "DELETED event must preserve object name from the body"
+        );
+
+        assert_eq!(
+            decoded["object"]["metadata"]["resourceVersion"], "78",
+            "DELETED event must stamp the deletion revision into resourceVersion"
+        );
+    }
+
     /// Regression guard: if encode_watch_event ever strips metadata.resourceVersion
     /// (e.g. by rebuilding the object from scratch), this test must fail.
     #[test]

@@ -379,23 +379,26 @@ fn delete_sync(
 
 /// Delete all objects in a namespace atomically.
 ///
-/// Returns the keys that were deleted (may be empty) and the new revision
+/// Returns the keys+bodies that were deleted (may be empty) and the new revision
 /// (only meaningful when at least one object was deleted).
 fn delete_namespace_sync(
     conn: &Connection,
     namespace: &str,
     last_written: &AtomicU64,
-) -> Result<(u64, Vec<String>)> {
+) -> Result<(u64, Vec<(String, Bytes)>)> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
-    // Collect all keys in the namespace.
-    let mut stmt = conn.prepare("SELECT key FROM objects WHERE ns = ?1")?;
-    let keys: Vec<String> = stmt
-        .query_map(params![namespace], |r| r.get::<_, String>(0))?
+    // Collect all keys and their current bodies in the namespace.
+    let mut stmt = conn.prepare("SELECT key, value FROM objects WHERE ns = ?1")?;
+    let pairs: Vec<(String, Bytes)> = stmt
+        .query_map(params![namespace], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?
         .filter_map(|r| r.ok())
+        .map(|(k, v)| (k, Bytes::from(v)))
         .collect();
 
-    if keys.is_empty() {
+    if pairs.is_empty() {
         conn.execute_batch("ROLLBACK")?;
         // Return current revision without incrementing (nothing was deleted).
         let rev: u64 = conn
@@ -424,7 +427,7 @@ fn delete_namespace_sync(
     conn.execute_batch("COMMIT")?;
     // Same rationale as put_sync: update immediately after COMMIT on the blocking thread.
     last_written.fetch_max(new_revision, Ordering::Release);
-    Ok((new_revision, keys))
+    Ok((new_revision, pairs))
 }
 
 fn get_sync(conn: &Connection, key: &str) -> Result<Option<StoreObject>> {
@@ -878,22 +881,21 @@ impl Store for SqliteStore {
         let conn = self.write_conn.clone();
         let ns = namespace.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
-        let (revision, keys) = tokio::task::spawn_blocking(move || {
+        let (revision, pairs) = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             delete_namespace_sync(&conn, &ns, &last_written)
         })
         .await??;
 
-        if !keys.is_empty() {
-            for key in &keys {
-                self.push_event(Arc::new(InternalEvent {
-                    key: key.clone(),
-                    revision,
-                    value: None,
-                    is_create: false,
-                    deleted_body: None,
-                }));
-            }
+        let keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
+        for (key, body) in pairs {
+            self.push_event(Arc::new(InternalEvent {
+                key,
+                revision,
+                value: None,
+                is_create: false,
+                deleted_body: Some(body),
+            }));
         }
 
         Ok(keys)
