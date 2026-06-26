@@ -996,7 +996,9 @@ struct MetaV1Condition {
     /// observedGeneration (field 3, int64)
     #[prost(int64, tag = "3")]
     observed_generation: i64,
-    /// lastTransitionTime (field 4, Time message) — skipped, not needed for round-trip
+    /// lastTransitionTime (field 4, Time message)
+    #[prost(message, tag = "4")]
+    last_transition_time: Option<Time>,
     /// reason (field 5, string)
     #[prost(string, tag = "5")]
     reason: String,
@@ -2974,6 +2976,13 @@ pub fn decode_service_proto(data: &[u8]) -> Option<serde_json::Value> {
                         });
                         if c.observed_generation != 0 {
                             cond["observedGeneration"] = c.observed_generation.into();
+                        }
+                        if let Some(ref ts) = c.last_transition_time {
+                            if ts.seconds > 0 {
+                                cond["lastTransitionTime"] = serde_json::Value::String(
+                                    crate::util::secs_to_rfc3339(ts.seconds as u64),
+                                );
+                            }
                         }
                         if !c.reason.is_empty() {
                             cond["reason"] = c.reason.clone().into();
@@ -14994,6 +15003,40 @@ mod tests {
         assert_eq!(
             result["status"]["conditions"][0]["message"], "Set from e2e test",
             "status.conditions[0].message must survive proto decode"
+        );
+    }
+
+    /// decode_service_proto must preserve lastTransitionTime on a status condition so that
+    /// metav1.Condition round-trips through protobuf UpdateStatus with a valid API object.
+    /// lastTransitionTime is a required field on metav1.Condition; dropping it produces an
+    /// invalid object that clients may reject or that may fail server-side validation.
+    #[test]
+    fn condition_last_transition_time_survives_proto_decode_so_status_conditions_are_api_valid() {
+        // metav1.Time { seconds: 1704067200 } — 2024-01-01T00:00:00Z
+        // Wire: field 1, varint wire type (tag = 1<<3|0 = 0x08), then the seconds value.
+        let mut time_bytes = encode_varint(0x08); // field 1, wire type 0
+        time_bytes.extend_from_slice(&encode_varint(1_704_067_200u64));
+
+        // metav1.Condition { type="Ready", status="True", lastTransitionTime=<above> }
+        let mut cond_bytes = encode_length_delimited(1, b"Ready");
+        cond_bytes.extend_from_slice(&encode_length_delimited(2, b"True"));
+        cond_bytes.extend_from_slice(&encode_length_delimited(4, &time_bytes));
+
+        // ServiceStatus { conditions: [cond] }
+        let status_bytes = encode_length_delimited(2, &cond_bytes);
+
+        // Service { metadata: { name: "svc-ltt" }, status: ... }
+        let name_bytes = encode_length_delimited(1, b"svc-ltt");
+        let mut proto = encode_length_delimited(1, &name_bytes);
+        proto.extend_from_slice(&encode_length_delimited(3, &status_bytes));
+
+        let result = decode_core_proto_by_kind("Service", &proto)
+            .expect("Service with lastTransitionTime must decode successfully");
+
+        assert_eq!(
+            result["status"]["conditions"][0]["lastTransitionTime"], "2024-01-01T00:00:00Z",
+            "lastTransitionTime must survive proto decode — without it, metav1.Condition is \
+             missing a required field and API clients may reject or misinterpret the object"
         );
     }
 }
