@@ -1875,6 +1875,48 @@ pub async fn patch_ephemeral_containers<S: Store>(
     Ok(Json(current_obj.body))
 }
 
+pub async fn put_ephemeral_containers<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns, name)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns, &state).await?;
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let body = extract_body(&body, ct);
+    let incoming: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    let mut current_obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let spec_before = current_obj.body["spec"].clone();
+    current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &incoming);
+    increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
+
+    let expected_rv = parse_resource_version(current_obj.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current_obj.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_to_status(e, &name))?;
+
+    current_obj.set_resource_version(new_rv);
+
+    Ok(Json(current_obj.body))
+}
+
 // ---------------------------------------------------------------------------
 // Binding subresource — POST /api/v1/namespaces/:ns/pods/:name/binding
 // ---------------------------------------------------------------------------
@@ -7149,7 +7191,7 @@ mod ephemeral_containers_route_tests {
     use axum::{
         body::Body,
         http::{header, Request, StatusCode},
-        routing::patch,
+        routing::{patch, put},
         Router,
     };
     use bytes::Bytes;
@@ -7285,6 +7327,92 @@ mod ephemeral_containers_route_tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "PATCH /ephemeralcontainers on nonexistent pod must return 404"
+        );
+    }
+
+    /// PUT /ephemeralcontainers must return 200 and include the ephemeral container.
+    ///
+    /// The conformance test common/node/ephemeral_containers.go:173 adds a second ephemeral
+    /// container via Update() which issues PUT. Without the PUT route the server returns 405
+    /// MethodNotAllowed and the second container is never added, failing the lifecycle test.
+    #[tokio::test]
+    async fn put_ephemeral_containers_returns_200_with_new_container() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let key = "/registry/pods/default/put-target";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "put-target", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}],
+                "ephemeralContainers": [{"name": "first", "image": "busybox"}]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
+                put(put_ephemeral_containers),
+            )
+            .with_state(state);
+
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "put-target", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}],
+                "ephemeralContainers": [
+                    {"name": "first", "image": "busybox"},
+                    {"name": "second", "image": "alpine"}
+                ]
+            }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/put-target/ephemeralcontainers")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&put_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PUT /ephemeralcontainers must return 200 — without this route the server returns 405 \
+             and the conformance test cannot add a second ephemeral container via Update()"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        let ecs = v["spec"]["ephemeralContainers"]
+            .as_array()
+            .expect("response must contain spec.ephemeralContainers");
+        assert_eq!(
+            ecs.len(),
+            2,
+            "both ephemeral containers must be present after PUT — without the PUT route \
+             the second container added via Update() is silently lost"
+        );
+        let names: Vec<&str> = ecs.iter().filter_map(|c| c["name"].as_str()).collect();
+        assert!(
+            names.contains(&"first"),
+            "pre-existing ephemeral container 'first' must not be removed by PUT"
+        );
+        assert!(
+            names.contains(&"second"),
+            "newly PUT ephemeral container 'second' must appear in response"
         );
     }
 }

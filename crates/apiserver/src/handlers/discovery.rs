@@ -1206,6 +1206,13 @@ fn storage_v1_resources() -> serde_json::Value {
                 "namespaced": false,
                 "kind": "VolumeAttributesClass",
                 "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+            },
+            {
+                "name": "csistoragecapacities",
+                "singularName": "csistoragecapacity",
+                "namespaced": true,
+                "kind": "CSIStorageCapacity",
+                "verbs": ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
             }
         ]
     })
@@ -2426,6 +2433,43 @@ mod tests {
         assert!(
             names.contains(&"volumeattributesclasses"),
             "volumeattributesclasses must be in storage.k8s.io/v1 — GA since k8s 1.31; got: {names:?}"
+        );
+    }
+
+    // storage.k8s.io/v1 must include csistoragecapacities — the conformance test
+    // storage/csistoragecapacity.go:128 checks discovery before issuing API calls.
+    #[tokio::test]
+    async fn storage_v1_resources_includes_csistoragecapacities() {
+        let state = make_state();
+        let resp = api_group_resources(
+            State(state),
+            Path(("storage.k8s.io".to_string(), "v1".to_string())),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let resources = val["resources"].as_array().unwrap();
+        let names: Vec<&str> = resources
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"csistoragecapacities"),
+            "csistoragecapacities must be in storage.k8s.io/v1 — \
+             without it the conformance test cannot discover and test the resource; got: {names:?}"
+        );
+        let csc = resources
+            .iter()
+            .find(|r| r["name"] == "csistoragecapacities")
+            .unwrap();
+        assert_eq!(
+            csc["namespaced"], true,
+            "csistoragecapacities must be marked namespaced — it is a per-namespace resource"
         );
     }
 
