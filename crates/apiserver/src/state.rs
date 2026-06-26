@@ -791,6 +791,10 @@ fn build_registry() -> HashMap<ResourceKey, ResourceMeta> {
         rk("storage.k8s.io", "v1", "volumeattributesclasses"),
         rm("VolumeAttributesClass", false, false),
     );
+    m.insert(
+        rk("storage.k8s.io", "v1", "csistoragecapacities"),
+        rm("CSIStorageCapacity", true, false),
+    );
 
     // scheduling.k8s.io/v1 — cluster-scoped
     m.insert(
