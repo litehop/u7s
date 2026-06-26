@@ -258,6 +258,10 @@ fn build_server_sans(advertise_host_str: Option<&str>) -> anyhow::Result<Vec<San
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         SanType::DnsName("host.lima.internal".try_into()?),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 96, 0, 1))),
+        SanType::DnsName("kubernetes".try_into()?),
+        SanType::DnsName("kubernetes.default".try_into()?),
+        SanType::DnsName("kubernetes.default.svc".try_into()?),
+        SanType::DnsName("kubernetes.default.svc.cluster.local".try_into()?),
     ];
     if let Some(host) = advertise_host_str {
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -589,6 +593,39 @@ mod tests {
             has_cluster_ip,
             "10.96.0.1 (kubernetes ClusterIP) must be in server SANs for in-cluster clients"
         );
+    }
+
+    /// build_server_sans must include the standard in-cluster kubernetes service DNS names.
+    /// In-cluster clients (OIDC discovery, kube-dns, pods) resolve the apiserver as
+    /// kubernetes.default.svc.cluster.local (and shorter forms). Without these SANs the
+    /// TLS handshake fails with "certificate is valid for localhost, not kubernetes.default.svc"
+    /// and the OIDC discovery conformance test fails.
+    #[test]
+    fn server_cert_includes_in_cluster_kubernetes_svc_sans_so_oidc_and_in_cluster_tls_verify() {
+        let sans = build_server_sans(None).expect("build_server_sans failed");
+        let dns_names: Vec<&str> = sans
+            .iter()
+            .filter_map(|s| {
+                if let SanType::DnsName(n) = s {
+                    Some(n.as_ref())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for expected in &[
+            "kubernetes",
+            "kubernetes.default",
+            "kubernetes.default.svc",
+            "kubernetes.default.svc.cluster.local",
+        ] {
+            assert!(
+                dns_names.contains(expected),
+                "server cert must include DNS SAN '{expected}' so in-cluster clients and \
+                 OIDC discovery (GET https://kubernetes.default.svc/.well-known/openid-configuration) \
+                 can verify the TLS handshake; missing SANs cause x509 errors that fail conformance"
+            );
+        }
     }
 
     /// build_server_sans with an IP advertise_host must include both host.lima.internal
