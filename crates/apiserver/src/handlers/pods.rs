@@ -2875,10 +2875,10 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
         }
     }
 
-    // Default fieldRef.apiVersion to "v1" for all containers (including initContainers).
-    // The kubelet calls ConvertDownwardAPIFieldLabel(apiVersion, ...) which errors with
-    // "unsupported pod version: <empty>" when apiVersion is absent.
-    // Real kube-apiserver stamps this field before storing the object.
+    // Default fieldRef.apiVersion to "v1" and port protocol to "TCP" for all containers
+    // (including initContainers). Real kube-apiserver stamps both fields before storing.
+    // Absent fieldRef.apiVersion causes kubelet "unsupported pod version: <empty>".
+    // Absent port protocol causes KCM endpointslice controller to emit ports:[].
     for containers_key in &["containers", "initContainers"] {
         if let Some(containers) = pod["spec"][containers_key].as_array_mut() {
             for container in containers {
@@ -2889,6 +2889,13 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
                             && (field_ref["apiVersion"].is_null() || field_ref["apiVersion"] == "")
                         {
                             field_ref["apiVersion"] = serde_json::json!("v1");
+                        }
+                    }
+                }
+                if let Some(ports) = container["ports"].as_array_mut() {
+                    for port in ports {
+                        if port["protocol"].is_null() {
+                            port["protocol"] = serde_json::Value::String("TCP".to_string());
                         }
                     }
                 }
@@ -3775,6 +3782,82 @@ mod create_defaults_tests {
         assert_eq!(
             pod["status"]["phase"], "Running",
             "pre-existing status.phase must not be overwritten to Pending"
+        );
+    }
+
+    /// apply_pod_create_defaults must stamp the COMPLETE set of defaults regardless of
+    /// which create route the pod arrives through.
+    ///
+    /// Before this consolidation, apply_pod_create_defaults (the only actually-invoked
+    /// path — pods are not in the generic resource registry) was missing the port protocol
+    /// default that lived only in default_pod (defaults.rs). A pod with an undeclared
+    /// containerPort protocol would be stored without protocol=TCP, causing the KCM
+    /// endpointslice controller to emit ports:[] for named-targetPort services and the
+    /// kubelet to see an incomplete spec. This test FAILS if the port protocol defaulting
+    /// is removed from apply_pod_create_defaults, proving it guards against regression.
+    #[test]
+    fn pod_create_applies_full_defaults_so_kubelet_never_sees_a_partial_spec() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "full-defaults-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "ports": [{"containerPort": 8080}]
+                }],
+                "initContainers": [{
+                    "name": "init",
+                    "image": "busybox",
+                    "ports": [{"containerPort": 9090}]
+                }],
+                "volumes": [{
+                    "name": "cfg",
+                    "configMap": {"name": "my-config"}
+                }]
+            }
+        });
+
+        apply_pod_create_defaults(&mut pod);
+
+        assert_eq!(
+            pod["spec"]["enableServiceLinks"], true,
+            "enableServiceLinks must be true — absent value causes kubelet \
+             CreateContainerConfigError: nil pod.spec.enableServiceLinks"
+        );
+        assert_eq!(
+            pod["spec"]["dnsPolicy"], "ClusterFirst",
+            "dnsPolicy must default to ClusterFirst — absent value causes kubelet \
+             to emit 'invalid DNSPolicy=' and silently fall back to ClusterFirst"
+        );
+        assert_eq!(
+            pod["spec"]["volumes"][0]["configMap"]["defaultMode"], 420,
+            "configMap volume defaultMode must be 420 — absent value causes kubelet \
+             to refuse the mount with 'no defaultMode used'"
+        );
+        assert_eq!(
+            pod["spec"]["containers"][0]["ports"][0]["protocol"], "TCP",
+            "container port protocol must default to TCP — absent protocol causes \
+             KCM endpointslice controller to emit ports:[] for named-targetPort services"
+        );
+        assert_eq!(
+            pod["spec"]["initContainers"][0]["ports"][0]["protocol"], "TCP",
+            "initContainer port protocol must also default to TCP"
+        );
+        assert_eq!(
+            pod["status"]["phase"], "Pending",
+            "status.phase must be Pending after create"
+        );
+        let conditions = pod["status"]["conditions"]
+            .as_array()
+            .expect("status.conditions must be set");
+        assert!(
+            conditions
+                .iter()
+                .any(|c| c["type"].as_str() == Some("PodScheduled")),
+            "PodScheduled condition must be present — conformance scheduling tests wait \
+             for it before declaring scheduling success"
         );
     }
 }
