@@ -167,33 +167,25 @@ pub fn normalize_rfc3339_to_micro(s: &str) -> String {
     s.to_string()
 }
 
-fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
-    // 400-year cycle = 146097 days
-    let n400 = days / 146097;
-    days %= 146097;
-    let n100 = (days / 36524).min(3);
-    days -= n100 * 36524;
-    let n4 = days / 1461;
-    days %= 1461;
-    let n1 = (days / 365).min(3);
-    days -= n1 * 365;
-
-    let year = n400 * 400 + n100 * 100 + n4 * 4 + n1 + 1970;
-    let leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-    let month_days: &[u64] = if leap {
-        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut month = 0u64;
-    for (i, &md) in month_days.iter().enumerate() {
-        if days < md {
-            month = i as u64 + 1;
-            break;
-        }
-        days -= md;
-    }
-    (year, month, days + 1)
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Shift epoch from 1970-01-01 to 0000-03-01 so that the leap day (Feb 29)
+    // falls at the end of each year in the shifted representation, eliminating
+    // off-by-one errors when the leap year is not the first year of a 4-year block.
+    // Algorithm: Howard Hinnant's civil_from_days (public domain).
+    //
+    // Days from 0000-03-01 proleptic Gregorian to 1970-01-01:
+    //   = 719468
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = yoe + era * 400; // year in proleptic calendar (March-based)
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month of year [0, 11] (March=0 .. February=11)
+    let day = doy - (153 * mp + 2) / 5 + 1; // day of month [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // convert to Jan=1..Dec=12
+    let year = if month <= 2 { y + 1 } else { y }; // adjust year for Jan/Feb
+    (year, month, day)
 }
 
 #[cfg(test)]
@@ -317,6 +309,50 @@ mod tests {
     #[test]
     fn rfc3339_leap_year_feb29() {
         assert_eq!(secs_to_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+    }
+
+    /// secs_to_rfc3339 must produce the correct calendar date across all leap-year boundary
+    /// cases so that every emitted timestamp (creationTimestamp, lastTransitionTime, token expiry,
+    /// table cells) is correct. Before the fix, dates in non-leap years that follow a leap year
+    /// within a 4-year block were off by one day: e.g. 2001-09-09 was emitted as 2001-09-10,
+    /// corrupting client-side timestamp comparisons and validation.
+    #[test]
+    fn secs_to_rfc3339_correct_across_leap_year_boundaries_so_emitted_timestamps_are_valid() {
+        let cases: &[(&str, u64)] = &[
+            // Unix epoch
+            ("1970-01-01T00:00:00Z", 0),
+            // Normal year mid-date (1970 is not a leap year)
+            ("1970-06-15T00:00:00Z", 14_256_000),
+            // Leap day: 2000-02-29 (2000 is a 400-yr leap year)
+            ("2000-02-29T00:00:00Z", 951_782_400),
+            // Mar 1 of a leap year (day after the leap day)
+            ("2000-03-01T00:00:00Z", 951_868_800),
+            // Jan 1 immediately after a leap year
+            ("2001-01-01T00:00:00Z", 978_307_200),
+            // The known-failing case: 2001-09-09 was decoded as 2001-09-10 before the fix.
+            // Any timestamp emitted after a leap year within a 4-year block was wrong.
+            ("2001-09-09T00:00:00Z", 999_993_600),
+            // Another post-leap-year date (2001-12-31, last day of the year after 2000)
+            ("2001-12-31T00:00:00Z", 1_009_756_800),
+            // Leap day in a common-era century year (2024 is a regular leap year)
+            ("2024-02-29T00:00:00Z", 1_709_164_800),
+            // Mar 1 after 2024 leap day
+            ("2024-03-01T00:00:00Z", 1_709_251_200),
+            // Jan 1 of the year after 2024 leap year
+            ("2025-01-01T00:00:00Z", 1_735_689_600),
+            // 2024-01-01 (existing test value, kept for non-regression)
+            ("2024-01-01T00:00:00Z", 1_704_067_200),
+            // Far-future date: 2100-01-01 (2100 is NOT a leap year — divisible by 100 but not 400)
+            ("2100-01-01T00:00:00Z", 4_102_444_800),
+        ];
+        for &(expected, secs) in cases {
+            let got = secs_to_rfc3339(secs);
+            assert_eq!(
+                got, expected,
+                "secs_to_rfc3339({secs}) = {got:?}, want {expected:?} — wrong date corrupts \
+                 all apiserver-emitted timestamps (creationTimestamp/lastTransitionTime/token-expiry)"
+            );
+        }
     }
 
     // -- validate_cli_path --
