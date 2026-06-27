@@ -1628,6 +1628,32 @@ pub async fn delete_namespaced_resource<S: Store>(
         }
     }
 
+    // Cascade-delete pods owned by a deleted ReplicationController.
+    // RC→pods is the highest-saturation leg: conformance namespace
+    // replication-controller-2022 accumulated 385 pods with zero individual
+    // pod deletes — all pile up against the 110-pod node cap.
+    if group.is_empty() && plural == "replicationcontrollers" {
+        let rc_uid = obj.body["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if !rc_uid.is_empty() {
+            delete_pods_owned_by(&state, &ns, &rc_uid, "ReplicationController").await;
+        }
+    }
+
+    // Cascade-delete pods owned by a deleted StatefulSet.
+    // Without this, StatefulSet pods linger against the 110-pod node cap.
+    if group == "apps" && plural == "statefulsets" {
+        let sts_uid = obj.body["metadata"]["uid"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if !sts_uid.is_empty() {
+            delete_pods_owned_by(&state, &ns, &sts_uid, "StatefulSet").await;
+        }
+    }
+
     // Remove the job-tracking finalizer from pods owned by a deleted Job.
     //
     // Kubernetes KCM's job-controller (1.36) adds `batch.kubernetes.io/job-tracking` to
@@ -2113,10 +2139,16 @@ async fn delete_replicasets_owned_by<S: Store>(
         if rs_name.is_empty() {
             continue;
         }
+        let rs_uid = rs["metadata"]["uid"].as_str().unwrap_or("").to_string();
         let rs_key =
             crate::keys::group_object_key("apps", "replicasets", Some(namespace), &rs_name);
         if let Err(e) = state.store.delete(&rs_key, None).await {
             tracing::warn!("cascade-delete replicaset {namespace}/{rs_name}: {e}");
+        }
+        // Cascade-delete pods owned by this RS — without this, RS-owned pods linger
+        // against the 110-pod node cap and cause OutOfpods saturation.
+        if !rs_uid.is_empty() {
+            delete_pods_owned_by(state, namespace, &rs_uid, "ReplicaSet").await;
         }
     }
 }
@@ -3790,6 +3822,372 @@ mod tests {
         assert!(
             store.get(other_rs_key).await.unwrap().is_some(),
             "ReplicaSet not owned by the deleted Deployment must not be affected"
+        );
+    }
+
+    /// Deleting a Deployment must cascade-delete pods owned by its ReplicaSets.
+    ///
+    /// The Deployment→RS→pods chain must be complete: when delete_replicasets_owned_by
+    /// deletes an RS, it must also call delete_pods_owned_by for that RS's pods.
+    /// Without this, RS-owned pods survive and pile up against the 110-pod node cap,
+    /// causing OutOfpods saturation that blocks conformance DaemonSet serial tests.
+    #[tokio::test]
+    async fn delete_deployment_cascades_rs_pods_transitively() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let deploy_uid = "cccc1111-0000-0000-0000-000000000001";
+        let rs_uid = "cccc2222-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the Deployment.
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "my-deploy2", "namespace": ns, "uid": deploy_uid }
+        });
+        let deploy_key = "/registry/apps/deployments/default/my-deploy2";
+        store
+            .put(
+                deploy_key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a ReplicaSet owned by this Deployment.
+        let rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "my-deploy2-rs",
+                "namespace": ns,
+                "uid": rs_uid,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "my-deploy2",
+                    "uid": deploy_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "replicas": 3 }
+        });
+        let rs_key = "/registry/apps/replicasets/default/my-deploy2-rs";
+        store
+            .put(
+                rs_key,
+                bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by the ReplicaSet.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-deploy2-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "ReplicaSet",
+                    "name": "my-deploy2-rs",
+                    "uid": rs_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/my-deploy2-pod";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the Deployment.
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                ns.to_string(),
+                "deployments".into(),
+                "my-deploy2".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // RS must be deleted.
+        assert!(
+            store.get(rs_key).await.unwrap().is_none(),
+            "ReplicaSet owned by deleted Deployment must be cascade-deleted"
+        );
+
+        // Pod owned by the RS must also be cascade-deleted — this is the key fix:
+        // delete_replicasets_owned_by must call delete_pods_owned_by for each RS.
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "pod owned by RS owned by deleted Deployment must be cascade-deleted — \
+             without this, RS-owned pods pile up against the 110-pod node cap"
+        );
+
+        // Deployment itself must be deleted.
+        assert!(
+            store.get(deploy_key).await.unwrap().is_none(),
+            "Deployment itself must be deleted"
+        );
+    }
+
+    /// Deleting a ReplicationController must cascade-delete owned pods immediately.
+    ///
+    /// RC→pods is the highest-saturation leg: conformance namespace
+    /// replication-controller-2022 accumulated 385 pods with zero individual pod
+    /// deletes — without this cascade all 385 pile up against the 110-pod node cap
+    /// and cause OutOfpods saturation for every subsequent test.
+    #[tokio::test]
+    async fn delete_rc_cascades_to_owned_pods() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let rc_uid = "dddddddd-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the ReplicationController.
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "my-rc", "namespace": ns, "uid": rc_uid },
+            "spec": { "replicas": 3, "selector": { "app": "my-rc" } }
+        });
+        let rc_key = "/registry/replicationcontrollers/default/my-rc";
+        store
+            .put(
+                rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by this RC.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-rc-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "name": "my-rc",
+                    "uid": rc_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/my-rc-pod";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed an unrelated pod (must NOT be deleted).
+        let other_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "other-pod-rc", "namespace": ns }
+        });
+        let other_pod_key = "/registry/pods/default/other-pod-rc";
+        store
+            .put(
+                other_pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&other_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the ReplicationController.
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "my-rc".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // Owned pod must be cascade-deleted — RC delete must cascade or node saturates at 110-pod cap.
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "pod owned by deleted ReplicationController must be cascade-deleted — \
+             RC delete must cascade to pods or the node saturates at the 110-pod cap"
+        );
+
+        // RC itself must be deleted.
+        assert!(
+            store.get(rc_key).await.unwrap().is_none(),
+            "ReplicationController itself must be deleted"
+        );
+
+        // Unrelated pod must survive.
+        assert!(
+            store.get(other_pod_key).await.unwrap().is_some(),
+            "pod not owned by the deleted RC must not be affected"
+        );
+    }
+
+    /// Deleting a StatefulSet must cascade-delete owned pods immediately.
+    ///
+    /// Without this, StatefulSet pods linger against the 110-pod node cap, causing
+    /// OutOfpods saturation that blocks conformance tests running on the same node.
+    #[tokio::test]
+    async fn delete_statefulset_cascades_to_owned_pods() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let sts_uid = "eeeeeeee-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the StatefulSet.
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "my-sts", "namespace": ns, "uid": sts_uid },
+            "spec": {
+                "replicas": 2,
+                "selector": { "matchLabels": { "app": "my-sts" } },
+                "serviceName": "my-sts"
+            }
+        });
+        let sts_key = "/registry/apps/statefulsets/default/my-sts";
+        store
+            .put(
+                sts_key,
+                bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by this StatefulSet.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-sts-0",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "name": "my-sts",
+                    "uid": sts_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/my-sts-0";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed an unrelated pod (must NOT be deleted).
+        let other_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "other-pod-sts", "namespace": ns }
+        });
+        let other_pod_key = "/registry/pods/default/other-pod-sts";
+        store
+            .put(
+                other_pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&other_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the StatefulSet.
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                ns.to_string(),
+                "statefulsets".into(),
+                "my-sts".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // Owned pod must be cascade-deleted.
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "pod owned by deleted StatefulSet must be cascade-deleted — \
+             without this, StatefulSet pods linger against the 110-pod node cap"
+        );
+
+        // StatefulSet itself must be deleted.
+        assert!(
+            store.get(sts_key).await.unwrap().is_none(),
+            "StatefulSet itself must be deleted"
+        );
+
+        // Unrelated pod must survive.
+        assert!(
+            store.get(other_pod_key).await.unwrap().is_some(),
+            "pod not owned by the deleted StatefulSet must not be affected"
         );
     }
 
