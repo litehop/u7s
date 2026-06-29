@@ -7403,6 +7403,66 @@ pub fn decode_proto_by_kind_and_version(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Gnostic OpenAPI v2 proto encoder
+// ---------------------------------------------------------------------------
+//
+// kubectl 1.36's validation code path sends a proto-only Accept header:
+//   Accept: application/com.github.proto-openapi.spec.v2@v1.0+protobuf
+// and unconditionally decodes the response body as a gnostic openapi_v2.Document
+// protobuf message, ignoring the response Content-Type. Returning JSON triggers
+// "proto: cannot parse invalid wire-format data".
+//
+// This encoder produces a minimal but wire-valid gnostic Document. Field numbers
+// match github.com/google/gnostic/openapiv2/OpenAPIv2.proto:
+//   Document field 1 = swagger (string)
+//   Document field 2 = info (Info message)
+//     Info field 1 = title (string)
+//     Info field 2 = description (string)  [version is field 6]
+// Definitions (field 14 in gnostic proto) is omitted — an empty/absent
+// definitions map is valid; kubectl skips schema validation for types it
+// has no definition for. Encoding CRD definitions in proto is deferred to
+// mayor-52wo (embedding upstream OpenAPI v2 schema).
+
+fn gnostic_varint(mut v: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+    out
+}
+
+fn gnostic_ld_field(field_number: u64, payload: &[u8]) -> Vec<u8> {
+    let tag = (field_number << 3) | 2; // wire type 2 = length-delimited
+    let mut out = gnostic_varint(tag);
+    out.extend_from_slice(&gnostic_varint(payload.len() as u64));
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Encode a minimal gnostic `openapi_v2.Document` protobuf that kubectl accepts.
+///
+/// Returns raw proto bytes (no k8s magic prefix — the gnostic proto is NOT wrapped
+/// in a Kubernetes Unknown envelope; it is the raw Document message bytes).
+pub fn encode_gnostic_openapi_v2_document() -> Vec<u8> {
+    // Info sub-message: field 1 = title, field 2 = description.
+    // (gnostic Info.version is field 6; omitting it produces empty string which
+    // is accepted by kubectl's gnostic decoder even though Swagger 2.0 requires it.)
+    let mut info = gnostic_ld_field(1, b"u7s");
+    info.extend_from_slice(&gnostic_ld_field(2, b"v1"));
+
+    // Document: field 1 = swagger "2.0", field 2 = info.
+    let mut doc = gnostic_ld_field(1, b"2.0");
+    doc.extend_from_slice(&gnostic_ld_field(2, &info));
+    doc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
