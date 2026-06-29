@@ -1510,6 +1510,180 @@ mod tests {
         );
     }
 
+    /// Regression test for mayor-2z1k: PATCH/PUT poddisruptionbudgets/status must persist
+    /// status.disruptedPods so the DisruptionController conformance test passes.
+    ///
+    /// The spec '[sig-apps] DisruptionController should update/patch PodDisruptionBudget status'
+    /// writes status.disruptedPods['pod-0'] via the PDB /status subresource and reads back the
+    /// key. If the handler wipes status (because the incoming proto-decoded body had null status),
+    /// the read-back returns an empty map and the conformance test fails with:
+    ///   `<map[string]v1.Time | len:0>: nil, expected key 'pod-0'`
+    ///
+    /// This test operates at the JSON level (the proto-decode layer is tested in proto.rs).
+    /// It fails if put_namespaced_resource_status removes status when incoming status is non-null.
+    #[tokio::test]
+    async fn put_pdb_status_persists_disrupted_pods() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": {
+                "name": "my-pdb",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": { "minAvailable": 1 }
+        });
+        let key = "/registry/policy/poddisruptionbudgets/default/my-pdb";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // DisruptionController PUT /status body with disruptedPods set.
+        let put_body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "my-pdb", "namespace": "default" },
+            "status": {
+                "disruptedPods": { "pod-0": "2024-01-01T00:00:00Z" },
+                "disruptionsAllowed": 0,
+                "currentHealthy": 1,
+                "desiredHealthy": 1,
+                "expectedPods": 1
+            }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "policy".into(),
+                "v1".into(),
+                "default".into(),
+                "poddisruptionbudgets".into(),
+                "my-pdb".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "PUT poddisruptionbudgets/status must succeed — DisruptionController calls this \
+             to record disrupted pods"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        let disrupted_pods = v["status"]["disruptedPods"].as_object().expect(
+            "status.disruptedPods must be present after PUT /status — \
+             the conformance test reads it back and expects key 'pod-0'; \
+             if missing the test fails with `<map[string]v1.Time | len:0>: nil`",
+        );
+        assert!(
+            disrupted_pods.contains_key("pod-0"),
+            "pod-0 must be in status.disruptedPods after PUT /status — \
+             the DisruptionController conformance test fails if this key is absent"
+        );
+
+        // spec must be unchanged — status subresource isolation applies to PDB too
+        assert_eq!(
+            v["spec"]["minAvailable"], 1,
+            "spec.minAvailable must not be modified by a PUT to /status"
+        );
+    }
+
+    /// Regression test: PATCH poddisruptionbudgets/status with merge-patch must persist
+    /// status.disruptedPods. The DisruptionController may use PATCH instead of PUT.
+    ///
+    /// This test fails if patch_namespaced_resource_status drops the status field when
+    /// applying a merge-patch that includes status.disruptedPods.
+    #[tokio::test]
+    async fn patch_pdb_status_persists_disrupted_pods() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": {
+                "name": "patch-pdb",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": { "minAvailable": 2 },
+            "status": {}
+        });
+        let key = "/registry/policy/poddisruptionbudgets/default/patch-pdb";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({
+            "status": {
+                "disruptedPods": { "pod-0": "2024-01-01T00:00:00Z" },
+                "disruptionsAllowed": 1,
+                "currentHealthy": 2,
+                "desiredHealthy": 2,
+                "expectedPods": 2
+            }
+        });
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "policy".into(),
+                "v1".into(),
+                "default".into(),
+                "poddisruptionbudgets".into(),
+                "patch-pdb".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "PATCH poddisruptionbudgets/status must succeed"
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        let disrupted_pods = v["status"]["disruptedPods"].as_object().expect(
+            "status.disruptedPods must survive PATCH /status — \
+             the DisruptionController conformance test fails if this field is absent after patch",
+        );
+        assert!(
+            disrupted_pods.contains_key("pod-0"),
+            "pod-0 must be in status.disruptedPods after PATCH /status"
+        );
+        assert_eq!(
+            v["spec"]["minAvailable"], 2,
+            "spec.minAvailable must not be changed by PATCH /status"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // MockStore — injects RevisionMismatch on the first put() after arm() is called.
     //

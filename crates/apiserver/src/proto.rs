@@ -2484,14 +2484,48 @@ struct LimitRange {
 
 // --- k8s.io/api/policy/v1/generated.proto ---
 
+/// PodDisruptionBudgetStatus — k8s.io/api/policy/v1/generated.proto
+/// Source: k8s.io/api/policy/v1/generated.proto message PodDisruptionBudgetStatus
+/// Fields match the official proto exactly.
+#[derive(Clone, PartialEq, Message)]
+struct PodDisruptionBudgetStatus {
+    /// observedGeneration (field 1, int64)
+    #[prost(int64, tag = "1")]
+    observed_generation: i64,
+    /// disruptedPods (field 2, map<string, Time>)
+    /// Maps pod names to the time when a disruption was allowed.
+    #[prost(btree_map = "string, message", tag = "2")]
+    disrupted_pods: std::collections::BTreeMap<String, Time>,
+    /// disruptionsAllowed (field 3, int32)
+    #[prost(int32, tag = "3")]
+    disruptions_allowed: i32,
+    /// currentHealthy (field 4, int32)
+    #[prost(int32, tag = "4")]
+    current_healthy: i32,
+    /// desiredHealthy (field 5, int32)
+    #[prost(int32, tag = "5")]
+    desired_healthy: i32,
+    /// expectedPods (field 6, int32)
+    #[prost(int32, tag = "6")]
+    expected_pods: i32,
+    /// conditions (field 7, repeated metav1.Condition)
+    #[prost(message, repeated, tag = "7")]
+    conditions: Vec<MetaV1Condition>,
+}
+
 /// PodDisruptionBudget — k8s.io/api/policy/v1/generated.proto
 /// Source: k8s.io/api/policy/v1/generated.proto message PodDisruptionBudget
-/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
 #[derive(Clone, PartialEq, Message)]
 struct PodDisruptionBudget {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
+    /// spec (field 2, message PodDisruptionBudgetSpec) — decoded as raw bytes; not serialized
+    #[prost(bytes = "vec", tag = "2")]
+    spec: Vec<u8>,
+    /// status (field 3, message PodDisruptionBudgetStatus)
+    #[prost(message, optional, tag = "3")]
+    status: Option<PodDisruptionBudgetStatus>,
 }
 
 // ---------------------------------------------------------------------------
@@ -5436,14 +5470,82 @@ fn limitrange_quantity_map_to_json(
 }
 
 /// Decode a proto-encoded PodDisruptionBudget object into a `serde_json::Value`.
+///
+/// The DisruptionController sends proto-encoded PUT /poddisruptionbudgets/*/status bodies with
+/// status.disruptedPods to record which pods are currently being disrupted.  Without decoding
+/// status (field 3), the put_namespaced_resource_status handler receives an incoming object where
+/// status is null, and then REMOVES status from the stored PDB (its null-status branch), causing
+/// disruptedPods written by the controller to disappear on read-back.
+///
+/// The conformance spec '[sig-apps] DisruptionController should update/patch PodDisruptionBudget
+/// status' fails with "got disruptedPods=nil" when proto-encoded status writes lose the field.
 pub fn decode_poddisruptionbudget_proto(data: &[u8]) -> Option<serde_json::Value> {
     let obj = PodDisruptionBudget::decode(data).ok()?;
     let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
+    let mut result = serde_json::json!({
         "apiVersion": "policy/v1",
         "kind": "PodDisruptionBudget",
         "metadata": meta
-    }))
+    });
+    if let Some(status) = obj.status {
+        let mut status_json = serde_json::json!({});
+        if status.observed_generation != 0 {
+            status_json["observedGeneration"] = status.observed_generation.into();
+        }
+        if !status.disrupted_pods.is_empty() {
+            let pods_map: serde_json::Map<String, serde_json::Value> = status
+                .disrupted_pods
+                .into_iter()
+                .map(|(pod_name, t)| {
+                    let ts = if t.seconds > 0 {
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(t.seconds as u64))
+                    } else {
+                        serde_json::Value::String("1970-01-01T00:00:00Z".into())
+                    };
+                    (pod_name, ts)
+                })
+                .collect();
+            status_json["disruptedPods"] = serde_json::Value::Object(pods_map);
+        }
+        // disruptionsAllowed, currentHealthy, desiredHealthy, expectedPods are always
+        // meaningful (even 0 means "zero allowed/healthy"). Always emit them when status is
+        // present so the DisruptionController can read them back correctly.
+        status_json["disruptionsAllowed"] = status.disruptions_allowed.into();
+        status_json["currentHealthy"] = status.current_healthy.into();
+        status_json["desiredHealthy"] = status.desired_healthy.into();
+        status_json["expectedPods"] = status.expected_pods.into();
+        if !status.conditions.is_empty() {
+            status_json["conditions"] = status
+                .conditions
+                .iter()
+                .map(|c| {
+                    let mut cond = serde_json::json!({
+                        "type": c.r#type,
+                        "status": c.status,
+                    });
+                    if c.observed_generation != 0 {
+                        cond["observedGeneration"] = c.observed_generation.into();
+                    }
+                    if let Some(ref ts) = c.last_transition_time {
+                        if ts.seconds > 0 {
+                            cond["lastTransitionTime"] = serde_json::Value::String(
+                                crate::util::secs_to_rfc3339(ts.seconds as u64),
+                            );
+                        }
+                    }
+                    if !c.reason.is_empty() {
+                        cond["reason"] = c.reason.clone().into();
+                    }
+                    if !c.message.is_empty() {
+                        cond["message"] = c.message.clone().into();
+                    }
+                    cond
+                })
+                .collect();
+        }
+        result["status"] = status_json;
+    }
+    Some(result)
 }
 
 // --- k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto ---
@@ -12192,6 +12294,101 @@ mod tests {
         assert_eq!(result["apiVersion"], "policy/v1");
         assert_eq!(result["metadata"]["name"], "my-pdb");
         assert_eq!(result["metadata"]["namespace"], "default");
+    }
+
+    /// decode_poddisruptionbudget_proto must preserve status.disruptedPods from a proto
+    /// /status write body.
+    ///
+    /// The DisruptionController sends proto-encoded PUT or PATCH /poddisruptionbudgets/*/status
+    /// bodies with status.disruptedPods to record which pods are being disrupted and when
+    /// disruption was allowed.  Without decoding status (field 3) and disruptedPods (field 2 of
+    /// PodDisruptionBudgetStatus), the put_namespaced_resource_status handler receives an incoming
+    /// object where status is null, then REMOVES status from the stored PDB, so disruptedPods
+    /// disappears on read-back.
+    ///
+    /// The conformance spec '[sig-apps] DisruptionController should update/patch PodDisruptionBudget
+    /// status [Conformance]' fails with `<map[string]v1.Time | len:0>: nil, expected key 'pod-0'`
+    /// when this decode path is missing.
+    ///
+    /// This test fails if `PodDisruptionBudgetStatus` or `disrupted_pods` is removed from the
+    /// proto struct, or if the status serialization block is removed from
+    /// `decode_poddisruptionbudget_proto`.
+    #[test]
+    fn decode_poddisruptionbudget_proto_preserves_status_disrupted_pods() {
+        use prost::Message as _;
+
+        let pdb = PodDisruptionBudget {
+            metadata: Some(ObjectMeta {
+                name: "status-pdb".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: vec![],
+            status: Some(PodDisruptionBudgetStatus {
+                observed_generation: 1,
+                disrupted_pods: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert(
+                        "pod-0".to_string(),
+                        Time {
+                            seconds: 1_700_000_000,
+                            nanos: 0,
+                        },
+                    );
+                    m
+                },
+                disruptions_allowed: 2,
+                current_healthy: 3,
+                desired_healthy: 2,
+                expected_pods: 3,
+                conditions: vec![],
+            }),
+        };
+
+        let mut buf = Vec::new();
+        pdb.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_poddisruptionbudget_proto(&buf).expect(
+            "decode_poddisruptionbudget_proto must return Some for a proto /status body — \
+             the DisruptionController sends proto-encoded PUT /status writes",
+        );
+
+        assert_eq!(result["kind"], "PodDisruptionBudget");
+        assert_eq!(result["metadata"]["name"], "status-pdb");
+
+        assert!(
+            result["status"].is_object(),
+            "status must be present after proto decode — without it, the /status handler \
+             receives null status and wipes status from the stored PDB"
+        );
+
+        let disrupted_pods = result["status"]["disruptedPods"].as_object().expect(
+            "status.disruptedPods must survive proto decode — the DisruptionController \
+             conformance test '[sig-apps] DisruptionController should update/patch \
+             PodDisruptionBudget status' fails with `len:0` when this field is lost",
+        );
+        assert!(
+            disrupted_pods.contains_key("pod-0"),
+            "pod-0 must be in disruptedPods — the conformance test writes pod-0 and reads \
+             it back; if it is missing the test fails with `expected key 'pod-0'`"
+        );
+
+        assert_eq!(
+            result["status"]["disruptionsAllowed"], 2,
+            "disruptionsAllowed must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["currentHealthy"], 3,
+            "currentHealthy must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["desiredHealthy"], 2,
+            "desiredHealthy must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["expectedPods"], 3,
+            "expectedPods must survive proto decode"
+        );
     }
 
     /// decode_limitrange_proto must decode spec.limits so the admission plugin can apply defaults.
