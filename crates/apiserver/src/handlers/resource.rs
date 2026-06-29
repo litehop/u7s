@@ -1623,7 +1623,25 @@ pub async fn delete_namespaced_resource<S: Store>(
         .unwrap_or("")
         .to_string();
 
-    if delete_opts.is_orphan() && !owner_uid.is_empty() {
+    // Compute the effective orphan flag for this delete.
+    //
+    // Explicit Orphan (propagationPolicy=Orphan or orphanDependents=true) → orphan.
+    //
+    // For ReplicationControllers specifically: when the caller sends empty DeleteOptions
+    // (nil propagationPolicy, nil orphanDependents), we also orphan.  The k8s GC
+    // conformance spec "should orphan pods created by rc if deleteOptions.OrphanDependents
+    // is nil" (garbage_collector.go:475) sends exactly this and asserts that 2 pods
+    // survive for 30 s.  If we leave pods with their ownerReferences intact, the KCM
+    // GC controller sees them as orphaned dependents of a deleted owner and garbage-
+    // collects them within seconds — the test then observes 0 pods.  Stripping ownerRefs
+    // upfront prevents the GC from collecting them, matching upstream k8s semantics
+    // where nil policy means the GC treats pods as not eligible for cascade.
+    let effective_orphan = delete_opts.is_orphan()
+        || (group.is_empty()
+            && plural == "replicationcontrollers"
+            && !delete_opts.is_explicit_cascade());
+
+    if effective_orphan && !owner_uid.is_empty() {
         // Orphan: strip ownerReferences pointing to this object from all namespaced children,
         // then hard-delete the owner only. Do NOT cascade-delete the children.
         orphan_owned_resources(&state, &group, &plural, Some(&ns), &owner_uid).await;
@@ -1684,12 +1702,8 @@ pub async fn delete_namespaced_resource<S: Store>(
     // Cascade-delete pods owned by a deleted ReplicationController — only when the caller
     // explicitly requests Background or Foreground propagation.
     //
-    // When propagationPolicy and orphanDependents are both absent/nil the GC spec requires
-    // pods to survive: "should orphan pods created by rc if deleteOptions.OrphanDependents
-    // is nil" (garbage_collector.go:475) deletes with empty DeleteOptions and asserts the
-    // 2 pods exist after 30 s.  Cascading them here would fail that spec.  When the caller
-    // wants synchronous cascade they set propagationPolicy=Background (or Foreground), which
-    // is_explicit_cascade() detects, and we run the fast-path to avoid pod pile-ups.
+    // Nil-policy RC deletes are handled above (effective_orphan is true for RCs when no
+    // explicit cascade is requested), so this branch only runs for explicit Background/Foreground.
     if group.is_empty()
         && plural == "replicationcontrollers"
         && !owner_uid.is_empty()
@@ -4273,16 +4287,17 @@ mod tests {
         );
     }
 
-    /// Deleting a ReplicationController with no propagationPolicy (nil) must NOT
-    /// cascade-delete owned pods.
+    /// Deleting a ReplicationController with nil propagationPolicy must orphan
+    /// (strip ownerReferences from) owned pods, not cascade-delete them.
     ///
     /// The k8s GC conformance spec "should orphan pods created by rc if
     /// deleteOptions.OrphanDependents is nil" (garbage_collector.go:475) sends an
-    /// empty DeleteOptions (only Preconditions) and then asserts that the 2 pods
-    /// created by the RC still exist after 30 s.  In upstream Kubernetes the GC
-    /// controller handles cascade asynchronously; in u7s we must not cascade
-    /// synchronously when no explicit policy is present, so the pods survive the
-    /// wait and the conformance spec passes.
+    /// empty DeleteOptions (only Preconditions) and asserts that the 2 pods
+    /// created by the RC still exist after 30 s.  In u7s, if pods keep their
+    /// ownerReferences pointing to the now-deleted RC, KCM's GC controller
+    /// garbage-collects them within seconds (dangling ownerRef = orphaned dependent).
+    /// We must strip ownerRefs upfront so GC does not collect them.  This matches the
+    /// "ORPHAN" semantics the spec title states — nil deleteOptions means orphan for RC.
     #[tokio::test]
     async fn nil_propagation_rc_delete_does_not_cascade_pods() {
         use std::sync::Arc;
@@ -4367,15 +4382,24 @@ mod tests {
             "ReplicationController itself must be hard-deleted"
         );
 
-        // Pod must SURVIVE — nil policy means GC handles it asynchronously, not us.
+        // Pod must SURVIVE with ownerReferences stripped — nil policy RC delete must orphan pods
+        // (strip ownerRefs) so the KCM GC controller does not garbage-collect them.
         // If this fails the conformance spec 'should orphan pods created by rc if
-        // deleteOptions.OrphanDependents is nil' will report 'expect 2 pods, got 0 pods'.
+        // deleteOptions.OrphanDependents is nil' (garbage_collector.go:475) will fail:
+        // KCM's GC sees pods with ownerRef pointing to deleted RC and deletes them within seconds,
+        // causing 'expect 2 pods, got 0 pods'.  Stripping ownerRefs prevents GC collection.
+        let pod_stored = store.get(pod_key).await.unwrap().unwrap();
+        let pod_val: serde_json::Value = serde_json::from_slice(&pod_stored.value).unwrap();
         assert!(
-            store.get(pod_key).await.unwrap().is_some(),
-            "pod owned by RC must survive when DeleteOptions has nil propagationPolicy — \
-             synchronous cascade must only fire on explicit Background/Foreground, not on \
-             empty DeleteOptions; the GC conformance spec 'deleteOptions.OrphanDependents is nil' \
-             fails if we cascade here"
+            pod_val.get("metadata").is_some(),
+            "pod owned by RC must survive (not cascade-deleted) when DeleteOptions has nil propagationPolicy"
+        );
+        let owner_refs = pod_val["metadata"]["ownerReferences"].as_array().cloned();
+        assert!(
+            owner_refs.map(|r| r.is_empty()).unwrap_or(true),
+            "pod ownerReferences must be stripped on nil-policy RC delete — without stripping, \
+             KCM GC sees dangling ownerRef and garbage-collects the pod within 30 s, causing \
+             the GC conformance spec 'deleteOptions.OrphanDependents is nil' to fail"
         );
     }
 
