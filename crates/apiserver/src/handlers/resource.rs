@@ -1472,6 +1472,17 @@ pub async fn replace_namespaced_resource<S: Store>(
         (None, None)
     };
 
+    // Allocate a clusterIP when a Service transitions away from ExternalName to a
+    // cluster-routed type (ClusterIP, NodePort, LoadBalancer).  The create path
+    // handles initial allocation; the update path must also allocate when the type
+    // changes, because ExternalName services are created without a clusterIP and the
+    // stored object carries no IP to preserve.
+    // maybe_allocate_cluster_ip is a no-op when clusterIP is already set or when
+    // the type is (still) ExternalName, so calling it unconditionally is safe.
+    if group.is_empty() && plural == "services" {
+        maybe_allocate_cluster_ip(&state, &ns, &name, &mut obj.body).await?;
+    }
+
     super::defaults::apply_defaults(&group, &plural, &mut obj.body);
     super::defaults::validate_resource(&group, &plural, &obj.body)
         .map_err(Status::unprocessable_entity)?;
@@ -2032,7 +2043,11 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
 
 /// Allocate a clusterIP for a Service if none is already set.
 ///
-/// Called on Service CREATE only (not update/patch — you never reallocate).
+/// Called on Service CREATE and UPDATE (PUT).  On create, an explicit clusterIP in the
+/// body is respected; without one an address is auto-allocated.  On update the call is
+/// a no-op for services that already have a clusterIP, but it allocates one when the
+/// service type transitions from ExternalName (which stores no clusterIP) to a
+/// cluster-routed type (ClusterIP, NodePort, LoadBalancer).
 /// Keeps `apply_defaults` pure (no async side effects).
 ///
 /// Sets `spec.clusterIP` in `body` when allocation succeeds.
@@ -11605,6 +11620,124 @@ mod tests {
             v2["spec"]["renewTime"].as_str(),
             Some(new_renew_ts),
             "spec.renewTime must reflect the updated value after PUT update"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Service ExternalName→ClusterIP type transition must allocate a clusterIP
+    // (mayor-qofd)
+    // ---------------------------------------------------------------------------
+
+    /// Changing a Service from ExternalName to ClusterIP via PUT must result in a
+    /// non-empty spec.clusterIP in the stored object.
+    ///
+    /// The conformance spec '[sig-network] Services should be able to change the type from
+    /// ExternalName to ClusterIP [Conformance]' (network/service.go:1445) fails with
+    /// "didn't get ClusterIP for non-ExternalName service" when the PUT on the main
+    /// endpoint does not trigger ClusterIP allocation.  ExternalName services are created
+    /// without a clusterIP; the update path must allocate one when the type changes.
+    ///
+    /// This test fails if maybe_allocate_cluster_ip is not called from
+    /// replace_namespaced_resource.
+    #[tokio::test]
+    async fn externalname_to_clusterip_allocates_cluster_ip() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+        use std::net::Ipv4Addr;
+        use std::str::FromStr;
+
+        let state = make_state_with_cidr_for_resource_tests("10.96.0.0/12");
+
+        // Step 1: create an ExternalName service (no clusterIP).
+        let svc_external = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": { "name": "type-changer", "namespace": "default" },
+            "spec": {
+                "type": "ExternalName",
+                "externalName": "my.external.host.example.com"
+            }
+        });
+        let create_resp = create_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), "default".into(), "services".into())),
+            axum::extract::Query(CreateQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc_external).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("ExternalName service create must succeed: {e:?}"))
+        .into_response();
+        assert_eq!(create_resp.status(), axum::http::StatusCode::CREATED);
+
+        // Capture the resourceVersion for the PUT.
+        let create_body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        let rv = created["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+
+        // Step 2: PUT to change type to ClusterIP — no clusterIP in body.
+        let svc_clusterip = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": "type-changer",
+                "namespace": "default",
+                "resourceVersion": rv
+            },
+            "spec": {
+                "type": "ClusterIP",
+                "ports": [{ "port": 80 }]
+            }
+        });
+        let put_resp = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "services".into(),
+                "type-changer".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&svc_clusterip).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Service type-change PUT must succeed: {e:?}"))
+        .into_response();
+
+        assert_eq!(put_resp.status(), axum::http::StatusCode::OK);
+
+        let put_body = to_bytes(put_resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&put_body).unwrap();
+
+        let cluster_ip = v["spec"]["clusterIP"].as_str().unwrap_or("").to_string();
+        assert!(
+            !cluster_ip.is_empty() && cluster_ip != "None",
+            "after ExternalName→ClusterIP type change via PUT, spec.clusterIP must be \
+             allocated — without this, the conformance test '[sig-network] Services should \
+             be able to change the type from ExternalName to ClusterIP' fails with \
+             'didn't get ClusterIP for non-ExternalName service'; got clusterIP={cluster_ip:?}"
+        );
+
+        // Must be a valid IPv4 address within the configured CIDR.
+        let ip = Ipv4Addr::from_str(&cluster_ip).unwrap_or_else(|_| {
+            panic!(
+                "spec.clusterIP must be a valid IPv4 address after type change, got {cluster_ip}"
+            )
+        });
+        let base = u32::from(Ipv4Addr::new(10, 96, 0, 0));
+        let mask: u32 = !((1u32 << (32 - 12)) - 1);
+        assert_eq!(
+            u32::from(ip) & mask,
+            base & mask,
+            "allocated clusterIP {ip} must be within 10.96.0.0/12"
         );
     }
 }
