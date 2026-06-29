@@ -1302,17 +1302,16 @@ fn scheduling_v1_resources() -> serde_json::Value {
 /// Polls the store at request time so that newly-created CRDs appear without
 /// a restart — required by the CustomResourcePublishOpenAPI conformance test.
 ///
-/// Always returns `Content-Type: application/json` regardless of the Accept header.
-/// u7s does not implement protobuf serialisation for the OpenAPI schema; returning
-/// 406 Not Acceptable when the client sends a proto-only Accept causes kubectl to
-/// report "the server was unable to respond with a content type that the client
-/// supports" and abort resource validation. Instead we serve JSON unconditionally —
-/// client-go always includes "application/json" as a fallback in its Accept list, and
-/// even if it only sent the protobuf MIME type, receiving JSON is harmless because
-/// client-go's OpenAPI parser accepts JSON.
+/// Content-type negotiation: kubectl 1.36's validation path sends a proto-only
+/// Accept (`application/com.github.proto-openapi.spec.v2@v1.0+protobuf`) and
+/// unconditionally gnostic-decodes the body, ignoring the response Content-Type.
+/// Returning JSON to that request causes "proto: cannot parse invalid wire-format
+/// data". When the Accept header is proto-only we return a minimal valid gnostic
+/// openapi_v2.Document; otherwise (Accept includes application/json or */*) we
+/// return JSON as before.
 pub async fn openapi_v2<S: Store>(
     State(state): State<AppState<S>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
 ) -> Response {
     let mut definitions = serde_json::Map::new();
 
@@ -1365,6 +1364,21 @@ pub async fn openapi_v2<S: Store>(
                 definitions.insert(key, def);
             }
         }
+    }
+
+    // Proto-only content negotiation: if Accept contains the gnostic proto media type
+    // and does NOT contain application/json, return a gnostic openapi_v2.Document.
+    // kubectl 1.36's validation path sends proto-only Accept and gnostic-decodes the
+    // body unconditionally — JSON bytes are invalid wire-format proto and cause
+    // "proto: cannot parse invalid wire-format data".
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if accept.contains("proto-openapi") && !accept.contains("application/json") {
+        const PROTO_CT: &str = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf";
+        let body = crate::proto::encode_gnostic_openapi_v2_document();
+        return ([(axum::http::header::CONTENT_TYPE, PROTO_CT)], body).into_response();
     }
 
     (
@@ -3218,20 +3232,17 @@ mod tests {
     }
 
     // GET /openapi/v2 with a proto-only Accept must return 200 with Content-Type:
-    // application/json — NOT 406. Returning 406 causes kubectl to report "the server
-    // was unable to respond with a content type that the client supports", which aborts
-    // resource validation and breaks `kubectl create` / `kubectl apply`.
+    // application/com.github.proto-openapi.spec.v2@v1.0+protobuf and a valid gnostic
+    // openapi_v2.Document in the body — NOT JSON. kubectl 1.36's validation path sends
+    // proto-only Accept and unconditionally gnostic-decodes the response body; returning
+    // JSON causes "proto: cannot parse invalid wire-format data" and breaks
+    // `kubectl create/describe/patch --validate`.
     //
-    // u7s does not implement protobuf serialisation for the OpenAPI schema; the correct
-    // behaviour is to serve JSON unconditionally. client-go always includes
-    // "application/json" as a fallback in its Accept list, and even if it only sent the
-    // protobuf MIME type, receiving JSON is harmless — client-go's OpenAPI parser reads
-    // JSON successfully.
-    //
-    // This test fails on revert: if the 406 response is re-introduced, the assertion on
-    // StatusCode::OK fails, and the "unable to respond with a content type" error returns.
+    // This test fails on revert: reverting the content-negotiation fix causes the handler
+    // to return application/json, making ct.starts_with("protobuf") fail; and the body
+    // would be valid JSON which is not valid gnostic proto.
     #[tokio::test]
-    async fn openapi_v2_proto_only_accept_returns_200_json() {
+    async fn openapi_v2_proto_only_accept_returns_200_proto() {
         let state = make_state();
         let app = Router::new()
             .route("/openapi/v2", get(openapi_v2))
@@ -3251,9 +3262,8 @@ mod tests {
         assert_eq!(
             resp.status(),
             axum::http::StatusCode::OK,
-            "proto-only Accept on /openapi/v2 must return 200 JSON — returning 406 causes \
-             kubectl to report 'unable to respond with a content type that the client \
-             supports', aborting resource validation and breaking kubectl create/apply"
+            "proto-only Accept on /openapi/v2 must return 200 — kubectl needs a valid \
+             response to proceed with resource validation"
         );
 
         let ct = resp
@@ -3262,19 +3272,29 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(
-            ct.starts_with("application/json"),
-            "Content-Type must be application/json for proto-only Accept; got: '{ct}'"
+            ct.contains("protobuf"),
+            "Content-Type must be the gnostic proto media type for proto-only Accept; \
+             kubectl gnostic-decodes the body regardless of Content-Type, but returning \
+             the correct Content-Type signals correct content negotiation; got: '{ct}'"
         );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
-        let val: serde_json::Value =
-            serde_json::from_slice(&body).expect("body must be valid JSON");
+        // The body must NOT be JSON — if it were, gnostic would produce
+        // "proto: cannot parse invalid wire-format data".
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&body).is_err(),
+            "proto-only Accept must not return JSON in the body; kubectl gnostic-decodes \
+             it unconditionally and JSON bytes are invalid wire-format proto"
+        );
+        // The body must start with a valid gnostic Document proto field tag.
+        // gnostic Document field 1 = swagger (string), wire type 2 (LEN) = 0x0a.
         assert_eq!(
-            val.get("swagger").and_then(|v| v.as_str()),
-            Some("2.0"),
-            "response must be a Swagger 2.0 document even when proto-only Accept is sent"
+            body.first().copied(),
+            Some(0x0a),
+            "gnostic Document must start with field-1 LEN tag (0x0a = field 1, wire type 2); \
+             any other first byte means the proto is malformed and kubectl will reject it"
         );
     }
 
