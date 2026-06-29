@@ -1774,7 +1774,9 @@ pub async fn patch_pod_resize<S: Store>(
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
 
+    let spec_before = current_obj.body["spec"].clone();
     current_obj.body = apply_resize_patch(&current_obj.body, &incoming);
+    increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
 
     let expected_rv = parse_resource_version(current_obj.resource_version())?;
     let new_rv = state
@@ -7387,6 +7389,67 @@ mod resize_tests {
         assert_eq!(
             result["spec"]["containers"][1]["resources"]["limits"]["cpu"], "50m",
             "sidecar container must be unchanged — resize only targets named containers"
+        );
+    }
+
+    /// resize that changes container resources must increment metadata.generation.
+    ///
+    /// Controllers and the kubelet use observedGeneration == generation to detect when they
+    /// have acted on the latest spec. If generation does not bump after a resize, controllers
+    /// will think the spec hasn't changed and silently skip applying the new resource limits.
+    #[test]
+    fn resize_that_changes_resources_bumps_generation() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "my-pod", "generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "resources": {"limits": {"cpu": "100m"}}}]
+            },
+            "status": {}
+        });
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "resources": {"limits": {"cpu": "200m"}}}]
+            }
+        });
+
+        let spec_before = stored["spec"].clone();
+        let mut result = apply_resize_patch(&stored, &incoming);
+        increment_pod_generation_if_spec_changed(&mut result, &spec_before);
+
+        assert_eq!(
+            result["metadata"]["generation"], 2i64,
+            "generation must increment after resize changes resources — \
+             controllers gate on observedGeneration==generation to detect spec changes"
+        );
+    }
+
+    /// resize that sends identical resources must NOT bump generation.
+    ///
+    /// A no-op resize (same values as already stored) should not advance generation —
+    /// doing so would cause spurious reconciliation loops in controllers.
+    #[test]
+    fn resize_with_identical_resources_does_not_bump_generation() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "my-pod", "generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "resources": {"limits": {"cpu": "100m"}}}]
+            },
+            "status": {}
+        });
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "resources": {"limits": {"cpu": "100m"}}}]
+            }
+        });
+
+        let spec_before = stored["spec"].clone();
+        let mut result = apply_resize_patch(&stored, &incoming);
+        increment_pod_generation_if_spec_changed(&mut result, &spec_before);
+
+        assert_eq!(
+            result["metadata"]["generation"], 1i64,
+            "generation must NOT change when resize sends identical resources — \
+             no-op resizes must not trigger spurious controller reconciliation"
         );
     }
 
