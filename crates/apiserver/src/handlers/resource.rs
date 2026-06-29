@@ -22,8 +22,8 @@ use crate::{
 use super::generic::{
     apply_delete_policy, apply_label_selector, build_list_response, check_clusterrole_escalation,
     check_crb_escalation, check_rb_escalation, decode_continue, lookup, parse_field_selector,
-    parse_label_selector, resolve_name, stamp_metadata, store_err, validate_name, CollectionQuery,
-    RBAC_GROUP,
+    parse_label_selector, resolve_name, stamp_metadata, store_err, validate_name,
+    validate_name_for_group, CollectionQuery, RBAC_GROUP,
 };
 use super::json_patch::{
     apply_field_validation, apply_json_patch, detect_patch_type, inject_managed_fields,
@@ -203,7 +203,7 @@ pub async fn get_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
-    validate_name("name", &name)?;
+    validate_name_for_group("name", &name, &group)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -351,7 +351,7 @@ pub async fn replace_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
+    validate_name_for_group("name", &name, &group)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -479,7 +479,7 @@ pub async fn delete_resource<S: Store>(
             "cannot delete bootstrap RBAC object {name}"
         )));
     }
-    validate_name("name", &name)?;
+    validate_name_for_group("name", &name, &group)?;
     let body = extract_body(&body, content_type(&headers));
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
@@ -854,7 +854,7 @@ pub async fn patch_resource<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    validate_name("name", &name)?;
+    validate_name_for_group("name", &name, &group)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -1064,7 +1064,7 @@ pub async fn get_namespaced_resource<S: Store>(
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
+    validate_name_for_group("name", &name, &group)?;
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1368,7 +1368,7 @@ pub async fn replace_namespaced_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
+    validate_name_for_group("name", &name, &group)?;
     let body = extract_body(&body, content_type(&headers));
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
@@ -1562,14 +1562,14 @@ pub async fn delete_namespaced_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    // Guard before validate_name("name") so colon-names in RBAC don't fail the charset check.
+    // Guard before validate_name_for_group so colon-names in RBAC don't fail the charset check.
     // Namespaced system: objects don't exist today but blocking them prevents future surprises.
     if is_seeded_rbac_object(&group, &name) {
         return Err(Status::forbidden(format!(
             "cannot delete bootstrap RBAC object {name}"
         )));
     }
-    validate_name("name", &name)?;
+    validate_name_for_group("name", &name, &group)?;
     let body = extract_body(&body, content_type(&headers));
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
@@ -1728,7 +1728,7 @@ pub async fn patch_namespaced_resource<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
-    validate_name("name", &name)?;
+    validate_name_for_group("name", &name, &group)?;
     let patch_type = detect_patch_type(&headers)?;
     let is_ssa = content_type(&headers).contains("apply-patch+yaml");
     let meta = match lookup(&state, &group, &version, &plural) {
@@ -7137,6 +7137,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         // Create two Services — allocation attaches a sentinel for each IP.
@@ -7248,6 +7249,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         })
     }
 
@@ -8613,6 +8615,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: Some(signing_key),
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         // Forge a properly signed token whose `t` (issued-at) is Unix epoch 0 — always expired.
@@ -8695,6 +8698,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: Some(signing_key),
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         // Token signed with a DIFFERENT key — HMAC verification fails.
@@ -8781,6 +8785,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: Some(signing_key),
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         // Forge a valid-signature token with Unix epoch timestamp so it is always expired.

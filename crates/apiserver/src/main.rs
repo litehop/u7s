@@ -165,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 7. Load or generate the SA signing key.
-    let (sa_encoding_key, sa_decoding_key) =
+    let (sa_encoding_key, sa_decoding_key, sa_public_key_pem) =
         match load_or_generate_sa_keys(&args.sa_key, &args.sa_pub) {
             Ok(sa_keys) => {
                 let enc = jsonwebtoken::EncodingKey::from_rsa_pem(&sa_keys.private_key_pem)
@@ -180,11 +180,11 @@ async fn main() -> anyhow::Result<()> {
                         e
                     })
                     .ok();
-                (enc, dec)
+                (enc, dec, Some(sa_keys.public_key_pem))
             }
             Err(e) => {
                 tracing::error!("SA key gen/load failed: {e}");
-                (None, None)
+                (None, None, None)
             }
         };
 
@@ -252,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
         kubelet_port: args.kubelet_port,
         continue_token_key: None, // fresh random key generated at startup
         konnectivity_proxy_addr: args.konnectivity_proxy_addr,
+        sa_public_key_pem,
     });
 
     // 10a. Populate RBAC index from persisted objects before serving.
@@ -345,6 +346,12 @@ fn build_router(state: AppState) -> Router {
         .route("/readyz", get(|| async { "ok" }))
         // Server version — no auth required (sonobuoy, kubectl version)
         .route("/version", get(handlers::discovery::version))
+        // OIDC SA issuer discovery — RBAC-gated via system:service-account-issuer-discovery ClusterRole
+        .route(
+            "/.well-known/openid-configuration",
+            get(handlers::oidc::openid_configuration),
+        )
+        .route("/openid/v1/jwks", get(handlers::oidc::jwks))
         // OpenAPI stubs — clients like Argo CD and kubectl call these on startup
         .route("/openapi/v2", get(handlers::discovery::openapi_v2))
         .route("/openapi/v3", get(handlers::discovery::openapi_v3))
@@ -1094,6 +1101,31 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         body,
         "system:service-account-issuer-discovery",
         "ClusterRole"
+    );
+
+    // ClusterRoleBinding: system:service-account-issuer-discovery → system:serviceaccounts.
+    // Grants every service account GET access to the OIDC discovery endpoints
+    // (/.well-known/openid-configuration and /openid/v1/jwks). Without this binding,
+    // pods cannot access these endpoints and the OIDC conformance test fails with 403.
+    // Matches upstream Kubernetes bootstrap policy.
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterrolebindings",
+        None,
+        "system:service-account-issuer-discovery",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:service-account-issuer-discovery", "uid": "00000000-0000-0000-0000-000000000067", "creationTimestamp": TS },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:serviceaccounts" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:service-account-issuer-discovery" }
+    });
+    put!(
+        key,
+        body,
+        "system:service-account-issuer-discovery",
+        "ClusterRoleBinding"
     );
 
     // -----------------------------------------------------------------------
@@ -5979,6 +6011,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         })
     }
 

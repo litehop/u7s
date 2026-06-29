@@ -1536,6 +1536,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -1628,6 +1629,7 @@ mod tests {
             kubelet_port: 10260,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         let node = serde_json::json!({
@@ -1850,6 +1852,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -2056,6 +2059,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -2440,6 +2444,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: Some("127.0.0.1:8132".to_owned()),
+            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -2541,6 +2546,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -2639,6 +2645,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({
@@ -2705,6 +2712,7 @@ mod tests {
             kubelet_port: 10250,
             continue_token_key: None,
             konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
         });
 
         let pod = serde_json::json!({

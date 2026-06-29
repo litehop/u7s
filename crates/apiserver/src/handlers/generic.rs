@@ -100,6 +100,39 @@ pub(crate) fn validate_name(label: &str, value: &str) -> Result<(), crate::statu
     Ok(())
 }
 
+/// Validate a resource name, allowing colons for RBAC resources.
+///
+/// RBAC resources (ClusterRole, ClusterRoleBinding, Role, RoleBinding) use
+/// colons in names by Kubernetes convention (e.g. `system:node`,
+/// `system:service-account-issuer-discovery`, or user-created bindings like
+/// `svcaccounts-5461-system:service-account-issuer-discovery`).
+/// For those resources, colons are allowed. All other name constraints apply.
+pub(crate) fn validate_name_for_group(
+    label: &str,
+    value: &str,
+    group: &str,
+) -> Result<(), crate::status::StatusError> {
+    if group == RBAC_GROUP && value.contains(':') {
+        // For RBAC names with colons, apply the same checks except the charset check.
+        // This allows `system:node` and `ns-system:role` while still rejecting
+        // path traversal and invalid length.
+        if value.is_empty() || value.len() > 253 {
+            return Err(Status::bad_request(format!(
+                "invalid {label} '{}': must be 1–253 characters",
+                value
+            )));
+        }
+        if value.contains('/') || value.contains("..") {
+            return Err(Status::bad_request(format!(
+                "invalid {label} '{}': must not contain '/' or '..'",
+                value
+            )));
+        }
+        return Ok(());
+    }
+    validate_name(label, value)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -1948,6 +1981,45 @@ mod resolve_name_tests {
         let err = validate_name("name", ".bar").expect_err("leading dot must be rejected");
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 400, "leading dot must return 400");
+    }
+
+    /// RBAC resources (ClusterRole, ClusterRoleBinding, Role, RoleBinding) use colons in
+    /// names by Kubernetes convention. Without allowing colons for the RBAC group, the
+    /// test framework cannot delete ClusterRoleBindings it creates (e.g.
+    /// `ns-system:service-account-issuer-discovery`) and the OIDC conformance test fails.
+    #[test]
+    fn validate_name_for_group_allows_colon_in_rbac_names() {
+        assert!(
+            validate_name_for_group("name", "system:node", RBAC_GROUP).is_ok(),
+            "system:node must be valid for RBAC group — colon is conventional in RBAC names"
+        );
+        assert!(
+            validate_name_for_group(
+                "name",
+                "svcaccounts-9027-system:service-account-issuer-discovery",
+                RBAC_GROUP
+            )
+            .is_ok(),
+            "user-created CRB name with embedded colon must be valid for RBAC — \
+             the OIDC conformance test creates and then deletes such bindings"
+        );
+        assert!(
+            validate_name_for_group("name", "system:node", "").is_err(),
+            "system:node must be REJECTED for non-RBAC groups — colons are only allowed in RBAC"
+        );
+    }
+
+    /// validate_name_for_group must still reject path traversal even for RBAC group.
+    #[test]
+    fn validate_name_for_group_rejects_path_traversal_in_rbac() {
+        assert!(
+            validate_name_for_group("name", "system:../../secrets", RBAC_GROUP).is_err(),
+            "path traversal via '..' must be rejected even for RBAC group"
+        );
+        assert!(
+            validate_name_for_group("name", "system:/secrets", RBAC_GROUP).is_err(),
+            "slash must be rejected even for RBAC group"
+        );
     }
 }
 
