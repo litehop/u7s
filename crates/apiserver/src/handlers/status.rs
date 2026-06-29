@@ -2332,4 +2332,215 @@ mod tests {
             "deletionTimestamp must survive PUT /namespaced/status"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // PVC status.conditions must be persisted via /status subresource (mayor-r83x)
+    // ---------------------------------------------------------------------------
+
+    /// PATCH /pvc/status with conditions must persist the conditions so they are
+    /// present on subsequent GET.
+    ///
+    /// The conformance spec '[sig-storage] PersistentVolumes CSI Conformance should
+    /// apply changes to a pv/pvc status [Conformance]' (storage/persistent_volumes.go:789)
+    /// patches PVC /status with a condition {type: "StatusUpdated"} and then reads it
+    /// back.  If the condition is not persisted, the test fails with
+    /// "got conditions=nil, expected StatusUpdated".
+    ///
+    /// This test fails if the merge_patch path in patch_namespaced_resource_status
+    /// does not propagate status.conditions to the stored object.
+    #[tokio::test]
+    async fn pvc_status_conditions_persisted_via_patch() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        // Seed a PVC with initial status.phase=Pending (as apply_defaults would set).
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "my-pvc",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "1Gi" } }
+            },
+            "status": { "phase": "Pending" }
+        });
+        let key = "/registry/persistentvolumeclaims/default/my-pvc";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // PATCH /pvc/status with a CSI condition.
+        let patch = serde_json::json!({
+            "status": {
+                "conditions": [
+                    {
+                        "type": "StatusUpdated",
+                        "status": "True",
+                        "reason": "CSITest",
+                        "message": "applied by conformance test"
+                    }
+                ]
+            }
+        });
+
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "my-pvc".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "PATCH /pvc/status must succeed — got: {:?}",
+            result.err()
+        );
+
+        // Verify the conditions are now stored.
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        let conditions = v["status"]["conditions"].as_array().expect(
+            "status.conditions must be an array after PATCH /pvc/status — \
+                 the conformance test '[sig-storage] PersistentVolumes CSI Conformance should \
+                 apply changes to a pv/pvc status' checks conditions != nil after the patch; \
+                 nil conditions means the PATCH did not persist",
+        );
+        assert_eq!(
+            conditions.len(),
+            1,
+            "exactly one condition must be stored after PATCH"
+        );
+        assert_eq!(
+            conditions[0]["type"], "StatusUpdated",
+            "condition type must be StatusUpdated — if this fails, patch_namespaced_resource_status \
+             is not merging status.conditions into the stored PVC object"
+        );
+
+        // The original phase must still be present (merge-patch preserves existing keys).
+        assert_eq!(
+            v["status"]["phase"], "Pending",
+            "status.phase must survive the PATCH — merge-patch must not wipe existing status keys"
+        );
+
+        // Spec must be untouched.
+        assert_eq!(
+            v["spec"]["accessModes"][0], "ReadWriteOnce",
+            "spec must be unchanged after PATCH /pvc/status"
+        );
+    }
+
+    /// PUT /pvc/status with conditions replaces status and conditions are readable.
+    ///
+    /// The CSI provisioner may use PUT instead of PATCH to set PVC status conditions.
+    /// If PUT /pvc/status doesn't persist conditions, CSI provisioning status is invisible.
+    ///
+    /// This test fails if put_namespaced_resource_status does not replace the status
+    /// field with the incoming value when that value contains conditions.
+    #[tokio::test]
+    async fn pvc_status_conditions_persisted_via_put() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+
+        let pvc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": "put-pvc",
+                "namespace": "default",
+                "resourceVersion": "1"
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": { "requests": { "storage": "2Gi" } }
+            },
+            "status": { "phase": "Pending" }
+        });
+        let key = "/registry/persistentvolumeclaims/default/put-pvc";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pvc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // PUT /pvc/status with phase=Bound and conditions.
+        let put_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": { "name": "put-pvc", "namespace": "default" },
+            "status": {
+                "phase": "Bound",
+                "conditions": [
+                    { "type": "StatusUpdated", "status": "True" }
+                ]
+            }
+        });
+
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                "default".into(),
+                "persistentvolumeclaims".into(),
+                "put-pvc".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "PUT /pvc/status must succeed — got: {:?}",
+            result.err()
+        );
+
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["status"]["phase"], "Bound",
+            "status.phase must be Bound after PUT /pvc/status"
+        );
+        let conditions = v["status"]["conditions"].as_array().expect(
+            "status.conditions must be present after PUT /pvc/status — \
+             if nil, the PUT did not replace status with the incoming value",
+        );
+        assert_eq!(
+            conditions[0]["type"], "StatusUpdated",
+            "condition type must be StatusUpdated after PUT /pvc/status"
+        );
+    }
 }
