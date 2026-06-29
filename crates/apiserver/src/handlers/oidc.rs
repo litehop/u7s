@@ -34,10 +34,12 @@ pub const SA_ISSUER: &str = "https://kubernetes.default.svc";
 ///
 /// Correctness: `issuer` must equal the `iss` in minted SA tokens exactly,
 /// otherwise OIDC verifiers will reject tokens as being from the wrong issuer.
-pub async fn openid_configuration<S: Store>(State(state): State<AppState<S>>) -> impl IntoResponse {
-    // jwks_uri is the absolute URL to our JWKS endpoint, using the advertised
-    // server address so in-cluster clients can reach it.
-    let jwks_uri = format!("{}/openid/v1/jwks", state.server_address);
+pub async fn openid_configuration<S: Store>(_state: State<AppState<S>>) -> impl IntoResponse {
+    // jwks_uri must use the issuer base URL (SA_ISSUER = "https://kubernetes.default.svc")
+    // so that pods can reach it via in-cluster DNS. Using the external server address
+    // (e.g. https://127.0.0.1:6445) would make the JWKS endpoint unreachable from pods,
+    // causing OIDC token validation to fail inside the cluster.
+    let jwks_uri = format!("{}/openid/v1/jwks", SA_ISSUER);
 
     Json(serde_json::json!({
         "issuer": SA_ISSUER,
@@ -244,6 +246,20 @@ mod tests {
             SA_ISSUER, "https://kubernetes.default.svc",
             "SA_ISSUER must exactly match the iss claim in SA tokens — \
              if they differ, all SA tokens are rejected by OIDC verifiers"
+        );
+    }
+
+    /// The discovery document's jwks_uri must use the in-cluster issuer URL, not the
+    /// external server address. Pods fetch the JWKS via in-cluster DNS
+    /// (kubernetes.default.svc); using the host-external address (e.g. 127.0.0.1:6445)
+    /// makes the JWKS unreachable from within the cluster and breaks OIDC validation.
+    #[test]
+    fn openid_configuration_jwks_uri_uses_in_cluster_issuer() {
+        let expected_jwks_uri = format!("{}/openid/v1/jwks", SA_ISSUER);
+        assert_eq!(
+            expected_jwks_uri, "https://kubernetes.default.svc/openid/v1/jwks",
+            "jwks_uri must use the in-cluster SA issuer URL so pods can reach the JWKS endpoint — \
+             a host-external address breaks OIDC token validation inside the cluster"
         );
     }
 

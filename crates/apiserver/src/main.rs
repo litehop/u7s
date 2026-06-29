@@ -1103,6 +1103,31 @@ async fn seed_rbac(store: &SqliteStore) -> anyhow::Result<()> {
         "ClusterRole"
     );
 
+    // ClusterRoleBinding: system:service-account-issuer-discovery → system:serviceaccounts.
+    // Grants every service account GET access to the OIDC discovery endpoints
+    // (/.well-known/openid-configuration and /openid/v1/jwks). Without this binding,
+    // pods cannot access these endpoints and the OIDC conformance test fails with 403.
+    // Matches upstream Kubernetes bootstrap policy.
+    let key = keys::group_object_key(
+        GROUP,
+        "clusterrolebindings",
+        None,
+        "system:service-account-issuer-discovery",
+    );
+    let body = serde_json::json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding",
+        "metadata": { "name": "system:service-account-issuer-discovery", "uid": "00000000-0000-0000-0000-000000000067", "creationTimestamp": TS },
+        "subjects": [{ "kind": "Group", "apiGroup": "rbac.authorization.k8s.io", "name": "system:serviceaccounts" }],
+        "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:service-account-issuer-discovery" }
+    });
+    put!(
+        key,
+        body,
+        "system:service-account-issuer-discovery",
+        "ClusterRoleBinding"
+    );
+
     // -----------------------------------------------------------------------
     // ClusterRole: admin — namespace-scoped admin (aggregate-to-admin).
     // -----------------------------------------------------------------------
