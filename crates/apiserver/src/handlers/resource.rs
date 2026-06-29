@@ -489,9 +489,16 @@ pub async fn delete_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
-            return super::cr::delete_cr(State(state), Path((group, version, plural, name)))
-                .await
-                .map(IntoResponse::into_response);
+            // body is already extracted (proto-decoded if needed). Pass empty headers so
+            // delete_cr's extract_body call treats it as plain JSON (no re-decode).
+            return super::cr::delete_cr(
+                State(state),
+                Path((group, version, plural, name)),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .map(IntoResponse::into_response);
         }
     };
 
@@ -1588,9 +1595,13 @@ pub async fn delete_namespaced_resource<S: Store>(
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
+            // body is already extracted (proto-decoded if needed). Pass empty headers so
+            // delete_cr_namespaced's extract_body call treats it as plain JSON (no re-decode).
             return super::cr::delete_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
+                HeaderMap::new(),
+                body,
             )
             .await
             .map(IntoResponse::into_response);

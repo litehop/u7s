@@ -16,7 +16,8 @@ use crate::{
     keys::cluster_object_key,
     state::AppState,
     status::Status,
-    util::{extract_body, parse_resource_version, utc_now_rfc3339},
+    types::{DeleteOptions, Object},
+    util::{content_type, extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
 const CRD_LIST_PREFIX: &str = "/registry/apiextensions.k8s.io/customresourcedefinitions/";
@@ -335,6 +336,11 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     let api_version = format!("{group}/{version}");
     obj["apiVersion"] = serde_json::Value::String(api_version);
     obj["kind"] = serde_json::Value::String(kind.to_string());
+    // Save ownerReferences before the ObjectMeta round-trip: ObjectMeta serde only
+    // knows declared fields, so ownerReferences is silently dropped by from_value/to_value.
+    // Restore it after so CR dependents created with ownerReferences survive intact and
+    // cascade_delete_cr_dependents can find them by ownerReference.uid.
+    let saved_owner_refs = obj["metadata"]["ownerReferences"].clone();
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
@@ -349,6 +355,9 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
         meta.creation_timestamp = Some(utc_now_rfc3339());
     }
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
+    if !saved_owner_refs.is_null() {
+        obj["metadata"]["ownerReferences"] = saved_owner_refs;
+    }
 }
 
 fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
@@ -813,9 +822,101 @@ pub async fn replace_cr<S: Store>(
     Ok(Json(obj))
 }
 
+/// Scan all CRD-backed object storage and cascade-delete (or orphan-strip) dependents
+/// of the deleted owner identified by `owner_uid`.
+///
+/// Strategy:
+/// - Background / no explicit policy → hard-delete all matching dependents, then recurse.
+/// - Orphan → strip the matching ownerReference entry and keep the object alive.
+///
+/// All CRD instances are stored under `/registry/cr/`, so a single prefix scan finds
+/// every CR regardless of group, version, or scope. We recurse to handle ownership chains
+/// (owner → dependent → grand-dependent). Without recursion, orphaned intermediate nodes
+/// would be left behind, leaking resources and failing the GC conformance chain test.
+async fn cascade_delete_cr_dependents<S: Store>(
+    state: &AppState<S>,
+    owner_uid: &str,
+    orphan: bool,
+) {
+    const CR_ALL_PREFIX: &str = "/registry/cr/";
+
+    let resp = match state
+        .store
+        .list(CR_ALL_PREFIX, ListOptions::default())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("cascade_delete_cr: list all CRs failed: {e}");
+            return;
+        }
+    };
+
+    for item in resp.items {
+        let obj: serde_json::Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Check whether this object is owned by `owner_uid`.
+        let owns = obj["metadata"]["ownerReferences"]
+            .as_array()
+            .map(|refs| refs.iter().any(|r| r["uid"].as_str() == Some(owner_uid)))
+            .unwrap_or(false);
+
+        if !owns {
+            continue;
+        }
+
+        let child_key = item.key.clone();
+        let child_uid = obj["metadata"]["uid"].as_str().unwrap_or("").to_string();
+
+        if orphan {
+            // Strip the ownerReference pointing to our owner. Keep other entries.
+            let mut child = obj;
+            let refs = child["metadata"]["ownerReferences"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let filtered: Vec<serde_json::Value> = refs
+                .into_iter()
+                .filter(|r| r["uid"].as_str() != Some(owner_uid))
+                .collect();
+            if filtered.is_empty() {
+                child["metadata"]
+                    .as_object_mut()
+                    .map(|m| m.remove("ownerReferences"));
+            } else {
+                child["metadata"]["ownerReferences"] = serde_json::Value::Array(filtered);
+            }
+            let updated = match serde_json::to_vec(&child) {
+                Ok(b) => bytes::Bytes::from(b),
+                Err(e) => {
+                    tracing::warn!("cascade_delete_cr: serialize {child_key}: {e}");
+                    continue;
+                }
+            };
+            if let Err(e) = state.store.put(&child_key, updated, None).await {
+                tracing::warn!("cascade_delete_cr: strip ownerRef {child_key}: {e}");
+            }
+        } else {
+            // Background cascade: delete the dependent then recurse for its own dependents.
+            if let Err(e) = state.store.delete(&child_key, None).await {
+                tracing::warn!("cascade_delete_cr: delete {child_key}: {e}");
+            }
+            // Recurse: this child may itself own other CRs.
+            if !child_uid.is_empty() {
+                Box::pin(cascade_delete_cr_dependents(state, &child_uid, false)).await;
+            }
+        }
+    }
+}
+
 pub async fn delete_cr<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -825,12 +926,41 @@ pub async fn delete_cr<S: Store>(
 
     let key = cr_store_key(&group, &version, &plural, None, &name);
 
-    let _ = state
+    let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+
+    // Parse DeleteOptions from the request body (same pattern as built-in delete handlers).
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
+
+    // apply_delete_policy: if the CR has finalizers, stamp deletionTimestamp and soft-delete.
+    if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut obj) {
+        let expected_rv = parse_resource_version(obj.resource_version())?;
+        let new_rv = state
+            .store
+            .put(&key, obj.to_bytes(), expected_rv)
+            .await
+            .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        let mut resp_body = Object { body: soft };
+        resp_body.set_resource_version(new_rv);
+        return Ok(Json(resp_body.body).into_response());
+    }
+
+    let owner_uid = obj.body["metadata"]["uid"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
 
     state
         .store
@@ -838,12 +968,19 @@ pub async fn delete_cr<S: Store>(
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
+    // Cascade or orphan dependents after the owner is deleted.
+    if !owner_uid.is_empty() {
+        let orphan = delete_opts.is_orphan();
+        cascade_delete_cr_dependents(&state, &owner_uid, orphan).await;
+    }
+
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
         "status": "Success",
         "code": 200
-    })))
+    }))
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,6 +1354,8 @@ pub async fn replace_cr_namespaced<S: Store>(
 pub async fn delete_cr_namespaced<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -1226,12 +1365,41 @@ pub async fn delete_cr_namespaced<S: Store>(
 
     let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
 
-    let _ = state
+    let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+
+    // Parse DeleteOptions from the request body (same pattern as built-in delete handlers).
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
+
+    let mut obj = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
+
+    // apply_delete_policy: if the CR has finalizers, stamp deletionTimestamp and soft-delete.
+    if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut obj) {
+        let expected_rv = parse_resource_version(obj.resource_version())?;
+        let new_rv = state
+            .store
+            .put(&key, obj.to_bytes(), expected_rv)
+            .await
+            .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        let mut resp_body = Object { body: soft };
+        resp_body.set_resource_version(new_rv);
+        return Ok(Json(resp_body.body).into_response());
+    }
+
+    let owner_uid = obj.body["metadata"]["uid"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
 
     state
         .store
@@ -1239,12 +1407,19 @@ pub async fn delete_cr_namespaced<S: Store>(
         .await
         .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
 
+    // Cascade or orphan dependents after the owner is deleted.
+    if !owner_uid.is_empty() {
+        let orphan = delete_opts.is_orphan();
+        cascade_delete_cr_dependents(&state, &owner_uid, orphan).await;
+    }
+
     Ok(Json(serde_json::json!({
         "kind": "Status",
         "apiVersion": "v1",
         "status": "Success",
         "code": 200
-    })))
+    }))
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -2148,6 +2323,8 @@ mod tests {
                     plural.clone(),
                     name.clone()
                 )),
+                axum::http::HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -3898,6 +4075,8 @@ mod tests {
             delete_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                axum::http::HeaderMap::new(),
+                Bytes::new(),
             )
             .await
             .is_ok(),
@@ -3929,6 +4108,8 @@ mod tests {
                     "widgets".to_string(),
                     "nonexistent".to_string(),
                 )),
+                axum::http::HeaderMap::new(),
+                Bytes::new(),
             )
             .await,
             "delete on missing object must return 404",
@@ -3954,6 +4135,8 @@ mod tests {
                     "applications".to_string(),
                     "my-app".to_string(),
                 )),
+                axum::http::HeaderMap::new(),
+                Bytes::new(),
             )
             .await,
             "namespaced CRD on cluster-scoped delete must return 404",
@@ -6779,5 +6962,650 @@ mod tests {
             "deletionTimestamp must survive PUT /cr/status"
         );
         assert_eq!(after_obj["status"]["ready"], true, "status must be updated");
+    }
+
+    // ---------------------------------------------------------------------------
+    // CR cascade-delete and apply_delete_policy tests (Rule 14: regressable)
+    //
+    // These tests encode GC conformance requirements:
+    // - Deleting a CR owner (Background) must cascade to dependents so GC conformance
+    //   spec 'should support cascading deletion of custom resources' does not leak CRs.
+    // - Orphan delete must strip ownerRefs instead of deleting, so orphaned CRs survive.
+    // - A CR with finalizers must be soft-deleted (deletionTimestamp set), not hard-deleted.
+    // - Ownership chains (owner→dependent→grand-dependent) must all be reclaimed.
+    // ---------------------------------------------------------------------------
+
+    /// Deleting a cluster-scoped CR owner without specifying a policy (default = cascade)
+    /// must delete its dependent CRs. Without this, GC conformance spec
+    /// 'should support cascading deletion of custom resources' fails — the dependent
+    /// CR is never removed and the test times out waiting for it to disappear.
+    #[tokio::test]
+    async fn delete_cr_owner_cascades_to_dependent_or_gc_conformance_fails() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        // Create owner widget.
+        let owner_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "owner-widget" },
+                "spec": {}
+            })
+            .to_string(),
+        );
+        create_cr(
+            State(state.clone()),
+            Path((group.to_string(), version.to_string(), plural.to_string())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            owner_body,
+        )
+        .await
+        .expect("create owner CR");
+
+        // Read back the owner to get its UID.
+        let owner_stored = state
+            .store
+            .get(&cr_store_key(group, version, plural, None, "owner-widget"))
+            .await
+            .unwrap()
+            .unwrap();
+        let owner_obj: serde_json::Value = serde_json::from_slice(&owner_stored.value).unwrap();
+        let owner_uid = owner_obj["metadata"]["uid"].as_str().unwrap().to_string();
+        assert!(!owner_uid.is_empty(), "owner must have a UID");
+
+        // Seed a dependent CR directly (with ownerReference → owner).
+        let dependent_key = cr_store_key(group, version, plural, None, "dep-widget");
+        let dependent_body = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "dep-widget",
+                "uid": "dep-uid-1",
+                "ownerReferences": [{
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "name": "owner-widget",
+                    "uid": owner_uid,
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &dependent_key,
+                Bytes::from(serde_json::to_vec(&dependent_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("seed dependent CR");
+
+        // Delete the owner with default (no) propagation policy.
+        delete_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "owner-widget".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete owner CR");
+
+        // Owner must be gone.
+        let owner_after = state
+            .store
+            .get(&cr_store_key(group, version, plural, None, "owner-widget"))
+            .await
+            .unwrap();
+        assert!(
+            owner_after.is_none(),
+            "owner CR must be deleted — if not, cascading delete is broken"
+        );
+
+        // Dependent must be gone (cascade).
+        let dep_after = state.store.get(&dependent_key).await.unwrap();
+        assert!(
+            dep_after.is_none(),
+            "deleting a CR owner must cascade to dependents or GC conformance fails / orphaned CRs leak"
+        );
+    }
+
+    /// Deleting a namespaced CR owner must cascade to its namespaced dependents.
+    /// Symmetric to the cluster-scoped test; without this, namespaced CRs owned
+    /// by a deleted namespaced CR are never reclaimed.
+    #[tokio::test]
+    async fn delete_cr_namespaced_owner_cascades_to_dependent() {
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io";
+        let version = "v1alpha1";
+        let plural = "applications";
+        let ns = "argocd";
+
+        // Create owner app.
+        create_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            app_body("owner-app", ns),
+        )
+        .await
+        .expect("create owner app");
+
+        let owner_stored = state
+            .store
+            .get(&cr_store_key(group, version, plural, Some(ns), "owner-app"))
+            .await
+            .unwrap()
+            .unwrap();
+        let owner_obj: serde_json::Value = serde_json::from_slice(&owner_stored.value).unwrap();
+        let owner_uid = owner_obj["metadata"]["uid"].as_str().unwrap().to_string();
+
+        // Seed dependent app.
+        let dep_key = cr_store_key(group, version, plural, Some(ns), "dep-app");
+        let dep_body = serde_json::json!({
+            "apiVersion": "argoproj.io/v1alpha1",
+            "kind": "Application",
+            "metadata": {
+                "name": "dep-app",
+                "namespace": ns,
+                "uid": "dep-app-uid",
+                "ownerReferences": [{
+                    "apiVersion": "argoproj.io/v1alpha1",
+                    "kind": "Application",
+                    "name": "owner-app",
+                    "uid": owner_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &dep_key,
+                Bytes::from(serde_json::to_vec(&dep_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .expect("seed dependent app");
+
+        // Delete the owner.
+        delete_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                ns.to_string(),
+                plural.to_string(),
+                "owner-app".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete owner app");
+
+        let dep_after = state.store.get(&dep_key).await.unwrap();
+        assert!(
+            dep_after.is_none(),
+            "deleting a namespaced CR owner must cascade to dependents — orphaned CRs leak otherwise"
+        );
+    }
+
+    /// Deleting a CR owner with Orphan propagationPolicy must leave the dependent alive
+    /// with its ownerReference stripped. Without this, an Orphan delete would accidentally
+    /// cascade and the GC orphan conformance spec would fail.
+    #[tokio::test]
+    async fn delete_cr_with_orphan_policy_strips_owner_ref_not_cascade() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        // Create owner.
+        let owner_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "orphan-owner" },
+                "spec": {}
+            })
+            .to_string(),
+        );
+        create_cr(
+            State(state.clone()),
+            Path((group.to_string(), version.to_string(), plural.to_string())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            owner_body,
+        )
+        .await
+        .expect("create owner CR");
+
+        let owner_stored = state
+            .store
+            .get(&cr_store_key(group, version, plural, None, "orphan-owner"))
+            .await
+            .unwrap()
+            .unwrap();
+        let owner_uid = serde_json::from_slice::<serde_json::Value>(&owner_stored.value).unwrap()
+            ["metadata"]["uid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Seed dependent.
+        let dep_key = cr_store_key(group, version, plural, None, "orphan-dep");
+        let dep_body = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "orphan-dep",
+                "uid": "orphan-dep-uid",
+                "ownerReferences": [{
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "name": "orphan-owner",
+                    "uid": owner_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &dep_key,
+                Bytes::from(serde_json::to_vec(&dep_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        // Delete owner with Orphan policy.
+        let orphan_opts = Bytes::from(
+            serde_json::json!({
+                "kind": "DeleteOptions",
+                "apiVersion": "v1",
+                "propagationPolicy": "Orphan"
+            })
+            .to_string(),
+        );
+        delete_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "orphan-owner".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            orphan_opts,
+        )
+        .await
+        .expect("orphan delete must succeed");
+
+        // Dependent must still exist (not cascade-deleted).
+        let dep_after = state.store.get(&dep_key).await.unwrap().expect(
+            "orphan delete of CR owner must leave dependent alive — cascade would be wrong",
+        );
+
+        // The ownerReference to the deleted owner must be stripped.
+        let dep_obj: serde_json::Value = serde_json::from_slice(&dep_after.value).unwrap();
+        let refs = dep_obj["metadata"]["ownerReferences"].as_array();
+        let still_has_ref = refs.map(|r| {
+            r.iter()
+                .any(|entry| entry["uid"].as_str() == Some(&owner_uid))
+        });
+        assert!(
+            still_has_ref != Some(true),
+            "orphan delete must strip the ownerReference from the dependent so GC does not re-collect it"
+        );
+    }
+
+    /// Deleting a CR with finalizers must soft-delete (stamp deletionTimestamp) rather than
+    /// hard-delete. Without this, finalizer-based lifecycle hooks (e.g. cleanup controllers)
+    /// never run and resources leak. The object must remain in the store.
+    #[tokio::test]
+    async fn delete_cr_with_finalizer_soft_deletes_not_hard_deletes() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        // Seed a CR with a finalizer directly (bypassing create handler which stamps UID).
+        let key = cr_store_key(group, version, plural, None, "finalizer-widget");
+        let cr_body = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "finalizer-widget",
+                "uid": "fin-uid-1",
+                "resourceVersion": "1",
+                "finalizers": ["example.io/protect"]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &key,
+                Bytes::from(serde_json::to_vec(&cr_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        delete_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "finalizer-widget".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete with finalizer must succeed (soft-delete)");
+
+        // Object must still exist (soft-deleted, not hard-deleted).
+        let after = state
+            .store
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("CR with finalizer must still exist after delete — hard delete ignores finalizers and breaks lifecycle hooks");
+
+        let obj: serde_json::Value = serde_json::from_slice(&after.value).unwrap();
+        assert!(
+            !obj["metadata"]["deletionTimestamp"].is_null()
+                && obj["metadata"]["deletionTimestamp"].as_str().is_some(),
+            "soft-deleted CR must have deletionTimestamp set so finalizer controllers know to run cleanup"
+        );
+    }
+
+    /// Deleting a CR owner must cascade transitively through ownership chains.
+    /// owner → dependent → grand-dependent: all three must be deleted.
+    /// Without transitive cascade, intermediate nodes survive and leak,
+    /// violating GC semantics for CR ownership chains.
+    #[tokio::test]
+    async fn delete_cr_owner_cascades_transitively_through_ownership_chain() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        // Create owner.
+        let owner_raw = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "chain-owner" },
+                "spec": {}
+            })
+            .to_string(),
+        );
+        create_cr(
+            State(state.clone()),
+            Path((group.to_string(), version.to_string(), plural.to_string())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            owner_raw,
+        )
+        .await
+        .unwrap();
+        let owner_uid = {
+            let s = state
+                .store
+                .get(&cr_store_key(group, version, plural, None, "chain-owner"))
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&s.value).unwrap()["metadata"]["uid"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Seed intermediate dependent owned by owner.
+        let dep_key = cr_store_key(group, version, plural, None, "chain-dep");
+        let dep_uid = "chain-dep-uid";
+        let dep_body = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "chain-dep",
+                "uid": dep_uid,
+                "ownerReferences": [{
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "name": "chain-owner",
+                    "uid": owner_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &dep_key,
+                Bytes::from(serde_json::to_vec(&dep_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        // Seed grand-dependent owned by dep.
+        let grand_key = cr_store_key(group, version, plural, None, "chain-grand");
+        let grand_body = serde_json::json!({
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "chain-grand",
+                "uid": "chain-grand-uid",
+                "ownerReferences": [{
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "name": "chain-dep",
+                    "uid": dep_uid,
+                    "controller": true
+                }]
+            },
+            "spec": {}
+        });
+        state
+            .store
+            .put(
+                &grand_key,
+                Bytes::from(serde_json::to_vec(&grand_body).unwrap()),
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        // Delete chain owner.
+        delete_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "chain-owner".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .unwrap();
+
+        let dep_after = state.store.get(&dep_key).await.unwrap();
+        assert!(
+            dep_after.is_none(),
+            "intermediate dependent must be cascade-deleted when owner is deleted"
+        );
+
+        let grand_after = state.store.get(&grand_key).await.unwrap();
+        assert!(
+            grand_after.is_none(),
+            "grand-dependent must be transitively cascade-deleted — non-recursive cascade leaves intermediate nodes and leaks CRs"
+        );
+    }
+
+    /// Creating a CR via the API with ownerReferences in metadata must preserve those
+    /// references in storage. stamp_cr_fields rounds-trips metadata through ObjectMeta
+    /// (which lacks ownerReferences), so without an explicit save+restore the ownerRefs
+    /// are silently dropped — cascade_delete_cr_dependents then can't find dependents and
+    /// GC conformance 'should support cascading deletion of custom resources' fails.
+    #[tokio::test]
+    async fn create_cr_via_api_preserves_owner_references() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        // Create owner first to get a UID.
+        create_cr(
+            State(state.clone()),
+            Path((group.to_string(), version.to_string(), plural.to_string())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "metadata": { "name": "ownerref-owner" },
+                    "spec": {}
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("create owner");
+
+        let owner_uid = {
+            let s = state
+                .store
+                .get(&cr_store_key(
+                    group,
+                    version,
+                    plural,
+                    None,
+                    "ownerref-owner",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&s.value).unwrap()["metadata"]["uid"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Create dependent with ownerReference via the create_cr API handler.
+        create_cr(
+            State(state.clone()),
+            Path((group.to_string(), version.to_string(), plural.to_string())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "metadata": {
+                        "name": "ownerref-dep",
+                        "ownerReferences": [{
+                            "apiVersion": "example.io/v1",
+                            "kind": "Widget",
+                            "name": "ownerref-owner",
+                            "uid": owner_uid,
+                            "controller": true,
+                            "blockOwnerDeletion": true
+                        }]
+                    },
+                    "spec": {}
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("create dependent");
+
+        // Read back the dependent and verify ownerReferences survived the create round-trip.
+        let dep_stored = state
+            .store
+            .get(&cr_store_key(group, version, plural, None, "ownerref-dep"))
+            .await
+            .unwrap()
+            .unwrap();
+        let dep_obj: serde_json::Value = serde_json::from_slice(&dep_stored.value).unwrap();
+        let refs = dep_obj["metadata"]["ownerReferences"].as_array();
+        assert!(
+            refs.is_some() && !refs.unwrap().is_empty(),
+            "ownerReferences must be preserved through create_cr — stamp_cr_fields \
+             rounds-trips metadata through ObjectMeta which drops unknown fields; \
+             without explicit save+restore, cascade cannot find dependents and GC conformance fails"
+        );
+        assert_eq!(
+            refs.unwrap()[0]["uid"].as_str(),
+            Some(owner_uid.as_str()),
+            "the ownerReference uid must match the owner's uid"
+        );
+
+        // Delete owner — cascade must find the API-created dependent and delete it.
+        delete_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "ownerref-owner".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete owner");
+
+        let dep_after = state
+            .store
+            .get(&cr_store_key(group, version, plural, None, "ownerref-dep"))
+            .await
+            .unwrap();
+        assert!(
+            dep_after.is_none(),
+            "cascade must delete a dependent that was created via the API with ownerReferences — \
+             if ownerRefs were dropped by create, cascade has nothing to match and the dependent leaks"
+        );
     }
 }
