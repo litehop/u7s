@@ -2201,6 +2201,50 @@ struct PersistentVolumeClaimSpec {
     volume_mode: String,
 }
 
+/// PersistentVolumeClaimCondition — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message PersistentVolumeClaimCondition
+/// Fields: type(1), status(2), lastProbeTime(3), lastTransitionTime(4), reason(5), message(6)
+#[derive(Clone, PartialEq, Message)]
+struct PersistentVolumeClaimCondition {
+    /// type (field 1, string)
+    #[prost(string, tag = "1")]
+    r#type: String,
+    /// status (field 2, string — ConditionStatus: "True"/"False"/"Unknown")
+    #[prost(string, tag = "2")]
+    status: String,
+    /// lastProbeTime (field 3, Time) — decoded as raw bytes, not serialized
+    #[prost(bytes = "vec", tag = "3")]
+    last_probe_time: Vec<u8>,
+    /// lastTransitionTime (field 4, Time) — decoded as raw bytes, not serialized
+    #[prost(bytes = "vec", tag = "4")]
+    last_transition_time: Vec<u8>,
+    /// reason (field 5, string)
+    #[prost(string, tag = "5")]
+    reason: String,
+    /// message (field 6, string)
+    #[prost(string, tag = "6")]
+    message: String,
+}
+
+/// PersistentVolumeClaimStatus — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message PersistentVolumeClaimStatus
+/// Fields: phase(1), accessModes(2), capacity(3), conditions(4), ...
+#[derive(Clone, PartialEq, Message)]
+struct PersistentVolumeClaimStatus {
+    /// phase (field 1, string — PersistentVolumeClaimPhase)
+    #[prost(string, tag = "1")]
+    phase: String,
+    /// accessModes (field 2, repeated string) — not typically set on status writes
+    #[prost(string, repeated, tag = "2")]
+    access_modes: Vec<String>,
+    /// capacity (field 3, ResourceList = map<string, Quantity>) — skip (complex)
+    #[prost(bytes = "vec", tag = "3")]
+    capacity: Vec<u8>,
+    /// conditions (field 4, repeated PersistentVolumeClaimCondition)
+    #[prost(message, repeated, tag = "4")]
+    conditions: Vec<PersistentVolumeClaimCondition>,
+}
+
 /// PersistentVolumeClaim — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message PersistentVolumeClaim
 #[derive(Clone, PartialEq, Message)]
@@ -2211,6 +2255,9 @@ struct PersistentVolumeClaim {
     /// spec (field 2, message PersistentVolumeClaimSpec)
     #[prost(message, optional, tag = "2")]
     spec: Option<PersistentVolumeClaimSpec>,
+    /// status (field 3, message PersistentVolumeClaimStatus)
+    #[prost(message, optional, tag = "3")]
+    status: Option<PersistentVolumeClaimStatus>,
 }
 
 /// EndpointAddress — k8s.io/api/core/v1/generated.proto
@@ -5055,6 +5102,43 @@ pub fn decode_persistentvolumeclaim_proto(data: &[u8]) -> Option<serde_json::Val
             .unwrap_or(false)
         {
             result["spec"] = spec_json;
+        }
+    }
+    // Decode status — CSI provisioners and PV controllers send proto-encoded PUT /pvc/status
+    // bodies to set phase and conditions.  Without decoding status here, the put_resource_status
+    // handler receives an incoming object with status=null and removes status from the stored
+    // PVC, causing conditions written by controllers to disappear on read-back.
+    if let Some(status) = obj.status {
+        let mut status_json = serde_json::json!({});
+        if !status.phase.is_empty() {
+            status_json["phase"] = serde_json::Value::String(status.phase);
+        }
+        if !status.conditions.is_empty() {
+            let conditions: Vec<serde_json::Value> = status
+                .conditions
+                .into_iter()
+                .map(|c| {
+                    let mut cond = serde_json::json!({
+                        "type": c.r#type,
+                        "status": c.status
+                    });
+                    if !c.reason.is_empty() {
+                        cond["reason"] = serde_json::Value::String(c.reason);
+                    }
+                    if !c.message.is_empty() {
+                        cond["message"] = serde_json::Value::String(c.message);
+                    }
+                    cond
+                })
+                .collect();
+            status_json["conditions"] = serde_json::Value::Array(conditions);
+        }
+        if status_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            result["status"] = status_json;
         }
     }
     Some(result)
@@ -14976,6 +15060,7 @@ mod tests {
                 }),
                 ..Default::default()
             }),
+            status: None,
         };
 
         let mut buf = Vec::new();
@@ -15010,6 +15095,84 @@ mod tests {
             result["spec"]["resources"]["requests"]["storage"], "1Gi",
             "spec.resources.requests.storage must survive proto decode — without it the PV \
              controller cannot determine the required volume size"
+        );
+    }
+
+    /// decode_persistentvolumeclaim_proto must preserve status.conditions from a proto
+    /// /status write body.
+    ///
+    /// The CSI external-provisioner may send proto-encoded PUT /pvc/status bodies with
+    /// status.conditions to report binding state.  Without decoding status (field 3), the
+    /// put_resource_status handler receives an incoming object where status is null, and then
+    /// REMOVES status from the stored PVC (its null-status branch), causing conditions written
+    /// by the controller to disappear on read-back.
+    ///
+    /// The conformance spec '[sig-storage] PersistentVolumes CSI Conformance should apply
+    /// changes to a pv/pvc status' fails with "got conditions=nil, expected StatusUpdated"
+    /// when proto-encoded status writes lose conditions.
+    ///
+    /// This test fails if the `status` field is removed from `PersistentVolumeClaim`, or if
+    /// the status serialization block is removed from `decode_persistentvolumeclaim_proto`.
+    #[test]
+    fn decode_persistentvolumeclaim_proto_preserves_status_conditions() {
+        use prost::Message as _;
+
+        let pvc = PersistentVolumeClaim {
+            metadata: Some(ObjectMeta {
+                name: "status-pvc".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(PersistentVolumeClaimStatus {
+                phase: "Bound".to_string(),
+                conditions: vec![PersistentVolumeClaimCondition {
+                    r#type: "StatusUpdated".to_string(),
+                    status: "True".to_string(),
+                    reason: "CSITest".to_string(),
+                    message: "applied by conformance test".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+
+        let mut buf = Vec::new();
+        pvc.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolumeclaim_proto(&buf)
+            .expect("decode_persistentvolumeclaim_proto must return Some for a proto /status body");
+
+        assert_eq!(result["kind"], "PersistentVolumeClaim");
+        assert_eq!(result["metadata"]["name"], "status-pvc");
+
+        assert_eq!(
+            result["status"]["phase"], "Bound",
+            "status.phase must survive proto decode of /pvc/status body — without this, a \
+             proto PUT /status that sets phase=Bound is silently ignored and the PVC stays Pending"
+        );
+
+        let conditions = result["status"]["conditions"].as_array().expect(
+            "status.conditions must survive proto decode — a proto PUT /pvc/status that drops \
+             conditions means the conformance test 'should apply changes to a pv/pvc status' \
+             reads back conditions=nil instead of the expected StatusUpdated condition",
+        );
+        assert_eq!(
+            conditions.len(),
+            1,
+            "one condition must survive proto decode"
+        );
+        assert_eq!(
+            conditions[0]["type"], "StatusUpdated",
+            "condition.type must be StatusUpdated after proto decode"
+        );
+        assert_eq!(
+            conditions[0]["status"], "True",
+            "condition.status must be True after proto decode"
+        );
+        assert_eq!(
+            conditions[0]["reason"], "CSITest",
+            "condition.reason must survive proto decode"
         );
     }
 
