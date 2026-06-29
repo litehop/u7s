@@ -71,6 +71,13 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
 ///
 /// Used to gate generation initialisation and increment so we don't accidentally
 /// set generation on non-workload resources (e.g. Services) where it's unused.
+///
+/// PodDisruptionBudget (policy/poddisruptionbudgets) is included because the
+/// disruption controller reads pdb.Generation and writes status.ObservedGeneration.
+/// The conformance test `waitForPdbToBeProcessed` polls until ObservedGeneration >=
+/// Generation — if Generation is 0 (absent), the wait is a no-op and the test races
+/// KCM's reconcile, writing disruptedPods before KCM's informer cache is settled.
+/// Real Kubernetes sets Generation=1 at PDB create time (PrepareForCreate strategy).
 pub fn is_workload_resource(group: &str, plural: &str) -> bool {
     matches!(
         (group, plural),
@@ -80,6 +87,7 @@ pub fn is_workload_resource(group: &str, plural: &str) -> bool {
             | ("apps", "daemonsets")
             | ("batch", "jobs")
             | ("batch", "cronjobs")
+            | ("policy", "poddisruptionbudgets")
     )
 }
 
@@ -2075,10 +2083,14 @@ mod tests {
         );
     }
 
-    /// StatefulSet, ReplicaSet, DaemonSet, Job, and CronJob must also get generation=1.
+    /// StatefulSet, ReplicaSet, DaemonSet, Job, CronJob, and PodDisruptionBudget must also get generation=1.
     ///
     /// All workload resources managed by KCM use generation for reconciliation gating.
     /// Missing generation on any of these causes the same skip-reconcile bug as Deployments.
+    /// PDB in particular: the disruption conformance test `waitForPdbToBeProcessed` polls
+    /// until status.observedGeneration >= metadata.generation — if generation is absent (0),
+    /// the check passes immediately without KCM ever reconciling, causing a race where
+    /// disruptedPods written by the test is overwritten by KCM before the test reads it back.
     #[test]
     fn all_workload_kinds_get_generation_1() {
         let cases = [
@@ -2087,6 +2099,7 @@ mod tests {
             ("apps", "daemonsets"),
             ("batch", "jobs"),
             ("batch", "cronjobs"),
+            ("policy", "poddisruptionbudgets"),
         ];
 
         for (group, plural) in cases {
@@ -2103,6 +2116,41 @@ mod tests {
                  KCM skips workload resources with null generation"
             );
         }
+    }
+
+    /// PodDisruptionBudget must get metadata.generation=1 on creation.
+    ///
+    /// The disruption controller conformance test `waitForPdbToBeProcessed` polls until
+    /// status.observedGeneration >= metadata.generation. Without generation=1, the check
+    /// is `0 >= 0` which returns immediately without KCM reconciling — the test then writes
+    /// disruptedPods and immediately reads it back, but KCM may concurrently reconcile
+    /// from a stale cache (without disruptedPods) and overwrite the entry, causing a flaky
+    /// FAIL. Real Kubernetes sets Generation=1 in PrepareForCreate (policy/poddisruptionbudget
+    /// strategy), so the test waits for a real KCM reconcile before proceeding.
+    ///
+    /// This test fails if is_workload_resource no longer includes ("policy", "poddisruptionbudgets").
+    #[test]
+    fn pdb_create_sets_generation_1_to_anchor_kcm_reconcile_guard() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "foo", "namespace": "default" },
+            "spec": {
+                "minAvailable": 1,
+                "selector": { "matchLabels": { "foo": "bar" } }
+            }
+        });
+
+        apply_defaults("policy", "poddisruptionbudgets", &mut obj);
+
+        assert_eq!(
+            obj["metadata"]["generation"], 1,
+            "PodDisruptionBudget must have metadata.generation=1 after creation — without it, \
+             waitForPdbToBeProcessed (which checks observedGeneration >= generation) is a no-op \
+             (0 >= 0 always true), removing the barrier that ensures KCM has reconciled before \
+             the conformance test writes disruptedPods; this causes a race where KCM clears the \
+             entry from a stale cache, making the test flaky"
+        );
     }
 
     /// Non-workload resources must NOT have metadata.generation set by apply_defaults.
