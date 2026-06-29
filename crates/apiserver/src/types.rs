@@ -460,6 +460,38 @@ pub struct NamespaceSpec {
 }
 
 // ---------------------------------------------------------------------------
+// DeleteOptions
+// ---------------------------------------------------------------------------
+
+/// Typed body for DELETE requests.
+///
+/// The apiserver reasons about propagationPolicy to gate cascade vs orphan
+/// behaviour, so it must flow through a typed struct rather than raw JSON map access.
+/// An absent or empty body is treated as Background (the default).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteOptions {
+    /// "Orphan", "Background", or "Foreground". Absent means Background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propagation_policy: Option<String>,
+    /// Legacy field. True maps to "Orphan". Nil/absent means "use propagationPolicy".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_dependents: Option<bool>,
+}
+
+impl DeleteOptions {
+    /// Resolve the effective propagation policy.
+    /// `orphanDependents: true` is the legacy way to request Orphan.
+    /// If both are absent, Background is the default.
+    pub fn is_orphan(&self) -> bool {
+        if let Some(true) = self.orphan_dependents {
+            return true;
+        }
+        self.propagation_policy.as_deref() == Some("Orphan")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CertificateSigningRequest typed fields
 // ---------------------------------------------------------------------------
 

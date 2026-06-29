@@ -15,7 +15,7 @@ use crate::{
     keys::{cluster_object_key, group_list_prefix, group_object_key},
     state::AppState,
     status::Status,
-    types::{Object, ObjectMeta},
+    types::{DeleteOptions, Object, ObjectMeta},
     util::{content_type, extract_body, parse_resource_version},
 };
 
@@ -469,6 +469,8 @@ pub async fn replace_resource<S: Store>(
 pub async fn delete_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Guard first — before validate_name so colon-names in RBAC (e.g. system:node) don't fail
     // the DNS-label charset check. The collection-delete path has the same guard.
@@ -478,6 +480,12 @@ pub async fn delete_resource<S: Store>(
         )));
     }
     validate_name("name", &name)?;
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -515,9 +523,20 @@ pub async fn delete_resource<S: Store>(
             .put(&key, obj.to_bytes(), expected_rv)
             .await
             .map_err(|e| store_err(e, &name, &meta.kind))?;
-        let mut body = Object { body: soft };
-        body.set_resource_version(new_rv);
-        return Ok(Json(body.body).into_response());
+        let mut resp_body = Object { body: soft };
+        resp_body.set_resource_version(new_rv);
+        return Ok(Json(resp_body.body).into_response());
+    }
+
+    let owner_uid = obj.body["metadata"]["uid"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if delete_opts.is_orphan() && !owner_uid.is_empty() {
+        // Orphan: strip ownerReferences pointing to this object from all children,
+        // then hard-delete the owner. Do NOT cascade-delete the children.
+        orphan_owned_resources(&state, &group, &plural, None, &owner_uid).await;
     }
 
     state
@@ -1528,6 +1547,8 @@ pub async fn replace_namespaced_resource<S: Store>(
 pub async fn delete_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
     // Guard before validate_name("name") so colon-names in RBAC don't fail the charset check.
@@ -1538,6 +1559,12 @@ pub async fn delete_namespaced_resource<S: Store>(
         )));
     }
     validate_name("name", &name)?;
+    let body = extract_body(&body, content_type(&headers));
+    let delete_opts: DeleteOptions = if body.is_empty() {
+        DeleteOptions::default()
+    } else {
+        serde_json::from_slice(&body).unwrap_or_default()
+    };
     let meta = match lookup(&state, &group, &version, &plural) {
         Ok(m) => m.clone(),
         Err(_) => {
@@ -1575,9 +1602,36 @@ pub async fn delete_namespaced_resource<S: Store>(
             .put(&key, obj.to_bytes(), expected_rv)
             .await
             .map_err(|e| store_err(e, &name, &meta.kind))?;
-        let mut body = Object { body: soft };
-        body.set_resource_version(new_rv);
-        return Ok(Json(body.body).into_response());
+        let mut resp_body = Object { body: soft };
+        resp_body.set_resource_version(new_rv);
+        return Ok(Json(resp_body.body).into_response());
+    }
+
+    let owner_uid = obj.body["metadata"]["uid"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if delete_opts.is_orphan() && !owner_uid.is_empty() {
+        // Orphan: strip ownerReferences pointing to this object from all namespaced children,
+        // then hard-delete the owner only. Do NOT cascade-delete the children.
+        orphan_owned_resources(&state, &group, &plural, Some(&ns), &owner_uid).await;
+        state
+            .store
+            .delete(&key, None)
+            .await
+            .map_err(|e| store_err(e, &name, &meta.kind))?;
+        if group == RBAC_GROUP {
+            let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
+            state.rbac_index.remove_object(&rbac_key);
+        }
+        return Ok(Json(serde_json::json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Success",
+            "code": 200
+        }))
+        .into_response());
     }
 
     state
@@ -1604,28 +1658,30 @@ pub async fn delete_namespaced_resource<S: Store>(
     // When a DaemonSet is deleted, pods with ownerReferences pointing to it must be
     // deleted immediately — otherwise they remain Running for the full pod GC timeout
     // (10+ minutes), blocking AfterEach cleanup in conformance tests.
-    if group == "apps" && plural == "daemonsets" {
-        let ds_uid = obj.body["metadata"]["uid"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        if !ds_uid.is_empty() {
-            delete_pods_owned_by(&state, &ns, &ds_uid, "DaemonSet").await;
-        }
+    if group == "apps" && plural == "daemonsets" && !owner_uid.is_empty() {
+        delete_pods_owned_by(&state, &ns, &owner_uid, "DaemonSet").await;
     }
 
     // Cascade-delete ReplicaSets owned by a deleted Deployment.
     // Without this, orphaned ReplicaSets continue creating pods indefinitely —
     // observed: smoke-test-mutate RS (desired: 1337) created 14000+ pods after
     // its Deployment was deleted.
-    if group == "apps" && plural == "deployments" {
-        let deploy_uid = obj.body["metadata"]["uid"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        if !deploy_uid.is_empty() {
-            delete_replicasets_owned_by(&state, &ns, &deploy_uid).await;
-        }
+    if group == "apps" && plural == "deployments" && !owner_uid.is_empty() {
+        delete_replicasets_owned_by(&state, &ns, &owner_uid).await;
+    }
+
+    // Cascade-delete pods owned by a deleted ReplicationController.
+    // RC→pods is the highest-saturation leg: conformance namespace
+    // replication-controller-2022 accumulated 385 pods with zero individual
+    // pod deletes — all pile up against the 110-pod node cap.
+    if group.is_empty() && plural == "replicationcontrollers" && !owner_uid.is_empty() {
+        delete_pods_owned_by(&state, &ns, &owner_uid, "ReplicationController").await;
+    }
+
+    // Cascade-delete pods owned by a deleted StatefulSet.
+    // Without this, StatefulSet pods linger against the 110-pod node cap.
+    if group == "apps" && plural == "statefulsets" && !owner_uid.is_empty() {
+        delete_pods_owned_by(&state, &ns, &owner_uid, "StatefulSet").await;
     }
 
     // Remove the job-tracking finalizer from pods owned by a deleted Job.
@@ -1639,14 +1695,8 @@ pub async fn delete_namespaced_resource<S: Store>(
     //
     // Fix: when we hard-delete a Job, synchronously remove the tracking finalizer from all
     // owned pods. If a pod now has deletionTimestamp + no finalizers, hard-delete it too.
-    if group == "batch" && plural == "jobs" {
-        let job_uid = obj.body["metadata"]["uid"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        if !job_uid.is_empty() {
-            remove_job_tracking_finalizer_from_pods(&state, &ns, &job_uid).await;
-        }
+    if group == "batch" && plural == "jobs" && !owner_uid.is_empty() {
+        remove_job_tracking_finalizer_from_pods(&state, &ns, &owner_uid).await;
     }
 
     Ok(Json(serde_json::json!({
@@ -2019,6 +2069,134 @@ pub(crate) fn rbac_cluster_key(group: &str, version: &str, plural: &str, name: &
     format!("/apis/{group}/{version}/{plural}/{name}")
 }
 
+/// Strip the ownerReference entry for `owner_uid` from all child resources that may
+/// be owned by the deleted object.
+///
+/// Called on Orphan delete. The owner is hard-deleted by the caller; children survive
+/// with the ownerReference removed so GC does not later garbage-collect them.
+///
+/// Scans pods (for RC/DaemonSet/StatefulSet owners) and replicasets (for Deployment owners)
+/// in the same namespace. For cluster-scoped owners `namespace` is None.
+///
+/// Conformance requirement: `propagationPolicy=Orphan` must leave owned resources alive
+/// and strip their ownerReferences — GC orphan specs fail if cascade deletes them instead.
+async fn orphan_owned_resources<S: Store>(
+    state: &crate::state::AppState<S>,
+    owner_group: &str,
+    owner_plural: &str,
+    namespace: Option<&str>,
+    owner_uid: &str,
+) {
+    // Determine which child resource types to scan based on the owner kind.
+    // Deployment → RSes (and pods, transitively, but GC conformance only checks RS survival).
+    // RC / DaemonSet / StatefulSet → pods.
+    let scan_replicasets = owner_group == "apps" && owner_plural == "deployments";
+    let scan_pods = !scan_replicasets;
+
+    let ns = namespace.unwrap_or("");
+
+    if scan_pods {
+        strip_owner_from_resources(
+            state,
+            &crate::keys::group_list_prefix("", "pods", namespace),
+            owner_uid,
+            ns,
+            "pods",
+        )
+        .await;
+    }
+
+    if scan_replicasets {
+        strip_owner_from_resources(
+            state,
+            &crate::keys::group_list_prefix("apps", "replicasets", namespace),
+            owner_uid,
+            ns,
+            "replicasets",
+        )
+        .await;
+    }
+}
+
+/// List all objects under `prefix`, find those with an ownerReference matching `owner_uid`,
+/// and remove that entry from their ownerReferences. Persists each updated object.
+async fn strip_owner_from_resources<S: Store>(
+    state: &crate::state::AppState<S>,
+    prefix: &str,
+    owner_uid: &str,
+    namespace: &str,
+    resource_label: &str,
+) {
+    let resp = match state
+        .store
+        .list(prefix, u7s_store::ListOptions::default())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("orphan: list {resource_label} in {namespace}: {e}");
+            return;
+        }
+    };
+
+    for item in resp.items {
+        let mut child: serde_json::Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let refs = match child["metadata"]["ownerReferences"].as_array() {
+            Some(r) if r.iter().any(|r| r["uid"].as_str() == Some(owner_uid)) => r.clone(),
+            _ => continue,
+        };
+
+        // Remove entries matching owner_uid; keep all others.
+        let filtered: Vec<serde_json::Value> = refs
+            .into_iter()
+            .filter(|r| r["uid"].as_str() != Some(owner_uid))
+            .collect();
+
+        if filtered.is_empty() {
+            child["metadata"]
+                .as_object_mut()
+                .map(|m| m.remove("ownerReferences"));
+        } else {
+            child["metadata"]["ownerReferences"] = serde_json::Value::Array(filtered);
+        }
+
+        let child_name = child["metadata"]["name"].as_str().unwrap_or("").to_string();
+        if child_name.is_empty() {
+            continue;
+        }
+        let child_ns = child["metadata"]["namespace"].as_str().unwrap_or(namespace);
+        let child_group = if child["apiVersion"].as_str().unwrap_or("").contains('/') {
+            child["apiVersion"]
+                .as_str()
+                .unwrap_or("")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            "".to_string()
+        };
+        let child_plural = resource_label.to_string();
+        let child_key =
+            crate::keys::group_object_key(&child_group, &child_plural, Some(child_ns), &child_name);
+
+        let updated_bytes = match serde_json::to_vec(&child) {
+            Ok(b) => bytes::Bytes::from(b),
+            Err(e) => {
+                tracing::warn!("orphan: serialize {resource_label}/{child_name}: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = state.store.put(&child_key, updated_bytes, None).await {
+            tracing::warn!("orphan: update {resource_label}/{child_name}: {e}");
+        }
+    }
+}
+
 /// Delete all pods in `namespace` whose `ownerReferences` contain an entry with
 /// `kind == owner_kind` and `uid == owner_uid`.
 ///
@@ -2113,10 +2291,16 @@ async fn delete_replicasets_owned_by<S: Store>(
         if rs_name.is_empty() {
             continue;
         }
+        let rs_uid = rs["metadata"]["uid"].as_str().unwrap_or("").to_string();
         let rs_key =
             crate::keys::group_object_key("apps", "replicasets", Some(namespace), &rs_name);
         if let Err(e) = state.store.delete(&rs_key, None).await {
             tracing::warn!("cascade-delete replicaset {namespace}/{rs_name}: {e}");
+        }
+        // Cascade-delete pods owned by this RS — without this, RS-owned pods linger
+        // against the 110-pod node cap and cause OutOfpods saturation.
+        if !rs_uid.is_empty() {
+            delete_pods_owned_by(state, namespace, &rs_uid, "ReplicaSet").await;
         }
     }
 }
@@ -3526,6 +3710,8 @@ mod tests {
                 "leases".into(),
                 "node-b".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await
         .unwrap_or_else(|_| panic!("delete must succeed"))
@@ -3554,6 +3740,8 @@ mod tests {
                 "leases".into(),
                 "nonexistent".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await;
 
@@ -3654,6 +3842,8 @@ mod tests {
                 "daemonsets".into(),
                 "my-ds".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
@@ -3769,6 +3959,8 @@ mod tests {
                 "deployments".into(),
                 "my-deploy".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await
         .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
@@ -3790,6 +3982,718 @@ mod tests {
         assert!(
             store.get(other_rs_key).await.unwrap().is_some(),
             "ReplicaSet not owned by the deleted Deployment must not be affected"
+        );
+    }
+
+    /// Deleting a Deployment must cascade-delete pods owned by its ReplicaSets.
+    ///
+    /// The Deployment→RS→pods chain must be complete: when delete_replicasets_owned_by
+    /// deletes an RS, it must also call delete_pods_owned_by for that RS's pods.
+    /// Without this, RS-owned pods survive and pile up against the 110-pod node cap,
+    /// causing OutOfpods saturation that blocks conformance DaemonSet serial tests.
+    #[tokio::test]
+    async fn delete_deployment_cascades_rs_pods_transitively() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let deploy_uid = "cccc1111-0000-0000-0000-000000000001";
+        let rs_uid = "cccc2222-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the Deployment.
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "my-deploy2", "namespace": ns, "uid": deploy_uid }
+        });
+        let deploy_key = "/registry/apps/deployments/default/my-deploy2";
+        store
+            .put(
+                deploy_key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a ReplicaSet owned by this Deployment.
+        let rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "my-deploy2-rs",
+                "namespace": ns,
+                "uid": rs_uid,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "my-deploy2",
+                    "uid": deploy_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "replicas": 3 }
+        });
+        let rs_key = "/registry/apps/replicasets/default/my-deploy2-rs";
+        store
+            .put(
+                rs_key,
+                bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by the ReplicaSet.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-deploy2-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "ReplicaSet",
+                    "name": "my-deploy2-rs",
+                    "uid": rs_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/my-deploy2-pod";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the Deployment.
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                ns.to_string(),
+                "deployments".into(),
+                "my-deploy2".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // RS must be deleted.
+        assert!(
+            store.get(rs_key).await.unwrap().is_none(),
+            "ReplicaSet owned by deleted Deployment must be cascade-deleted"
+        );
+
+        // Pod owned by the RS must also be cascade-deleted — this is the key fix:
+        // delete_replicasets_owned_by must call delete_pods_owned_by for each RS.
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "pod owned by RS owned by deleted Deployment must be cascade-deleted — \
+             without this, RS-owned pods pile up against the 110-pod node cap"
+        );
+
+        // Deployment itself must be deleted.
+        assert!(
+            store.get(deploy_key).await.unwrap().is_none(),
+            "Deployment itself must be deleted"
+        );
+    }
+
+    /// Deleting a ReplicationController must cascade-delete owned pods immediately.
+    ///
+    /// RC→pods is the highest-saturation leg: conformance namespace
+    /// replication-controller-2022 accumulated 385 pods with zero individual pod
+    /// deletes — without this cascade all 385 pile up against the 110-pod node cap
+    /// and cause OutOfpods saturation for every subsequent test.
+    #[tokio::test]
+    async fn delete_rc_cascades_to_owned_pods() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let rc_uid = "dddddddd-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the ReplicationController.
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "my-rc", "namespace": ns, "uid": rc_uid },
+            "spec": { "replicas": 3, "selector": { "app": "my-rc" } }
+        });
+        let rc_key = "/registry/replicationcontrollers/default/my-rc";
+        store
+            .put(
+                rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by this RC.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-rc-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "name": "my-rc",
+                    "uid": rc_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/my-rc-pod";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed an unrelated pod (must NOT be deleted).
+        let other_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "other-pod-rc", "namespace": ns }
+        });
+        let other_pod_key = "/registry/pods/default/other-pod-rc";
+        store
+            .put(
+                other_pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&other_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the ReplicationController.
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "my-rc".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // Owned pod must be cascade-deleted — RC delete must cascade or node saturates at 110-pod cap.
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "pod owned by deleted ReplicationController must be cascade-deleted — \
+             RC delete must cascade to pods or the node saturates at the 110-pod cap"
+        );
+
+        // RC itself must be deleted.
+        assert!(
+            store.get(rc_key).await.unwrap().is_none(),
+            "ReplicationController itself must be deleted"
+        );
+
+        // Unrelated pod must survive.
+        assert!(
+            store.get(other_pod_key).await.unwrap().is_some(),
+            "pod not owned by the deleted RC must not be affected"
+        );
+    }
+
+    /// Deleting a StatefulSet must cascade-delete owned pods immediately.
+    ///
+    /// Without this, StatefulSet pods linger against the 110-pod node cap, causing
+    /// OutOfpods saturation that blocks conformance tests running on the same node.
+    #[tokio::test]
+    async fn delete_statefulset_cascades_to_owned_pods() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let sts_uid = "eeeeeeee-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the StatefulSet.
+        let sts = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": { "name": "my-sts", "namespace": ns, "uid": sts_uid },
+            "spec": {
+                "replicas": 2,
+                "selector": { "matchLabels": { "app": "my-sts" } },
+                "serviceName": "my-sts"
+            }
+        });
+        let sts_key = "/registry/apps/statefulsets/default/my-sts";
+        store
+            .put(
+                sts_key,
+                bytes::Bytes::from(serde_json::to_vec(&sts).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by this StatefulSet.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-sts-0",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "StatefulSet",
+                    "name": "my-sts",
+                    "uid": sts_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/my-sts-0";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed an unrelated pod (must NOT be deleted).
+        let other_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "other-pod-sts", "namespace": ns }
+        });
+        let other_pod_key = "/registry/pods/default/other-pod-sts";
+        store
+            .put(
+                other_pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&other_pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the StatefulSet.
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                ns.to_string(),
+                "statefulsets".into(),
+                "my-sts".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // Owned pod must be cascade-deleted.
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "pod owned by deleted StatefulSet must be cascade-deleted — \
+             without this, StatefulSet pods linger against the 110-pod node cap"
+        );
+
+        // StatefulSet itself must be deleted.
+        assert!(
+            store.get(sts_key).await.unwrap().is_none(),
+            "StatefulSet itself must be deleted"
+        );
+
+        // Unrelated pod must survive.
+        assert!(
+            store.get(other_pod_key).await.unwrap().is_some(),
+            "pod not owned by the deleted StatefulSet must not be affected"
+        );
+    }
+
+    /// Orphan delete of an RC must LEAVE owned pods alive and strip their ownerReferences.
+    ///
+    /// GC conformance specs "should orphan pods created by rc if delete options say so" and
+    /// "should orphan pods created by rc if deleteOptions.OrphanDependents is nil" assert that
+    /// pods survive RC deletion with propagationPolicy=Orphan. If the cascade runs instead,
+    /// expected 50 pods becomes 0 — a data-loss regression visible to every kubectl --cascade=orphan user.
+    #[tokio::test]
+    async fn orphan_delete_rc_leaves_pods_alive_strips_owner_refs() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let rc_uid = "ffff1111-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the ReplicationController.
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "orphan-rc", "namespace": ns, "uid": rc_uid },
+            "spec": { "replicas": 1, "selector": { "app": "orphan-rc" } }
+        });
+        let rc_key = "/registry/replicationcontrollers/default/orphan-rc";
+        store
+            .put(
+                rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by this RC.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "orphan-rc-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "name": "orphan-rc",
+                    "uid": rc_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/orphan-rc-pod";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete with propagationPolicy=Orphan — pods must NOT be cascade-deleted.
+        let orphan_body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": "Orphan"
+            }))
+            .unwrap(),
+        );
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "orphan-rc".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            orphan_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("orphan delete must succeed: {e:?}"));
+
+        // RC must be deleted.
+        assert!(
+            store.get(rc_key).await.unwrap().is_none(),
+            "RC itself must be hard-deleted on Orphan delete"
+        );
+
+        // Pod must SURVIVE — Orphan delete must not cascade.
+        // GC conformance specs fail with 'expected 50 pods, got 0' if this regresses.
+        assert!(
+            store.get(pod_key).await.unwrap().is_some(),
+            "Orphan delete of RC must leave pods alive — cascade on Orphan is data-loss; \
+             GC conformance specs 'should orphan pods created by rc if delete options say so' will fail"
+        );
+
+        // Pod's ownerReferences must be stripped.
+        let pod_stored = store.get(pod_key).await.unwrap().unwrap();
+        let pod_val: serde_json::Value = serde_json::from_slice(&pod_stored.value).unwrap();
+        let owner_refs = pod_val["metadata"]["ownerReferences"].as_array();
+        let still_has_owner_ref = owner_refs
+            .map(|refs| refs.iter().any(|r| r["uid"].as_str() == Some(rc_uid)))
+            .unwrap_or(false);
+        assert!(
+            !still_has_owner_ref,
+            "Orphan delete must strip ownerReference pointing to the RC — \
+             without this the GC will garbage-collect the pod later, defeating Orphan semantics"
+        );
+    }
+
+    /// Orphan delete of a Deployment must leave owned ReplicaSets alive and strip their ownerReferences.
+    ///
+    /// GC conformance spec "should orphan RS created by deployment when deleteOptions.PropagationPolicy is Orphan"
+    /// asserts RSes survive the Deployment deletion. If cascade runs instead, the RS count goes to 0
+    /// (and so do its pods), breaking --cascade=orphan for Deployments.
+    #[tokio::test]
+    async fn orphan_delete_deployment_leaves_replicasets_alive_strips_owner_refs() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let deploy_uid = "ffff2222-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the Deployment.
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "orphan-deploy", "namespace": ns, "uid": deploy_uid }
+        });
+        let deploy_key = "/registry/apps/deployments/default/orphan-deploy";
+        store
+            .put(
+                deploy_key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a ReplicaSet owned by this Deployment.
+        let rs = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "orphan-deploy-rs",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "orphan-deploy",
+                    "uid": deploy_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "replicas": 1 }
+        });
+        let rs_key = "/registry/apps/replicasets/default/orphan-deploy-rs";
+        store
+            .put(
+                rs_key,
+                bytes::Bytes::from(serde_json::to_vec(&rs).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete with propagationPolicy=Orphan — RSes must NOT be cascade-deleted.
+        let orphan_body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": "Orphan"
+            }))
+            .unwrap(),
+        );
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                ns.to_string(),
+                "deployments".into(),
+                "orphan-deploy".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            orphan_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("orphan delete must succeed: {e:?}"));
+
+        // Deployment must be deleted.
+        assert!(
+            store.get(deploy_key).await.unwrap().is_none(),
+            "Deployment itself must be hard-deleted on Orphan delete"
+        );
+
+        // RS must SURVIVE — Orphan delete must not cascade.
+        // GC conformance spec 'should orphan RS created by deployment when deleteOptions.PropagationPolicy is Orphan' fails otherwise.
+        assert!(
+            store.get(rs_key).await.unwrap().is_some(),
+            "Orphan delete of Deployment must leave ReplicaSets alive — \
+             GC conformance spec 'should orphan RS created by deployment...' will fail if this regresses"
+        );
+
+        // RS's ownerReferences must be stripped.
+        let rs_stored = store.get(rs_key).await.unwrap().unwrap();
+        let rs_val: serde_json::Value = serde_json::from_slice(&rs_stored.value).unwrap();
+        let owner_refs = rs_val["metadata"]["ownerReferences"].as_array();
+        let still_has_owner_ref = owner_refs
+            .map(|refs| refs.iter().any(|r| r["uid"].as_str() == Some(deploy_uid)))
+            .unwrap_or(false);
+        assert!(
+            !still_has_owner_ref,
+            "Orphan delete must strip ownerReference pointing to the Deployment from its RSes — \
+             without this GC will garbage-collect the RS, defeating Orphan semantics"
+        );
+    }
+
+    /// Background (default) delete still cascades — cascade must not be broken by the Orphan gate.
+    ///
+    /// Regression guard: the Orphan path is a guard around the cascade helpers; if the guard
+    /// incorrectly fires for Background deletes the cascade tests will start failing (pods survive).
+    #[tokio::test]
+    async fn background_delete_rc_still_cascades() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let rc_uid = "ffff3333-0000-0000-0000-000000000001";
+        let ns = "default";
+
+        // Seed the ReplicationController.
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "bg-rc", "namespace": ns, "uid": rc_uid },
+            "spec": { "replicas": 1, "selector": { "app": "bg-rc" } }
+        });
+        let rc_key = "/registry/replicationcontrollers/default/bg-rc";
+        store
+            .put(
+                rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by this RC.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "bg-rc-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "name": "bg-rc",
+                    "uid": rc_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/bg-rc-pod";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete with explicit Background — cascade must still run.
+        let bg_body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": "Background"
+            }))
+            .unwrap(),
+        );
+        delete_namespaced_resource(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "bg-rc".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            bg_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("background delete must succeed: {e:?}"));
+
+        // Pod must be cascade-deleted — Background still cascades.
+        // If this fails, the Orphan gate is too wide and breaks Background delete.
+        assert!(
+            store.get(pod_key).await.unwrap().is_none(),
+            "Background/default delete of RC must still cascade-delete pods — \
+             the Orphan gate must not apply to Background policy"
+        );
+
+        // RC itself must be deleted.
+        assert!(
+            store.get(rc_key).await.unwrap().is_none(),
+            "RC itself must be hard-deleted on Background delete"
         );
     }
 
@@ -3899,6 +4803,8 @@ mod tests {
                 plural.to_string(),
                 name.to_string(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await
         .unwrap_or_else(|_| panic!("soft-delete must succeed"));
@@ -4073,6 +4979,8 @@ mod tests {
                 "clusterrolebindings".into(),
                 "system:node".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await;
 
@@ -4104,6 +5012,8 @@ mod tests {
                 "csinodes".into(),
                 "nonexistent".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await;
 
@@ -4160,6 +5070,8 @@ mod tests {
                 "csinodes".into(),
                 "finalizer-node".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await;
         let result = match del_result {
@@ -4759,6 +5671,8 @@ mod tests {
                 "leases".into(),
                 "finalizer-lease".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await;
         let result = match del_ns {
@@ -4922,6 +5836,8 @@ mod tests {
                 "widgets".into(),
                 "missing-widget".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await;
 
@@ -4948,6 +5864,8 @@ mod tests {
                 "widgets".into(),
                 "missing-widget".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await;
 
@@ -5790,6 +6708,8 @@ mod tests {
                 "csinodes".into(),
                 "..".into(),
             )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
         )
         .await;
 
