@@ -1162,11 +1162,20 @@ pub async fn create_namespaced_resource<S: Store>(
             None
         };
 
+    // Save ownerReferences before the ObjectMeta round-trip: ObjectMeta serde only
+    // knows the fields declared in the struct, so any field not in it (including
+    // ownerReferences) is silently dropped during from_value/to_value.  We restore
+    // the saved value immediately after so KCM-created Jobs (and any other object
+    // whose ownerReferences arrive via protobuf) survive the round-trip intact.
+    let saved_owner_refs = obj.body["metadata"]["ownerReferences"].clone();
     let mut ns_meta: ObjectMeta =
         serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
     ns_meta.namespace = Some(ns.clone());
     obj.body["metadata"] =
         serde_json::to_value(ns_meta).map_err(|e| Status::internal(e.to_string()))?;
+    if !saved_owner_refs.is_null() {
+        obj.body["metadata"]["ownerReferences"] = saved_owner_refs;
+    }
     stamp_metadata(&mut obj);
 
     // Auto-allocate clusterIP for Services that don't specify one.
@@ -11494,6 +11503,109 @@ mod tests {
              when the job is deleted — without this, the GC cascade never completes and \
              the pod stays Terminating forever"
         );
+    }
+
+    // -- ownerReferences preserved through create ObjectMeta round-trip (mayor-2f5a) --
+
+    /// create_namespaced_resource must persist ownerReferences from the incoming body.
+    ///
+    /// The create handler converts metadata through an ObjectMeta struct to set the
+    /// namespace field.  ObjectMeta only declares the fields it explicitly knows about;
+    /// any other field (including ownerReferences) is silently dropped by serde.  If
+    /// ownerReferences are dropped during create, KCM-created Jobs (which carry an
+    /// ownerReference to their CronJob) are stored without ownerReferences — the
+    /// CronJob→Job cascade cannot match them, so the GC conformance spec
+    /// "should delete jobs and pods created by cronjob" times out seeing 1 job / 1 pod
+    /// after the CronJob is deleted.
+    #[tokio::test]
+    async fn create_namespaced_resource_preserves_owner_references() {
+        use axum::extract::{Path, State};
+
+        let state = make_state();
+        let ns = "default";
+        let cj_uid = "cj-uid-preserve-ownerrefs";
+
+        // Create a Job with ownerReferences pointing to a CronJob — exactly what KCM
+        // cronjob-controller does when it creates a Job from a CronJob schedule.
+        let body = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "preserve-ownerrefs-job",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "name": "my-cronjob",
+                    "uid": cj_uid,
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }]
+            },
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{"name": "c", "image": "busybox"}],
+                        "restartPolicy": "Never"
+                    }
+                }
+            }
+        });
+        let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
+
+        let result = create_namespaced_resource(
+            State(state.clone()),
+            Path(("batch".into(), "v1".into(), ns.to_string(), "jobs".into())),
+            axum::extract::Query(CreateQuery::default()),
+            axum::Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec![],
+            }),
+            axum::http::HeaderMap::new(),
+            body_bytes,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create Job must succeed: {e:?}"));
+
+        // The stored object must have ownerReferences intact — if the ObjectMeta round-trip
+        // drops them, the stored Job has no ownerReferences and the CronJob cascade cannot
+        // identify it as owned, causing the GC conformance test to fail.
+        let stored = state
+            .store
+            .get(&crate::keys::group_object_key(
+                "batch",
+                "jobs",
+                Some(ns),
+                "preserve-ownerrefs-job",
+            ))
+            .await
+            .unwrap()
+            .expect("Job must be stored");
+        let stored_val: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored Job must be valid JSON");
+        let refs = stored_val["metadata"]["ownerReferences"].as_array().expect(
+            "stored Job metadata.ownerReferences must be an array — if missing, the \
+                 ObjectMeta round-trip in create_namespaced_resource dropped them, causing \
+                 the CronJob→Job cascade to find no owned Jobs after CronJob deletion",
+        );
+        assert_eq!(refs.len(), 1, "one ownerReference must survive create");
+        assert_eq!(
+            refs[0]["kind"].as_str(),
+            Some("CronJob"),
+            "ownerReference.kind must be CronJob"
+        );
+        assert_eq!(
+            refs[0]["uid"].as_str(),
+            Some(cj_uid),
+            "ownerReference.uid must match CronJob UID — cascade uses uid equality"
+        );
+        assert_eq!(
+            refs[0]["controller"].as_bool(),
+            Some(true),
+            "controller field must survive the round-trip"
+        );
+        let _ = result;
     }
 
     // -- CronJob cascade (mayor-2f5a) --
