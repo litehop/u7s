@@ -155,6 +155,31 @@ struct ObjectMeta {
     finalizers: Vec<String>,
 }
 
+/// OwnerReference — one entry in ObjectMeta.ownerReferences.
+/// Source: apimachinery-meta-v1-generated.proto message OwnerReference
+/// Field numbers match the official proto definition exactly.
+#[derive(Clone, PartialEq, Message)]
+struct OwnerReference {
+    /// kind (field 1, string)
+    #[prost(string, tag = "1")]
+    kind: String,
+    /// name (field 3, string)
+    #[prost(string, tag = "3")]
+    name: String,
+    /// uid (field 4, string)
+    #[prost(string, tag = "4")]
+    uid: String,
+    /// apiVersion (field 5, string)
+    #[prost(string, tag = "5")]
+    api_version: String,
+    /// controller (field 6, optional bool)
+    #[prost(bool, optional, tag = "6")]
+    controller: Option<bool>,
+    /// blockOwnerDeletion (field 7, optional bool)
+    #[prost(bool, optional, tag = "7")]
+    block_owner_deletion: Option<bool>,
+}
+
 // --- k8s.io/api/core/v1/generated.proto ---
 
 /// NamespaceSpec (field 1=finalizers repeated string)
@@ -2633,6 +2658,46 @@ fn object_meta_to_json(meta: ObjectMeta) -> serde_json::Value {
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
         m["annotations"] = serde_json::Value::Object(annotations);
+    }
+    if !meta.owner_references.is_empty() {
+        let refs: Vec<serde_json::Value> = meta
+            .owner_references
+            .iter()
+            .filter_map(|raw| OwnerReference::decode(raw.as_slice()).ok())
+            .map(|r| {
+                let mut entry = serde_json::json!({});
+                if !r.api_version.is_empty() {
+                    entry["apiVersion"] = serde_json::Value::String(r.api_version);
+                }
+                if !r.kind.is_empty() {
+                    entry["kind"] = serde_json::Value::String(r.kind);
+                }
+                if !r.name.is_empty() {
+                    entry["name"] = serde_json::Value::String(r.name);
+                }
+                if !r.uid.is_empty() {
+                    entry["uid"] = serde_json::Value::String(r.uid);
+                }
+                if let Some(ctrl) = r.controller {
+                    entry["controller"] = serde_json::Value::Bool(ctrl);
+                }
+                if let Some(bod) = r.block_owner_deletion {
+                    entry["blockOwnerDeletion"] = serde_json::Value::Bool(bod);
+                }
+                entry
+            })
+            .collect();
+        if !refs.is_empty() {
+            m["ownerReferences"] = serde_json::Value::Array(refs);
+        }
+    }
+    if !meta.finalizers.is_empty() {
+        let fins: Vec<serde_json::Value> = meta
+            .finalizers
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+        m["finalizers"] = serde_json::Value::Array(fins);
     }
     m
 }
@@ -10912,6 +10977,81 @@ mod tests {
         assert_eq!(
             result["spec"]["template"]["spec"]["restartPolicy"], "Never",
             "restartPolicy must be preserved from the template spec"
+        );
+    }
+
+    /// decode_job_proto must preserve ownerReferences from the proto ObjectMeta.
+    ///
+    /// KCM's cronjob-controller creates Jobs with ownerReferences pointing to the CronJob.
+    /// Before this fix, object_meta_to_json silently dropped ownerReferences, so the stored
+    /// Job had no ownerReferences, and the CronJob→Jobs cascade could not match Jobs to their
+    /// CronJob owner — causing the GC conformance spec "should delete jobs and pods created by
+    /// cronjob" to fail (the cascade enumerated Jobs but found none owned by the deleted CronJob).
+    #[test]
+    fn decode_job_proto_preserves_owner_references() {
+        use prost::Message as _;
+
+        let cj_uid = "cj-uid-1234-5678-abcd";
+
+        // Encode the OwnerReference as prost would.
+        let owner_ref = OwnerReference {
+            kind: "CronJob".to_string(),
+            name: "my-cj".to_string(),
+            uid: cj_uid.to_string(),
+            api_version: "batch/v1".to_string(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        };
+        let mut owner_ref_bytes = Vec::new();
+        owner_ref
+            .encode(&mut owner_ref_bytes)
+            .expect("OwnerReference encode must succeed");
+
+        let job = Job {
+            metadata: Some(ObjectMeta {
+                name: "my-cj-job".to_string(),
+                namespace: "default".to_string(),
+                uid: "job-uid-abcd".to_string(),
+                owner_references: vec![owner_ref_bytes],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("Job encode must succeed");
+
+        let result = decode_job_proto(&buf)
+            .expect("decode_job_proto must return Some for Job with ownerReferences");
+
+        let refs = result["metadata"]["ownerReferences"].as_array().expect(
+            "ownerReferences must be present in decoded Job — without this, the \
+                 CronJob->Jobs cascade in delete_namespaced_resource cannot match Jobs to their \
+                 CronJob owner and the GC conformance spec fails",
+        );
+        assert_eq!(
+            refs.len(),
+            1,
+            "one ownerReference must survive proto decode"
+        );
+        assert_eq!(
+            refs[0]["kind"], "CronJob",
+            "ownerReference kind must be CronJob — this is how the cascade identifies owned Jobs"
+        );
+        assert_eq!(
+            refs[0]["uid"], cj_uid,
+            "ownerReference uid must match the CronJob UID — the cascade checks uid equality"
+        );
+        assert_eq!(
+            refs[0]["apiVersion"], "batch/v1",
+            "ownerReference apiVersion must be preserved"
+        );
+        assert_eq!(
+            refs[0]["name"], "my-cj",
+            "ownerReference name must be preserved"
+        );
+        assert_eq!(
+            refs[0]["controller"], true,
+            "controller field must be preserved from ownerReference"
         );
     }
 
