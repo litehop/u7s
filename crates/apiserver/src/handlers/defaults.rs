@@ -28,9 +28,6 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("", "services") = (group, plural) {
         default_service(obj);
     }
-    if let ("", "pods") = (group, plural) {
-        default_pod(obj);
-    }
     if plural == "events" && (group.is_empty() || group == "events.k8s.io") {
         normalize_event_timestamps(obj);
     }
@@ -320,32 +317,6 @@ pub fn default_service_ip_fields(obj: &mut serde_json::Value) {
     // clusterIPs
     if obj["spec"]["clusterIPs"].is_null() && !cluster_ip.is_empty() && cluster_ip != "None" {
         obj["spec"]["clusterIPs"] = serde_json::json!([cluster_ip]);
-    }
-}
-
-/// Default ContainerPort.protocol to TCP when absent for all containers in a Pod.
-///
-/// The real kube-apiserver sets ContainerPort.Protocol = TCP at write time when the
-/// client omits it.  The endpointslice controller (KCM) uses the pod's containerPort
-/// Protocol when building EndpointSlice port entries for named targetPorts; an empty
-/// Protocol causes the KCM to produce EndpointSlices with ports:[] regardless of the
-/// Service's own protocol field, breaking the named-targetPort resolution.
-///
-/// Applies to spec.containers[*].ports[*] and spec.initContainers[*].ports[*].
-/// Idempotent: existing non-empty protocol values are never overwritten.
-fn default_pod(obj: &mut serde_json::Value) {
-    for field in &["containers", "initContainers"] {
-        if let Some(containers) = obj["spec"][field].as_array_mut() {
-            for container in containers.iter_mut() {
-                if let Some(ports) = container["ports"].as_array_mut() {
-                    for port in ports.iter_mut() {
-                        if port["protocol"].is_null() {
-                            port["protocol"] = serde_json::Value::String("TCP".to_string());
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -1058,88 +1029,6 @@ mod tests {
             obj["spec"]["ports"][0]["protocol"], "UDP",
             "existing spec.ports[].protocol must not be overwritten — changing UDP to TCP \
              breaks UDP services"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // Pod container-port protocol defaulting
-    // ---------------------------------------------------------------------------
-
-    /// Pod containerPort without protocol must have protocol defaulted to TCP.
-    ///
-    /// The endpointslice controller (KCM) uses the pod's ContainerPort.Protocol when
-    /// building EndpointSlice ports for named targetPorts.  When Protocol is absent (empty
-    /// string after JSON unmarshal), the KCM cannot produce a valid EndpointSlice port
-    /// entry, resulting in ports:[] for the slice.  The real kube-apiserver defaults
-    /// ContainerPort.Protocol=TCP at write time.  Without this default, any Service with a
-    /// named targetPort will have an EndpointSlice with empty ports, breaking conformance.
-    #[test]
-    fn pod_container_port_protocol_defaults_to_tcp_when_omitted() {
-        let mut obj = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "pod1", "namespace": "default" },
-            "spec": {
-                "containers": [{
-                    "name": "container1",
-                    "ports": [{"name": "http", "containerPort": 8080}]
-                }]
-            }
-        });
-
-        apply_defaults("", "pods", &mut obj);
-
-        assert_eq!(
-            obj["spec"]["containers"][0]["ports"][0]["protocol"], "TCP",
-            "spec.containers[].ports[].protocol must default to TCP — absent protocol causes \
-             KCM endpointslice controller to produce ports:[] for named-targetPort services"
-        );
-    }
-
-    /// Pod containerPort with explicit protocol must not be overwritten.
-    #[test]
-    fn pod_container_port_existing_protocol_not_overwritten() {
-        let mut obj = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "pod1", "namespace": "default" },
-            "spec": {
-                "containers": [{
-                    "name": "container1",
-                    "ports": [{"name": "dns", "containerPort": 53, "protocol": "UDP"}]
-                }]
-            }
-        });
-
-        apply_defaults("", "pods", &mut obj);
-
-        assert_eq!(
-            obj["spec"]["containers"][0]["ports"][0]["protocol"], "UDP",
-            "existing spec.containers[].ports[].protocol must not be overwritten"
-        );
-    }
-
-    /// Pod initContainer port protocol must also default to TCP.
-    #[test]
-    fn pod_init_container_port_protocol_defaults_to_tcp() {
-        let mut obj = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "pod1", "namespace": "default" },
-            "spec": {
-                "initContainers": [{
-                    "name": "init1",
-                    "ports": [{"name": "check", "containerPort": 9090}]
-                }],
-                "containers": []
-            }
-        });
-
-        apply_defaults("", "pods", &mut obj);
-
-        assert_eq!(
-            obj["spec"]["initContainers"][0]["ports"][0]["protocol"], "TCP",
-            "spec.initContainers[].ports[].protocol must default to TCP"
         );
     }
 

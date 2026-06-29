@@ -277,20 +277,31 @@ pub fn extract_status_replicas(obj: &serde_json::Value) -> i64 {
     }
 }
 
-/// GET /apis/apps/v1/namespaces/:ns/:resource/:name/scale
-pub async fn get_scale<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((ns, resource, name)): Path<(String, String, String)>,
-) -> Result<Response, crate::status::StatusError> {
-    require_scale_resource(&resource)?;
+// ---------------------------------------------------------------------------
+// Shared scale implementation — parameterised by group and resource.
+//
+// group="apps"  → apps/v1 workloads (deployments, replicasets, statefulsets)
+// group=""       → core/v1 ReplicationController
+//
+// The public handlers below are thin wrappers that extract path segments and
+// forward to these impls, keeping the route-specific Path extractor types out
+// of the shared logic.
+// ---------------------------------------------------------------------------
 
-    let key = group_object_key("apps", &resource, Some(&ns), &name);
+async fn scale_get_impl<S: Store>(
+    state: AppState<S>,
+    group: &str,
+    resource: &str,
+    ns: &str,
+    name: &str,
+) -> Result<Response, crate::status::StatusError> {
+    let key = group_object_key(group, resource, Some(ns), name);
     let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &resource))?;
+        .ok_or_else(|| Status::not_found(name, resource))?;
 
     let obj: serde_json::Value = serde_json::from_slice(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -302,25 +313,19 @@ pub async fn get_scale<S: Store>(
         .unwrap_or("")
         .to_string();
 
-    Ok(Json(build_scale(&name, &ns, spec_replicas, status_replicas, &rv)).into_response())
+    Ok(Json(build_scale(name, ns, spec_replicas, status_replicas, &rv)).into_response())
 }
 
-/// PUT /apis/apps/v1/namespaces/:ns/:resource/:name/scale
-///
-/// Accepts a Scale object body; writes `spec.replicas` back into the stored
-/// workload, increments resourceVersion, returns the updated Scale.
-///
-/// Accepts both `application/json` and `application/vnd.kubernetes.protobuf`
-/// request bodies — client-go sends protobuf by default.
-pub async fn put_scale<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((ns, resource, name)): Path<(String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
+async fn scale_put_impl<S: Store>(
+    state: AppState<S>,
+    group: &str,
+    resource: &str,
+    ns: &str,
+    name: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    require_scale_resource(&resource)?;
-
-    let scale = decode_scale_body(&body, &headers)?;
+    let scale = decode_scale_body(body, headers)?;
 
     let new_replicas = scale
         .spec
@@ -328,13 +333,13 @@ pub async fn put_scale<S: Store>(
         .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?
         as i64;
 
-    let key = group_object_key("apps", &resource, Some(&ns), &name);
+    let key = group_object_key(group, resource, Some(ns), name);
     let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &resource))?;
+        .ok_or_else(|| Status::not_found(name, resource))?;
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -359,39 +364,33 @@ pub async fn put_scale<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?;
 
     Ok(Json(build_scale(
-        &name,
-        &ns,
+        name,
+        ns,
         new_replicas,
         status_replicas,
         &new_rv.to_string(),
     )))
 }
 
-/// PATCH /apis/apps/v1/namespaces/:ns/:resource/:name/scale
-///
-/// Accepts a JSON merge-patch body targeting the Scale object.  Only
-/// `spec.replicas` is extracted and written back to the stored workload.
-///
-/// Accepts both `application/json` and `application/vnd.kubernetes.protobuf`
-/// request bodies — client-go sends protobuf by default.
-pub async fn patch_scale<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((ns, resource, name)): Path<(String, String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
+async fn scale_patch_impl<S: Store>(
+    state: AppState<S>,
+    group: &str,
+    resource: &str,
+    ns: &str,
+    name: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    require_scale_resource(&resource)?;
-
     // Accept both JSON and proto bodies; extract spec.replicas from whichever.
-    let ct = content_type(&headers);
-    let decoded = extract_body(&body, ct);
+    let ct = content_type(headers);
+    let decoded = extract_body(body, ct);
     let patch_body: serde_json::Value =
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&decoded) {
             v
-        } else if let Some(scale) = try_decode_proto_scale_body(&body) {
+        } else if let Some(scale) = try_decode_proto_scale_body(body) {
             serde_json::to_value(scale).unwrap_or_default()
         } else {
-            let e = serde_json::from_slice::<serde_json::Value>(&body)
+            let e = serde_json::from_slice::<serde_json::Value>(body)
                 .err()
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "unrecognised body format".into());
@@ -400,13 +399,13 @@ pub async fn patch_scale<S: Store>(
     let patch_scale_spec: ScaleSpec =
         serde_json::from_value(patch_body["spec"].clone()).unwrap_or_default();
 
-    let key = group_object_key("apps", &resource, Some(&ns), &name);
+    let key = group_object_key(group, resource, Some(ns), name);
     let stored = state
         .store
         .get(&key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &resource))?;
+        .ok_or_else(|| Status::not_found(name, resource))?;
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
@@ -439,8 +438,8 @@ pub async fn patch_scale<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?;
 
     Ok(Json(build_scale(
-        &name,
-        &ns,
+        name,
+        ns,
         new_replicas,
         status_replicas,
         &new_rv.to_string(),
@@ -448,16 +447,71 @@ pub async fn patch_scale<S: Store>(
 }
 
 // ---------------------------------------------------------------------------
-// ReplicationController scale subresource — GET/PUT/PATCH
+// apps/v1 scale handlers — GET/PUT/PATCH
+//
+// Routes:
+//   GET    /apis/apps/v1/namespaces/:ns/:resource/:name/scale
+//   PUT    /apis/apps/v1/namespaces/:ns/:resource/:name/scale
+//   PATCH  /apis/apps/v1/namespaces/:ns/:resource/:name/scale
+//
+// Supports deployments, replicasets, statefulsets (all stored under group="apps").
+// ---------------------------------------------------------------------------
+
+/// GET /apis/apps/v1/namespaces/:ns/:resource/:name/scale
+pub async fn get_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, resource, name)): Path<(String, String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    require_scale_resource(&resource)?;
+    scale_get_impl(state, "apps", &resource, &ns, &name).await
+}
+
+/// PUT /apis/apps/v1/namespaces/:ns/:resource/:name/scale
+///
+/// Accepts a Scale object body; writes `spec.replicas` back into the stored
+/// workload, increments resourceVersion, returns the updated Scale.
+///
+/// Accepts both `application/json` and `application/vnd.kubernetes.protobuf`
+/// request bodies — client-go sends protobuf by default.
+pub async fn put_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, resource, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    require_scale_resource(&resource)?;
+    scale_put_impl(state, "apps", &resource, &ns, &name, &headers, &body).await
+}
+
+/// PATCH /apis/apps/v1/namespaces/:ns/:resource/:name/scale
+///
+/// Accepts a JSON merge-patch body targeting the Scale object.  Only
+/// `spec.replicas` is extracted and written back to the stored workload.
+///
+/// Accepts both `application/json` and `application/vnd.kubernetes.protobuf`
+/// request bodies — client-go sends protobuf by default.
+pub async fn patch_scale<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, resource, name)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    require_scale_resource(&resource)?;
+    scale_patch_impl(state, "apps", &resource, &ns, &name, &headers, &body).await
+}
+
+// ---------------------------------------------------------------------------
+// ReplicationController scale handlers — GET/PUT/PATCH
 //
 // Routes:
 //   GET    /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
 //   PUT    /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
 //   PATCH  /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
 //
-// RCs are a core/v1 resource stored under /registry/replicationcontrollers/{ns}/{name}
-// (group=""), not under apps/v1. The generic scale handlers hard-code group="apps" in
-// their store key, so RC needs dedicated handlers that pass group="" to group_object_key.
+// RCs are a core/v1 resource (group="") — their store key differs from apps/v1
+// workloads.  These thin wrappers forward to the shared impl with group="".
+// The 2-element path extractor (ns, name) matches the route pattern which has
+// the resource fixed to "replicationcontrollers".
 // ---------------------------------------------------------------------------
 
 /// GET /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
@@ -465,25 +519,7 @@ pub async fn get_rc_scale<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, name)): Path<(String, String)>,
 ) -> Result<Response, crate::status::StatusError> {
-    let key = group_object_key("", "replicationcontrollers", Some(&ns), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "replicationcontrollers"))?;
-
-    let obj: serde_json::Value = serde_json::from_slice(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let spec_replicas = extract_replicas(&obj);
-    let status_replicas = extract_status_replicas(&obj);
-    let rv = obj["metadata"]["resourceVersion"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    Ok(Json(build_scale(&name, &ns, spec_replicas, status_replicas, &rv)).into_response())
+    scale_get_impl(state, "", "replicationcontrollers", &ns, &name).await
 }
 
 /// PUT /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
@@ -493,48 +529,16 @@ pub async fn put_rc_scale<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let scale = decode_scale_body(&body, &headers)?;
-
-    let new_replicas = scale
-        .spec
-        .replicas
-        .ok_or_else(|| Status::bad_request("spec.replicas must be an integer".into()))?
-        as i64;
-
-    let key = group_object_key("", "replicationcontrollers", Some(&ns), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "replicationcontrollers"))?;
-
-    let mut obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let old_replicas = extract_replicas(&obj.body);
-    let status_replicas = extract_status_replicas(&obj.body);
-    obj.body["spec"]["replicas"] = serde_json::Value::Number(new_replicas.into());
-
-    if new_replicas != old_replicas {
-        let gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
-        obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
-    }
-
-    let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    Ok(Json(build_scale(
-        &name,
+    scale_put_impl(
+        state,
+        "",
+        "replicationcontrollers",
         &ns,
-        new_replicas,
-        status_replicas,
-        &new_rv.to_string(),
-    )))
+        &name,
+        &headers,
+        &body,
+    )
+    .await
 }
 
 /// PATCH /api/v1/namespaces/:ns/replicationcontrollers/:name/scale
@@ -544,64 +548,16 @@ pub async fn patch_rc_scale<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ct = content_type(&headers);
-    let decoded = extract_body(&body, ct);
-    let patch_body: serde_json::Value =
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&decoded) {
-            v
-        } else if let Some(scale) = try_decode_proto_scale_body(&body) {
-            serde_json::to_value(scale).unwrap_or_default()
-        } else {
-            let e = serde_json::from_slice::<serde_json::Value>(&body)
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unrecognised body format".into());
-            return Err(Status::bad_request(format!("invalid JSON: {e}")));
-        };
-    let patch_scale_spec: ScaleSpec =
-        serde_json::from_value(patch_body["spec"].clone()).unwrap_or_default();
-
-    let key = group_object_key("", "replicationcontrollers", Some(&ns), &name);
-    let stored = state
-        .store
-        .get(&key)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, "replicationcontrollers"))?;
-
-    let mut obj = Object::from_bytes(&stored.value)
-        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
-
-    let old_replicas = extract_replicas(&obj.body);
-    let status_replicas = extract_status_replicas(&obj.body);
-
-    let new_replicas = if let Some(r) = patch_scale_spec.replicas {
-        let r = r as i64;
-        obj.body["spec"]["replicas"] = serde_json::json!(r);
-        r
-    } else {
-        old_replicas
-    };
-
-    if new_replicas != old_replicas {
-        let gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
-        obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
-    }
-
-    let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
-    let new_rv = state
-        .store
-        .put(&key, obj.to_bytes(), expected_rv)
-        .await
-        .map_err(|e| Status::internal(e.to_string()))?;
-
-    Ok(Json(build_scale(
-        &name,
+    scale_patch_impl(
+        state,
+        "",
+        "replicationcontrollers",
         &ns,
-        new_replicas,
-        status_replicas,
-        &new_rv.to_string(),
-    )))
+        &name,
+        &headers,
+        &body,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -1849,6 +1805,83 @@ mod handler_tests {
             "replicationcontrollers must be in SCALE_RESOURCES — HPA and kubectl scale \
              both use the /scale subresource for RCs; without this entry any generic \
              require_scale_resource check would return 404"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression test for mayor-trb0: unified handler must keep RC on core key
+    //
+    // After the refactor the RC handlers delegate to scale_put_impl/scale_get_impl
+    // with group="".  This test confirms the RC path still resolves the correct
+    // core store key (/registry/replicationcontrollers/…) and does NOT fall back
+    // to the apps store key (/registry/apps/replicationcontrollers/…).
+    // -----------------------------------------------------------------------
+
+    /// PUT scale on an RC via the unified handler writes spec.replicas to the
+    /// core/v1 store key (group=""), not the apps/v1 key.
+    ///
+    /// Fails on revert: if put_rc_scale passes group="apps" to scale_put_impl,
+    /// the store lookup hits /registry/apps/replicationcontrollers/{ns}/{name}
+    /// which does not exist — the handler returns 404 instead of 200, and HPA
+    /// cannot scale ReplicationControllers.
+    #[tokio::test]
+    async fn put_rc_scale_via_unified_handler_resolves_core_group_store_key() {
+        let (state, store) = make_state();
+        seed_rc(&store, "default", "my-rc", 1).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/replicationcontrollers/{name}/scale",
+                put(put_rc_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "spec": { "replicas": 5 }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/replicationcontrollers/my-rc/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PUT scale on an RC must return 200 — if the unified handler uses group='apps' \
+             it looks up the wrong store key and returns 404, breaking HPA on RCs"
+        );
+
+        let resp_body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(
+            json["spec"]["replicas"], 5,
+            "response spec.replicas must reflect the PUT value"
+        );
+
+        // The RC must be updated at the core/v1 store key, not the apps key.
+        let core_key = "/registry/replicationcontrollers/default/my-rc";
+        let stored = store.get(core_key).await.unwrap().unwrap();
+        let stored_obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_obj["spec"]["replicas"], 5,
+            "RC spec.replicas must be written to the core/v1 store key — \
+             a wrong group='apps' would write to /registry/apps/replicationcontrollers/… \
+             (key not found) or silently create a stale entry, leaving the real RC unchanged"
+        );
+
+        // Confirm the apps key was NOT created (it should not exist).
+        let apps_key = "/registry/apps/replicationcontrollers/default/my-rc";
+        assert!(
+            store.get(apps_key).await.unwrap().is_none(),
+            "the apps/v1 store key must not be created for an RC — group must be '' not 'apps'"
         );
     }
 }
