@@ -1718,6 +1718,14 @@ pub async fn delete_namespaced_resource<S: Store>(
         delete_pods_owned_by(&state, &ns, &owner_uid, "StatefulSet").await;
     }
 
+    // Cascade-delete Jobs owned by a deleted CronJob, then cascade each Job's pods.
+    // Without this, Jobs (and their pods) created by a CronJob linger after the CronJob is
+    // deleted — the GC conformance spec "should delete jobs and pods created by cronjob"
+    // fails because the test asserts both Jobs AND Pods are gone within 60 s.
+    if group == "batch" && plural == "cronjobs" && !owner_uid.is_empty() {
+        delete_jobs_owned_by(&state, &ns, &owner_uid).await;
+    }
+
     // Remove the job-tracking finalizer from pods owned by a deleted Job.
     //
     // Kubernetes KCM's job-controller (1.36) adds `batch.kubernetes.io/job-tracking` to
@@ -2339,6 +2347,67 @@ async fn delete_replicasets_owned_by<S: Store>(
         // against the 110-pod node cap and cause OutOfpods saturation.
         if !rs_uid.is_empty() {
             delete_pods_owned_by(state, namespace, &rs_uid, "ReplicaSet").await;
+        }
+    }
+}
+
+/// Called after a CronJob hard-delete to cascade-delete owned Jobs (and transitively their pods).
+///
+/// Without this, Jobs (and pods) created by a CronJob accumulate indefinitely after the
+/// CronJob is deleted — the GC conformance spec "should delete jobs and pods created by
+/// cronjob" times out asserting both are gone.
+///
+/// Each owned Job is hard-deleted, then its pods are cleaned up via the existing
+/// Job→pods helpers (remove_job_tracking_finalizer_from_pods + delete_pods_owned_by).
+async fn delete_jobs_owned_by<S: Store>(
+    state: &crate::state::AppState<S>,
+    namespace: &str,
+    owner_uid: &str,
+) {
+    let prefix = crate::keys::group_list_prefix("batch", "jobs", Some(namespace));
+    let resp = match state
+        .store
+        .list(&prefix, u7s_store::ListOptions::default())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("cascade-delete jobs in {namespace}: list failed: {e}");
+            return;
+        }
+    };
+
+    for item in resp.items {
+        let job: serde_json::Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let owned = job["metadata"]["ownerReferences"]
+            .as_array()
+            .map(|refs| {
+                refs.iter().any(|r| {
+                    r["uid"].as_str() == Some(owner_uid) && r["kind"].as_str() == Some("CronJob")
+                })
+            })
+            .unwrap_or(false);
+        if !owned {
+            continue;
+        }
+        let job_name = job["metadata"]["name"].as_str().unwrap_or("").to_string();
+        if job_name.is_empty() {
+            continue;
+        }
+        let job_uid = job["metadata"]["uid"].as_str().unwrap_or("").to_string();
+        let job_key = crate::keys::group_object_key("batch", "jobs", Some(namespace), &job_name);
+        if let Err(e) = state.store.delete(&job_key, None).await {
+            tracing::warn!("cascade-delete job {namespace}/{job_name}: {e}");
+        }
+        // Cascade-delete pods owned by this Job — two-level chain: CronJob→Job→Pod.
+        // The job-tracking finalizer must be removed first (KCM sets it); then hard-delete
+        // any pods that are now finalizer-free with a deletionTimestamp, and delete the rest.
+        if !job_uid.is_empty() {
+            remove_job_tracking_finalizer_from_pods(state, namespace, &job_uid).await;
+            delete_pods_owned_by(state, namespace, &job_uid, "Job").await;
         }
     }
 }
@@ -11424,6 +11493,228 @@ mod tests {
             "pod with deletionTimestamp + only tracking finalizer must be hard-deleted \
              when the job is deleted — without this, the GC cascade never completes and \
              the pod stays Terminating forever"
+        );
+    }
+
+    // -- CronJob cascade (mayor-2f5a) --
+
+    /// Deleting a CronJob must cascade-delete owned Jobs AND their pods, or the GC conformance
+    /// spec "should delete jobs and pods created by cronjob" will time out polling for 0 jobs
+    /// and 0 pods (observing 1 job / 1 pod for the full 60 s before "context deadline exceeded").
+    #[tokio::test]
+    async fn delete_cronjob_cascades_to_jobs_and_pods() {
+        let state = make_state();
+        let cj_uid = "cj-uid-aaaa-0001";
+        let job_uid = "job-uid-bbbb-0001";
+        let ns = "default";
+
+        // Seed the CronJob.
+        let cj_key = crate::keys::group_object_key("batch", "cronjobs", Some(ns), "my-cj");
+        let cj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": { "name": "my-cj", "namespace": ns, "uid": cj_uid },
+            "spec": { "schedule": "*/1 * * * *" }
+        });
+        state
+            .store
+            .put(
+                &cj_key,
+                bytes::Bytes::from(serde_json::to_vec(&cj).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed CronJob");
+
+        // Seed a Job owned by this CronJob (as KCM cronjob-controller creates it).
+        let job_key = crate::keys::group_object_key("batch", "jobs", Some(ns), "my-cj-job");
+        let job = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "my-cj-job",
+                "namespace": ns,
+                "uid": job_uid,
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "name": "my-cj",
+                    "uid": cj_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "template": { "spec": { "containers": [] } } }
+        });
+        state
+            .store
+            .put(
+                &job_key,
+                bytes::Bytes::from(serde_json::to_vec(&job).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed Job");
+
+        // Seed a Pod owned by the Job (as KCM job-controller creates it).
+        let pod_key = crate::keys::group_object_key("", "pods", Some(ns), "my-cj-job-pod");
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-cj-job-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": "my-cj-job",
+                    "uid": job_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        state
+            .store
+            .put(
+                &pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed Pod");
+
+        // Delete the CronJob (default empty body — matches what the GC conformance test sends).
+        delete_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "batch".into(),
+                "v1".into(),
+                ns.to_string(),
+                "cronjobs".into(),
+                "my-cj".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("CronJob delete must succeed: {e:?}"));
+
+        // CronJob itself must be gone.
+        assert!(
+            state.store.get(&cj_key).await.unwrap().is_none(),
+            "CronJob itself must be hard-deleted"
+        );
+
+        // Job must be cascade-deleted — without this the GC conformance spec sees 'expected 0 jobs, got 1'.
+        assert!(
+            state.store.get(&job_key).await.unwrap().is_none(),
+            "Job owned by deleted CronJob must be cascade-deleted — \
+             GC conformance spec 'should delete jobs and pods created by cronjob' fails otherwise"
+        );
+
+        // Pod must be cascade-deleted — without this the spec sees 'expected 0 pods, got 1'.
+        assert!(
+            state.store.get(&pod_key).await.unwrap().is_none(),
+            "Pod owned by Job owned by deleted CronJob must be cascade-deleted — \
+             GC conformance spec 'should delete jobs and pods created by cronjob' fails otherwise \
+             (two-level chain: CronJob->Job->Pod)"
+        );
+    }
+
+    /// Deleting a CronJob with propagationPolicy=Orphan must NOT cascade-delete its Jobs or Pods.
+    ///
+    /// Explicit Orphan semantics must be honored for CronJob just as for every other resource:
+    /// the owned Jobs (and their Pods) survive with ownerReferences stripped, so they are not
+    /// later garbage-collected as orphaned dependants.
+    #[tokio::test]
+    async fn delete_cronjob_with_orphan_policy_does_not_cascade() {
+        let state = make_state();
+        let cj_uid = "cj-uid-cccc-0002";
+        let job_uid = "job-uid-dddd-0002";
+        let ns = "default";
+
+        // Seed CronJob.
+        let cj_key = crate::keys::group_object_key("batch", "cronjobs", Some(ns), "orphan-cj");
+        let cj = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": { "name": "orphan-cj", "namespace": ns, "uid": cj_uid },
+            "spec": { "schedule": "*/1 * * * *" }
+        });
+        state
+            .store
+            .put(
+                &cj_key,
+                bytes::Bytes::from(serde_json::to_vec(&cj).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed CronJob");
+
+        // Seed a Job owned by the CronJob.
+        let job_key = crate::keys::group_object_key("batch", "jobs", Some(ns), "orphan-cj-job");
+        let job = serde_json::json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {
+                "name": "orphan-cj-job",
+                "namespace": ns,
+                "uid": job_uid,
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "name": "orphan-cj",
+                    "uid": cj_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "template": { "spec": { "containers": [] } } }
+        });
+        state
+            .store
+            .put(
+                &job_key,
+                bytes::Bytes::from(serde_json::to_vec(&job).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed Job");
+
+        // Delete with propagationPolicy=Orphan.
+        let orphan_body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": "Orphan"
+            }))
+            .unwrap(),
+        );
+        delete_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "batch".into(),
+                "v1".into(),
+                ns.to_string(),
+                "cronjobs".into(),
+                "orphan-cj".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            orphan_body,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Orphan delete must succeed: {e:?}"));
+
+        // CronJob itself must be gone.
+        assert!(
+            state.store.get(&cj_key).await.unwrap().is_none(),
+            "CronJob itself must be hard-deleted on Orphan delete"
+        );
+
+        // Job must survive — Orphan means do NOT cascade.
+        assert!(
+            state.store.get(&job_key).await.unwrap().is_some(),
+            "Orphan delete of CronJob must leave its Jobs alive — \
+             cascade on Orphan would contradict explicit Orphan semantics"
         );
     }
 
