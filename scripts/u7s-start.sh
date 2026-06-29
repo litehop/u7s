@@ -105,7 +105,12 @@ fi
 
 mkdir -p "$WORKDIR"
 
-KONNECTIVITY_PROXY_PORT="${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-8135}"
+if [ -n "${_KONNECTIVITY_SERVER_PORT_OVERRIDE:-}" ]; then
+  KONNECTIVITY_PROXY_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"
+else
+  # Auto-derive: 6443→8135, 6444→8235, 6445→8335 (each port offset of 1 adds 100).
+  KONNECTIVITY_PROXY_PORT=$(( 8135 + (PORT - 6443) * 100 ))
+fi
 # Derive agent/admin/health ports from the server port: server=N, agent=N-3, admin=N-2, health=N-1.
 # This matches the mayor default layout (8135/8132/8133/8134) and lets each slot pick
 # a unique base (slot1→8235, slot2→8335, …) without colliding with the mayor or each other.
