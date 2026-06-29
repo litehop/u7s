@@ -134,7 +134,8 @@ bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG}
 
 # Step 05: Start scheduler inside VM.
 banner "Step 5/6: Start u7s-scheduler"
-bash "$DIR/05-start-scheduler.sh"
+# shellcheck disable=SC2086
+bash "$DIR/05-start-scheduler.sh" ${_WORKDIR_ARG}
 
 # Step 06: Run sonobuoy.
 banner "Step 6/6: Run sonobuoy"

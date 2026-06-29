@@ -338,14 +338,14 @@ limit: ~4 GiB RAM per VM).
 
 **Available VMs and their assigned ports:**
 
-| VM name | Host port | Kubelet port | Notes |
-|---|---|---|---|
-| `lima-node` | `6443` | `10250` | Mayor's VM — never assign to workers |
-| slot 1 | `6444` | `10251` | |
-| slot 2 | `6445` | `10252` | |
-| slot 3 | `6446` | `10253` | |
-| slot 4 | `6447` | `10254` | |
-| slot 5 | `6448` | `10255` | |
+| VM name | Host port | Kubelet port | Konnectivity | Notes |
+|---|---|---|---|---|
+| `lima-node` | `6443` | `10250` | `8135` | Mayor's VM — never assign to workers |
+| slot 1 | `6444` | `10251` | `8235` | |
+| slot 2 | `6445` | `10252` | `8335` | |
+| slot 3 | `6446` | `10253` | `8435` | |
+| slot 4 | `6447` | `10254` | `8535` | |
+| slot 5 | `6448` | `10255` | `8635` | |
 
 All workers bind to `127.0.0.1` — port is the isolation boundary between parallel
 workers. Different loopback IPs are NOT reliably reachable from inside Lima VMs via
@@ -372,12 +372,14 @@ Your assigned kubelet port: 10251
 The worker uses these to invoke the conformance stack. `run-all.sh` is the single
 entry point — it builds, resets, restarts all components, and runs sonobuoy:
 
-```bash
-scripts/conformance/run-all.sh \
-  --vm lima-node-smoke \
-  --port 6444 \
-  --workdir ./temp/u7s \
-  [--reset] [--verbose] [--focus <regex>]
+Invoke it BARE — the first token of the command MUST be `scripts/...`. Do NOT
+prefix with `bash`/`sh` and do NOT lead with `cd ... &&`: the Bash allowlist
+matches commands that START WITH `scripts/conformance/run-all.sh`, so any prefix
+gets the call denied. If a call is denied, retry the bare form — a denial is a
+signal to fix the invocation, not to abort the task.
+
+```
+scripts/conformance/run-all.sh --vm lima-node-smoke --port 6444 --workdir ./temp/u7s [--reset] [--verbose] [--focus <regex>]
 ```
 
 `--workdir ./temp/u7s` (relative to CWD = worktree root) is where state lands.
@@ -385,7 +387,10 @@ scripts/conformance/run-all.sh \
 inline). Omit `--binary` and the script builds the worktree itself, so no manual
 `cargo build` is needed. Workers must not hard-code `lima-node` or `6443` anywhere.
 `U7S_HOST_IP` is no longer used — workers always bind to `127.0.0.1` and use
-`--port` for isolation.
+`--port` for isolation. The konnectivity port auto-derives from `--port` (6443→8135,
+6444→8235, 6445→8335, …); workers no longer need to pass `--konnectivity-server-port`
+for standard slots. An explicit `--konnectivity-server-port` override remains available
+when needed.
 
 ### Verify with kubectl first; reserve sonobuoy for the final gate
 

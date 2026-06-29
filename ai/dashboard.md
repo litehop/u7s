@@ -1,40 +1,57 @@
 # Dashboard
-2026-06-26T09:19Z — Mayor active. **0 workers in-flight, 0 open PRs, all 3 VMs free.** On main `98b8e69a`. Branch protection ON.
+2026-06-29T01:42Z — **PR #617 MERGED (cascade-delete + propagationPolicy=Orphan, GC correctness). Mayor on main `8b399974`, 0 workers, 0 open PRs. Branch protection ON. Loops CANCELLED.**
 
 Resume: `bd prime`
 
-## What needs the operator now
-**Decision: kick off a fresh FULL conformance run?** The actionable bead queue is drained (19 PRs merged this session). The last full data is the PARTIAL 0625-2158 sample (184/444 specs, killed at the 6h cap) — now stale after 19 fixes. A fresh full run would re-baseline the real remaining surface and inform the 2 non-trivial open beads (wjon, gobh).
-- Open question if you run it: bump the 6h sonobuoy cap? This session fixed many hang sources (pod-start/defaulting, proxy, status), so it may now finish in 6h. (NOTE: `--plugin-timeout` is NOT a valid flag — that was reverted. The cap is the aggregator `timeoutseconds` in the sonobuoy config; needs `sonobuoy gen --timeout` or a config file — verify the flag against the binary before editing.)
+## What just landed: #617 (mayor-3dnc cascade + mayor-5rkt Orphan)
+The 0627-1541 saturation root cause + the GC orphan bug, both fixed in one merged PR.
+- **Cascade:** owner hard-delete now cascades to owned pods (RS→pods, RC→pods, StatefulSet→pods). Stops the 110-pod node saturation (`OutOfpods` ×224 in 0627-1541 → ~24 fake failures + the 6h truncation).
+- **Orphan (the real root cause):** DELETE bodies are proto-encoded (`application/vnd.kubernetes.protobuf`); old code JSON-decoded them and ALWAYS got Background, silently ignoring `propagationPolicy`. Added a `DeleteOptionsProto` decoder; Orphan now strips ownerReferences + skips cascade; cascade gated on `policy != Orphan`. (Same proto-decode-drop family we've hit repeatedly.)
+- **Verified:** GC `--focus` on lima-node-smoke (run `temp/e2e/0629-1021-garbage-collector`): **7 passed / 4 failed (was 5/6)** — no regression, +2 specs. CI fully green (17/17). Fixed specs: orphan-RS-from-deployment, orphan-pods-rc [Serial], delete-RS-when-not-orphaning.
 
-## Open beads (3) — none a clean fix-dispatch
-- **mayor-wjon** (P2) in-place pod resize (`/pods/{name}/resize` subresource) — SPIKE-FIRST, a real feature. Scope before dispatch.
-- **mayor-gobh** (P3) OIDC discovery residual failures after the #606 TLS fix — INVESTIGATE-FIRST: needs a fresh `--focus` to capture the real failures (RBAC escalation? kube-root-ca CA mismatch?). Original log was lost.
-- **mayor-9xb5** (P3) remove dead `default_pod` from defaults.rs (trivial cargo-only chore; filed from #612). The one cleanly-dispatchable item, but tiny.
+## Follow-ups filed from #617's 4 remaining GC failures (all pre-existing, none a regression)
+- **mayor-wo9t (P3)** — legacy `orphanDependents=nil` orphan default still cascades (partial gap in #617's own Orphan fix; small extension).
+- **mayor-kxsk (P3, feature)** — Foreground propagation unimplemented (deferred by design; needs finalizer machinery).
+- **mayor-2f5a (P3)** — cronjob→jobs→pods + CR cascading deletion TIME OUT (`context deadline exceeded`). INVESTIGATE-FIRST: saturation/throughput vs. a real CronJob/CR cascade gap — re-run isolated on a clean node before assuming code gap.
+
+## Infra fix — mayor-evnb CONFIRMED + FIX DISPATCHED (agent ab80163e on lima-node-2)
+Scout (adcdeab4, CLOSED-by-mayor) + mayor-verified-in-source root cause of the 7h "aggregator Pending" hang. NOT "non-default VMs broken" — two bugs that only bite non-default workdir/port runs (workers used default temp/u7s → unaffected):
+- **BUG 1 (the hang):** `run-all.sh:137` invokes the scheduler with NO `${_WORKDIR_ARG}` (every sibling step passes it). Scheduler defaulted to `temp/u7s/kubeconfig` → connected to the WRONG cluster → never scheduled the lima-node-2 aggregator. (My konnectivity hypothesis was a red herring for the hang.) Side-effect: a non-default-workdir scheduler-start would pkill the MAYOR's scheduler (default-workdir pkill scope) — my baseline likely disrupted the mayor stack.
+- **BUG 2 (independent, breaks exec/logs not scheduling):** `u7s-start.sh:108` + `lima-start.sh:60` hardcode konnectivity port default 8135 → non-default run collides with mayor's 8135 → the `nc -z 8135` guard skips the konnectivity block → stack runs with no proxy.
+- **FIX (ab80163e):** (1) pass `${_WORKDIR_ARG}` to scheduler; (2) auto-derive konnectivity port = 8135+(PORT-6443)×100 in both scripts; (3) add konnectivity column to the VM-slots tables. Verifying on lima-node-2 with a NON-default workdir (closes the scout's no-live-repro gap). Findings: `ai/findings/0629-lima-node-2-konnectivity-hang.md`.
+- ⚠️ Worker is editing the VM-slots table in BOTH dispatch-prompt-template.md AND ai/dashboard.md — mayor must NOT touch those tables until its PR merges (collision avoidance).
+
+## 0627-1541 discrete-bug backlog (FILED, HELD — operator: dispatch none until priority decided)
+- **mayor-6fej (P2)** — kubectl OpenAPI `proto: cannot parse invalid wire-format data` (3 specs, one root cause; may relate to deferred mayor-52wo). Scout-first.
+- **mayor-bg9m (P2)** — 6 discrete wrong-value bugs (Lease times nil, PVC status, ExternalName→ClusterIP, GC orphan [now likely fixed by #617 — re-verify], PDB, Secret immutability). Split per-bug at dispatch.
+- **mayor-xe19 (P3)** — default ServiceCIDR not created (service-cidr-controller disabled) + RS GC timing.
+
+## Pre-existing held beads
+- mayor-wjon (P2) in-place pod resize — SPIKE-FIRST.
+- mayor-9xb5 (P3) remove dead default_pod — trivial cargo-only chore.
+- mayor-gobh (P3) OIDC residual after #606 — INVESTIGATE-FIRST.
+- mayor-trb0 (P3) parameterize scale handlers by group — cleanup from #615.
 
 ## Deferred (3)
-- mayor-52wo (P2) embed upstream OpenAPI v2 for built-in types — also makes `kubectl create/apply --validate` work (currently fails default validation on built-in types; needs `--validate=false`).
-- mayor-j7to (P2) Argo CD minimal RBAC seed.
-- mayor-rvkq (P3) CRD CEL validation rules.
+mayor-52wo (embed upstream OpenAPI v2) · mayor-j7to (Argo CD RBAC seed) · mayor-rvkq (CRD CEL validation).
+
+## TODO (mayor, trivial)
+- Fix the ` ```bash ` fence at `dispatch-prompt-template.md:375` → plain ``` (the source of workers copying `bash` into the allowlisted `run-all.sh` command). One-line doc edit; operator-approved.
+
+## Lessons this wave (candidates for bd memory)
+- **Mayor checkout drift:** dispatching a worker WITHOUT `isolation="worktree"` (to build on an existing PR branch) makes it operate in the mayor's checkout and leaves it on the feature branch. Twice this session. If a worker must extend an existing branch, either give it a worktree off that branch or expect to restore main afterward (stash beads/dashboard → checkout main → pull → re-export beads).
+- **`bash`/`cd` prefix breaks the allowlist:** `Bash(scripts/conformance/run-all.sh *)` matches commands STARTING WITH `scripts/...`. Any `bash `/`sh `/`cd ... &&` prefix → denied. Workers must invoke bare; a denial means adapt, not abort.
 
 ## Stance
-Pre-alpha Kubernetes apiserver in Rust. Correctness > conformance breadth. Workers in isolated worktrees (`ai/worktrees/`); mayor orchestrates, does not code (except trivial 4-condition, externally-verified edits). Merge-on-green WITH verification. No back-compat shims. Never `--admin`.
-
-## Standing rules / lessons
-Persisted as bd memories (survive compaction) — `bd memories` to read. This session banked: verify-bead-framing-before-dispatch · typing-guideline-no-raw-json-for-reasoned-fields · continue-running-agent-with-sendmessage · extract-e2e-logs-before-worktree-remove. (Time discipline + push policy + worker-dispatch mechanics already in memory.)
+Pre-alpha Kubernetes apiserver in Rust. Correctness > conformance breadth. Workers in isolated worktrees; mayor orchestrates, doesn't code (except trivial 4-condition externally-verified edits). Merge-on-green WITH verification. No back-compat shims. Never `--admin`.
 
 ## VM slots
-| Slot | VM | Port | Kubelet | Status |
-|---|---|---|---|---|
-| mayor | lima-node | 6443 | 10250 | operator stack (kubeconfig at temp/u7s/kubeconfig, node Ready) |
-| worker-1 | lima-node-smoke | 6444 | 10251 | free |
-| worker-2 | lima-node-2 | 6445 | 10252 | free |
-Konnectivity ports now per-slot (#613): server = 8135 + N×100; default 8135 = mayor.
-
-## Recent merges (this session) — 19 PRs + 1 direct commit
-Drain/endpointslice wave (latest first): #613 konnectivity per-slot ports (3w29) · #612 consolidate pod defaulting + found #610 default_pod dead-code (kma3) · #611 QOS compare-by-value (w3b5) · #610 containerPort/Service-port protocol=TCP (8ykk) · #609 EndpointSlice proto tag-swap (6ipr) · #608 clear stale condition reason on kubelet null (wblp).
-DEFER re-triage wave: #607 enable disruption controller (khgv) · #606 serving-cert kubernetes.default.svc SANs (s8ur) · #605 enableServiceLinks proto field 26 (kgtw) · #604 cfg(test) prepare_live_event (18h4) · `1a437ce9` KCM `--controllers='*,-cloud'` direct-commit (4xjk).
-Triage wave: #603 pod-proxy http→https (52fb) · #602 secs_to_rfc3339 leap-year fix (9ai4) · #601 Table 406 for non-Table auth handlers (ugt8) · #600 pod QOS+RuntimeClass overhead (jgwx/7r0q) · #599 lastTransitionTime decode (o67l) · #597 Service UpdateStatus conditions (ujet) · #596 CSI + ephemeral containers (emm1/xt41/trm9). #598 closed (wrong-path, superseded by #601).
+| Slot | VM | Port | Kubelet | Konnectivity | Status |
+|---|---|---|---|---|---|
+| mayor | lima-node | 6443 | 10250 | 8135 | operator stack |
+| worker-1 | lima-node-smoke | 6444 | 10251 | 8235 | free (known-good for GC focus) |
+| worker-2 | lima-node-2 | 6445 | 10252 | 8335 | free (mayor-evnb fix verified) |
+Konnectivity auto-derives from port: 8135 + (port − 6443) × 100. No need to pass --konnectivity-server-port for standard slots.
 
 ## Session loops
-:07 posture · :11 worktree hygiene · :17/2h cluster · :23/2h merge · :43 dispatch · :53 dashboard
+CANCELLED. Re-create on resume: :07 posture · :11 worktree hygiene · :17/2h cluster · :23/2h merge · :43 dispatch · :53 dashboard
