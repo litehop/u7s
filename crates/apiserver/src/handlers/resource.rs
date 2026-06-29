@@ -469,6 +469,7 @@ pub async fn replace_resource<S: Store>(
 pub async fn delete_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Guard first — before validate_name so colon-names in RBAC (e.g. system:node) don't fail
@@ -479,6 +480,7 @@ pub async fn delete_resource<S: Store>(
         )));
     }
     validate_name("name", &name)?;
+    let body = extract_body(&body, content_type(&headers));
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -1545,6 +1547,7 @@ pub async fn replace_namespaced_resource<S: Store>(
 pub async fn delete_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
@@ -1556,6 +1559,7 @@ pub async fn delete_namespaced_resource<S: Store>(
         )));
     }
     validate_name("name", &name)?;
+    let body = extract_body(&body, content_type(&headers));
     let delete_opts: DeleteOptions = if body.is_empty() {
         DeleteOptions::default()
     } else {
@@ -3706,6 +3710,7 @@ mod tests {
                 "leases".into(),
                 "node-b".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await
@@ -3735,6 +3740,7 @@ mod tests {
                 "leases".into(),
                 "nonexistent".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await;
@@ -3836,6 +3842,7 @@ mod tests {
                 "daemonsets".into(),
                 "my-ds".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await
@@ -3952,6 +3959,7 @@ mod tests {
                 "deployments".into(),
                 "my-deploy".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await
@@ -4082,6 +4090,7 @@ mod tests {
                 "deployments".into(),
                 "my-deploy2".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await
@@ -4201,6 +4210,7 @@ mod tests {
                 "replicationcontrollers".into(),
                 "my-rc".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await
@@ -4321,6 +4331,7 @@ mod tests {
                 "statefulsets".into(),
                 "my-sts".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await
@@ -4431,6 +4442,7 @@ mod tests {
                 "replicationcontrollers".into(),
                 "orphan-rc".into(),
             )),
+            axum::http::HeaderMap::new(),
             orphan_body,
         )
         .await
@@ -4547,6 +4559,7 @@ mod tests {
                 "deployments".into(),
                 "orphan-deploy".into(),
             )),
+            axum::http::HeaderMap::new(),
             orphan_body,
         )
         .await
@@ -4663,6 +4676,7 @@ mod tests {
                 "replicationcontrollers".into(),
                 "bg-rc".into(),
             )),
+            axum::http::HeaderMap::new(),
             bg_body,
         )
         .await
@@ -4789,6 +4803,7 @@ mod tests {
                 plural.to_string(),
                 name.to_string(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await
@@ -4964,6 +4979,7 @@ mod tests {
                 "clusterrolebindings".into(),
                 "system:node".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await;
@@ -4996,6 +5012,7 @@ mod tests {
                 "csinodes".into(),
                 "nonexistent".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await;
@@ -5053,6 +5070,7 @@ mod tests {
                 "csinodes".into(),
                 "finalizer-node".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await;
@@ -5653,6 +5671,7 @@ mod tests {
                 "leases".into(),
                 "finalizer-lease".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await;
@@ -5817,6 +5836,7 @@ mod tests {
                 "widgets".into(),
                 "missing-widget".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await;
@@ -5844,6 +5864,7 @@ mod tests {
                 "widgets".into(),
                 "missing-widget".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await;
@@ -6687,6 +6708,7 @@ mod tests {
                 "csinodes".into(),
                 "..".into(),
             )),
+            axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
         .await;

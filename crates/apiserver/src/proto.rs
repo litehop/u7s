@@ -88,6 +88,25 @@ struct MicroTime {
     nanos: i32,
 }
 
+/// DeleteOptions — controls how an object deletion is performed.
+/// Source: apimachinery-meta-v1-generated.proto message DeleteOptions
+/// Only the fields needed for propagationPolicy/orphanDependents are decoded.
+#[derive(Clone, PartialEq, Message)]
+struct DeleteOptionsProto {
+    /// gracePeriodSeconds (field 1, int64 optional)
+    #[prost(int64, optional, tag = "1")]
+    grace_period_seconds: Option<i64>,
+    /// preconditions (field 2, message) — skipped, decoded as bytes
+    #[prost(bytes = "vec", tag = "2")]
+    preconditions: Vec<u8>,
+    /// orphanDependents (field 3, bool optional) — deprecated, maps to Orphan
+    #[prost(bool, optional, tag = "3")]
+    orphan_dependents: Option<bool>,
+    /// propagationPolicy (field 4, string optional)
+    #[prost(string, optional, tag = "4")]
+    propagation_policy: Option<String>,
+}
+
 /// ObjectMeta — common metadata for all Kubernetes objects.
 /// Source: apimachinery-meta-v1-generated.proto message ObjectMeta
 #[derive(Clone, PartialEq, Message)]
@@ -7205,6 +7224,32 @@ pub fn decode_controllerrevision_proto(data: &[u8]) -> Option<serde_json::Value>
     Some(out)
 }
 
+/// Decode a proto-encoded DeleteOptions message into a serde_json::Value.
+///
+/// The Kubernetes client sends DELETE request bodies as protobuf-encoded DeleteOptions
+/// (Content-Type: application/vnd.kubernetes.protobuf). Without this decoder,
+/// extract_body returns the raw proto bytes and serde_json::from_slice fails silently
+/// (unwrap_or_default), so propagationPolicy=Orphan is never honored.
+pub fn decode_delete_options_proto(data: &[u8]) -> Option<serde_json::Value> {
+    let opts = DeleteOptionsProto::decode(data).ok()?;
+    let mut obj = serde_json::json!({
+        "apiVersion": "meta.k8s.io/v1",
+        "kind": "DeleteOptions"
+    });
+    if let Some(policy) = &opts.propagation_policy {
+        if !policy.is_empty() {
+            obj["propagationPolicy"] = serde_json::Value::String(policy.clone());
+        }
+    }
+    if let Some(orphan) = opts.orphan_dependents {
+        obj["orphanDependents"] = serde_json::Value::Bool(orphan);
+    }
+    if let Some(grace) = opts.grace_period_seconds {
+        obj["gracePeriodSeconds"] = serde_json::Value::Number(serde_json::Number::from(grace));
+    }
+    Some(obj)
+}
+
 pub fn decode_proto_by_kind_and_version(
     kind: &str,
     api_version: &str,
@@ -7269,6 +7314,7 @@ pub fn decode_proto_by_kind_and_version(
         "CertificateSigningRequest" => decode_csr_proto(raw),
         "PriorityClass" => decode_priorityclass_proto(raw),
         "ControllerRevision" => decode_controllerrevision_proto(raw),
+        "DeleteOptions" => decode_delete_options_proto(raw),
         _ => None,
     }
 }
@@ -15239,6 +15285,54 @@ mod tests {
             result["status"]["conditions"][0]["lastTransitionTime"], "2024-01-01T00:00:00Z",
             "lastTransitionTime must survive proto decode — without it, metav1.Condition is \
              missing a required field and API clients may reject or misinterpret the object"
+        );
+    }
+
+    /// decode_delete_options_proto must extract propagationPolicy=Orphan from proto-encoded body.
+    ///
+    /// The Kubernetes Go client sends DELETE request bodies as protobuf-encoded DeleteOptions.
+    /// Without this decoder, extract_body returns raw proto bytes, serde_json::from_slice fails
+    /// silently (unwrap_or_default → Background), and propagationPolicy=Orphan is never honored.
+    /// If this test fails (reverted), GC conformance specs for Orphan cascading will fail.
+    #[test]
+    fn decode_delete_options_proto_extracts_propagation_policy_orphan() {
+        // Build a proto-encoded DeleteOptions with propagationPolicy = "Orphan"
+        // field 4 (propagationPolicy) = string, wire type 2 (length-delimited)
+        let policy_bytes = b"Orphan";
+        let proto = encode_length_delimited(4, policy_bytes);
+
+        let result = decode_delete_options_proto(&proto)
+            .expect("proto-encoded DeleteOptions with propagationPolicy must decode");
+
+        assert_eq!(
+            result["propagationPolicy"], "Orphan",
+            "propagationPolicy=Orphan must survive proto decode — without this, \
+             the GC conformance spec 'should orphan RS created by deployment when \
+             deleteOptions.PropagationPolicy is Orphan' will fail because the Kubernetes \
+             client sends DeleteOptions as protobuf and the orphan gate never fires"
+        );
+    }
+
+    /// decode_delete_options_proto must extract orphanDependents=true from proto-encoded body.
+    ///
+    /// The legacy orphanDependents boolean field (field 3) must also be decoded correctly,
+    /// since some older clients use it instead of propagationPolicy.
+    #[test]
+    fn decode_delete_options_proto_extracts_orphan_dependents_true() {
+        // Build a proto-encoded DeleteOptions with orphanDependents = true
+        // field 3 (orphanDependents) = bool, wire type 0 (varint)
+        let tag = encode_varint(3 << 3); // field 3, wire type 0 (varint)
+        let mut proto = tag;
+        proto.push(1); // true
+
+        let result = decode_delete_options_proto(&proto)
+            .expect("proto-encoded DeleteOptions with orphanDependents must decode");
+
+        assert_eq!(
+            result["orphanDependents"], true,
+            "orphanDependents=true must survive proto decode — without this, \
+             legacy clients using orphanDependents instead of propagationPolicy \
+             will not get Orphan semantics"
         );
     }
 }
