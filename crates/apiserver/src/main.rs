@@ -147,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
     seed_services(&store, &apiserver_ip, apiserver_port).await?;
     seed_serviceaccounts(&store).await?;
     seed_coredns(&store).await?;
+    seed_servicecidrs(&store, &args.service_cluster_ip_range).await?;
 
     // 4. Generate TLS certs.
     let tls_material = generate_tls(&args)?;
@@ -3052,6 +3053,55 @@ async fn seed_flowcontrol(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seed the default `kubernetes` ServiceCIDR object.
+///
+/// A real kube-apiserver creates this via `service-cidr-controller` in KCM.
+/// u7s seeds it at startup (consistent with how default/kubernetes Service and
+/// RBAC bootstrap objects are seeded) so the conformance spec
+/// "[sig-network] ServiceCIDR and IPAddress API should support ServiceCIDR API
+/// operations" does not fail instantly with "ServiceCIDR kubernetes not found".
+async fn seed_servicecidrs(store: &SqliteStore, service_cidr: &str) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    if service_cidr.is_empty() {
+        return Ok(());
+    }
+
+    let key = keys::group_object_key("networking.k8s.io", "servicecidrs", None, "kubernetes");
+    let body = serde_json::json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "ServiceCIDR",
+        "metadata": {
+            "name": "kubernetes",
+            "uid": "00000000-0000-0000-0000-000000000030",
+            "creationTimestamp": "2024-01-01T00:00:00Z"
+        },
+        "spec": {
+            "cidrs": [service_cidr]
+        },
+        "status": {
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "lastTransitionTime": "2024-01-01T00:00:00Z",
+                "reason": "AppliedCIDR",
+                "message": "Kubernetes Service CIDR is ready"
+            }]
+        }
+    });
+    match store
+        .put(&key, Bytes::from(body.to_string()), Some(0))
+        .await
+    {
+        Ok(_) => tracing::info!("seeded ServiceCIDR: kubernetes"),
+        Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(anyhow::anyhow!("seed ServiceCIDR kubernetes: {e}")),
+    }
+
+    Ok(())
+}
+
 async fn serve_tls(
     listener: TcpListener,
     app: Router,
@@ -4428,6 +4478,72 @@ mod tests {
         seed_serviceaccounts(&store)
             .await
             .expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn seed_servicecidrs_creates_default_kubernetes_servicecidr() {
+        // The default ServiceCIDR named "kubernetes" must exist at startup.
+        // The conformance spec "[sig-network] ServiceCIDR and IPAddress API
+        // should support ServiceCIDR API operations" fails instantly with
+        // "ServiceCIDR kubernetes not found" if this object is absent.
+        let store = make_store();
+        seed_servicecidrs(&store, "10.96.0.0/12")
+            .await
+            .expect("seed must not fail");
+
+        let key = keys::group_object_key("networking.k8s.io", "servicecidrs", None, "kubernetes");
+        let obj = store.get(&key).await.expect("get must not fail");
+        assert!(
+            obj.is_some(),
+            "ServiceCIDR 'kubernetes' must exist after seeding — \
+             conformance test cannot proceed without it"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&obj.unwrap().value).expect("valid json");
+        assert_eq!(parsed["kind"].as_str(), Some("ServiceCIDR"));
+        assert_eq!(parsed["metadata"]["name"].as_str(), Some("kubernetes"));
+        assert_eq!(
+            parsed["spec"]["cidrs"][0].as_str(),
+            Some("10.96.0.0/12"),
+            "spec.cidrs must contain the service CIDR range"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_servicecidrs_is_idempotent() {
+        // A second call must not error — CAS rv=0 returns AlreadyExists which is silently ignored.
+        // This matches the startup guarantee: u7s may restart against an existing database.
+        let store = make_store();
+        seed_servicecidrs(&store, "10.96.0.0/12")
+            .await
+            .expect("first seed must not fail");
+        seed_servicecidrs(&store, "10.96.0.0/12")
+            .await
+            .expect("second seed must not fail — seed must be idempotent");
+
+        let key = keys::group_object_key("networking.k8s.io", "servicecidrs", None, "kubernetes");
+        let obj = store.get(&key).await.expect("get must not fail");
+        assert!(
+            obj.is_some(),
+            "ServiceCIDR 'kubernetes' must still exist after second seed call"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_servicecidrs_skips_empty_cidr() {
+        // When --service-cluster-ip-range is set to empty string (allocation disabled),
+        // seed_servicecidrs must not create any object.
+        let store = make_store();
+        seed_servicecidrs(&store, "")
+            .await
+            .expect("seed with empty cidr must not fail");
+
+        let key = keys::group_object_key("networking.k8s.io", "servicecidrs", None, "kubernetes");
+        let obj = store.get(&key).await.expect("get must not fail");
+        assert!(
+            obj.is_none(),
+            "ServiceCIDR 'kubernetes' must not be created when service CIDR is empty"
+        );
     }
 
     /// GET /openapi/v2 and /openapi/v3 must return 200 (not 403) without credentials.
