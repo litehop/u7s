@@ -11447,4 +11447,164 @@ mod tests {
             "admin who holds all pod-reader rules must be allowed to create a RoleBinding"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // Lease acquireTime/renewTime must be persisted and returned on GET
+    // (mayor-tiqt)
+    // ---------------------------------------------------------------------------
+
+    /// A Lease created with spec.acquireTime and spec.renewTime must return
+    /// those fields non-nil on GET.
+    ///
+    /// The conformance spec '[sig-node] Lease lease API should be available
+    /// [Conformance]' (k8s test/e2e/common/node/lease.go:99) creates a Lease with
+    /// both timestamps set and asserts they are non-nil after create and update.
+    /// If acquireTime or renewTime are dropped by the create or update path, the
+    /// test fails with "unexpected nil acquireTime" or "unexpected nil renewTime".
+    ///
+    /// This test fails if apply_defaults, the metadata round-trip, or any other
+    /// handler step strips spec fields from a Lease.
+    #[tokio::test]
+    async fn lease_acquire_and_renew_time_preserved_on_create_and_update() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, Query, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        let acquire_ts = "2026-06-29T12:00:00.000000Z";
+        let renew_ts = "2026-06-29T12:00:01.000000Z";
+
+        // Step 1: create a Lease with acquireTime and renewTime via PUT (upsert).
+        let lease_v1 = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "test-lease", "namespace": "kube-node-lease" },
+            "spec": {
+                "holderIdentity": "node-1",
+                "leaseDurationSeconds": 40,
+                "acquireTime": acquire_ts,
+                "renewTime": renew_ts,
+                "leaseTransitions": 0
+            }
+        });
+        let _ = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "test-lease".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&lease_v1).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Lease create must succeed: {e:?}"))
+        .into_response();
+
+        // Step 2: GET the Lease and check acquireTime/renewTime are present.
+        let get_resp = get_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "test-lease".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Lease GET must succeed: {e:?}"));
+
+        let body = to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            v["spec"]["acquireTime"].as_str(),
+            Some(acquire_ts),
+            "spec.acquireTime must be present after create — the Lease conformance test \
+             ([sig-node] Lease lease API should be available) checks acquireTime != nil \
+             after create; if dropped the test fails with 'unexpected nil acquireTime'"
+        );
+        assert_eq!(
+            v["spec"]["renewTime"].as_str(),
+            Some(renew_ts),
+            "spec.renewTime must be present after create — the Lease conformance test \
+             checks renewTime != nil after create; if dropped the test fails with \
+             'unexpected nil renewTime'"
+        );
+
+        // Step 3: UPDATE via PUT with a new renewTime but same acquireTime.
+        let new_renew_ts = "2026-06-29T12:00:41.000000Z";
+        let stored_rv = v["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let lease_v2 = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": "test-lease",
+                "namespace": "kube-node-lease",
+                "resourceVersion": stored_rv
+            },
+            "spec": {
+                "holderIdentity": "node-1",
+                "leaseDurationSeconds": 40,
+                "acquireTime": acquire_ts,
+                "renewTime": new_renew_ts,
+                "leaseTransitions": 0
+            }
+        });
+        let _ = replace_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "test-lease".into(),
+            )),
+            Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&lease_v2).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Lease update must succeed: {e:?}"))
+        .into_response();
+
+        // Step 4: GET again — acquireTime must still be set, renewTime updated.
+        let get_resp2 = get_namespaced_resource(
+            State(state.clone()),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "test-lease".into(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Lease second GET must succeed: {e:?}"));
+
+        let body2 = to_bytes(get_resp2.into_body(), usize::MAX).await.unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+
+        assert_eq!(
+            v2["spec"]["acquireTime"].as_str(),
+            Some(acquire_ts),
+            "spec.acquireTime must still be present after update — \
+             the Lease conformance test checks acquireTime != nil after update too"
+        );
+        assert_eq!(
+            v2["spec"]["renewTime"].as_str(),
+            Some(new_renew_ts),
+            "spec.renewTime must reflect the updated value after PUT update"
+        );
+    }
 }
