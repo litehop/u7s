@@ -467,11 +467,10 @@ pub struct NamespaceSpec {
 ///
 /// The apiserver reasons about propagationPolicy to gate cascade vs orphan
 /// behaviour, so it must flow through a typed struct rather than raw JSON map access.
-/// An absent or empty body is treated as Background (the default).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteOptions {
-    /// "Orphan", "Background", or "Foreground". Absent means Background.
+    /// "Orphan", "Background", or "Foreground". Absent/nil means: do not cascade synchronously.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub propagation_policy: Option<String>,
     /// Legacy field. True maps to "Orphan". Nil/absent means "use propagationPolicy".
@@ -480,14 +479,34 @@ pub struct DeleteOptions {
 }
 
 impl DeleteOptions {
-    /// Resolve the effective propagation policy.
-    /// `orphanDependents: true` is the legacy way to request Orphan.
-    /// If both are absent, Background is the default.
+    /// Returns true when the caller has explicitly requested Orphan propagation.
+    /// `orphanDependents: true` is the legacy spelling; `propagationPolicy: Orphan` is current.
     pub fn is_orphan(&self) -> bool {
         if let Some(true) = self.orphan_dependents {
             return true;
         }
         self.propagation_policy.as_deref() == Some("Orphan")
+    }
+
+    /// Returns true when the caller has explicitly requested cascade (Background or Foreground).
+    ///
+    /// This is the gate for synchronous cascade-delete on the apiserver.  When both
+    /// `propagationPolicy` and `orphanDependents` are absent/nil the request carries no
+    /// explicit propagation intent and we do NOT cascade immediately — the GC controller
+    /// is expected to clean up orphaned dependants asynchronously.  This matches upstream
+    /// Kubernetes: k8s GC conformance spec "should orphan pods created by rc if
+    /// deleteOptions.OrphanDependents is nil" deletes with empty DeleteOptions and asserts
+    /// pods survive for at least 30 seconds, which only holds if we do not synchronously
+    /// cascade them here.
+    pub fn is_explicit_cascade(&self) -> bool {
+        // Legacy spelling: orphanDependents=false is the old way to request Background.
+        if let Some(false) = self.orphan_dependents {
+            return true;
+        }
+        matches!(
+            self.propagation_policy.as_deref(),
+            Some("Background") | Some("Foreground")
+        )
     }
 }
 
