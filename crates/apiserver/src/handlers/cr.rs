@@ -336,6 +336,11 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
     let api_version = format!("{group}/{version}");
     obj["apiVersion"] = serde_json::Value::String(api_version);
     obj["kind"] = serde_json::Value::String(kind.to_string());
+    // Save ownerReferences before the ObjectMeta round-trip: ObjectMeta serde only
+    // knows declared fields, so ownerReferences is silently dropped by from_value/to_value.
+    // Restore it after so CR dependents created with ownerReferences survive intact and
+    // cascade_delete_cr_dependents can find them by ownerReference.uid.
+    let saved_owner_refs = obj["metadata"]["ownerReferences"].clone();
     let mut meta: crate::types::ObjectMeta =
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     if meta.uid.as_deref().map(|s| s.is_empty()).unwrap_or(true) {
@@ -350,6 +355,9 @@ fn stamp_cr_fields(obj: &mut serde_json::Value, group: &str, version: &str, kind
         meta.creation_timestamp = Some(utc_now_rfc3339());
     }
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
+    if !saved_owner_refs.is_null() {
+        obj["metadata"]["ownerReferences"] = saved_owner_refs;
+    }
 }
 
 fn validate_cr_name(name: &str) -> Result<(), crate::status::StatusError> {
@@ -7469,6 +7477,135 @@ mod tests {
         assert!(
             grand_after.is_none(),
             "grand-dependent must be transitively cascade-deleted — non-recursive cascade leaves intermediate nodes and leaks CRs"
+        );
+    }
+
+    /// Creating a CR via the API with ownerReferences in metadata must preserve those
+    /// references in storage. stamp_cr_fields rounds-trips metadata through ObjectMeta
+    /// (which lacks ownerReferences), so without an explicit save+restore the ownerRefs
+    /// are silently dropped — cascade_delete_cr_dependents then can't find dependents and
+    /// GC conformance 'should support cascading deletion of custom resources' fails.
+    #[tokio::test]
+    async fn create_cr_via_api_preserves_owner_references() {
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io";
+        let version = "v1";
+        let plural = "widgets";
+
+        // Create owner first to get a UID.
+        create_cr(
+            State(state.clone()),
+            Path((group.to_string(), version.to_string(), plural.to_string())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "metadata": { "name": "ownerref-owner" },
+                    "spec": {}
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("create owner");
+
+        let owner_uid = {
+            let s = state
+                .store
+                .get(&cr_store_key(
+                    group,
+                    version,
+                    plural,
+                    None,
+                    "ownerref-owner",
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&s.value).unwrap()["metadata"]["uid"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // Create dependent with ownerReference via the create_cr API handler.
+        create_cr(
+            State(state.clone()),
+            Path((group.to_string(), version.to_string(), plural.to_string())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                serde_json::json!({
+                    "apiVersion": "example.io/v1",
+                    "kind": "Widget",
+                    "metadata": {
+                        "name": "ownerref-dep",
+                        "ownerReferences": [{
+                            "apiVersion": "example.io/v1",
+                            "kind": "Widget",
+                            "name": "ownerref-owner",
+                            "uid": owner_uid,
+                            "controller": true,
+                            "blockOwnerDeletion": true
+                        }]
+                    },
+                    "spec": {}
+                })
+                .to_string(),
+            ),
+        )
+        .await
+        .expect("create dependent");
+
+        // Read back the dependent and verify ownerReferences survived the create round-trip.
+        let dep_stored = state
+            .store
+            .get(&cr_store_key(group, version, plural, None, "ownerref-dep"))
+            .await
+            .unwrap()
+            .unwrap();
+        let dep_obj: serde_json::Value = serde_json::from_slice(&dep_stored.value).unwrap();
+        let refs = dep_obj["metadata"]["ownerReferences"].as_array();
+        assert!(
+            refs.is_some() && !refs.unwrap().is_empty(),
+            "ownerReferences must be preserved through create_cr — stamp_cr_fields \
+             rounds-trips metadata through ObjectMeta which drops unknown fields; \
+             without explicit save+restore, cascade cannot find dependents and GC conformance fails"
+        );
+        assert_eq!(
+            refs.unwrap()[0]["uid"].as_str(),
+            Some(owner_uid.as_str()),
+            "the ownerReference uid must match the owner's uid"
+        );
+
+        // Delete owner — cascade must find the API-created dependent and delete it.
+        delete_cr(
+            State(state.clone()),
+            Path((
+                group.to_string(),
+                version.to_string(),
+                plural.to_string(),
+                "ownerref-owner".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete owner");
+
+        let dep_after = state
+            .store
+            .get(&cr_store_key(group, version, plural, None, "ownerref-dep"))
+            .await
+            .unwrap();
+        assert!(
+            dep_after.is_none(),
+            "cascade must delete a dependent that was created via the API with ownerReferences — \
+             if ownerRefs were dropped by create, cascade has nothing to match and the dependent leaks"
         );
     }
 }
