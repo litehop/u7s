@@ -160,6 +160,54 @@ static V1_RESOURCES: &[ApiResource] = &[
         short_names: Some(PODS_SHORT_NAMES),
     },
     ApiResource {
+        name: "pods/binding",
+        singular_name: "",
+        namespaced: true,
+        kind: "Binding",
+        verbs: &["create"],
+        short_names: None,
+    },
+    ApiResource {
+        name: "pods/ephemeralcontainers",
+        singular_name: "",
+        namespaced: true,
+        kind: "EphemeralContainers",
+        verbs: &["get", "patch", "update"],
+        short_names: None,
+    },
+    ApiResource {
+        name: "pods/eviction",
+        singular_name: "",
+        namespaced: true,
+        kind: "Eviction",
+        verbs: &["create"],
+        short_names: None,
+    },
+    ApiResource {
+        name: "pods/log",
+        singular_name: "",
+        namespaced: true,
+        kind: "Pod",
+        verbs: &["get"],
+        short_names: None,
+    },
+    ApiResource {
+        name: "pods/resize",
+        singular_name: "",
+        namespaced: true,
+        kind: "PodResizeBody",
+        verbs: &["get", "patch", "update"],
+        short_names: None,
+    },
+    ApiResource {
+        name: "pods/status",
+        singular_name: "",
+        namespaced: true,
+        kind: "Pod",
+        verbs: &["get", "patch", "update"],
+        short_names: None,
+    },
+    ApiResource {
         name: "replicationcontrollers",
         singular_name: "replicationcontroller",
         namespaced: true,
@@ -872,6 +920,59 @@ mod tests {
         assert!(
             names.contains(&"replicationcontrollers"),
             "replicationcontrollers must be in /api/v1 — legacy but required for API conformance"
+        );
+    }
+
+    /// pods/resize must be advertised in /api/v1 discovery or client-go falls back
+    /// to the regular replace endpoint, bypassing the resize-specific validation
+    /// and generation-bump logic.
+    ///
+    /// All pod subresources (binding, ephemeralcontainers, eviction, log, resize, status)
+    /// must be present so that discovery-aware clients can correctly route subresource requests.
+    #[test]
+    fn pod_subresources_advertised_in_v1_discovery() {
+        let list = ApiResourceList::v1();
+        let names: Vec<&str> = list.resources.iter().map(|r| r.name).collect();
+
+        assert!(
+            names.contains(&"pods/resize"),
+            "pods/resize must be in /api/v1 — without it client-go falls back \
+             to the replace endpoint and bypasses resize-specific handling"
+        );
+        assert!(
+            names.contains(&"pods/status"),
+            "pods/status must be in /api/v1 — kubelet and controllers patch pod status via this subresource"
+        );
+        assert!(
+            names.contains(&"pods/log"),
+            "pods/log must be in /api/v1 — kubectl logs depends on this subresource"
+        );
+        assert!(
+            names.contains(&"pods/binding"),
+            "pods/binding must be in /api/v1 — scheduler uses this to bind pods to nodes"
+        );
+        assert!(
+            names.contains(&"pods/eviction"),
+            "pods/eviction must be in /api/v1 — kubectl drain and PodDisruptionBudget enforcement use this"
+        );
+        assert!(
+            names.contains(&"pods/ephemeralcontainers"),
+            "pods/ephemeralcontainers must be in /api/v1 — kubectl debug uses this subresource"
+        );
+
+        // Verify pods/resize has the correct verbs for the resize protocol.
+        let resize = list
+            .resources
+            .iter()
+            .find(|r| r.name == "pods/resize")
+            .expect("pods/resize must be in /api/v1");
+        assert!(
+            resize.verbs.contains(&"patch"),
+            "pods/resize must advertise 'patch' verb — in-place resize uses PATCH"
+        );
+        assert!(
+            resize.verbs.contains(&"update"),
+            "pods/resize must advertise 'update' verb — in-place resize uses PUT"
         );
     }
 
