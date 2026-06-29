@@ -1681,11 +1681,20 @@ pub async fn delete_namespaced_resource<S: Store>(
         delete_replicasets_owned_by(&state, &ns, &owner_uid).await;
     }
 
-    // Cascade-delete pods owned by a deleted ReplicationController.
-    // RC→pods is the highest-saturation leg: conformance namespace
-    // replication-controller-2022 accumulated 385 pods with zero individual
-    // pod deletes — all pile up against the 110-pod node cap.
-    if group.is_empty() && plural == "replicationcontrollers" && !owner_uid.is_empty() {
+    // Cascade-delete pods owned by a deleted ReplicationController — only when the caller
+    // explicitly requests Background or Foreground propagation.
+    //
+    // When propagationPolicy and orphanDependents are both absent/nil the GC spec requires
+    // pods to survive: "should orphan pods created by rc if deleteOptions.OrphanDependents
+    // is nil" (garbage_collector.go:475) deletes with empty DeleteOptions and asserts the
+    // 2 pods exist after 30 s.  Cascading them here would fail that spec.  When the caller
+    // wants synchronous cascade they set propagationPolicy=Background (or Foreground), which
+    // is_explicit_cascade() detects, and we run the fast-path to avoid pod pile-ups.
+    if group.is_empty()
+        && plural == "replicationcontrollers"
+        && !owner_uid.is_empty()
+        && delete_opts.is_explicit_cascade()
+    {
         delete_pods_owned_by(&state, &ns, &owner_uid, "ReplicationController").await;
     }
 
@@ -4132,14 +4141,16 @@ mod tests {
         );
     }
 
-    /// Deleting a ReplicationController must cascade-delete owned pods immediately.
+    /// Deleting a ReplicationController with explicit propagationPolicy=Background must
+    /// cascade-delete owned pods immediately.
     ///
-    /// RC→pods is the highest-saturation leg: conformance namespace
-    /// replication-controller-2022 accumulated 385 pods with zero individual pod
-    /// deletes — without this cascade all 385 pile up against the 110-pod node cap
-    /// and cause OutOfpods saturation for every subsequent test.
+    /// Callers that want synchronous cascade (e.g. conformance teardown tooling that passes
+    /// propagationPolicy=Background) need pods gone fast so the 110-pod node cap is not hit.
+    /// The cascade only fires on explicit Background/Foreground; nil policy leaves pods alive
+    /// so the GC conformance spec "should orphan pods created by rc if deleteOptions.OrphanDependents
+    /// is nil" can assert pods survive.
     #[tokio::test]
-    async fn delete_rc_cascades_to_owned_pods() {
+    async fn background_policy_rc_delete_cascades_to_owned_pods() {
         use std::sync::Arc;
         use u7s_store::SqliteStore;
 
@@ -4215,7 +4226,15 @@ mod tests {
             .await
             .unwrap();
 
-        // Delete the ReplicationController.
+        // Delete with explicit propagationPolicy=Background — cascade must fire.
+        let bg_body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": "Background"
+            }))
+            .unwrap(),
+        );
         delete_namespaced_resource(
             axum::extract::State(state),
             axum::extract::Path((
@@ -4226,16 +4245,19 @@ mod tests {
                 "my-rc".into(),
             )),
             axum::http::HeaderMap::new(),
-            bytes::Bytes::new(),
+            bg_body,
         )
         .await
         .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
 
-        // Owned pod must be cascade-deleted — RC delete must cascade or node saturates at 110-pod cap.
+        // Owned pod must be cascade-deleted — explicit Background must cascade immediately.
+        // If this fails the synchronous cascade path is gated too wide and Background deletes
+        // do not clean up pods, causing pod pile-ups against the 110-pod node cap.
         assert!(
             store.get(pod_key).await.unwrap().is_none(),
-            "pod owned by deleted ReplicationController must be cascade-deleted — \
-             RC delete must cascade to pods or the node saturates at the 110-pod cap"
+            "pod owned by deleted ReplicationController must be cascade-deleted on \
+             explicit Background delete — without synchronous cascade the node saturates \
+             at the 110-pod cap when callers explicitly request Background propagation"
         );
 
         // RC itself must be deleted.
@@ -4248,6 +4270,112 @@ mod tests {
         assert!(
             store.get(other_pod_key).await.unwrap().is_some(),
             "pod not owned by the deleted RC must not be affected"
+        );
+    }
+
+    /// Deleting a ReplicationController with no propagationPolicy (nil) must NOT
+    /// cascade-delete owned pods.
+    ///
+    /// The k8s GC conformance spec "should orphan pods created by rc if
+    /// deleteOptions.OrphanDependents is nil" (garbage_collector.go:475) sends an
+    /// empty DeleteOptions (only Preconditions) and then asserts that the 2 pods
+    /// created by the RC still exist after 30 s.  In upstream Kubernetes the GC
+    /// controller handles cascade asynchronously; in u7s we must not cascade
+    /// synchronously when no explicit policy is present, so the pods survive the
+    /// wait and the conformance spec passes.
+    #[tokio::test]
+    async fn nil_propagation_rc_delete_does_not_cascade_pods() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let rc_uid = "dddddddd-0000-0000-0000-000000000002";
+        let ns = "default";
+
+        // Seed the ReplicationController (no special finalizers — plain RC as the GC test creates).
+        let rc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "nil-policy-rc", "namespace": ns, "uid": rc_uid },
+            "spec": { "replicas": 2, "selector": { "app": "nil-policy-rc" } }
+        });
+        let rc_key = "/registry/replicationcontrollers/default/nil-policy-rc";
+        store
+            .put(
+                rc_key,
+                bytes::Bytes::from(serde_json::to_vec(&rc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Seed a pod owned by this RC.
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "nil-policy-rc-pod",
+                "namespace": ns,
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "name": "nil-policy-rc",
+                    "uid": rc_uid,
+                    "controller": true
+                }]
+            },
+            "spec": { "containers": [{ "name": "c", "image": "busybox" }] }
+        });
+        let pod_key = "/registry/pods/default/nil-policy-rc-pod";
+        store
+            .put(
+                pod_key,
+                bytes::Bytes::from(serde_json::to_vec(&pod).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete with empty body (nil propagationPolicy, nil orphanDependents) — the exact
+        // shape the GC conformance test sends via metav1.DeleteOptions{Preconditions: ...}.
+        delete_namespaced_resource(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "".into(),
+                "v1".into(),
+                ns.to_string(),
+                "replicationcontrollers".into(),
+                "nil-policy-rc".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("delete must succeed: {e:?}"));
+
+        // RC itself must be gone.
+        assert!(
+            store.get(rc_key).await.unwrap().is_none(),
+            "ReplicationController itself must be hard-deleted"
+        );
+
+        // Pod must SURVIVE — nil policy means GC handles it asynchronously, not us.
+        // If this fails the conformance spec 'should orphan pods created by rc if
+        // deleteOptions.OrphanDependents is nil' will report 'expect 2 pods, got 0 pods'.
+        assert!(
+            store.get(pod_key).await.unwrap().is_some(),
+            "pod owned by RC must survive when DeleteOptions has nil propagationPolicy — \
+             synchronous cascade must only fire on explicit Background/Foreground, not on \
+             empty DeleteOptions; the GC conformance spec 'deleteOptions.OrphanDependents is nil' \
+             fails if we cascade here"
         );
     }
 
