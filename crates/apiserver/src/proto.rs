@@ -813,6 +813,19 @@ struct EnvFromSource {
     secret_ref: Option<SecretEnvSource>,
 }
 
+/// ContainerResizePolicy — k8s.io/api/core/v1/generated.proto message ContainerResizePolicy
+/// Specifies the resize policy for a resource (cpu/memory) in a container.
+/// Field numbers: resourceName (field 1), restartPolicy (field 2).
+#[derive(Clone, PartialEq, Message)]
+struct ContainerResizePolicy {
+    /// resourceName (field 1, string) — "cpu" or "memory"
+    #[prost(string, tag = "1")]
+    resource_name: String,
+    /// restartPolicy (field 2, string) — "NotRequired" or "RestartContainer"
+    #[prost(string, tag = "2")]
+    restart_policy: String,
+}
+
 /// ContainerPort — k8s.io/api/core/v1/generated.proto message ContainerPort
 /// Represents a network port in a single container.
 #[derive(Clone, PartialEq, Message)]
@@ -883,6 +896,11 @@ struct Container {
     /// startupProbe (field 22, message Probe)
     #[prost(message, tag = "22")]
     startup_probe: Option<Probe>,
+    /// resizePolicy (field 23, repeated ContainerResizePolicy) — per-resource resize restart policy;
+    /// used by kubelet and apiserver for in-place pod resize (KEP-1287). Silently dropped before
+    /// this fix, causing resize conformance tests to fail post-PATCH verification.
+    #[prost(message, repeated, tag = "23")]
+    resize_policy: Vec<ContainerResizePolicy>,
     /// lifecycle (field 12, message Lifecycle)
     #[prost(message, tag = "12")]
     lifecycle: Option<Lifecycle>,
@@ -4699,6 +4717,32 @@ fn container_to_json(c: Container) -> serde_json::Value {
     }
     if let Some(lc) = c.lifecycle {
         cm.insert("lifecycle".to_string(), lifecycle_to_json(lc));
+    }
+    if !c.resize_policy.is_empty() {
+        let rp_json: Vec<serde_json::Value> = c
+            .resize_policy
+            .into_iter()
+            .map(|rp| {
+                let mut rpm = serde_json::Map::new();
+                if !rp.resource_name.is_empty() {
+                    rpm.insert(
+                        "resourceName".to_string(),
+                        serde_json::Value::String(rp.resource_name),
+                    );
+                }
+                if !rp.restart_policy.is_empty() {
+                    rpm.insert(
+                        "restartPolicy".to_string(),
+                        serde_json::Value::String(rp.restart_policy),
+                    );
+                }
+                serde_json::Value::Object(rpm)
+            })
+            .collect();
+        cm.insert(
+            "resizePolicy".to_string(),
+            serde_json::Value::Array(rp_json),
+        );
     }
     if !c.volume_mounts.is_empty() {
         let mounts: Vec<serde_json::Value> = c
@@ -15870,6 +15914,77 @@ mod tests {
              the GC conformance spec 'should orphan RS created by deployment when \
              deleteOptions.PropagationPolicy is Orphan' will fail because the Kubernetes \
              client sends DeleteOptions as protobuf and the orphan gate never fires"
+        );
+    }
+
+    /// decode_pod_proto must preserve Container.resizePolicy (proto field 23) through the decode.
+    ///
+    /// resizePolicy is a repeated ContainerResizePolicy specifying how the kubelet should handle
+    /// in-place CPU/memory resize (KEP-1287). kubectl/client-go send pods as protobuf; if field 23
+    /// is absent from the Container prost struct it is SILENTLY DROPPED — the GET response after a
+    /// PATCH /resize will be missing resizePolicy, causing the resize conformance tests
+    /// "Pod InPlace Resize Container 6 containers various operations" and
+    /// "increase CPU/mem multi-container" to fail on their post-PATCH verification step.
+    /// This test MUST fail if the ContainerResizePolicy struct or the resize_policy field (tag=23)
+    /// on Container is removed.
+    #[test]
+    fn decode_container_proto_preserves_resize_policy() {
+        // Build ContainerResizePolicy{resourceName="cpu", restartPolicy="NotRequired"}
+        let mut crp_cpu = encode_length_delimited(1, b"cpu"); // resourceName (field 1)
+        crp_cpu.extend_from_slice(&encode_length_delimited(2, b"NotRequired")); // restartPolicy (field 2)
+
+        // Build ContainerResizePolicy{resourceName="memory", restartPolicy="RestartContainer"}
+        let mut crp_mem = encode_length_delimited(1, b"memory"); // resourceName (field 1)
+        crp_mem.extend_from_slice(&encode_length_delimited(2, b"RestartContainer")); // restartPolicy (field 2)
+
+        // Container: name (field 1), image (field 2), resizePolicy repeated (field 23)
+        let mut container = encode_length_delimited(1, b"app"); // name
+        container.extend_from_slice(&encode_length_delimited(2, b"app:latest")); // image
+        container.extend_from_slice(&encode_length_delimited(23, &crp_cpu)); // resizePolicy[0]
+        container.extend_from_slice(&encode_length_delimited(23, &crp_mem)); // resizePolicy[1]
+
+        // PodSpec: containers (field 2)
+        let pod_spec = encode_length_delimited(2, &container);
+
+        // Pod: metadata (field 1), spec (field 2)
+        let mut obj_meta = encode_length_delimited(1, b"resize-test"); // ObjectMeta.name
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("pod with resizePolicy must decode — proto field 23 is ContainerResizePolicy");
+
+        let containers = result["spec"]["containers"]
+            .as_array()
+            .expect("spec.containers must be an array");
+        assert_eq!(containers.len(), 1);
+
+        let resize_policy = containers[0]["resizePolicy"]
+            .as_array()
+            .expect("resizePolicy must be present — without field 23 in Container prost struct it is silently dropped, breaking resize conformance tests");
+        assert_eq!(
+            resize_policy.len(),
+            2,
+            "both resizePolicy entries must survive proto decode"
+        );
+        assert_eq!(
+            resize_policy[0]["resourceName"], "cpu",
+            "resizePolicy[0].resourceName must be 'cpu'"
+        );
+        assert_eq!(
+            resize_policy[0]["restartPolicy"], "NotRequired",
+            "resizePolicy[0].restartPolicy must be 'NotRequired'"
+        );
+        assert_eq!(
+            resize_policy[1]["resourceName"], "memory",
+            "resizePolicy[1].resourceName must be 'memory'"
+        );
+        assert_eq!(
+            resize_policy[1]["restartPolicy"], "RestartContainer",
+            "resizePolicy[1].restartPolicy must be 'RestartContainer' — if this fails, \
+             resize conformance tests will fail on post-PATCH GET verification because \
+             the returned pod is missing resizePolicy"
         );
     }
 
