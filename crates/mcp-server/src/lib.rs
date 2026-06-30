@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerInfo},
+    model::{CallToolResult, ContentBlock, ServerInfo},
     schemars, tool, tool_router,
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -94,7 +94,7 @@ impl U7sTools {
 
         let diagnostics = parse_diagnostics(&String::from_utf8_lossy(&output.stdout));
         let json = serde_json::to_string_pretty(&diagnostics).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     /// List all open beads that are ready to work (no blockers).
@@ -109,7 +109,7 @@ impl U7sTools {
             .map_err(|e| McpError::internal_error(format!("failed to run bd: {e}"), None))?;
 
         let text = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     /// Show full details of a bead issue by ID.
@@ -130,7 +130,7 @@ impl U7sTools {
         } else {
             String::from_utf8_lossy(&output.stderr).to_string()
         };
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 }
 
