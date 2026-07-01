@@ -1423,7 +1423,12 @@ pub async fn replace_pod_status<S: Store>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
-    let ns = parse_namespace(&raw_ns, &state).await?;
+    // Skip namespace existence check: KCM's pod-GC calls PUT /status to mark a pod
+    // Failed after the namespace is already deleted. Checking namespace existence here
+    // would return "Namespace not found" 404, which KCM treats as retryable — trapping
+    // GC in an infinite retry loop. Skipping the check lets the pod key lookup below
+    // return "Pod not found" 404 instead, which KCM treats as terminal (pod is gone).
+    let ns = Namespace::parse(&raw_ns).map_err(Status::bad_request)?;
     let ct = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1677,7 +1682,12 @@ pub async fn patch_pod_status<S: Store>(
         )));
     }
 
-    let ns = parse_namespace(&raw_ns, &state).await?;
+    // Skip namespace existence check: KCM's pod-GC calls PATCH /status to mark a pod
+    // Failed after the namespace is already deleted. Checking namespace existence here
+    // would return "Namespace not found" 404, which KCM treats as retryable — trapping
+    // GC in an infinite retry loop. Skipping the check lets the pod key lookup below
+    // return "Pod not found" 404 instead, which KCM treats as terminal (pod is gone).
+    let ns = Namespace::parse(&raw_ns).map_err(Status::bad_request)?;
 
     let key = object_key("pods", ns.as_str(), &name);
 
@@ -6213,6 +6223,128 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// Regression test for mayor-h9fz: PATCH /status on a pod whose namespace is deleted
+    /// must return "Pod not found" 404 (loop-terminating), NOT "Namespace not found" 404
+    /// (retryable). KCM's pod-GC controller marks orphaned/terminating pods Failed via a
+    /// status PATCH; if the namespace is already hard-deleted, the previous code returned
+    /// "Namespace not found" 404 because parse_namespace ran first. KCM treats that as a
+    /// retryable error and retried every ~2s forever (2566 errors in 15h in one run),
+    /// keeping the apiserver log growing and the GC loop hot indefinitely. A "Pod not found"
+    /// 404 is what KCM treats as terminal (pod is gone, GC is done).
+    ///
+    /// This test fails if the namespace existence check is reintroduced in patch_pod_status:
+    /// PATCH on a missing namespace would return 404 with reason=NotFound and message
+    /// containing "Namespace", not "Pod", breaking the invariant below.
+    #[tokio::test]
+    async fn terminal_status_patch_on_pod_in_deleted_ns_does_not_trap_gc_retry() {
+        let (state, _) = make_state();
+        // Namespace is NOT seeded — simulates a hard-deleted namespace.
+        // Pod is also absent (cascade-deleted with the namespace).
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                patch(patch_pod_status),
+            )
+            .with_state(state);
+
+        // KCM pod-GC issues this exact patch to mark an orphaned pod Failed.
+        let patch_body = serde_json::json!({"status": {"phase": "Failed"}});
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/v1/namespaces/deleted-namespace/pods/orphan-pod/status")
+            .header(
+                header::CONTENT_TYPE,
+                "application/strategic-merge-patch+json",
+            )
+            .body(json_body(&patch_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        // Must be 404 (not 500 or 200).
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "status PATCH on deleted namespace must return 404 so KCM GC can terminate"
+        );
+
+        // Read response body to verify the 404 is for the POD, not the namespace.
+        // KCM treats 'Pod not found' as terminal but 'Namespace not found' as retryable.
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+        let message = body["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("Pod") || message.contains("pod") || message.contains("orphan-pod"),
+            "404 must identify the missing Pod, not the Namespace — \
+             KCM gc_controller treats 'Pod not found' as terminal (GC done) \
+             but 'Namespace not found' as retryable (GC loops forever). \
+             Got message: '{message}'"
+        );
+        assert!(
+            !message.to_lowercase().contains("namespace"),
+            "404 must NOT mention Namespace — that is the retryable error that traps KCM GC. \
+             Got message: '{message}'"
+        );
+    }
+
+    /// Regression test for mayor-h9fz: PUT /status on a pod whose namespace is deleted
+    /// must return "Pod not found" 404, not "Namespace not found" 404.
+    /// Same invariant as the PATCH case above — KCM also uses PUT /status in some paths.
+    #[tokio::test]
+    async fn terminal_status_put_on_pod_in_deleted_ns_does_not_trap_gc_retry() {
+        let (state, _) = make_state();
+        // Namespace is NOT seeded — simulates a hard-deleted namespace.
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "orphan-pod", "namespace": "deleted-namespace"},
+            "status": {"phase": "Failed"}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/deleted-namespace/pods/orphan-pod/status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "status PUT on deleted namespace must return 404"
+        );
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resp_body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+        let message = resp_body["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("Pod") || message.contains("pod") || message.contains("orphan-pod"),
+            "404 must identify the missing Pod — \
+             a Namespace 404 traps KCM pod-GC in an infinite retry loop. \
+             Got: '{message}'"
+        );
+        assert!(
+            !message.to_lowercase().contains("namespace"),
+            "404 must NOT mention Namespace. Got: '{message}'"
+        );
     }
 
     // -----------------------------------------------------------------------
