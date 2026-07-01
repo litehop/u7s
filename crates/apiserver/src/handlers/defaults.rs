@@ -37,6 +37,9 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     if let ("coordination.k8s.io", "leases") = (group, plural) {
         default_lease(obj);
     }
+    if let ("", "replicationcontrollers") = (group, plural) {
+        default_replicationcontroller(obj);
+    }
 
     if is_workload_resource(group, plural) {
         initialize_workload_generation(obj);
@@ -135,6 +138,37 @@ fn default_pvc(obj: &mut serde_json::Value) {
             obj["status"] = serde_json::json!({});
         }
         obj["status"]["phase"] = serde_json::Value::String("Pending".to_string());
+    }
+}
+
+/// Default `spec.selector` and `spec.replicas` on a ReplicationController when absent.
+///
+/// Upstream kube-apiserver defaults RC's `spec.selector` from `spec.template.metadata.labels`
+/// at create time when the caller omits it. The conformance helper `newRC` (test/e2e/apps/rc.go)
+/// creates RCs without an explicit selector, relying on this defaulting. Without it our apiserver
+/// stores an empty selector; the KCM RC controller with an empty selector cannot match the pods it
+/// creates (empty set matches nothing) → always sees active=0/desired=N → creates pods without
+/// bound (verified: nil-selector RC created 179 pods in 8 s; mayor-n9t6).
+///
+/// IMPORTANT: RC uses a flat equality-based label selector (`map<string,string>`), NOT the
+/// set-based `{matchLabels: {...}}` format used by ReplicaSet/StatefulSet/Deployment.
+/// Wrapping in `matchLabels` would produce a JSON structure that KCM cannot parse as an RC
+/// selector and would re-introduce the empty-match runaway.
+///
+/// Idempotent: an existing non-null selector is never overwritten.
+fn default_replicationcontroller(obj: &mut serde_json::Value) {
+    // Default spec.selector from template labels when absent.
+    // RC selector is a flat map<string,string> — NOT wrapped in matchLabels.
+    if obj["spec"]["selector"].is_null() {
+        let labels = obj["spec"]["template"]["metadata"]["labels"].clone();
+        if labels.is_object() {
+            obj["spec"]["selector"] = labels;
+        }
+    }
+
+    // Default spec.replicas to 1 when absent.
+    if obj["spec"]["replicas"].is_null() {
+        obj["spec"]["replicas"] = serde_json::Value::Number(1.into());
     }
 }
 
@@ -1509,6 +1543,102 @@ mod tests {
             serde_json::Value::Number(3.into()),
             "existing partition must not be overwritten — resetting a canary partition \
              to 0 would release all pods at once, defeating the staged rollout"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // ReplicationController defaults
+    // ---------------------------------------------------------------------------
+
+    /// A nil RC selector must default to the template labels; otherwise the RC controller
+    /// cannot match its own pods and creates them without bound (conformance RC runaway, mayor-n9t6).
+    ///
+    /// The conformance helper `newRC` (test/e2e/apps/rc.go) creates an RC with spec.selector=nil,
+    /// relying on this defaulting. Without it the apiserver stores an empty selector; KCM sees
+    /// active=0 forever and created 179 pods in 8 s on the live stack before the node saturated.
+    ///
+    /// RC selector is a FLAT map (not matchLabels) — wrapping would break KCM's selector parse.
+    #[test]
+    fn rc_selector_defaults_from_template_labels_else_kcm_runaway() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "template": {
+                    "metadata": { "labels": { "name": "my-hostname-basic" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("", "replicationcontrollers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "name": "my-hostname-basic" }),
+            "spec.selector must be a flat map defaulted from template labels — \
+             an empty RC selector causes KCM to see active=0 forever and create \
+             pods without bound (conformance RC runaway, mayor-n9t6)"
+        );
+        // Must NOT be wrapped in matchLabels (RC uses equality-based selector).
+        assert!(
+            obj["spec"]["selector"]["matchLabels"].is_null(),
+            "RC selector must be flat, not wrapped in matchLabels — \
+             matchLabels wrapping makes KCM fail to parse the selector as an RC equality selector"
+        );
+    }
+
+    /// RC spec.replicas must default to 1 when absent.
+    ///
+    /// KCM's RC controller dereferences *rc.Spec.Replicas; nil causes a nil-pointer panic.
+    #[test]
+    fn rc_replicas_defaults_to_1() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "app": "test" },
+                "template": {}
+            }
+        });
+
+        apply_defaults("", "replicationcontrollers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["replicas"],
+            serde_json::Value::Number(1.into()),
+            "spec.replicas must default to 1 — nil replicas panics KCM RC controller"
+        );
+    }
+
+    /// An existing RC spec.selector must not be overwritten.
+    ///
+    /// Overwriting a user-supplied selector would change which pods the RC considers owned,
+    /// causing it to orphan existing pods and create new ones — effectively a runaway.
+    #[test]
+    fn rc_existing_selector_not_overwritten() {
+        let mut obj = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "metadata": { "name": "test", "namespace": "default" },
+            "spec": {
+                "selector": { "app": "my-explicit-selector" },
+                "template": {
+                    "metadata": { "labels": { "app": "my-explicit-selector", "extra": "label" } },
+                    "spec": { "containers": [] }
+                }
+            }
+        });
+
+        apply_defaults("", "replicationcontrollers", &mut obj);
+
+        assert_eq!(
+            obj["spec"]["selector"],
+            serde_json::json!({ "app": "my-explicit-selector" }),
+            "existing RC spec.selector must not be overwritten — \
+             changing it would cause the RC controller to orphan owned pods"
         );
     }
 
