@@ -1729,6 +1729,104 @@ pub async fn patch_pod_status<S: Store>(
 // Resize subresource — PATCH/PUT /api/v1/namespaces/:ns/pods/:name/resize
 // ---------------------------------------------------------------------------
 
+/// Validate a resize patch against the stored pod before applying it.
+///
+/// Kubernetes rejects resize patches that would:
+/// 1. Reference a container name not present in the stored pod (rename/add).
+/// 2. Remove a resource quantity that is currently set on the container
+///    (resize may change values but not remove resource fields).
+/// 3. Change the pod's QoS class (e.g. BestEffort → Burstable, Guaranteed → Burstable).
+///
+/// This matches real k8s behaviour: the conformance test
+/// "apply invalid resize patch requests" expects 422 for all such mutations.
+/// Without this check u7s accepts patches that real k8s rejects, causing
+/// conformance failures ("Expected an error to have occurred. Got: nil").
+pub fn validate_resize_patch(
+    stored: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> Result<(), String> {
+    let pod_ns = stored["metadata"]["namespace"].as_str().unwrap_or("");
+    let pod_name = stored["metadata"]["name"].as_str().unwrap_or("");
+
+    let stored_containers = stored["spec"]["containers"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+
+    // Build the map: stored container name → stored container object.
+    let stored_by_name: std::collections::HashMap<&str, &serde_json::Value> = stored_containers
+        .iter()
+        .filter_map(|c| c["name"].as_str().map(|n| (n, c)))
+        .collect();
+
+    // Rule 1: every container named in the patch must exist in the stored pod.
+    // A name that doesn't match any stored container is either a rename (forbidden)
+    // or an attempt to add a new container (also forbidden).
+    if let Some(incoming_containers) = incoming["spec"]["containers"].as_array() {
+        for c in incoming_containers {
+            let name = c["name"].as_str().unwrap_or("");
+            if !stored_by_name.contains_key(name) {
+                return Err(format!(
+                    "Pod {pod_ns}/{pod_name}: spec.containers[name={name}]: \
+                     container not found in pod — resize may not rename or add containers",
+                ));
+            }
+        }
+
+        // Rule 2: resize may not remove a resource quantity that is currently set.
+        // For each incoming container that appears in the stored pod, check that every
+        // resource quantity (requests.cpu, requests.memory, limits.cpu, limits.memory)
+        // that is non-empty in the stored container is also non-empty in the patch.
+        // Removing a resource quantity changes the effective resource structure and is
+        // forbidden by k8s resize validation (e.g. Burstable pod removing cpu requests
+        // or Burstable pod removing limits while increasing requests).
+        for c in incoming_containers {
+            let name = c["name"].as_str().unwrap_or("");
+            let Some(stored_c) = stored_by_name.get(name) else {
+                continue; // already caught by Rule 1
+            };
+
+            for section in &["requests", "limits"] {
+                for resource in &["cpu", "memory"] {
+                    let stored_val = &stored_c["resources"][section][resource];
+                    let incoming_resources = &c["resources"];
+                    // Only validate if the incoming patch specifies a resources object.
+                    // If incoming["resources"] is null, apply_resize_patch skips the update entirely.
+                    if incoming_resources.is_null() {
+                        continue;
+                    }
+                    // The stored container has this quantity set (non-null, non-empty string).
+                    let stored_has = stored_val.as_str().is_some_and(|s| !s.is_empty());
+                    // The incoming patch has this quantity absent or null.
+                    let incoming_val = &incoming_resources[section][resource];
+                    let incoming_has = incoming_val.as_str().is_some_and(|s| !s.is_empty());
+                    if stored_has && !incoming_has {
+                        return Err(format!(
+                            "Pod {pod_ns}/{pod_name}: spec.containers[name={name}].resources.\
+                             {section}.{resource}: \
+                             resize may not remove a resource quantity that is currently set",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Rule 3: QoS class must not change.
+    // Apply the patch to a scratch copy and compare QoS classes.
+    let after = apply_resize_patch(stored, incoming);
+    let qos_before = compute_qos_class(stored);
+    let qos_after = compute_qos_class(&after);
+    if qos_before != qos_after {
+        return Err(format!(
+            "Pod {pod_ns}/{pod_name}: resize would change QoS class from \
+             {qos_before} to {qos_after} — resize may not change the pod's QoS class",
+        ));
+    }
+
+    Ok(())
+}
+
 /// Merge incoming container resources onto the stored pod (match by container name),
 /// then set status.resize = "Proposed".
 ///
@@ -1783,6 +1881,8 @@ pub async fn patch_pod_resize<S: Store>(
 
     let mut current_obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    validate_resize_patch(&current_obj.body, &incoming).map_err(Status::unprocessable_entity)?;
 
     let spec_before = current_obj.body["spec"].clone();
     current_obj.body = apply_resize_patch(&current_obj.body, &incoming);
@@ -7608,6 +7708,277 @@ mod resize_tests {
         );
         // status.resize is still set even if no container matched.
         assert_eq!(result["status"]["resize"], "Proposed");
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_resize_patch — regression tests for invalid-resize rejection
+    // (conformance: "apply invalid resize patch requests", pod_resize.go:389)
+    // -----------------------------------------------------------------------
+
+    /// Guaranteed pod — rename containers: patch names a container that doesn't
+    /// exist in the stored pod. Real k8s rejects this with 422 because there is
+    /// no container to resize; accepting it would silently no-op or corrupt state.
+    #[test]
+    fn resize_rejects_container_rename_else_kubelet_gets_impossible_spec() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "guaranteed-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "100m", "memory": "128Mi"},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        // Patch references "app-renamed" — this container doesn't exist in the pod.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app-renamed",
+                    "resources": {
+                        "limits": {"cpu": "200m", "memory": "256Mi"},
+                        "requests": {"cpu": "200m", "memory": "256Mi"}
+                    }
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_err(),
+            "resize referencing a non-existent container name must be rejected — \
+             real k8s returns 422 Invalid; accepting it causes conformance failure \
+             'Expected an error to have occurred. Got: nil'"
+        );
+    }
+
+    /// BestEffort pod — request memory: a BestEffort pod (no requests, no limits)
+    /// adding memory requests would change its QoS class to Burstable.
+    /// Real k8s rejects this with 422 because resize must not change QoS class.
+    #[test]
+    fn resize_rejects_besteffort_pod_adding_requests_else_qos_class_changes() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "besteffort-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {}
+                }]
+            },
+            "status": {}
+        });
+        // BestEffort pod trying to add memory requests — changes QoS to Burstable.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "requests": {"memory": "128Mi"}
+                    }
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_err(),
+            "BestEffort pod adding resource requests must be rejected — \
+             this changes QoS class from BestEffort to Burstable; \
+             real k8s returns 422 Invalid for this mutation"
+        );
+    }
+
+    /// Burstable pod — remove cpu&memory limits while increasing requests:
+    /// removes limits from a Burstable pod. Real k8s rejects this with 422 because
+    /// resize may not remove resource quantities that are currently set.
+    #[test]
+    fn resize_rejects_burstable_removing_limits_while_increasing_requests() {
+        // Burstable pod: requests != limits.
+        let stored = serde_json::json!({
+            "metadata": {"name": "burstable-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "200m", "memory": "256Mi"},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        // Patch omits limits entirely, only sends requests — removes the cpu and memory limits.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "500m", "memory": "512Mi"}
+                        // no limits key → limits are removed
+                    }
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_err(),
+            "Burstable pod removing cpu&memory limits must be rejected — \
+             resize may not remove resource quantities that are currently set; \
+             real k8s returns 422 Invalid for this mutation (pod_resize.go:389)"
+        );
+    }
+
+    /// Burstable pod — remove cpu requests: patch that omits cpu in requests.
+    /// Removing a resource quantity that was previously set is forbidden.
+    #[test]
+    fn resize_rejects_burstable_removing_cpu_requests_else_resource_structure_changes() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "burstable-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "200m", "memory": "256Mi"},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        // Patch omits requests.cpu — removes it, keeping only memory.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "200m", "memory": "256Mi"},
+                        "requests": {"memory": "128Mi"}
+                        // requests.cpu is absent — removed
+                    }
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_err(),
+            "Burstable pod removing cpu requests must be rejected — \
+             resize may not remove resource quantities that are currently set; \
+             real k8s returns 422 Invalid (pod_resize.go:389 'remove cpu requests' case)"
+        );
+    }
+
+    /// Guaranteed pod — valid resize (same QoS, existing containers): must be accepted.
+    /// This ensures the validator doesn't over-reject valid resize patches.
+    #[test]
+    fn resize_accepts_guaranteed_pod_valid_resource_change() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "guaranteed-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "100m", "memory": "128Mi"},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        // Valid resize: increase resources, keep QoS Guaranteed (requests == limits).
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "200m", "memory": "256Mi"},
+                        "requests": {"cpu": "200m", "memory": "256Mi"}
+                    }
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_ok(),
+            "valid Guaranteed resize (same QoS, existing container) must be accepted — \
+             over-rejection would break the in-place resize feature entirely"
+        );
+    }
+
+    /// Burstable pod — rename container: the patch names a different container.
+    /// This is the Burstable variant of the container-rename rejection.
+    #[test]
+    fn resize_rejects_burstable_container_rename_else_kubelet_gets_impossible_spec() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "burstable-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "requests": {"cpu": "100m"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "totally-different-name",
+                    "resources": {"requests": {"cpu": "200m"}}
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_err(),
+            "resize with a container name not in the stored pod must be rejected — \
+             real k8s returns 422; accepting it silently no-ops and misleads callers"
+        );
+    }
+
+    /// Guaranteed pod → Burstable: patch that makes requests != limits.
+    /// This changes QoS from Guaranteed to Burstable — must be rejected.
+    #[test]
+    fn resize_rejects_guaranteed_to_burstable_qos_change() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "guaranteed-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "100m", "memory": "128Mi"},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        // Set cpu request != cpu limit → breaks Guaranteed, becomes Burstable.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "200m", "memory": "128Mi"},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_err(),
+            "resize that changes QoS class from Guaranteed to Burstable must be rejected — \
+             real k8s returns 422 Invalid; QoS class must not change via resize"
+        );
     }
 }
 
