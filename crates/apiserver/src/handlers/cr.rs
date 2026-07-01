@@ -222,7 +222,10 @@ pub async fn find_crd<S: Store>(
     for obj in &resp.items {
         let crd: CustomResourceDefinition = match serde_json::from_slice(&obj.value) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(err = %e, key = %obj.key, "find_crd: skipping unparseable CRD in store");
+                continue;
+            }
         };
         if crd.spec.group != group || crd.spec.names.plural != plural {
             continue;
@@ -497,6 +500,47 @@ pub async fn list_cr<S: Store>(
                 return Err(Status::not_acceptable(format!(
                     "the server does not support Table format for {group}/{version}/{plural}"
                 )));
+            }
+            // A tombstoned CRD group returns 410 Gone. For non-watch requests (LIST, GET) this
+            // is correct — informers that re-list after a watch 410 will also 410 and stop.
+            // But for watch+sendInitialEvents=true, a bare HTTP 410 causes client-go to
+            // re-list (which also 410s) and immediately retry, creating an infinite hot-loop
+            // (~6000 req/s) that self-saturates the apiserver and kills conformance runs.
+            // Instead, serve an empty sendInitialEvents watch stream (200 + BOOKMARK at rv=0)
+            // so the informer parks at a valid resourceVersion rather than looping.
+            if err.0 == StatusCode::GONE
+                && query.watch == Some(true)
+                && query.send_initial_events == Some(true)
+            {
+                let pom = wants_partial_object_metadata(accept);
+                let (watch_api_version, watch_kind) = if pom {
+                    (
+                        "meta.k8s.io/v1".to_string(),
+                        "PartialObjectMetadata".to_string(),
+                    )
+                } else {
+                    (format!("{group}/{version}"), plural.clone())
+                };
+                let prefix = cr_list_prefix(&group, &version, &plural, None);
+                return super::watch::watch_generic(
+                    state,
+                    super::watch::WatchConfig {
+                        prefix,
+                        api_version: watch_api_version,
+                        kind: watch_kind,
+                        from_revision: query.resource_version.unwrap_or(0),
+                        initial_items: Some((vec![], 0)),
+                        label_selector: query.label_selector,
+                        field_selector: query.field_selector,
+                        allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
+                        username,
+                        as_partial_object_metadata: pom,
+                        group: group.clone(),
+                        plural: plural.clone(),
+                        timeout_seconds: query.timeout_seconds,
+                    },
+                )
+                .await;
             }
             return Err(err);
         }
@@ -1009,6 +1053,44 @@ pub async fn list_cr_namespaced<S: Store>(
                 return Err(Status::not_acceptable(format!(
                     "the server does not support Table format for {group}/{version}/{plural}"
                 )));
+            }
+            // Same guard as list_cr: for watch+sendInitialEvents on a tombstoned group,
+            // return an empty watch stream (200 + BOOKMARK) instead of HTTP 410.
+            // Without this, a namespaced watch+sendInitialEvents hot-loops identically
+            // to the cluster-scoped path, killing conformance runs.
+            if err.0 == StatusCode::GONE
+                && query.watch == Some(true)
+                && query.send_initial_events == Some(true)
+            {
+                let pom = wants_partial_object_metadata(accept);
+                let (watch_api_version, watch_kind) = if pom {
+                    (
+                        "meta.k8s.io/v1".to_string(),
+                        "PartialObjectMetadata".to_string(),
+                    )
+                } else {
+                    (format!("{group}/{version}"), plural.clone())
+                };
+                let prefix = cr_list_prefix(&group, &version, &plural, Some(&ns));
+                return super::watch::watch_generic(
+                    state,
+                    super::watch::WatchConfig {
+                        prefix,
+                        api_version: watch_api_version,
+                        kind: watch_kind,
+                        from_revision: query.resource_version.unwrap_or(0),
+                        initial_items: Some((vec![], 0)),
+                        label_selector: query.label_selector,
+                        field_selector: query.field_selector,
+                        allow_watch_bookmarks: query.allow_watch_bookmarks == Some(true),
+                        username,
+                        as_partial_object_metadata: pom,
+                        group: group.clone(),
+                        plural: plural.clone(),
+                        timeout_seconds: query.timeout_seconds,
+                    },
+                )
+                .await;
             }
             return Err(err);
         }
@@ -6076,6 +6158,223 @@ mod tests {
             json["code"], 410,
             "list after CRD deletion must return 410 Gone, not 404 — \
              404 causes GC informer to retry indefinitely, blocking namespace deletion"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tombstone + watch guard tests (P1: mayor-jiap)
+    //
+    // These tests encode the contract that prevents the conformance-killing hot-loop:
+    //
+    //   watch=true + sendInitialEvents=true on a tombstoned group → 200 + BOOKMARK
+    //   watch=true (no sendInitialEvents) on a tombstoned group   → 410 (client stops)
+    //   non-watch LIST on a tombstoned group                      → 410 (preserved)
+    //
+    // The hot-loop scenario: after CRD deletion, client-go informers watch the group
+    // with sendInitialEvents=true. A bare 410 here causes the informer to re-list; the
+    // re-list also 410s (no resumable resourceVersion in body), so the informer retries
+    // immediately — ~6000 req/s. This self-saturates the apiserver and kills conformance
+    // runs. The fix intercepts the GONE error for watch+sendInitialEvents and returns an
+    // empty watch stream (200 + BOOKMARK) so the informer parks at a valid RV instead.
+    // ---------------------------------------------------------------------------
+
+    // REGRESSION TEST (P1 mayor-jiap): a watch+sendInitialEvents=true on a tombstoned
+    // CRD group must return HTTP 200 (chunked watch stream with BOOKMARK), NOT 410.
+    // If reverted, this test returns Err(410) → confirm the hot-loop regression is back.
+    #[tokio::test]
+    async fn live_crd_watch_sendinitialevents_never_returns_410_cluster() {
+        use crate::handlers::crd;
+
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        // Delete the CRD — writes the tombstone.
+        crd::delete_crd(
+            State(state.clone()),
+            axum::extract::Path("widgets.example.io".to_string()),
+        )
+        .await
+        .expect("delete_crd must succeed");
+
+        // watch=true + sendInitialEvents=true on the now-tombstoned group.
+        // Must NOT return 410 — a 410 here causes the informer to re-list; the re-list
+        // also 410s (bare 410 with no resumable resourceVersion) → infinite hot-loop
+        // (~6000 req/s) → apiserver self-saturation → conformance run killed.
+        let query = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            send_initial_events: Some(true),
+            allow_watch_bookmarks: Some(true),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            timeout_seconds: Some(1),
+        };
+
+        let resp = list_cr(
+            State(state.clone()),
+            Path((
+                "example.io".to_string(),
+                "v1".to_string(),
+                "widgets".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            query,
+            "test-user".to_string(),
+        )
+        .await
+        .expect(
+            "watch+sendInitialEvents on tombstoned group must return 200, NOT 410 — \
+             a 410 here causes the informer to hot-loop (~6000 req/s) and kill conformance runs",
+        );
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "watch+sendInitialEvents on tombstoned CRD group must return 200 OK — \
+             a 410 triggers client-go re-list which also 410s, creating an infinite hot-loop"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("transfer-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("chunked"),
+            "must be a chunked watch stream, not a buffered error response"
+        );
+
+        // Collect the stream and verify it contains a BOOKMARK (sendInitialEvents-end marker).
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect watch stream body");
+        let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
+        assert!(
+            body_str.contains("BOOKMARK"),
+            "watch+sendInitialEvents stream on tombstoned group must contain a BOOKMARK so the \
+             informer can park at a valid resourceVersion — missing BOOKMARK means the informer \
+             cannot make progress and will immediately reconnect, causing a hot-loop; \
+             body={body_str:?}"
+        );
+        assert!(
+            body_str.contains("initial-events-end"),
+            "BOOKMARK must carry the k8s.io/initial-events-end annotation to signal the \
+             informer that the initial snapshot is complete"
+        );
+    }
+
+    // REGRESSION TEST (P1 mayor-jiap): same guard for the namespaced watch path.
+    // Namespaced informers (e.g., argo CD watching per-namespace apps) hit list_cr_namespaced
+    // — if this path still 410s on sendInitialEvents, they also hot-loop.
+    #[tokio::test]
+    async fn live_crd_watch_sendinitialevents_never_returns_410_namespaced() {
+        use crate::handlers::crd;
+
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        crd::delete_crd(
+            State(state.clone()),
+            axum::extract::Path("applications.argoproj.io".to_string()),
+        )
+        .await
+        .expect("delete_crd must succeed");
+
+        let query = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            send_initial_events: Some(true),
+            allow_watch_bookmarks: Some(true),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            timeout_seconds: Some(1),
+        };
+
+        let resp = list_cr_namespaced(
+            State(state.clone()),
+            Path((
+                "argoproj.io".to_string(),
+                "v1alpha1".to_string(),
+                "argocd".to_string(),
+                "applications".to_string(),
+            )),
+            axum::http::HeaderMap::new(),
+            query,
+            "test-user".to_string(),
+        )
+        .await
+        .expect(
+            "namespaced watch+sendInitialEvents on tombstoned group must return 200, NOT 410 — \
+             a 410 here triggers the same hot-loop as the cluster-scoped path",
+        );
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("collect watch stream body");
+        let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
+        assert!(
+            body_str.contains("BOOKMARK"),
+            "namespaced watch+sendInitialEvents stream must contain BOOKMARK; body={body_str:?}"
+        );
+    }
+
+    // Plain watch=true WITHOUT sendInitialEvents on a tombstoned group must still return
+    // 410. A plain watch 410 (without sendInitialEvents) is safe: the informer's recovery
+    // path does a re-LIST which also 410s, and client-go treats two consecutive 410s as
+    // terminal — it backs off and eventually stops. The guard must be narrow (only
+    // watch+sendInitialEvents) so we don't accidentally make a non-sendInitialEvents watch
+    // on a tombstoned group succeed (which would give the informer a watch stream that
+    // never receives events, keeping the informer alive on a dead type indefinitely).
+    #[tokio::test]
+    async fn deleted_crd_watch_no_sendinitialevents_returns_410() {
+        use crate::handlers::crd;
+
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        crd::delete_crd(
+            State(state.clone()),
+            axum::extract::Path("widgets.example.io".to_string()),
+        )
+        .await
+        .expect("delete_crd must succeed");
+
+        // watch=true WITHOUT sendInitialEvents — should still 410.
+        let query = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(0),
+            send_initial_events: None, // NOT set
+            allow_watch_bookmarks: Some(true),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            timeout_seconds: Some(1),
+        };
+
+        let err = expect_err_status(
+            list_cr(
+                State(state.clone()),
+                Path((
+                    "example.io".to_string(),
+                    "v1".to_string(),
+                    "widgets".to_string(),
+                )),
+                axum::http::HeaderMap::new(),
+                query,
+                "test-user".to_string(),
+            )
+            .await,
+            "plain watch (no sendInitialEvents) on tombstoned group must error",
+        );
+
+        let json = serde_json::to_value(&err.1).unwrap();
+        assert_eq!(
+            json["code"], 410,
+            "plain watch without sendInitialEvents on tombstoned group must still return 410 — \
+             the guard must be narrow (only sendInitialEvents) to preserve informer stop semantics"
         );
     }
 
