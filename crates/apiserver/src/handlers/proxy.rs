@@ -1208,18 +1208,16 @@ pub(crate) fn build_pod_proxy_client(
 
 /// Proxy a request to the pod's IP and containerPort.
 ///
-/// GET /api/v1/namespaces/{ns}/pods/{name}/proxy/{*path} → http://{podIP}:{port}/{path}
-///
-/// Uses plain HTTP (not TLS) because pod IPs are cluster-internal.
-/// When konnectivity_proxy_addr is configured, the request is tunnelled through
-/// the konnectivity-server so that pod IPs unreachable from the host are still reachable.
-/// Returns 404 if the pod is not in the store, 503 if status.podIP is empty.
-pub async fn pod_proxy<S: Store>(
-    State(state): State<AppState<S>>,
-    Path((ns, pod_name, path_suffix)): Path<(String, String, String)>,
+/// Shared implementation for both the with-subpath and no-subpath pod proxy routes.
+/// `path_suffix` is the portion after `/proxy/`; use `""` for the root proxy form.
+async fn pod_proxy_dispatch<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    pod_name: &str,
+    path_suffix: &str,
     req: axum::http::Request<Body>,
 ) -> Result<Response, crate::status::StatusError> {
-    let (pod_ip, port, proxy_addr) = resolve_pod_proxy_target(&state, &ns, &pod_name).await?;
+    let (pod_ip, port, proxy_addr) = resolve_pod_proxy_target(state, ns, pod_name).await?;
 
     let target_url = format!("http://{pod_ip}:{port}/{path_suffix}");
 
@@ -1268,6 +1266,39 @@ pub async fn pod_proxy<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))
 }
 
+/// Proxy a request to the pod's IP and containerPort (with sub-path).
+///
+/// GET /api/v1/namespaces/{ns}/pods/{name}/proxy/{*path} → http://{podIP}:{port}/{path}
+///
+/// Uses plain HTTP (not TLS) because pod IPs are cluster-internal.
+/// When konnectivity_proxy_addr is configured, the request is tunnelled through
+/// the konnectivity-server so that pod IPs unreachable from the host are still reachable.
+/// Returns 404 if the pod is not in the store, 503 if status.podIP is empty.
+pub async fn pod_proxy<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, pod_name, path_suffix)): Path<(String, String, String)>,
+    req: axum::http::Request<Body>,
+) -> Result<Response, crate::status::StatusError> {
+    pod_proxy_dispatch(&state, &ns, &pod_name, &path_suffix, req).await
+}
+
+/// Proxy a request to the pod's IP and containerPort (no sub-path form).
+///
+/// GET /api/v1/namespaces/{ns}/pods/{name}/proxy  → http://{podIP}:{port}/
+/// GET /api/v1/namespaces/{ns}/pods/{name}/proxy/ → http://{podIP}:{port}/
+///
+/// axum's `{*path}` wildcard requires a non-empty segment, so a dial to /proxy or /proxy/
+/// (the form used by the RC serve-image conformance test) would not match the `/{*path}`
+/// route and falls through to the generic handler — returning 404. This handler covers
+/// those two forms explicitly and forwards to the pod root path.
+pub async fn pod_proxy_root<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, pod_name)): Path<(String, String)>,
+    req: axum::http::Request<Body>,
+) -> Result<Response, crate::status::StatusError> {
+    pod_proxy_dispatch(&state, &ns, &pod_name, "", req).await
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -1310,6 +1341,27 @@ mod tests {
             .route(
                 "/api/v1/namespaces/{ns}/pods/{name}/portforward",
                 get(pod_portforward).post(pod_portforward),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/proxy",
+                get(pod_proxy_root)
+                    .post(pod_proxy_root)
+                    .put(pod_proxy_root)
+                    .delete(pod_proxy_root),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/proxy/",
+                get(pod_proxy_root)
+                    .post(pod_proxy_root)
+                    .put(pod_proxy_root)
+                    .delete(pod_proxy_root),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/proxy/{*path}",
+                get(pod_proxy)
+                    .post(pod_proxy)
+                    .put(pod_proxy)
+                    .delete(pod_proxy),
             )
             .with_state(state)
     }
@@ -2473,6 +2525,72 @@ mod tests {
             "pod proxy must thread the konnectivity_proxy_addr from state — \
              without it, pod IPs unreachable from the host produce 502 instead of succeeding"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // pod_proxy_root: routing regression for no-subpath proxy form
+    //
+    // axum's `{*path}` wildcard requires a NON-EMPTY segment. Without explicit
+    // routes for /proxy and /proxy/, a GET to the pod proxy root falls through
+    // to the generic handler and returns 404. This blocks the RC serve-image
+    // conformance test (WaitForPodsResponding dials /proxy without a subpath).
+    // -----------------------------------------------------------------------
+
+    /// /proxy (no subpath) must route to the proxy handler, not return 404.
+    ///
+    /// The RC serve-image conformance test dials the pod proxy subresource without
+    /// any sub-path. Before this fix, the route `/proxy/{*path}` required a
+    /// non-empty segment so `/proxy` and `/proxy/` fell through to a 404.
+    /// We verify routing by seeding a pod with no podIP (which the handler
+    /// returns 503 for). 503 proves the handler was reached; 404 proves it was not.
+    #[tokio::test]
+    async fn pod_proxy_root_path_routes_not_404_else_serve_image_conformance_fails() {
+        let state = make_state();
+
+        // Seed a pod that exists but has no podIP → handler returns 503, not 404.
+        // If the route is missing, axum returns 404 (METHOD_NOT_ALLOWED or NOT_FOUND).
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "srv", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "srv"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let mut router = make_router(state);
+
+        for path in [
+            "/api/v1/namespaces/default/pods/srv/proxy",
+            "/api/v1/namespaces/default/pods/srv/proxy/",
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.call(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "GET {path} must NOT return 404 — the RC serve-image conformance test \
+                 dials the pod proxy without a sub-path and a 404 causes WaitForPodsResponding \
+                 to fail even though the pod is Running"
+            );
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "GET {path} must reach the proxy handler and return 503 \
+                 (pod exists but has no podIP) — any other status means routing is broken"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
