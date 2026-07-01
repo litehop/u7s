@@ -472,6 +472,25 @@ fn build_router(state: AppState) -> Router {
             get(handlers::proxy::pod_portforward).post(handlers::proxy::pod_portforward),
         )
         // Pods — proxy subresource: forward to pod IP at http://{podIP}:{containerPort}/{path}
+        //
+        // axum's `{*path}` wildcard requires a NON-EMPTY trailing segment. A dial to
+        // /proxy or /proxy/ (the root form used by the RC serve-image conformance test)
+        // does not match `/{*path}` and falls through to 404. Register the no-subpath
+        // forms explicitly before the wildcard route.
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/proxy",
+            get(handlers::proxy::pod_proxy_root)
+                .post(handlers::proxy::pod_proxy_root)
+                .put(handlers::proxy::pod_proxy_root)
+                .delete(handlers::proxy::pod_proxy_root),
+        )
+        .route(
+            "/api/v1/namespaces/{ns}/pods/{name}/proxy/",
+            get(handlers::proxy::pod_proxy_root)
+                .post(handlers::proxy::pod_proxy_root)
+                .put(handlers::proxy::pod_proxy_root)
+                .delete(handlers::proxy::pod_proxy_root),
+        )
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/proxy/{*path}",
             get(handlers::proxy::pod_proxy)
