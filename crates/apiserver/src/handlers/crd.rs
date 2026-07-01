@@ -471,6 +471,12 @@ pub async fn replace_crd<S: Store>(
         .await
         .map_err(|e| store_err_crd(e, &name))?;
 
+    // Clear any stale tombstone for this group. Without this, a CRD deleted then
+    // re-created via PUT (replace_crd) would leave a tombstone in the store — mirroring
+    // the tombstone-clear that create_crd (POST) already does at crd.rs:362-363.
+    let tombstone_key = deleted_group_tombstone_key(&crd.spec.group);
+    let _ = state.store.delete(&tombstone_key, None).await;
+
     crd.metadata.resource_version = rv.to_string();
     Ok(Json(crd))
 }
