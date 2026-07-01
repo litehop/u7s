@@ -28,6 +28,10 @@ When kubectl/client-go/KCM send an object as `application/vnd.kubernetes.protobu
 - PodDisruptionBudget.status.disruptedPods (field 3 status not decoded) — #627
 - ObjectMeta.ownerReferences not decoded by object_meta_to_json — #626
 - Container.resizePolicy (field 23) — mayor-op18 (open)
+- ReplicationController.status (bytes, never emitted) — mayor-cokf / PR #TBD
+- DaemonSet.status (field entirely absent from prost struct) — mayor-cokf / PR #TBD
+- Job.status (bytes, never emitted) — mayor-cokf / PR #TBD
+- CronJob.status (bytes, never emitted) — mayor-cokf / PR #TBD
 
 **Rule when touching ANY proto struct / fixing a "field is missing after a write" bug:** the cause is almost always a missing field in the prost struct. Add the field with the correct upstream field NUMBER (check k8s `staging/src/k8s.io/api/<group>/<v>/generated.proto`), decode it, and add a proto-round-trip regression test (`decode_<kind>_proto_preserves_<field>`). **Higher-leverage move:** when fixing one, AUDIT the rest of that struct's fields against the upstream .proto in the same pass — there are likely siblings also missing. A systematic proto-struct-vs-upstream audit (its own bead) would surface the remaining drops in one sweep instead of one-conformance-spec-at-a-time.
 

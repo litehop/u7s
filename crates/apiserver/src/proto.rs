@@ -1164,6 +1164,49 @@ struct ReplicationControllerSpec {
     template: Option<AppsPodTemplateSpec>,
 }
 
+/// ReplicationControllerCondition — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ReplicationControllerCondition
+#[derive(Clone, PartialEq, Message)]
+struct ReplicationControllerCondition {
+    /// type (field 1, string)
+    #[prost(string, tag = "1")]
+    r#type: String,
+    /// status (field 2, string)
+    #[prost(string, tag = "2")]
+    status: String,
+    // field 3 = lastTransitionTime (Time message) — skipped
+    /// reason (field 4, string)
+    #[prost(string, tag = "4")]
+    reason: String,
+    /// message (field 5, string)
+    #[prost(string, tag = "5")]
+    message: String,
+}
+
+/// ReplicationControllerStatus — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ReplicationControllerStatus
+#[derive(Clone, PartialEq, Message)]
+struct ReplicationControllerStatus {
+    /// replicas (field 1, int32)
+    #[prost(int32, tag = "1")]
+    replicas: i32,
+    /// fullyLabeledReplicas (field 2, int32)
+    #[prost(int32, tag = "2")]
+    fully_labeled_replicas: i32,
+    /// observedGeneration (field 3, int64)
+    #[prost(int64, tag = "3")]
+    observed_generation: i64,
+    /// readyReplicas (field 4, int32)
+    #[prost(int32, tag = "4")]
+    ready_replicas: i32,
+    /// availableReplicas (field 5, int32)
+    #[prost(int32, tag = "5")]
+    available_replicas: i32,
+    /// conditions (field 6, repeated ReplicationControllerCondition)
+    #[prost(message, repeated, tag = "6")]
+    conditions: Vec<ReplicationControllerCondition>,
+}
+
 /// ReplicationController — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ReplicationController
 #[derive(Clone, PartialEq, Message)]
@@ -1174,9 +1217,9 @@ struct ReplicationController {
     /// spec (field 2, message ReplicationControllerSpec)
     #[prost(message, tag = "2")]
     spec: Option<ReplicationControllerSpec>,
-    /// status (field 3, bytes) — not decoded on input
-    #[prost(bytes = "vec", tag = "3")]
-    status: Vec<u8>,
+    /// status (field 3, message ReplicationControllerStatus)
+    #[prost(message, tag = "3")]
+    status: Option<ReplicationControllerStatus>,
 }
 
 /// PersistentVolumeSpec — k8s.io/api/core/v1/generated.proto (key fields only)
@@ -1969,6 +2012,17 @@ struct CronJobSpec {
     time_zone: String,
 }
 
+/// CronJobStatus — k8s.io/api/batch/v1/generated.proto
+/// Source: api-batch-v1-generated.proto message CronJobStatus
+/// fields 4 (lastScheduleTime) and 5 (lastSuccessfulTime) are Time messages — skipped
+#[derive(Clone, PartialEq, Message)]
+struct CronJobStatus {
+    /// active (field 1, repeated ObjectReference) — stored as name/namespace only
+    #[prost(message, repeated, tag = "1")]
+    active: Vec<ObjectReference>,
+    // fields 4, 5 = lastScheduleTime, lastSuccessfulTime (Time messages) — skipped
+}
+
 /// CronJob — k8s.io/api/batch/v1/generated.proto
 /// Source: k8s.io/api/batch/v1/generated.proto message CronJob
 /// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
@@ -1980,9 +2034,63 @@ struct CronJob {
     /// spec (field 2, message CronJobSpec)
     #[prost(message, tag = "2")]
     spec: Option<CronJobSpec>,
-    /// status (field 3, bytes) — not decoded on input
-    #[prost(bytes = "vec", tag = "3")]
-    status: Vec<u8>,
+    /// status (field 3, message CronJobStatus)
+    #[prost(message, tag = "3")]
+    status: Option<CronJobStatus>,
+}
+
+/// JobCondition — k8s.io/api/batch/v1/generated.proto
+/// Source: api-batch-v1-generated.proto message JobCondition
+/// fields 3 (lastProbeTime) and 4 (lastTransitionTime) are Time messages — skipped
+#[derive(Clone, PartialEq, Message)]
+struct JobCondition {
+    /// type (field 1, string)
+    #[prost(string, tag = "1")]
+    r#type: String,
+    /// status (field 2, string)
+    #[prost(string, tag = "2")]
+    status: String,
+    // fields 3, 4 = lastProbeTime, lastTransitionTime (Time messages) — skipped
+    /// reason (field 5, string)
+    #[prost(string, tag = "5")]
+    reason: String,
+    /// message (field 6, string)
+    #[prost(string, tag = "6")]
+    message: String,
+}
+
+/// JobStatus — k8s.io/api/batch/v1/generated.proto
+/// Source: api-batch-v1-generated.proto message JobStatus
+/// fields 2 (startTime) and 3 (completionTime) are Time messages — skipped
+/// field 8 (uncountedTerminatedPods) is a complex message — skipped
+#[derive(Clone, PartialEq, Message)]
+struct JobStatus {
+    /// conditions (field 1, repeated JobCondition)
+    #[prost(message, repeated, tag = "1")]
+    conditions: Vec<JobCondition>,
+    // fields 2, 3 = startTime, completionTime (Time messages) — skipped
+    /// active (field 4, int32)
+    #[prost(int32, tag = "4")]
+    active: i32,
+    /// succeeded (field 5, int32)
+    #[prost(int32, tag = "5")]
+    succeeded: i32,
+    /// failed (field 6, int32)
+    #[prost(int32, tag = "6")]
+    failed: i32,
+    /// completedIndexes (field 7, string)
+    #[prost(string, tag = "7")]
+    completed_indexes: String,
+    // field 8 = uncountedTerminatedPods (complex message) — skipped
+    /// ready (field 9, int32)
+    #[prost(int32, tag = "9")]
+    ready: i32,
+    /// failedIndexes (field 10, string)
+    #[prost(string, tag = "10")]
+    failed_indexes: String,
+    /// terminating (field 11, int32)
+    #[prost(int32, tag = "11")]
+    terminating: i32,
 }
 
 /// Job — k8s.io/api/batch/v1/generated.proto
@@ -1996,9 +2104,9 @@ struct Job {
     /// spec (field 2, message JobSpec)
     #[prost(message, tag = "2")]
     spec: Option<JobSpec>,
-    /// status (field 3, bytes) — not decoded on input
-    #[prost(bytes = "vec", tag = "3")]
-    status: Vec<u8>,
+    /// status (field 3, message JobStatus)
+    #[prost(message, tag = "3")]
+    status: Option<JobStatus>,
 }
 
 // --- k8s.io/api/apps/v1/generated.proto ---
@@ -2181,6 +2289,61 @@ struct DaemonSetSpec {
     template: Option<AppsPodTemplateSpec>,
 }
 
+/// DaemonSetCondition — k8s.io/api/apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message DaemonSetCondition
+#[derive(Clone, PartialEq, Message)]
+struct DaemonSetCondition {
+    /// type (field 1, string)
+    #[prost(string, tag = "1")]
+    r#type: String,
+    /// status (field 2, string)
+    #[prost(string, tag = "2")]
+    status: String,
+    // field 3 = lastTransitionTime (Time message) — skipped
+    /// reason (field 4, string)
+    #[prost(string, tag = "4")]
+    reason: String,
+    /// message (field 5, string)
+    #[prost(string, tag = "5")]
+    message: String,
+}
+
+/// DaemonSetStatus — k8s.io/api/apps/v1/generated.proto
+/// Source: api-apps-v1-generated.proto message DaemonSetStatus
+#[derive(Clone, PartialEq, Message)]
+struct DaemonSetStatus {
+    /// currentNumberScheduled (field 1, int32)
+    #[prost(int32, tag = "1")]
+    current_number_scheduled: i32,
+    /// numberMisscheduled (field 2, int32)
+    #[prost(int32, tag = "2")]
+    number_misscheduled: i32,
+    /// desiredNumberScheduled (field 3, int32)
+    #[prost(int32, tag = "3")]
+    desired_number_scheduled: i32,
+    /// numberReady (field 4, int32)
+    #[prost(int32, tag = "4")]
+    number_ready: i32,
+    /// observedGeneration (field 5, int64)
+    #[prost(int64, tag = "5")]
+    observed_generation: i64,
+    /// updatedNumberScheduled (field 6, int32)
+    #[prost(int32, tag = "6")]
+    updated_number_scheduled: i32,
+    /// numberAvailable (field 7, int32)
+    #[prost(int32, tag = "7")]
+    number_available: i32,
+    /// numberUnavailable (field 8, int32)
+    #[prost(int32, tag = "8")]
+    number_unavailable: i32,
+    /// collisionCount (field 9, int32)
+    #[prost(int32, tag = "9")]
+    collision_count: i32,
+    /// conditions (field 10, repeated DaemonSetCondition)
+    #[prost(message, repeated, tag = "10")]
+    conditions: Vec<DaemonSetCondition>,
+}
+
 /// DaemonSet — k8s.io/api/apps/v1/generated.proto
 /// Source: api-apps-v1-generated.proto message DaemonSet
 #[derive(Clone, PartialEq, Message)]
@@ -2191,6 +2354,9 @@ struct DaemonSet {
     /// spec (field 2, message DaemonSetSpec)
     #[prost(message, tag = "2")]
     spec: Option<DaemonSetSpec>,
+    /// status (field 3, message DaemonSetStatus)
+    #[prost(message, tag = "3")]
+    status: Option<DaemonSetStatus>,
 }
 
 /// ReplicaSet — k8s.io/api/apps/v1/generated.proto
@@ -3285,6 +3451,51 @@ pub fn decode_replicationcontroller_proto(data: &[u8]) -> Option<serde_json::Val
         obj["spec"] = serde_json::Value::Object(spec_map);
     }
 
+    if let Some(status) = rc.status {
+        let mut status_json = serde_json::json!({});
+        if status.replicas != 0 {
+            status_json["replicas"] = status.replicas.into();
+        }
+        if status.fully_labeled_replicas != 0 {
+            status_json["fullyLabeledReplicas"] = status.fully_labeled_replicas.into();
+        }
+        if status.observed_generation != 0 {
+            status_json["observedGeneration"] = status.observed_generation.into();
+        }
+        if status.ready_replicas != 0 {
+            status_json["readyReplicas"] = status.ready_replicas.into();
+        }
+        if status.available_replicas != 0 {
+            status_json["availableReplicas"] = status.available_replicas.into();
+        }
+        if !status.conditions.is_empty() {
+            status_json["conditions"] = status
+                .conditions
+                .iter()
+                .map(|c| {
+                    let mut cond = serde_json::json!({
+                        "type": c.r#type,
+                        "status": c.status,
+                    });
+                    if !c.reason.is_empty() {
+                        cond["reason"] = c.reason.clone().into();
+                    }
+                    if !c.message.is_empty() {
+                        cond["message"] = c.message.clone().into();
+                    }
+                    cond
+                })
+                .collect();
+        }
+        if status_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            obj["status"] = status_json;
+        }
+    }
+
     Some(obj)
 }
 
@@ -4226,6 +4437,47 @@ pub fn decode_cronjob_proto(data: &[u8]) -> Option<serde_json::Value> {
         obj["spec"] = serde_json::Value::Object(spec_map);
     }
 
+    if let Some(status) = cj.status {
+        let mut status_json = serde_json::json!({});
+        if !status.active.is_empty() {
+            status_json["active"] = status
+                .active
+                .iter()
+                .filter_map(|r| {
+                    if r.name.is_empty() && r.namespace.is_empty() {
+                        None
+                    } else {
+                        let mut entry = serde_json::json!({});
+                        if !r.name.is_empty() {
+                            entry["name"] = r.name.clone().into();
+                        }
+                        if !r.namespace.is_empty() {
+                            entry["namespace"] = r.namespace.clone().into();
+                        }
+                        if !r.kind.is_empty() {
+                            entry["kind"] = r.kind.clone().into();
+                        }
+                        if !r.api_version.is_empty() {
+                            entry["apiVersion"] = r.api_version.clone().into();
+                        }
+                        if !r.uid.is_empty() {
+                            entry["uid"] = r.uid.clone().into();
+                        }
+                        Some(entry)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into();
+        }
+        if status_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            obj["status"] = status_json;
+        }
+    }
+
     Some(obj)
 }
 
@@ -4242,6 +4494,57 @@ pub fn decode_job_proto(data: &[u8]) -> Option<serde_json::Value> {
 
     if let Some(spec) = job.spec {
         obj["spec"] = job_spec_to_json(spec);
+    }
+
+    if let Some(status) = job.status {
+        let mut status_json = serde_json::json!({});
+        if !status.conditions.is_empty() {
+            status_json["conditions"] = status
+                .conditions
+                .iter()
+                .map(|c| {
+                    let mut cond = serde_json::json!({
+                        "type": c.r#type,
+                        "status": c.status,
+                    });
+                    if !c.reason.is_empty() {
+                        cond["reason"] = c.reason.clone().into();
+                    }
+                    if !c.message.is_empty() {
+                        cond["message"] = c.message.clone().into();
+                    }
+                    cond
+                })
+                .collect();
+        }
+        if status.active != 0 {
+            status_json["active"] = status.active.into();
+        }
+        if status.succeeded != 0 {
+            status_json["succeeded"] = status.succeeded.into();
+        }
+        if status.failed != 0 {
+            status_json["failed"] = status.failed.into();
+        }
+        if !status.completed_indexes.is_empty() {
+            status_json["completedIndexes"] = status.completed_indexes.into();
+        }
+        if status.ready != 0 {
+            status_json["ready"] = status.ready.into();
+        }
+        if !status.failed_indexes.is_empty() {
+            status_json["failedIndexes"] = status.failed_indexes.into();
+        }
+        if status.terminating != 0 {
+            status_json["terminating"] = status.terminating.into();
+        }
+        if status_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            obj["status"] = status_json;
+        }
     }
 
     Some(obj)
@@ -5131,6 +5434,62 @@ pub fn decode_daemonset_proto(data: &[u8]) -> Option<serde_json::Value> {
     if let Some(spec) = obj.spec {
         if let Some(spec_json) = apps_spec_to_json(spec.selector, spec.template) {
             out["spec"] = spec_json;
+        }
+    }
+    if let Some(status) = obj.status {
+        let mut status_json = serde_json::json!({});
+        if status.current_number_scheduled != 0 {
+            status_json["currentNumberScheduled"] = status.current_number_scheduled.into();
+        }
+        if status.number_misscheduled != 0 {
+            status_json["numberMisscheduled"] = status.number_misscheduled.into();
+        }
+        if status.desired_number_scheduled != 0 {
+            status_json["desiredNumberScheduled"] = status.desired_number_scheduled.into();
+        }
+        if status.number_ready != 0 {
+            status_json["numberReady"] = status.number_ready.into();
+        }
+        if status.observed_generation != 0 {
+            status_json["observedGeneration"] = status.observed_generation.into();
+        }
+        if status.updated_number_scheduled != 0 {
+            status_json["updatedNumberScheduled"] = status.updated_number_scheduled.into();
+        }
+        if status.number_available != 0 {
+            status_json["numberAvailable"] = status.number_available.into();
+        }
+        if status.number_unavailable != 0 {
+            status_json["numberUnavailable"] = status.number_unavailable.into();
+        }
+        if status.collision_count != 0 {
+            status_json["collisionCount"] = status.collision_count.into();
+        }
+        if !status.conditions.is_empty() {
+            status_json["conditions"] = status
+                .conditions
+                .iter()
+                .map(|c| {
+                    let mut cond = serde_json::json!({
+                        "type": c.r#type,
+                        "status": c.status,
+                    });
+                    if !c.reason.is_empty() {
+                        cond["reason"] = c.reason.clone().into();
+                    }
+                    if !c.message.is_empty() {
+                        cond["message"] = c.message.clone().into();
+                    }
+                    cond
+                })
+                .collect();
+        }
+        if status_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            out["status"] = status_json;
         }
     }
     Some(out)
@@ -15771,7 +16130,7 @@ mod tests {
                     }),
                 }),
             }),
-            status: Vec::new(),
+            status: None,
         };
 
         let mut buf = Vec::new();
@@ -16008,6 +16367,255 @@ mod tests {
             "orphanDependents=true must survive proto decode — without this, \
              legacy clients using orphanDependents instead of propagationPolicy \
              will not get Orphan semantics"
+        );
+    }
+
+    /// decode_replicationcontroller_proto must preserve status.replicas and status.readyReplicas.
+    ///
+    /// Without status decoding, a proto-path RC status write silently discards the status object.
+    /// Any client that GETs the RC via proto sees replicas=0 and readyReplicas=0, and controllers
+    /// that compute desired-vs-actual replica counts will loop trying to scale up an already-full RC.
+    #[test]
+    fn decode_replicationcontroller_proto_preserves_status_else_controllers_see_zero_and_loop() {
+        let status = ReplicationControllerStatus {
+            replicas: 3,
+            fully_labeled_replicas: 3,
+            observed_generation: 7,
+            ready_replicas: 2,
+            available_replicas: 2,
+            conditions: vec![ReplicationControllerCondition {
+                r#type: "ReplicaFailure".to_string(),
+                status: "False".to_string(),
+                reason: "".to_string(),
+                message: "".to_string(),
+            }],
+        };
+        let mut status_bytes = Vec::new();
+        status
+            .encode(&mut status_bytes)
+            .expect("prost encode must succeed");
+
+        let rc = ReplicationController {
+            metadata: Some(ObjectMeta {
+                name: "my-rc".to_string(),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(status),
+        };
+        let mut proto = Vec::new();
+        rc.encode(&mut proto).expect("prost encode must succeed");
+
+        let result = decode_core_proto_by_kind("ReplicationController", &proto)
+            .expect("RC with status must decode successfully");
+
+        assert_eq!(
+            result["status"]["replicas"], 3,
+            "status.replicas must survive proto decode — without this, controllers \
+             computing desired-vs-actual replica counts see 0 and loop"
+        );
+        assert_eq!(
+            result["status"]["readyReplicas"], 2,
+            "status.readyReplicas must survive proto decode — without this, readiness \
+             checks always see 0 and incorrectly report the RC as not ready"
+        );
+        assert_eq!(
+            result["status"]["fullyLabeledReplicas"], 3,
+            "status.fullyLabeledReplicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["observedGeneration"], 7,
+            "status.observedGeneration must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["availableReplicas"], 2,
+            "status.availableReplicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "ReplicaFailure",
+            "status.conditions must survive proto decode"
+        );
+    }
+
+    /// decode_daemonset_proto must preserve status fields.
+    ///
+    /// Without status decoding, proto-path DaemonSet status writes silently discard the status.
+    /// Controllers that observe DaemonSet status (e.g., node readiness checks) will always see
+    /// zero scheduled/ready counts and never progress past initial state.
+    #[test]
+    fn decode_daemonset_proto_preserves_status_else_node_readiness_checks_see_zero_and_stall() {
+        let status = DaemonSetStatus {
+            current_number_scheduled: 5,
+            number_misscheduled: 1,
+            desired_number_scheduled: 5,
+            number_ready: 4,
+            observed_generation: 2,
+            updated_number_scheduled: 5,
+            number_available: 4,
+            number_unavailable: 1,
+            collision_count: 0,
+            conditions: vec![DaemonSetCondition {
+                r#type: "Available".to_string(),
+                status: "True".to_string(),
+                reason: "".to_string(),
+                message: "".to_string(),
+            }],
+        };
+        let ds = DaemonSet {
+            metadata: Some(ObjectMeta {
+                name: "my-ds".to_string(),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(status),
+        };
+        let mut proto = Vec::new();
+        ds.encode(&mut proto).expect("prost encode must succeed");
+
+        let result = decode_core_proto_by_kind("DaemonSet", &proto)
+            .expect("DaemonSet with status must decode successfully");
+
+        assert_eq!(
+            result["status"]["currentNumberScheduled"], 5,
+            "status.currentNumberScheduled must survive proto decode — without this, \
+             node readiness checks always see 0 scheduled and stall"
+        );
+        assert_eq!(
+            result["status"]["numberReady"], 4,
+            "status.numberReady must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["desiredNumberScheduled"], 5,
+            "status.desiredNumberScheduled must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["numberAvailable"], 4,
+            "status.numberAvailable must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["observedGeneration"], 2,
+            "status.observedGeneration must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Available",
+            "status.conditions must survive proto decode"
+        );
+    }
+
+    /// decode_job_proto must preserve status.succeeded and status.conditions.
+    ///
+    /// Without status decoding, a proto-path Job status write silently discards the status.
+    /// The CronJob controller and the job garbage collector both observe Job status to decide
+    /// whether to clean up finished Jobs; if status is invisible they keep running and filling
+    /// the history limit.
+    #[test]
+    fn decode_job_proto_preserves_status_else_cronjob_gc_cannot_see_completion_and_loops() {
+        let status = JobStatus {
+            conditions: vec![JobCondition {
+                r#type: "Complete".to_string(),
+                status: "True".to_string(),
+                reason: "".to_string(),
+                message: "".to_string(),
+            }],
+            active: 0,
+            succeeded: 3,
+            failed: 1,
+            completed_indexes: "0-2".to_string(),
+            ready: 0,
+            failed_indexes: "".to_string(),
+            terminating: 0,
+        };
+        let job = Job {
+            metadata: Some(ObjectMeta {
+                name: "my-job".to_string(),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(status),
+        };
+        let mut proto = Vec::new();
+        job.encode(&mut proto).expect("prost encode must succeed");
+
+        let result = decode_core_proto_by_kind("Job", &proto)
+            .expect("Job with status must decode successfully");
+
+        assert_eq!(
+            result["status"]["succeeded"], 3,
+            "status.succeeded must survive proto decode — without this, the CronJob \
+             GC cannot see job completion and keeps creating new jobs past the history limit"
+        );
+        assert_eq!(
+            result["status"]["failed"], 1,
+            "status.failed must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["completedIndexes"], "0-2",
+            "status.completedIndexes must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Complete",
+            "status.conditions[0].type must survive proto decode — without this, \
+             the Job completion condition is invisible and GC never cleans up finished Jobs"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["status"], "True",
+            "status.conditions[0].status must survive proto decode"
+        );
+    }
+
+    /// decode_cronjob_proto must preserve status.active job references.
+    ///
+    /// Without status decoding, a proto-path CronJob status write discards the active job list.
+    /// The CronJob controller uses status.active to track concurrency; if it's invisible, the
+    /// controller can fire multiple overlapping Jobs when ConcurrencyPolicy=Forbid/Replace.
+    #[test]
+    fn decode_cronjob_proto_preserves_status_active_else_concurrency_control_is_blind() {
+        let status = CronJobStatus {
+            active: vec![ObjectReference {
+                kind: "Job".to_string(),
+                namespace: "default".to_string(),
+                name: "my-cronjob-abc".to_string(),
+                uid: "uid-123".to_string(),
+                api_version: "batch/v1".to_string(),
+                resource_version: "".to_string(),
+                field_path: "".to_string(),
+            }],
+        };
+        let cj = CronJob {
+            metadata: Some(ObjectMeta {
+                name: "my-cronjob".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(CronJobSpec {
+                schedule: "*/5 * * * *".to_string(),
+                concurrency_policy: "Forbid".to_string(),
+                starting_deadline_seconds: 0,
+                suspend: false,
+                successful_jobs_history_limit: 3,
+                failed_jobs_history_limit: 1,
+                job_template: None,
+                time_zone: "".to_string(),
+            }),
+            status: Some(status),
+        };
+        let mut proto = Vec::new();
+        cj.encode(&mut proto).expect("prost encode must succeed");
+
+        let result = decode_core_proto_by_kind("CronJob", &proto)
+            .expect("CronJob with status must decode successfully");
+
+        assert_eq!(
+            result["status"]["active"][0]["name"], "my-cronjob-abc",
+            "status.active[0].name must survive proto decode — without this, the CronJob \
+             controller cannot see running jobs and fires extra Jobs violating ConcurrencyPolicy"
+        );
+        assert_eq!(
+            result["status"]["active"][0]["namespace"], "default",
+            "status.active[0].namespace must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["active"][0]["kind"], "Job",
+            "status.active[0].kind must survive proto decode"
         );
     }
 }
