@@ -181,6 +181,24 @@ pub struct NodeList {
 #[derive(Deserialize)]
 pub struct NodeItem {
     pub metadata: NodeMetadata,
+    #[serde(default)]
+    pub status: NodeStatus,
+}
+
+#[derive(Deserialize, Default)]
+pub struct NodeStatus {
+    #[serde(default)]
+    pub allocatable: NodeAllocatable,
+    #[serde(default)]
+    pub capacity: NodeAllocatable,
+}
+
+#[derive(Deserialize, Default)]
+pub struct NodeAllocatable {
+    /// Maximum pods the node will accept (quantity string, e.g. "110").
+    /// Zero means the field was absent — treat as unlimited for safety (no cap check).
+    #[serde(default)]
+    pub pods: String,
 }
 
 #[derive(Deserialize)]
@@ -188,6 +206,91 @@ pub struct NodeMetadata {
     pub name: String,
     #[serde(default)]
     pub labels: std::collections::HashMap<String, String>,
+}
+
+/// Parse a Kubernetes quantity string for pod count (e.g. "110") into u32.
+///
+/// Returns 0 when the field is absent or unparseable, which the capacity check
+/// treats as "unknown capacity — skip capping".  Pod counts are always small
+/// non-negative integers so u32 is more than sufficient.
+pub fn parse_pod_capacity(s: &str) -> u32 {
+    s.trim().parse::<u32>().unwrap_or(0)
+}
+
+/// Minimal typed view of a pod list item needed to count running pods on a node.
+#[derive(Deserialize)]
+struct PodListItem {
+    status: PodListItemStatus,
+}
+
+#[derive(Deserialize, Default)]
+struct PodListItemStatus {
+    #[serde(default)]
+    phase: String,
+}
+
+/// Count non-terminated pods from a raw JSON pod list response body.
+///
+/// "Non-terminated" means phase is not Succeeded or Failed.  This matches the
+/// upstream NodeResourcesFit predicate: running and pending pods consume a slot;
+/// completed pods do not.
+///
+/// Returns Err if the body cannot be parsed as a pod list.
+pub fn count_non_terminated_pods(body: &str) -> anyhow::Result<u32> {
+    #[derive(Deserialize)]
+    struct PodList {
+        items: Vec<PodListItem>,
+    }
+    let list: PodList = serde_json::from_str(body).context("parse pod list for node capacity")?;
+    let count = list
+        .items
+        .iter()
+        .filter(|p| p.status.phase != "Succeeded" && p.status.phase != "Failed")
+        .count();
+    Ok(count as u32)
+}
+
+/// Select the first node from `list` whose labels satisfy `selector` AND that
+/// has at least one free pod slot.
+///
+/// `pod_counts` maps node name → current non-terminated pod count (from a prior
+/// GET /api/v1/pods?fieldSelector=spec.nodeName=<node>).  If a node's name is
+/// absent from `pod_counts`, its count is treated as 0 (conservative: schedule).
+///
+/// Capacity is read from `status.allocatable.pods`, falling back to
+/// `status.capacity.pods`.  A capacity of 0 (field absent / unparseable) means
+/// the limit is unknown; such nodes are NOT skipped (the old safe behaviour).
+///
+/// Returns `Err` when no node satisfies the selector with free capacity, so the
+/// caller can leave the pod Pending instead of binding to a full node.
+///
+/// Pure function so the capacity-gate logic can be unit-tested without a network.
+pub fn select_node_with_capacity(
+    list: NodeList,
+    selector: &std::collections::HashMap<String, String>,
+    pod_counts: &std::collections::HashMap<String, u32>,
+) -> anyhow::Result<String> {
+    let found = list.items.into_iter().find(|n| {
+        if !node_selector_matches(&n.metadata.labels, selector) {
+            return false;
+        }
+        // Resolve capacity: prefer allocatable, fall back to capacity.
+        let cap_str = if !n.status.allocatable.pods.is_empty() {
+            &n.status.allocatable.pods
+        } else {
+            &n.status.capacity.pods
+        };
+        let cap = parse_pod_capacity(cap_str);
+        if cap == 0 {
+            // Capacity unknown — do not block scheduling.
+            return true;
+        }
+        let used = pod_counts.get(&n.metadata.name).copied().unwrap_or(0);
+        used < cap
+    });
+    found.map(|n| n.metadata.name).context(
+        "no node satisfies the pod's nodeSelector with free pod capacity (NodeResourcesFit)",
+    )
 }
 
 /// Return true when all entries in `selector` are satisfied by `labels`.
@@ -236,11 +339,16 @@ pub fn select_first_node(list: NodeList) -> anyhow::Result<String> {
         .context("no nodes available")
 }
 
-/// Return the name of the first node that satisfies `node_selector`.
+/// Return the name of the first node that satisfies `node_selector` and has
+/// at least one free pod slot (NodeResourcesFit predicate).
 ///
-/// Fetches the node list from the API server and applies `node_selector_matches`.
-/// An empty `node_selector` matches any node. Returns `Err` when no matching
-/// node exists so that the caller can skip binding and leave the pod Pending.
+/// Fetches the node list from the API server, then — for each selector-matching
+/// candidate — counts non-terminated pods already assigned to it via
+/// GET /api/v1/pods?fieldSelector=spec.nodeName%3D<node>.  A node at or above
+/// its `status.allocatable.pods` limit is skipped.  Returns `Err` when no
+/// suitable node exists so that the caller can skip binding and leave the pod
+/// Pending (mayor-bbxr: without this check, pods are bound to full nodes and
+/// the kubelet fails them OutOfpods).
 pub async fn pick_node(
     connector: &TlsConnector,
     server: &str,
@@ -251,7 +359,42 @@ pub async fn pick_node(
         bail!("GET /api/v1/nodes returned {status}: {body}");
     }
     let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
-    select_node_for_pod(list, node_selector)
+
+    // Build per-node pod counts for every candidate node (selector-matching).
+    // We only query nodes that pass the selector to avoid unnecessary API calls.
+    let mut pod_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for node in &list.items {
+        if !node_selector_matches(&node.metadata.labels, node_selector) {
+            continue;
+        }
+        let node_name = &node.metadata.name;
+        let pods_path = format!("/api/v1/pods?fieldSelector=spec.nodeName%3D{node_name}");
+        match http_get(connector, server, &pods_path).await {
+            Ok((ps, pb)) if ps.is_success() => {
+                match count_non_terminated_pods(&pb) {
+                    Ok(n) => {
+                        pod_counts.insert(node_name.clone(), n);
+                    }
+                    Err(e) => {
+                        // Treat count as 0 (allow scheduling) rather than failing
+                        // the entire pick_node call — a parse error here is not
+                        // grounds to leave the pod unscheduled indefinitely.
+                        tracing::warn!("failed to count pods on {node_name}: {e} — treating as 0");
+                    }
+                }
+            }
+            Ok((ps, pb)) => {
+                tracing::warn!(
+                    "GET pods for node {node_name} returned {ps}: {pb} — treating count as 0"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("GET pods for node {node_name} failed: {e} — treating count as 0");
+            }
+        }
+    }
+
+    select_node_with_capacity(list, node_selector, &pod_counts)
 }
 
 /// The target of a Binding — identifies the node to bind to.
@@ -800,12 +943,14 @@ mod tests {
                         name: "node-a".to_owned(),
                         labels: Default::default(),
                     },
+                    status: NodeStatus::default(),
                 },
                 NodeItem {
                     metadata: NodeMetadata {
                         name: "node-b".to_owned(),
                         labels: Default::default(),
                     },
+                    status: NodeStatus::default(),
                 },
             ],
         };
@@ -904,6 +1049,7 @@ mod tests {
                     name: "worker-0".to_owned(),
                     labels: Default::default(),
                 },
+                status: NodeStatus::default(),
             }],
         };
         let name = select_first_node(list).expect("single-item list must return Ok");
@@ -926,6 +1072,7 @@ mod tests {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
             },
+            status: NodeStatus::default(),
         }
     }
 
@@ -1050,6 +1197,185 @@ mod tests {
              reverting to always-pick-first would pass this as Ok, causing the conformance \
              test 'validates that NodeSelector is respected if not matching' to fail because \
              the pod gets scheduled instead of staying Pending"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // NodeResourcesFit / pod-capacity gate (mayor-bbxr)
+    //
+    // Without this check the scheduler binds pods to nodes already at their pod
+    // cap; the kubelet then fails them OutOfpods (phase=Failed) instead of leaving
+    // the pod Pending where controllers can re-issue it safely.
+    // ---------------------------------------------------------------------------
+
+    fn make_node_with_capacity(name: &str, labels: &[(&str, &str)], capacity: &str) -> NodeItem {
+        NodeItem {
+            metadata: NodeMetadata {
+                name: name.to_owned(),
+                labels: labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+            status: NodeStatus {
+                allocatable: NodeAllocatable {
+                    pods: capacity.to_owned(),
+                },
+                capacity: NodeAllocatable {
+                    pods: capacity.to_owned(),
+                },
+            },
+        }
+    }
+
+    /// A node at pod capacity must NOT be chosen — otherwise the kubelet fails
+    /// the pod with OutOfpods (phase=Failed) and controllers may recreate without
+    /// bound (mayor-bbxr).  Reverting `select_node_with_capacity` to ignore counts
+    /// would make this test pass when it should fail: the function would return
+    /// Ok("worker-0") instead of Err, so a pod would be bound to a full node.
+    #[test]
+    fn full_node_is_not_selected_so_pod_pends_instead_of_failing() {
+        let list = NodeList {
+            items: vec![make_node_with_capacity("worker-0", &[], "110")],
+        };
+        let selector = std::collections::HashMap::new();
+        // Node already has 110 pods — at capacity.
+        let counts: std::collections::HashMap<String, u32> =
+            [("worker-0".to_owned(), 110u32)].into();
+        let result = select_node_with_capacity(list, &selector, &counts);
+        assert!(
+            result.is_err(),
+            "a node at pod capacity must return Err so the pod stays Pending, \
+             not be selected and cause the kubelet to fail it OutOfpods (mayor-bbxr) — \
+             got: {:?}",
+            result.ok()
+        );
+    }
+
+    /// A node with one free slot must be selected — the common non-full case must
+    /// still schedule.  If select_node_with_capacity always returns Err, all
+    /// scheduling would stop (false positive), so we test the positive path too.
+    #[test]
+    fn node_with_free_slot_is_selected() {
+        let list = NodeList {
+            items: vec![make_node_with_capacity("worker-0", &[], "110")],
+        };
+        let selector = std::collections::HashMap::new();
+        // Node has 109 pods — one slot free.
+        let counts: std::collections::HashMap<String, u32> =
+            [("worker-0".to_owned(), 109u32)].into();
+        let result = select_node_with_capacity(list, &selector, &counts);
+        assert!(
+            result.is_ok(),
+            "a node with a free slot must be selected — if this fails, scheduling is \
+             incorrectly blocked even when capacity is available"
+        );
+        assert_eq!(result.unwrap(), "worker-0");
+    }
+
+    /// When two nodes match the selector but one is full, the scheduler must pick
+    /// the node with free capacity — not the full one and not Err.
+    #[test]
+    fn full_node_is_skipped_when_second_node_has_room() {
+        let list = NodeList {
+            items: vec![
+                make_node_with_capacity("worker-full", &[], "110"),
+                make_node_with_capacity("worker-free", &[], "110"),
+            ],
+        };
+        let selector = std::collections::HashMap::new();
+        let counts: std::collections::HashMap<String, u32> = [
+            ("worker-full".to_owned(), 110u32),
+            ("worker-free".to_owned(), 50u32),
+        ]
+        .into();
+        let result = select_node_with_capacity(list, &selector, &counts);
+        assert!(
+            result.is_ok(),
+            "must pick worker-free when worker-full is at capacity"
+        );
+        assert_eq!(
+            result.unwrap(),
+            "worker-free",
+            "must skip the full node and pick the one with free capacity (mayor-bbxr)"
+        );
+    }
+
+    /// When ALL matching nodes are full, the pod must stay Pending (Err returned)
+    /// so that no OutOfpods failure is triggered.
+    #[test]
+    fn all_nodes_full_returns_err_so_pod_stays_pending() {
+        let list = NodeList {
+            items: vec![
+                make_node_with_capacity("worker-0", &[], "110"),
+                make_node_with_capacity("worker-1", &[], "110"),
+            ],
+        };
+        let selector = std::collections::HashMap::new();
+        let counts: std::collections::HashMap<String, u32> = [
+            ("worker-0".to_owned(), 110u32),
+            ("worker-1".to_owned(), 110u32),
+        ]
+        .into();
+        let result = select_node_with_capacity(list, &selector, &counts);
+        assert!(
+            result.is_err(),
+            "all nodes full must return Err so the pod stays Pending, not be bound \
+             to a full node causing OutOfpods (mayor-bbxr)"
+        );
+    }
+
+    /// A node with unknown capacity (field absent / zero) must still be schedulable.
+    /// We do not block on missing data — that would prevent scheduling entirely in
+    /// clusters that don't expose allocatable.pods.
+    #[test]
+    fn node_with_unknown_capacity_is_not_blocked() {
+        // capacity "" → parse_pod_capacity returns 0 → treated as "unknown, allow"
+        let list = NodeList {
+            items: vec![make_node_with_capacity("worker-0", &[], "")],
+        };
+        let selector = std::collections::HashMap::new();
+        let counts: std::collections::HashMap<String, u32> =
+            [("worker-0".to_owned(), 999u32)].into();
+        let result = select_node_with_capacity(list, &selector, &counts);
+        assert!(
+            result.is_ok(),
+            "a node with unknown capacity (empty string) must not be blocked — \
+             we don't have enough information to cap it"
+        );
+    }
+
+    /// parse_pod_capacity handles the standard "110" quantity string.
+    #[test]
+    fn parse_pod_capacity_handles_standard_quantity() {
+        assert_eq!(parse_pod_capacity("110"), 110);
+        assert_eq!(parse_pod_capacity("0"), 0);
+        assert_eq!(parse_pod_capacity(""), 0);
+        assert_eq!(parse_pod_capacity("not-a-number"), 0);
+    }
+
+    /// count_non_terminated_pods counts correctly, excluding Succeeded and Failed.
+    ///
+    /// This is the NodeResourcesFit predicate: running/pending pods consume a slot;
+    /// completed pods do not.  Reverting to count all pods would over-count and
+    /// block scheduling when completed pods have not yet been GC'd.
+    #[test]
+    fn count_non_terminated_pods_excludes_terminal_phases() {
+        let body = serde_json::json!({
+            "items": [
+                { "status": { "phase": "Running" } },
+                { "status": { "phase": "Pending" } },
+                { "status": { "phase": "Succeeded" } },
+                { "status": { "phase": "Failed" } },
+                { "status": {} },  // missing phase → not terminal → counts
+            ]
+        })
+        .to_string();
+        let count = count_non_terminated_pods(&body).expect("should parse");
+        assert_eq!(
+            count, 3,
+            "Running + Pending + unknown-phase count as consuming a slot; \
+             Succeeded and Failed do not (NodeResourcesFit predicate, mayor-bbxr)"
         );
     }
 
