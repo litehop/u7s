@@ -8206,6 +8206,100 @@ mod resize_tests {
              got: {msg}"
         );
     }
+
+    /// Guaranteed pod — remove limits via empty object: must fire "resource limits cannot be removed",
+    /// NOT a QoS error. The QoS check (Rule 4) uses merge semantics and skips empty sections, so
+    /// stored limits are preserved during QoS computation (still Guaranteed → no QoS change).
+    /// Rule 3 then fires because limits.cpu is in stored but absent in the patch's empty limits:{}.
+    ///
+    /// This tests that Rule 4 ordering + merge_resize_for_qos empty-section skipping don't
+    /// falsely claim a QoS change when the real error is a forbidden resource removal.
+    #[test]
+    fn resize_rejects_guaranteed_removing_limits_with_removal_error_not_qos_error() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "guaranteed-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {"cpu": "100m", "memory": "128Mi"},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        // Send limits:{} to remove all limits (Guaranteed pod).
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "resources": {
+                        "limits": {},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_err(),
+            "removing limits from Guaranteed pod must be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("resource limits cannot be removed"),
+            "error must be 'resource limits cannot be removed' (not a QoS error) — \
+             merge_resize_for_qos must skip empty sections so Rule 4 doesn't shadow Rule 3; \
+             got: {msg}"
+        );
+    }
+
+    /// Burstable pod — set requests == limits: must fire QoS error (Burstable → Guaranteed),
+    /// even though the patch omits the limits section entirely (no limits key). Rule 4 uses
+    /// merge semantics where absent sections are preserved from the stored pod, so the merged
+    /// pod has limits=stored and requests=patch → they become equal → QoS changes.
+    ///
+    /// This tests that Rule 4 (QoS) runs before Rule 3 (removal) so the correct error fires.
+    #[test]
+    fn resize_rejects_burstable_setting_requests_equal_to_limits_via_qos_error() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "burstable-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "c1",
+                    "resources": {
+                        "limits": {"cpu": "200m", "memory": "256Mi"},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }
+                }]
+            },
+            "status": {}
+        });
+        // Patch only sets requests == stored limits (no limits key in patch → preserved by merge).
+        // This would make requests == limits → QoS changes Burstable → Guaranteed.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "c1",
+                    "resources": {
+                        "requests": {"cpu": "200m", "memory": "256Mi"}
+                    }
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(result.is_err(), "QoS change must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Pod QOS Class may not change as a result of resizing"),
+            "error must be QoS error (not 'limits cannot be removed') — \
+             Rule 4 must fire before Rule 3 when QoS change is the real issue; \
+             got: {msg}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
