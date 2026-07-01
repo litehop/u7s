@@ -1816,18 +1816,40 @@ pub fn validate_resize_patch(
         ));
     }
 
+    // Rule 4: QoS class must not change — checked BEFORE Rule 3 (resource removal).
+    //
+    // Checked first because some tests ("Burstable pod - set requests == limits") send a patch
+    // that omits the limits section entirely (to avoid triggering limits-removal) but would
+    // change QoS from Burstable → Guaranteed. If Rule 3 ran first, it would fire
+    // "resource limits cannot be removed" instead of the expected QoS error.
+    //
+    // Uses merge semantics (absent section = preserved from stored) so that a patch sending
+    // only requests implicitly keeps existing limits for the QoS computation. This allows
+    // detecting QoS changes that would occur when requests are set equal to stored limits.
+    let qos_before = compute_qos_class(stored);
+    let qos_after = compute_qos_class(&merge_resize_for_qos(stored, incoming));
+    if qos_before != qos_after {
+        return Err(format!(
+            "Pod {pod_ns}/{pod_name}: \
+             Pod QOS Class may not change as a result of resizing. \
+             Existing QOS class: {qos_before}, new QOS class: {qos_after}",
+        ));
+    }
+
     // Rule 3: resize may not remove a resource quantity that is currently set.
     //
-    // Section-level semantics (matching real k8s):
-    // - If a section (requests or limits) IS PRESENT in the patch, then every quantity
-    //   that was set in the stored container for that section must also be present in the
-    //   patch. Omitting a previously-set quantity from a present section means removal.
-    // - If a section is ABSENT from the patch's resources, the stored values for that
-    //   section are preserved in the merge (no removal error is triggered).
+    // ALL-SECTIONS semantics: for every cpu/memory resource in requests AND limits,
+    // check whether the stored value is present in the patch. A patch that omits the
+    // limits section entirely (limits key absent from resources) is treated as "remove
+    // all limits", same as a patch that explicitly sets limits to {}.
     //
-    // Check limits before requests: "resource limits cannot be removed" must fire
-    // before "resource requests cannot be removed" when both sections are missing,
-    // because k8s validates limits first (Guaranteed pod - remove limits test expects this).
+    // Indexing into missing keys via serde_json returns Value::Null, so
+    // incoming_resources["limits"]["cpu"].as_str() → None when limits is absent or
+    // limits.cpu is absent. This fires the same removal error in both cases.
+    //
+    // Check limits before requests so "resource limits cannot be removed" fires before
+    // "resource requests cannot be removed" when both sections are missing (the
+    // "Guaranteed pod - remove limits" conformance test expects this ordering).
     let stored_by_name: std::collections::HashMap<&str, &serde_json::Value> = stored_containers
         .iter()
         .filter_map(|c| c["name"].as_str().map(|n| (n, c)))
@@ -1843,57 +1865,39 @@ pub fn validate_resize_patch(
             continue;
         }
 
-        // Check limits section first (if present in patch).
-        if incoming_resources["limits"].is_object() {
-            for resource in &["cpu", "memory"] {
-                let stored_has = stored_c["resources"]["limits"][resource]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty());
-                let incoming_has = incoming_resources["limits"][resource]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty());
-                if stored_has && !incoming_has {
-                    return Err(format!(
-                        "Pod {pod_ns}/{pod_name}: \
-                         spec.containers[name={name}].resources.limits.{resource}: \
-                         resource limits cannot be removed",
-                    ));
-                }
+        // Check limits first.
+        for resource in &["cpu", "memory"] {
+            let stored_has = stored_c["resources"]["limits"][resource]
+                .as_str()
+                .is_some_and(|s| !s.is_empty());
+            let incoming_has = incoming_resources["limits"][resource]
+                .as_str()
+                .is_some_and(|s| !s.is_empty());
+            if stored_has && !incoming_has {
+                return Err(format!(
+                    "Pod {pod_ns}/{pod_name}: \
+                     spec.containers[name={name}].resources.limits.{resource}: \
+                     resource limits cannot be removed",
+                ));
             }
         }
 
-        // Check requests section (if present in patch).
-        if incoming_resources["requests"].is_object() {
-            for resource in &["cpu", "memory"] {
-                let stored_has = stored_c["resources"]["requests"][resource]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty());
-                let incoming_has = incoming_resources["requests"][resource]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty());
-                if stored_has && !incoming_has {
-                    return Err(format!(
-                        "Pod {pod_ns}/{pod_name}: \
-                         spec.containers[name={name}].resources.requests.{resource}: \
-                         resource requests cannot be removed",
-                    ));
-                }
+        // Check requests.
+        for resource in &["cpu", "memory"] {
+            let stored_has = stored_c["resources"]["requests"][resource]
+                .as_str()
+                .is_some_and(|s| !s.is_empty());
+            let incoming_has = incoming_resources["requests"][resource]
+                .as_str()
+                .is_some_and(|s| !s.is_empty());
+            if stored_has && !incoming_has {
+                return Err(format!(
+                    "Pod {pod_ns}/{pod_name}: \
+                     spec.containers[name={name}].resources.requests.{resource}: \
+                     resource requests cannot be removed",
+                ));
             }
         }
-    }
-
-    // Rule 4: QoS class must not change.
-    // Compute the MERGED post-patch state: absent sections are preserved from stored
-    // (matching real k8s merge semantics). A patch that only updates requests but omits
-    // limits preserves the existing limits, and the merged result may change QoS class.
-    let qos_before = compute_qos_class(stored);
-    let qos_after = compute_qos_class(&merge_resize_for_qos(stored, incoming));
-    if qos_before != qos_after {
-        return Err(format!(
-            "Pod {pod_ns}/{pod_name}: \
-             Pod QOS Class may not change as a result of resizing. \
-             Existing QOS class: {qos_before}, new QOS class: {qos_after}",
-        ));
     }
 
     Ok(())
@@ -1925,9 +1929,17 @@ fn merge_resize_for_qos(
                 if incoming_resources.is_null() {
                     continue;
                 }
-                // Merge section by section: only update sections that are present in the patch.
+                // Merge section by section: only update sections that are non-empty in
+                // the patch. An empty object {} (explicit removal) is intentionally NOT
+                // merged here — for QoS computation we need to see what limits/requests
+                // WOULD be after a valid resize; the actual removal is caught by Rule 3.
+                // Skipping empty {} means the stored values are preserved for QoS checks,
+                // so "Guaranteed pod remove limits" does not falsely trigger a QoS error.
                 for section in &["requests", "limits"] {
-                    if incoming_resources[section].is_object() {
+                    if incoming_resources[section]
+                        .as_object()
+                        .is_some_and(|m| !m.is_empty())
+                    {
                         stored_container["resources"][section] =
                             incoming_resources[section].clone();
                     }
@@ -7980,11 +7992,10 @@ mod resize_tests {
             "status": {}
         });
         // Patch explicitly sets limits to {} (empty object) to remove them, and increases requests.
-        // Real k8s tests send limits:{} (not just absent limits) to signal removal: an absent
-        // limits section preserves existing limits (merge semantics), while limits:{} (an empty
-        // object with no keys) means "remove all limits". Our section-level check only fires
-        // when the limits key is present as an object (including empty {}), matching this
-        // real k8s test behavior.
+        // Rule 3 uses ALL-SECTIONS semantics: indexing into absent keys (via serde_json) returns
+        // Null, so both an absent limits key and limits:{} (empty object) are treated as "no
+        // value for cpu/memory in limits", triggering the removal error. limits:{} is used here
+        // to make the test scenario explicit (and matches what some real k8s e2e clients send).
         let incoming = serde_json::json!({
             "spec": {
                 "containers": [{
