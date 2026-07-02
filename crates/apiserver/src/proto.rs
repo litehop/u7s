@@ -901,6 +901,12 @@ struct Container {
     /// this fix, causing resize conformance tests to fail post-PATCH verification.
     #[prost(message, repeated, tag = "23")]
     resize_policy: Vec<ContainerResizePolicy>,
+    /// restartPolicy (field 24, optional string) — KEP-3939 sidecar containers. When set to
+    /// "Always", the init container runs as a sidecar (non-blocking). Silently dropped before
+    /// this fix, converting sidecar init containers into traditional blocking init containers
+    /// (sleep 1d never exits → pod stuck Pending → resize conformance tests time out after 300s).
+    #[prost(string, optional, tag = "24")]
+    restart_policy: Option<String>,
     /// lifecycle (field 12, message Lifecycle)
     #[prost(message, tag = "12")]
     lifecycle: Option<Lifecycle>,
@@ -5046,6 +5052,11 @@ fn container_to_json(c: Container) -> serde_json::Value {
             "resizePolicy".to_string(),
             serde_json::Value::Array(rp_json),
         );
+    }
+    if let Some(rp) = c.restart_policy {
+        if !rp.is_empty() {
+            cm.insert("restartPolicy".to_string(), serde_json::Value::String(rp));
+        }
     }
     if !c.volume_mounts.is_empty() {
         let mounts: Vec<serde_json::Value> = c
@@ -16616,6 +16627,54 @@ mod tests {
         assert_eq!(
             result["status"]["active"][0]["kind"], "Job",
             "status.active[0].kind must survive proto decode"
+        );
+    }
+
+    /// decode_pod_proto must preserve Container.restartPolicy (proto field 24) for sidecar init containers.
+    ///
+    /// Field 24 of Container is `optional string restartPolicy` (KEP-3939, k8s release-1.34
+    /// core/v1/generated.proto). When set to "Always" on an init container, the kubelet treats it
+    /// as a sidecar that runs concurrently (non-blocking). Without field 24 in the Container prost
+    /// struct, u7s SILENTLY DROPS the field — the init container is stored without restartPolicy,
+    /// the kubelet sees a traditional blocking init container, sleep-1d never exits, and the pod
+    /// stays Pending forever. This causes ~23 of the 54 resize conformance specs to time out after
+    /// 300s waiting for Running+Ready. This test MUST fail if restart_policy (tag=24) is removed
+    /// from the Container prost struct or the emission in container_to_json is removed.
+    #[test]
+    fn decode_container_proto_preserves_restart_policy_else_sidecar_becomes_blocking_init() {
+        // Build Container: name (field 1), image (field 2), restartPolicy (field 24) = "Always"
+        // This simulates a sidecar init container as sent by the e2e test binary.
+        let mut container = encode_length_delimited(1, b"sidecar"); // name
+        container.extend_from_slice(&encode_length_delimited(2, b"busybox:latest")); // image
+                                                                                     // field 24, wire type 2 (length-delimited string) — the "optional string" proto field
+        container.extend_from_slice(&encode_length_delimited(24, b"Always")); // restartPolicy
+
+        // PodSpec: initContainers (field 20), containers (field 2) — put sidecar as init container
+        // Use containers field (field 2) for simplicity; the decoder path is the same.
+        let pod_spec = encode_length_delimited(2, &container);
+
+        // Pod: metadata (field 1), spec (field 2)
+        let mut obj_meta = encode_length_delimited(1, b"sidecar-pod"); // ObjectMeta.name
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"default")); // ObjectMeta.namespace
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto).expect(
+            "pod with sidecar init container (restartPolicy=Always) must decode — \
+             proto field 24 is Container.restartPolicy",
+        );
+
+        let containers = result["spec"]["containers"]
+            .as_array()
+            .expect("spec.containers must be an array");
+        assert_eq!(containers.len(), 1);
+
+        assert_eq!(
+            containers[0]["restartPolicy"], "Always",
+            "Container.restartPolicy must be 'Always' — without field 24 in the Container prost \
+             struct it is silently dropped, converting the sidecar init container into a blocking \
+             init container that never exits, leaving the pod Pending and causing resize \
+             conformance specs to time out after 300s"
         );
     }
 }
