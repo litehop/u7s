@@ -143,7 +143,7 @@ pub async fn patch_approval<S: Store>(
         }
     }
 
-    let expected_rv = parse_resource_version(current.resource_version())?;
+    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -524,6 +524,124 @@ mod tests {
         assert!(
             conds.iter().any(|c| c["type"] == "Denied"),
             "json-patch on /approval must add the Denied condition"
+        );
+    }
+
+    /// PATCH /approval with a stale resourceVersion must return 409 Conflict.
+    ///
+    /// Two approvers patching the same CSR concurrently must not silently clobber each other.
+    /// Without CAS, the second PATCH always succeeds regardless of resourceVersion because
+    /// patch_approval used the stored object's RV (always matches) as the CAS token.
+    #[tokio::test]
+    async fn patch_approval_stale_rv_returns_409_else_concurrent_approvers_clobber() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "stale-rv-csr";
+        seed_csr(&store, name, None).await;
+
+        // Advance the stored object so rv=1 is now stale.
+        let key = format!("/registry/certificates.k8s.io/certificatesigningrequests/{name}");
+        let stored = store.get(&key).await.unwrap().unwrap();
+        let mut obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        obj["status"]["conditions"] = serde_json::json!([]);
+        let rv1 = stored.revision;
+        // Write a new revision so rv1 becomes stale.
+        let rv2 = store
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+        assert!(rv2 > rv1, "rv must advance");
+
+        // PATCH carries the stale rv1.
+        let patch_body = serde_json::json!({
+            "metadata": { "name": name, "resourceVersion": rv1.to_string() },
+            "status": {
+                "conditions": [{"type": "Approved", "status": "True", "reason": "test", "message": ""}]
+            }
+        });
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        match result {
+            Err(err) => assert_eq!(
+                err.0,
+                axum::http::StatusCode::CONFLICT,
+                "stale resourceVersion in PATCH /approval body must return 409 — \
+                 two concurrent approvers must not silently clobber each other"
+            ),
+            Ok(_) => panic!(
+                "PATCH /approval with stale resourceVersion must be rejected with 409, \
+                 else concurrent approvers silently overwrite each other's decisions"
+            ),
+        }
+    }
+
+    /// PATCH /approval with no resourceVersion in the patch body succeeds unconditionally.
+    ///
+    /// Clients that omit metadata.resourceVersion must not be broken by the PATCH CAS fix.
+    #[tokio::test]
+    async fn patch_approval_absent_rv_is_unconditional_write() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let name = "norev-approval-csr";
+        seed_csr(&store, name, None).await;
+
+        let patch_body = serde_json::json!({
+            "status": {
+                "conditions": [{"type": "Approved", "status": "True", "reason": "test", "message": ""}]
+            }
+        });
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let result = patch_approval(
+            axum::extract::State(state),
+            axum::extract::Path(name.to_owned()),
+            headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch_body).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PATCH /approval without metadata.resourceVersion must succeed (unconditional) — \
+             clients that omit rv must not be broken by the stale-RV CAS fix"
         );
     }
 
