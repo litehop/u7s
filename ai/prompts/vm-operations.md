@@ -38,6 +38,10 @@ scripts/worker-vm.sh start <VM> 127.0.0.1 <KUBELET_PORT>
 For full stack bringup (build + apiserver + kubelet + KCM + sonobuoy), use `run-all.sh`.
 Your CWD is the worktree root. `--workdir` defaults to `$PWD/temp/u7s` — omit it entirely.
 
+**WARNING: bare `run-all.sh` (no `--focus`, no `--stack-only`) runs the FULL conformance
+suite, which takes ~6h at current state. Always use `--focus` or `--stack-only` unless
+you intend a full run.**
+
 **First run — pass `--reset`.**
 `--reset` wipes `temp/u7s/`, kills any process on `<PORT>`, kills in-VM processes, and
 deletes+reprovisions the VM. Required when the VM may have stale state from a previous
@@ -85,6 +89,44 @@ scripts/conformance/run-all.sh --vm <VM> --port <PORT> --kubelet-port <KUBELET_P
 
 Only pass `--binary <path>` if you deliberately want to skip the build and run a
 pre-built binary; for normal worktree iteration, omit it.
+
+---
+
+## Stack-only mode — live stack without sonobuoy
+
+Use `--stack-only` to bring up steps 1–5 (build, apiserver, kubelet, KCM, scheduler)
+and then stop, leaving the stack running for kubectl or direct-DB investigation. Step 6
+(sonobuoy) is skipped entirely — no sonobuoy pod is launched.
+
+This is the correct tool when you want to inspect cluster state, run kubectl commands
+manually, or debug the API surface without waiting for sonobuoy. It avoids accidentally
+triggering the full ~6h suite.
+
+```bash
+# first time (reset + stack-only):
+scripts/conformance/run-all.sh \
+  --vm           <VM> \
+  --port         <PORT> \
+  --kubelet-port <KUBELET_PORT> \
+  --reset \
+  --stack-only
+
+# subsequent (reuse stack):
+scripts/conformance/run-all.sh \
+  --vm           <VM> \
+  --port         <PORT> \
+  --kubelet-port <KUBELET_PORT> \
+  --stack-only
+```
+
+After the run completes, the stack is accessible:
+```bash
+kubectl --kubeconfig temp/u7s/kubeconfig get nodes
+kubectl --kubeconfig temp/u7s/kubeconfig get pods -A
+```
+
+If `--focus` and `--stack-only` are both passed, `--focus` is ignored (warning printed to
+stderr) and the stack is brought up without sonobuoy.
 
 ---
 
