@@ -148,7 +148,7 @@ pub async fn patch_resource_status<S: Store>(
 
     match patch_type {
         PatchType::Json => {
-            // JSON Patch addresses the full document; operations include the /status prefix.
+            validate_status_json_patch_paths(&patch)?;
             apply_json_patch(&mut current.body, &patch)?;
         }
         _ => {
@@ -173,7 +173,7 @@ pub async fn patch_resource_status<S: Store>(
         }
     }
 
-    let expected_rv = parse_resource_version(current.resource_version())?;
+    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -295,7 +295,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
 
     match patch_type {
         PatchType::Json => {
-            // JSON Patch addresses the full document; operations include the /status prefix.
+            validate_status_json_patch_paths(&patch)?;
             apply_json_patch(&mut current.body, &patch)?;
         }
         _ => {
@@ -320,7 +320,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
         }
     }
 
-    let expected_rv = parse_resource_version(current.resource_version())?;
+    let expected_rv = parse_resource_version(patch["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -329,6 +329,34 @@ pub async fn patch_namespaced_resource_status<S: Store>(
 
     current.set_resource_version(new_rv);
     Ok(Json(current.body))
+}
+
+/// Validate that every op in a JSON Patch sent to a /status subresource targets
+/// only `/status/...` or `/metadata/...`. A client with `patch <res>/status` must
+/// not be able to write spec — that is privilege escalation.
+///
+/// Returns 422 if any op path is outside the allowed prefixes.
+fn validate_status_json_patch_paths(
+    patch: &serde_json::Value,
+) -> Result<(), crate::status::StatusError> {
+    let ops = patch
+        .as_array()
+        .ok_or_else(|| Status::unprocessable_entity("JSON patch must be an array".into()))?;
+    for op in ops {
+        let path = op["path"].as_str().ok_or_else(|| {
+            Status::unprocessable_entity("JSON patch op missing 'path' field".into())
+        })?;
+        if !path.starts_with("/status/")
+            && path != "/status"
+            && !path.starts_with("/metadata/")
+            && path != "/metadata"
+        {
+            return Err(Status::unprocessable_entity(format!(
+                "JSON patch on /status subresource may only target /status or /metadata paths; got '{path}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2996,6 +3024,533 @@ mod tests {
             result.is_ok(),
             "absent resourceVersion in namespaced PUT /status body must succeed (unconditional) — \
              clients that omit rv must not be broken by the stale-RV CAS fix"
+        );
+    }
+
+    fn json_patch_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json-patch+json"),
+        );
+        h
+    }
+
+    /// JSON Patch on /status with a spec-targeting op must be rejected 422.
+    ///
+    /// A client that has `patch <resource>/status` RBAC must not be able to write
+    /// spec fields by sending a JSON Patch with path "/spec/...". Without this guard,
+    /// privilege escalation allows overwriting the resource spec via the /status route.
+    #[tokio::test]
+    async fn patch_resource_status_json_patch_targeting_spec_is_rejected_422() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "spec-guard-node" },
+            "spec": { "drivers": [{"name": "original.csi.io"}] },
+            "status": {}
+        });
+        let key = "/registry/storage.k8s.io/csinodes/spec-guard-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!([
+            {"op": "replace", "path": "/spec/drivers/0/name", "value": "attacker.csi.io"}
+        ]);
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "spec-guard-node".into(),
+            )),
+            json_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "JSON Patch with /spec path on /status subresource must be rejected — \
+                 a client with only patch status RBAC must not be able to overwrite spec"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "spec-targeting JSON Patch on /status must return 422 — \
+             privilege escalation: patch status can write spec without this guard"
+        );
+
+        // Confirm spec was NOT modified.
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["drivers"][0]["name"], "original.csi.io",
+            "spec.drivers must not be modified by a /status JSON Patch with a /spec path"
+        );
+    }
+
+    /// JSON Patch on /status with a /status/* op succeeds.
+    ///
+    /// Legitimate controllers that PATCH /status with JSON Patch using /status/* paths
+    /// must continue to work after the path-isolation guard is added.
+    #[tokio::test]
+    async fn patch_resource_status_json_patch_targeting_status_succeeds() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "status-ok-node" },
+            "spec": { "drivers": [] },
+            "status": {}
+        });
+        let key = "/registry/storage.k8s.io/csinodes/status-ok-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/status/ready", "value": true}
+        ]);
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "status-ok-node".into(),
+            )),
+            json_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "JSON Patch with /status/* path on /status subresource must succeed — \
+             the path-isolation guard must not block legitimate status writes"
+        );
+    }
+
+    /// JSON Patch on namespaced /status with a spec-targeting op must be rejected 422.
+    ///
+    /// Same privilege-escalation guard as the cluster-scoped variant, applied to the
+    /// namespaced code path. A client with `patch deployments/status` must not write spec.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_json_patch_targeting_spec_is_rejected_422() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "guarded-deploy", "namespace": "default" },
+            "spec": { "replicas": 3 },
+            "status": {}
+        });
+        let key = "/registry/apps/deployments/default/guarded-deploy";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!([
+            {"op": "replace", "path": "/spec/replicas", "value": 0}
+        ]);
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "guarded-deploy".into(),
+            )),
+            json_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "JSON Patch with /spec path on namespaced /status subresource must be rejected — \
+                 a client with only patch deployments/status RBAC must not overwrite spec.replicas"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "spec-targeting JSON Patch on namespaced /status must return 422 — \
+             without this guard, patch status RBAC can silently scale down a Deployment"
+        );
+
+        // Confirm spec.replicas was NOT modified.
+        let stored = store.get(key).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["replicas"], 3,
+            "spec.replicas must not be modified by a /status JSON Patch with /spec path"
+        );
+    }
+
+    /// JSON Patch on namespaced /status with a /status/* op succeeds.
+    ///
+    /// The guard must permit legitimate status writes via /status/* paths.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_json_patch_targeting_status_succeeds() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "status-write-deploy", "namespace": "default" },
+            "spec": { "replicas": 1 },
+            "status": {}
+        });
+        let key = "/registry/apps/deployments/default/status-write-deploy";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!([
+            {"op": "add", "path": "/status/readyReplicas", "value": 1}
+        ]);
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "status-write-deploy".into(),
+            )),
+            json_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "JSON Patch with /status/* path on namespaced /status subresource must succeed — \
+             the guard must not block legitimate controller status writes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests for PATCH /status CAS (the PUT sibling was fixed but PATCH
+    // was left reading the stored object's RV — unconditional writes).
+    // ---------------------------------------------------------------------------
+
+    /// PATCH cluster-scoped /status with a stale resourceVersion must return 409 Conflict.
+    ///
+    /// Without this fix, patch_resource_status used current.resource_version() (the stored
+    /// object's RV, just fetched) as the CAS token — always matches, making every PATCH
+    /// unconditional. A controller holding a stale snapshot silently clobbers concurrent writes.
+    #[tokio::test]
+    async fn patch_resource_status_stale_rv_returns_409_else_concurrent_controllers_clobber() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "stale-node" },
+            "spec": { "drivers": [] },
+            "status": {}
+        });
+        let key = "/registry/storage.k8s.io/csinodes/stale-node";
+        let rv1 = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Advance to rv2 (simulates a concurrent controller write).
+        let mut csinode2 = csinode.clone();
+        csinode2["status"]["ready"] = serde_json::json!(true);
+        let rv2 = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+        assert!(rv2 > rv1, "rv must advance");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Patch carries the stale rv1 in metadata.resourceVersion.
+        let patch = serde_json::json!({
+            "metadata": { "resourceVersion": rv1.to_string() },
+            "status": { "phase": "Failed" }
+        });
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "stale-node".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "PATCH /status with stale resourceVersion must return 409 — \
+                 without CAS, concurrent controllers silently overwrite each other's status"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "stale resourceVersion in PATCH cluster-scoped /status must return 409 — \
+             controllers must retry from a fresh GET when their snapshot is stale"
+        );
+    }
+
+    /// PATCH cluster-scoped /status with no resourceVersion succeeds unconditionally.
+    ///
+    /// Clients that omit metadata.resourceVersion must not be broken by the PATCH CAS fix.
+    #[tokio::test]
+    async fn patch_resource_status_absent_rv_is_unconditional_write() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let csinode = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "norev-node" },
+            "spec": { "drivers": [] },
+            "status": {}
+        });
+        let key = "/registry/storage.k8s.io/csinodes/norev-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({"status": {"phase": "Ready"}});
+        let result = patch_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "norev-node".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PATCH cluster-scoped /status without metadata.resourceVersion must succeed — \
+             the PATCH CAS fix must not break clients that omit the resourceVersion"
+        );
+    }
+
+    /// PATCH namespaced /status with a stale resourceVersion must return 409 Conflict.
+    ///
+    /// Same OCC contract as the cluster-scoped variant, applied to the namespaced path.
+    /// Without this fix, a controller updating deployments/status with a stale snapshot
+    /// silently clobbers the Deployment controller's concurrent status write.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_stale_rv_returns_409_else_concurrent_controllers_clobber(
+    ) {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "stale-status-deploy", "namespace": "default" },
+            "spec": { "replicas": 1 },
+            "status": {}
+        });
+        let key = "/registry/apps/deployments/default/stale-status-deploy";
+        let rv1 = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Advance to rv2 (simulates a concurrent Deployment controller write).
+        let mut deploy2 = deploy.clone();
+        deploy2["status"]["readyReplicas"] = serde_json::json!(1);
+        let rv2 = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+        assert!(rv2 > rv1, "rv must advance");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Patch carries the stale rv1.
+        let patch = serde_json::json!({
+            "metadata": { "resourceVersion": rv1.to_string() },
+            "status": { "readyReplicas": 0 }
+        });
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "stale-status-deploy".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "PATCH namespaced /status with stale resourceVersion must return 409 — \
+                 without CAS, a controller with a stale snapshot silently clobbers concurrent writes"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "stale resourceVersion in PATCH namespaced /status must return 409 — \
+             controllers must retry from a fresh GET; without this they silently lose updates"
+        );
+    }
+
+    /// PATCH namespaced /status with no resourceVersion succeeds unconditionally.
+    ///
+    /// Clients that omit metadata.resourceVersion must not be broken by the PATCH CAS fix.
+    #[tokio::test]
+    async fn patch_namespaced_resource_status_absent_rv_is_unconditional_write() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let deploy = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "norev-status-deploy", "namespace": "default" },
+            "spec": { "replicas": 1 },
+            "status": {}
+        });
+        let key = "/registry/apps/deployments/default/norev-status-deploy";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let patch = serde_json::json!({"status": {"readyReplicas": 1}});
+        let result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "norev-status-deploy".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "PATCH namespaced /status without metadata.resourceVersion must succeed — \
+             the PATCH CAS fix must not break controllers that omit the resourceVersion"
         );
     }
 }

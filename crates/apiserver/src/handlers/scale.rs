@@ -433,12 +433,13 @@ async fn scale_patch_impl<S: Store>(
         obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
     }
 
-    let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
+    let expected_rv =
+        crate::util::parse_resource_version(patch_body["metadata"]["resourceVersion"].as_str())?;
     let new_rv = state
         .store
         .put(&key, obj.to_bytes(), expected_rv)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .map_err(|e| store_err(e, name, resource))?;
 
     Ok(Json(build_scale(
         name,
@@ -1997,6 +1998,112 @@ mod handler_tests {
             StatusCode::OK,
             "absent metadata.resourceVersion in PUT /scale body must succeed (unconditional) — \
              single-writer clients must not be broken by the stale-RV CAS fix"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests for PATCH /scale CAS (the PUT sibling was fixed but PATCH
+    // was left reading the stored object's RV — unconditional writes).
+    // HPA scales EXCLUSIVELY via PATCH — highest impact path.
+    // ---------------------------------------------------------------------------
+
+    /// PATCH /scale with a stale resourceVersion in the patch body must return 409 Conflict.
+    ///
+    /// HPA scales deployments/statefulsets exclusively via PATCH. Without this fix,
+    /// patch_scale_impl used the stored object's RV as the CAS token, making every PATCH
+    /// unconditional — a stale HPA write silently clobbers a concurrent write instead of
+    /// receiving 409 and retrying from a fresh GET.
+    #[tokio::test]
+    async fn patch_scale_stale_rv_returns_409_else_hpa_silently_clobbers_concurrent_writes() {
+        let (state, store) = make_state();
+
+        let key = "/registry/apps/deployments/default/hpa-target";
+        let val = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "hpa-target", "namespace": "default", "resourceVersion": "1" },
+            "spec": { "replicas": 1 },
+            "status": {}
+        });
+        let rv1 = store
+            .put(key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .unwrap();
+
+        // Advance to rv2 (simulates a concurrent write).
+        let mut val2 = val.clone();
+        val2["metadata"]["resourceVersion"] = serde_json::json!(rv1.to_string());
+        val2["spec"]["replicas"] = serde_json::json!(5);
+        let rv2 = store
+            .put(
+                key,
+                Bytes::from(serde_json::to_vec(&val2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+        assert!(rv2 > rv1, "rv must advance after concurrent write");
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .with_state(state);
+
+        // Patch body carries the now-stale rv1 — must be rejected with 409.
+        let body = serde_json::json!({
+            "metadata": { "resourceVersion": rv1.to_string() },
+            "spec": { "replicas": 2 }
+        });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/apis/apps/v1/namespaces/default/deployments/hpa-target/scale")
+            .header("content-type", "application/merge-patch+json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a stale HPA scale PATCH must 409, else it silently clobbers a concurrent write — \
+             HPA scales exclusively via PATCH; without CAS it can overwrite a concurrent \
+             kubectl scale or another HPA loop's update"
+        );
+    }
+
+    /// PATCH /scale with no resourceVersion in the patch body succeeds unconditionally.
+    ///
+    /// Clients that omit metadata.resourceVersion must not be broken by the PATCH CAS fix.
+    /// This is the common case: most PATCH scale bodies do not include metadata.resourceVersion.
+    #[tokio::test]
+    async fn patch_scale_absent_rv_is_unconditional_write() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "patch-norev", 3).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                patch(patch_scale),
+            )
+            .with_state(state);
+
+        let body = serde_json::json!({ "spec": { "replicas": 7 } });
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/apis/apps/v1/namespaces/default/deployments/patch-norev/scale")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "PATCH /scale without metadata.resourceVersion must succeed (unconditional) — \
+             the PATCH CAS fix must not break clients that omit the resourceVersion"
         );
     }
 }
