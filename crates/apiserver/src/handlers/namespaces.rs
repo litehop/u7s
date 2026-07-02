@@ -536,7 +536,12 @@ pub async fn finalize_namespace<S: Store>(
     }
 
     // Finalizers remain — persist the updated object and return it.
-    let expected_rv = parse_resource_version(current.resource_version())?;
+    // CAS on the INCOMING request's resourceVersion, not the stored object's: /finalize is
+    // a replace subresource, so a client holding a stale snapshot must get 409 and retry
+    // rather than clobber a concurrent write. Absent rv stays unconditional (returns None).
+    let incoming_meta: ObjectMeta =
+        serde_json::from_value(req["metadata"].clone()).unwrap_or_default();
+    let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -2395,6 +2400,66 @@ mod tests {
             finalizers[0].as_str(),
             Some("controller-b"),
             "the remaining finalizer must be 'controller-b'"
+        );
+    }
+
+    // PUT /finalize with a stale resourceVersion must return 409 Conflict.
+    // /finalize is a replace subresource: KCM's namespace controller reads the namespace,
+    // removes a finalizer, and PUTs it back. If a concurrent write landed in between, the
+    // stale PUT must be rejected so the controller retries from a fresh GET instead of
+    // resurrecting stale finalizers (which would strand the namespace in Terminating).
+    #[tokio::test]
+    async fn finalize_namespace_stale_rv_returns_409() {
+        use axum::response::IntoResponse;
+        use u7s_store::Store;
+        let state = make_state();
+
+        let key = crate::keys::cluster_object_key("namespaces", "occ-fin-ns");
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "occ-fin-ns",
+                "uid": "00000000-0000-0000-0000-000000000004",
+                "resourceVersion": "1",
+                "deletionTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["controller-a", "controller-b"] },
+            "status": { "phase": "Terminating" }
+        });
+        state
+            .store
+            .put(&key, bytes::Bytes::from(ns.to_string()), Some(0))
+            .await
+            .expect("direct store write must succeed");
+
+        // Finalize with a STALE resourceVersion (store is at rv=1, not 99999) and finalizers
+        // still non-empty (so it takes the persist path, not hard-delete).
+        let finalize_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": { "name": "occ-fin-ns", "resourceVersion": "99999" },
+                "spec": { "finalizers": ["controller-b"] }
+            })
+            .to_string(),
+        );
+
+        let resp = finalize_namespace(
+            State(state.clone()),
+            Path("occ-fin-ns".to_string()),
+            axum::http::HeaderMap::new(),
+            finalize_body,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CONFLICT,
+            "stale resourceVersion on PUT /finalize must return 409 Conflict — \
+             otherwise the namespace controller resurrects stale finalizers over a concurrent \
+             write and the namespace can stay stuck in Terminating"
         );
     }
 

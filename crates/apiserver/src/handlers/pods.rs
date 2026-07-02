@@ -1452,7 +1452,12 @@ pub async fn replace_pod_status<S: Store>(
 
     crate::handlers::status::merge_incoming_metadata(&mut current_obj.body, &incoming);
 
-    let expected_rv = parse_resource_version(current_obj.resource_version())?;
+    // CAS on the INCOMING body's resourceVersion, not the stored object's: a client
+    // holding a stale snapshot must get 409 and retry, not silently clobber a concurrent
+    // write. Absent rv stays unconditional (parse_resource_version returns None).
+    let incoming_meta: ObjectMeta =
+        serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();
+    let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let new_rv = state
         .store
         .put(&key, current_obj.to_bytes(), expected_rv)
@@ -2039,7 +2044,12 @@ pub async fn patch_pod_resize<S: Store>(
     current_obj.body = apply_resize_patch(&current_obj.body, &incoming);
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
 
-    let expected_rv = parse_resource_version(current_obj.resource_version())?;
+    // CAS on the INCOMING body's resourceVersion. This route serves both PUT and PATCH:
+    // a PUT client sends its rv and must get 409 on a stale write; a PATCH omits rv, so
+    // parse_resource_version returns None and the write stays unconditional.
+    let incoming_meta: ObjectMeta =
+        serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();
+    let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let new_rv = state
         .store
         .put(&key, current_obj.to_bytes(), expected_rv)
@@ -2189,7 +2199,11 @@ pub async fn put_ephemeral_containers<S: Store>(
     current_obj.body = apply_ephemeral_containers_patch(&current_obj.body, &incoming);
     increment_pod_generation_if_spec_changed(&mut current_obj.body, &spec_before);
 
-    let expected_rv = parse_resource_version(current_obj.resource_version())?;
+    // CAS on the INCOMING body's resourceVersion, not the stored object's, so a stale
+    // PUT is rejected with 409. Absent rv stays unconditional (returns None).
+    let incoming_meta: ObjectMeta =
+        serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();
+    let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let new_rv = state
         .store
         .put(&key, current_obj.to_bytes(), expected_rv)
@@ -6907,6 +6921,146 @@ mod handler_tests {
             StatusCode::CONFLICT,
             "stale resourceVersion on replace_pod must return 409 Conflict — \
              OCC prevents lost-update races when multiple controllers update the same pod"
+        );
+    }
+
+    /// PUT /pods/:name/status with a stale resourceVersion must return 409 Conflict.
+    /// The status subresource honors OCC: kubelet and other status writers hold a snapshot;
+    /// without this check a stale writer silently overwrites a newer status write.
+    #[tokio::test]
+    async fn replace_pod_status_stale_rv_returns_409() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "occ-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/status",
+                put(replace_pod_status),
+            )
+            .with_state(state);
+
+        let stale_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "occ-pod", "namespace": "default", "resourceVersion": "99999"},
+            "status": {"phase": "Running"}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/occ-pod/status")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&stale_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "stale resourceVersion on replace_pod_status must return 409 Conflict — \
+             otherwise a stale status writer clobbers a concurrent write instead of retrying"
+        );
+    }
+
+    /// PUT /pods/:name/resize with a stale resourceVersion must return 409 Conflict.
+    /// The resize subresource accepts PUT (client sends its rv); a stale write must be
+    /// rejected so concurrent resizers don't lose updates.
+    #[tokio::test]
+    async fn patch_pod_resize_put_stale_rv_returns_409() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        // Seed a pod whose container already has resources so the resize is VALID and reaches
+        // the CAS check (validate_resize_patch runs before it) — only the rv is stale here.
+        let key = "/registry/pods/default/occ-pod";
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "occ-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "resources": {"limits": {"cpu": "100m"}, "requests": {"cpu": "100m"}}
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&pod).unwrap()), None)
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                put(patch_pod_resize),
+            )
+            .with_state(state);
+
+        // Otherwise-valid resize (cpu 100m -> 200m) but with a STALE resourceVersion.
+        let stale_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "occ-pod", "namespace": "default", "resourceVersion": "99999"},
+            "spec": {"containers": [{
+                "name": "app",
+                "resources": {"limits": {"cpu": "200m"}, "requests": {"cpu": "200m"}}
+            }]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/occ-pod/resize")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&stale_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "stale resourceVersion on a PUT /resize must return 409 Conflict — \
+             a stale resize must retry from a fresh GET, not overwrite a concurrent write"
+        );
+    }
+
+    /// PUT /pods/:name/ephemeralcontainers with a stale resourceVersion must return 409.
+    /// A stale writer to the ephemeralcontainers subresource must not clobber a newer write.
+    #[tokio::test]
+    async fn put_ephemeral_containers_stale_rv_returns_409() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        seed_pod(&store, "default", "occ-pod", serde_json::json!({})).await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/ephemeralcontainers",
+                put(put_ephemeral_containers),
+            )
+            .with_state(state);
+
+        let stale_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "occ-pod", "namespace": "default", "resourceVersion": "99999"},
+            "spec": {"ephemeralContainers": [{"name": "debugger", "image": "busybox"}]}
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/namespaces/default/pods/occ-pod/ephemeralcontainers")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&stale_body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "stale resourceVersion on put_ephemeral_containers must return 409 Conflict — \
+             otherwise a stale writer silently overwrites a concurrent ephemeralContainers update"
         );
     }
 
