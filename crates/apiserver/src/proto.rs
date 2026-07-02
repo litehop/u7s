@@ -1917,9 +1917,75 @@ struct RoleBinding {
 
 // --- k8s.io/api/batch/v1/generated.proto ---
 
+/// SuccessPolicyRule — k8s.io/api/batch/v1/generated.proto message SuccessPolicyRule
+#[derive(Clone, PartialEq, Message)]
+struct SuccessPolicyRule {
+    /// succeededIndexes (field 1, optional string)
+    #[prost(string, optional, tag = "1")]
+    succeeded_indexes: Option<String>,
+    /// succeededCount (field 2, optional int32)
+    #[prost(int32, optional, tag = "2")]
+    succeeded_count: Option<i32>,
+}
+
+/// SuccessPolicy — k8s.io/api/batch/v1/generated.proto message SuccessPolicy
+#[derive(Clone, PartialEq, Message)]
+struct SuccessPolicy {
+    /// rules (field 1, repeated SuccessPolicyRule)
+    #[prost(message, repeated, tag = "1")]
+    rules: Vec<SuccessPolicyRule>,
+}
+
+/// PodFailurePolicyOnExitCodesRequirement — k8s.io/api/batch/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct PodFailurePolicyOnExitCodesRequirement {
+    /// containerName (field 1, optional string)
+    #[prost(string, optional, tag = "1")]
+    container_name: Option<String>,
+    /// operator (field 2, string)
+    #[prost(string, tag = "2")]
+    operator: String,
+    /// values (field 3, repeated int32)
+    #[prost(int32, repeated, tag = "3")]
+    values: Vec<i32>,
+}
+
+/// PodFailurePolicyOnPodConditionsPattern — k8s.io/api/batch/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct PodFailurePolicyOnPodConditionsPattern {
+    /// type (field 1, string)
+    #[prost(string, tag = "1")]
+    r#type: String,
+    /// status (field 2, string)
+    #[prost(string, tag = "2")]
+    status: String,
+}
+
+/// PodFailurePolicyRule — k8s.io/api/batch/v1/generated.proto
+#[derive(Clone, PartialEq, Message)]
+struct PodFailurePolicyRule {
+    /// action (field 1, string)
+    #[prost(string, tag = "1")]
+    action: String,
+    /// onExitCodes (field 2, optional PodFailurePolicyOnExitCodesRequirement)
+    #[prost(message, optional, tag = "2")]
+    on_exit_codes: Option<PodFailurePolicyOnExitCodesRequirement>,
+    /// onPodConditions (field 3, repeated PodFailurePolicyOnPodConditionsPattern)
+    #[prost(message, repeated, tag = "3")]
+    on_pod_conditions: Vec<PodFailurePolicyOnPodConditionsPattern>,
+}
+
+/// PodFailurePolicy — k8s.io/api/batch/v1/generated.proto message PodFailurePolicy
+#[derive(Clone, PartialEq, Message)]
+struct PodFailurePolicy {
+    /// rules (field 1, repeated PodFailurePolicyRule)
+    #[prost(message, repeated, tag = "1")]
+    rules: Vec<PodFailurePolicyRule>,
+}
+
 /// JobSpec — k8s.io/api/batch/v1/generated.proto
 /// Source: k8s.io/api/batch/v1/generated.proto message JobSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
+/// Field numbers verified against crates/apiserver/proto/api-batch-v1-generated.proto.
 /// Only scalar/string fields are decoded; template (field 6, PodTemplateSpec) is decoded
 /// as a nested message so container definitions are preserved and pods can start.
 #[derive(Clone, PartialEq, Message)]
@@ -1954,24 +2020,24 @@ struct JobSpec {
     /// suspend (field 10, bool)
     #[prost(bool, tag = "10")]
     suspend: bool,
-    /// podFailurePolicy (field 11, bytes) — complex message, decoded as raw bytes
-    #[prost(bytes = "vec", tag = "11")]
-    pod_failure_policy: Vec<u8>,
-    /// backoffLimitPerIndex (field 12, int32) — added k8s 1.28
-    #[prost(int32, tag = "12")]
-    backoff_limit_per_index: i32,
-    /// maxFailedIndexes (field 13, int32) — added k8s 1.28
-    #[prost(int32, tag = "13")]
-    max_failed_indexes: i32,
+    /// podFailurePolicy (field 11, message PodFailurePolicy)
+    #[prost(message, optional, tag = "11")]
+    pod_failure_policy: Option<PodFailurePolicy>,
+    /// backoffLimitPerIndex (field 12, optional int32) — proto2 optional; Some(0) means "set to 0"
+    #[prost(int32, optional, tag = "12")]
+    backoff_limit_per_index: Option<i32>,
+    /// maxFailedIndexes (field 13, optional int32) — proto2 optional; Some(0) means "set to 0"
+    #[prost(int32, optional, tag = "13")]
+    max_failed_indexes: Option<i32>,
     /// podReplacementPolicy (field 14, string) — added k8s 1.28
     #[prost(string, tag = "14")]
     pod_replacement_policy: String,
     /// managedBy (field 15, string) — added k8s 1.30
     #[prost(string, tag = "15")]
     managed_by: String,
-    /// successPolicy (field 16, bytes) — complex message, decoded as raw bytes
-    #[prost(bytes = "vec", tag = "16")]
-    success_policy: Vec<u8>,
+    /// successPolicy (field 16, message SuccessPolicy)
+    #[prost(message, optional, tag = "16")]
+    success_policy: Option<SuccessPolicy>,
 }
 
 /// JobTemplateSpec — field 1=ObjectMeta, field 2=JobSpec
@@ -4381,6 +4447,54 @@ pub fn decode_token_review_proto(data: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
+fn success_policy_to_json(sp: SuccessPolicy) -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = sp
+        .rules
+        .into_iter()
+        .map(|r| {
+            let mut rule = serde_json::json!({});
+            if let Some(idx) = r.succeeded_indexes {
+                rule["succeededIndexes"] = idx.into();
+            }
+            if let Some(cnt) = r.succeeded_count {
+                rule["succeededCount"] = serde_json::Value::Number(serde_json::Number::from(cnt));
+            }
+            rule
+        })
+        .collect();
+    serde_json::json!({ "rules": rules })
+}
+
+fn pod_failure_policy_to_json(pfp: PodFailurePolicy) -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = pfp
+        .rules
+        .into_iter()
+        .map(|r| {
+            let mut rule = serde_json::json!({ "action": r.action });
+            if let Some(ec) = r.on_exit_codes {
+                let mut oec = serde_json::json!({
+                    "operator": ec.operator,
+                    "values": ec.values,
+                });
+                if let Some(cn) = ec.container_name {
+                    oec["containerName"] = cn.into();
+                }
+                rule["onExitCodes"] = oec;
+            }
+            if !r.on_pod_conditions.is_empty() {
+                rule["onPodConditions"] = r
+                    .on_pod_conditions
+                    .into_iter()
+                    .map(|p| serde_json::json!({ "type": p.r#type, "status": p.status }))
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            rule
+        })
+        .collect();
+    serde_json::json!({ "rules": rules })
+}
+
 /// Convert a prost JobSpec into a serde_json::Value object.
 fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
     let mut m = serde_json::Map::new();
@@ -4429,16 +4543,16 @@ fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
             serde_json::Value::String(spec.pod_replacement_policy),
         );
     }
-    if spec.backoff_limit_per_index != 0 {
+    if let Some(v) = spec.backoff_limit_per_index {
         m.insert(
             "backoffLimitPerIndex".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(spec.backoff_limit_per_index)),
+            serde_json::Value::Number(serde_json::Number::from(v)),
         );
     }
-    if spec.max_failed_indexes != 0 {
+    if let Some(v) = spec.max_failed_indexes {
         m.insert(
             "maxFailedIndexes".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(spec.max_failed_indexes)),
+            serde_json::Value::Number(serde_json::Number::from(v)),
         );
     }
     if !spec.managed_by.is_empty() {
@@ -4446,6 +4560,15 @@ fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
             "managedBy".to_string(),
             serde_json::Value::String(spec.managed_by),
         );
+    }
+    if let Some(pfp) = spec.pod_failure_policy {
+        m.insert(
+            "podFailurePolicy".to_string(),
+            pod_failure_policy_to_json(pfp),
+        );
+    }
+    if let Some(sp) = spec.success_policy {
+        m.insert("successPolicy".to_string(), success_policy_to_json(sp));
     }
     // Decode and include the pod template so containers are preserved.
     // An empty template object is used as fallback so the k8s schema remains valid.
@@ -11548,6 +11671,9 @@ mod tests {
     /// The e2e conformance tests create Jobs with these fields (job.go:621, :658, :753).
     /// Without handling these fields, the prost decode fails and decode_job_proto returns None,
     /// causing 400 "invalid JSON" responses for all indexed Job creation requests.
+    /// Also verifies podFailurePolicy survives the round-trip: dropped podFailurePolicy means
+    /// the kcm job controller cannot honor failure rules, so pods that should be ignored or
+    /// counted toward backoffLimit are handled with default behavior instead.
     #[test]
     fn decode_job_proto_handles_indexed_job_with_failure_policy() {
         use prost::Message as _;
@@ -11563,9 +11689,19 @@ mod tests {
                 parallelism: 2,
                 backoff_limit: 6,
                 completion_mode: "Indexed".to_string(),
-                backoff_limit_per_index: 1,
-                max_failed_indexes: 3,
-                pod_failure_policy: vec![0x0a, 0x04, 0x08, 0x01, 0x10, 0x01],
+                backoff_limit_per_index: Some(1),
+                max_failed_indexes: Some(3),
+                pod_failure_policy: Some(PodFailurePolicy {
+                    rules: vec![PodFailurePolicyRule {
+                        action: "Ignore".to_string(),
+                        on_exit_codes: Some(PodFailurePolicyOnExitCodesRequirement {
+                            operator: "In".to_string(),
+                            values: vec![42],
+                            container_name: None,
+                        }),
+                        on_pod_conditions: vec![],
+                    }],
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -11599,10 +11735,25 @@ mod tests {
             result["spec"]["template"].is_object(),
             "spec.template must always be present as empty object (required by k8s schema)"
         );
+        assert_eq!(
+            result["spec"]["podFailurePolicy"]["rules"][0]["action"], "Ignore",
+            "podFailurePolicy dropped on proto decode → kcm job controller never sees failure rules → \
+             pods that should be ignored count toward backoffLimit, conformance Job tests fail"
+        );
+        assert_eq!(
+            result["spec"]["podFailurePolicy"]["rules"][0]["onExitCodes"]["operator"], "In",
+            "podFailurePolicy.onExitCodes must survive round-trip so kcm can apply exit-code-based rules"
+        );
+        assert_eq!(
+            result["spec"]["podFailurePolicy"]["rules"][0]["onExitCodes"]["values"][0],
+            42,
+        );
     }
 
     /// decode_job_proto must handle a Job with successPolicy — conformance test job.go:502 and
     /// job.go:582 create Jobs with successPolicy (k8s 1.30+ field at proto field 16).
+    /// successPolicy dropped → kcm job controller never sees it → Job never reaches its
+    /// terminal condition via success criteria, conformance test hangs until timeout.
     #[test]
     fn decode_job_proto_handles_job_with_success_policy() {
         use prost::Message as _;
@@ -11616,7 +11767,12 @@ mod tests {
             spec: Some(JobSpec {
                 completions: 3,
                 completion_mode: "Indexed".to_string(),
-                success_policy: vec![0x0a, 0x02, 0x08, 0x02],
+                success_policy: Some(SuccessPolicy {
+                    rules: vec![SuccessPolicyRule {
+                        succeeded_indexes: Some("0-1".to_string()),
+                        succeeded_count: Some(2),
+                    }],
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -11634,6 +11790,56 @@ mod tests {
         assert_eq!(result["metadata"]["name"], "success-policy-job");
         assert_eq!(result["spec"]["completionMode"], "Indexed");
         assert_eq!(result["spec"]["completions"], 3);
+        assert_eq!(
+            result["spec"]["successPolicy"]["rules"][0]["succeededIndexes"], "0-1",
+            "successPolicy dropped on proto decode → kcm job controller never sees it → \
+             Job never reaches its terminal condition, conformance test hangs 5min"
+        );
+        assert_eq!(
+            result["spec"]["successPolicy"]["rules"][0]["succeededCount"], 2,
+            "successPolicy.succeededCount must survive round-trip so kcm can evaluate success criteria"
+        );
+    }
+
+    /// decode_job_proto must preserve backoffLimitPerIndex=0 and maxFailedIndexes=0.
+    /// Proto3 zero-value suppression would drop these (both are valid user-supplied zeroes):
+    /// backoffLimitPerIndex=0 means "no retries per index"; maxFailedIndexes=0 means
+    /// "fail immediately when any index fails". Losing either changes Job failure semantics.
+    #[test]
+    fn decode_job_proto_preserves_zero_valued_per_index_limits() {
+        use prost::Message as _;
+
+        let job = Job {
+            metadata: Some(ObjectMeta {
+                name: "zero-limits-job".to_string(),
+                namespace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(JobSpec {
+                completions: 4,
+                completion_mode: "Indexed".to_string(),
+                backoff_limit_per_index: Some(0),
+                max_failed_indexes: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        job.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_job_proto(&buf).expect("zero-valued per-index limits must decode");
+
+        assert_eq!(
+            result["spec"]["backoffLimitPerIndex"], 0,
+            "backoffLimitPerIndex=0 must be preserved; losing it changes Job failure semantics \
+             (0 means no retries per index, not 'field absent')"
+        );
+        assert_eq!(
+            result["spec"]["maxFailedIndexes"], 0,
+            "maxFailedIndexes=0 must be preserved; losing it changes Job failure semantics \
+             (0 means fail immediately when any index fails, not 'field absent')"
+        );
     }
 
     /// decode_job_proto must preserve spec.template.spec.containers from the proto body.
