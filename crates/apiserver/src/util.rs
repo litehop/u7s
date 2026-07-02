@@ -135,6 +135,21 @@ pub fn secs_to_rfc3339(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
+/// Convert a Unix timestamp (seconds + nanoseconds) to an RFC3339 string with microsecond
+/// precision (`YYYY-MM-DDThh:mm:ss.ffffffZ`).
+///
+/// Used for MicroTime fields (acquireTime, renewTime on Lease; eventTime on Event).
+/// MicroTime carries nanoseconds in the proto wire but the Kubernetes API truncates to
+/// microseconds — nanos / 1000. The caller must ensure seconds > 0.
+pub fn secs_nanos_to_rfc3339_micro(secs: u64, nanos: i32) -> String {
+    let date_time = secs_to_rfc3339(secs);
+    // Truncate nanos to microseconds (6 decimal digits). nanos is 0..=999_999_999.
+    let micros = nanos.max(0) / 1000;
+    // date_time ends with 'Z'; insert the fractional part before it.
+    let base = &date_time[..date_time.len() - 1]; // strip trailing 'Z'
+    format!("{base}.{micros:06}Z")
+}
+
 /// Normalize an RFC3339 timestamp string to include microsecond precision.
 ///
 /// client-go's `metav1.MicroTime` (used for `Event.eventTime`) and some Event
@@ -459,6 +474,33 @@ mod tests {
             normalize_rfc3339_to_micro("2017-09-20T13:49:16+05:30"),
             "2017-09-20T13:49:16.000000+05:30",
             "bare RFC3339 with numeric TZ offset must gain .000000 before offset"
+        );
+    }
+
+    // -- secs_nanos_to_rfc3339_micro --
+
+    /// secs_nanos_to_rfc3339_micro must produce microsecond precision from nanos.
+    ///
+    /// MicroTime carries nanoseconds in the proto wire; if nanos are discarded the
+    /// Lease renewTime comparison in the conformance test fails because the stored
+    /// timestamp has .000000 while the kubelet's value has actual sub-second precision.
+    #[test]
+    fn secs_nanos_to_rfc3339_micro_includes_nanos_as_microseconds() {
+        assert_eq!(
+            secs_nanos_to_rfc3339_micro(1_704_067_215, 123_456_000),
+            "2024-01-01T00:00:15.123456Z",
+            "nanos must be truncated to microseconds and included in the timestamp; \
+             if absent, Lease renewTime precision is lost and conformance comparison fails"
+        );
+    }
+
+    /// Zero nanos must produce .000000 suffix (not be dropped).
+    #[test]
+    fn secs_nanos_to_rfc3339_micro_zero_nanos_produces_zeros() {
+        assert_eq!(
+            secs_nanos_to_rfc3339_micro(1_704_067_200, 0),
+            "2024-01-01T00:00:00.000000Z",
+            "zero nanos must produce .000000 suffix — required by client-go MicroTime codec"
         );
     }
 
