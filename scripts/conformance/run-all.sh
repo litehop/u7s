@@ -50,6 +50,7 @@ DIR="$REPO/scripts/conformance"
 WORKDIR="$PWD/temp/u7s"
 FOCUS="${SONOBUOY_FOCUS:-}"
 RESET=0
+VERBOSE=0
 BINARY=""
 PORT=""
 KUBELET_PORT=""
@@ -59,7 +60,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --reset) RESET=1; shift ;;
     --focus) FOCUS="$2"; shift 2 ;;
-    --verbose) export RUST_LOG=debug; shift ;;
+    --verbose) export RUST_LOG=debug; VERBOSE=1; shift ;;
     --vm) U7S_VM_NAME="$2"; export U7S_VM_NAME; shift 2 ;;
     --ip) U7S_HOST_IP="$2"; export U7S_HOST_IP; shift 2 ;;
     --binary) BINARY="$2"; shift 2 ;;
@@ -89,6 +90,11 @@ _KUBELET_PORT_ARG=""
 _KONNECTIVITY_SERVER_PORT_ARG=""
 _WORKDIR_ARG=""
 _VM_ARG=""
+_KCM_V_ARG=""
+# When --verbose is set, raise kube-controller-manager verbosity to --v=4 so the
+# disruption controller logs its pod list / expectedCount decisions (V(4)) — the
+# view needed to diagnose why disruptedPods gets cleared.
+[ "$VERBOSE" -eq 1 ] && _KCM_V_ARG="--kcm-v 4"
 [ -n "$PORT" ]                    && _PORT_ARG="--port $PORT"
 [ -n "$KUBELET_PORT" ]            && _KUBELET_PORT_ARG="--kubelet-port $KUBELET_PORT"
 [ -n "$KONNECTIVITY_SERVER_PORT" ] && _KONNECTIVITY_SERVER_PORT_ARG="--konnectivity-server-port $KONNECTIVITY_SERVER_PORT"
@@ -130,7 +136,7 @@ bash "$DIR/lima-start.sh" ${_PORT_ARG} ${_KUBELET_PORT_ARG} ${_KONNECTIVITY_SERV
 # Step 04: Start kcm inside VM.
 banner "Step 4/6: Start kube-controller-manager"
 # shellcheck disable=SC2086
-bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG}
+bash "$DIR/04-start-kcm.sh" ${_PORT_ARG} ${_WORKDIR_ARG} ${_KCM_V_ARG}
 
 # Step 05: Start scheduler inside VM.
 banner "Step 5/6: Start u7s-scheduler"
