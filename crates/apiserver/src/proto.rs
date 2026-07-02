@@ -2270,6 +2270,42 @@ struct StatefulSet {
     status: Option<StatefulSetStatus>,
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct DeploymentCondition {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(string, tag = "2")]
+    status: String,
+    // tag 6 = lastUpdateTime (Time) — skipped
+    // tag 7 = lastTransitionTime (Time) — skipped
+    #[prost(string, tag = "4")]
+    reason: String,
+    #[prost(string, tag = "5")]
+    message: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct DeploymentStatus {
+    #[prost(int64, tag = "1")]
+    observed_generation: i64,
+    #[prost(int32, tag = "2")]
+    replicas: i32,
+    #[prost(int32, tag = "3")]
+    updated_replicas: i32,
+    #[prost(int32, tag = "7")]
+    ready_replicas: i32,
+    #[prost(int32, tag = "4")]
+    available_replicas: i32,
+    #[prost(int32, tag = "5")]
+    unavailable_replicas: i32,
+    #[prost(int32, tag = "9")]
+    terminating_replicas: i32,
+    #[prost(message, repeated, tag = "6")]
+    conditions: Vec<DeploymentCondition>,
+    #[prost(int32, tag = "8")]
+    collision_count: i32,
+}
+
 /// Deployment — k8s.io/api/apps/v1/generated.proto
 /// Source: api-apps-v1-generated.proto message Deployment
 #[derive(Clone, PartialEq, Message)]
@@ -2280,6 +2316,9 @@ struct Deployment {
     /// spec (field 2, message DeploymentSpec)
     #[prost(message, tag = "2")]
     spec: Option<DeploymentSpec>,
+    /// status (field 3, message DeploymentStatus)
+    #[prost(message, tag = "3")]
+    status: Option<DeploymentStatus>,
 }
 
 /// DaemonSetSpec — k8s.io/api/apps/v1/generated.proto
@@ -2375,6 +2414,40 @@ struct ReplicaSet {
     /// spec (field 2, message ReplicaSetSpec)
     #[prost(message, tag = "2")]
     spec: Option<ReplicaSetSpec>,
+    /// status (field 3, message ReplicaSetStatus)
+    #[prost(message, tag = "3")]
+    status: Option<ReplicaSetStatus>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ReplicaSetCondition {
+    #[prost(string, tag = "1")]
+    r#type: String,
+    #[prost(string, tag = "2")]
+    status: String,
+    // tag 3 = lastTransitionTime (Time) — skipped
+    #[prost(string, tag = "4")]
+    reason: String,
+    #[prost(string, tag = "5")]
+    message: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ReplicaSetStatus {
+    #[prost(int32, tag = "1")]
+    replicas: i32,
+    #[prost(int32, tag = "2")]
+    fully_labeled_replicas: i32,
+    #[prost(int64, tag = "3")]
+    observed_generation: i64,
+    #[prost(int32, tag = "4")]
+    ready_replicas: i32,
+    #[prost(int32, tag = "5")]
+    available_replicas: i32,
+    #[prost(message, repeated, tag = "6")]
+    conditions: Vec<ReplicaSetCondition>,
+    #[prost(int32, tag = "7")]
+    terminating_replicas: i32,
 }
 
 /// ServiceAccount — k8s.io/api/core/v1/generated.proto
@@ -5455,6 +5528,59 @@ pub fn decode_deployment_proto(data: &[u8]) -> Option<serde_json::Value> {
             out["spec"] = spec_json;
         }
     }
+    if let Some(status) = obj.status {
+        let mut status_json = serde_json::json!({});
+        if status.observed_generation != 0 {
+            status_json["observedGeneration"] = status.observed_generation.into();
+        }
+        if status.replicas != 0 {
+            status_json["replicas"] = status.replicas.into();
+        }
+        if status.updated_replicas != 0 {
+            status_json["updatedReplicas"] = status.updated_replicas.into();
+        }
+        if status.ready_replicas != 0 {
+            status_json["readyReplicas"] = status.ready_replicas.into();
+        }
+        if status.available_replicas != 0 {
+            status_json["availableReplicas"] = status.available_replicas.into();
+        }
+        if status.unavailable_replicas != 0 {
+            status_json["unavailableReplicas"] = status.unavailable_replicas.into();
+        }
+        if status.terminating_replicas != 0 {
+            status_json["terminatingReplicas"] = status.terminating_replicas.into();
+        }
+        if status.collision_count != 0 {
+            status_json["collisionCount"] = status.collision_count.into();
+        }
+        if !status.conditions.is_empty() {
+            status_json["conditions"] = status
+                .conditions
+                .iter()
+                .map(|c| {
+                    let mut cond = serde_json::json!({
+                        "type": c.r#type,
+                        "status": c.status,
+                    });
+                    if !c.reason.is_empty() {
+                        cond["reason"] = c.reason.clone().into();
+                    }
+                    if !c.message.is_empty() {
+                        cond["message"] = c.message.clone().into();
+                    }
+                    cond
+                })
+                .collect();
+        }
+        if status_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            out["status"] = status_json;
+        }
+    }
     Some(out)
 }
 
@@ -5551,6 +5677,53 @@ pub fn decode_replicaset_proto(data: &[u8]) -> Option<serde_json::Value> {
             .unwrap_or(false)
         {
             out["spec"] = spec_json;
+        }
+    }
+    if let Some(status) = obj.status {
+        let mut status_json = serde_json::json!({});
+        if status.replicas != 0 {
+            status_json["replicas"] = status.replicas.into();
+        }
+        if status.fully_labeled_replicas != 0 {
+            status_json["fullyLabeledReplicas"] = status.fully_labeled_replicas.into();
+        }
+        if status.observed_generation != 0 {
+            status_json["observedGeneration"] = status.observed_generation.into();
+        }
+        if status.ready_replicas != 0 {
+            status_json["readyReplicas"] = status.ready_replicas.into();
+        }
+        if status.available_replicas != 0 {
+            status_json["availableReplicas"] = status.available_replicas.into();
+        }
+        if status.terminating_replicas != 0 {
+            status_json["terminatingReplicas"] = status.terminating_replicas.into();
+        }
+        if !status.conditions.is_empty() {
+            status_json["conditions"] = status
+                .conditions
+                .iter()
+                .map(|c| {
+                    let mut cond = serde_json::json!({
+                        "type": c.r#type,
+                        "status": c.status,
+                    });
+                    if !c.reason.is_empty() {
+                        cond["reason"] = c.reason.clone().into();
+                    }
+                    if !c.message.is_empty() {
+                        cond["message"] = c.message.clone().into();
+                    }
+                    cond
+                })
+                .collect();
+        }
+        if status_json
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
+            out["status"] = status_json;
         }
     }
     Some(out)
@@ -16767,6 +16940,150 @@ mod tests {
              struct it is silently dropped, converting the sidecar init container into a blocking \
              init container that never exits, leaving the pod Pending and causing resize \
              conformance specs to time out after 300s"
+        );
+    }
+
+    /// decode_deployment_proto must preserve status on proto round-trip.
+    ///
+    /// Without status decoding, a proto-path UpdateStatus on a Deployment silently drops the
+    /// status. Controllers and kubectl see empty status; conformance status tests hang waiting
+    /// for conditions that are never stored.
+    #[test]
+    fn decode_deployment_proto_preserves_status_else_controllers_see_empty_status_and_hang() {
+        let status = DeploymentStatus {
+            observed_generation: 3,
+            replicas: 5,
+            updated_replicas: 5,
+            ready_replicas: 4,
+            available_replicas: 4,
+            unavailable_replicas: 1,
+            terminating_replicas: 0,
+            collision_count: 0,
+            conditions: vec![DeploymentCondition {
+                r#type: "Available".to_string(),
+                status: "True".to_string(),
+                reason: "MinimumReplicasAvailable".to_string(),
+                message: "Deployment has minimum availability.".to_string(),
+            }],
+        };
+        let deploy = Deployment {
+            metadata: Some(ObjectMeta {
+                name: "my-deploy".to_string(),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(status),
+        };
+        let mut proto = Vec::new();
+        deploy
+            .encode(&mut proto)
+            .expect("prost encode must succeed");
+
+        let result = decode_core_proto_by_kind("Deployment", &proto)
+            .expect("Deployment with status must decode successfully");
+
+        assert_eq!(
+            result["status"]["observedGeneration"], 3,
+            "status.observedGeneration must survive proto decode — dropped status causes \
+             controllers and kubectl to see empty status; conformance status tests hang"
+        );
+        assert_eq!(
+            result["status"]["replicas"], 5,
+            "status.replicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["readyReplicas"], 4,
+            "status.readyReplicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["availableReplicas"], 4,
+            "status.availableReplicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["unavailableReplicas"], 1,
+            "status.unavailableReplicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["updatedReplicas"], 5,
+            "status.updatedReplicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "Available",
+            "status.conditions[0].type must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["status"], "True",
+            "status.conditions[0].status must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["reason"], "MinimumReplicasAvailable",
+            "status.conditions[0].reason must survive proto decode"
+        );
+    }
+
+    /// decode_replicaset_proto must preserve status on proto round-trip.
+    ///
+    /// Without status decoding, a proto-path UpdateStatus on a ReplicaSet silently drops the
+    /// status. The Deployment controller reads ReplicaSet status to compute its own status;
+    /// if RS status is invisible the Deployment status never converges and conformance tests hang.
+    #[test]
+    fn decode_replicaset_proto_preserves_status_else_deployment_controller_cannot_compute_status() {
+        let status = ReplicaSetStatus {
+            replicas: 3,
+            fully_labeled_replicas: 3,
+            observed_generation: 2,
+            ready_replicas: 2,
+            available_replicas: 2,
+            terminating_replicas: 0,
+            conditions: vec![ReplicaSetCondition {
+                r#type: "ReplicaFailure".to_string(),
+                status: "False".to_string(),
+                reason: "".to_string(),
+                message: "".to_string(),
+            }],
+        };
+        let rs = ReplicaSet {
+            metadata: Some(ObjectMeta {
+                name: "my-rs".to_string(),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(status),
+        };
+        let mut proto = Vec::new();
+        rs.encode(&mut proto).expect("prost encode must succeed");
+
+        let result = decode_core_proto_by_kind("ReplicaSet", &proto)
+            .expect("ReplicaSet with status must decode successfully");
+
+        assert_eq!(
+            result["status"]["replicas"], 3,
+            "status.replicas must survive proto decode — dropped RS status makes the Deployment \
+             controller unable to compute its own status; conformance status tests hang"
+        );
+        assert_eq!(
+            result["status"]["readyReplicas"], 2,
+            "status.readyReplicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["availableReplicas"], 2,
+            "status.availableReplicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["observedGeneration"], 2,
+            "status.observedGeneration must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["fullyLabeledReplicas"], 3,
+            "status.fullyLabeledReplicas must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "ReplicaFailure",
+            "status.conditions[0].type must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["status"], "False",
+            "status.conditions[0].status must survive proto decode"
         );
     }
 }
