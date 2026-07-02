@@ -17,6 +17,8 @@ use crate::{
     util::{content_type, extract_body},
 };
 
+use super::generic::store_err;
+
 // ---------------------------------------------------------------------------
 // Typed Scale structs — local to this file (single-use, not in types.rs)
 // ---------------------------------------------------------------------------
@@ -356,12 +358,13 @@ async fn scale_put_impl<S: Store>(
         obj.body["metadata"]["generation"] = serde_json::json!(gen + 1);
     }
 
-    let expected_rv = crate::util::parse_resource_version(obj.resource_version())?;
+    let expected_rv =
+        crate::util::parse_resource_version(scale.metadata.resource_version.as_deref())?;
     let new_rv = state
         .store
         .put(&key, obj.to_bytes(), expected_rv)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?;
+        .map_err(|e| store_err(e, name, resource))?;
 
     Ok(Json(build_scale(
         name,
@@ -1882,6 +1885,118 @@ mod handler_tests {
         assert!(
             store.get(apps_key).await.unwrap().is_none(),
             "the apps/v1 store key must not be created for an RC — group must be '' not 'apps'"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests for mayor-8phw: scale_put_impl must CAS on the incoming
+    // Scale's metadata.resourceVersion, not the stored object's RV.
+    // ---------------------------------------------------------------------------
+
+    /// PUT /scale with a stale resourceVersion in the Scale body must return 409 Conflict.
+    ///
+    /// Without this fix scale_put_impl used the stored object's RV as the CAS token,
+    /// making every PUT unconditional — HPA or kubectl scale holding a stale snapshot
+    /// would silently overwrite a concurrent write instead of receiving 409 and retrying.
+    #[tokio::test]
+    async fn put_scale_stale_rv_returns_409_else_concurrent_writers_clobber() {
+        let (state, store) = make_state();
+
+        // Seed the deployment at rv=1.
+        let key = "/registry/apps/deployments/default/cas-deploy";
+        let val = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "cas-deploy", "namespace": "default", "resourceVersion": "1" },
+            "spec": { "replicas": 1 },
+            "status": {}
+        });
+        let rv1 = store
+            .put(key, Bytes::from(serde_json::to_vec(&val).unwrap()), None)
+            .await
+            .unwrap();
+
+        // Advance to rv2 (simulates a concurrent HPA write).
+        let mut val2 = val.clone();
+        val2["metadata"]["resourceVersion"] = serde_json::json!(rv1.to_string());
+        val2["spec"]["replicas"] = serde_json::json!(3);
+        let rv2 = store
+            .put(
+                key,
+                Bytes::from(serde_json::to_vec(&val2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+        assert!(rv2 > rv1, "rv must advance after concurrent write");
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        // Scale body carries the now-stale rv1 — must be rejected with 409.
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "metadata": { "name": "cas-deploy", "namespace": "default", "resourceVersion": rv1.to_string() },
+            "spec": { "replicas": 2 }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/deployments/cas-deploy/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "stale metadata.resourceVersion in PUT /scale body must return 409 Conflict — \
+             without this, HPA and kubectl scale silently clobber concurrent replica updates"
+        );
+    }
+
+    /// PUT /scale with an absent resourceVersion in the Scale body succeeds unconditionally.
+    ///
+    /// Clients that omit metadata.resourceVersion (e.g. single-writer kubectl scale calls)
+    /// must not be broken by the stale-RV CAS fix.
+    #[tokio::test]
+    async fn put_scale_absent_rv_is_unconditional_write() {
+        let (state, store) = make_state();
+        seed_workload(&store, "deployments", "default", "no-rv-deploy", 1).await;
+
+        let app = Router::new()
+            .route(
+                "/apis/apps/v1/namespaces/{ns}/{resource}/{name}/scale",
+                put(put_scale),
+            )
+            .with_state(state);
+
+        // No metadata.resourceVersion — must succeed as unconditional write.
+        let body = serde_json::json!({
+            "apiVersion": "autoscaling/v1",
+            "kind": "Scale",
+            "spec": { "replicas": 4 }
+        });
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/apis/apps/v1/namespaces/default/deployments/no-rv-deploy/scale")
+            .header("content-type", "application/json")
+            .body(json_body(&body))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "absent metadata.resourceVersion in PUT /scale body must succeed (unconditional) — \
+             single-writer clients must not be broken by the stale-RV CAS fix"
         );
     }
 }
