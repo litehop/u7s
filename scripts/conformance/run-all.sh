@@ -10,14 +10,20 @@
 #   06-run-sonobuoy.sh     — run sonobuoy and print results
 #
 # Usage:
-#   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--vm <name>]
+#   scripts/conformance/run-all.sh [--reset] [--focus <regex>] [--stack-only] [--vm <name>]
 #                                  [--binary <path>] [--port <N>] [--workdir <path>]
 #                                  [--konnectivity-server-port <N>]
 #
-#   --reset   Run reset.sh before building — kills host processes, deletes the
-#             lima-node VM, and wipes ./temp/u7s/ (relative to CWD) for a fully clean run.
-#   --focus   Passed through to sonobuoy to narrow test selection.
-#             Also settable via SONOBUOY_FOCUS env var.
+#   --reset      Run reset.sh before building — kills host processes, deletes the
+#                lima-node VM, and wipes ./temp/u7s/ (relative to CWD) for a fully clean run.
+#   --focus      Passed through to sonobuoy to narrow test selection.
+#                Also settable via SONOBUOY_FOCUS env var.
+#   --stack-only Bring up steps 1–5 (build, apiserver, kubelet, KCM, scheduler) and
+#                then stop — skip step 6 (sonobuoy). The stack is left running so you
+#                can use kubectl or inspect the DB directly. Useful for manual debugging
+#                without triggering a sonobuoy run. Note: a bare invocation (no --focus,
+#                no --stack-only) runs the FULL conformance suite (~6h at current state).
+#                If --focus is also supplied it is ignored (warning printed to stderr).
 #   --vm      Lima VM name to use (default: lima-node). Sets U7S_VM_NAME so all
 #             child scripts (lima-start, 04-start-kcm, 06-run-sonobuoy) use the
 #             same VM. Allows multiple workers to run in parallel against their
@@ -51,6 +57,7 @@ WORKDIR="$PWD/temp/u7s"
 FOCUS="${SONOBUOY_FOCUS:-}"
 RESET=0
 VERBOSE=0
+STACK_ONLY=0
 BINARY=""
 PORT=""
 KUBELET_PORT=""
@@ -68,9 +75,14 @@ while [[ $# -gt 0 ]]; do
     --kubelet-port) KUBELET_PORT="$2"; shift 2 ;;
     --konnectivity-server-port) KONNECTIVITY_SERVER_PORT="$2"; shift 2 ;;
     --workdir) WORKDIR="$2"; shift 2 ;;
+    --stack-only) STACK_ONLY=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+if [ "$STACK_ONLY" -eq 1 ] && [ -n "$FOCUS" ]; then
+  echo "--focus ignored with --stack-only" >&2
+fi
 
 banner() {
   echo ""
@@ -144,9 +156,13 @@ banner "Step 5/6: Start u7s-scheduler"
 bash "$DIR/05-start-scheduler.sh" ${_WORKDIR_ARG}
 
 # Step 06: Run sonobuoy.
-banner "Step 6/6: Run sonobuoy"
-export SONOBUOY_FOCUS="$FOCUS"
-# shellcheck disable=SC2086
-bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG}
+if [ "$STACK_ONLY" -eq 1 ]; then
+  banner "Step 6/6: Run sonobuoy (skipped — --stack-only)"
+else
+  banner "Step 6/6: Run sonobuoy"
+  export SONOBUOY_FOCUS="$FOCUS"
+  # shellcheck disable=SC2086
+  bash "$DIR/06-run-sonobuoy.sh" ${_PORT_ARG} ${_WORKDIR_ARG}
+fi
 
 banner "Done"
