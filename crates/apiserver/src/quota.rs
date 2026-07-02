@@ -149,11 +149,47 @@ fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
     }
 }
 
+/// Count pods in `namespace` that match all scopes on `quota`.
+///
+/// Scopes only apply to pods; other resources are counted without scope filtering.
+/// Returns the number of pods that match every scope in `quota["spec"]["scopes"]`.
+async fn count_scope_filtered_pods<S: Store>(store: &S, namespace: &str, quota: &Value) -> u64 {
+    let scopes: Vec<&str> = quota["spec"]["scopes"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+
+    let prefix = group_list_prefix("", "pods", Some(namespace));
+    let items = match store.list(&prefix, ListOptions::default()).await {
+        Ok(resp) => resp.items,
+        Err(e) => {
+            tracing::warn!("quota: failed to list pods in {namespace}: {e}");
+            return 0;
+        }
+    };
+
+    items
+        .iter()
+        .filter(|item| {
+            let pod: Value = match serde_json::from_slice(&item.value) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            scopes
+                .iter()
+                .all(|scope| object_matches_scope(scope, Some(&pod)))
+        })
+        .count() as u64
+}
+
 /// Compute live usage counts for all hard-limit entries in a single ResourceQuota object.
 ///
 /// Returns a map from quota resource name (e.g. `"pods"`, `"count/deployments.apps"`) to
 /// a string count (e.g. `"3"`). Only entries whose resource name is known to
 /// `quota_resource_to_group_plural` are counted; unknown entries are omitted.
+///
+/// Pod resources are scope-filtered using `quota["spec"]["scopes"]` so that a
+/// Terminating-scoped quota does not count non-terminating pods (and vice versa).
 ///
 /// This function is pure with respect to writes — it only reads from the store.
 pub async fn count_quota_usage<S: Store>(
@@ -169,15 +205,33 @@ pub async fn count_quota_usage<S: Store>(
         None => return std::collections::BTreeMap::new(),
     };
 
+    // Is scope filtering needed? Only when the quota has scopes AND those scopes are pod-scopes.
+    let has_pod_scopes = quota["spec"]["scopes"]
+        .as_array()
+        .map(|arr| {
+            arr.iter().any(|s| {
+                matches!(
+                    s.as_str(),
+                    Some("BestEffort" | "NotBestEffort" | "Terminating" | "NotTerminating")
+                )
+            })
+        })
+        .unwrap_or(false);
+
     let mut used = std::collections::BTreeMap::new();
     for (resource_name, _) in hard {
         if let Some((group, plural)) = quota_resource_to_group_plural(resource_name) {
-            let prefix = group_list_prefix(group, plural, Some(namespace));
-            let count = match store.list(&prefix, ListOptions::default()).await {
-                Ok(resp) => resp.items.len() as u64,
-                Err(e) => {
-                    tracing::warn!("quota: failed to count {plural} in {namespace}: {e}");
-                    0
+            // Pod resources respect scope filtering; other resource types are always counted.
+            let count = if has_pod_scopes && group.is_empty() && plural == "pods" {
+                count_scope_filtered_pods(store, namespace, quota).await
+            } else {
+                let prefix = group_list_prefix(group, plural, Some(namespace));
+                match store.list(&prefix, ListOptions::default()).await {
+                    Ok(resp) => resp.items.len() as u64,
+                    Err(e) => {
+                        tracing::warn!("quota: failed to count {plural} in {namespace}: {e}");
+                        0
+                    }
                 }
             };
             used.insert(resource_name.clone(), count.to_string());
