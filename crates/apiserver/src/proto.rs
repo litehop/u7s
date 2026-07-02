@@ -2703,6 +2703,31 @@ struct PodDisruptionBudgetStatus {
     conditions: Vec<MetaV1Condition>,
 }
 
+/// PodDisruptionBudgetSpec — k8s.io/api/policy/v1/generated.proto
+/// Source: k8s.io/api/policy/v1/generated.proto message PodDisruptionBudgetSpec
+///
+/// Must be decoded (not left as opaque bytes): the KCM disruption controller reads
+/// spec.selector to find the pods a PDB covers. If the apiserver drops spec on a
+/// proto-encoded create, the stored PDB has no selector, the controller matches no pods
+/// (expectedPods=0), and buildDisruptedPodMap clears status.disruptedPods — failing the
+/// conformance spec `[sig-apps] DisruptionController should update/patch PodDisruptionBudget
+/// status`.
+#[derive(Clone, PartialEq, Message)]
+struct PodDisruptionBudgetSpec {
+    /// minAvailable (field 1, IntOrString)
+    #[prost(message, optional, tag = "1")]
+    min_available: Option<IntOrString>,
+    /// selector (field 2, metav1.LabelSelector)
+    #[prost(message, optional, tag = "2")]
+    selector: Option<AdmissionLabelSelector>,
+    /// maxUnavailable (field 3, IntOrString)
+    #[prost(message, optional, tag = "3")]
+    max_unavailable: Option<IntOrString>,
+    /// unhealthyPodEvictionPolicy (field 4, string, optional)
+    #[prost(string, tag = "4")]
+    unhealthy_pod_eviction_policy: String,
+}
+
 /// PodDisruptionBudget — k8s.io/api/policy/v1/generated.proto
 /// Source: k8s.io/api/policy/v1/generated.proto message PodDisruptionBudget
 #[derive(Clone, PartialEq, Message)]
@@ -2710,9 +2735,9 @@ struct PodDisruptionBudget {
     /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
-    /// spec (field 2, message PodDisruptionBudgetSpec) — decoded as raw bytes; not serialized
-    #[prost(bytes = "vec", tag = "2")]
-    spec: Vec<u8>,
+    /// spec (field 2, message PodDisruptionBudgetSpec)
+    #[prost(message, optional, tag = "2")]
+    spec: Option<PodDisruptionBudgetSpec>,
     /// status (field 3, message PodDisruptionBudgetStatus)
     #[prost(message, optional, tag = "3")]
     status: Option<PodDisruptionBudgetStatus>,
@@ -5901,6 +5926,22 @@ pub fn decode_poddisruptionbudget_proto(data: &[u8]) -> Option<serde_json::Value
         "kind": "PodDisruptionBudget",
         "metadata": meta
     });
+    if let Some(spec) = obj.spec {
+        let mut spec_json = serde_json::json!({});
+        if let Some(min_available) = spec.min_available {
+            spec_json["minAvailable"] = min_available.to_json();
+        }
+        if let Some(selector) = spec.selector {
+            spec_json["selector"] = label_selector_to_json(selector);
+        }
+        if let Some(max_unavailable) = spec.max_unavailable {
+            spec_json["maxUnavailable"] = max_unavailable.to_json();
+        }
+        if !spec.unhealthy_pod_eviction_policy.is_empty() {
+            spec_json["unhealthyPodEvictionPolicy"] = spec.unhealthy_pod_eviction_policy.into();
+        }
+        result["spec"] = spec_json;
+    }
     if let Some(status) = obj.status {
         let mut status_json = serde_json::json!({});
         if status.observed_generation != 0 {
@@ -12737,7 +12778,7 @@ mod tests {
                 namespace: "default".to_string(),
                 ..Default::default()
             }),
-            spec: vec![],
+            spec: None,
             status: Some(PodDisruptionBudgetStatus {
                 observed_generation: 1,
                 disrupted_pods: {
@@ -12802,6 +12843,57 @@ mod tests {
         assert_eq!(
             result["status"]["expectedPods"], 3,
             "expectedPods must survive proto decode"
+        );
+    }
+
+    /// decode_poddisruptionbudget_proto must decode spec.selector and spec.minAvailable from a
+    /// proto-encoded PDB create body.
+    ///
+    /// The e2e client (and client-go generally) sends PDB creates protobuf-encoded. The KCM
+    /// disruption controller reads spec.selector to find the pods a PDB covers. If the apiserver
+    /// drops spec on decode, the stored PDB has no selector, so getPdbForPod matches nothing, the
+    /// controller computes expectedPods=0, and buildDisruptedPodMap clears status.disruptedPods.
+    ///
+    /// The conformance spec '[sig-apps] DisruptionController should update/patch PodDisruptionBudget
+    /// status' then fails: the test writes disruptedPods={pod-0} and reads it back empty
+    /// (`<map[string]v1.Time | len:0>: nil, expected key 'pod-0'`), because the controller wiped it.
+    ///
+    /// This test fails if `spec` is decoded as opaque bytes (the old behavior) or if the spec
+    /// serialization block is removed from `decode_poddisruptionbudget_proto`.
+    #[test]
+    fn decode_poddisruptionbudget_proto_preserves_spec_selector() {
+        // spec.selector.matchLabels = {"foo": "bar"} — LabelSelector.matchLabels is field 1
+        // (map<string,string>); each map entry is key (field 1) + value (field 2).
+        let mut label_entry = encode_length_delimited(1, b"foo"); // key
+        label_entry.extend_from_slice(&encode_length_delimited(2, b"bar")); // value
+        let selector_bytes = encode_length_delimited(1, &label_entry);
+
+        // spec.minAvailable = 1 — IntOrString{type=0 (Int), intVal=1}; both are varint fields
+        // (tag (field<<3)|0), NOT length-delimited.
+        let int_or_string_bytes = vec![0x08, 0x00, 0x10, 0x01];
+
+        // PodDisruptionBudgetSpec{ minAvailable: field 1, selector: field 2 }
+        let mut spec_bytes = encode_length_delimited(1, &int_or_string_bytes);
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, &selector_bytes));
+
+        // PodDisruptionBudget{ metadata: field 1, spec: field 2 } — ObjectMeta name=field 1.
+        let meta_bytes = encode_length_delimited(1, b"foo");
+        let mut pdb_bytes = encode_length_delimited(1, &meta_bytes);
+        pdb_bytes.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
+
+        let result = decode_poddisruptionbudget_proto(&pdb_bytes)
+            .expect("decode_poddisruptionbudget_proto must return Some for a proto create body");
+
+        assert_eq!(
+            result["spec"]["selector"]["matchLabels"]["foo"], "bar",
+            "spec.selector.matchLabels must survive proto decode — without it the KCM disruption \
+             controller matches no pods (expectedPods=0) and wipes disruptedPods, failing the \
+             conformance spec 'DisruptionController should update/patch PodDisruptionBudget status'"
+        );
+        assert_eq!(
+            result["spec"]["minAvailable"], 1,
+            "spec.minAvailable must survive proto decode — the disruption controller uses it to \
+             compute desiredHealthy/expectedPods"
         );
     }
 
