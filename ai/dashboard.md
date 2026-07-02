@@ -1,12 +1,41 @@
 # Dashboard
-2026-07-02T15:03Z — **Audit→fix cycle COMPLETE. 3 audits ran → 6 beads filed → 5 HIGH/MED fixes shipped in 3 PRs (#645/#646/#647), all merged green. Mayor on main level with origin. 0 workers, 0 open PRs. Board: 20 ready.**
+2026-07-02T22:39Z — **7 fixes merged. ROOT CAUSE of u3fa PROVEN (physical log evidence) + FIX IN FLIGHT: batch namespace-delete stamped all objects ONE rv → watch dedup silently dropped all-but-one DELETE event → controllers wedged in a permanent 409-loop. NOT a SQLite stale read; NOT #646. Operator chose Fix A (unique rv per object, etcd-like). Mayor on main `d806ee4e` = origin. 0 open PRs. 1 worker (u3fa fix).**
 
 Resume: `bd prime`
 
 ## What needs the operator now
-- **Nothing blocking.** This session's wave (audits-first, your call) is fully landed and verified. Ready for the next move.
-- **Recommended next: the P1 (mayor-7lrp) — SQLite WAL stale-read** wedging kcm controllers (598 "not as new as written version" in one run; widest blast radius on run stability). Well-root-caused, dispatch-ready. NOTE before dispatch: the w8tj bead history + `ai/findings/0702-watch-consistency-audit.md` both flag the global BOOKMARK-per-write (sqlite.rs:166-172) as a watch-consistency concern — likely adjacent to this bug. A scout should read both before the fix worker starts.
-- **Then: ~17 symptom-framed P2 conformance beads.** Root-cause-verify each (scout/kubectl repro) before dispatching a fix — per verify-bead-framing-before-dispatch, symptom-filed beads are often wrong about cause.
+- **Nothing blocking.** u3fa fix worker running (Fix A, live-verified via --stack-only + --focus EndpointSlice gate). I'll verify its diff + VM evidence and bring the PR when it lands.
+- **After u3fa merges: re-scope mayor-7lrp** against fresh data (it's a SEPARATE, transient bookmark-latency issue — the batch-delete fix may reduce its errors too; measure before deciding if it needs its own fix). u3fa is blocked-by 7lrp in bd but they're distinct bugs — will unlink/re-scope post-merge.
+
+## ✅ PROVEN ROOT CAUSE (u3fa) — batch-delete watch event loss
+Physical evidence (preserved: ai/findings/u3fa-7lrp-evidence/{apiserver-a731152e.log, consistency-scout-verdict.md}), VERIFIED by mayor against log + code:
+- `delete_namespace_sync` (sqlite.rs:384) deletes all ns objects in one txn, bumps the global revision counter ONCE → every deleted object stamped the SAME rv (596 in capture).
+- `push_event` fires N DELETE events all at rv=596; watch dedup (sqlite.rs:995 `event.revision <= last_replayed`) yields the first, then **permanently drops the rest** (log line 2806: `dedup skip .../endpoints/.../example-named-port rv=596 last_replayed=596`).
+- endpoints-controller never sees the DELETE → keeps stale informer cache → PUTs old rv → correct 409 (RevisionMismatch{expected:N,current:0}, object is gone) → retries from the never-updated cache → **infinite 409-loop** (16 PUTs over 40+s) → EndpointSlice test FAILS.
+- **Refuted:** #646 scope (it's a 409, not a 403); first 7lrp scout's "WAL stale read / watch latency" (guards ARE fine; this is permanent event loss, not timing).
+- **Fix (in flight):** per-object rv increment in delete_namespace_sync (sole multi-object mutation path — confirmed) so every DELETE gets a distinct watch event. Atomicity preserved (still one BEGIN IMMEDIATE/COMMIT).
+
+## In-flight
+| Worker | Bead | Surface | State |
+|---|---|---|---|
+| fix (a906b74f) | mayor-u3fa (P1) | crates/store/src/sqlite.rs + live VM lima-node-smoke:6444 | ⏳ Fix A (unique rv per deleted object). Regression test (fails-on-revert) + live verify: no dedup-skip/409-loop after fix, --focus EndpointSlice test PASSES. |
+
+## 🔬 P1 (mayor-7lrp) re-investigation — the framing is suspect
+First scout (findings: ai/findings/7lrp-wal-stale-read-scout-2026-07-02.md) claimed the get()/list() guards are correct and pivoted to "watch-delivery latency" as the cause of the 598 "read version N not as new as written version M" errors — but NEVER physically proved a stale read occurs, and never examined how rv is computed/stamped/served. Operator flagged this as the SAME hand-wave shape that cost 2 days on PDB (where the real bug was our apiserver dropping `spec` on proto decode). Prior: SQLite is ACID + benchmarked orders of magnitude above our load; a read regressing after a newer read is unthinkable unless OUR code is wrong.
+**Suspect zone (mayor's read):** single GLOBAL revision counter in `meta` (sqlite.rs:276), objects stamped with global value (stamp_resource_version :209-219 @ :289), last_written_revision global AtomicU64 (:37,:311). Hypotheses for 2nd scout: (1) HTTP response returns rv=M but stored/served object carries a different rv (PDB-class mis-serve); (2) kcm's GLOBAL-rv ConsistencyStore trips because a per-resource LIST snapshot rv < global M (another resource advanced the global counter); (3) counter advanced before COMMIT durable; (4) content_type re-encode alters rv.
+
+## In-flight
+None. (EndpointSlice scout a731152e STALLED at watchdog before writing its doc; partial captured + apiserver.log preserved. Next: one merged u3fa+7lrp consistency scout — awaiting operator go on scope.)
+
+## ✅ Tooling fix landed: --stack-only (#651, mayor-inox)
+run-all.sh now has --stack-only (steps 1-5, skip sonobuoy — stack left up for kubectl/DB) + vm-operations.md documents it + a bare-run=~6h warning. This closes the runaway that killed the first 7lrp scout. Mayor-side follow-ups DONE: dispatch-prompt-template.md Lima block now mandates --focus/--stack-only + warns against bare run-all.sh (uncommitted — fold into next push); bd memory worker-run-all-verbatim updated with flag discipline.
+
+## Queued next
+- **mayor-u3fa (P1)** — EndpointSlice regression (scout IN FLIGHT above). If #646 is the cause, the fix likely reverts/narrows the matches_rule scope logic — will surface to operator (touches admission we just shipped).
+- **mayor-7lrp (P1)** — WAL stale-read, PAUSED. RE-DISPATCH the adversarial scout (now with --stack-only, no sonobuoy needed) AFTER u3fa, since u3fa may share a root cause (both could be admission/CAS write-path regressions). Mandate: physically prove a SQLite stale read OR pin our rv compute/stamp/serve bug. First scout doc (hypotheses to falsify): ai/findings/7lrp-wal-stale-read-scout-2026-07-02.md.
+
+## Recently shipped this session (all merged, mayor-verified)
+#650 Job proto decode (successPolicy/podFailurePolicy + zero per-index limits, 2w29) · #649 beads-sync · #648 rmcp 2.1.0 · #647 PATCH CAS + JSON-Patch /status isolation (egmm/o419) · #646 CEL checked-arithmetic + matches_rule scope (wucf/gzm3) · #645 Deployment/RS status proto decode (0mth). Plus 3 audits closed (perf/quality/security).
 
 ## This session's shipped work (all merged 2026-07-02 ~15:02Z, all diffs mayor-verified)
 - **#647** (egmm P1 + o419 P2) — PATCH subresource CAS: scale/approval/status PATCH handlers now source the CAS token from the incoming patch body (was: stored RV = unconditional writes; #643 fixed the PUT siblings, these were missed). HPA-critical (scale is PATCH-only). + JSON-Patch /status path-isolation (422 if a JSON Patch on /status targets /spec — was a priv-esc). 1816 tests.
