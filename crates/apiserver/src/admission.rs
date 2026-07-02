@@ -493,9 +493,17 @@ pub fn matches_rule(
         s == "*" || s == operation
     });
 
-    let _ = namespace; // namespace scoping is handled separately via namespaceSelector evaluation
+    // scope field: "Namespaced" → only match namespaced resources (namespace is Some);
+    // "Cluster" → only match cluster-scoped resources (namespace is None);
+    // "*" or absent → match both. The `namespace` param is None for cluster-scoped requests.
+    let scope = rule["scope"].as_str().unwrap_or("*");
+    let scope_match = match scope {
+        "Namespaced" => namespace.is_some(),
+        "Cluster" => namespace.is_none(),
+        _ => true,
+    };
 
-    group_match && version_match && resource_match && operation_match
+    group_match && version_match && resource_match && operation_match && scope_match
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,7 +1182,9 @@ fn apply_add_op(
         CelToken::Plus => match (left, right) {
             (serde_json::Value::Number(a), serde_json::Value::Number(b)) => {
                 if let (Some(ai), Some(bi)) = (a.as_i64(), b.as_i64()) {
-                    Some(serde_json::Value::Number((ai + bi).into()))
+                    // Overflow yields an eval error (None) rather than panicking the
+                    // admission request thread, which would be a panic-DoS vector.
+                    Some(serde_json::Value::Number(ai.checked_add(bi)?.into()))
                 } else {
                     Some(serde_json::json!(a.as_f64()? + b.as_f64()?))
                 }
@@ -1229,18 +1239,15 @@ fn apply_mul_op(
     let l = left.as_i64()?;
     let r = right.as_i64()?;
     match op {
-        CelToken::Star => Some(serde_json::Value::Number((l * r).into())),
+        // checked_mul: overflow (e.g. i64::MAX * 2) yields eval error instead of panic.
+        CelToken::Star => Some(serde_json::Value::Number(l.checked_mul(r)?.into())),
         CelToken::Slash => {
-            if r == 0 {
-                return None;
-            }
-            Some(serde_json::Value::Number((l / r).into()))
+            // checked_div covers both r==0 and i64::MIN/-1 (which wraps to panic).
+            Some(serde_json::Value::Number(l.checked_div(r)?.into()))
         }
         CelToken::Percent => {
-            if r == 0 {
-                return None;
-            }
-            Some(serde_json::Value::Number((l % r).into()))
+            // checked_rem covers r==0 and i64::MIN%-1.
+            Some(serde_json::Value::Number(l.checked_rem(r)?.into()))
         }
         _ => None,
     }
@@ -1269,7 +1276,8 @@ fn parse_vap_unary(
             match inner {
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
-                        Some(serde_json::Value::Number((-i).into()))
+                        // checked_neg: -i64::MIN would overflow and panic.
+                        Some(serde_json::Value::Number(i.checked_neg()?.into()))
                     } else {
                         n.as_f64().map(|f| serde_json::json!(-f))
                     }
@@ -2976,6 +2984,78 @@ mod tests {
             ),
             "empty lists must not match anything"
         );
+    }
+
+    /// A rule with scope "Namespaced" must not match a cluster-scoped resource.
+    /// Without this, a Namespaced-scoped webhook fires on cluster-scoped resources
+    /// (e.g. Nodes), violating the admin's intent.
+    #[test]
+    fn matches_rule_scope_namespaced_rejects_cluster_scoped_request() {
+        let rule = json!({
+            "apiGroups": ["*"],
+            "apiVersions": ["*"],
+            "resources": ["*"],
+            "operations": ["*"],
+            "scope": "Namespaced"
+        });
+        assert!(
+            !matches_rule(&rule, "", "v1", "nodes", None, "CREATE"),
+            "scope=Namespaced must not match a cluster-scoped resource (namespace=None)"
+        );
+        assert!(
+            matches_rule(&rule, "", "v1", "pods", Some("default"), "CREATE"),
+            "scope=Namespaced must match a namespaced resource (namespace=Some)"
+        );
+    }
+
+    /// A rule with scope "Cluster" must not match a namespaced resource.
+    /// Without this, a Cluster-scoped webhook fires on namespaced resources,
+    /// violating the admin's intent and leaking webhook coverage.
+    #[test]
+    fn matches_rule_scope_cluster_rejects_namespaced_request() {
+        let rule = json!({
+            "apiGroups": ["*"],
+            "apiVersions": ["*"],
+            "resources": ["*"],
+            "operations": ["*"],
+            "scope": "Cluster"
+        });
+        assert!(
+            !matches_rule(&rule, "", "v1", "pods", Some("default"), "CREATE"),
+            "scope=Cluster must not match a namespaced resource (namespace=Some)"
+        );
+        assert!(
+            matches_rule(&rule, "", "v1", "nodes", None, "CREATE"),
+            "scope=Cluster must match a cluster-scoped resource (namespace=None)"
+        );
+    }
+
+    /// A rule with scope "*" (or absent) must match both namespaced and cluster-scoped resources.
+    #[test]
+    fn matches_rule_scope_wildcard_matches_both_namespaced_and_cluster() {
+        let rule_star = json!({
+            "apiGroups": ["*"],
+            "apiVersions": ["*"],
+            "resources": ["*"],
+            "operations": ["*"],
+            "scope": "*"
+        });
+        let rule_absent = json!({
+            "apiGroups": ["*"],
+            "apiVersions": ["*"],
+            "resources": ["*"],
+            "operations": ["*"]
+        });
+        for (label, rule) in [("scope=*", &rule_star), ("scope=absent", &rule_absent)] {
+            assert!(
+                matches_rule(rule, "", "v1", "nodes", None, "CREATE"),
+                "{label}: must match cluster-scoped resource"
+            );
+            assert!(
+                matches_rule(rule, "", "v1", "pods", Some("default"), "CREATE"),
+                "{label}: must match namespaced resource"
+            );
+        }
     }
 
     // -- run_mutating_webhooks: no webhooks configured → object passes through unchanged --
@@ -5511,6 +5591,85 @@ mod tests {
             tokens.is_some(),
             "|| is valid CEL disjunction and must tokenize successfully; \
              rejecting it would break all disjunction-based matchCondition expressions"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // CEL arithmetic overflow tests (mayor-wucf)
+    //
+    // A VAP/MAP author can submit CEL expressions with overflowing integer arithmetic.
+    // In Rust, integer overflow panics in debug mode and under overflow-checks=true
+    // (cargo test default). The panic kills the async admission request thread and
+    // causes all subsequent admission calls to return 500 — a panic-DoS.
+    // ---------------------------------------------------------------------------
+
+    /// i64::MAX * 2 must produce an eval error (None), not panic the admission thread.
+    /// A VAP author who submits this expression would otherwise DoS every admission
+    /// request on the cluster until the apiserver is restarted.
+    #[test]
+    fn cel_mul_overflow_yields_eval_error_not_panic() {
+        let object = json!({"metadata": {"name": "x"}});
+        let vars = serde_json::Map::new();
+        let req = json!({});
+        let result = eval_cel_vap_value("9223372036854775807 * 2", &object, &vars, &req);
+        assert!(
+            result.is_none(),
+            "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
+        );
+    }
+
+    /// i64::MIN / -1 must produce an eval error (None), not panic the admission thread.
+    /// This is the signed integer division overflow case: the mathematical result exceeds
+    /// i64::MAX by 1, causing a panic on the division instruction.
+    #[test]
+    fn cel_div_min_by_neg1_yields_eval_error_not_panic() {
+        let object = json!({"metadata": {"name": "x"}});
+        let vars = serde_json::Map::new();
+        let req = json!({});
+        let result = eval_cel_vap_value("-9223372036854775808 / -1", &object, &vars, &req);
+        assert!(
+            result.is_none(),
+            "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
+        );
+    }
+
+    /// i64::MAX + 1 must produce an eval error (None), not panic the admission thread.
+    #[test]
+    fn cel_add_overflow_yields_eval_error_not_panic() {
+        let object = json!({"metadata": {"name": "x"}});
+        let vars = serde_json::Map::new();
+        let req = json!({});
+        let result = eval_cel_vap_value("9223372036854775807 + 1", &object, &vars, &req);
+        assert!(
+            result.is_none(),
+            "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
+        );
+    }
+
+    /// i64::MIN % -1 must produce an eval error (None), not panic.
+    #[test]
+    fn cel_rem_min_by_neg1_yields_eval_error_not_panic() {
+        let object = json!({"metadata": {"name": "x"}});
+        let vars = serde_json::Map::new();
+        let req = json!({});
+        let result = eval_cel_vap_value("-9223372036854775808 % -1", &object, &vars, &req);
+        assert!(
+            result.is_none(),
+            "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
+        );
+    }
+
+    /// -i64::MIN must produce an eval error (None), not panic.
+    #[test]
+    fn cel_neg_min_yields_eval_error_not_panic() {
+        let object = json!({"metadata": {"name": "x"}});
+        let vars = serde_json::Map::new();
+        let req = json!({});
+        // Unary negation of i64::MIN overflows because i64::MAX = -i64::MIN - 1.
+        let result = eval_cel_vap_value("-(-9223372036854775808)", &object, &vars, &req);
+        assert!(
+            result.is_none(),
+            "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
         );
     }
 
