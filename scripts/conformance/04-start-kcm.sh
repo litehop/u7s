@@ -13,11 +13,13 @@ KCM_LOG="/tmp/kcm.log"
 
 _WORKDIR_OVERRIDE=""
 _PORT_OVERRIDE=""
+KCM_V=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vm) U7S_VM_NAME="$2"; shift 2 ;;
     --workdir) _WORKDIR_OVERRIDE="$2"; shift 2 ;;
     --port) _PORT_OVERRIDE="$2"; shift 2 ;;
+    --kcm-v) KCM_V="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -48,6 +50,9 @@ limactl shell "$VM_NAME" bash -s <<EOF
 set -euo pipefail
 
 WORKDIR="$WORKDIR"
+# Verbosity flag: when run-all.sh is invoked with --verbose it passes --kcm-v <N>,
+# which becomes "--v=<N>" here so the disruption controller's V(4) pod-list logs appear.
+KCM_V_FLAG="$([ -n "$KCM_V" ] && echo "--v=$KCM_V" || echo "")"
 CACHE_DIR="\${KCM_CACHE_DIR:-\${HOME}/.cache/u7s/kcm}"
 KCM_LOG="$KCM_LOG"
 
@@ -111,6 +116,7 @@ setsid "\$KCM_BINARY" \\
   --leader-elect=false \\
   --bind-address=127.0.0.1 \\
   --kube-api-content-type=application/json \\
+  \$KCM_V_FLAG \\
   > "\$KCM_LOG" 2>&1 &
 
 echo "kube-controller-manager running (PID \$!, log: \$KCM_LOG)"
