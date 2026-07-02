@@ -111,7 +111,7 @@ pub async fn put_resource_status<S: Store>(
     }
     merge_incoming_metadata(&mut current.body, &incoming.body);
 
-    let expected_rv = parse_resource_version(current.resource_version())?;
+    let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -246,7 +246,7 @@ pub async fn put_namespaced_resource_status<S: Store>(
     }
     merge_incoming_metadata(&mut current.body, &incoming.body);
 
-    let expected_rv = parse_resource_version(current.resource_version())?;
+    let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -2715,6 +2715,287 @@ mod tests {
         assert_eq!(
             conditions[0]["type"], "StatusUpdated",
             "condition type must be StatusUpdated after PUT /pvc/status"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests for mayor-8phw: subresource PUT CAS must use the INCOMING
+    // body's resourceVersion, not the stored object's.  Without this fix, a writer
+    // holding a stale RV can overwrite a newer write (concurrent clobber) instead
+    // of receiving 409 Conflict and retrying from a fresh GET.
+    // ---------------------------------------------------------------------------
+
+    /// put_resource_status with a stale resourceVersion in the body must return 409 Conflict.
+    ///
+    /// Without this fix the handler used the stored object's RV as the CAS token, making
+    /// every PUT unconditional — a controller holding stale state would silently overwrite
+    /// a peer's concurrent write instead of receiving 409 and retrying from a fresh GET.
+    #[tokio::test]
+    async fn put_resource_status_stale_rv_returns_409_else_concurrent_writers_clobber() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "rv-test-node" },
+            "spec": { "drivers": [] }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/rv-test-node";
+        // First write gives rv=1.
+        let rv1 = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        // Second write advances to rv=2 (simulates a concurrent writer).
+        let mut obj2 = obj.clone();
+        obj2["metadata"]["resourceVersion"] = serde_json::json!(rv1.to_string());
+        let rv2 = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+        assert!(rv2 > rv1, "rv must advance after second write");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // PUT body carries the now-stale rv1 — must be rejected with 409.
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "rv-test-node", "resourceVersion": rv1.to_string() },
+            "status": { "ready": true }
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "rv-test-node".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "stale-rv PUT to put_resource_status must return 409 — \
+                 without this check concurrent controllers silently clobber each other"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "stale resourceVersion in PUT /status body must produce 409 Conflict, \
+             not 200 — controllers must retry from a fresh GET when they lose the CAS race"
+        );
+    }
+
+    /// put_resource_status with an absent resourceVersion in the body succeeds unconditionally.
+    ///
+    /// Clients that legitimately omit resourceVersion (e.g. single-writer bootstrapping)
+    /// must not be broken by the stale-RV fix.  parse_resource_version returns None for
+    /// absent/empty rv, and the store treats None as unconditional.
+    #[tokio::test]
+    async fn put_resource_status_absent_rv_is_unconditional_write() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let obj = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "no-rv-node" },
+            "spec": { "drivers": [] }
+        });
+        let key = "/registry/storage.k8s.io/csinodes/no-rv-node";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&obj).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Body has no resourceVersion — must succeed (unconditional write).
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSINode",
+            "metadata": { "name": "no-rv-node" },
+            "status": { "ready": false }
+        });
+        let result = put_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "no-rv-node".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "absent resourceVersion in PUT /status body must succeed (unconditional write) — \
+             single-writer bootstrap clients must not be broken by the stale-RV fix"
+        );
+    }
+
+    /// put_namespaced_resource_status with a stale resourceVersion in the body must return 409.
+    ///
+    /// This is the PDB conformance scenario: the DisruptionController holds a snapshot at rv=R0,
+    /// the test's UpdateStatus advances the store to R1, then the controller's stale PUT (still
+    /// body rv=R0) must get 409 so it retries with a fresh GET and preserves disruptedPods.
+    /// Without this fix the controller's write was accepted unconditionally, wiping disruptedPods.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_stale_rv_returns_409_else_concurrent_writers_clobber() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "cas-pdb", "namespace": "default" },
+            "spec": { "minAvailable": 1 }
+        });
+        let key = "/registry/policy/poddisruptionbudgets/default/cas-pdb";
+        let rv1 = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        // Advance the store to rv2 (peer writer succeeded).
+        let mut pdb2 = pdb.clone();
+        pdb2["metadata"]["resourceVersion"] = serde_json::json!(rv1.to_string());
+        let rv2 = store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pdb2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+        assert!(rv2 > rv1, "rv must advance after second write");
+
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // PUT body carries the now-stale rv1 — must be rejected with 409.
+        let body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "cas-pdb", "namespace": "default", "resourceVersion": rv1.to_string() },
+            "status": { "disruptedPods": {}, "disruptionsAllowed": 1 }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "policy".into(),
+                "v1".into(),
+                "default".into(),
+                "poddisruptionbudgets".into(),
+                "cas-pdb".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "stale-rv PUT to put_namespaced_resource_status must return 409 — \
+                 the PDB conformance test fails when the DisruptionController's stale write \
+                 is accepted unconditionally and wipes disruptedPods"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "stale resourceVersion in namespaced PUT /status body must produce 409 — \
+             controllers must retry from fresh GET, not silently clobber concurrent writes"
+        );
+    }
+
+    /// put_namespaced_resource_status with an absent resourceVersion in the body succeeds.
+    ///
+    /// Upstream k8s allows omitting resourceVersion in a subresource PUT, treating it as
+    /// an unconditional write.  The fix must not break this.
+    #[tokio::test]
+    async fn put_namespaced_resource_status_absent_rv_is_unconditional_write() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let pdb = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "norev-pdb", "namespace": "default" },
+            "spec": { "minAvailable": 1 }
+        });
+        let key = "/registry/policy/poddisruptionbudgets/default/norev-pdb";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&pdb).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // No resourceVersion in body — must succeed unconditionally.
+        let body = serde_json::json!({
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": { "name": "norev-pdb", "namespace": "default" },
+            "status": { "disruptionsAllowed": 2 }
+        });
+        let result = put_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "policy".into(),
+                "v1".into(),
+                "default".into(),
+                "poddisruptionbudgets".into(),
+                "norev-pdb".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "absent resourceVersion in namespaced PUT /status body must succeed (unconditional) — \
+             clients that omit rv must not be broken by the stale-RV CAS fix"
         );
     }
 }

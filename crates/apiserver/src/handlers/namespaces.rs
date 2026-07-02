@@ -598,7 +598,7 @@ pub async fn put_namespace_status<S: Store>(
 
     crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body);
 
-    let expected_rv = parse_resource_version(current.resource_version())?;
+    let expected_rv = parse_resource_version(incoming.resource_version())?;
     let new_rv = state
         .store
         .put(&key, current.to_bytes(), expected_rv)
@@ -3419,6 +3419,144 @@ mod admission_tests {
             "CRD with namespace-scoped group must be deleted when namespace is soft-deleted — \
              without this, KCM re-queues the namespace drain indefinitely and the namespace \
              never finishes terminating"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for mayor-8phw: put_namespace_status must CAS on the
+// INCOMING body's resourceVersion, not the stored object's RV.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod namespace_status_cas_tests {
+    use super::*;
+    use std::sync::Arc;
+    use u7s_store::{SqliteStore, Store};
+
+    fn make_state(store: Arc<SqliteStore>) -> crate::state::AppState {
+        crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        )
+    }
+
+    fn json_headers() -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        h
+    }
+
+    /// put_namespace_status with a stale resourceVersion in the body must return 409 Conflict.
+    ///
+    /// Without this fix put_namespace_status used the stored object's RV as the CAS token,
+    /// making every PUT unconditional — a controller with a stale snapshot of the Namespace
+    /// would silently overwrite a peer's concurrent status write instead of receiving 409
+    /// and retrying from a fresh GET.
+    #[tokio::test]
+    async fn put_namespace_status_stale_rv_returns_409_else_concurrent_writers_clobber() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "cas-ns" },
+            "spec": { "finalizers": ["kubernetes"] },
+            "status": {}
+        });
+        let key = "/registry/namespaces/cas-ns";
+        let rv1 = store
+            .put(key, Bytes::from(serde_json::to_vec(&ns).unwrap()), None)
+            .await
+            .unwrap();
+        // Advance the store to rv2 (simulate a concurrent writer).
+        let mut ns2 = ns.clone();
+        ns2["metadata"]["resourceVersion"] = serde_json::json!(rv1.to_string());
+        let rv2 = store
+            .put(
+                key,
+                Bytes::from(serde_json::to_vec(&ns2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+        assert!(rv2 > rv1, "rv must advance after second write");
+
+        let state = make_state(store);
+
+        // PUT body carries the now-stale rv1 — must be rejected with 409.
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "cas-ns", "resourceVersion": rv1.to_string() },
+            "status": { "phase": "Terminating" }
+        });
+        let result = put_namespace_status(
+            State(state),
+            Path("cas-ns".to_string()),
+            json_headers(),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "stale-rv PUT to put_namespace_status must return 409 — \
+                 without this check concurrent controllers silently clobber namespace status writes"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "stale resourceVersion in PUT /namespaces/status body must return 409 — \
+             controllers must retry from a fresh GET when they lose the CAS race"
+        );
+    }
+
+    /// put_namespace_status with an absent resourceVersion in the body succeeds unconditionally.
+    ///
+    /// Upstream k8s allows omitting resourceVersion in a subresource PUT.  The fix must not
+    /// break clients that legitimately omit rv.
+    #[tokio::test]
+    async fn put_namespace_status_absent_rv_is_unconditional_write() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "norev-ns" },
+            "spec": { "finalizers": ["kubernetes"] },
+            "status": {}
+        });
+        let key = "/registry/namespaces/norev-ns";
+        store
+            .put(key, Bytes::from(serde_json::to_vec(&ns).unwrap()), None)
+            .await
+            .unwrap();
+        let state = make_state(store);
+
+        // No resourceVersion in body — must succeed as unconditional write.
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": "norev-ns" },
+            "status": { "phase": "Active" }
+        });
+        let result = put_namespace_status(
+            State(state),
+            Path("norev-ns".to_string()),
+            json_headers(),
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "absent resourceVersion in PUT /namespaces/status body must succeed (unconditional) — \
+             single-writer clients that omit rv must not be broken by the stale-RV CAS fix"
         );
     }
 }

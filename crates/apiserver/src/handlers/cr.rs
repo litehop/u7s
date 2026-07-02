@@ -1760,9 +1760,9 @@ pub async fn put_cr_status<S: Store>(
 
     crate::handlers::status::merge_incoming_metadata(&mut current, &incoming);
 
-    let current_meta: crate::types::ObjectMeta =
-        serde_json::from_value(current["metadata"].clone()).unwrap_or_default();
-    let expected_rv = parse_resource_version(current_meta.resource_version.as_deref())?;
+    let incoming_meta: crate::types::ObjectMeta =
+        serde_json::from_value(incoming["metadata"].clone()).unwrap_or_default();
+    let expected_rv = parse_resource_version(incoming_meta.resource_version.as_deref())?;
     let bytes = serde_json::to_vec(&current).map_err(|e| Status::internal(e.to_string()))?;
     let new_rv = state
         .store
@@ -7905,6 +7905,166 @@ mod tests {
             dep_after.is_none(),
             "cascade must delete a dependent that was created via the API with ownerReferences — \
              if ownerRefs were dropped by create, cascade has nothing to match and the dependent leaks"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression tests for mayor-8phw: put_cr_status must CAS on the INCOMING
+    // body's metadata.resourceVersion, not the stored object's RV.
+    // ---------------------------------------------------------------------------
+
+    /// put_cr_status with a stale resourceVersion in the body must return 409 Conflict.
+    ///
+    /// Without this fix put_cr_status used the stored object's RV as the CAS token,
+    /// making every PUT unconditional — a controller with a stale snapshot of the CR
+    /// would silently overwrite a peer's concurrent status write instead of receiving
+    /// 409 and retrying from a fresh GET.
+    #[tokio::test]
+    async fn put_cr_status_stale_rv_returns_409_else_concurrent_writers_clobber() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        // Create the CR (rv=1 from the store).
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "stale-widget" },
+                "spec": { "color": "green" }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path(("example.io".into(), "v1".into(), "widgets".into())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                create_body,
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Read rv1 from the store.
+        let key = "/registry/cr/example.io/v1/widgets/stale-widget";
+        let stored = state.store.get(key).await.unwrap().unwrap();
+        let obj: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        let rv1: u64 = obj["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+
+        // Advance to rv2 (peer writer succeeds).
+        let mut obj2 = obj.clone();
+        obj2["status"] = serde_json::json!({ "peer": true });
+        let rv2 = state
+            .store
+            .put(
+                key,
+                Bytes::from(serde_json::to_vec(&obj2).unwrap()),
+                Some(rv1),
+            )
+            .await
+            .unwrap();
+        assert!(rv2 > rv1, "rv must advance after peer write");
+
+        // PUT /status body carries the now-stale rv1 — must be rejected with 409.
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "stale-widget", "resourceVersion": rv1.to_string() },
+                "status": { "ready": false }
+            })
+            .to_string(),
+        );
+        let result = put_cr_status(
+            State(state.clone()),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "widgets".into(),
+                "stale-widget".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            put_body,
+        )
+        .await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!(
+                "stale-rv PUT to put_cr_status must return 409 — \
+                 without this check concurrent controllers silently clobber CR status writes"
+            ),
+        };
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::CONFLICT,
+            "stale resourceVersion in PUT /cr/status body must return 409 Conflict — \
+             controllers must retry from a fresh GET when they lose the CAS race"
+        );
+    }
+
+    /// put_cr_status with an absent resourceVersion in the body succeeds unconditionally.
+    ///
+    /// Upstream k8s allows omitting resourceVersion in a subresource PUT, treating it as
+    /// an unconditional write.  The fix must not break this.
+    #[tokio::test]
+    async fn put_cr_status_absent_rv_is_unconditional_write() {
+        let state = make_state();
+        install_cluster_crd_with_status_subresource(&state).await;
+
+        let create_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "norev-widget" },
+                "spec": { "color": "red" }
+            })
+            .to_string(),
+        );
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path(("example.io".into(), "v1".into(), "widgets".into())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                create_body,
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // PUT body with no resourceVersion — must succeed as unconditional write.
+        let put_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": "norev-widget" },
+                "status": { "ready": true }
+            })
+            .to_string(),
+        );
+        let result = put_cr_status(
+            State(state.clone()),
+            Path((
+                "example.io".into(),
+                "v1".into(),
+                "widgets".into(),
+                "norev-widget".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            put_body,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "absent resourceVersion in PUT /cr/status body must succeed (unconditional write) — \
+             single-writer clients that omit rv must not be broken by the stale-RV CAS fix"
         );
     }
 }
