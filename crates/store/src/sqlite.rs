@@ -379,13 +379,18 @@ fn delete_sync(
 
 /// Delete all objects in a namespace atomically.
 ///
-/// Returns the keys+bodies that were deleted (may be empty) and the new revision
-/// (only meaningful when at least one object was deleted).
+/// Returns (key, body, revision) for each deleted object. Each object gets its own distinct
+/// revision so that watchers receive a separate DELETED event per object. A shared revision
+/// would cause the watch stream's dedup check (`event.revision <= last_replayed`) to drop
+/// all but the first DELETED event — controllers would miss deletions and wedge in a 409-loop.
+///
+/// All deletes stay inside ONE `BEGIN IMMEDIATE … COMMIT` transaction (namespace delete
+/// remains atomic on the storage side); only the revision assignment is per-object.
 fn delete_namespace_sync(
     conn: &Connection,
     namespace: &str,
     last_written: &AtomicU64,
-) -> Result<(u64, Vec<(String, Bytes)>)> {
+) -> Result<Vec<(String, Bytes, u64)>> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
 
     // Collect all keys and their current bodies in the namespace.
@@ -400,34 +405,31 @@ fn delete_namespace_sync(
 
     if pairs.is_empty() {
         conn.execute_batch("ROLLBACK")?;
-        // Return current revision without incrementing (nothing was deleted).
-        let rev: u64 = conn
-            .query_row(
-                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
-                [],
-                |r| r.get::<_, i64>(0).map(|v| v as u64),
-            )
-            .unwrap_or(0);
-        return Ok((rev, vec![]));
+        return Ok(vec![]);
     }
 
-    // Increment global revision once for the batch.
-    conn.execute(
-        "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
-        [],
-    )?;
-    let new_revision: u64 = conn.query_row(
-        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
-        [],
-        |r| r.get::<_, i64>(0).map(|v| v as u64),
-    )?;
+    // Assign each deleted object its own distinct revision (etcd-like per-object mod-revision).
+    // All deletes are in the same transaction so the namespace delete remains atomic on storage.
+    let mut result: Vec<(String, Bytes, u64)> = Vec::with_capacity(pairs.len());
+    for (key, body) in pairs {
+        conn.execute(
+            "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'revision'",
+            [],
+        )?;
+        let rev: u64 = conn.query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'revision'",
+            [],
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
+        )?;
+        conn.execute("DELETE FROM objects WHERE key = ?1", params![key])?;
+        result.push((key, body, rev));
+    }
 
-    // Delete all objects in the namespace.
-    conn.execute("DELETE FROM objects WHERE ns = ?1", params![namespace])?;
     conn.execute_batch("COMMIT")?;
     // Same rationale as put_sync: update immediately after COMMIT on the blocking thread.
-    last_written.fetch_max(new_revision, Ordering::Release);
-    Ok((new_revision, pairs))
+    let max_rev = result.last().map_or(0, |(_, _, r)| *r);
+    last_written.fetch_max(max_rev, Ordering::Release);
+    Ok(result)
 }
 
 fn get_sync(conn: &Connection, key: &str) -> Result<Option<StoreObject>> {
@@ -881,14 +883,14 @@ impl Store for SqliteStore {
         let conn = self.write_conn.clone();
         let ns = namespace.to_string();
         let last_written = Arc::clone(&self.last_written_revision);
-        let (revision, pairs) = tokio::task::spawn_blocking(move || {
+        let deleted = tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             delete_namespace_sync(&conn, &ns, &last_written)
         })
         .await??;
 
-        let keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
-        for (key, body) in pairs {
+        let keys: Vec<String> = deleted.iter().map(|(k, _, _)| k.clone()).collect();
+        for (key, body, revision) in deleted {
             self.push_event(Arc::new(InternalEvent {
                 key,
                 revision,
@@ -1679,6 +1681,111 @@ mod tests {
                 "deletion_log must retain tombstone for ns-{i} (not re-created); evicting it \
                  would cause a reconnecting watcher to miss the DELETED event, deadlocking any \
                  controller waiting for the namespace deletion to complete"
+            );
+        }
+    }
+
+    /// Batch namespace delete must emit a distinct watch DELETED event per object.
+    ///
+    /// Why it matters: before the fix, delete_namespace_sync incremented the global revision
+    /// counter ONCE for the entire batch, so every deleted object shared the same revision.
+    /// push_event broadcast N DELETED events all at the same rv. The watch stream's dedup check
+    /// (`event.revision <= last_replayed`) yielded the first event (advancing last_replayed to
+    /// that rv) and silently dropped every subsequent event at the same rv. Controllers watching
+    /// /registry/endpoints/ received only ONE of the N endpoint DELETED events; their informer
+    /// caches retained stale copies of the others. On the next reconcile the controller PUT
+    /// with the stale rv, got 409 (object deleted → stored=0), and looped forever
+    /// (EndpointSlice conformance failure).
+    ///
+    /// This test MUST fail if the per-object-revision change is reverted: shared rv → dedup
+    /// drops all but the first DELETED event → watcher receives < N deletes → assert fails.
+    #[tokio::test]
+    async fn batch_namespace_delete_emits_distinct_watch_event_per_object() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+        let namespace = "endpointslice-test";
+
+        // Create 3 objects under /registry/endpoints/<namespace>/ to simulate the endpoints
+        // the EndpointSlice controller creates for services in the namespace.
+        let keys = [
+            format!("/registry/endpoints/{namespace}/svc-a"),
+            format!("/registry/endpoints/{namespace}/svc-b"),
+            format!("/registry/endpoints/{namespace}/svc-c"),
+        ];
+        for key in &keys {
+            let name = key.rsplit('/').next().unwrap_or("obj");
+            let val = Bytes::from(format!(
+                r#"{{"apiVersion":"v1","kind":"Endpoints","metadata":{{"name":"{name}","namespace":"{namespace}"}}}}"#
+            ));
+            store.put(key, val, None).await.expect("put must succeed");
+        }
+
+        // Subscribe BEFORE the delete so we enter the live-event loop.
+        let prefix = format!("/registry/endpoints/{namespace}/");
+        let stream = store.watch(&prefix, 0).await.expect("watch must succeed");
+        futures_util::pin_mut!(stream);
+
+        // Consume the 3 Added events from replay (objects existed before the watch started at rv=0).
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let mut added_count = 0usize;
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Added(_))) => added_count += 1,
+                Ok(Some(WatchEvent::Bookmark { .. })) => {}
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+            if added_count == keys.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            added_count,
+            keys.len(),
+            "watch must deliver Added for all {} pre-existing objects before the delete test begins",
+            keys.len()
+        );
+
+        // Delete the namespace — this calls delete_namespace_resources internally.
+        store
+            .delete_namespace_resources(namespace)
+            .await
+            .expect("delete_namespace_resources must succeed");
+
+        // Collect DELETED events for a short window. Each of the 3 objects must produce its own
+        // DELETED event. If any share a revision, the dedup check drops all but the first and
+        // the controller never learns about the others.
+        let mut deleted_keys: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(WatchEvent::Deleted { key, .. })) => deleted_keys.push(key),
+                Ok(Some(WatchEvent::Bookmark { .. })) => {}
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+            if deleted_keys.len() == keys.len() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            deleted_keys.len(),
+            keys.len(),
+            "batch namespace delete must emit a distinct watch event per object, else controllers \
+             miss deletes and wedge in a 409-loop (EndpointSlice conformance); got {} DELETED \
+             events, expected {}; missing: {:?}",
+            deleted_keys.len(),
+            keys.len(),
+            keys.iter()
+                .filter(|k| !deleted_keys.contains(k))
+                .collect::<Vec<_>>(),
+        );
+        for key in &keys {
+            assert!(
+                deleted_keys.contains(key),
+                "batch namespace delete must deliver DELETED event for {key}; a missing event \
+                 leaves the controller's informer cache stale — the controller PUTs with the old \
+                 rv, gets 409, and loops forever (EndpointSlice conformance failure)"
             );
         }
     }
