@@ -123,15 +123,27 @@ pub fn pod_is_best_effort(pod: &Value) -> bool {
     true
 }
 
+/// Returns true if the pod has spec.activeDeadlineSeconds set (is a terminating pod).
+///
+/// A pod is Terminating-scoped when it has an active deadline — i.e. it will be
+/// forcibly terminated after a finite time. This matches the Kubernetes definition:
+/// https://kubernetes.io/docs/concepts/workloads/pods/#pod-termination
+fn pod_is_terminating(pod: &Value) -> bool {
+    pod["spec"]["activeDeadlineSeconds"].is_number()
+}
+
 /// Returns true if the object matches the given ResourceQuota scope.
 ///
-/// Only "BestEffort" and "NotBestEffort" scope selectors are implemented here.
+/// Implemented scopes: BestEffort, NotBestEffort, Terminating, NotTerminating.
 /// Unknown scopes are treated conservatively: the object is assumed to match
 /// (quota applies), which is the safe default.
 fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
     match scope {
         "BestEffort" => object.is_some_and(pod_is_best_effort),
         "NotBestEffort" => object.is_none_or(|pod| !pod_is_best_effort(pod)),
+        // A pod matches Terminating iff spec.activeDeadlineSeconds is set.
+        "Terminating" => object.is_some_and(pod_is_terminating),
+        "NotTerminating" => object.is_none_or(|pod| !pod_is_terminating(pod)),
         // Unknown scopes: assume match (conservative — don't silently skip quotas).
         _ => true,
     }
@@ -597,6 +609,54 @@ mod tests {
             result.is_ok(),
             "Burstable pod must NOT be counted against a BestEffort-scoped quota — \
              it does not match the BestEffort scope and should be allowed"
+        );
+    }
+
+    // -- Terminating / NotTerminating scope filtering --
+
+    /// A pod WITH activeDeadlineSeconds must match Terminating (and NOT NotTerminating).
+    /// A pod WITHOUT activeDeadlineSeconds must match NotTerminating (and NOT Terminating).
+    ///
+    /// If these cases fall through to the always-match default, terminating-scope quota
+    /// accounting is wrong: non-terminating pods would be counted against a
+    /// Terminating-scoped quota, causing the ResourceQuota conformance test
+    /// `should verify ResourceQuota with terminating scopes` to fail.
+    #[test]
+    fn terminating_scope_matches_pod_with_active_deadline_seconds() {
+        let terminating_pod = json!({
+            "spec": {
+                "activeDeadlineSeconds": 300,
+                "containers": [{"name": "c", "image": "nginx"}]
+            }
+        });
+        assert!(
+            object_matches_scope("Terminating", Some(&terminating_pod)),
+            "a pod's Terminating-scope membership must follow activeDeadlineSeconds — \
+             else terminating-scope quota accounting is wrong (ResourceQuota conformance)"
+        );
+        assert!(
+            !object_matches_scope("NotTerminating", Some(&terminating_pod)),
+            "a pod's Terminating-scope membership must follow activeDeadlineSeconds — \
+             else terminating-scope quota accounting is wrong (ResourceQuota conformance)"
+        );
+    }
+
+    #[test]
+    fn not_terminating_scope_matches_pod_without_active_deadline_seconds() {
+        let non_terminating_pod = json!({
+            "spec": {
+                "containers": [{"name": "c", "image": "nginx"}]
+            }
+        });
+        assert!(
+            object_matches_scope("NotTerminating", Some(&non_terminating_pod)),
+            "a pod's Terminating-scope membership must follow activeDeadlineSeconds — \
+             else terminating-scope quota accounting is wrong (ResourceQuota conformance)"
+        );
+        assert!(
+            !object_matches_scope("Terminating", Some(&non_terminating_pod)),
+            "a pod's Terminating-scope membership must follow activeDeadlineSeconds — \
+             else terminating-scope quota accounting is wrong (ResourceQuota conformance)"
         );
     }
 
