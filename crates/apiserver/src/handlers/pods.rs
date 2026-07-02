@@ -1759,6 +1759,34 @@ pub fn validate_resize_patch(
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
 
+    // Rule 2a: check $setElementOrder/containers for reorder intent.
+    // A strategic-merge-patch that only reorders (no resource changes) sends ONLY this
+    // directive with no `spec.containers` array. The positional check below (Rule 2b)
+    // handles the case where `containers` is also present; this check catches the
+    // directive-only case that would otherwise be skipped by the early return.
+    if let Some(order_arr) = incoming["spec"]["$setElementOrder/containers"].as_array() {
+        let mut name_mismatches: Vec<String> = Vec::new();
+        for (order_idx, entry) in order_arr.iter().enumerate() {
+            let order_name = entry["name"].as_str().unwrap_or("");
+            let stored_name = stored_containers
+                .get(order_idx)
+                .and_then(|s| s["name"].as_str())
+                .unwrap_or("");
+            if order_name != stored_name {
+                name_mismatches.push(format!(
+                    "spec.containers[{order_idx}].name: Forbidden: \
+                     containers may not be renamed or reordered on resize"
+                ));
+            }
+        }
+        if !name_mismatches.is_empty() {
+            return Err(format!(
+                "Pod {pod_ns}/{pod_name}: {}",
+                name_mismatches.join(", ")
+            ));
+        }
+    }
+
     let incoming_containers = match incoming["spec"]["containers"].as_array() {
         Some(a) => a.as_slice(),
         None => return Ok(()), // no containers in patch — nothing to validate
@@ -1788,7 +1816,7 @@ pub fn validate_resize_patch(
         }
     }
 
-    // Rule 2: containers in the patch must match the stored pod in name AND order.
+    // Rule 2b: containers in the patch must match the stored pod in name AND order.
     // Reordering or renaming containers is forbidden — the patch's i-th container must
     // have the same name as the stored pod's i-th container for all indices present in the patch.
     // This catches both rename (name doesn't exist in stored) and reorder (name exists but
@@ -8127,6 +8155,84 @@ mod resize_tests {
         assert!(
             msg.contains("Forbidden: containers may not be renamed or reordered on resize"),
             "error must contain k8s conformance substring; got: {msg}"
+        );
+    }
+
+    /// Burstable pod — reorder via $setElementOrder/containers only (no containers array).
+    /// The real k8s conformance test 'Burstable pod - reorder containers' sends a
+    /// strategic-merge-patch with ONLY spec.$setElementOrder/containers in reversed order
+    /// and NO spec.containers array. Without this check, the early-return on absent
+    /// containers would silently accept the patch, applying the reorder client-side, and
+    /// causing the kubelet to map resources to the wrong container (cpu quota for c1 applied
+    /// to c2, etc.). k8s rejects with "Forbidden: containers may not be renamed or reordered".
+    #[test]
+    fn resize_rejects_container_reorder_via_set_element_order_else_kubelet_maps_resources_to_wrong_container(
+    ) {
+        let stored = serde_json::json!({
+            "metadata": {"name": "burstable-pod", "namespace": "default"},
+            "spec": {
+                "containers": [
+                    {"name": "c1", "resources": {"requests": {"cpu": "100m"}}},
+                    {"name": "c2", "resources": {"requests": {"cpu": "100m"}}}
+                ]
+            },
+            "status": {}
+        });
+        // Conformance test sends ONLY $setElementOrder/containers with reversed order —
+        // no spec.containers array at all.
+        let incoming = serde_json::json!({
+            "spec": {
+                "$setElementOrder/containers": [{"name": "c2"}, {"name": "c1"}]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_err(),
+            "reorder via $setElementOrder/containers must be rejected — \
+             if accepted, the kubelet applies stored resources to the new container order, \
+             silently assigning c1's cpu quota to c2 and vice versa"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Forbidden: containers may not be renamed or reordered on resize"),
+            "error must contain k8s conformance substring; got: {msg}"
+        );
+    }
+
+    /// Control: $setElementOrder/containers in stored order must be accepted.
+    /// A valid resize with matching order and only resource changes must not be rejected —
+    /// over-rejection would break the in-place resize feature for all Burstable pods.
+    #[test]
+    fn resize_accepts_set_element_order_in_stored_order() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "burstable-pod", "namespace": "default"},
+            "spec": {
+                "containers": [
+                    {"name": "c1", "resources": {"requests": {"cpu": "100m"}}},
+                    {"name": "c2", "resources": {"requests": {"cpu": "100m"}}}
+                ]
+            },
+            "status": {}
+        });
+        // $setElementOrder/containers in SAME order as stored — must be accepted.
+        let incoming = serde_json::json!({
+            "spec": {
+                "$setElementOrder/containers": [{"name": "c1"}, {"name": "c2"}],
+                "containers": [
+                    {"name": "c1", "resources": {"requests": {"cpu": "200m"}}},
+                    {"name": "c2", "resources": {"requests": {"cpu": "200m"}}}
+                ]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_ok(),
+            "valid resize with matching $setElementOrder/containers must be accepted — \
+             over-rejection blocks all strategic-merge-patch resize requests; \
+             got: {:?}",
+            result.err()
         );
     }
 
