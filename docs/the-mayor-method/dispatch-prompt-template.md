@@ -379,8 +379,28 @@ gets the call denied. If a call is denied, retry the bare form — a denial is a
 signal to fix the invocation, not to abort the task.
 
 ```
-scripts/conformance/run-all.sh --vm lima-node-smoke --port 6444 --workdir ./temp/u7s [--reset] [--verbose] [--focus <regex>]
+scripts/conformance/run-all.sh --vm lima-node-smoke --port 6444 --workdir ./temp/u7s [--reset] [--verbose] [--focus <regex>] [--stack-only]
 ```
+
+**⚠️ NEVER dispatch a bare `run-all.sh` (no `--focus`, no `--stack-only`).** A bare
+invocation runs the FULL conformance suite, which at the current state runs to the
+6h timeout — a scout dispatched to investigate one thing will silently burn the
+whole budget on a full run. Every VM dispatch prompt MUST tell the worker to use
+EITHER `--stack-only` (investigate via kubectl / direct DB, no sonobuoy at all) OR
+`--focus <regex>` (run one targeted test), and to reserve any `--focus` run for a
+FINAL confirmation gate — never a bare full run unless a full run is explicitly the
+stated goal of the bead.
+
+- **`--stack-only`** — brings up steps 1–5 (build, apiserver, kubelet, KCM,
+  scheduler) and SKIPS sonobuoy entirely. The stack is left running; the worker uses
+  `kubectl --kubeconfig ./temp/u7s/kubeconfig ...` and `limactl shell <VM> sudo
+  sqlite3 ...` / `... grep /tmp/kcm.log` to reproduce and diagnose in seconds. This
+  is the DEFAULT for any investigation/scout bead — no sonobuoy needed to repro
+  almost anything a conformance test asserts.
+- **`--focus <regex>`** — runs sonobuoy for just the matching test(s). Use as the
+  final gate once a fix is in, not for iterative diagnosis.
+- `--stack-only` + `--focus` together: `--focus` is ignored (warning to stderr),
+  stack-only wins.
 
 `--workdir ./temp/u7s` (relative to CWD = worktree root) is where state lands.
 `--verbose` turns on `RUST_LOG=debug` (set inside the script — never export it
