@@ -2006,8 +2006,13 @@ pub async fn delete_collection_resource<S: Store>(
                 }
             }
         }
-        // Ignore NotFound races (another writer may have deleted concurrently).
-        let _ = state.store.delete(&obj.key, None).await;
+        // NotFound means another writer deleted this object concurrently — tolerate it.
+        // Any other error (disk full, DB corruption, …) means some objects survived;
+        // propagate so the caller does not believe all objects were deleted.
+        match state.store.delete(&obj.key, None).await {
+            Ok(_) | Err(StoreError::NotFound { .. }) => {}
+            Err(e) => return Err(Status::internal(e.to_string())),
+        }
         if let Some(ref ip) = cluster_ip_to_release {
             state.release_service_ip(ip).await;
         }
@@ -2075,7 +2080,13 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
                 state.rbac_index.remove_object(&rbac_key);
             }
         }
-        let _ = state.store.delete(&obj.key, None).await;
+        // NotFound means another writer deleted this object concurrently — tolerate it.
+        // Any other error (disk full, DB corruption, …) means some objects survived;
+        // propagate so the caller does not believe all objects were deleted.
+        match state.store.delete(&obj.key, None).await {
+            Ok(_) | Err(StoreError::NotFound { .. }) => {}
+            Err(e) => return Err(Status::internal(e.to_string())),
+        }
         if let Some(ref ip) = cluster_ip_to_release {
             state.release_service_ip(ip).await;
         }
@@ -12423,6 +12434,439 @@ mod tests {
             u32::from(ip) & mask,
             base & mask,
             "allocated clusterIP {ip} must be within 10.96.0.0/12"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // MockStore that injects a non-NotFound delete error on demand.
+    //
+    // Used by delete_collection error-propagation tests only.
+    // ---------------------------------------------------------------------------
+
+    struct FailOnDeleteStore {
+        inner: std::sync::Arc<u7s_store::SqliteStore>,
+        /// When true the *next* delete() call returns a storage error instead of
+        /// delegating to the real store.  Cleared after firing once.
+        arm: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailOnDeleteStore {
+        fn new() -> Self {
+            Self {
+                inner: std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").unwrap()),
+                arm: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl u7s_store::Store for FailOnDeleteStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let inject = self.arm.swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move {
+                if inject {
+                    // Simulate a storage-layer failure (revision mismatch is a concrete
+                    // non-NotFound variant that requires no external crates to construct).
+                    Err(u7s_store::StoreError::RevisionMismatch {
+                        expected: 999,
+                        current: 1,
+                    })
+                } else {
+                    inner.delete(&key, expected_revision).await
+                }
+            }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+    }
+
+    /// delete_collection_resource must propagate a non-NotFound store error rather than
+    /// returning 200 Success.  Silent swallowing causes quota drift: the client believes
+    /// all objects were deleted, but some may survive because the store rejected the delete.
+    ///
+    /// Revert the match-on-delete fix (back to `let _ = …`) and this test fails.
+    #[tokio::test]
+    async fn delete_collection_resource_propagates_non_notfound_store_error() {
+        use axum::extract::{Path, Query, State};
+
+        let mock = std::sync::Arc::new(FailOnDeleteStore::new());
+        let state = crate::state::AppState::new(
+            mock.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed one ClusterRoleBinding (non-seeded name so it is not skipped).
+        let key = crate::keys::group_object_key(
+            "rbac.authorization.k8s.io",
+            "clusterrolebindings",
+            None,
+            "test-binding",
+        );
+        let val = serde_json::json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": { "name": "test-binding" },
+        });
+        mock.inner
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed must succeed");
+
+        // Arm the store to fail on the next delete.
+        mock.arm();
+
+        let result = delete_collection_resource(
+            State(state),
+            Path((
+                "rbac.authorization.k8s.io".into(),
+                "v1".into(),
+                "clusterrolebindings".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "delete_collection must propagate a non-NotFound store error — \
+             silently returning 200 causes quota drift: client believes all objects \
+             deleted, but surviving objects skew quota accounting"
+        );
+    }
+
+    /// delete_collection_namespaced_resource must propagate a non-NotFound store error
+    /// rather than returning 200 Success.  Same quota-drift / hidden-failure risk as the
+    /// cluster-scoped variant.
+    ///
+    /// Revert the match-on-delete fix (back to `let _ = …`) and this test fails.
+    #[tokio::test]
+    async fn delete_collection_namespaced_propagates_non_notfound_store_error() {
+        use axum::extract::{Path, Query, State};
+
+        let mock = std::sync::Arc::new(FailOnDeleteStore::new());
+        let state = crate::state::AppState::new(
+            mock.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed one Lease in "test-ns".
+        let key = crate::keys::group_object_key(
+            "coordination.k8s.io",
+            "leases",
+            Some("test-ns"),
+            "my-lease",
+        );
+        let val = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "my-lease", "namespace": "test-ns" },
+            "spec": {}
+        });
+        mock.inner
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed must succeed");
+
+        // Arm the store to fail on the next delete.
+        mock.arm();
+
+        let result = delete_collection_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "test-ns".into(),
+                "leases".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "delete_collection_namespaced must propagate a non-NotFound store error — \
+             silently returning 200 causes quota drift: client believes all objects \
+             deleted, but surviving objects skew quota accounting"
+        );
+    }
+
+    /// A FailOnDeleteStore variant that injects NotFound (not a real error) on delete.
+    ///
+    /// Models the concurrent-delete race: list returned a key that a peer deleted
+    /// before our loop could reach it.
+    struct NotFoundOnDeleteStore {
+        inner: std::sync::Arc<u7s_store::SqliteStore>,
+        arm: std::sync::atomic::AtomicBool,
+    }
+
+    impl NotFoundOnDeleteStore {
+        fn new() -> Self {
+            Self {
+                inner: std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").unwrap()),
+                arm: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.arm.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl u7s_store::Store for NotFoundOnDeleteStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Option<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.get(&key).await }
+        }
+
+        fn list(
+            &self,
+            prefix: &str,
+            opts: u7s_store::ListOptions,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u7s_store::ListResponse>> + Send
+        {
+            let inner = self.inner.clone();
+            let prefix = prefix.to_string();
+            async move { inner.list(&prefix, opts).await }
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<u64>> + Send {
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move { inner.put(&key, value, expected_revision).await }
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+            expected_revision: Option<u64>,
+        ) -> impl std::future::Future<Output = u7s_store::Result<(u64, bytes::Bytes)>> + Send
+        {
+            let inject = self.arm.swap(false, std::sync::atomic::Ordering::SeqCst);
+            let inner = self.inner.clone();
+            let key = key.to_string();
+            async move {
+                if inject {
+                    Err(u7s_store::StoreError::NotFound { key: key.clone() })
+                } else {
+                    inner.delete(&key, expected_revision).await
+                }
+            }
+        }
+
+        fn delete_namespace_resources(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<String>>> + Send {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.delete_namespace_resources(&ns).await }
+        }
+
+        fn watch(
+            &self,
+            _prefix: &str,
+            _from_revision: u64,
+        ) -> impl std::future::Future<
+            Output = u7s_store::Result<
+                impl futures_core::Stream<Item = u7s_store::WatchEvent> + Send + 'static,
+            >,
+        > + Send {
+            std::future::ready(Ok(futures_util::stream::empty()))
+        }
+
+        fn compaction_horizon(&self) -> u64 {
+            self.inner.compaction_horizon()
+        }
+
+        fn current_revision(&self) -> u64 {
+            self.inner.current_revision()
+        }
+    }
+
+    /// NotFound during delete_collection is a tolerated concurrent-delete race, not an error.
+    /// The handler must still succeed (200) when the only failure is NotFound.
+    ///
+    /// Revert the NotFound tolerance (make NotFound also propagate) and this test fails.
+    #[tokio::test]
+    async fn delete_collection_tolerates_notfound_concurrent_race() {
+        use axum::extract::{Path, Query, State};
+
+        // Inject a NotFound on delete to model the race: list captured the key, but a
+        // concurrent writer deleted it before our loop reached it.
+        let mock = std::sync::Arc::new(NotFoundOnDeleteStore::new());
+        let state = crate::state::AppState::new(
+            mock.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Seed a Lease so it appears in the list response.
+        let key = crate::keys::group_object_key(
+            "coordination.k8s.io",
+            "leases",
+            Some("default"),
+            "raced-lease",
+        );
+        let val = serde_json::json!({
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": { "name": "raced-lease", "namespace": "default" },
+            "spec": {}
+        });
+        mock.inner
+            .put(
+                &key,
+                bytes::Bytes::from(serde_json::to_vec(&val).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed must succeed");
+
+        // Arm the NotFound injection so delete returns NotFound (race).
+        mock.arm();
+
+        let result = delete_collection_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "default".into(),
+                "leases".into(),
+            )),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "delete_collection must tolerate NotFound (concurrent-delete race) \
+             and still return 200 — treating NotFound as fatal would cause spurious \
+             errors during normal namespace teardown"
         );
     }
 }
