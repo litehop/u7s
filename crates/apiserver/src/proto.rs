@@ -2739,14 +2739,19 @@ struct VolumeAttributesClass {
 /// ResourceQuotaSpec — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ResourceQuotaSpec
 ///
-/// Only field 1 (hard) is decoded; scopes (field 2) and scopeSelector (field 3) are skipped.
+/// Fields 1 (hard) and 2 (scopes) are decoded; scopeSelector (field 3) is skipped.
 /// hard is required by the quota controller to enforce limits; without it the controller
 /// sees no limits and skips reconciliation, leaving spec.hard null after create.
+/// scopes is required so the quota controller scope-filters pods correctly; without it
+/// a Terminating-scoped quota appears scope-less and KCM counts all pods against it.
 #[derive(Clone, PartialEq, Message)]
 struct ResourceQuotaSpec {
     /// hard (field 1, map<string, Quantity>) — the desired hard limits per named resource
     #[prost(btree_map = "string, message", tag = "1")]
     hard: std::collections::BTreeMap<String, Quantity>,
+    /// scopes (field 2, repeated string) — e.g. ["Terminating"], ["BestEffort"]
+    #[prost(string, repeated, tag = "2")]
+    scopes: Vec<String>,
 }
 
 /// ResourceQuota — k8s.io/api/core/v1/generated.proto
@@ -6163,10 +6168,16 @@ pub fn decode_resourcequota_proto(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta
     });
     if let Some(spec) = obj.spec {
-        if !spec.hard.is_empty() {
-            result["spec"] = serde_json::json!({
-                "hard": limitrange_quantity_map_to_json(spec.hard)
-            });
+        if !spec.hard.is_empty() || !spec.scopes.is_empty() {
+            let mut spec_json = serde_json::json!({});
+            if !spec.hard.is_empty() {
+                spec_json["hard"] = limitrange_quantity_map_to_json(spec.hard);
+            }
+            if !spec.scopes.is_empty() {
+                spec_json["scopes"] =
+                    serde_json::Value::Array(spec.scopes.into_iter().map(Into::into).collect());
+            }
+            result["spec"] = spec_json;
         }
     }
     Some(result)
@@ -13146,6 +13157,60 @@ mod tests {
             result["spec"]["hard"]["pods"], "10",
             "spec.hard.pods must be decoded — without this the quota controller sees null \
              spec.hard and skips reconciliation, so no quota is ever enforced"
+        );
+    }
+
+    /// decode_resourcequota_proto must decode spec.scopes so KCM scope-filters pod usage correctly.
+    ///
+    /// When a ResourceQuota is created with spec.scopes (e.g. ["Terminating"]) via proto encoding
+    /// (as the e2e test binary does via client-go), the scopes field must survive decoding.
+    /// Without it, KCM's quota controller sees a scope-less quota and counts ALL pods against it,
+    /// causing a Terminating-scoped quota to show pods="1" when a non-terminating pod exists.
+    /// The conformance test "should verify ResourceQuota with terminating scopes" then fails
+    /// because it expects the terminating-scope quota's used.pods to remain "0".
+    /// This test must fail if spec.scopes decoding is removed.
+    #[test]
+    fn decode_resourcequota_proto_extracts_spec_scopes() {
+        // Build the proto bytes for:
+        //   ResourceQuota {
+        //     metadata: ObjectMeta { name: "terminating-quota", namespace: "default" },
+        //     spec: ResourceQuotaSpec {
+        //       hard: {"pods": Quantity{string: "5"}},
+        //       scopes: ["Terminating"]
+        //     }
+        //   }
+
+        let encode_quantity = |s: &[u8]| -> Vec<u8> { encode_length_delimited(1, s) };
+
+        let encode_map_entry = |key: &[u8], val_bytes: &[u8]| -> Vec<u8> {
+            let mut entry = encode_length_delimited(1, key);
+            entry.extend_from_slice(&encode_length_delimited(2, val_bytes));
+            entry
+        };
+
+        // ResourceQuotaSpec { hard: {"pods": Quantity{string: "5"}}, scopes: ["Terminating"] }
+        let pods_entry = encode_map_entry(b"pods", &encode_quantity(b"5"));
+        let mut spec_bytes = encode_length_delimited(1, &pods_entry); // field 1 = hard
+        spec_bytes.extend_from_slice(&encode_length_delimited(2, b"Terminating")); // field 2 = scopes[0]
+
+        // ResourceQuota { metadata, spec }
+        let mut meta_bytes = encode_length_delimited(1, b"terminating-quota"); // name
+        meta_bytes.extend_from_slice(&encode_length_delimited(3, b"default")); // namespace
+        let mut proto = encode_length_delimited(1, &meta_bytes); // field 1 = metadata
+        proto.extend_from_slice(&encode_length_delimited(2, &spec_bytes)); // field 2 = spec
+
+        let result = decode_core_proto_by_kind("ResourceQuota", &proto)
+            .expect("ResourceQuota with spec.scopes must decode successfully");
+
+        assert_eq!(result["kind"], "ResourceQuota");
+        assert_eq!(result["metadata"]["name"], "terminating-quota");
+        assert_eq!(result["spec"]["hard"]["pods"], "5");
+        assert_eq!(
+            result["spec"]["scopes"],
+            serde_json::json!(["Terminating"]),
+            "spec.scopes must be decoded from proto field 2 — without it KCM sees a scope-less \
+             quota and counts non-terminating pods against Terminating-scoped quotas, causing the \
+             conformance test 'verify ResourceQuota with terminating scopes' to fail"
         );
     }
 
