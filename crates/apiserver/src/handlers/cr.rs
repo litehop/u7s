@@ -761,7 +761,7 @@ pub async fn create_cr<S: Store>(
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
-    let key = cr_store_key(&group, &version, &plural, None, &name);
+    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
@@ -806,7 +806,7 @@ pub async fn replace_cr<S: Store>(
         )));
     }
 
-    let key = cr_store_key(&group, &version, &plural, None, &name);
+    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
 
     // Must exist before replace.
     let stored = state
@@ -968,7 +968,7 @@ pub async fn delete_cr<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &version, &plural, None, &name);
+    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
 
     let stored = state
         .store
@@ -1330,7 +1330,7 @@ pub async fn create_cr_namespaced<S: Store>(
     obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
 
-    let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
+    let key = cr_store_key(&group, &ctx.storage_version, &plural, Some(&ns), &name);
     let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
     let rv = state
         .store
@@ -1375,7 +1375,7 @@ pub async fn replace_cr_namespaced<S: Store>(
         )));
     }
 
-    let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
+    let key = cr_store_key(&group, &ctx.storage_version, &plural, Some(&ns), &name);
 
     let stored = state
         .store
@@ -1445,7 +1445,7 @@ pub async fn delete_cr_namespaced<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
+    let key = cr_store_key(&group, &ctx.storage_version, &plural, Some(&ns), &name);
 
     let stored = state
         .store
@@ -1516,6 +1516,7 @@ pub async fn patch_cr<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = crate::handlers::json_patch::detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -1523,13 +1524,54 @@ pub async fn patch_cr<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &version, &plural, None, &name);
-    let stored = state
+    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
+    let stored_opt = state
         .store
         .get(&key)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // SSA (apply-patch+yaml) upsert: create the CR when it does not exist yet.
+    // kubectl apply and conformance tests use apply-patch+yaml to create-or-update CRs;
+    // returning 404 for a missing object breaks the apply flow.
+    if is_ssa && stored_opt.is_none() {
+        // SSA bodies are YAML (Content-Type: application/apply-patch+yaml); parse via
+        // serde_yaml so YAML block syntax is accepted, not just JSON.
+        let mut obj: serde_json::Value = serde_yaml::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch body: {e}")))?;
+        // stamp_cr_fields sets apiVersion, kind, uid, creationTimestamp.
+        stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
+        validate_cr_schema(&obj, &ctx)?;
+        let admission_ctx = AdmissionContext {
+            group: &group,
+            version: &version,
+            resource: &plural,
+            name: &name,
+            namespace: None,
+            operation: "CREATE",
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
+            dry_run: false,
+        };
+        obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+        run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+        let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+        let rv = state
+            .store
+            .put(&key, Bytes::from(bytes), Some(0))
+            .await
+            .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        let mut meta: crate::types::ObjectMeta =
+            serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+        meta.resource_version = Some(rv.to_string());
+        obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
+        return Ok((StatusCode::CREATED, Json(obj)).into_response());
+    }
+
+    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -1592,7 +1634,7 @@ pub async fn patch_cr<S: Store>(
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.resource_version = Some(new_rv.to_string());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    Ok(Json(obj))
+    Ok(Json(obj).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,6 +1649,7 @@ pub async fn patch_cr_namespaced<S: Store>(
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let patch_type = crate::handlers::json_patch::detect_patch_type(&headers)?;
+    let is_ssa = content_type(&headers).contains("apply-patch+yaml");
 
     let ctx = find_crd(&state, &group, &version, &plural).await?;
 
@@ -1614,13 +1657,57 @@ pub async fn patch_cr_namespaced<S: Store>(
         return Err(Status::not_found(&name, &ctx.kind));
     }
 
-    let key = cr_store_key(&group, &version, &plural, Some(&ns), &name);
-    let stored = state
+    let key = cr_store_key(&group, &ctx.storage_version, &plural, Some(&ns), &name);
+    let stored_opt = state
         .store
         .get(&key)
         .await
-        .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    // SSA (apply-patch+yaml) upsert: create the CR when it does not exist yet.
+    if is_ssa && stored_opt.is_none() {
+        // SSA bodies are YAML (Content-Type: application/apply-patch+yaml); parse via
+        // serde_yaml so YAML block syntax is accepted, not just JSON.
+        let mut obj: serde_json::Value = serde_yaml::from_slice(&body)
+            .map_err(|e| Status::bad_request(format!("invalid patch body: {e}")))?;
+        stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
+        {
+            let mut meta: crate::types::ObjectMeta =
+                serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+            meta.namespace = Some(ns.clone());
+            obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
+        }
+        validate_cr_schema(&obj, &ctx)?;
+        let admission_ctx = AdmissionContext {
+            group: &group,
+            version: &version,
+            resource: &plural,
+            name: &name,
+            namespace: Some(&ns),
+            operation: "CREATE",
+            user_info: Some(serde_json::json!({
+                "username": user.username,
+                "uid": user.uid,
+                "groups": user.groups,
+            })),
+            dry_run: false,
+        };
+        obj = run_mutating_webhooks(&state, obj, None, &admission_ctx).await?;
+        run_validating_webhooks(&state, &obj, None, &admission_ctx).await?;
+        let bytes = serde_json::to_vec(&obj).map_err(|e| Status::internal(e.to_string()))?;
+        let rv = state
+            .store
+            .put(&key, Bytes::from(bytes), Some(0))
+            .await
+            .map_err(|e| store_err_cr(e, &name, &ctx.kind))?;
+        let mut meta: crate::types::ObjectMeta =
+            serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
+        meta.resource_version = Some(rv.to_string());
+        obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
+        return Ok((StatusCode::CREATED, Json(obj)).into_response());
+    }
+
+    let stored = stored_opt.ok_or_else(|| Status::not_found(&name, &ctx.kind))?;
 
     let mut obj: serde_json::Value =
         serde_json::from_slice(&stored.value).map_err(|e| Status::internal(e.to_string()))?;
@@ -1683,7 +1770,7 @@ pub async fn patch_cr_namespaced<S: Store>(
         serde_json::from_value(obj["metadata"].take()).unwrap_or_default();
     meta.resource_version = Some(new_rv.to_string());
     obj["metadata"] = serde_json::to_value(meta).unwrap_or_default();
-    Ok(Json(obj))
+    Ok(Json(obj).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1731,7 +1818,7 @@ pub async fn put_cr_status<S: Store>(
             return Err(Status::not_found(&name, &ctx.kind));
         }
         (
-            cr_store_key(&group, &version, &plural, None, &name),
+            cr_store_key(&group, &ctx.storage_version, &plural, None, &name),
             ctx.kind,
         )
     };
@@ -1803,7 +1890,7 @@ pub async fn get_cr_status<S: Store>(
     if ctx.namespaced {
         return Err(Status::not_found(&name, &ctx.kind));
     }
-    let key = cr_store_key(&group, &version, &plural, None, &name);
+    let key = cr_store_key(&group, &ctx.storage_version, &plural, None, &name);
     let stored = state
         .store
         .get(&key)
@@ -8066,6 +8153,288 @@ mod tests {
             result.is_ok(),
             "absent resourceVersion in PUT /cr/status body must succeed (unconditional write) — \
              single-writer clients that omit rv must not be broken by the stale-RV CAS fix"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression test for mayor-4xgf: non-storage-version CR writes must deliver
+    // watch events on the storage-version prefix (FieldValidation conformance tests).
+    //
+    // Root cause: create_cr/delete_cr used the REQUEST version in the store key, but
+    // list_cr/watch already remapped the key prefix to the STORAGE version. This caused
+    // events emitted for non-storage-version operations to be silently filtered out by
+    // the watch's prefix check — matching nothing because the key used v1beta1 while
+    // the watch listened on v1.
+    //
+    // The conformance test helper `isWatchCachePrimed` (fixtures/resources.go) uses
+    // exactly this pattern: creates + deletes a probe CR via the first SERVED version
+    // (v1beta1, which is non-storage), then watches from the create RV and expects a
+    // DELETED event. Without the fix, no event arrives and all 5 FieldValidation tests
+    // fail with "cannot create crd gave up waiting for watch event".
+    // ---------------------------------------------------------------------------
+
+    /// A CR created then deleted via a non-storage version must deliver a DELETED watch
+    /// event at that version's endpoint.
+    ///
+    /// WHY this matters: the k8s conformance helper `isWatchCachePrimed` uses the first
+    /// served version (often non-storage) to probe watch readiness. A missing DELETED event
+    /// causes all 5 FieldValidation [Conformance] tests to time out with "gave up waiting
+    /// for watch event". Without this fix those tests fail and the suite regresses.
+    #[tokio::test]
+    async fn non_storage_version_cr_write_delivers_delete_watch_event() {
+        use crate::handlers::crd;
+        use axum::body::to_bytes;
+        use tokio::time::{timeout, Duration};
+
+        let state = make_state();
+
+        // Install a multi-version CRD: v1beta1 is served but NOT the storage version;
+        // v1 is the storage version. This matches the CRD shape used by the FieldValidation
+        // conformance test (NewRandomNameMultipleVersionCustomResourceDefinition).
+        let multi_version_crd = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "gadgets.example.io" },
+                "spec": {
+                    "group": "example.io",
+                    "names": {
+                        "plural": "gadgets",
+                        "singular": "gadget",
+                        "kind": "Gadget",
+                        "listKind": "GadgetList"
+                    },
+                    "scope": "Cluster",
+                    "versions": [
+                        { "name": "v1beta1", "served": true, "storage": false },
+                        { "name": "v1",      "served": true, "storage": true  }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            multi_version_crd,
+        )
+        .await
+        .expect("install multi-version CRD");
+
+        // Step 1: create the probe CR via v1beta1 (non-storage version).
+        let probe_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "example.io/v1beta1",
+                "kind": "Gadget",
+                "metadata": { "name": "probe" },
+                "spec": {}
+            })
+            .to_string(),
+        );
+        let create_resp = create_cr(
+            State(state.clone()),
+            Path(("example.io".into(), "v1beta1".into(), "gadgets".into())),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            probe_body,
+        )
+        .await
+        .expect("create probe CR via non-storage version");
+        let create_body = to_bytes(create_resp.into_response().into_body(), usize::MAX)
+            .await
+            .expect("read create response body");
+        let create_json: serde_json::Value =
+            serde_json::from_slice(&create_body).expect("parse create response");
+        let create_rv: u64 = create_json["metadata"]["resourceVersion"]
+            .as_str()
+            .expect("resourceVersion must be a string")
+            .parse()
+            .expect("resourceVersion must parse as u64");
+
+        // Step 2: open a watch at the create RV on the v1beta1 endpoint.
+        // This must observe the upcoming DELETE event even though v1 is the storage version.
+        let watch_q = super::super::generic::CollectionQuery {
+            watch: Some(true),
+            resource_version: Some(create_rv),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: Some(5),
+        };
+        let watch_resp = list_cr(
+            State(state.clone()),
+            Path(("example.io".into(), "v1beta1".into(), "gadgets".into())),
+            axum::http::HeaderMap::new(),
+            watch_q,
+            "test-user".into(),
+        )
+        .await
+        .expect("open watch on v1beta1 endpoint");
+        assert_eq!(watch_resp.status(), StatusCode::OK);
+
+        // Step 3: delete the probe CR via v1beta1.
+        delete_cr(
+            State(state.clone()),
+            Path((
+                "example.io".into(),
+                "v1beta1".into(),
+                "gadgets".into(),
+                "probe".into(),
+            )),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .expect("delete probe CR via non-storage version");
+
+        // Step 4: collect the watch stream (5s timeout) and assert a DELETED event arrives.
+        // If the fix is reverted, create_cr/delete_cr use `v1beta1` in the key while the
+        // watch uses the `v1` prefix — the DELETE event key never starts with the v1 prefix
+        // → the event is filtered → the stream ends without DELETED → assertion fails.
+        let body = timeout(
+            Duration::from_secs(5),
+            to_bytes(watch_resp.into_body(), usize::MAX),
+        )
+        .await
+        .expect("watch stream must complete within 5 seconds")
+        .expect("collect watch stream body");
+        let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
+
+        assert!(
+            body_str.contains("\"DELETED\""),
+            "watch on non-storage-version (v1beta1) endpoint must receive DELETED event when \
+             CR is deleted via that version — without this, the k8s conformance helper \
+             isWatchCachePrimed times out and all 5 FieldValidation tests fail with \
+             'cannot create crd gave up waiting for watch event'; body={body_str:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression test for mayor-4xgf (SSA upsert): apply-patch+yaml with a YAML
+    // body must CREATE the CR (not return 400) when the object doesn't exist yet.
+    //
+    // Root cause: the SSA upsert path used serde_json::from_slice to parse the body,
+    // but the k8s client sends genuine YAML (Content-Type: application/apply-patch+yaml).
+    // JSON parsing fails for any YAML that uses block-mapping syntax (e.g. `key: value`).
+    // The conformance test at field_validation.go:278 sends:
+    //   PATCH /apis/<group>/v1beta1/<plural>/mytest?fieldValidation=Strict
+    // with a YAML body — returning 400 there causes "the server rejected our request".
+    // ---------------------------------------------------------------------------
+
+    /// A YAML-body SSA PATCH on a non-existent cluster-scoped CR must CREATE it (201).
+    ///
+    /// WHY this matters: the k8s conformance test "should create/apply a valid CR for CRD
+    /// with validation schema" sends a YAML apply-patch+yaml body to create 'mytest'.
+    /// Without serde_yaml parsing, serde_json::from_slice returns Err at byte 1 (YAML
+    /// block syntax is not valid JSON) → 400 Bad Request → test fails with
+    /// "the server rejected our request for an unknown reason".
+    #[tokio::test]
+    async fn ssa_yaml_body_creates_cluster_scoped_cr() {
+        use crate::handlers::crd;
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // Install a CRD with v1 (storage) version and a schema.
+        let crd_bytes = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "things.ssa.example.com" },
+                "spec": {
+                    "group": "ssa.example.com",
+                    "names": {
+                        "plural": "things",
+                        "singular": "thing",
+                        "kind": "Thing",
+                        "listKind": "ThingList"
+                    },
+                    "scope": "Cluster",
+                    "versions": [
+                        {
+                            "name": "v1",
+                            "served": true,
+                            "storage": true,
+                            "schema": {
+                                "openAPIV3Schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "spec": {
+                                            "type": "object",
+                                            "properties": {
+                                                "foo": { "type": "string" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+        crd::create_crd(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            crd_bytes,
+        )
+        .await
+        .expect("install CRD");
+
+        // Send a YAML-body SSA PATCH (apply-patch+yaml) for a new object.
+        // The body is genuine YAML (block-mapping syntax), NOT JSON.
+        let yaml_body = Bytes::from(
+            b"apiVersion: ssa.example.com/v1\nkind: Thing\nmetadata:\n  name: mytest\nspec:\n  foo: bar\n"
+                .to_vec(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/apply-patch+yaml"),
+        );
+
+        let resp = patch_cr(
+            State(state.clone()),
+            Path((
+                "ssa.example.com".into(),
+                "v1".into(),
+                "things".into(),
+                "mytest".into(),
+            )),
+            test_user(),
+            headers,
+            yaml_body,
+        )
+        .await
+        .expect("SSA YAML upsert must not return Err")
+        .into_response();
+
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "apply-patch+yaml with YAML body on a missing cluster-scoped CR must return 201 \
+             CREATED — if serde_json::from_slice is used instead of serde_yaml, YAML block \
+             syntax is rejected with 400, causing conformance test field_validation.go:278 to \
+             fail with 'the server rejected our request for an unknown reason'"
+        );
+
+        // Verify the stored CR has spec.foo = "bar".
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let resp_obj: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("response must be valid JSON");
+        assert_eq!(
+            resp_obj["spec"]["foo"].as_str(),
+            Some("bar"),
+            "the created CR must have spec.foo='bar' as sent in the YAML body"
         );
     }
 }
