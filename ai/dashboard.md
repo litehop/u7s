@@ -1,49 +1,54 @@
 # Dashboard
-2026-07-03T02:15Z — **Long session, lots shipped. 12 PRs merged (audits→fixes, proto-drops, u3fa consistency, tooling). PROTO-TYPING EPIC decided + filed. Mayor on main `3e423de3` = origin. 0 open PRs. 0 workers. Board: 15 ready + EPIC.**
+2026-07-03T03:16Z — **Non-proto-drop batch COMPLETE (4 fixes merged + 1 reclassified). 18 PRs merged this session. Mayor on main `4f41f2de` = origin. 0 open PRs, 0 workers. Board: 13 ready + EPIC. STOPPED for backlog re-evaluation (operator).**
 
 Resume: `bd prime`
 
-## What needs the operator now
-- **Nothing blocking.** Clean slate — pick the next thread.
-- **Two P1s teed up, both need an operator call before dispatch:**
-  1. **mayor-dqwf** — Phase-1 GATE of the proto-typing EPIC (mayor-xmu4). Ready to dispatch when you want to start the ~3-5 day migration. It's a spike→real (prove the prost-build decode+JSON-emission adapter on one group), cargo-verifiable, gates the rest.
-  2. **mayor-7lrp** — the residual watch/informer-consistency latency ("EndpointSlice informer cache out of date" — bookmark-delivery lag, distinct from the u3fa batch-delete bug now fixed). NEEDS A DESIGN DECISION, not a blind fix — the 0702-watch-consistency-audit flags it as maybe-not-fixable without forking KCM. Recommend: re-measure on a fresh full run first, then decide.
-- **Also available:** a fresh FULL conformance run to re-baseline (12 fixes landed since the last one) — would re-rank the 15 symptom beads and confirm the dfly generic-PATCH-TypeMeta fix's blast radius.
+## What needs the operator now — RE-EVALUATION DECISIONS
+The non-proto-drop batch is done. Threads awaiting your call:
+1. **Proto-typing EPIC (mayor-xmu4)** — decided (Direction A). P1 gate mayor-dqwf is READY. Start now (~3-5d) or defer? Highest-leverage — kills the recurring bug class.
+2. **7lrp (P1)** — watch/informer-consistency latency (design decision; maybe-unfixable-without-forking-KCM per audit). Re-measure on a fresh full run first, then decide.
+3. **rsei preemption (P1)** — SCOUTED = missing FEATURE (~6-9d EPIC), not a bug; blocked-by osuq (priority proto-drop). Build or defer?
+Also: a fresh FULL conformance run to re-baseline (18 fixes landed) — re-ranks everything + confirms dfly PATCH-TypeMeta blast radius (mayor-f172).
 
-## ✅ PROTO-TYPING EPIC — DECIDED (Direction A: prost-build codegen)
-The week's dominant bug class = proto.rs hand-written PARTIAL prost structs (224 of 643 msgs) silently dropping fields. Decision (operator): generate complete structs FROM upstream .proto → omission becomes STRUCTURALLY impossible. Rejected Direction B (types-as-source-of-truth): no Rust types→proto tool exists (spike surveyed 7 crates); B's checker catches wrong tags but NOT omissions, ~2x cost. Full record: **ai/extended-context/proto-typing-decision.md** + bd memory `proto-typing-direction-a-decision`. Research: ai/findings/{k8s-proto-schema-churn-1.34-1.36, proto-source-of-truth-spike}-2026-07-03.md + PoC.
-- **EPIC mayor-xmu4** → P1 mayor-dqwf (GATE), P2 mayor-tkyb (existing groups), P3 mayor-0vl5 (10 missing groups), P4 mayor-2bfd (delete dead structs+gate). OpenAPI mayor-52wo relates-to. Hard part: proto.rs combines decode+JSON-emit in ~200 fns → must split into generated-decode + adapter (Phase 1 proves the pattern).
+## ✅ Non-proto-drop batch results
+| Bead | Outcome |
+|---|---|
+| 2av8 | ✅ #659 — create_pod honors dryRun=All + 403 missing RuntimeClass. VM-verified, --focus PASS. |
+| f60a | ✅ #660 — webhook timeout error includes URL+timeout. Mayor caught+fixed a double-`?` URL-collision bug. |
+| frxo | ✅ #661 — SA token credential-id (JTI). Added UserInfo.extra (~90 mechanical sites, verified uniform). |
+| n124 | ✅ #662 — pod proxy via manual CONNECT tunnel (reqwest only tunnels https). VM-verified 200/zero-405. |
+| rsei | RECLASSIFIED → missing feature (~6-9d EPIC). Escape-hatch caught proto-drop osuq. |
 
-## Uncommitted (fold into next push)
-.beads/ (EPIC + phase beads, 7lrp re-scope), ai/dashboard.md, ai/extended-context/proto-typing-decision.md (new). No code.
+Escape-hatch + verify-the-diff paid off 3×: rsei's hidden proto-drop, f60a's URL-collision, n124's asymmetry. All fixes have fails-on-revert tests.
 
-## Board — 15 ready (+ EPIC mayor-xmu4)
-- **mayor-7lrp (P1)** — watch/informer-consistency latency (design decision; see above).
-- **mayor-cef5 (P3)** — deferred audit findings (perf F1 admission-config-cache = biggest write-latency lever; quality F-05 delete_collection error-swallow).
-- **~13 symptom-framed P2 conformance beads** (root-cause-verify each via --stack-only kubectl BEFORE a fix — half of the ones checked this session were mis-framed): qrip (STS rolling update), frxo (SA token credential-id), kxht (VAP outcomes+panic — distinct from wucf's arithmetic fix), rsei (scheduler preemption), uam0 (CRD /openapi/v2), pu5i (pod log 500), n124 (pod proxy CONNECT tunnel), 2av8 (dryRun+RuntimeClass), y832 (sonobuoy progress dropped), f60a (webhook timeout type). Infra/chore: zc9l (smoke coverage), vehd (k8s patch-version check). Plus a filed follow-up: verify which PATCH tests the dfly generic-TypeMeta fix now passes.
+## PROTO-TYPING EPIC (mayor-xmu4) — decided (Direction A: prost-build codegen)
+Kills silent-field-drop structurally. Record: ai/extended-context/proto-typing-decision.md (on main). Phases: P1 mayor-dqwf (GATE — prove decode+JSON-emission adapter; hard part = proto.rs combines decode+emit in ~200 fns), P2 tkyb, P3 0vl5, P4 2bfd. New instance this session: mayor-osuq (PodSpec priority/priorityClassName).
 
-## Shipped this session (all merged, mayor-verified)
-#657 mcpls dispatch guidance · #656 f5p5 ResourceQuota terminating-scope (+2 proto-drops: activeDeadlineSeconds, scopeSelector) · #655 GET /pods/resize (lp6i) · #654 proto cluster (on07 Volume defaultMode, a83z Lease MicroTime nanos, dfly GENERIC PATCH-TypeMeta) · #653 u3fa batch-delete watch-event-loss (distinct-rv-per-object) · #652 --stack-only mandate docs · #651 --stack-only flag · #650 Job proto decode (2w29) · #649 beads-sync · #648 rmcp 2.1.0 · #647 PATCH CAS + JSON-Patch /status isolation · #646 CEL checked-arith + matches_rule scope · #645 Deployment/RS status proto decode. Plus 3 audits (perf/quality/security) closed.
+## Board — 13 ready (+ EPIC)
+- **P1:** 7lrp (design decision), osuq (priority proto-drop — EPIC scope), dqwf (EPIC P1 gate).
+- **Still-open conformance (root-cause-verify via --stack-only before fixing — half checked this session were mis-framed):** qrip (STS rolling update — MAY be spec.template proto/patch drop, scout first), kxht (VAP outcomes+panic — CEL context, likely not proto), uam0 (CRD schema in /openapi/v2 — OpenAPI gen, downstream of typing EPIC), pu5i (pod log 500 — proxy/streaming), y832 (sonobuoy progress annotation not persisting — WRITE-path silent-loss, sibling of proto-drop).
+- **Chores:** zc9l (smoke coverage), vehd (k8s patch pins). **P3:** f172 (verify dfly PATCH-TypeMeta blast radius next run), cef5 (deferred audit perf/LOW: admission-config-cache, delete_collection error-swallow).
 
-## Key lessons banked this session
-- **proto-decode-drop is THE bug class** → the mayor-xmu4 EPIC exists to kill it structurally. Every `// skipped` in proto.rs is a latent bug.
-- Root-cause-first pays: several symptom beads were mis-framed (lp6i "route missing"=missing GET method; f5p5 "404"=scope bug; #646 suspected then refuted for EndpointSlice). Scouts avoided ≥2 bad fixes (one would've regressed conformance).
-- Worker discipline: check branch-base vs origin/main before merging (stale forks silently revert merges); mandate FOREGROUND run-all.sh (backgrounded runs stall workers); ALWAYS read the e2e.txt PASS line yourself (workers claim progress the test doesn't confirm); NEVER bare run-all.sh (=6h full suite — see --stack-only).
-- mcpls LSP is useful (grep-then-LSP-at-position) but underused → now in dispatch template + memory.
+## Shipped this session (18 PRs)
+Proto-drops: #645 Deploy/RS status · #650 Job spec · #654 Volume defaultMode+Lease MicroTime+generic PATCH TypeMeta · #656 ResourceQuota terminating (activeDeadlineSeconds+scopeSelector). Consistency: #653 u3fa batch-delete watch-event-loss. Conformance: #647 PATCH CAS+/status isolation · #646 CEL checked-arith+matches_rule scope · #659 dryRun+RuntimeClass · #660 webhook timeout · #661 SA token JTI · #662 pod proxy CONNECT. Infra/docs: #648 rmcp2.1 · #651 --stack-only · #652/#657 dispatch-template · #649/#658 bookkeeping. Plus 3 audits.
+
+## Key lessons banked
+proto-decode-drop is THE bug class → EPIC mayor-xmu4. Root-cause-first + escape-hatch + read-the-e2e.txt-yourself repeatedly caught mis-framed beads + would-be-regressions. Worker discipline: FOREGROUND run-all.sh, check branch-base before merge, never bare run-all.sh (=6h). mcpls grep-then-LSP in dispatch template.
 
 ## Tooling
-`run-all.sh --stack-only` (stack up, no sonobuoy — for kubectl/DB investigation). `--focus <regex>` for targeted gate. NEVER bare (=full ~6h suite). Dispatch template + bd memory carry the discipline.
+`run-all.sh --stack-only` (stack up, no sonobuoy) · `--focus <regex>` (targeted gate) · NEVER bare (=6h full suite).
 
 ## Stance (unchanged)
-Pre-alpha Kubernetes apiserver in Rust. Correctness > conformance breadth. Workers in isolated worktrees (ALWAYS isolation="worktree"); mayor orchestrates, doesn't code (4-condition gate). Merge-on-green WITH verification (read the e2e.txt). No back-compat. Never --admin. Flag security/API/architecture PRs. Confirm branch=main + pwd before bead/dashboard ops.
+Pre-alpha k8s apiserver in Rust. Correctness > breadth. Workers in isolated worktrees (ALWAYS isolation="worktree"); mayor orchestrates (4-condition gate). Merge-on-green WITH verification (read the e2e.txt). No back-compat. Never --admin. Flag security/API/architecture PRs. Confirm branch=main + pwd before bead/dashboard ops.
 
-## VM slots
-| Slot | VM | Port | Kubelet | Konnectivity | Status |
-|---|---|---|---|---|---|
-| mayor | lima-node | 6443 | 10250 | 8135 | operator stack |
-| worker-1 | lima-node-smoke | 6444 | 10251 | 8235 | free |
-| worker-2 | lima-node-2 | 6445 | 10252 | 8335 | free |
-Konnectivity auto-derives from port: 8135 + (port − 6443) × 100.
+## VM slots (6: mayor + slots 1-5)
+| Slot | VM | Port | Kubelet |
+|---|---|---|---|
+| mayor | lima-node | 6443 | 10250 |
+| 1 | lima-node-smoke | 6444 | 10251 |
+| 2 | lima-node-2 | 6445 | 10252 |
+| 3-5 | lima-node-3/4/5 | 6446-8 | 10253-5 |
+Slots 3-5 provision on first `run-all.sh --reset`. Konnectivity auto-derives: 8135 + (port−6443)×100.
 
 ## Session loops (session-only, auto-expire 7d)
 :07 posture · :11 worktree hygiene · :17/2h cluster · :23/2h merge · :43 dispatch · :53 dashboard
