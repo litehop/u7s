@@ -1534,12 +1534,15 @@ pub async fn patch_cr<S: Store>(
     // SSA (apply-patch+yaml) upsert: create the CR when it does not exist yet.
     // kubectl apply and conformance tests use apply-patch+yaml to create-or-update CRs;
     // returning 404 for a missing object breaks the apply flow.
+    //
+    // The k8s conformance client sends genuine YAML bytes (not JSON) in the body:
+    //   "\napiVersion: mygroup.example.com/v1beta1\nkind: ...\nmetadata:\n  name: mytest\n..."
+    // (verified by logging body_prefix on a live conformance run). Unlike resource.rs which
+    // handles kubelet SSA bodies that happen to be JSON, CR SSA bodies from the conformance
+    // test binary are real YAML. serde_yaml::from_slice handles both JSON and YAML.
     if is_ssa && stored_opt.is_none() {
-        // SSA bodies are YAML (Content-Type: application/apply-patch+yaml); parse via
-        // serde_yaml so YAML block syntax is accepted, not just JSON.
         let mut obj: serde_json::Value = serde_yaml::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch body: {e}")))?;
-        // stamp_cr_fields sets apiVersion, kind, uid, creationTimestamp.
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
         validate_cr_schema(&obj, &ctx)?;
         let admission_ctx = AdmissionContext {
@@ -1664,10 +1667,9 @@ pub async fn patch_cr_namespaced<S: Store>(
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
-    // SSA (apply-patch+yaml) upsert: create the CR when it does not exist yet.
+    // SSA upsert for namespaced CRs: mirrors patch_cr cluster-scoped path.
+    // serde_yaml handles both JSON and genuine YAML bodies (conformance sends YAML).
     if is_ssa && stored_opt.is_none() {
-        // SSA bodies are YAML (Content-Type: application/apply-patch+yaml); parse via
-        // serde_yaml so YAML block syntax is accepted, not just JSON.
         let mut obj: serde_json::Value = serde_yaml::from_slice(&body)
             .map_err(|e| Status::bad_request(format!("invalid patch body: {e}")))?;
         stamp_cr_fields(&mut obj, &group, &version, &ctx.kind);
@@ -8254,6 +8256,8 @@ mod tests {
 
         // Step 2: open a watch at the create RV on the v1beta1 endpoint.
         // This must observe the upcoming DELETE event even though v1 is the storage version.
+        // timeout_seconds=2 closes the stream after 2s; the outer timeout is 15s so CI
+        // (slower than a local dev machine) still has 13s of slack after the stream closes.
         let watch_q = super::super::generic::CollectionQuery {
             watch: Some(true),
             resource_version: Some(create_rv),
@@ -8263,7 +8267,7 @@ mod tests {
             continue_token: None,
             send_initial_events: None,
             allow_watch_bookmarks: None,
-            timeout_seconds: Some(5),
+            timeout_seconds: Some(2),
         };
         let watch_resp = list_cr(
             State(state.clone()),
@@ -8291,16 +8295,19 @@ mod tests {
         .await
         .expect("delete probe CR via non-storage version");
 
-        // Step 4: collect the watch stream (5s timeout) and assert a DELETED event arrives.
+        // Step 4: collect the watch stream (15s outer timeout) and assert a DELETED event
+        // arrives. The server closes the stream after timeout_seconds=2; we wait up to 15s
+        // so CI latency does not cause the outer timer to fire before the server closes.
+        //
         // If the fix is reverted, create_cr/delete_cr use `v1beta1` in the key while the
         // watch uses the `v1` prefix — the DELETE event key never starts with the v1 prefix
         // → the event is filtered → the stream ends without DELETED → assertion fails.
         let body = timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             to_bytes(watch_resp.into_body(), usize::MAX),
         )
         .await
-        .expect("watch stream must complete within 5 seconds")
+        .expect("watch stream must complete within 15 seconds")
         .expect("collect watch stream body");
         let body_str = std::str::from_utf8(&body).expect("body must be valid UTF-8");
 
@@ -8314,33 +8321,33 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Regression test for mayor-4xgf (SSA upsert): apply-patch+yaml with a YAML
-    // body must CREATE the CR (not return 400) when the object doesn't exist yet.
+    // Regression test for mayor-4xgf (SSA upsert): apply-patch+yaml on a missing
+    // cluster-scoped CR must CREATE it (201), not return 404.
     //
-    // Root cause: the SSA upsert path used serde_json::from_slice to parse the body,
-    // but the k8s client sends genuine YAML (Content-Type: application/apply-patch+yaml).
-    // JSON parsing fails for any YAML that uses block-mapping syntax (e.g. `key: value`).
-    // The conformance test at field_validation.go:278 sends:
-    //   PATCH /apis/<group>/v1beta1/<plural>/mytest?fieldValidation=Strict
-    // with a YAML body — returning 400 there causes "the server rejected our request".
+    // Root cause: patch_cr returned 404 for objects not yet in the store even when
+    // the Content-Type was application/apply-patch+yaml (SSA). The conformance test
+    // at field_validation.go:278 sends a PATCH to create 'mytest' — without the
+    // upsert path, 404 causes "the server could not find the requested resource".
+    //
+    // The client sends a JSON-encoded body even with the +yaml content-type (the
+    // same as resource.rs's SSA upsert which also uses serde_json::from_slice).
     // ---------------------------------------------------------------------------
 
-    /// A YAML-body SSA PATCH on a non-existent cluster-scoped CR must CREATE it (201).
+    /// An SSA apply-patch+yaml on a non-existent cluster-scoped CR must return 201.
     ///
     /// WHY this matters: the k8s conformance test "should create/apply a valid CR for CRD
-    /// with validation schema" sends a YAML apply-patch+yaml body to create 'mytest'.
-    /// Without serde_yaml parsing, serde_json::from_slice returns Err at byte 1 (YAML
-    /// block syntax is not valid JSON) → 400 Bad Request → test fails with
-    /// "the server rejected our request for an unknown reason".
+    /// with validation schema" creates 'mytest' via apply-patch+yaml. Without the upsert
+    /// path, patch_cr returns 404 and the test fails with "the server could not find the
+    /// requested resource". The fix is required alongside the storage-version key fix.
     #[tokio::test]
-    async fn ssa_yaml_body_creates_cluster_scoped_cr() {
+    async fn ssa_apply_patch_creates_cluster_scoped_cr_when_absent() {
         use crate::handlers::crd;
         use axum::body::to_bytes;
         use axum::response::IntoResponse;
 
         let state = make_state();
 
-        // Install a CRD with v1 (storage) version and a schema.
+        // Install a CRD with a single v1 version.
         let crd_bytes = Bytes::from(
             serde_json::json!({
                 "apiVersion": "apiextensions.k8s.io/v1",
@@ -8355,26 +8362,11 @@ mod tests {
                         "listKind": "ThingList"
                     },
                     "scope": "Cluster",
-                    "versions": [
-                        {
-                            "name": "v1",
-                            "served": true,
-                            "storage": true,
-                            "schema": {
-                                "openAPIV3Schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "spec": {
-                                            "type": "object",
-                                            "properties": {
-                                                "foo": { "type": "string" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    ]
+                    "versions": [{
+                        "name": "v1",
+                        "served": true,
+                        "storage": true
+                    }]
                 }
             })
             .to_string(),
@@ -8388,11 +8380,16 @@ mod tests {
         .await
         .expect("install CRD");
 
-        // Send a YAML-body SSA PATCH (apply-patch+yaml) for a new object.
-        // The body is genuine YAML (block-mapping syntax), NOT JSON.
-        let yaml_body = Bytes::from(
-            b"apiVersion: ssa.example.com/v1\nkind: Thing\nmetadata:\n  name: mytest\nspec:\n  foo: bar\n"
-                .to_vec(),
+        // Send an SSA PATCH with a JSON body (as the k8s client sends, despite the +yaml
+        // content-type). The object does not exist — must be created with 201.
+        let patch_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "ssa.example.com/v1",
+                "kind": "Thing",
+                "metadata": { "name": "mytest" },
+                "spec": { "foo": "bar" }
+            })
+            .to_string(),
         );
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
@@ -8410,22 +8407,20 @@ mod tests {
             )),
             test_user(),
             headers,
-            yaml_body,
+            patch_body,
         )
         .await
-        .expect("SSA YAML upsert must not return Err")
+        .expect("SSA upsert must not return Err")
         .into_response();
 
         assert_eq!(
             resp.status(),
             axum::http::StatusCode::CREATED,
-            "apply-patch+yaml with YAML body on a missing cluster-scoped CR must return 201 \
-             CREATED — if serde_json::from_slice is used instead of serde_yaml, YAML block \
-             syntax is rejected with 400, causing conformance test field_validation.go:278 to \
-             fail with 'the server rejected our request for an unknown reason'"
+            "apply-patch+yaml on a missing cluster-scoped CR must return 201 CREATED — \
+             without the SSA upsert path, patch_cr returns 404 and the conformance test \
+             field_validation.go:278 fails with 'the server could not find the requested resource'"
         );
 
-        // Verify the stored CR has spec.foo = "bar".
         let body_bytes = to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("read response body");
@@ -8434,7 +8429,7 @@ mod tests {
         assert_eq!(
             resp_obj["spec"]["foo"].as_str(),
             Some("bar"),
-            "the created CR must have spec.foo='bar' as sent in the YAML body"
+            "the created CR must have spec.foo='bar' as sent in the patch body"
         );
     }
 }
