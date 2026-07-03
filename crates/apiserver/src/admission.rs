@@ -844,10 +844,14 @@ async fn invoke_mutating_webhook<S: Store>(
             }
         }
     };
-    let call_url = match &target {
+    let base_url = match &target {
         WebhookTarget::DirectUrl(u) => u.as_str(),
         WebhookTarget::ServiceResolved { url } => url.as_str(),
     };
+    let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
+    // Append ?timeout=Ns so the URL in error messages matches what the conformance
+    // test checks for (strings.Contains(err, "/path?timeout=1s")).
+    let call_url = format!("{base_url}?timeout={secs}s");
 
     let uid = uuid::Uuid::new_v4().to_string();
     let review = build_review(&uid, ctx, object, old_object);
@@ -871,7 +875,7 @@ async fn invoke_mutating_webhook<S: Store>(
         &state.webhook_client,
         webhook.timeout_seconds,
     );
-    let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
+    let (response, timed_out) = call_webhook(&wh_client, &call_url, &review).await;
 
     match response {
         Some(resp) => {
@@ -914,10 +918,10 @@ async fn invoke_mutating_webhook<S: Store>(
                 );
                 Ok((object.clone(), false))
             } else if timed_out {
-                let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
+                // Include the full URL (with ?timeout=Ns) so the client error message
+                // matches what the conformance test checks: the URL path + "timeout".
                 Err(Status::gateway_timeout(format!(
-                    "Timeout: request did not complete within requested timeout {}s",
-                    secs
+                    "request did not complete within requested timeout {secs}s: {call_url}"
                 )))
             } else {
                 Err(Status::internal(format!(
@@ -2636,10 +2640,14 @@ pub async fn run_validating_webhooks<S: Store>(
                 }
             }
         };
-        let call_url = match &target {
+        let base_url = match &target {
             WebhookTarget::DirectUrl(u) => u.as_str(),
             WebhookTarget::ServiceResolved { url } => url.as_str(),
         };
+        let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
+        // Append ?timeout=Ns so the URL in error messages matches what the conformance
+        // test checks for (strings.Contains(err, "/path?timeout=1s")).
+        let call_url = format!("{base_url}?timeout={secs}s");
 
         let uid = uuid::Uuid::new_v4().to_string();
         let review = build_review(&uid, ctx, object, old_object);
@@ -2663,7 +2671,7 @@ pub async fn run_validating_webhooks<S: Store>(
             &state.webhook_client,
             webhook.timeout_seconds,
         );
-        let (response, timed_out) = call_webhook(&wh_client, call_url, &review).await;
+        let (response, timed_out) = call_webhook(&wh_client, &call_url, &review).await;
 
         match response {
             Some(resp) => {
@@ -2692,10 +2700,10 @@ pub async fn run_validating_webhooks<S: Store>(
                         webhook.name
                     );
                 } else if timed_out {
-                    let secs = webhook.timeout_seconds.unwrap_or(10).max(1);
+                    // Include the full URL (with ?timeout=Ns) so the client error message
+                    // matches what the conformance test checks: the URL path + "timeout".
                     return Err(Status::gateway_timeout(format!(
-                        "Timeout: request did not complete within requested timeout {}s",
-                        secs
+                        "request did not complete within requested timeout {secs}s: {call_url}"
                     )));
                 } else {
                     return Err(Status::internal(format!(
@@ -3533,13 +3541,17 @@ mod tests {
         );
     }
 
-    /// A validating webhook that exceeds its configured timeout must return HTTP 504.
+    /// A validating webhook that exceeds its configured timeout must return HTTP 504
+    /// with an error message containing the webhook URL (with ?timeout=Ns) and the word
+    /// "timeout".
     ///
-    /// The conformance test `should honor timeout` expects an HTTP/dial-level timeout
-    /// error (gateway timeout), not a generic 500. Without the fix the error is 500
-    /// "request deadline exceeded" and the conformance check fails.
+    /// The conformance test `should honor timeout` checks two things:
+    ///   1. The error contains "context deadline exceeded" OR "timeout" (case-sensitive).
+    ///   2. The error contains "/path?timeout=1s" (the URL the apiserver called).
+    /// Returning only a generic "Timeout: …" message without the URL fails check 2.
+    /// Returning a 500 fails the expectation of a gateway-timeout-class error.
     #[tokio::test]
-    async fn validating_webhook_timeout_returns_504_not_500() {
+    async fn validating_webhook_timeout_error_contains_url_with_timeout_param() {
         use axum::routing::post;
         use axum::Router;
         use tokio::net::TcpListener;
@@ -3620,9 +3632,23 @@ mod tests {
              `should honor timeout` recognises it as a network/dial timeout — \
              returning 500 causes the conformance test to fail"
         );
+        // The conformance test checks strings.Contains(err.Error(), "timeout") — our
+        // message must contain the word so client-go classifies it as a timeout error.
         assert!(
-            err.1.message.contains("Timeout:"),
-            "timeout message must start with 'Timeout:' matching kube-apiserver convention, got: {}",
+            err.1.message.contains("timeout"),
+            "timeout error message must contain the word 'timeout' so the conformance test \
+             (strings.Contains check) classifies it as a timeout, got: {}",
+            err.1.message
+        );
+        // The conformance test also checks for the webhook URL with ?timeout=Ns
+        // (strings.Contains(err, "/webhook?timeout=1s")). Without the URL in the message
+        // the test fails even when the HTTP status is correct.
+        let expected_url_suffix = "/webhook?timeout=1s";
+        assert!(
+            err.1.message.contains(expected_url_suffix),
+            "timeout error message must contain the webhook URL with ?timeout=1s so the \
+             conformance test recognises which webhook timed out — \
+             reverting the URL inclusion breaks this check. Got: {}",
             err.1.message
         );
     }
