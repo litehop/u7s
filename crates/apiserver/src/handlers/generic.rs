@@ -2092,6 +2092,7 @@ mod escalation_tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
+            extra: Default::default(),
         });
         create_resource(
             axum::extract::State(state.clone()),
@@ -2133,6 +2134,7 @@ mod escalation_tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
+            extra: Default::default(),
         });
         create_resource(
             axum::extract::State(state.clone()),
@@ -2178,6 +2180,7 @@ mod escalation_tests {
             username: "carol".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
         let result = create_resource(
             axum::extract::State(state.clone()),
@@ -2245,6 +2248,7 @@ mod escalation_tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
+            extra: Default::default(),
         };
         let crb_body = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -2298,6 +2302,7 @@ mod escalation_tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
+            extra: Default::default(),
         };
         let crb_body = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -2340,6 +2345,7 @@ mod escalation_tests {
             username: "alice".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
         let crb_body = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -2424,6 +2430,7 @@ mod escalation_tests {
             username: "bob".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
         let crb_body = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -2475,6 +2482,7 @@ mod escalation_tests {
             username: "eve".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
         let crb_body = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -2551,6 +2559,7 @@ mod escalation_tests {
             username: "bob".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
         let rb_body = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -2602,6 +2611,7 @@ mod escalation_tests {
             username: "eve".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
         let rb_body = serde_json::json!({
             "apiVersion": "rbac.authorization.k8s.io/v1",
@@ -2669,6 +2679,7 @@ mod escalation_tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
+            extra: Default::default(),
         });
         create_resource(
             axum::extract::State(state.clone()),
@@ -2779,6 +2790,7 @@ mod escalation_tests {
             username: "alice".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
         let result = super::check_clusterrole_escalation(
             "clusterroles",
@@ -2852,6 +2864,7 @@ mod escalation_tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
+            extra: Default::default(),
         };
         let result = super::check_clusterrole_escalation(
             "clusterroles",
@@ -2884,6 +2897,7 @@ mod escalation_tests {
             username: "alice".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
         let result = super::check_clusterrole_escalation(
             "clusterroles",

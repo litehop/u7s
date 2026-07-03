@@ -537,6 +537,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
@@ -590,6 +591,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
             headers.clone(),
             bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
@@ -605,6 +607,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
@@ -658,6 +661,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),
@@ -726,6 +730,7 @@ mod tests {
             username: "test".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
 
         let result = list_csr(
@@ -797,6 +802,7 @@ mod tests {
                 username: "test".into(),
                 uid: "".into(),
                 groups: vec![],
+                extra: Default::default(),
             }))
             .with_state(state);
 
@@ -909,6 +915,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
             headers,
             bytes::Bytes::from(serde_json::to_vec(&csr_body).unwrap()),

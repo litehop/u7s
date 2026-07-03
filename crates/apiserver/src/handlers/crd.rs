@@ -635,6 +635,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         })
     }
 
@@ -866,6 +867,7 @@ mod tests {
                 username: "test-user".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await
@@ -972,6 +974,7 @@ mod tests {
                 username: "test-user".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await
@@ -1257,6 +1260,7 @@ mod tests {
                 username: "test-user".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await
@@ -1400,6 +1404,7 @@ mod admission_tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         })
     }
 
