@@ -552,6 +552,18 @@ When a worker returns from a VM/sonobuoy-touching bead:
   reproduce via `kubectl` against the running stack + `/tmp/kcm.log`, root-cause
   and fix there, and run sonobuoy ONCE as the final gate. Also tell them the real
   result is in `podlogs/sonobuoy/.../logs/e2e.txt`, not `plugins/.../e2e.log`.
+- **Workers (and scouts) hunt for the e2e test source in the wrong places.** The
+  upstream Go test body is NOT in this repo, the sonobuoy archive, or `temp/e2e/`
+  — so agents waste calls searching. Tell them exactly where: check
+  `temp/research/` FIRST (gitignored; already holds curated upstream k8s source),
+  and if the file isn't there, `WebFetch` it from the raw GitHub URL derived from
+  the `e2e.txt` failure line (e.g. `k8s.io/kubernetes/test/e2e/node/pods.go:530`
+  → `raw.githubusercontent.com/kubernetes/kubernetes/release-1.34/test/e2e/node/pods.go`,
+  branch pinned to the conformance client version). The full protocol is in
+  `ai/prompts/vm-operations.md` (Step 6, "Locating the failing test's source") —
+  point the worker there. Reconstructing the test from the bare assertion string
+  is unreliable: `Expected 2 to be equivalent to 1` is meaningless without the
+  create→no-op-update→assert sequence around it.
 - **Workers rebuild the stack by hand and stall on un-permitted tools.** When a
   bead needs a live run (especially with debug logs), workers tend to improvise:
   `cargo build` separately, `kill` stale processes, `curl` the apiserver, then
