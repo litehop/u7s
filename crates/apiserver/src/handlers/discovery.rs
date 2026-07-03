@@ -1500,6 +1500,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         })
     }
 

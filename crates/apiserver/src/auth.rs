@@ -35,11 +35,15 @@ pub struct PeerCertificate(pub Vec<u8>);
 // UserInfo
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UserInfo {
     pub username: String,
     pub uid: String,
     pub groups: Vec<String>,
+    /// Extra authentication attributes keyed by name.
+    /// SA tokens carry `authentication.kubernetes.io/credential-id` = `["JTI=<jti>"]`
+    /// so that conformance tests can verify bound token identity.
+    pub extra: HashMap<String, Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +103,7 @@ pub fn load_token_file(path: &str) -> anyhow::Result<HashMap<String, UserInfo>> 
                 username,
                 uid,
                 groups,
+                extra: HashMap::new(),
             },
         );
     }
@@ -177,6 +182,7 @@ fn authenticate(
                 username: "system:anonymous".to_owned(),
                 uid: String::new(),
                 groups: vec!["system:unauthenticated".to_owned()],
+                extra: HashMap::new(),
             })
         }
         Some(value) => {
@@ -267,6 +273,7 @@ pub fn extract_client_cert_identity(der: &[u8]) -> Option<UserInfo> {
         username,
         uid: String::new(),
         groups,
+        extra: HashMap::new(),
     })
 }
 
@@ -353,7 +360,8 @@ pub(crate) fn try_verify_sa_jwt(
             // Check revocation before accepting the token. A revoked JTI is rejected
             // even if the signature and expiry are otherwise valid — this allows
             // immediate token invalidation without waiting for the 24h JWT expiry.
-            if let Some(jti) = &data.claims.jti {
+            let jti = data.claims.jti;
+            if let Some(jti) = &jti {
                 if revoked_jtis.contains(jti.as_str()) {
                     tracing::debug!("SA JWT rejected: jti={jti} is in the revocation list");
                     return None;
@@ -382,10 +390,24 @@ pub(crate) fn try_verify_sa_jwt(
                 g.push("system:authenticated".to_owned());
                 g
             };
+            // Surface the token's unique ID as authentication.kubernetes.io/credential-id
+            // so that TokenReview callers can verify which specific token was used.
+            // Upstream format: "JTI=" + the jti claim value.
+            let extra = if let Some(jti) = jti {
+                let mut m = HashMap::new();
+                m.insert(
+                    "authentication.kubernetes.io/credential-id".to_owned(),
+                    vec![format!("JTI={jti}")],
+                );
+                m
+            } else {
+                HashMap::new()
+            };
             Some(UserInfo {
                 username: sub,
                 uid: String::new(),
                 groups,
+                extra,
             })
         }
         Err(e) => {
@@ -755,6 +777,7 @@ where
                 username: impersonate_user,
                 uid: String::new(),
                 groups,
+                extra: HashMap::new(),
             }
         } else {
             authenticated_user
@@ -876,6 +899,7 @@ mod tests {
                 username: "alice".to_owned(),
                 uid: "42".to_owned(),
                 groups: vec!["devs".to_owned()],
+                extra: Default::default(),
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
@@ -910,6 +934,7 @@ mod tests {
                 username: "alice".to_owned(),
                 uid: "1".to_owned(),
                 groups: vec![],
+                extra: Default::default(),
             },
         );
         let result = ct_token_lookup(&map, "exact-token-abc");
@@ -928,6 +953,7 @@ mod tests {
                 username: "alice".to_owned(),
                 uid: "1".to_owned(),
                 groups: vec![],
+                extra: Default::default(),
             },
         );
         assert!(
@@ -961,6 +987,7 @@ mod tests {
                 username: "alice".to_owned(),
                 uid: "1".to_owned(),
                 groups: vec![],
+                extra: Default::default(),
             },
         );
         // Shorter candidate — must not match.
@@ -1546,6 +1573,7 @@ mod tests {
                 username: "static-user".to_owned(),
                 uid: "0".to_owned(),
                 groups: vec![],
+                extra: Default::default(),
             },
         );
         let (enc, dec) = test_rsa_keypair();
@@ -1655,6 +1683,7 @@ mod tests {
                 username: "bob".to_owned(),
                 uid: "1".to_owned(),
                 groups: vec![],
+                extra: Default::default(),
             },
         );
         let der = make_cert_der("alice", &["system:masters"]);
@@ -1721,6 +1750,7 @@ mod tests {
                 username: "alice".to_owned(),
                 uid: "42".to_owned(),
                 groups: vec!["devs".to_owned()],
+                extra: Default::default(),
             },
         );
         let req = make_req(Method::GET, "/api/v1/pods", Some("Bearer secret-token"));
@@ -1912,6 +1942,7 @@ mod tests {
                 username: "alice".to_owned(),
                 uid: "1".to_owned(),
                 groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
             },
         );
 
@@ -1978,6 +2009,7 @@ mod tests {
                 username: "charlie".to_owned(),
                 uid: "2".to_owned(),
                 groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
             },
         );
 
@@ -2022,6 +2054,7 @@ mod tests {
                 username: "bob".to_owned(),
                 uid: "3".to_owned(),
                 groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
             },
         );
 
@@ -2058,6 +2091,68 @@ mod tests {
             std::str::from_utf8(&body_bytes).unwrap(),
             "bob",
             "identity without impersonation must be the token-authenticated user"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // credential-id extra info (authentication.kubernetes.io/credential-id)
+    // ---------------------------------------------------------------------------
+
+    /// A bound SA token authenticated via try_verify_sa_jwt must carry
+    /// authentication.kubernetes.io/credential-id = ["JTI=<jti>"] in extra.
+    ///
+    /// The conformance test "ServiceAccounts should mount an API token into pods"
+    /// authenticates the pod's projected token via TokenReview and asserts that
+    /// status.user.extra["authentication.kubernetes.io/credential-id"] contains a
+    /// single item starting with "JTI=". Without this, the conformance test fails
+    /// with: "expected single authentication.kubernetes.io/credential-id extra info
+    /// item starting with JTI=, got []".
+    #[test]
+    fn sa_jwt_with_jti_carries_credential_id_in_extra() {
+        let (enc, dec) = test_rsa_keypair();
+        let jti = "test-jti-conformance-abc";
+        let token = mint_sa_jwt_with_jti(&enc, "system:serviceaccount:default:my-sa", jti, 3600);
+
+        let result = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new());
+        let user = result.expect("valid SA JWT with jti must authenticate");
+
+        let cred_id_key = "authentication.kubernetes.io/credential-id";
+        let cred_ids = user.extra.get(cred_id_key).expect(
+            "authenticated SA token must carry authentication.kubernetes.io/credential-id \
+             in extra — without it the ServiceAccount token-mount conformance test fails \
+             with: got []",
+        );
+        assert_eq!(
+            cred_ids.len(),
+            1,
+            "credential-id must be a single-element list, conformance asserts exactly one item"
+        );
+        assert_eq!(
+            cred_ids[0],
+            format!("JTI={jti}"),
+            "credential-id must be 'JTI=' + the JWT jti claim — \
+             reverting this breaks the ServiceAccount token-mount conformance test"
+        );
+    }
+
+    /// A bound SA token without a jti claim must authenticate successfully with
+    /// empty extra — it must NOT be rejected just because jti is absent.
+    ///
+    /// This preserves compatibility with tokens minted before jti was required.
+    /// Extra must be empty (not contain credential-id) when jti is not present.
+    #[test]
+    fn sa_jwt_without_jti_authenticates_with_empty_extra() {
+        let (enc, dec) = test_rsa_keypair();
+        // mint_sa_jwt produces a token WITHOUT a jti claim (legacy format).
+        let token = mint_sa_jwt(&enc, "system:serviceaccount:default:legacy-sa", 3600);
+
+        let result = try_verify_sa_jwt(&token, &dec, &[], &HashSet::new());
+        let user = result.expect("SA JWT without jti must still authenticate");
+
+        assert!(
+            user.extra.is_empty(),
+            "SA JWT without jti must produce empty extra — \
+             credential-id must only be set when the token actually contains a jti claim"
         );
     }
 }

@@ -5325,6 +5325,7 @@ mod handler_tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         })
     }
 
@@ -6876,6 +6877,7 @@ mod handler_tests {
             username: "test-user".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
 
         let app = Router::new()
@@ -6947,6 +6949,7 @@ mod handler_tests {
             username: "test-user".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
 
         let app = Router::new()
@@ -6983,6 +6986,7 @@ mod handler_tests {
             username: "test-user".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
 
         let app = Router::new()
@@ -7445,6 +7449,7 @@ mod handler_tests {
             username: "test".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         };
 
         let app = Router::new()
@@ -9265,6 +9270,7 @@ mod admission_tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         })
     }
 

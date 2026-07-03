@@ -3242,6 +3242,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         })
     }
 
@@ -4898,6 +4899,7 @@ mod tests {
                 username: "admin".into(),
                 uid: "".into(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             headers,
             bytes::Bytes::from(proto_body),
@@ -4985,6 +4987,7 @@ mod tests {
                 username: "admin".into(),
                 uid: "".into(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             headers,
             bytes::Bytes::from(proto_body),
@@ -5144,6 +5147,7 @@ mod tests {
                 username: "system:node:ci-node".into(),
                 uid: "".into(),
                 groups: vec!["system:nodes".into()],
+                extra: Default::default(),
             }),
             headers,
             body_bytes,
@@ -5358,6 +5362,7 @@ mod tests {
             username: "test-user".into(),
             uid: "".into(),
             groups: vec![],
+            extra: Default::default(),
         };
 
         // --- Step 1: POST — create the CSR ---
@@ -5570,6 +5575,7 @@ mod tests {
             username: "test".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
         let resp = router.call(req).await.expect("router must not error");
 
@@ -5660,6 +5666,7 @@ mod tests {
             username: "test".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
         let resp = router.call(req).await.expect("router must not error");
 
@@ -5768,6 +5775,7 @@ mod tests {
             username: "test".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
         let resp = router.call(req).await.expect("router must not error");
 
@@ -6085,6 +6093,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
 
         let resp = router.call(req).await.expect("router must not error");
@@ -6152,6 +6161,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             });
             req
         };
@@ -6217,6 +6227,7 @@ mod tests {
             username: "admin".to_string(),
             uid: String::new(),
             groups: vec!["system:masters".to_string()],
+            extra: Default::default(),
         };
 
         let make_role_req = |name: &str, query: &str| {
@@ -6335,6 +6346,7 @@ mod tests {
             username: "admin".to_string(),
             uid: String::new(),
             groups: vec!["system:masters".to_string()],
+            extra: Default::default(),
         };
 
         // Create a PersistentVolume so the DELETE has something to act on.
@@ -6441,6 +6453,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
 
         let resp = router.call(req).await.expect("router must not error");
@@ -6507,6 +6520,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
 
         let resp = router.call(req).await.expect("router must not error");
@@ -6604,6 +6618,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
 
         let resp = router.call(req).await.expect("router must not error");
@@ -6718,6 +6733,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
 
         let resp = router.call(req).await.expect("router must not error");
@@ -6776,6 +6792,7 @@ mod tests {
             username: "test".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
         let resp = router.call(req).await.expect("router must not error");
 

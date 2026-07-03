@@ -544,6 +544,8 @@ struct TokenReviewUser {
     username: String,
     uid: String,
     groups: Vec<String>,
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    extra: std::collections::HashMap<String, Vec<String>>,
 }
 
 pub async fn token_review<S: Store>(
@@ -597,6 +599,7 @@ pub async fn token_review<S: Store>(
                 username: u.username,
                 uid: u.uid,
                 groups: u.groups,
+                extra: u.extra,
             }),
         },
         None => TokenReviewStatus {
@@ -859,6 +862,7 @@ mod tests {
                 username: "argocd-admin".to_owned(),
                 uid: "42".to_owned(),
                 groups: vec!["system:authenticated".to_owned()],
+                extra: Default::default(),
             },
         );
 
@@ -1057,6 +1061,7 @@ mod handler_tests {
             username: username.to_owned(),
             uid: String::new(),
             groups: groups.iter().map(|g| g.to_string()).collect(),
+            extra: Default::default(),
         }
     }
 
@@ -1479,6 +1484,7 @@ mod handler_tests {
                 username: "kubelet-node1".to_owned(),
                 uid: "7".to_owned(),
                 groups: vec!["system:nodes".to_owned()],
+                extra: Default::default(),
             },
         );
         let state = AppState::new(

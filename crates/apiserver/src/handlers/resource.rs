@@ -2937,6 +2937,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         })
     }
 
@@ -3226,6 +3227,7 @@ mod tests {
                 username: "test-user".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await
@@ -3739,6 +3741,7 @@ mod tests {
                 username: "test".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await
@@ -5023,6 +5026,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
+            extra: Default::default(),
         });
         create_resource(
             axum::extract::State(state.clone()),
@@ -5381,6 +5385,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&csinode).unwrap()),
@@ -5432,6 +5437,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&v1).unwrap()),
@@ -5469,6 +5475,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&v2).unwrap()),
@@ -5509,6 +5516,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&v1).unwrap()),
@@ -5539,6 +5547,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&stale).unwrap()),
@@ -5788,6 +5797,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
+            extra: Default::default(),
         });
 
         match create_resource(
@@ -5881,6 +5891,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
         )
         .await;
@@ -6244,6 +6255,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
@@ -6278,6 +6290,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&widget).unwrap()),
@@ -6692,6 +6705,7 @@ mod tests {
                 username: "test".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await
@@ -6788,6 +6802,7 @@ mod tests {
                 username: "gc-user".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await
@@ -6872,6 +6887,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from("not valid json"),
@@ -6956,6 +6972,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
@@ -7085,6 +7102,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from("invalid json"),
@@ -7821,6 +7839,7 @@ mod tests {
                 username: "kubectl".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
@@ -8044,6 +8063,7 @@ mod tests {
                 username: "test".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
             json_headers(),
             body.clone(),
@@ -8071,6 +8091,7 @@ mod tests {
                 username: "test".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
             json_headers(),
             body,
@@ -8347,6 +8368,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
@@ -8975,6 +8997,7 @@ mod tests {
                 username: "test-user".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await;
@@ -9058,6 +9081,7 @@ mod tests {
                 username: "test-user".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await;
@@ -9145,6 +9169,7 @@ mod tests {
                 username: "test-user".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
         )
         .await;
@@ -9625,6 +9650,7 @@ mod tests {
                 username: "system:masters".into(),
                 uid: String::new(),
                 groups: vec!["system:masters".into()],
+                extra: Default::default(),
             }),
             json_headers(),
             bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
@@ -11657,6 +11683,7 @@ mod tests {
                 username: "admin".into(),
                 uid: String::new(),
                 groups: vec![],
+                extra: Default::default(),
             }),
             axum::http::HeaderMap::new(),
             body_bytes,
@@ -11992,6 +12019,7 @@ mod tests {
             username: "alice".into(),
             uid: String::new(),
             groups: vec![],
+            extra: Default::default(),
         });
         let result = create_namespaced_resource(
             State(state),
@@ -12088,6 +12116,7 @@ mod tests {
             username: "admin".into(),
             uid: String::new(),
             groups: vec!["system:masters".into()],
+            extra: Default::default(),
         });
         let result = create_namespaced_resource(
             State(state),
