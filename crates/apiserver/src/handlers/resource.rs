@@ -334,6 +334,9 @@ pub async fn create_resource<S: Store>(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
+    if group == ADMISSION_GROUP {
+        state.refresh_admission_config(&plural).await;
+    }
     write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
     inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
@@ -462,6 +465,9 @@ pub async fn replace_resource<S: Store>(
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
+    if group == ADMISSION_GROUP {
+        state.refresh_admission_config(&plural).await;
+    }
     write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
     Ok(Json(obj.body).into_response())
 }
@@ -524,6 +530,9 @@ pub async fn delete_resource<S: Store>(
             let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
             state.rbac_index.remove_object(&rbac_key);
         }
+        if group == ADMISSION_GROUP {
+            state.refresh_admission_config(&plural).await;
+        }
         let expected_rv = parse_resource_version(obj.resource_version())?;
         let new_rv = state
             .store
@@ -555,6 +564,9 @@ pub async fn delete_resource<S: Store>(
     if group == RBAC_GROUP {
         let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
         state.rbac_index.remove_object(&rbac_key);
+    }
+    if group == ADMISSION_GROUP {
+        state.refresh_admission_config(&plural).await;
     }
     Ok(Json(serde_json::json!({
         "kind": "Status",
@@ -779,6 +791,9 @@ pub(crate) async fn do_patch<S: Store>(
             };
             state.rbac_index.remove_object(&rbac_key);
         }
+        if group == ADMISSION_GROUP {
+            state.refresh_admission_config(plural).await;
+        }
         return Ok(Json(current.body).into_response());
     }
 
@@ -839,6 +854,9 @@ pub(crate) async fn do_patch<S: Store>(
             Some(namespace) => rbac_namespaced_key(group, version, namespace, plural, name),
         };
         state.rbac_index.apply_object(&rbac_key, &current.body);
+    }
+    if group == ADMISSION_GROUP {
+        state.refresh_admission_config(plural).await;
     }
     // SSA: echo synthetic managedFields so clients (e.g. Argo CD) can track field ownership.
     if is_ssa {
@@ -2016,6 +2034,10 @@ pub async fn delete_collection_resource<S: Store>(
         if let Some(ref ip) = cluster_ip_to_release {
             state.release_service_ip(ip).await;
         }
+    }
+    if group == ADMISSION_GROUP {
+        // One re-list after all deletions in the collection — cheaper than per-object.
+        state.refresh_admission_config(&plural).await;
     }
 
     Ok(Json(serde_json::json!({

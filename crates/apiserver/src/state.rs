@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::Semaphore;
 use u7s_store::{ListOptions, SqliteStore, Store};
 
@@ -85,6 +85,49 @@ impl WatchLimitState {
     }
 }
 
+/// In-memory cache for the 5 admission configuration object sets.
+///
+/// Cache invalidation strategy: inline, write-through.
+/// Every handler that writes or deletes an admission config object (in
+/// `handlers/resource.rs`) calls `AppState::refresh_admission_config` immediately
+/// after the store write succeeds. The refresh re-lists only the affected prefix
+/// (at most a handful of objects) and atomically replaces the cached `Arc`. On the
+/// admission hot path, all 5 fetch functions read a clone of the `Arc` — zero store
+/// round-trips. Reads dominate writes 1000:1, so `std::sync::RwLock` suffices; no
+/// additional crate is needed.
+///
+/// Each slot is `Option<Arc<Vec<...>>>`:
+/// - `None` = cache cold (not yet populated; fetch functions fall back to the store).
+/// - `Some(v)` = cache warm; use directly.
+///
+/// The cache is warmed at startup by `init_admission_cache`. Tests that seed the store
+/// directly (without going through the handler) may leave the cache cold; in that case
+/// fetch functions fall back to the store, preserving existing test behaviour.
+pub struct AdmissionConfigCache {
+    /// MutatingWebhookConfiguration objects.
+    pub mutating_webhooks: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+    /// ValidatingWebhookConfiguration objects.
+    pub validating_webhooks: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+    /// MutatingAdmissionPolicy objects.
+    pub mutating_policies: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+    /// ValidatingAdmissionPolicy objects.
+    pub validating_policies: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+    /// ValidatingAdmissionPolicyBinding objects.
+    pub validating_policy_bindings: RwLock<Option<Arc<Vec<serde_json::Value>>>>,
+}
+
+impl AdmissionConfigCache {
+    pub fn new() -> Self {
+        AdmissionConfigCache {
+            mutating_webhooks: RwLock::new(None),
+            validating_webhooks: RwLock::new(None),
+            mutating_policies: RwLock::new(None),
+            validating_policies: RwLock::new(None),
+            validating_policy_bindings: RwLock::new(None),
+        }
+    }
+}
+
 pub struct AppState<S = SqliteStore> {
     pub store: Arc<S>,
     pub resource_registry: Arc<HashMap<ResourceKey, ResourceMeta>>,
@@ -135,6 +178,9 @@ pub struct AppState<S = SqliteStore> {
     /// Stored so the OIDC JWKS endpoint can serve the public key material without
     /// holding a reference to the private key. None when SA key is unavailable.
     pub sa_public_key_pem: Option<Arc<Vec<u8>>>,
+    /// In-memory cache for the 5 admission configuration object sets.
+    /// See `AdmissionConfigCache` for the invalidation strategy.
+    pub admission_cache: Arc<AdmissionConfigCache>,
 }
 
 /// Configuration passed to [`AppState::new_with_config`].
@@ -194,6 +240,7 @@ impl<S> Clone for AppState<S> {
             webhook_identity_pem: self.webhook_identity_pem.clone(),
             revoked_jtis: self.revoked_jtis.clone(),
             sa_public_key_pem: self.sa_public_key_pem.clone(),
+            admission_cache: self.admission_cache.clone(),
         }
     }
 }
@@ -335,6 +382,7 @@ impl<S: Store> AppState<S> {
             webhook_identity_pem: cfg.webhook_identity_pem.map(Arc::new),
             revoked_jtis: Arc::new(Mutex::new(HashSet::new())),
             sa_public_key_pem: cfg.sa_public_key_pem.map(Arc::new),
+            admission_cache: Arc::new(AdmissionConfigCache::new()),
         }
     }
 
@@ -444,6 +492,74 @@ impl<S: Store> AppState<S> {
         let next = (max_offset + 1).min(alloc.size - 1);
         alloc.hint.store(next, Ordering::Relaxed);
         tracing::info!("service-ip hint initialized to offset {next}");
+    }
+
+    /// Refresh the admission config cache for the given plural resource type.
+    ///
+    /// Called inline by write/delete handlers in `handlers/resource.rs` immediately after
+    /// a successful store write for any admission config resource. Re-lists only the affected
+    /// prefix (at most a handful of objects) and atomically swaps the cached `Arc`.
+    ///
+    /// This is the write-through invalidation that keeps the cache correct: after this returns,
+    /// any concurrent read from `admission_cache` sees the updated config set.
+    pub async fn refresh_admission_config(&self, plural: &str) {
+        let prefix = format!("/registry/admissionregistration.k8s.io/{plural}/");
+        let items: Vec<serde_json::Value> =
+            match self.store.list(&prefix, ListOptions::default()).await {
+                Ok(resp) => resp
+                    .items
+                    .into_iter()
+                    .filter_map(|item| serde_json::from_slice(&item.value).ok())
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        "admission cache: failed to refresh {plural}: {e}; cache unchanged"
+                    );
+                    return;
+                }
+            };
+        let new_slot = Some(Arc::new(items));
+        match plural {
+            "mutatingwebhookconfigurations" => {
+                *self.admission_cache.mutating_webhooks.write().unwrap() = new_slot;
+            }
+            "validatingwebhookconfigurations" => {
+                *self.admission_cache.validating_webhooks.write().unwrap() = new_slot;
+            }
+            "mutatingadmissionpolicies" => {
+                *self.admission_cache.mutating_policies.write().unwrap() = new_slot;
+            }
+            "validatingadmissionpolicies" => {
+                *self.admission_cache.validating_policies.write().unwrap() = new_slot;
+            }
+            "validatingadmissionpolicybindings" => {
+                *self
+                    .admission_cache
+                    .validating_policy_bindings
+                    .write()
+                    .unwrap() = new_slot;
+            }
+            _ => {
+                // Not an admission config type — nothing to refresh.
+            }
+        }
+    }
+
+    /// Populate the admission config cache from objects already persisted in the store.
+    ///
+    /// Must be called once at startup before serving requests, so the first admission check
+    /// does not incur a cache miss and falls back to the store.
+    pub async fn init_admission_cache(&self) {
+        for plural in &[
+            "mutatingwebhookconfigurations",
+            "validatingwebhookconfigurations",
+            "mutatingadmissionpolicies",
+            "validatingadmissionpolicies",
+            "validatingadmissionpolicybindings",
+        ] {
+            self.refresh_admission_config(plural).await;
+        }
+        tracing::info!("admission cache: initialized from store");
     }
 
     /// Attempt to allocate the next available clusterIP from the service CIDR.
