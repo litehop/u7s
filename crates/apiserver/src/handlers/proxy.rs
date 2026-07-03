@@ -1170,40 +1170,155 @@ pub async fn resolve_pod_proxy_target<S: Store>(
     Ok((pod_ip, port, proxy_addr))
 }
 
-/// Build a plain HTTP reqwest client for pod proxy requests.
+/// Build a plain HTTP reqwest client for direct pod access (no konnectivity).
 ///
-/// When `konnectivity_proxy_addr` is set, an HTTPS CONNECT proxy is configured so
-/// requests to pod IPs (which are only reachable within the node's CNI network)
-/// are tunnelled through the konnectivity-server → konnectivity-agent path.
-///
-/// The konnectivity-server's proxy port is TLS-secured (--server-cert/--server-key
-/// with --server-ca-cert). The proxy URL must use https:// and the client must
-/// present the cluster CA for server verification and an mTLS identity so the
-/// konnectivity-server can authenticate the apiserver as a trusted client.
+/// Used when `konnectivity_proxy_addr` is not set and the apiserver can reach
+/// pod IPs directly (e.g. in tests or same-host setups).
 pub(crate) fn build_pod_proxy_client(
-    konnectivity_proxy_addr: Option<&str>,
     ca_der: Option<&[u8]>,
     client_identity_pem: Option<&[u8]>,
 ) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
-    if let Some(addr) = konnectivity_proxy_addr {
-        // konnectivity-server --server-port is TLS — use https://, not http://.
-        let proxy_url = format!("https://{addr}");
-        if let Ok(proxy) = reqwest::Proxy::all(&proxy_url) {
-            builder = builder.proxy(proxy);
+    if let Some(der) = ca_der {
+        if let Ok(cert) = reqwest::Certificate::from_der(der) {
+            builder = builder.use_rustls_tls().tls_certs_only([cert]);
         }
-        if let Some(der) = ca_der {
-            if let Ok(cert) = reqwest::Certificate::from_der(der) {
-                builder = builder.use_rustls_tls().tls_certs_only([cert]);
-            }
-        }
-        if let Some(pem) = client_identity_pem {
-            if let Ok(identity) = reqwest::Identity::from_pem(pem) {
-                builder = builder.identity(identity);
-            }
+    }
+    if let Some(pem) = client_identity_pem {
+        if let Ok(identity) = reqwest::Identity::from_pem(pem) {
+            builder = builder.identity(identity);
         }
     }
     builder.build().unwrap_or_default()
+}
+
+/// Proxy a pod request through a CONNECT tunnel to konnectivity-server.
+///
+/// konnectivity-server accepts only the CONNECT verb. reqwest's Proxy::all() only
+/// issues CONNECT for https:// targets; for http:// targets it sends a plain forward-
+/// proxy GET which konnectivity rejects with 405. This function establishes the
+/// tunnel manually: TLS-connect to konnectivity, send CONNECT pod_ip:port, then
+/// speak plain HTTP to the pod over the tunneled byte stream.
+#[allow(clippy::too_many_arguments)]
+async fn pod_proxy_via_connect_tunnel(
+    konnectivity_addr: &str,
+    pod_ip: &str,
+    port: u16,
+    path: &str,
+    method: axum::http::Method,
+    body_bytes: bytes::Bytes,
+    ca_der: Option<&[u8]>,
+    client_identity_pem: Option<&[u8]>,
+) -> Result<(u16, bytes::Bytes), String> {
+    use http_body_util::BodyExt as _;
+    use hyper_util::rt::TokioIo;
+    use rustls::pki_types::ServerName;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio_rustls::TlsConnector;
+
+    // 1. Parse konnectivity host and port.
+    let (kconn_host, kconn_port) = {
+        let mut parts = konnectivity_addr.rsplitn(2, ':');
+        let p: u16 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| format!("invalid konnectivity addr: {konnectivity_addr}"))?;
+        let h = parts
+            .next()
+            .ok_or_else(|| format!("invalid konnectivity addr (no host): {konnectivity_addr}"))?;
+        (h.to_owned(), p)
+    };
+
+    // 2. Build a TLS client config pinned to the cluster CA.
+    let tls_config = build_kubelet_tls_config(ca_der, client_identity_pem)
+        .map_err(|e| format!("konnectivity TLS config: {e}"))?;
+    let connector = TlsConnector::from(tls_config);
+
+    // 3. Open a TCP connection to konnectivity-server.
+    let tcp = TcpStream::connect(format!("{kconn_host}:{kconn_port}"))
+        .await
+        .map_err(|e| format!("konnectivity TCP connect: {e}"))?;
+
+    let server_name = ServerName::try_from(kconn_host.as_str())
+        .map(|n| n.to_owned())
+        .map_err(|e| format!("invalid konnectivity server name '{kconn_host}': {e}"))?;
+    let mut tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| format!("konnectivity TLS handshake: {e}"))?;
+
+    // 4. Send HTTP CONNECT to ask konnectivity to tunnel to pod_ip:port.
+    //    konnectivity-server (proxy-agent v0.35.0) accepts CONNECT only.
+    let connect_req = format!("CONNECT {pod_ip}:{port} HTTP/1.1\r\nHost: {pod_ip}:{port}\r\n\r\n");
+    tls_stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .map_err(|e| format!("CONNECT write: {e}"))?;
+
+    // 5. Read the CONNECT response line. konnectivity returns "HTTP/1.1 200 Connection established\r\n\r\n".
+    let mut resp_buf = [0u8; 256];
+    let mut total = 0usize;
+    loop {
+        if total >= resp_buf.len() {
+            return Err("CONNECT response too large".into());
+        }
+        let n = tls_stream
+            .read(&mut resp_buf[total..])
+            .await
+            .map_err(|e| format!("CONNECT read: {e}"))?;
+        if n == 0 {
+            return Err("konnectivity closed connection during CONNECT".into());
+        }
+        total += n;
+        // Look for the end of the HTTP response headers (\r\n\r\n).
+        if resp_buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let resp_str = std::str::from_utf8(&resp_buf[..total]).unwrap_or("");
+    if !resp_str.starts_with("HTTP/1.1 200") {
+        return Err(format!(
+            "CONNECT rejected: {}",
+            resp_str.lines().next().unwrap_or("")
+        ));
+    }
+
+    // 6. The tunnel is open. Speak plain HTTP to the pod over the tunneled stream.
+    let io = TokioIo::new(tls_stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, axum::body::Body>(io)
+        .await
+        .map_err(|e| format!("hyper handshake over tunnel: {e}"))?;
+    tokio::spawn(conn);
+
+    let uri = if path.is_empty() {
+        "/".to_owned()
+    } else if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+
+    let hyper_req = hyper::Request::builder()
+        .method(method.as_str())
+        .uri(&uri)
+        .header("Host", format!("{pod_ip}:{port}"))
+        .body(axum::body::Body::from(body_bytes))
+        .map_err(|e| format!("build pod request: {e}"))?;
+
+    let hyper_resp = sender
+        .send_request(hyper_req)
+        .await
+        .map_err(|e| format!("pod request over tunnel: {e}"))?;
+
+    let status = hyper_resp.status().as_u16();
+    let collected = hyper_resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| format!("read pod response body: {e}"))?;
+
+    Ok((status, collected.to_bytes()))
 }
 
 /// Proxy a request to the pod's IP and containerPort.
@@ -1219,17 +1334,55 @@ async fn pod_proxy_dispatch<S: Store>(
 ) -> Result<Response, crate::status::StatusError> {
     let (pod_ip, port, proxy_addr) = resolve_pod_proxy_target(state, ns, pod_name).await?;
 
-    let target_url = format!("http://{pod_ip}:{port}/{path_suffix}");
-
-    let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
-        .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
-
+    let method = req.method().clone();
     let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
         .await
         .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
 
+    if let Some(addr) = proxy_addr.as_deref() {
+        // Route through konnectivity via an explicit CONNECT tunnel.
+        // konnectivity-server accepts CONNECT only; a plain forward-proxy GET returns 405.
+        let (status, body) = pod_proxy_via_connect_tunnel(
+            addr,
+            &pod_ip,
+            port,
+            path_suffix,
+            method,
+            body_bytes,
+            state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            state
+                .kubelet_client_identity_pem
+                .as_deref()
+                .map(|v| v.as_slice()),
+        )
+        .await
+        .map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("pod unreachable via konnectivity: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                },
+            )
+        })?;
+
+        return Response::builder()
+            .status(status)
+            .body(Body::from(body))
+            .map_err(|e| Status::internal(e.to_string()));
+    }
+
+    // No konnectivity proxy — direct connection to pod IP.
+    let target_url = format!("http://{pod_ip}:{port}/{path_suffix}");
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
+
     let client = build_pod_proxy_client(
-        proxy_addr.as_deref(),
         state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
         state
             .kubelet_client_identity_pem
@@ -1238,7 +1391,7 @@ async fn pod_proxy_dispatch<S: Store>(
     );
 
     let pod_resp = client
-        .request(method, &target_url)
+        .request(reqwest_method, &target_url)
         .body(body_bytes)
         .send()
         .await
@@ -3128,56 +3281,139 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_pod_proxy_client: konnectivity tunnel must use https://, not http://
-    //
-    // The konnectivity-server --server-port is TLS-secured. Using http:// causes
-    // all pod proxy requests to hang with context deadline exceeded because the
-    // plaintext HTTP CONNECT is rejected by a TLS-only endpoint. This is the root
-    // cause of the 37x deadline-exceeded failures in run 0625-2158.
+    // build_pod_proxy_client: direct-connect client must build without panicking
     // -----------------------------------------------------------------------
 
-    /// build_pod_proxy_client without konnectivity must build successfully.
+    /// build_pod_proxy_client must build successfully when no CA is provided.
     ///
-    /// When konnectivity is not configured (e.g. apiserver can reach pod IPs directly),
-    /// the client must still build successfully — pod proxy without a tunnel must work.
+    /// When konnectivity is not configured and the apiserver can reach pod IPs
+    /// directly, the client must build — pod proxy without a tunnel must work.
     #[test]
-    fn build_pod_proxy_client_without_konnectivity_succeeds() {
-        let client = build_pod_proxy_client(None, None, None);
-        // The client is not None — it must have built successfully.
-        // Regression: if build_pod_proxy_client panics or returns a broken client,
-        // all pod proxy requests fail with 502 even when konnectivity is not needed.
+    fn build_pod_proxy_client_without_ca_succeeds() {
+        let client = build_pod_proxy_client(None, None);
         drop(client); // just verify it was built
     }
 
-    /// build_pod_proxy_client with konnectivity addr must build a client with https:// proxy.
-    ///
-    /// The konnectivity-server --server-port is TLS-secured with --server-cert/--server-key.
-    /// Using http:// (as was the bug) causes the CONNECT tunnel to fail: the TLS handshake
-    /// is never initiated, the request hangs, and the client times out after 300s.
-    /// Using https:// establishes TLS before the CONNECT verb — matching what the server expects.
-    ///
-    /// This test fails if the proxy_url is changed back to format!("http://{addr}").
-    #[test]
-    fn build_pod_proxy_client_konnectivity_uses_https_scheme() {
-        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
-        let ca_der = cert.cert.der().to_vec();
+    // -----------------------------------------------------------------------
+    // pod_proxy_via_connect_tunnel: pod proxy must use CONNECT, not forward-proxy GET
+    //
+    // konnectivity-server (proxy-agent v0.35.0) accepts CONNECT only. A plain
+    // forward-proxy GET (which reqwest sends for http:// targets) returns 405
+    // "this proxy only supports CONNECT passthrough". This test verifies that
+    // pod_proxy_via_connect_tunnel sends CONNECT, not GET, to the proxy.
+    //
+    // The test starts a plain-TCP mock "proxy" (no TLS, to avoid cert overhead in
+    // tests) that records the first line of the inbound request. The fix call path
+    // uses build_kubelet_tls_config which requires a CA; in tests we bypass TLS by
+    // exercising a variant with a test TLS server. The assertion checks that CONNECT
+    // appears in the request — reverting to the old reqwest Proxy::all() approach
+    // would cause GET to appear instead.
+    //
+    // IMPLEMENTATION NOTE: because the tunnel function requires mTLS (build_kubelet_tls_config),
+    // the network-level test is the live VM repro (see bead mayor-n124). The unit test
+    // below validates the CONNECT request string construction independently.
+    // -----------------------------------------------------------------------
 
-        // With a valid CA, the client must build successfully.
-        // If http:// were used the client would still build (reqwest validates the URL
-        // at connection time, not at client-build time), but the CONNECT would fail at
-        // runtime when the TLS handshake attempt is rejected by the plaintext endpoint.
-        //
-        // The compile-time guard is the `https://` literal in build_pod_proxy_client:
-        // reverting it to `http://` breaks this assertion at the next kubectl proxy call.
-        // We verify the function signature includes ca_der so the caller cannot silently
-        // omit the CA — omitting it would mean the TLS handshake succeeds but server
-        // cert is unverified (MITM vector).
-        let client = build_pod_proxy_client(Some("127.0.0.1:8135"), Some(&ca_der), None);
-        drop(client);
+    /// pod_proxy_via_connect_tunnel sends CONNECT to the konnectivity proxy.
+    ///
+    /// If this test is reverted to the old reqwest Proxy::all() approach, the mock
+    /// server would receive a plain forward-proxy GET (e.g. "GET http://10.0.0.1:80/ HTTP/1.1")
+    /// instead of a CONNECT request, and konnectivity would reply 405.
+    ///
+    /// The test uses a TLS server backed by an ephemeral self-signed cert so the
+    /// tunnel function's TLS connect path is exercised. On receiving CONNECT, the
+    /// server returns 200 and then serves a minimal HTTP response so hyper can
+    /// complete the handshake and the function returns Ok.
+    #[tokio::test]
+    async fn pod_proxy_via_connect_tunnel_sends_connect_not_forward_proxy_get() {
+        use rcgen::generate_simple_self_signed;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls::ServerConfig;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
 
-        // Verify the function accepts all three parameters — removing any of them would
-        // break this call site and surface the regression at compile time.
-        // The three-parameter call above already exercises this; no type alias needed.
+        // Generate a self-signed cert for the mock konnectivity server.
+        let cert = generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+
+        // Build a TLS acceptor for the mock server.
+        let server_cert = CertificateDer::from(cert_der.clone());
+        let server_key = PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert], server_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        // Bind a random port for the mock konnectivity server.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap().to_string();
+
+        // Track what CONNECT target the proxy received.
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(tcp).await.unwrap();
+
+            // Read the CONNECT request.
+            let mut buf = [0u8; 512];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // Extract and send the first line (e.g. "CONNECT 10.0.0.1:80 HTTP/1.1").
+            let first_line = request.lines().next().unwrap_or("").to_string();
+            let _ = tx.send(first_line);
+
+            // Reply 200 Connection established.
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+
+            // Serve a minimal HTTP response for the pod request that follows.
+            let mut buf2 = [0u8; 512];
+            let _ = stream.read(&mut buf2).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .unwrap();
+        });
+
+        let result = pod_proxy_via_connect_tunnel(
+            &proxy_addr,
+            "10.0.0.1",
+            80,
+            "/metrics",
+            axum::http::Method::GET,
+            bytes::Bytes::new(),
+            Some(&cert_der),
+            None,
+        )
+        .await;
+
+        // The CONNECT line must name the pod target, not be a forward-proxy GET.
+        let first_line = rx.await.unwrap();
+        assert!(
+            first_line.starts_with("CONNECT 10.0.0.1:80"),
+            "pod proxy to konnectivity must send CONNECT, not a forward-proxy GET — \
+             konnectivity-server accepts only CONNECT and replies 405 to anything else; \
+             got: {first_line:?}"
+        );
+        assert!(
+            result.is_ok(),
+            "pod_proxy_via_connect_tunnel must succeed when konnectivity accepts CONNECT: {:?}",
+            result.err()
+        );
+        let (status, body) = result.unwrap();
+        assert_eq!(
+            status, 200,
+            "pod response must be 200, not the konnectivity 405 that the old code produced"
+        );
+        assert_eq!(&body[..], b"hello");
     }
 
     // -----------------------------------------------------------------------
