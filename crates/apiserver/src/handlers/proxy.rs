@@ -1035,18 +1035,33 @@ async fn portforward_proxy(
 ///
 /// Separated from the handler for unit-testability: all error paths (404, 502)
 /// are reachable without a real HTTP connection.
+/// Strip a trailing `:port` from a node name as it appears in a proxy URL.
+///
+/// Sonobuoy's dump.go (and kubectl) build node-proxy URLs as
+/// `/api/v1/nodes/<name>:<port>/proxy/...` (e.g. "lima-node:10250").
+/// The node is stored under the bare name without the port suffix.
+/// Node names are DNS-1123 labels (no colons), so a single rsplit_once(':')
+/// on the last colon is safe and sufficient — no full URL parser needed.
+pub fn strip_node_port(node_name: &str) -> &str {
+    node_name
+        .rsplit_once(':')
+        .map(|(bare, _port)| bare)
+        .unwrap_or(node_name)
+}
+
 pub async fn resolve_node_proxy_target<S: Store>(
     state: &AppState<S>,
     node_name: &str,
     path_suffix: &str,
 ) -> Result<(String, reqwest::Client), crate::status::StatusError> {
-    let node_key = cluster_object_key("nodes", node_name);
+    let bare_name = strip_node_port(node_name);
+    let node_key = cluster_object_key("nodes", bare_name);
     let node_stored = state
         .store
         .get(&node_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(node_name, "Node"))?;
+        .ok_or_else(|| Status::not_found(bare_name, "Node"))?;
 
     let node: serde_json::Value = serde_json::from_slice(&node_stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored node: {e}")))?;
@@ -1060,7 +1075,7 @@ pub async fn resolve_node_proxy_target<S: Store>(
     )
     .ok_or_else(|| {
         Status::internal(format!(
-            "node \"{node_name}\" has no usable address in status.addresses"
+            "node \"{bare_name}\" has no usable address in status.addresses"
         ))
     })?;
 
@@ -2483,6 +2498,68 @@ mod tests {
             404,
             "node proxy must return 404 when the node is not in the store — \
              a 502 or 500 would mislead the caller into thinking the kubelet is down"
+        );
+    }
+
+    /// strip_node_port must strip the trailing :port from a URL node name.
+    ///
+    /// Sonobuoy's dump.go builds node-proxy URLs as /api/v1/nodes/<name>:<port>/proxy/pods.
+    /// Without stripping, the store lookup uses "lima-node:10250" instead of "lima-node",
+    /// causing every sonobuoy pod-dump to 404 with "Node lima-node:10250 not found".
+    #[test]
+    fn strip_node_port_removes_port_suffix() {
+        assert_eq!(
+            super::strip_node_port("lima-node:10250"),
+            "lima-node",
+            "sonobuoy/kubectl node-proxy pod retrieval 404s if :port suffix is not stripped \
+             before the store lookup"
+        );
+        assert_eq!(
+            super::strip_node_port("lima-node"),
+            "lima-node",
+            "bare node names (no port suffix) must pass through unchanged"
+        );
+    }
+
+    /// node proxy with a :port suffix in the name must resolve the same node as
+    /// a bare-name lookup — confirming the port stripping reaches the store.
+    ///
+    /// If strip_node_port is removed or bypassed, "lima-node:10250" will not be
+    /// found in the store and resolve_node_proxy_target returns 404, breaking
+    /// every sonobuoy pod-dump that constructs the URL with a port suffix.
+    #[tokio::test]
+    async fn node_proxy_port_suffix_in_name_resolves_correctly() {
+        let state = make_state();
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "lima-node", "resourceVersion": "1"},
+            "status": {
+                "addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "lima-node"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        // This is the URL sonobuoy's dump.go generates: name includes :port suffix.
+        // Without stripping, the store lookup fails and the user sees
+        // "Unable to retrieve kubelet pods for node lima-node: Node lima-node:10250 not found".
+        let result = resolve_node_proxy_target(&state, "lima-node:10250", "pods").await;
+        // make_state() has no cluster CA so we get 503 (TLS not configured) rather than 200,
+        // but the important check is that we did NOT get 404 — the store lookup found "lima-node".
+        let status_code = result.map(|_| 200u16).unwrap_or_else(|e| e.0.as_u16());
+        assert_ne!(
+            status_code, 404,
+            "node proxy with ':port' suffix must not 404 — the port must be stripped before \
+             the store lookup or sonobuoy pod-dump reports: Node lima-node:10250 not found"
         );
     }
 
