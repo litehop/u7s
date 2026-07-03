@@ -1,13 +1,35 @@
 # Dashboard
-2026-07-03T04:28Z — **CLEAN STATE. 23 PRs merged this session; #666 admission-cache landed. Mayor on main `87ae7cc7` = origin. 0 workers, 0 open PRs. Board ~11 ready + EPIC. Awaiting operator on the big open calls.**
+2026-07-03T11:20Z — **First full conformance run (0703-1822) → first fix MERGED. #668 MIME/Content-Type (13 tests) landed on main `7a57604b`. 1 fix worker still in-flight (pod-gen-17). Facts-before-beads keeps paying: caught the categorization scout fabricating ALL file paths + 2 wrong root-cause sketches; caught the MIME worker's soft "grep-for-zero-errors" evidence and verified via the green CI kubectl smoke matrix instead. Mayor on `7a57604b` = origin.**
 
 Resume: `bd prime`
 
-## What needs the operator now — pick the next thread (all your call)
-1. **Proto-typing EPIC P1 (mayor-dqwf)** — ready to dispatch. ~3-5d initiative that structurally kills the proto-drop bug class (this session's dominant bug). Highest leverage. Decision record: ai/extended-context/proto-typing-decision.md.
-2. **A-vs-B re-baseline** — a fresh FULL conformance run (23 fixes landed) re-ranks the board + confirms dfly PATCH-TypeMeta blast radius (f172). Cheap insight; my earlier lean was "A then B" (baseline, then EPIC).
-3. **7lrp (P1)** — watch/informer-consistency latency; design decision (maybe-unfixable-without-forking-KCM per audit). Re-measure on a fresh run first.
-4. **rsei (P1)** — scheduler preemption is a missing FEATURE (~6-9d EPIC), blocked by osuq. Build or defer?
+## ✅ Shipped this session
+- **#668 (mayor-tt5h)** MIME/Content-Type — /openapi/v2 proto response now uses the non-deprecated dot form (@v1.0→.v1.0). Upstream-verified (kube-openapi responds dot-form for both Accept variants); 17/17 CI green incl. kubectl smoke cells; API-surface change flagged in PR body. Unblocks 13 kubectl-validation conformance tests.
+
+## 🔧 1 fix worker in-flight
+- **mayor-h4xw** pod-generation no-op bump (17 tests) → worker a54f02c9, pods.rs, VM 2/6445, branch based on pre-merge c6dda7b6 (DISJOINT from #668's discovery.rs — no conflict when it merges, no rebase needed). Fix (Option A, operator-approved): extract pure apply_pod_spec_defaults (NO status side effects) so create+update share spec-defaulting; compare spec-defaulted at 5 update call sites. ⚠️ scout's apply_pod_create_defaults fix REJECTED — it stomps status→Pending. Awaiting PR.
+
+## 📝 Staged (uncommitted, fold into next PR) — NOT pushed
+- ai/prompts/vm-operations.md + docs/the-mayor-method/dispatch-prompt-template.md: "locate the e2e test source" protocol (check temp/research/ first, else WebFetch raw GitHub pinned to client version). Memory: locate-e2e-test-source-research-then-github.
+- ai/prompts/vm-operations.md: "--focus gate BLOCKS — scope slim or background it, never busy-poll" + "cancelling run-all.sh does NOT cancel sonobuoy" + "narrow --focus to ONE test (full name) for iteration, but the ACCEPTANCE GATE is the DISPATCH focus (whole cluster), not the narrowed one" (Step 6). Mayor return-review must confirm e2e.txt PASS is for the dispatch-level focus/count, not a zoomed-in subset. Memory: focus-acceptance-is-dispatch-focus-not-narrowed. Root-caused the MIME worker's 62-min run: --focus "Kubectl client" (~15 min, sonobuoy run --wait) hit the 10-min FOREGROUND Bash timeout ceiling → returned no result → worker busy-polled kubectl ~40 min (the run kept executing IN THE VM, orphaned; delete needs `limactl shell <VM> sudo sonobuoy delete --all --wait --kubeconfig /tmp/sonobuoy-kubeconfig`) → then double-launched into a VM with the first run still alive. Fix: slim --focus (foreground <10min) OR run_in_background:true (survives >10min, pings; allowlist-safe); cancel via in-VM sonobuoy delete. NOT port isolation, NOT a u7s bug. Memories: worker-run-all-verbatim (corrected) + worker-run-all-cancel-gotcha.
+- ai/dashboard.md (this file).
+
+## ⚠️ Triage doc caveat (READ before trusting it)
+ai/findings/conformance-full-run-triage-2026-07-03.md (Haiku scout) has TRUSTWORTHY cluster counts/symptoms/test-lists from the logs, but its root-cause hypotheses + ALL source-file pointers are FABRICATED (cold-workspace guessing — every path I checked was wrong; real layout is flat crates/apiserver/src/, no crates/controllers/). Use it for the failure MAP only. Each cluster needs real root-causing (kubectl repro + verified file:line) before it becomes a fix bead.
+
+## What needs the operator now
+1. **✅ 2 clusters ROOT-CAUSED (CONFIRMED, verified vs real source):**
+   - **MIME/Content-Type (13 tests)** — /openapi/v2 returns `Content-Type: application/com.github.proto-openapi.spec.v2@v1.0+protobuf`; the `@v1.0` breaks Go mime.ParseMediaType in kubectl validation. discovery.rs:1379. TENSION: existing test (discovery.rs:3245) asserts current behavior is "correct" (it fixed the opposite proto-decode bug). Operator chose: **verify upstream exactly THEN fix** → ⏳ upstream-verification scout in-flight (ad802787). Doc: ai/findings/rc-mime-content-type-2026-07-03.md.
+   - **observedGeneration (17 tests)** — top-level status.observedGeneration never initialized on create (pods.rs:3103 apply_pod_create_defaults). Generation defaulting/increment WORK. SECONDARY: Pod status dropped on proto decode (proto.rs:1000, "not decoded on input") — proto-drop class, likely folds into EPIC. Doc: ai/findings/rc-observed-generation-2026-07-03.md. Decomposes into Bead A (observedGen init, small) + Bead B (proto status-drop, → EPIC). **Awaiting operator go to file + fix.**
+2. **~28 of 141 already have beads** (uam0 CRD-openapi ×10, kxht VAP-panic ×7, rsei preempt ×7, pu5i pod-log ×4-cascade, 7lrp WAL ×3, f172 PATCH-TypeMeta ×2, qrip ×1). **4 are pure INFRA** (need 2 nodes; kubelet /etc/hosts). Real NEW surface ≈ 21 clusters.
+3. **Proto-typing EPIC (mayor-dqwf)** — triage confirms proto-drop is live (Pod status, plus Lease defaults/status fields/security-context/image spec smell the same). Sizes the EPIC's payoff. Ready when you are.
+4. **Next RC-scout candidates** (your call): admission-webhook-deny (8), CRD-watch-never-converges (5) + watch-order (5), the 4 apiserver PANICS (VAP index-oob + 3 controller nil-derefs — crashes = high value), status-fields-missing (4).
+
+## Board bugs likely CONFIRMED-real by this run (were symptom-beads)
+kxht (VAP `index out of range [-1]` panic — CONFIRMED in logs), uam0 (CRD schema timeout — CONFIRMED), f172 (PATCH missing Kind — CONFIRMED). rsei/pu5i/7lrp/qrip corroborated by matching failures.
+
+## ⚠️ Scout-isolation lesson (banked: scout-isolation-use-worker-not-researcher)
+researcher-type scouts do NOT get a pinned worktree CWD — their file writes hit the mayor checkout (path-resolution leak) or get permission-blocked. VM/--stack-only isolation DID work for them. RULE: researcher = read-only analysis, NO file writes to repo; use subagent_type=worker for anything needing isolation="worktree" + file output. (No harm this session: findings docs are gitignored + verified correct.)
 
 ## ✅ Smoke-test catch RESOLVED (operator diagnosis) — was CI config, NOT a u7s bug
 zc9l's pod-log smoke check failed on all 3 kubelet cells (apiserver→kubelet containerLogs rejected). Operator pinned it: inbound apiserver→kubelet path lacked the client-ca/TLS auth lima-start.sh:217-283 sets up. Fixed in #664 (mirror lima: client-ca-file + serving cert signed by cluster CA + authorization.mode:AlwaysAllow). All 10 smoke cells GREEN; check NOT weakened. Permanent CI hardening — inbound kubelet path now exercised every PR. (Distinct from mayor-pu5i, the real log-500 code bug — still open.)

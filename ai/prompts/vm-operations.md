@@ -226,8 +226,30 @@ limactl shell <VM> pgrep -a kube-controller    # KCM alive
 This is where you spend almost all diagnostic time. A `sonobuoy --focus` run is
 5+ min and can hang to 20 (watchdog reaps the test namespace at 5 min, ginkgo
 then flails against the dead namespace). kubectl answers the same question in
-seconds. Read the failing test's source (`test/e2e/...`) to learn its exact API
-sequence, then reproduce it here.
+seconds. Read the failing test's source to learn its exact API sequence, then
+reproduce it here.
+
+### Locating the failing test's source (do NOT hunt for it)
+
+Do NOT search the sonobuoy archive, `temp/e2e/`, or the workspace for the test
+body — the e2e test source is upstream Go, not in this repo or the run archive.
+Two places only, in this order:
+
+1. **`temp/research/` first** (gitignored; already holds curated upstream k8s
+   source — test bodies like `statefulset_e2e.go` / `webhook-test.go`, plus
+   controllers like `kcm_job_controller.go`). `ls temp/research/` and grep it for
+   the test name or a distinctive assertion string. If the file is there, Read it.
+2. **Otherwise fetch it from GitHub** with the `WebFetch` tool against the raw
+   URL. The failure line in `e2e.txt` names the file+line, e.g.
+   `k8s.io/kubernetes/test/e2e/node/pods.go:530` →
+   `https://raw.githubusercontent.com/kubernetes/kubernetes/release-1.34/test/e2e/node/pods.go`
+   (pin the branch to the conformance client version — this repo targets 1.34+;
+   check `serverversion.json` in the run dir if unsure). Read the function around
+   the cited line to get the exact create→update→assert sequence.
+
+Never reconstruct the test from the failure message alone — the assertion text
+(`Expected 2 to be equivalent to 1`) is meaningless without the surrounding
+sequence (e.g. that the `2` came from a no-op update that must not have bumped).
 
 ```bash
 kubectl --kubeconfig temp/u7s/kubeconfig apply -f - <<'EOF'
@@ -244,6 +266,60 @@ Run sonobuoy ONLY as the final pass/fail gate, after kubectl confirms the fix.
 When you do, read the result from
 `temp/e2e/<run>/podlogs/sonobuoy/<...>/logs/e2e.txt` (the full test timeline) —
 NOT `plugins/e2e/results/global/e2e.log`, which omits the test body.
+
+### The `--focus` gate BLOCKS — scope it slim, or background it (do NOT busy-poll)
+
+`run-all.sh --focus` runs `sonobuoy run --wait` (`06-run-sonobuoy.sh`), so the
+command **blocks until the e2e binary exits and returns the result then** — you
+do NOT need to poll for completion. Two ways to run it, by expected duration:
+
+- **Slim focus (finishes < 10 min) → run it foreground, bare.** Scope the regex
+  to the SPECIFIC failing test(s), e.g. `--focus "Guestbook application should
+  create and stop"`, NOT a whole area like `--focus "Kubectl client"` (that
+  matches dozens of tests, ~15 min). A slim focus keeps iteration fast and
+  finishes inside the foreground timeout. To pin to exactly ONE test, use its
+  FULL name as the focus, e.g.
+  `--focus "[sig-node] Pods Extended (pod generation) Pod Generation pod generation should start at 1 and increment per update"`
+  (the full test name from `e2e.txt` / the JUnit XML; ginkgo focus is a regex, so
+  a complete name matches that one test).
+
+  **But the ACCEPTANCE GATE is the focus you were DISPATCHED with, not the one you
+  narrowed to.** Zooming into one test is for fast ITERATION only. A bead that
+  covers a cluster (e.g. all `Kubectl client` create/replace tests, or all
+  `pod generation` tests) is NOT discharged by one narrowed test going green —
+  the other tests in the cluster may still fail. Before you close the bead / claim
+  success, re-run the FINAL gate against the ORIGINAL dispatch focus and confirm
+  the whole set passes (read `e2e.txt`). Report the pass line for the dispatch
+  focus, not just your zoomed-in one.
+- **A run that will exceed ~10 min → launch it as a BACKGROUND job**
+  (`run_in_background: true` on the bare `scripts/conformance/run-all.sh …`
+  command — the background flag is a tool parameter, not a command suffix, so it
+  stays allowlist-safe). The foreground Bash timeout is capped at **10 min
+  (600000 ms) and cannot be raised** — a longer run will time out mid-flight and
+  return nothing. A background job detaches, survives past 10 min, and notifies
+  you when it exits; then read `e2e.txt`.
+
+**Never** hand-roll a `kubectl get pods -n sonobuoy` wait loop to watch a run
+finish, and never launch a second `--focus` run while one is going. If a
+foreground `--focus` call returns without a result, it TIMED OUT (run too long) —
+re-run it in the background or narrow the focus; do not start polling.
+
+**Cancelling the Bash call does NOT cancel the sonobuoy run.** sonobuoy runs
+inside the VM; killing/timing-out the host-side `run-all.sh` command (or a Ctrl-C
+equivalent) leaves the e2e job still executing in the VM — which is why polling
+still shows live pods, and why a second `--focus` then collides with the first.
+To actually stop a run (before re-running, or to abort), delete it IN THE VM
+against the in-VM kubeconfig (the same command the script uses for pre-run
+cleanup):
+
+```bash
+limactl shell <VM> sudo sonobuoy delete --all --wait --kubeconfig /tmp/sonobuoy-kubeconfig
+```
+
+Note `/tmp/sonobuoy-kubeconfig` is the VM-side kubeconfig the script copies in —
+NOT the host's `temp/u7s/kubeconfig`. A fresh `run-all.sh --focus` (or `--reset`)
+runs this delete automatically before starting, so you only need it by hand when
+you interrupted a run and want to re-issue one, or to abort without re-running.
 
 ---
 
