@@ -161,6 +161,15 @@ You are implementing bead **<BEAD_ID>** in <project description>.
 - Use the `Read` tool for file reads — never `cat`, `head`, or `tail` via Bash.
 - Use the `Edit` tool for targeted edits — never `sed` or `awk` via Bash.
 - Use the `Grep` tool for search — never shell `grep` / `find` for file I/O.
+- For code navigation (callers, usage paths, rename impact, a symbol's type),
+  use the `mcp__mcpls__*` LSP tools — they give the compiler's semantic view,
+  not a text match. Workflow is **grep-then-LSP**: grep to find the symbol
+  string + its line, then `get_references` / `get_definition` / `get_hover` at
+  that `file_path` + 1-based `line`/`character` to get true refs/def/type
+  (`prepare_call_hierarchy` + `get_incoming_calls` for multi-hop caller trees).
+  Caveat: `workspace_symbol_search` (whole-workspace search by name) needs a
+  warm rust-analyzer index and returns EMPTY in a fresh worktree even for real
+  symbols — grep to find the anchor, LSP-at-position to analyze it.
 - Bash is for runtime commands only: `git`, `cargo`, `gh`, `kubectl`, `bd`.
 - These are not preferences — violating them triggers permission prompts that
   stall the session. Use the right tool the first time.
