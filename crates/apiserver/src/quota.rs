@@ -149,15 +149,39 @@ fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
     }
 }
 
+/// Returns true if the object matches all expressions in a scopeSelector.
+///
+/// Supported operators: Exists (pod must match scopeName), DoesNotExist (must not match).
+/// In/NotIn with values are not implemented (unused by conformance tests); unknown operators
+/// are treated as matching (conservative default).
+fn object_matches_scope_selector(scope_selector: &Value, object: Option<&Value>) -> bool {
+    let exprs = match scope_selector["matchExpressions"].as_array() {
+        Some(arr) => arr,
+        None => return true, // no expressions — matches everything
+    };
+    exprs.iter().all(|expr| {
+        let scope_name = expr["scopeName"].as_str().unwrap_or("");
+        let operator = expr["operator"].as_str().unwrap_or("");
+        match operator {
+            "Exists" => object_matches_scope(scope_name, object),
+            "DoesNotExist" => !object_matches_scope(scope_name, object),
+            // In/NotIn with values — not implemented; treat as match (conservative)
+            _ => true,
+        }
+    })
+}
+
 /// Count pods in `namespace` that match all scopes on `quota`.
 ///
 /// Scopes only apply to pods; other resources are counted without scope filtering.
-/// Returns the number of pods that match every scope in `quota["spec"]["scopes"]`.
+/// Returns the number of pods that match every scope in `quota["spec"]["scopes"]`
+/// AND every expression in `quota["spec"]["scopeSelector"]`.
 async fn count_scope_filtered_pods<S: Store>(store: &S, namespace: &str, quota: &Value) -> u64 {
     let scopes: Vec<&str> = quota["spec"]["scopes"]
         .as_array()
         .map(|arr| arr.iter().filter_map(|s| s.as_str()).collect())
         .unwrap_or_default();
+    let scope_selector = &quota["spec"]["scopeSelector"];
 
     let prefix = group_list_prefix("", "pods", Some(namespace));
     let items = match store.list(&prefix, ListOptions::default()).await {
@@ -175,9 +199,15 @@ async fn count_scope_filtered_pods<S: Store>(store: &S, namespace: &str, quota: 
                 Ok(v) => v,
                 Err(_) => return false,
             };
-            scopes
+            let matches_scopes = scopes
                 .iter()
-                .all(|scope| object_matches_scope(scope, Some(&pod)))
+                .all(|scope| object_matches_scope(scope, Some(&pod)));
+            let matches_selector = if scope_selector.is_object() {
+                object_matches_scope_selector(scope_selector, Some(&pod))
+            } else {
+                true
+            };
+            matches_scopes && matches_selector
         })
         .count() as u64
 }
@@ -206,7 +236,9 @@ pub async fn count_quota_usage<S: Store>(
     };
 
     // Is scope filtering needed? Only when the quota has scopes AND those scopes are pod-scopes.
-    let has_pod_scopes = quota["spec"]["scopes"]
+    // Scope filtering applies when the quota has spec.scopes (pod-scope names) or
+    // spec.scopeSelector (matchExpressions with pod-scope names like Terminating).
+    let has_scopes_array = quota["spec"]["scopes"]
         .as_array()
         .map(|arr| {
             arr.iter().any(|s| {
@@ -217,6 +249,18 @@ pub async fn count_quota_usage<S: Store>(
             })
         })
         .unwrap_or(false);
+    let has_scope_selector = quota["spec"]["scopeSelector"]["matchExpressions"]
+        .as_array()
+        .map(|arr| {
+            arr.iter().any(|expr| {
+                matches!(
+                    expr["scopeName"].as_str(),
+                    Some("BestEffort" | "NotBestEffort" | "Terminating" | "NotTerminating")
+                )
+            })
+        })
+        .unwrap_or(false);
+    let has_pod_scopes = has_scopes_array || has_scope_selector;
 
     let mut used = std::collections::BTreeMap::new();
     for (resource_name, _) in hard {
@@ -278,6 +322,11 @@ pub async fn check_resource_quota<S: Store>(
                 // This quota does not apply to the incoming object — skip it entirely.
                 continue;
             }
+        }
+        // scopeSelector matching: if the quota has a scopeSelector, the object must match it.
+        let scope_selector = &quota["spec"]["scopeSelector"];
+        if scope_selector.is_object() && !object_matches_scope_selector(scope_selector, object) {
+            continue;
         }
 
         let hard = &quota["spec"]["hard"];

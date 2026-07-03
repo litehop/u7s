@@ -927,7 +927,7 @@ struct Container {
 ///   field 2  = containers (repeated Container)
 ///   field 3  = restartPolicy (string)
 ///   field 4  = terminationGracePeriodSeconds (int64, skipped)
-///   field 5  = activeDeadlineSeconds (int64, skipped)
+///   field 5  = activeDeadlineSeconds (int64)
 ///   field 6  = dnsPolicy (string, skipped)
 ///   field 7  = nodeSelector (map, skipped)
 ///   field 8  = serviceAccountName (string)
@@ -949,6 +949,14 @@ struct PodSpec {
     /// restartPolicy (field 3, string)
     #[prost(string, tag = "3")]
     restart_policy: String,
+    /// activeDeadlineSeconds (field 5, optional int64) — when set, the pod will be forcibly
+    /// terminated after this many seconds. Required for Terminating-scope ResourceQuota
+    /// accounting: pod_is_terminating() checks this field to decide whether a pod counts
+    /// against a Terminating-scoped quota. Without this field, all pods look non-terminating
+    /// and the Terminating quota never counts any pod (conformance test :803 fails with 5-min
+    /// timeout waiting for status.used to reflect the terminating pod).
+    #[prost(int64, optional, tag = "5")]
+    active_deadline_seconds: Option<i64>,
     /// serviceAccountName (field 8, string)
     #[prost(string, tag = "8")]
     service_account_name: String,
@@ -2736,14 +2744,47 @@ struct VolumeAttributesClass {
 
 // --- k8s.io/api/core/v1/generated.proto (resource management types) ---
 
+/// ScopedResourceSelectorRequirement — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ScopedResourceSelectorRequirement
+///
+/// A single match expression in a scopeSelector. Required for the
+/// "verify ResourceQuota with terminating scopes through scope selectors"
+/// conformance test (:1567), which creates quotas with spec.scopeSelector
+/// instead of spec.scopes. Without this struct, scopeSelector is silently
+/// dropped from the stored JSON and the reconciler treats the quota as
+/// scope-less, counting all pods against it.
+#[derive(Clone, PartialEq, Message)]
+struct ScopedResourceSelectorRequirement {
+    /// scopeName (field 1, string) — e.g. "Terminating", "BestEffort"
+    #[prost(string, tag = "1")]
+    scope_name: String,
+    /// operator (field 2, string) — "In", "NotIn", "Exists", "DoesNotExist"
+    #[prost(string, tag = "2")]
+    operator: String,
+    /// values (field 3, repeated string)
+    #[prost(string, repeated, tag = "3")]
+    values: Vec<String>,
+}
+
+/// ScopeSelector — k8s.io/api/core/v1/generated.proto
+/// Source: api-core-v1-generated.proto message ScopeSelector
+#[derive(Clone, PartialEq, Message)]
+struct ScopeSelector {
+    /// matchExpressions (field 1, repeated ScopedResourceSelectorRequirement)
+    #[prost(message, repeated, tag = "1")]
+    match_expressions: Vec<ScopedResourceSelectorRequirement>,
+}
+
 /// ResourceQuotaSpec — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ResourceQuotaSpec
 ///
-/// Fields 1 (hard) and 2 (scopes) are decoded; scopeSelector (field 3) is skipped.
+/// Fields 1 (hard), 2 (scopes), and 3 (scopeSelector) are decoded.
 /// hard is required by the quota controller to enforce limits; without it the controller
 /// sees no limits and skips reconciliation, leaving spec.hard null after create.
 /// scopes is required so the quota controller scope-filters pods correctly; without it
 /// a Terminating-scoped quota appears scope-less and KCM counts all pods against it.
+/// scopeSelector is required for the scope-selectors conformance test (:1567) which
+/// uses spec.scopeSelector instead of spec.scopes.
 #[derive(Clone, PartialEq, Message)]
 struct ResourceQuotaSpec {
     /// hard (field 1, map<string, Quantity>) — the desired hard limits per named resource
@@ -2752,6 +2793,10 @@ struct ResourceQuotaSpec {
     /// scopes (field 2, repeated string) — e.g. ["Terminating"], ["BestEffort"]
     #[prost(string, repeated, tag = "2")]
     scopes: Vec<String>,
+    /// scopeSelector (field 3, optional ScopeSelector) — alternative to scopes using
+    /// matchExpressions with operators (Exists, DoesNotExist, In, NotIn)
+    #[prost(message, optional, tag = "3")]
+    scope_selector: Option<ScopeSelector>,
 }
 
 /// ResourceQuota — k8s.io/api/core/v1/generated.proto
@@ -5475,6 +5520,14 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
             serde_json::Value::String(spec.restart_policy),
         );
     }
+    if let Some(ads) = spec.active_deadline_seconds {
+        if ads > 0 {
+            spec_map.insert(
+                "activeDeadlineSeconds".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(ads)),
+            );
+        }
+    }
     if !spec.service_account_name.is_empty() {
         spec_map.insert(
             "serviceAccountName".to_string(),
@@ -6168,7 +6221,7 @@ pub fn decode_resourcequota_proto(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta
     });
     if let Some(spec) = obj.spec {
-        if !spec.hard.is_empty() || !spec.scopes.is_empty() {
+        if !spec.hard.is_empty() || !spec.scopes.is_empty() || spec.scope_selector.is_some() {
             let mut spec_json = serde_json::json!({});
             if !spec.hard.is_empty() {
                 spec_json["hard"] = limitrange_quantity_map_to_json(spec.hard);
@@ -6176,6 +6229,27 @@ pub fn decode_resourcequota_proto(data: &[u8]) -> Option<serde_json::Value> {
             if !spec.scopes.is_empty() {
                 spec_json["scopes"] =
                     serde_json::Value::Array(spec.scopes.into_iter().map(Into::into).collect());
+            }
+            if let Some(ss) = spec.scope_selector {
+                if !ss.match_expressions.is_empty() {
+                    let exprs: Vec<serde_json::Value> = ss
+                        .match_expressions
+                        .into_iter()
+                        .map(|expr| {
+                            let mut m = serde_json::json!({
+                                "scopeName": expr.scope_name,
+                                "operator": expr.operator,
+                            });
+                            if !expr.values.is_empty() {
+                                m["values"] = serde_json::Value::Array(
+                                    expr.values.into_iter().map(Into::into).collect(),
+                                );
+                            }
+                            m
+                        })
+                        .collect();
+                    spec_json["scopeSelector"] = serde_json::json!({ "matchExpressions": exprs });
+                }
             }
             result["spec"] = spec_json;
         }
@@ -9088,6 +9162,74 @@ mod tests {
             "spec.runtimeClassName must survive proto decode — without it the overhead \
              injection block in create_pod is never entered and spec.overhead stays absent, \
              causing the RuntimeClass conformance test to fail"
+        );
+    }
+
+    /// decode_pod_proto must preserve spec.activeDeadlineSeconds from field 5 of PodSpec.
+    ///
+    /// The ResourceQuota conformance test "should verify ResourceQuota with terminating scopes"
+    /// ([sig-api-machinery] resource_quota.go:803) creates a terminating pod (activeDeadlineSeconds=600)
+    /// via the typed Go client which sends protobuf. Without decoding PodSpec field 5, the stored
+    /// JSON lacks activeDeadlineSeconds, pod_is_terminating() always returns false, and the
+    /// reconciler never counts the pod against the Terminating-scoped quota. The test then
+    /// times out (5 minutes) waiting for status.used.pods to reach "1". This test must fail
+    /// if the field 5 decode is removed.
+    #[test]
+    fn decode_pod_proto_preserves_active_deadline_seconds_for_terminating_scope_quota() {
+        // Build: Pod {
+        //   metadata: ObjectMeta { name: "terminating-pod", namespace: "test-ns" },
+        //   spec: PodSpec {
+        //     containers: [Container { name: "c", image: "img" }],
+        //     activeDeadlineSeconds: 600,   // field 5, varint
+        //   }
+        // }
+        fn encode_varint_field(field_number: u64, value: u64) -> Vec<u8> {
+            let tag = field_number << 3; // wire type 0 = varint
+            let mut out = Vec::new();
+            let mut t = tag;
+            loop {
+                let byte = (t & 0x7f) as u8;
+                t >>= 7;
+                if t == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+            let mut v = value;
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+            out
+        }
+
+        let mut obj_meta = encode_length_delimited(1, b"terminating-pod");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"test-ns"));
+
+        let mut container = encode_length_delimited(1, b"c");
+        container.extend_from_slice(&encode_length_delimited(2, b"img"));
+
+        let mut pod_spec = encode_length_delimited(2, &container); // containers at field 2
+        pod_spec.extend_from_slice(&encode_varint_field(5, 600)); // activeDeadlineSeconds = 600
+
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed for a pod with activeDeadlineSeconds");
+
+        assert_eq!(
+            result["spec"]["activeDeadlineSeconds"], 600,
+            "spec.activeDeadlineSeconds must survive proto decode — without it pod_is_terminating \
+             always returns false, the reconciler never counts the terminating pod against a \
+             Terminating-scoped ResourceQuota, and the conformance test times out after 5 minutes \
+             waiting for status.used.pods to reach '1'"
         );
     }
 
