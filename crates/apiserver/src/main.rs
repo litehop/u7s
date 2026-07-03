@@ -2291,24 +2291,39 @@ pub async fn reconcile_quota_status(store: &SqliteStore) -> bool {
 
         let live_used = quota::count_quota_usage(store, &quota).await;
 
-        let current_used = quota["status"]["used"]
+        // Compare only the keys we computed against current values for those same keys.
+        // KCM writes status.used for all hard-limit resources (including CPU/memory).
+        // We only compute count-based resources (pods, services, …).  Comparing or
+        // replacing the full map would clobber KCM's CPU/memory entries.
+        let current_for_live_keys: std::collections::BTreeMap<String, String> = quota["status"]
+            ["used"]
             .as_object()
             .map(|m| {
                 m.iter()
+                    .filter(|(k, _)| live_used.contains_key(k.as_str()))
                     .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("0").to_string()))
-                    .collect::<std::collections::BTreeMap<_, _>>()
+                    .collect()
             })
             .unwrap_or_default();
 
-        if live_used == current_used {
+        if live_used == current_for_live_keys {
             continue;
         }
 
-        let used_json: serde_json::Value = live_used
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect();
-        quota["status"]["used"] = used_json;
+        // Merge our computed values into the existing used map; do not replace keys
+        // that KCM (or another writer) set for resources we do not compute.
+        if let Some(used_map) = quota["status"]["used"].as_object_mut() {
+            for (k, v) in &live_used {
+                used_map.insert(k.clone(), serde_json::Value::String(v.clone()));
+            }
+        } else {
+            // No existing used map — create one from our values.
+            let used_json: serde_json::Value = live_used
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect();
+            quota["status"]["used"] = used_json;
+        }
 
         if let Err(e) = store
             .put(&key, Bytes::from(quota.to_string()), Some(revision))
