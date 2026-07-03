@@ -254,6 +254,14 @@ fn merge_key_for_path(path: &str) -> MergeKeyKind {
         // reconcile and continuously recreate the pod sandbox (sandbox loop).
         path if path == "podIPs" || path.ends_with(".podIPs") => MergeKeyKind::Key("ip"),
 
+        // ownerReferences is keyed by uid.  KCM releases a pod from a ReplicaSet/RC by
+        // sending $patch:delete with the RS uid; without this entry the directive is stored
+        // literally, leaving a garbage ownerReference {$patch:delete, uid:…} that causes
+        // controllers and GC to dereference a nil .Controller field and panic.
+        path if path == "metadata.ownerReferences" || path.ends_with(".ownerReferences") => {
+            MergeKeyKind::Key("uid")
+        }
+
         path if path == "containerStatuses"
             || path.ends_with(".containerStatuses")
             || path == "initContainerStatuses"
@@ -1016,6 +1024,123 @@ mod tests {
         assert!(
             state.get("running").is_some(),
             "running key must be present after kubelet patches state to running"
+        );
+    }
+
+    /// $patch:delete on metadata.ownerReferences must remove the matching entry by uid,
+    /// not store the directive object literally.
+    ///
+    /// KCM releases an adopted pod from a ReplicaSet/RC by sending a strategic-merge PATCH with
+    /// {"metadata":{"ownerReferences":[{"$patch":"delete","uid":"<rs-uid>"}]}}.
+    /// Without "uid" registered as the merge key for ownerReferences, the $patch:delete element
+    /// falls through to last-write-wins and is stored as a garbage ownerReference
+    /// {"$patch":"delete","uid":"..."} with no controller/blockOwnerDeletion fields.
+    /// Controllers and GC that dereference .Controller on that entry nil-deref and panic
+    /// (the ReplicaSet adopt-release conformance test panics at replica_set.go:392).
+    #[test]
+    fn smp_patch_delete_on_owner_references_removes_entry_not_stores_directive() {
+        let mut target = serde_json::json!({
+            "metadata": {
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "name": "my-rs",
+                        "uid": "rs-uid-X",
+                        "controller": true,
+                        "blockOwnerDeletion": true
+                    },
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "name": "other-rs",
+                        "uid": "rs-uid-Y",
+                        "controller": false,
+                        "blockOwnerDeletion": false
+                    }
+                ]
+            }
+        });
+        // KCM releases the pod from my-rs by sending $patch:delete for rs-uid-X.
+        let patch = serde_json::json!({
+            "metadata": {
+                "ownerReferences": [
+                    {"$patch": "delete", "uid": "rs-uid-X"}
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let refs = target["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(
+            refs.len(),
+            1,
+            "$patch:delete must remove the matching ownerReference by uid — if the directive \
+             is stored literally, controllers/GC dereference .Controller on the garbage entry \
+             and nil-deref panic (RS adopt-release conformance test fails at replica_set.go:392)"
+        );
+        assert_eq!(
+            refs[0]["uid"], "rs-uid-Y",
+            "the surviving ownerReference must be the one whose uid was NOT deleted"
+        );
+        assert!(
+            refs.iter().all(|r| r.get("$patch").is_none()),
+            "the $patch directive object must not appear as a literal ownerReference entry"
+        );
+    }
+
+    /// A normal (non-directive) ownerReferences strategic-merge patch merges by uid.
+    ///
+    /// Adding a new ownerReference must preserve existing ones; updating an existing one
+    /// (same uid) must merge the fields rather than duplicate the entry.
+    #[test]
+    fn smp_owner_references_merge_by_uid_preserves_existing_entries() {
+        let mut target = serde_json::json!({
+            "metadata": {
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "name": "my-rs",
+                        "uid": "rs-uid-X",
+                        "controller": true
+                    }
+                ]
+            }
+        });
+        // Patch adds a second ownerReference; the first must survive.
+        let patch = serde_json::json!({
+            "metadata": {
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "name": "other-rs",
+                        "uid": "rs-uid-Y",
+                        "controller": false
+                    }
+                ]
+            }
+        });
+
+        strategic_merge_patch(&mut target, &patch).unwrap();
+
+        let refs = target["metadata"]["ownerReferences"].as_array().unwrap();
+        assert_eq!(
+            refs.len(),
+            2,
+            "adding a new ownerReference must preserve the existing one — \
+             without uid merge key, the entire array is replaced and the pod \
+             loses its original owner, breaking GC and adoption tracking"
+        );
+        assert!(
+            refs.iter().any(|r| r["uid"] == "rs-uid-X"),
+            "original ownerReference (rs-uid-X) must survive the merge"
+        );
+        assert!(
+            refs.iter().any(|r| r["uid"] == "rs-uid-Y"),
+            "new ownerReference (rs-uid-Y) must be present after the merge"
         );
     }
 
