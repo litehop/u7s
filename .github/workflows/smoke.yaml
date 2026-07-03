@@ -393,14 +393,21 @@ jobs:
           echo "SMOKE_TMPDIR=$TMPDIR" >> "$GITHUB_ENV"
           SMOKE_TOKEN="kubelet-admin-token-$(date +%s)"
           echo "$SMOKE_TOKEN,kubelet-admin,uid0,system:masters" > "$TMPDIR/token-auth.csv"
+          # Pass --ca-key / --ca-cert so the CA key is available to sign the kubelet
+          # serving cert below (needed for apiserver→kubelet mTLS).
+          # Pass --kubelet-preferred-address 127.0.0.1 so the apiserver always dials
+          # the kubelet at 127.0.0.1:10250 — the serving cert SAN only needs 127.0.0.1.
           ./target/release/u7s-apiserver \
             --db "$TMPDIR/state.db" \
             --kubeconfig "$TMPDIR/kubeconfig" \
             --sa-key "$TMPDIR/sa.key" \
             --sa-pub "$TMPDIR/sa.pub" \
+            --ca-key "$TMPDIR/ca.key" \
+            --ca-cert "$TMPDIR/ca.crt" \
             --token-auth-file "$TMPDIR/token-auth.csv" \
             --advertise-address https://127.0.0.1:6443 \
             --service-cluster-ip-range "10.96.0.0/12" \
+            --kubelet-preferred-address 127.0.0.1 \
             >"$TMPDIR/server.log" 2>&1 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
           for i in $(seq 1 30); do
@@ -430,6 +437,35 @@ jobs:
             "    token: $SMOKE_TOKEN" \
             > "$TMPDIR/kubeconfig"
 
+      - name: Generate kubelet TLS
+        run: |
+          # Mirror lima-start.sh: give the kubelet a serving cert signed by the cluster CA
+          # so the apiserver's WebPkiServerVerifier can verify it, and a --client-ca-file
+          # so the kubelet can authenticate the apiserver's mTLS client cert on log/exec/attach.
+          # Without these, build_kubelet_tls_config rejects the kubelet's self-signed cert
+          # and the log proxy returns InternalError ("kubelet request failed").
+          TMPDIR="${{ env.SMOKE_TMPDIR }}"
+          # ca.crt is DER-encoded; kubelet and openssl need PEM.
+          openssl x509 -in "$TMPDIR/ca.crt" -inform DER -out "$TMPDIR/ca.pem" -outform PEM
+          sudo cp "$TMPDIR/ca.pem" /etc/kubelet-ca.crt
+          sudo chmod 644 /etc/kubelet-ca.crt
+          # Generate a kubelet serving key + cert with SAN=127.0.0.1.
+          # The apiserver always dials 127.0.0.1:10250 (--kubelet-preferred-address 127.0.0.1),
+          # so only that SAN is needed — no need to discover the runner's InternalIP.
+          openssl ecparam -genkey -name prime256v1 -noout -out "$TMPDIR/kubelet-tls.key"
+          openssl req -new -key "$TMPDIR/kubelet-tls.key" \
+            -subj "/CN=ci-node" -sha256 \
+            -out "$TMPDIR/kubelet-tls.csr"
+          openssl x509 -req -in "$TMPDIR/kubelet-tls.csr" \
+            -CA "$TMPDIR/ca.pem" -CAkey "$TMPDIR/ca.key" \
+            -CAcreateserial -days 365 -sha256 \
+            -extfile <(printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n') \
+            -out "$TMPDIR/kubelet-tls.crt"
+          sudo cp "$TMPDIR/kubelet-tls.crt" /etc/kubelet-tls.crt
+          sudo cp "$TMPDIR/kubelet-tls.key" /etc/kubelet-tls.key
+          sudo chmod 644 /etc/kubelet-tls.crt
+          sudo chmod 600 /etc/kubelet-tls.key
+
       - name: Start kubelet
         run: |
           TMPDIR="${{ env.SMOKE_TMPDIR }}"
@@ -444,6 +480,13 @@ jobs:
           failSwapOn: false
           resolvConf: ""
           staticPodPath: /tmp/kubelet-pods
+          authentication:
+            x509:
+              clientCAFile: /etc/kubelet-ca.crt
+            anonymous:
+              enabled: false
+          authorization:
+            mode: AlwaysAllow
           EOF
           sudo "$HOME/bin/kubelet" \
             --config=/etc/kubelet-config.yaml \
@@ -451,6 +494,8 @@ jobs:
             --hostname-override=ci-node \
             --logging-format=text \
             --v=2 \
+            --tls-cert-file=/etc/kubelet-tls.crt \
+            --tls-private-key-file=/etc/kubelet-tls.key \
             >"$TMPDIR/kubelet.log" 2>&1 &
           echo "KUBELET_PID=$!" >> "$GITHUB_ENV"
 
