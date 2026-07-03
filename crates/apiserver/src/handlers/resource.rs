@@ -821,6 +821,7 @@ pub(crate) async fn do_patch<S: Store>(
                 inject_managed_fields(&mut current.body, fm, &api_ver, &now);
             }
         }
+        inject_type_meta(&mut current.body, group, version, &meta.kind);
         return Ok(Json(current.body).into_response());
     }
 
@@ -850,6 +851,7 @@ pub(crate) async fn do_patch<S: Store>(
             inject_managed_fields(&mut current.body, fm, &api_ver, &now);
         }
     }
+    inject_type_meta(&mut current.body, group, version, &meta.kind);
     Ok(Json(current.body).into_response())
 }
 
@@ -5615,6 +5617,89 @@ mod tests {
         let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["metadata"]["labels"]["env"], "prod");
+    }
+
+    /// PATCH response must include kind and apiVersion even when the stored object omits them.
+    ///
+    /// The Kubernetes API contract requires every response object to carry TypeMeta.
+    /// client-go (and the DRA conformance harness) checks `Object.Kind` on every response;
+    /// if kind is absent it returns "Object 'Kind' is missing" and the conformance test fails.
+    ///
+    /// The bug: do_patch returned current.body without calling inject_type_meta, so if the
+    /// stored JSON lacked kind/apiVersion (e.g. the client omitted them in the create body),
+    /// the PATCH response would also lack them. This affects ALL resources, not only ResourceClaim.
+    ///
+    /// This test fails if inject_type_meta is removed from the PATCH return path in do_patch.
+    #[tokio::test]
+    async fn patch_namespaced_resource_response_always_includes_type_meta() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Store a Lease WITHOUT kind/apiVersion in the body — simulates a client that omits
+        // TypeMeta and relies on the server to stamp it in every response (including PATCH).
+        let lease_without_type_meta = serde_json::json!({
+            "metadata": { "name": "no-type-meta", "namespace": "kube-node-lease", "resourceVersion": "1" },
+            "spec": { "holderIdentity": "original" }
+        });
+        store
+            .put(
+                "/registry/coordination.k8s.io/leases/kube-node-lease/no-type-meta",
+                bytes::Bytes::from(serde_json::to_vec(&lease_without_type_meta).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut mp_headers = axum::http::HeaderMap::new();
+        mp_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/merge-patch+json"),
+        );
+
+        let patch = serde_json::json!({"spec": {"holderIdentity": "patched"}});
+
+        let result = patch_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "no-type-meta".into(),
+            )),
+            axum::extract::Query(PatchQuery::default()),
+            test_user(),
+            mp_headers,
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .expect("patch must succeed")
+        .into_response();
+
+        let body = to_bytes(result.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["kind"], "Lease",
+            "PATCH response must include kind even when stored body lacks it; \
+             conformance harness rejects the object with 'Object Kind is missing'"
+        );
+        assert_eq!(
+            v["apiVersion"], "coordination.k8s.io/v1",
+            "PATCH response must include apiVersion even when stored body lacks it; \
+             conformance harness requires both kind and apiVersion on every response"
+        );
     }
 
     /// patch_namespaced_resource with merge-patch updates the object.

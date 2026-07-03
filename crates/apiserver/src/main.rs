@@ -442,7 +442,8 @@ fn build_router(state: AppState) -> Router {
         // Must be before the generic catch-all so axum doesn't interpret "resize" as a pod name.
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/resize",
-            axum::routing::patch(handlers::pods::patch_pod_resize)
+            axum::routing::get(handlers::pods::get_pod_resize)
+                .patch(handlers::pods::patch_pod_resize)
                 .put(handlers::pods::patch_pod_resize),
         )
         // Pods — ephemeralcontainers subresource (GA since k8s 1.25)

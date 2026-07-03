@@ -425,7 +425,8 @@ struct KeyToPath {
 }
 
 /// SecretVolumeSource — api-core-v1-generated.proto message SecretVolumeSource
-/// field 1 = secretName (string), field 2 = items (repeated KeyToPath)
+/// field 1 = secretName (string), field 2 = items (repeated KeyToPath),
+/// field 3 = defaultMode (int32)
 #[derive(Clone, PartialEq, Message)]
 struct SecretVolumeSource {
     /// secretName (field 1, string) — name of the Secret in the pod's namespace
@@ -434,6 +435,9 @@ struct SecretVolumeSource {
     /// items (field 2, repeated KeyToPath) — key-to-path mappings within the volume
     #[prost(message, repeated, tag = "2")]
     items: Vec<KeyToPath>,
+    /// defaultMode (field 3, int32) — default permission bits for files in the volume
+    #[prost(int32, tag = "3")]
+    default_mode: i32,
 }
 
 /// LocalObjectReference — api-core-v1-generated.proto message LocalObjectReference
@@ -446,7 +450,8 @@ struct LocalObjectReference {
 }
 
 /// ConfigMapVolumeSource — api-core-v1-generated.proto message ConfigMapVolumeSource
-/// field 1 = localObjectReference (message, name), field 2 = items (repeated KeyToPath)
+/// field 1 = localObjectReference (message, name), field 2 = items (repeated KeyToPath),
+/// field 3 = defaultMode (int32)
 #[derive(Clone, PartialEq, Message)]
 struct ConfigMapVolumeSource {
     /// localObjectReference (field 1, message) — contains the configMap name
@@ -455,6 +460,9 @@ struct ConfigMapVolumeSource {
     /// items (field 2, repeated KeyToPath) — key-to-path mappings within the volume
     #[prost(message, repeated, tag = "2")]
     items: Vec<KeyToPath>,
+    /// defaultMode (field 3, int32) — default permission bits for files in the volume
+    #[prost(int32, tag = "3")]
+    default_mode: i32,
 }
 
 /// EmptyDirVolumeSource — api-core-v1-generated.proto message EmptyDirVolumeSource
@@ -3862,17 +3870,15 @@ pub fn decode_lease_proto(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(t) = spec.acquire_time {
             if t.seconds > 0 {
-                let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
-                    t.seconds as u64,
-                ));
+                // MicroTime carries sub-second precision via nanos; truncate to microseconds.
+                let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
                 spec_map.insert("acquireTime".to_string(), serde_json::Value::String(ts));
             }
         }
         if let Some(t) = spec.renew_time {
             if t.seconds > 0 {
-                let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
-                    t.seconds as u64,
-                ));
+                // MicroTime carries sub-second precision via nanos; truncate to microseconds.
+                let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
                 spec_map.insert("renewTime".to_string(), serde_json::Value::String(ts));
             }
         }
@@ -4058,9 +4064,7 @@ pub fn decode_event_proto(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(t) = s.last_observed_time {
             if t.seconds > 0 {
-                let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
-                    t.seconds as u64,
-                ));
+                let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
                 sm.insert(
                     "lastObservedTime".to_string(),
                     serde_json::Value::String(ts),
@@ -5370,6 +5374,18 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
                                     key_to_path_items_to_json(s.items),
                                 );
                             }
+                            // defaultMode: kubelet applies these permission bits to files in the
+                            // volume; if absent the kubelet falls back to 0644, ignoring what the
+                            // pod spec requested (e.g. 0400 for read-only secrets).
+                            let dm = if s.default_mode == 0 {
+                                420
+                            } else {
+                                s.default_mode
+                            };
+                            secret_map.insert(
+                                "defaultMode".to_string(),
+                                serde_json::Value::Number(dm.into()),
+                            );
                             vm.insert("secret".to_string(), serde_json::Value::Object(secret_map));
                         }
                     }
@@ -5410,6 +5426,18 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
                                         key_to_path_items_to_json(cm.items),
                                     );
                                 }
+                                // defaultMode: kubelet applies these permission bits to files in
+                                // the volume; if absent the kubelet falls back to 0644, ignoring
+                                // what the pod spec requested (e.g. 0400 for read-only configs).
+                                let dm = if cm.default_mode == 0 {
+                                    420
+                                } else {
+                                    cm.default_mode
+                                };
+                                cm_map.insert(
+                                    "defaultMode".to_string(),
+                                    serde_json::Value::Number(dm.into()),
+                                );
                                 vm.insert(
                                     "configMap".to_string(),
                                     serde_json::Value::Object(cm_map),
@@ -7955,9 +7983,7 @@ pub fn decode_events_v1_event_proto(data: &[u8]) -> Option<serde_json::Value> {
     });
     if let Some(t) = ev.event_time {
         if t.seconds > 0 {
-            let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
-                t.seconds as u64,
-            ));
+            let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
             out["eventTime"] = serde_json::Value::String(ts);
         }
     }
@@ -7968,9 +7994,7 @@ pub fn decode_events_v1_event_proto(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(t) = s.last_observed_time {
             if t.seconds > 0 {
-                let ts = crate::util::normalize_rfc3339_to_micro(&crate::util::secs_to_rfc3339(
-                    t.seconds as u64,
-                ));
+                let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
                 sj["lastObservedTime"] = serde_json::Value::String(ts);
             }
         }
@@ -10645,6 +10669,46 @@ mod tests {
             "acquireTime with seconds=-1 must be absent, not year-584554049254; \
              got: {} — negative MicroTime seconds must be dropped, not cast to u64::MAX",
             result["spec"]["acquireTime"]
+        );
+    }
+
+    /// Lease.renewTime nanoseconds must be preserved in the decoded timestamp.
+    ///
+    /// The kubelet sends MicroTime (seconds + nanoseconds) on every heartbeat. If nanoseconds
+    /// are silently discarded, the stored renewTime is second-level precision while the kubelet's
+    /// in-memory value has sub-second precision. The lease conformance test compares the GET
+    /// response renewTime against the value the kubelet PUT — if nanos are dropped the comparison
+    /// fails because `2024-01-01T00:00:15.000000Z` != `2024-01-01T00:00:15.123456Z`.
+    ///
+    /// This test fails if secs_nanos_to_rfc3339_micro is reverted to normalize_rfc3339_to_micro
+    /// (which zeroes out the fractional seconds, producing .000000 regardless of nanos).
+    #[test]
+    fn decode_lease_proto_preserves_renew_time_nanoseconds() {
+        // Build: LeaseSpec { renewTime: MicroTime { seconds: 1704067215, nanos: 123456000 } }
+        // 123456000 nanos = 123456 microseconds → .123456 in the formatted string.
+        let mut obj_meta = encode_length_delimited(1, b"test-node");
+        obj_meta.extend_from_slice(&encode_length_delimited(3, b"kube-node-lease"));
+
+        // MicroTime for renewTime: field 1 (seconds, varint) + field 2 (nanos, varint)
+        let mut renew_time_msg = encode_varint(1 << 3); // field 1, wire 0
+        renew_time_msg.extend_from_slice(&encode_varint(1_704_067_215u64));
+        // nanos field: tag = (2 << 3) | 0 = 0x10
+        renew_time_msg.push(0x10);
+        renew_time_msg.extend_from_slice(&encode_varint(123_456_000u64)); // 123456 µs
+
+        // LeaseSpec { renewTime (field 4) }
+        let lease_spec = encode_length_delimited(4, &renew_time_msg);
+
+        let mut lease_proto = encode_length_delimited(1, &obj_meta);
+        lease_proto.extend_from_slice(&encode_length_delimited(2, &lease_spec));
+
+        let result = decode_lease_proto(&lease_proto).expect("must decode Lease proto");
+
+        assert_eq!(
+            result["spec"]["renewTime"], "2024-01-01T00:00:15.123456Z",
+            "renewTime must include microsecond precision from MicroTime.nanos; \
+             if nanos are dropped the kubelet's heartbeat timestamp is rounded to \
+             second precision and the lease conformance comparison fails"
         );
     }
 
@@ -13989,6 +14053,107 @@ mod tests {
             volumes[0]["secret"]["secretName"], "my-secret",
             "volumes[0].secret.secretName must be 'my-secret' — kubelet uses this to find the \
              Secret object; if absent the volume cannot be mounted and the pod stays Pending"
+        );
+    }
+
+    /// spec.volumes[].secret.defaultMode must survive proto decode and appear in decoded JSON.
+    ///
+    /// The kubelet applies defaultMode as the permission bits for all files in the mounted
+    /// secret volume. If defaultMode is dropped, the kubelet falls back to 0644, so a pod
+    /// requesting 0400 (read-only) gets 0644 files — the conformance test
+    /// "should be consumable from pods in volume with defaultMode set" then fails because
+    /// the actual file mode does not match what the pod spec requested.
+    ///
+    /// This test fails if SecretVolumeSource.default_mode (field 3) is removed from the
+    /// prost struct or the defaultMode emit block in pod_spec_to_json is removed.
+    #[test]
+    fn decode_pod_proto_preserves_secret_volume_default_mode() {
+        // SecretVolumeSource { secretName (field 1) = "my-secret", defaultMode (field 3) = 256 }
+        // 256 decimal = 0o400 octal (read-only by owner) — same value the conformance test uses.
+        let mut secret_vol_src = encode_length_delimited(1, b"my-secret");
+        // field 3 (defaultMode), wire type 0 (varint): tag = (3 << 3) | 0 = 0x18
+        secret_vol_src.push(0x18);
+        secret_vol_src.extend_from_slice(&encode_varint(256));
+
+        // VolumeSource { secret (field 6) = SecretVolumeSource }
+        let volume_source = encode_length_delimited(6, &secret_vol_src);
+
+        // Volume { name (field 1) = "sec-vol", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"sec-vol");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with a secret volume with defaultMode");
+
+        let volumes = result["spec"]["volumes"]
+            .as_array()
+            .expect("spec.volumes must be present");
+        assert_eq!(
+            volumes[0]["secret"]["defaultMode"], 256,
+            "secret.defaultMode must be 256 (0o400); if dropped the kubelet uses 0644 instead \
+             of the requested mode, causing the conformance test \
+             'should be consumable from pods in volume with defaultMode set' to fail"
+        );
+    }
+
+    /// spec.volumes[].configMap.defaultMode must survive proto decode and appear in decoded JSON.
+    ///
+    /// Same bug class as SecretVolumeSource.defaultMode: the kubelet applies defaultMode to all
+    /// files in the mounted configMap volume. If dropped, files get 0644 instead of the
+    /// requested mode, and the conformance test fails.
+    ///
+    /// This test fails if ConfigMapVolumeSource.default_mode (field 3) is removed from the
+    /// prost struct or the defaultMode emit block in pod_spec_to_json is removed.
+    #[test]
+    fn decode_pod_proto_preserves_configmap_volume_default_mode() {
+        // ConfigMapVolumeSource {
+        //   localObjectReference (field 1) = { name (field 1) = "my-cm" },
+        //   defaultMode (field 3) = 256  (0o400)
+        // }
+        let local_ref = encode_length_delimited(1, b"my-cm");
+        let mut cm_vol_src = encode_length_delimited(1, &local_ref);
+        // field 3 (defaultMode), wire type 0: tag = (3 << 3) | 0 = 0x18
+        cm_vol_src.push(0x18);
+        cm_vol_src.extend_from_slice(&encode_varint(256));
+
+        // VolumeSource { configMap (field 19) = ConfigMapVolumeSource }
+        let volume_source = encode_length_delimited(19, &cm_vol_src);
+
+        // Volume { name (field 1) = "cm-vol", volumeSource (field 2) = VolumeSource }
+        let mut volume = encode_length_delimited(1, b"cm-vol");
+        volume.extend_from_slice(&encode_length_delimited(2, &volume_source));
+
+        // PodSpec { volumes (field 1), containers (field 2) }
+        let container = encode_length_delimited(1, b"app");
+        let mut podspec = encode_length_delimited(1, &volume);
+        podspec.extend_from_slice(&encode_length_delimited(2, &container));
+
+        // Pod { metadata (field 1), spec (field 2) }
+        let obj_meta = encode_length_delimited(1, b"test-pod");
+        let mut pod_proto = encode_length_delimited(1, &obj_meta);
+        pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
+
+        let result = decode_pod_proto(&pod_proto)
+            .expect("decode_pod_proto must succeed with a configMap volume with defaultMode");
+
+        let volumes = result["spec"]["volumes"]
+            .as_array()
+            .expect("spec.volumes must be present");
+        assert_eq!(
+            volumes[0]["configMap"]["defaultMode"], 256,
+            "configMap.defaultMode must be 256 (0o400); if dropped the kubelet uses 0644 instead \
+             of the requested mode, causing the conformance test \
+             'should be consumable from pods in volume with defaultMode set' to fail"
         );
     }
 

@@ -2061,6 +2061,34 @@ pub async fn patch_pod_resize<S: Store>(
     Ok(Json(current_obj.body))
 }
 
+/// GET /api/v1/namespaces/{ns}/pods/{name}/resize
+///
+/// Returns the pod object. status.resize (a field within status) reflects the
+/// current resize state. The in-place-resize conformance test polls this endpoint
+/// after each PATCH /resize to confirm the resize was applied; without this
+/// handler the route returns 405 and the conformance poll loop never terminates.
+pub async fn get_pod_resize<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns, name)): Path<(String, String)>,
+) -> Result<Response, crate::status::StatusError> {
+    let ns = parse_namespace(&raw_ns, &state).await?;
+
+    let key = object_key("pods", ns.as_str(), &name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, "Pod"))?;
+
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        stored.value,
+    )
+        .into_response())
+}
+
 // ---------------------------------------------------------------------------
 // EphemeralContainers subresource — PATCH /api/v1/namespaces/:ns/pods/:name/ephemeralcontainers
 // ---------------------------------------------------------------------------
@@ -7456,6 +7484,94 @@ mod handler_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_pod_resize
+    // -----------------------------------------------------------------------
+
+    /// GET /pods/<name>/resize must return 200 with the pod body.
+    ///
+    /// The in-place-resize conformance test polls GET /resize after each
+    /// PATCH /resize to confirm the resize was applied. Without this handler
+    /// the route returns 405 and the conformance poll loop never terminates.
+    #[tokio::test]
+    async fn get_pod_resize_returns_200_with_pod_body() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        let pod_json = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "resize-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"phase": "Running", "resize": "Proposed"}
+        });
+        store
+            .put(
+                "/registry/pods/default/resize-pod",
+                bytes::Bytes::from(serde_json::to_vec(&pod_json).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                get(get_pod_resize),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/resize-pod/resize")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET /pods/<name>/resize must return the resize status — the in-place-resize \
+             conformance test polls it; 405 breaks the test"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["status"]["resize"], "Proposed",
+            "GET /pods/<name>/resize must return the pod body including status.resize so \
+             the conformance test can observe the resize state transition"
+        );
+    }
+
+    /// GET /pods/<name>/resize on a missing pod must return 404, not 405.
+    #[tokio::test]
+    async fn get_pod_resize_missing_pod_returns_404() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/namespaces/{ns}/pods/{name}/resize",
+                get(get_pod_resize),
+            )
+            .with_state(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/pods/ghost/resize")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GET /pods/<name>/resize must return 404 for a missing pod"
+        );
     }
 
     // -----------------------------------------------------------------------
