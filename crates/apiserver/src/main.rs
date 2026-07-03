@@ -261,6 +261,10 @@ async fn main() -> anyhow::Result<()> {
     // 10b. Seed service IP hint from already-allocated sentinels in the store.
     state.init_service_ip_hint().await;
 
+    // 10c-pre. Populate admission config cache from persisted objects before serving.
+    // This ensures the first admission check after startup reads from cache, not the store.
+    state.init_admission_cache().await;
+
     // 10c. Keep the kubernetes EndpointSlice in sync with the kubernetes Endpoints.
     // KCM's endpointslice-controller may update the EndpointSlice with the apiserver
     // address from its own kubeconfig (e.g. a Lima VM gateway IP), which differs from
