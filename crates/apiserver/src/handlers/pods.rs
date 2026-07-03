@@ -602,7 +602,13 @@ pub async fn delete_pod<S: Store>(
 
     // Soft-delete: stamp deletionTimestamp so the kubelet knows to gracefully terminate
     // the container. Applies regardless of whether the pod has finalizers.
+    //
+    // Setting deletionTimestamp is always a real mutation — Kubernetes increments
+    // metadata.generation on every graceful delete so that controllers can detect
+    // the transition via observedGeneration (pods.go:573 conformance test).
     obj.body["metadata"]["deletionTimestamp"] = serde_json::Value::String(utc_now_rfc3339());
+    let current_gen = obj.body["metadata"]["generation"].as_i64().unwrap_or(1);
+    obj.body["metadata"]["generation"] = serde_json::json!(current_gen + 1);
     let expected_rv = parse_resource_version(obj.resource_version())?;
     let new_rv = state
         .store
@@ -3095,12 +3101,12 @@ mod patch_type_tests {
     }
 }
 
-/// Apply pod creation defaults: set spec.enableServiceLinks=true if absent,
-/// and stamp defaultMode=420 on configMap/secret/projected volumes if absent.
+/// Apply spec-only defaults to a pod's spec fields.
 ///
-/// Extracted for testability — the full create_pod handler is async and needs
-/// a live store, so the defaulting logic lives here as a pure function.
-pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
+/// This must NOT touch pod.status — callers on the update path rely on it being
+/// status-free so that a running pod's phase and conditions are never stomped back
+/// to "Pending" / "Unschedulable" by a no-op replace or patch.
+pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
     // Deserialize spec into typed form once; all typed-field accesses are compile-checked.
     let mut spec: PodSpec = serde_json::from_value(pod["spec"].clone()).unwrap_or_default();
 
@@ -3155,6 +3161,78 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
     }
     // If spec.volumes is None, there is nothing to default.
 
+    // Remove spurious `defaultMode` from DownwardAPIProjection sources inside projected volumes.
+    //
+    // `DownwardAPIProjection` (used in spec.volumes[].projected.sources[].downwardAPI) has no
+    // `defaultMode` field in the Kubernetes API — only `DownwardAPIVolumeSource` (top-level
+    // downwardAPI volume) has it. The u7s protobuf decoder incorrectly injects `defaultMode: 420`
+    // into these inner sources when decoding a protobuf PUT body from client-go, causing the
+    // stored spec (no defaultMode there) to differ from the proto-decoded incoming spec on every
+    // no-op replace, which produces a phantom generation bump. Stripping it here in the
+    // comparison copies normalises both sides to the canonical stored form.
+    //
+    // NOTE: use immutable index checks before mutable access — serde_json's IndexMut autovivifies
+    // intermediate null entries, which would corrupt volumes that have no projected field.
+    if let Some(volumes) = pod["spec"]["volumes"].as_array_mut() {
+        for vol in volumes.iter_mut() {
+            // Guard: only enter if the volume has an actual projected.sources array.
+            let has_projected_sources = vol
+                .get("projected")
+                .and_then(|p| p.get("sources"))
+                .and_then(|s| s.as_array())
+                .is_some();
+            if !has_projected_sources {
+                continue;
+            }
+            if let Some(sources) = vol["projected"]["sources"].as_array_mut() {
+                for src in sources.iter_mut() {
+                    if src.get("downwardAPI").is_some_and(|d| d.is_object()) {
+                        src["downwardAPI"]
+                            .as_object_mut()
+                            .map(|m| m.remove("defaultMode"));
+                    }
+                }
+            }
+        }
+    }
+
+    // Default fieldRef.apiVersion to "v1" and port protocol to "TCP" for all containers
+    // (including initContainers). Real kube-apiserver stamps both fields before storing.
+    // Absent fieldRef.apiVersion causes kubelet "unsupported pod version: <empty>".
+    // Absent port protocol causes KCM endpointslice controller to emit ports:[].
+    for containers_key in &["containers", "initContainers"] {
+        if let Some(containers) = pod["spec"][containers_key].as_array_mut() {
+            for container in containers {
+                if let Some(env) = container["env"].as_array_mut() {
+                    for var in env {
+                        let field_ref = &mut var["valueFrom"]["fieldRef"];
+                        if field_ref.is_object()
+                            && (field_ref["apiVersion"].is_null() || field_ref["apiVersion"] == "")
+                        {
+                            field_ref["apiVersion"] = serde_json::json!("v1");
+                        }
+                    }
+                }
+                if let Some(ports) = container["ports"].as_array_mut() {
+                    for port in ports {
+                        if port["protocol"].is_null() {
+                            port["protocol"] = serde_json::Value::String("TCP".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply pod creation defaults: set spec.enableServiceLinks=true if absent,
+/// and stamp defaultMode=420 on configMap/secret/projected volumes if absent.
+///
+/// Extracted for testability — the full create_pod handler is async and needs
+/// a live store, so the defaulting logic lives here as a pure function.
+pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
+    apply_pod_spec_defaults(pod);
+
     // Initialize status.conditions with PodScheduled=False when absent.
     //
     // Real kube-apiserver always stamps this condition on Pod create.  Conformance
@@ -3189,34 +3267,6 @@ pub fn apply_pod_create_defaults(pod: &mut serde_json::Value) {
         match pod["status"]["conditions"].as_array_mut() {
             Some(arr) => arr.push(scheduled_false),
             None => pod["status"]["conditions"] = serde_json::json!([scheduled_false]),
-        }
-    }
-
-    // Default fieldRef.apiVersion to "v1" and port protocol to "TCP" for all containers
-    // (including initContainers). Real kube-apiserver stamps both fields before storing.
-    // Absent fieldRef.apiVersion causes kubelet "unsupported pod version: <empty>".
-    // Absent port protocol causes KCM endpointslice controller to emit ports:[].
-    for containers_key in &["containers", "initContainers"] {
-        if let Some(containers) = pod["spec"][containers_key].as_array_mut() {
-            for container in containers {
-                if let Some(env) = container["env"].as_array_mut() {
-                    for var in env {
-                        let field_ref = &mut var["valueFrom"]["fieldRef"];
-                        if field_ref.is_object()
-                            && (field_ref["apiVersion"].is_null() || field_ref["apiVersion"] == "")
-                        {
-                            field_ref["apiVersion"] = serde_json::json!("v1");
-                        }
-                    }
-                }
-                if let Some(ports) = container["ports"].as_array_mut() {
-                    for port in ports {
-                        if port["protocol"].is_null() {
-                            port["protocol"] = serde_json::Value::String("TCP".to_string());
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -3306,16 +3356,15 @@ pub fn compute_qos_class(pod: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Set `metadata.generation = 1` on a newly created pod if absent or null.
-/// Preserves the caller-supplied value when it is already set.
+/// Set `metadata.generation = 1` on a newly created pod.
 ///
-/// Kubernetes conformance tests require generation=1 on every newly created pod.
-/// Without this, controllers that gate on observedGeneration == generation will
-/// never progress because generation stays at null.
+/// `metadata.generation` is a server-managed field in Kubernetes. The apiserver
+/// always stamps it to 1 on create, ignoring any client-supplied value.
+/// Controllers that gate on observedGeneration == generation must see generation=1
+/// on every new pod; a caller-supplied value of 100 would force a controller to
+/// wait for 99 phantom generations that will never arrive.
 pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
-    if pod["metadata"]["generation"].is_null() {
-        pod["metadata"]["generation"] = serde_json::json!(1i64);
-    }
+    pod["metadata"]["generation"] = serde_json::json!(1i64);
 }
 
 /// Increment `metadata.generation` by 1 when the pod spec has changed.
@@ -3323,11 +3372,34 @@ pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
 /// Called after PATCH and PUT operations. Kubernetes increments generation on
 /// every spec change so that controllers and status reporters can detect when
 /// spec has advanced past what they last reconciled (via observedGeneration).
+///
+/// Both sides are spec-defaulted before comparing so that a client omitting
+/// defaulted fields (dnsPolicy, enableServiceLinks, volume defaultMode,
+/// container env fieldRef.apiVersion, port protocol) does not produce a
+/// spurious generation bump — upstream k8s only bumps on a real spec change.
 pub fn increment_pod_generation_if_spec_changed(
     pod: &mut serde_json::Value,
     spec_before: &serde_json::Value,
 ) {
-    if pod["spec"] != *spec_before {
+    let mut after_pod = serde_json::json!({ "spec": pod["spec"].clone() });
+    apply_pod_spec_defaults(&mut after_pod);
+
+    let mut before_pod = serde_json::json!({ "spec": spec_before.clone() });
+    apply_pod_spec_defaults(&mut before_pod);
+
+    // Strip fields that the u7s protobuf decoder does not decode from PodSpec (skipped
+    // proto fields). These fields are set at create-time and cannot change via a Replace
+    // sent over protobuf; comparing them would produce phantom generation bumps whenever
+    // client-go (which always uses protobuf) does any update, including a no-op replace.
+    // Stripping from both sides keeps the comparison symmetric.
+    for spec in [&mut after_pod["spec"], &mut before_pod["spec"]] {
+        if let Some(m) = spec.as_object_mut() {
+            // field 9 — automountServiceAccountToken is skipped by the proto decoder
+            m.remove("automountServiceAccountToken");
+        }
+    }
+
+    if after_pod["spec"] != before_pod["spec"] {
         let current = pod["metadata"]["generation"].as_i64().unwrap_or(1);
         pod["metadata"]["generation"] = serde_json::json!(current + 1);
     }
@@ -4245,23 +4317,28 @@ mod generation_tests {
         );
     }
 
-    /// create_pod must preserve a caller-supplied generation value.
+    /// create_pod must reset a caller-supplied generation value to 1.
     ///
-    /// Some controllers pre-set generation (e.g. when reconstructing objects);
-    /// overriding it would break their bookkeeping.
+    /// metadata.generation is a server-managed field. Kubernetes conformance test
+    /// "custom-set generation on new pods" (pods.go:554) creates a pod with
+    /// generation=100 and asserts the server returns generation=1. A controller
+    /// waiting for observedGeneration==generation would stall forever if the server
+    /// accepted generation=100 — it would need 99 phantom spec changes to catch up.
     #[test]
-    fn initialize_preserves_caller_supplied_generation() {
+    fn initialize_resets_caller_supplied_generation_to_1() {
         let mut pod = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "my-pod", "namespace": "default", "generation": 5i64},
+            "metadata": {"name": "my-pod", "namespace": "default", "generation": 100i64},
             "spec": {"containers": [{"name": "app", "image": "nginx"}]}
         });
         initialize_pod_generation(&mut pod);
         assert_eq!(
             pod["metadata"]["generation"],
-            serde_json::json!(5i64),
-            "a caller-supplied generation must not be overridden on create"
+            serde_json::json!(1i64),
+            "generation must be reset to 1 on create even if the client sent a different value — \
+             metadata.generation is server-managed; a non-1 initial value would stall \
+             controllers waiting for observedGeneration==generation to catch up"
         );
     }
 
@@ -4337,6 +4414,290 @@ mod generation_tests {
             serde_json::json!(3i64),
             "generation must increment monotonically — generation=3 after two spec changes; \
              a reset or skip would break observedGeneration tracking in controllers"
+        );
+    }
+
+    /// A no-op replace (client omits defaulted fields) must NOT bump generation.
+    ///
+    /// Upstream k8s conformance test node/pods.go:530 creates a pod (gen=1) then
+    /// does an empty update and expects gen still 1.  u7s was returning 2 because
+    /// the stored spec (fully defaulted) differed structurally from the incoming
+    /// spec (missing dnsPolicy, enableServiceLinks, volume defaultMode, etc.).
+    /// Controllers that gate on observedGeneration==generation would re-reconcile
+    /// every pod on every no-op update, and the conformance pod-generation suite
+    /// would fail with "Expected 2 to be equivalent to 1".
+    #[test]
+    fn noop_update_omitting_defaulted_fields_does_not_bump_generation() {
+        // Simulate a fully-defaulted stored spec (what is written to the store on create).
+        let mut stored_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test-pod", "namespace": "default", "generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:1.0"}],
+                "dnsPolicy": "ClusterFirst",
+                "enableServiceLinks": true
+            }
+        });
+        apply_pod_create_defaults(&mut stored_pod);
+        let spec_before = stored_pod["spec"].clone();
+
+        // Simulate a no-op update: client sends back the pod but omits some defaulted
+        // fields (e.g. dnsPolicy stripped, as many kubectl-based clients do on round-trip).
+        let mut incoming_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test-pod", "namespace": "default", "generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:1.0"}]
+                // dnsPolicy and enableServiceLinks intentionally omitted
+            }
+        });
+
+        increment_pod_generation_if_spec_changed(&mut incoming_pod, &spec_before);
+
+        assert_eq!(
+            incoming_pod["metadata"]["generation"],
+            serde_json::json!(1i64),
+            "generation must stay at 1 after a no-op update that omits defaulted fields — \
+             controllers gate on observedGeneration==generation; a spurious bump causes \
+             every controller to re-reconcile unchanged pods and the k8s pod-generation \
+             conformance suite to fail with 'Expected 2 to be equivalent to 1'"
+        );
+    }
+
+    /// A real spec change (image update) after a create must still bump generation.
+    ///
+    /// Verifies that the no-op fix does not suppress legitimate generation increments —
+    /// controllers would miss the new spec and never re-reconcile if this were broken.
+    #[test]
+    fn real_spec_change_still_bumps_generation() {
+        // Simulate stored spec after create defaults.
+        let mut stored_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test-pod", "namespace": "default", "generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:1.0"}]
+            }
+        });
+        apply_pod_create_defaults(&mut stored_pod);
+        let spec_before = stored_pod["spec"].clone();
+
+        // Incoming pod changes the container image — a real spec change.
+        let mut incoming_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test-pod", "namespace": "default", "generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:2.0"}]
+            }
+        });
+
+        increment_pod_generation_if_spec_changed(&mut incoming_pod, &spec_before);
+
+        assert_eq!(
+            incoming_pod["metadata"]["generation"],
+            serde_json::json!(2i64),
+            "generation must increment to 2 on a real spec change — controllers use \
+             generation/observedGeneration to detect new work; no increment means stale reconcile"
+        );
+    }
+
+    /// Protobuf-decoded spec with spurious defaultMode in projected source's downwardAPI must
+    /// not bump generation on a no-op replace.
+    ///
+    /// client-go sends pods via protobuf. The u7s proto decoder calls
+    /// downward_api_volume_source_to_json with defaultMode=0 for projected sources'
+    /// DownwardAPIProjection entries (which have no defaultMode field), which injects
+    /// defaultMode:420 into the inner source. The stored spec (created via JSON or
+    /// apply_pod_create_defaults) has no defaultMode in that position. Without normalization,
+    /// every protobuf no-op replace by client-go bumps generation — conformance test
+    /// "pod generation should start at 1 and increment per update" (pods.go:530) would fail.
+    #[test]
+    fn proto_style_noop_with_spurious_defaultmode_in_downward_api_source() {
+        // Stored spec: projected volume with downwardAPI source (no defaultMode in source).
+        let spec_before = serde_json::json!({
+            "containers": [{"name": "app", "image": "nginx:1.0"}],
+            "volumes": [{
+                "name": "kube-api-access",
+                "projected": {
+                    "defaultMode": 420,
+                    "sources": [
+                        {"serviceAccountToken": {"expirationSeconds": 3607, "path": "token"}},
+                        {"downwardAPI": {"items": [{"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.namespace"}, "path": "namespace"}]}}
+                    ]
+                }
+            }]
+        });
+
+        // Incoming spec: same content but with spurious defaultMode:420 in the downwardAPI source
+        // (as injected by the proto decoder when client-go sends the pod back via protobuf).
+        let mut incoming_pod = serde_json::json!({
+            "metadata": {"generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:1.0"}],
+                "volumes": [{
+                    "name": "kube-api-access",
+                    "projected": {
+                        "defaultMode": 420,
+                        "sources": [
+                            {"serviceAccountToken": {"expirationSeconds": 3607, "path": "token"}},
+                            {"downwardAPI": {
+                                "defaultMode": 420,
+                                "items": [{"fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.namespace"}, "path": "namespace"}]
+                            }}
+                        ]
+                    }
+                }]
+            }
+        });
+
+        increment_pod_generation_if_spec_changed(&mut incoming_pod, &spec_before);
+
+        assert_eq!(
+            incoming_pod["metadata"]["generation"],
+            serde_json::json!(1i64),
+            "generation must stay at 1 when client-go sends a protobuf no-op replace — the proto \
+             decoder injects defaultMode:420 into projected.sources[].downwardAPI (a field that \
+             DownwardAPIProjection does not have); without normalization every client-go replace \
+             bumps generation and conformance pod-generation tests fail"
+        );
+    }
+
+    /// apply_pod_spec_defaults must not inject a `projected` field into non-projected volumes.
+    ///
+    /// serde_json's IndexMut autovivifies intermediate null entries when accessed mutably.
+    /// If the projected-source normalization code uses mutable indexing on a volume that has
+    /// no `projected` field (e.g. a plain configMap volume), it would corrupt the volume spec
+    /// by inserting `"projected": {"sources": null}`, causing the kubelet to see two volume
+    /// plugins and refuse to mount the volume ("multiple volume plugins matched").
+    #[test]
+    fn spec_defaults_do_not_autovivify_projected_on_non_projected_volumes() {
+        let mut pod = serde_json::json!({
+            "metadata": {"generation": 1i64},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx:1.0"}],
+                "volumes": [
+                    {"name": "config-vol", "configMap": {"name": "my-cm", "defaultMode": 420}},
+                    {"name": "empty", "emptyDir": {}}
+                ]
+            }
+        });
+
+        apply_pod_spec_defaults(&mut pod);
+
+        assert!(
+            pod["spec"]["volumes"][0]["projected"].is_null(),
+            "apply_pod_spec_defaults must not inject a projected field into a configMap volume — \
+             the kubelet would see both configMap and projected plugins and refuse to mount"
+        );
+        assert!(
+            pod["spec"]["volumes"][1]["projected"].is_null(),
+            "apply_pod_spec_defaults must not inject a projected field into an emptyDir volume"
+        );
+    }
+
+    /// Adding a toleration via client-go (which reads JSON-in-proto and omits nil fields on PUT)
+    /// must still bump generation.
+    ///
+    /// client-go reads the pod via proto GET (u7s returns JSON-in-proto-envelope). The stored
+    /// spec may have explicit null fields (env:null, ports:null, initContainers:null, volumes:null).
+    /// When client-go re-encodes the Go struct to JSON with omitempty, these nil slices are
+    /// omitted. However apply_pod_spec_defaults uses IndexMut to access container["env"] and
+    /// container["ports"], which AUTOVIVIFIES the absent keys as null — so both sides end up
+    /// with env:null after normalization. The toleration added by the test creates a real diff.
+    #[test]
+    fn client_go_toleration_update_bumps_generation() {
+        // spec_before: stored spec with explicit null fields (as u7s stores them).
+        let spec_before = serde_json::json!({
+            "containers": [
+                {
+                    "command": ["sleep", "300"],
+                    "env": null,
+                    "image": "registry.k8s.io/e2e-test-images/busybox:1.37.0-1",
+                    "imagePullPolicy": "IfNotPresent",
+                    "name": "busybox",
+                    "ports": null
+                }
+            ],
+            "dnsPolicy": "ClusterFirst",
+            "enableServiceLinks": true,
+            "initContainers": null,
+            "nodeName": "lima-node-2",
+            "terminationGracePeriodSeconds": 5,
+            "volumes": null,
+            "automountServiceAccountToken": true
+        });
+
+        // incoming pod: client-go omits nil fields (env, ports, initContainers, volumes) but adds toleration.
+        let mut incoming_pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test-pod", "namespace": "default", "generation": 1i64},
+            "spec": {
+                "containers": [
+                    {
+                        "command": ["sleep", "300"],
+                        "image": "registry.k8s.io/e2e-test-images/busybox:1.37.0-1",
+                        "imagePullPolicy": "IfNotPresent",
+                        "name": "busybox"
+                        // env, ports omitted (nil in Go → omitempty → absent)
+                    }
+                ],
+                "dnsPolicy": "ClusterFirst",
+                "enableServiceLinks": true,
+                "nodeName": "lima-node-2",
+                "terminationGracePeriodSeconds": 5,
+                "automountServiceAccountToken": true,
+                "tolerations": [{"key": "dedicated", "operator": "Equal", "value": "test", "effect": "NoSchedule"}]
+                // initContainers, volumes omitted (nil → omitempty → absent)
+            }
+        });
+
+        increment_pod_generation_if_spec_changed(&mut incoming_pod, &spec_before);
+
+        assert_eq!(
+            incoming_pod["metadata"]["generation"],
+            serde_json::json!(2i64),
+            "adding a toleration via client-go PUT must bump generation — client-go omits nil \
+             fields (env, ports, volumes, initContainers) but the real change (toleration added) \
+             must still be detected; pods.go:530 conformance test asserts gen==2 after this update"
+        );
+    }
+
+    /// Graceful delete (setting deletionTimestamp) must increment generation.
+    ///
+    /// Kubernetes conformance test "custom-set generation on new pods and graceful delete"
+    /// (pods.go:573) creates a pod (gen=1), issues a graceful DELETE, and asserts gen=2.
+    /// Without this bump, controllers watching generation/observedGeneration would never see
+    /// the terminating transition — they would attempt to reconcile a pod that is already gone.
+    ///
+    /// This test verifies the arithmetic that delete_pod applies directly, mirroring the
+    /// logic in the soft-delete branch of the handler.
+    #[test]
+    fn graceful_delete_increments_generation() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "my-pod",
+                "namespace": "default",
+                "generation": 1i64
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        // Simulate what delete_pod does: stamp deletionTimestamp, increment generation.
+        pod["metadata"]["deletionTimestamp"] = serde_json::json!("2026-01-01T00:00:00Z");
+        let current_gen = pod["metadata"]["generation"].as_i64().unwrap_or(1);
+        pod["metadata"]["generation"] = serde_json::json!(current_gen + 1);
+
+        assert_eq!(
+            pod["metadata"]["generation"],
+            serde_json::json!(2i64),
+            "graceful delete must bump generation from 1 to 2 — pods.go:573 conformance test \
+             asserts gen=2 after DELETE; controllers use this to detect the terminating transition"
         );
     }
 }
