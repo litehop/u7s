@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        k8s: ["1.34.8", "1.35.5", "1.36.1"]
+        k8s: ["1.34.9", "1.35.6", "1.36.2"]
     name: kubectl ${{ matrix.k8s }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -251,6 +251,23 @@ jobs:
           EOF
           kubectl get foo smoke-foo
 
+      - name: Service ClusterIP allocated
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          # Create a ClusterIP Service and assert the apiserver assigns it a non-empty
+          # ClusterIP from the service-cluster-ip-range.  Catches regressions where the
+          # IP allocator is broken or the Service write-path is misconfigured.
+          kubectl create service clusterip smoke-svc --tcp=80:80 --namespace smoke-test
+          SVC_IP=$(kubectl get service smoke-svc --namespace smoke-test \
+            -o jsonpath='{.spec.clusterIP}')
+          if [ -z "$SVC_IP" ] || [ "$SVC_IP" = "None" ]; then
+            echo "ERROR: Service smoke-svc has no ClusterIP (got: '$SVC_IP')"
+            kubectl get service smoke-svc --namespace smoke-test -o yaml
+            exit 1
+          fi
+          echo "Service ClusterIP allocated: $SVC_IP"
+
       - name: Stop apiserver
         if: always()
         run: |
@@ -273,7 +290,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        k8s: ["1.34.8", "1.35.5", "1.36.1"]
+        k8s: ["1.34.9", "1.35.6", "1.36.2"]
     name: kubelet ${{ matrix.k8s }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -376,14 +393,21 @@ jobs:
           echo "SMOKE_TMPDIR=$TMPDIR" >> "$GITHUB_ENV"
           SMOKE_TOKEN="kubelet-admin-token-$(date +%s)"
           echo "$SMOKE_TOKEN,kubelet-admin,uid0,system:masters" > "$TMPDIR/token-auth.csv"
+          # Pass --ca-key / --ca-cert so the CA key is available to sign the kubelet
+          # serving cert below (needed for apiserver→kubelet mTLS).
+          # Pass --kubelet-preferred-address 127.0.0.1 so the apiserver always dials
+          # the kubelet at 127.0.0.1:10250 — the serving cert SAN only needs 127.0.0.1.
           ./target/release/u7s-apiserver \
             --db "$TMPDIR/state.db" \
             --kubeconfig "$TMPDIR/kubeconfig" \
             --sa-key "$TMPDIR/sa.key" \
             --sa-pub "$TMPDIR/sa.pub" \
+            --ca-key "$TMPDIR/ca.key" \
+            --ca-cert "$TMPDIR/ca.crt" \
             --token-auth-file "$TMPDIR/token-auth.csv" \
             --advertise-address https://127.0.0.1:6443 \
             --service-cluster-ip-range "10.96.0.0/12" \
+            --kubelet-preferred-address 127.0.0.1 \
             >"$TMPDIR/server.log" 2>&1 &
           echo "SERVER_PID=$!" >> "$GITHUB_ENV"
           for i in $(seq 1 30); do
@@ -413,6 +437,35 @@ jobs:
             "    token: $SMOKE_TOKEN" \
             > "$TMPDIR/kubeconfig"
 
+      - name: Generate kubelet TLS
+        run: |
+          # Mirror lima-start.sh: give the kubelet a serving cert signed by the cluster CA
+          # so the apiserver's WebPkiServerVerifier can verify it, and a --client-ca-file
+          # so the kubelet can authenticate the apiserver's mTLS client cert on log/exec/attach.
+          # Without these, build_kubelet_tls_config rejects the kubelet's self-signed cert
+          # and the log proxy returns InternalError ("kubelet request failed").
+          TMPDIR="${{ env.SMOKE_TMPDIR }}"
+          # ca.crt is DER-encoded; kubelet and openssl need PEM.
+          openssl x509 -in "$TMPDIR/ca.crt" -inform DER -out "$TMPDIR/ca.pem" -outform PEM
+          sudo cp "$TMPDIR/ca.pem" /etc/kubelet-ca.crt
+          sudo chmod 644 /etc/kubelet-ca.crt
+          # Generate a kubelet serving key + cert with SAN=127.0.0.1.
+          # The apiserver always dials 127.0.0.1:10250 (--kubelet-preferred-address 127.0.0.1),
+          # so only that SAN is needed — no need to discover the runner's InternalIP.
+          openssl ecparam -genkey -name prime256v1 -noout -out "$TMPDIR/kubelet-tls.key"
+          openssl req -new -key "$TMPDIR/kubelet-tls.key" \
+            -subj "/CN=ci-node" -sha256 \
+            -out "$TMPDIR/kubelet-tls.csr"
+          openssl x509 -req -in "$TMPDIR/kubelet-tls.csr" \
+            -CA "$TMPDIR/ca.pem" -CAkey "$TMPDIR/ca.key" \
+            -CAcreateserial -days 365 -sha256 \
+            -extfile <(printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth\n') \
+            -out "$TMPDIR/kubelet-tls.crt"
+          sudo cp "$TMPDIR/kubelet-tls.crt" /etc/kubelet-tls.crt
+          sudo cp "$TMPDIR/kubelet-tls.key" /etc/kubelet-tls.key
+          sudo chmod 644 /etc/kubelet-tls.crt
+          sudo chmod 600 /etc/kubelet-tls.key
+
       - name: Start kubelet
         run: |
           TMPDIR="${{ env.SMOKE_TMPDIR }}"
@@ -427,6 +480,13 @@ jobs:
           failSwapOn: false
           resolvConf: ""
           staticPodPath: /tmp/kubelet-pods
+          authentication:
+            x509:
+              clientCAFile: /etc/kubelet-ca.crt
+            anonymous:
+              enabled: false
+          authorization:
+            mode: AlwaysAllow
           EOF
           sudo "$HOME/bin/kubelet" \
             --config=/etc/kubelet-config.yaml \
@@ -434,6 +494,8 @@ jobs:
             --hostname-override=ci-node \
             --logging-format=text \
             --v=2 \
+            --tls-cert-file=/etc/kubelet-tls.crt \
+            --tls-private-key-file=/etc/kubelet-tls.key \
             >"$TMPDIR/kubelet.log" 2>&1 &
           echo "KUBELET_PID=$!" >> "$GITHUB_ENV"
 
@@ -527,6 +589,21 @@ jobs:
           fi
           echo "Pod reached Succeeded:"
           kubectl get pod smoke-pod -n default
+
+      - name: Pod log subresource
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          # Fetch logs from the completed smoke-pod via the log subresource.
+          # A successful response containing the expected output confirms the
+          # apiserver→kubelet log proxy path is wired correctly end-to-end.
+          LOG_OUT=$(kubectl logs smoke-pod -n default)
+          if ! echo "$LOG_OUT" | grep -q "hello"; then
+            echo "ERROR: expected 'hello' in pod logs, got:"
+            echo "$LOG_OUT"
+            exit 1
+          fi
+          echo "Pod log subresource returned expected output: $LOG_OUT"
 
       - name: ConfigMap volume mount
         env:
@@ -626,7 +703,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        k8s: ["1.34.8", "1.35.5", "1.36.1"]
+        k8s: ["1.34.9", "1.35.6", "1.36.2"]
     name: kcm ${{ matrix.k8s }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -734,7 +811,7 @@ jobs:
             --cluster-signing-key-file="$TMPDIR/ca.key" \
             --service-account-private-key-file="$TMPDIR/sa.key" \
             --root-ca-file="$TMPDIR/ca.pem" \
-            --controllers=csrapproving,csrsigning,garbagecollector,deployment,replicaset \
+            --controllers=csrapproving,csrsigning,garbagecollector,deployment,replicaset,job \
             --use-service-account-credentials=false \
             --leader-elect=false \
             --bind-address=127.0.0.1 \
@@ -853,6 +930,50 @@ jobs:
           # Clean up.
           kubectl delete deployment hello --namespace default
           kubectl delete configmap hello-config --namespace default
+
+      - name: Job controller creates Pod
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          # Create a Job and assert the job controller spawns a Pod for it.
+          # No kubelet in this job — we only assert the Pod object exists, not
+          # that it runs.  Confirms the job controller is wired up correctly.
+          kubectl apply --validate=false -f - <<'EOF'
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: smoke-job
+            namespace: default
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: worker
+                    image: busybox:1.36
+                    command: ["echo", "done"]
+          EOF
+
+          POD_FOUND=0
+          for i in $(seq 1 60); do
+            POD_COUNT=$(kubectl get pod -l "batch.kubernetes.io/job-name=smoke-job" -n default \
+              --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$POD_COUNT" -ge 1 ]; then
+              POD_FOUND=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$POD_FOUND" -eq 0 ]; then
+            echo "ERROR: job controller did not create a Pod for smoke-job within 60s"
+            kubectl get pod -n default || true
+            tail -50 "${{ env.SMOKE_TMPDIR }}/kcm.log"
+            tail -50 "${{ env.SMOKE_TMPDIR }}/server.log"
+            exit 1
+          fi
+          echo "Job controller created Pod for smoke-job:"
+          kubectl get pod -l "batch.kubernetes.io/job-name=smoke-job" -n default
+          kubectl delete job smoke-job --namespace default
 
       - name: Stop u7s and kcm
         if: always()

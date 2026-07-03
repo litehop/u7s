@@ -66,17 +66,17 @@ jobs:
           mkdir -p ~/bin
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      - name: Cache kubectl 1.36.1
+      - name: Cache kubectl 1.36.2
         id: cache-kubectl
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/bin/kubectl
-          key: kubectl-1.36.1-${{ runner.arch }}
+          key: kubectl-1.36.2-${{ runner.arch }}
 
-      - name: Install kubectl 1.36.1
+      - name: Install kubectl 1.36.2
         if: steps.cache-kubectl.outputs.cache-hit != 'true'
         env:
-          K8S_VERSION: "1.36.1"
+          K8S_VERSION: "1.36.2"
         run: |
           MINOR=$(echo "$K8S_VERSION" | cut -d. -f1-2)
           curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${MINOR}/deb/Release.key" \
@@ -141,7 +141,7 @@ jobs:
       - name: Download kube-controller-manager
         run: |
           TMPDIR="${{ env.BENCH_TMPDIR }}"
-          curl -fsSL "https://dl.k8s.io/release/v1.36.1/bin/linux/amd64/kube-controller-manager" \
+          curl -fsSL "https://dl.k8s.io/release/v1.36.2/bin/linux/amd64/kube-controller-manager" \
             -o "$TMPDIR/kube-controller-manager"
           chmod +x "$TMPDIR/kube-controller-manager"
 

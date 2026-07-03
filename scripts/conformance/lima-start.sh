@@ -377,7 +377,7 @@ echo "konnectivity-agent pod applied (logs: kubectl logs -n kube-system konnecti
 
 # Detect kubelet version to pull the matching kube-proxy binary.
 KUBELET_VERSION=$(limactl shell "$VM_NAME" kubelet --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-KUBELET_VERSION="${KUBELET_VERSION:-1.36.1}"
+KUBELET_VERSION="${KUBELET_VERSION:-1.36.2}"
 
 # Create kube-proxy ServiceAccount and RBAC (needed for the kubeconfig token).
 kubectl --kubeconfig="$KUBECONFIG_PATH" create serviceaccount kube-proxy -n kube-system \
