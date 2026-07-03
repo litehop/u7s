@@ -1376,7 +1376,7 @@ pub async fn openapi_v2<S: Store>(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if accept.contains("proto-openapi") && !accept.contains("application/json") {
-        const PROTO_CT: &str = "application/com.github.proto-openapi.spec.v2@v1.0+protobuf";
+        const PROTO_CT: &str = "application/com.github.proto-openapi.spec.v2.v1.0+protobuf";
         let body = crate::proto::encode_gnostic_openapi_v2_document();
         return ([(axum::http::header::CONTENT_TYPE, PROTO_CT)], body).into_response();
     }
@@ -3232,16 +3232,15 @@ mod tests {
         );
     }
 
-    // GET /openapi/v2 with a proto-only Accept must return 200 with Content-Type:
-    // application/com.github.proto-openapi.spec.v2@v1.0+protobuf and a valid gnostic
-    // openapi_v2.Document in the body — NOT JSON. kubectl 1.36's validation path sends
-    // proto-only Accept and unconditionally gnostic-decodes the response body; returning
-    // JSON causes "proto: cannot parse invalid wire-format data" and breaks
-    // `kubectl create/describe/patch --validate`.
+    // GET /openapi/v2 with a proto-only Accept (client may send the deprecated @v1.0 form)
+    // must return 200 with Content-Type using the non-deprecated dot form
+    // (application/com.github.proto-openapi.spec.v2.v1.0+protobuf) — upstream kube-openapi
+    // always responds with the dot form regardless of which Accept variant the client sent.
+    // The @ form fails Go's mime.ParseMediaType (non-RFC-2045 token), causing kubectl
+    // create/replace --validate to error with "mime: unexpected content after media subtype".
     //
-    // This test fails on revert: reverting the content-negotiation fix causes the handler
-    // to return application/json, making ct.starts_with("protobuf") fail; and the body
-    // would be valid JSON which is not valid gnostic proto.
+    // This test fails on revert: reverting to the @ form makes the dot-form assertion fail
+    // and kubectl validation breaks for all resources.
     #[tokio::test]
     async fn openapi_v2_proto_only_accept_returns_200_proto() {
         let state = make_state();
@@ -3273,10 +3272,17 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(
-            ct.contains("protobuf"),
-            "Content-Type must be the gnostic proto media type for proto-only Accept; \
-             kubectl gnostic-decodes the body regardless of Content-Type, but returning \
-             the correct Content-Type signals correct content negotiation; got: '{ct}'"
+            ct.contains("spec.v2.v1.0+protobuf"),
+            "Content-Type must use the non-deprecated dot form \
+             (spec.v2.v1.0+protobuf, not spec.v2@v1.0+protobuf); the @ form breaks \
+             kubectl's mime.ParseMediaType with 'mime: unexpected content after media \
+             subtype', causing kubectl create/replace --validate to fail; got: '{ct}'"
+        );
+        assert!(
+            !ct.contains("@"),
+            "Content-Type must NOT contain the deprecated @ form — Go's \
+             mime.ParseMediaType rejects it with 'mime: unexpected content after media \
+             subtype', breaking kubectl validation; got: '{ct}'"
         );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
