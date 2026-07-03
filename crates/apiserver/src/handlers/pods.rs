@@ -317,6 +317,7 @@ pub async fn list_pods<S: Store>(
 pub async fn create_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns,)): Path<(String,)>,
+    Query(create_query): Query<super::json_patch::CreateQuery>,
     Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
@@ -359,7 +360,13 @@ pub async fn create_pod<S: Store>(
                 }
             }
             Ok(None) => {
-                tracing::warn!(rc = %rc_name, key = %rc_key, "RuntimeClass not found in store — overhead not injected");
+                // RuntimeClass referenced but not found: reject the pod. The real
+                // kube-apiserver returns 403 Forbidden here (RuntimeClass admission plugin).
+                // Failing to reject causes test pods to be persisted indefinitely, filling
+                // the node and cascading failures into unrelated tests.
+                return Err(Status::forbidden(format!(
+                    "pod rejected: RuntimeClass \"{rc_name}\" not found"
+                )));
             }
             Err(e) => {
                 tracing::warn!(rc = %rc_name, err = %e, "store error looking up RuntimeClass — overhead not injected");
@@ -380,7 +387,7 @@ pub async fn create_pod<S: Store>(
             "uid": user.uid,
             "groups": user.groups,
         })),
-        dry_run: false,
+        dry_run: create_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
@@ -395,6 +402,11 @@ pub async fn create_pod<S: Store>(
     obj.body["status"]["qosClass"] =
         serde_json::Value::String(compute_qos_class(&obj.body).to_owned());
 
+    // Dry-run: validation passed; return the would-be created object without persisting.
+    if create_query.is_dry_run() {
+        return Ok((StatusCode::CREATED, Json(obj.body)).into_response());
+    }
+
     let key = object_key("pods", ns.as_str(), &name);
     let new_rv = state
         .store
@@ -404,7 +416,7 @@ pub async fn create_pod<S: Store>(
 
     obj.set_resource_version(new_rv);
 
-    Ok((StatusCode::CREATED, Json(obj.body)))
+    Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
 
 pub async fn get_pod<S: Store>(
@@ -5686,6 +5698,135 @@ mod handler_tests {
     }
 
     // -----------------------------------------------------------------------
+    // dryRun=All and RuntimeClass rejection regression tests
+    // -----------------------------------------------------------------------
+
+    /// POST ?dryRun=All must return 201 but NOT persist the pod.
+    ///
+    /// Without the dryRun check in create_pod the pod is written to the store
+    /// even when the client requests a dry run.  A scheduler then binds it to a
+    /// real node, consuming capacity and causing cascading OutOfpods failures in
+    /// unrelated tests.
+    #[tokio::test]
+    async fn create_pod_dry_run_returns_success_without_persisting() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state.clone());
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "dry-run-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "dryRun=All must return 201 (would-be created object) so clients know validation passed"
+        );
+
+        // The pod must NOT appear in the store — if it does, the scheduler will
+        // bind it to a real node and consume node capacity.
+        let stored = store
+            .get("/registry/pods/default/dry-run-pod")
+            .await
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "dryRun=All must not persist the pod — a persisted dry-run pod \
+             gets scheduled for real, consuming node capacity and cascading \
+             OutOfpods failures into other tests"
+        );
+    }
+
+    /// POST a pod referencing a non-existent RuntimeClass must return 403.
+    ///
+    /// The real kube-apiserver rejects such pods via the RuntimeClass admission
+    /// plugin.  Without this rejection the pod is persisted and scheduled, fills
+    /// the node (cap 110), and causes all subsequent pod-creation tests to fail
+    /// with OutOfpods.  The conformance test 'should reject a Pod requesting a
+    /// deleted RuntimeClass' uses dryRun=All and expects Forbidden — so the 403
+    /// must also fire under dry-run.
+    #[tokio::test]
+    async fn create_pod_missing_runtime_class_returns_403() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        // Deliberately do NOT seed any RuntimeClass for "missing-rc".
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "rc-missing-pod", "namespace": "default"},
+            "spec": {
+                "runtimeClassName": "missing-rc",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        // Without dryRun — must be rejected.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "pod referencing a non-existent RuntimeClass must be rejected 403 — \
+             without this, the pod is persisted and scheduled, filling the node \
+             and causing OutOfpods failures in unrelated tests"
+        );
+
+        // With dryRun=All — validation must still fire and return 403.
+        let req_dry = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods?dryRun=All")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp_dry = app.oneshot(req_dry).await.unwrap();
+        assert_eq!(
+            resp_dry.status(),
+            StatusCode::FORBIDDEN,
+            "dryRun=All must still run validation — a missing RuntimeClass must \
+             return 403 even under dry-run (conformance test 'should reject a Pod \
+             requesting a deleted RuntimeClass' uses dryRun=All + expects Forbidden)"
+        );
+
+        // Neither request should have persisted the pod.
+        let stored = store
+            .get("/registry/pods/default/rc-missing-pod")
+            .await
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "rejected pod must not be persisted in the store"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // automountServiceAccountToken defaulting (mayor-vfe2)
     // -----------------------------------------------------------------------
 
@@ -9242,6 +9383,7 @@ mod admission_tests {
         let result = create_pod(
             axum::extract::State(state),
             axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
             test_user(),
             headers,
             pod_body,
@@ -9318,6 +9460,7 @@ mod admission_tests {
         let result = create_pod(
             axum::extract::State(state),
             axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
             test_user(),
             headers,
             pod_body,
