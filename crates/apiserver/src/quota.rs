@@ -123,18 +123,93 @@ pub fn pod_is_best_effort(pod: &Value) -> bool {
     true
 }
 
+/// Returns true if the pod has spec.activeDeadlineSeconds set (is a terminating pod).
+///
+/// A pod is Terminating-scoped when it has an active deadline — i.e. it will be
+/// forcibly terminated after a finite time. This matches the Kubernetes definition:
+/// https://kubernetes.io/docs/concepts/workloads/pods/#pod-termination
+fn pod_is_terminating(pod: &Value) -> bool {
+    pod["spec"]["activeDeadlineSeconds"].is_number()
+}
+
 /// Returns true if the object matches the given ResourceQuota scope.
 ///
-/// Only "BestEffort" and "NotBestEffort" scope selectors are implemented here.
+/// Implemented scopes: BestEffort, NotBestEffort, Terminating, NotTerminating.
 /// Unknown scopes are treated conservatively: the object is assumed to match
 /// (quota applies), which is the safe default.
 fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
     match scope {
         "BestEffort" => object.is_some_and(pod_is_best_effort),
         "NotBestEffort" => object.is_none_or(|pod| !pod_is_best_effort(pod)),
+        // A pod matches Terminating iff spec.activeDeadlineSeconds is set.
+        "Terminating" => object.is_some_and(pod_is_terminating),
+        "NotTerminating" => object.is_none_or(|pod| !pod_is_terminating(pod)),
         // Unknown scopes: assume match (conservative — don't silently skip quotas).
         _ => true,
     }
+}
+
+/// Returns true if the object matches all expressions in a scopeSelector.
+///
+/// Supported operators: Exists (pod must match scopeName), DoesNotExist (must not match).
+/// In/NotIn with values are not implemented (unused by conformance tests); unknown operators
+/// are treated as matching (conservative default).
+fn object_matches_scope_selector(scope_selector: &Value, object: Option<&Value>) -> bool {
+    let exprs = match scope_selector["matchExpressions"].as_array() {
+        Some(arr) => arr,
+        None => return true, // no expressions — matches everything
+    };
+    exprs.iter().all(|expr| {
+        let scope_name = expr["scopeName"].as_str().unwrap_or("");
+        let operator = expr["operator"].as_str().unwrap_or("");
+        match operator {
+            "Exists" => object_matches_scope(scope_name, object),
+            "DoesNotExist" => !object_matches_scope(scope_name, object),
+            // In/NotIn with values — not implemented; treat as match (conservative)
+            _ => true,
+        }
+    })
+}
+
+/// Count pods in `namespace` that match all scopes on `quota`.
+///
+/// Scopes only apply to pods; other resources are counted without scope filtering.
+/// Returns the number of pods that match every scope in `quota["spec"]["scopes"]`
+/// AND every expression in `quota["spec"]["scopeSelector"]`.
+async fn count_scope_filtered_pods<S: Store>(store: &S, namespace: &str, quota: &Value) -> u64 {
+    let scopes: Vec<&str> = quota["spec"]["scopes"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    let scope_selector = &quota["spec"]["scopeSelector"];
+
+    let prefix = group_list_prefix("", "pods", Some(namespace));
+    let items = match store.list(&prefix, ListOptions::default()).await {
+        Ok(resp) => resp.items,
+        Err(e) => {
+            tracing::warn!("quota: failed to list pods in {namespace}: {e}");
+            return 0;
+        }
+    };
+
+    items
+        .iter()
+        .filter(|item| {
+            let pod: Value = match serde_json::from_slice(&item.value) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let matches_scopes = scopes
+                .iter()
+                .all(|scope| object_matches_scope(scope, Some(&pod)));
+            let matches_selector = if scope_selector.is_object() {
+                object_matches_scope_selector(scope_selector, Some(&pod))
+            } else {
+                true
+            };
+            matches_scopes && matches_selector
+        })
+        .count() as u64
 }
 
 /// Compute live usage counts for all hard-limit entries in a single ResourceQuota object.
@@ -142,6 +217,9 @@ fn object_matches_scope(scope: &str, object: Option<&Value>) -> bool {
 /// Returns a map from quota resource name (e.g. `"pods"`, `"count/deployments.apps"`) to
 /// a string count (e.g. `"3"`). Only entries whose resource name is known to
 /// `quota_resource_to_group_plural` are counted; unknown entries are omitted.
+///
+/// Pod resources are scope-filtered using `quota["spec"]["scopes"]` so that a
+/// Terminating-scoped quota does not count non-terminating pods (and vice versa).
 ///
 /// This function is pure with respect to writes — it only reads from the store.
 pub async fn count_quota_usage<S: Store>(
@@ -157,15 +235,47 @@ pub async fn count_quota_usage<S: Store>(
         None => return std::collections::BTreeMap::new(),
     };
 
+    // Is scope filtering needed? Only when the quota has scopes AND those scopes are pod-scopes.
+    // Scope filtering applies when the quota has spec.scopes (pod-scope names) or
+    // spec.scopeSelector (matchExpressions with pod-scope names like Terminating).
+    let has_scopes_array = quota["spec"]["scopes"]
+        .as_array()
+        .map(|arr| {
+            arr.iter().any(|s| {
+                matches!(
+                    s.as_str(),
+                    Some("BestEffort" | "NotBestEffort" | "Terminating" | "NotTerminating")
+                )
+            })
+        })
+        .unwrap_or(false);
+    let has_scope_selector = quota["spec"]["scopeSelector"]["matchExpressions"]
+        .as_array()
+        .map(|arr| {
+            arr.iter().any(|expr| {
+                matches!(
+                    expr["scopeName"].as_str(),
+                    Some("BestEffort" | "NotBestEffort" | "Terminating" | "NotTerminating")
+                )
+            })
+        })
+        .unwrap_or(false);
+    let has_pod_scopes = has_scopes_array || has_scope_selector;
+
     let mut used = std::collections::BTreeMap::new();
     for (resource_name, _) in hard {
         if let Some((group, plural)) = quota_resource_to_group_plural(resource_name) {
-            let prefix = group_list_prefix(group, plural, Some(namespace));
-            let count = match store.list(&prefix, ListOptions::default()).await {
-                Ok(resp) => resp.items.len() as u64,
-                Err(e) => {
-                    tracing::warn!("quota: failed to count {plural} in {namespace}: {e}");
-                    0
+            // Pod resources respect scope filtering; other resource types are always counted.
+            let count = if has_pod_scopes && group.is_empty() && plural == "pods" {
+                count_scope_filtered_pods(store, namespace, quota).await
+            } else {
+                let prefix = group_list_prefix(group, plural, Some(namespace));
+                match store.list(&prefix, ListOptions::default()).await {
+                    Ok(resp) => resp.items.len() as u64,
+                    Err(e) => {
+                        tracing::warn!("quota: failed to count {plural} in {namespace}: {e}");
+                        0
+                    }
                 }
             };
             used.insert(resource_name.clone(), count.to_string());
@@ -212,6 +322,11 @@ pub async fn check_resource_quota<S: Store>(
                 // This quota does not apply to the incoming object — skip it entirely.
                 continue;
             }
+        }
+        // scopeSelector matching: if the quota has a scopeSelector, the object must match it.
+        let scope_selector = &quota["spec"]["scopeSelector"];
+        if scope_selector.is_object() && !object_matches_scope_selector(scope_selector, object) {
+            continue;
         }
 
         let hard = &quota["spec"]["hard"];
@@ -597,6 +712,54 @@ mod tests {
             result.is_ok(),
             "Burstable pod must NOT be counted against a BestEffort-scoped quota — \
              it does not match the BestEffort scope and should be allowed"
+        );
+    }
+
+    // -- Terminating / NotTerminating scope filtering --
+
+    /// A pod WITH activeDeadlineSeconds must match Terminating (and NOT NotTerminating).
+    /// A pod WITHOUT activeDeadlineSeconds must match NotTerminating (and NOT Terminating).
+    ///
+    /// If these cases fall through to the always-match default, terminating-scope quota
+    /// accounting is wrong: non-terminating pods would be counted against a
+    /// Terminating-scoped quota, causing the ResourceQuota conformance test
+    /// `should verify ResourceQuota with terminating scopes` to fail.
+    #[test]
+    fn terminating_scope_matches_pod_with_active_deadline_seconds() {
+        let terminating_pod = json!({
+            "spec": {
+                "activeDeadlineSeconds": 300,
+                "containers": [{"name": "c", "image": "nginx"}]
+            }
+        });
+        assert!(
+            object_matches_scope("Terminating", Some(&terminating_pod)),
+            "a pod's Terminating-scope membership must follow activeDeadlineSeconds — \
+             else terminating-scope quota accounting is wrong (ResourceQuota conformance)"
+        );
+        assert!(
+            !object_matches_scope("NotTerminating", Some(&terminating_pod)),
+            "a pod's Terminating-scope membership must follow activeDeadlineSeconds — \
+             else terminating-scope quota accounting is wrong (ResourceQuota conformance)"
+        );
+    }
+
+    #[test]
+    fn not_terminating_scope_matches_pod_without_active_deadline_seconds() {
+        let non_terminating_pod = json!({
+            "spec": {
+                "containers": [{"name": "c", "image": "nginx"}]
+            }
+        });
+        assert!(
+            object_matches_scope("NotTerminating", Some(&non_terminating_pod)),
+            "a pod's Terminating-scope membership must follow activeDeadlineSeconds — \
+             else terminating-scope quota accounting is wrong (ResourceQuota conformance)"
+        );
+        assert!(
+            !object_matches_scope("Terminating", Some(&non_terminating_pod)),
+            "a pod's Terminating-scope membership must follow activeDeadlineSeconds — \
+             else terminating-scope quota accounting is wrong (ResourceQuota conformance)"
         );
     }
 
