@@ -251,6 +251,23 @@ jobs:
           EOF
           kubectl get foo smoke-foo
 
+      - name: Service ClusterIP allocated
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          # Create a ClusterIP Service and assert the apiserver assigns it a non-empty
+          # ClusterIP from the service-cluster-ip-range.  Catches regressions where the
+          # IP allocator is broken or the Service write-path is misconfigured.
+          kubectl create service clusterip smoke-svc --tcp=80:80 --namespace smoke-test
+          SVC_IP=$(kubectl get service smoke-svc --namespace smoke-test \
+            -o jsonpath='{.spec.clusterIP}')
+          if [ -z "$SVC_IP" ] || [ "$SVC_IP" = "None" ]; then
+            echo "ERROR: Service smoke-svc has no ClusterIP (got: '$SVC_IP')"
+            kubectl get service smoke-svc --namespace smoke-test -o yaml
+            exit 1
+          fi
+          echo "Service ClusterIP allocated: $SVC_IP"
+
       - name: Stop apiserver
         if: always()
         run: |
@@ -528,6 +545,21 @@ jobs:
           echo "Pod reached Succeeded:"
           kubectl get pod smoke-pod -n default
 
+      - name: Pod log subresource
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          # Fetch logs from the completed smoke-pod via the log subresource.
+          # A successful response containing the expected output confirms the
+          # apiserver→kubelet log proxy path is wired correctly end-to-end.
+          LOG_OUT=$(kubectl logs smoke-pod -n default)
+          if ! echo "$LOG_OUT" | grep -q "hello"; then
+            echo "ERROR: expected 'hello' in pod logs, got:"
+            echo "$LOG_OUT"
+            exit 1
+          fi
+          echo "Pod log subresource returned expected output: $LOG_OUT"
+
       - name: ConfigMap volume mount
         env:
           KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
@@ -734,7 +766,7 @@ jobs:
             --cluster-signing-key-file="$TMPDIR/ca.key" \
             --service-account-private-key-file="$TMPDIR/sa.key" \
             --root-ca-file="$TMPDIR/ca.pem" \
-            --controllers=csrapproving,csrsigning,garbagecollector,deployment,replicaset \
+            --controllers=csrapproving,csrsigning,garbagecollector,deployment,replicaset,job \
             --use-service-account-credentials=false \
             --leader-elect=false \
             --bind-address=127.0.0.1 \
@@ -853,6 +885,50 @@ jobs:
           # Clean up.
           kubectl delete deployment hello --namespace default
           kubectl delete configmap hello-config --namespace default
+
+      - name: Job controller creates Pod
+        env:
+          KUBECONFIG: ${{ env.SMOKE_TMPDIR }}/kubeconfig
+        run: |
+          # Create a Job and assert the job controller spawns a Pod for it.
+          # No kubelet in this job — we only assert the Pod object exists, not
+          # that it runs.  Confirms the job controller is wired up correctly.
+          kubectl apply --validate=false -f - <<'EOF'
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: smoke-job
+            namespace: default
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: worker
+                    image: busybox:1.36
+                    command: ["echo", "done"]
+          EOF
+
+          POD_FOUND=0
+          for i in $(seq 1 60); do
+            POD_COUNT=$(kubectl get pod -l "batch.kubernetes.io/job-name=smoke-job" -n default \
+              --no-headers 2>/dev/null | wc -l | tr -d ' ')
+            if [ "$POD_COUNT" -ge 1 ]; then
+              POD_FOUND=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$POD_FOUND" -eq 0 ]; then
+            echo "ERROR: job controller did not create a Pod for smoke-job within 60s"
+            kubectl get pod -n default || true
+            tail -50 "${{ env.SMOKE_TMPDIR }}/kcm.log"
+            tail -50 "${{ env.SMOKE_TMPDIR }}/server.log"
+            exit 1
+          fi
+          echo "Job controller created Pod for smoke-job:"
+          kubectl get pod -l "batch.kubernetes.io/job-name=smoke-job" -n default
+          kubectl delete job smoke-job --namespace default
 
       - name: Stop u7s and kcm
         if: always()
