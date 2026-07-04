@@ -32,6 +32,22 @@ fn main() {
                     .join("k8s.io/api/core/v1/generated.proto")
                     .to_str()
                     .unwrap(),
+                include_dir
+                    .join("k8s.io/api/storage/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/node/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/flowcontrol/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/scheduling/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
             ],
             &[include_dir.to_str().unwrap()],
         )
