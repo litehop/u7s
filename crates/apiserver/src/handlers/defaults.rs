@@ -69,8 +69,8 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
     }
 }
 
-/// Returns true when the group/plural pair is a workload resource that tracks
-/// metadata.generation.
+/// Returns true when the group/plural pair is a workload resource that KCM
+/// reconciles via metadata.generation.
 ///
 /// Used to gate generation initialisation and increment so we don't accidentally
 /// set generation on non-workload resources (e.g. Services) where it's unused.
@@ -81,12 +81,6 @@ pub fn apply_defaults(group: &str, plural: &str, obj: &mut serde_json::Value) {
 /// Generation — if Generation is 0 (absent), the wait is a no-op and the test races
 /// KCM's reconcile, writing disruptedPods before KCM's informer cache is settled.
 /// Real Kubernetes sets Generation=1 at PDB create time (PrepareForCreate strategy).
-///
-/// Pods ("", "pods") are included because upstream Kubernetes (PodObservedGenerationTracking,
-/// GA in 1.34) increments metadata.generation on Pod spec updates. The conformance test
-/// `pod generation should start at 1 and increment per update` asserts generation=1 at
-/// create and +1 per mutable-spec update (tolerations, activeDeadlineSeconds, container
-/// image changes). Without this, generation stays at 1 regardless of updates.
 pub fn is_workload_resource(group: &str, plural: &str) -> bool {
     matches!(
         (group, plural),
@@ -97,7 +91,6 @@ pub fn is_workload_resource(group: &str, plural: &str) -> bool {
             | ("batch", "jobs")
             | ("batch", "cronjobs")
             | ("policy", "poddisruptionbudgets")
-            | ("", "pods")
     )
 }
 
@@ -2357,100 +2350,6 @@ mod tests {
             obj["metadata"]["generation"], 1,
             "generation must not increment when spec is unchanged — spurious increments \
              cause unnecessary KCM reconcile loops"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // Regression tests: Pod generation tracking (mayor-14l1)
-    //
-    // The conformance test `pod generation should start at 1 and increment per update`
-    // (k8s.io/kubernetes/test/e2e/node/pods.go) asserts generation=1 at Pod create and
-    // +1 for each mutable spec update (tolerations, activeDeadlineSeconds, container image).
-    // All three tests below must fail if ("", "pods") is removed from is_workload_resource.
-    // ---------------------------------------------------------------------------
-
-    /// Pods must have metadata.generation=1 after creation.
-    ///
-    /// The PodObservedGenerationTracking conformance test (pods.go) checks generation=1
-    /// immediately after CreateSync. Without generation initialisation for pods, the field
-    /// stays absent (null) and every subsequent generation-comparison in the test fails.
-    #[test]
-    fn pod_create_sets_generation_1_for_conformance_tracking() {
-        let mut obj = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": { "name": "test", "namespace": "default" },
-            "spec": {
-                "containers": [{ "name": "c", "image": "busybox" }]
-            }
-        });
-
-        apply_defaults("", "pods", &mut obj);
-
-        assert_eq!(
-            obj["metadata"]["generation"], 1,
-            "Pod must have metadata.generation=1 after creation — the PodObservedGenerationTracking \
-             conformance test (pods.go) asserts generation=1 immediately after CreateSync; without \
-             this, the generation field stays null and all subsequent per-update increment assertions fail"
-        );
-    }
-
-    /// A Pod spec update (e.g. toleration added) must bump metadata.generation.
-    ///
-    /// The conformance test updates Tolerations, ActiveDeadlineSeconds, and container images
-    /// and asserts generation increments by 1 for each. Without this increment, generation
-    /// stays at 1 after 4 spec updates (pods.go:530: Expected 1 to be equivalent to 5).
-    #[test]
-    fn pod_spec_update_bumps_generation_for_pod_generation_conformance() {
-        let spec_before = serde_json::json!({
-            "containers": [{ "name": "c", "image": "busybox" }],
-            "tolerations": []
-        });
-        let mut obj = serde_json::json!({
-            "metadata": { "name": "test", "generation": 1 },
-            "spec": {
-                "containers": [{ "name": "c", "image": "busybox" }],
-                "tolerations": [{ "key": "foo", "operator": "Equal", "value": "bar", "effect": "NoSchedule" }]
-            }
-        });
-
-        increment_workload_generation_if_spec_changed(&mut obj, &spec_before);
-
-        assert_eq!(
-            obj["metadata"]["generation"], 2,
-            "Pod generation must increment when spec changes (e.g. toleration added) — the \
-             PodObservedGenerationTracking conformance test does 4 mutable-spec updates and \
-             asserts generation reaches 5; staying at 1 means this test fails at pods.go:530"
-        );
-    }
-
-    /// A Pod status-only update must NOT bump metadata.generation.
-    ///
-    /// Only spec changes gate generation increments. If a status PUT (written by the kubelet
-    /// or a controller via /status subresource) were to bump generation, conformance tests
-    /// relying on generation as a staleness signal would see spurious increments and controllers
-    /// would reconcile unnecessarily.
-    #[test]
-    fn pod_status_update_does_not_bump_generation_preserving_conformance_semantics() {
-        let spec_before = serde_json::json!({
-            "containers": [{ "name": "c", "image": "busybox" }]
-        });
-        // Status changed but spec is identical to spec_before.
-        let mut obj = serde_json::json!({
-            "metadata": { "name": "test", "generation": 1 },
-            "spec": {
-                "containers": [{ "name": "c", "image": "busybox" }]
-            },
-            "status": { "phase": "Running" }
-        });
-
-        increment_workload_generation_if_spec_changed(&mut obj, &spec_before);
-
-        assert_eq!(
-            obj["metadata"]["generation"], 1,
-            "Pod generation must NOT increment on a status-only update — generation is gated on \
-             spec changes only; status updates (written by kubelet or controllers) must not bump \
-             generation or controllers would see spurious staleness signals and reconcile unnecessarily"
         );
     }
 
