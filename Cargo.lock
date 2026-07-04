@@ -96,6 +96,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e149dc73cd30538307e7ffa2acd3d2221148eaeed4871f246657b1c3eaa1cbd2"
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -765,6 +771,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1032,6 +1047,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "foldhash 0.2.0",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
+dependencies = [
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -2209,7 +2233,7 @@ dependencies = [
  "bitflags",
  "fallible-iterator",
  "fallible-streaming-iterator",
- "hashlink",
+ "hashlink 0.12.0",
  "libsqlite3-sys",
  "smallvec",
  "sqlite-wasm-rs",
@@ -2515,19 +2539,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
 ]
 
 [[package]]
@@ -3064,7 +3075,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "serde_yaml",
  "sha2 0.11.0",
  "subtle",
  "thiserror",
@@ -3078,6 +3088,7 @@ dependencies = [
  "u7s-store",
  "uuid",
  "x509-cert",
+ "yaml-rust2",
 ]
 
 [[package]]
@@ -3185,12 +3196,6 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
@@ -3703,6 +3708,17 @@ dependencies = [
  "rusticata-macros",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "yaml-rust2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "631a50d867fafb7093e709d75aaee9e0e0d5deb934021fcea25ac2fe09edc51e"
+dependencies = [
+ "arraydeque",
+ "encoding_rs",
+ "hashlink 0.11.1",
 ]
 
 [[package]]
