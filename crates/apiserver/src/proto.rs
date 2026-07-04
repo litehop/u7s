@@ -215,20 +215,6 @@ struct Namespace {
     status: Option<NamespaceStatus>,
 }
 
-/// PodTemplate — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message PodTemplate
-/// Only metadata (field 1) is decoded; template (field 2, PodTemplateSpec) is skipped.
-/// The chunking conformance test creates PodTemplates via proto; we only need name/namespace
-/// to return 201 and allow the test to proceed past the Create phase without panicking.
-#[derive(Clone, PartialEq, Message)]
-struct PodTemplate {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    // template (field 2, PodTemplateSpec) — skipped; PodSpec is deeply nested and not needed
-    // for routing/storage. The template is preserved as an empty object in the output JSON.
-}
-
 /// ResourceRequirements — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ResourceRequirements
 /// limits (field 1) and requests (field 2) are both map<string, Quantity>.
@@ -1142,33 +1128,6 @@ struct Service {
     /// status (field 3, message ServiceStatus)
     #[prost(message, tag = "3")]
     status: Option<ServiceStatus>,
-}
-
-/// Secret — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message Secret
-/// Field numbers match the official proto exactly:
-///   field 1 = metadata (message ObjectMeta)
-///   field 2 = data (map<string,bytes>)
-///   field 3 = type (string)        ← NOTE: type=3, stringData=4 (not the reverse)
-///   field 4 = stringData (map<string,string>)
-///   field 5 = immutable (bool)
-#[derive(Clone, PartialEq, Message)]
-struct Secret {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// data (field 2, map<string,bytes>)
-    #[prost(map = "string, bytes", tag = "2")]
-    data: std::collections::HashMap<String, Vec<u8>>,
-    /// type (field 3, string) — wire field 3, not 4
-    #[prost(string, tag = "3")]
-    r#type: String,
-    /// stringData (field 4, map<string,string>) — wire field 4, not 3
-    #[prost(map = "string, string", tag = "4")]
-    string_data: std::collections::HashMap<String, String>,
-    /// immutable (field 5, bool)
-    #[prost(bool, tag = "5")]
-    immutable: bool,
 }
 
 /// ReplicationControllerSpec — k8s.io/api/core/v1/generated.proto
@@ -2326,74 +2285,6 @@ struct PersistentVolumeClaim {
     status: Option<PersistentVolumeClaimStatus>,
 }
 
-/// EndpointAddress — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message EndpointAddress
-/// Canonical field layout:
-///   1: ip (string)
-///   2: targetRef (ObjectReference, LEN/message) — decoded as raw bytes, not serialized
-///   3: hostname (string)
-///   4: nodeName (string)
-#[derive(Clone, PartialEq, Message)]
-struct EndpointAddress {
-    /// ip (field 1, string)
-    #[prost(string, tag = "1")]
-    ip: String,
-    /// targetRef (field 2, ObjectReference) — captured as bytes, not serialized to JSON
-    #[prost(bytes = "vec", tag = "2")]
-    target_ref: Vec<u8>,
-    /// hostname (field 3, string)
-    #[prost(string, tag = "3")]
-    hostname: String,
-    /// nodeName (field 4, string)
-    #[prost(string, tag = "4")]
-    node_name: String,
-}
-
-/// EndpointPort — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message EndpointPort
-#[derive(Clone, PartialEq, Message)]
-struct EndpointPort {
-    /// name (field 1, string)
-    #[prost(string, tag = "1")]
-    name: String,
-    /// port (field 2, int32)
-    #[prost(int32, tag = "2")]
-    port: i32,
-    /// protocol (field 3, string)
-    #[prost(string, tag = "3")]
-    protocol: String,
-    /// appProtocol (field 4, string)
-    #[prost(string, tag = "4")]
-    app_protocol: String,
-}
-
-/// EndpointSubset — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message EndpointSubset
-#[derive(Clone, PartialEq, Message)]
-struct EndpointSubset {
-    /// addresses (field 1, repeated EndpointAddress)
-    #[prost(message, repeated, tag = "1")]
-    addresses: Vec<EndpointAddress>,
-    /// notReadyAddresses (field 2, repeated EndpointAddress)
-    #[prost(message, repeated, tag = "2")]
-    not_ready_addresses: Vec<EndpointAddress>,
-    /// ports (field 3, repeated EndpointPort)
-    #[prost(message, repeated, tag = "3")]
-    ports: Vec<EndpointPort>,
-}
-
-/// Endpoints — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message Endpoints
-#[derive(Clone, PartialEq, Message)]
-struct Endpoints {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// subsets (field 2, repeated EndpointSubset)
-    #[prost(message, repeated, tag = "2")]
-    subsets: Vec<EndpointSubset>,
-}
-
 // --- k8s.io/api/storage/v1/generated.proto ---
 
 /// StorageClass — k8s.io/api/storage/v1/generated.proto
@@ -2438,75 +2329,6 @@ struct VolumeAttributesClass {
     parameters: std::collections::HashMap<String, String>,
 }
 
-// --- k8s.io/api/core/v1/generated.proto (resource management types) ---
-
-/// ScopedResourceSelectorRequirement — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ScopedResourceSelectorRequirement
-///
-/// A single match expression in a scopeSelector. Required for the
-/// "verify ResourceQuota with terminating scopes through scope selectors"
-/// conformance test (:1567), which creates quotas with spec.scopeSelector
-/// instead of spec.scopes. Without this struct, scopeSelector is silently
-/// dropped from the stored JSON and the reconciler treats the quota as
-/// scope-less, counting all pods against it.
-#[derive(Clone, PartialEq, Message)]
-struct ScopedResourceSelectorRequirement {
-    /// scopeName (field 1, string) — e.g. "Terminating", "BestEffort"
-    #[prost(string, tag = "1")]
-    scope_name: String,
-    /// operator (field 2, string) — "In", "NotIn", "Exists", "DoesNotExist"
-    #[prost(string, tag = "2")]
-    operator: String,
-    /// values (field 3, repeated string)
-    #[prost(string, repeated, tag = "3")]
-    values: Vec<String>,
-}
-
-/// ScopeSelector — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ScopeSelector
-#[derive(Clone, PartialEq, Message)]
-struct ScopeSelector {
-    /// matchExpressions (field 1, repeated ScopedResourceSelectorRequirement)
-    #[prost(message, repeated, tag = "1")]
-    match_expressions: Vec<ScopedResourceSelectorRequirement>,
-}
-
-/// ResourceQuotaSpec — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ResourceQuotaSpec
-///
-/// Fields 1 (hard), 2 (scopes), and 3 (scopeSelector) are decoded.
-/// hard is required by the quota controller to enforce limits; without it the controller
-/// sees no limits and skips reconciliation, leaving spec.hard null after create.
-/// scopes is required so the quota controller scope-filters pods correctly; without it
-/// a Terminating-scoped quota appears scope-less and KCM counts all pods against it.
-/// scopeSelector is required for the scope-selectors conformance test (:1567) which
-/// uses spec.scopeSelector instead of spec.scopes.
-#[derive(Clone, PartialEq, Message)]
-struct ResourceQuotaSpec {
-    /// hard (field 1, map<string, Quantity>) — the desired hard limits per named resource
-    #[prost(btree_map = "string, message", tag = "1")]
-    hard: std::collections::BTreeMap<String, Quantity>,
-    /// scopes (field 2, repeated string) — e.g. ["Terminating"], ["BestEffort"]
-    #[prost(string, repeated, tag = "2")]
-    scopes: Vec<String>,
-    /// scopeSelector (field 3, optional ScopeSelector) — alternative to scopes using
-    /// matchExpressions with operators (Exists, DoesNotExist, In, NotIn)
-    #[prost(message, optional, tag = "3")]
-    scope_selector: Option<ScopeSelector>,
-}
-
-/// ResourceQuota — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ResourceQuota
-#[derive(Clone, PartialEq, Message)]
-struct ResourceQuota {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message ResourceQuotaSpec)
-    #[prost(message, optional, tag = "2")]
-    spec: Option<ResourceQuotaSpec>,
-}
-
 /// Quantity — k8s.io/apimachinery/pkg/api/resource/generated.proto
 /// Source: apimachinery-resource-generated.proto message Quantity
 ///
@@ -2518,51 +2340,6 @@ struct Quantity {
     /// string representation (field 1, e.g. "500m", "128Mi", "1")
     #[prost(string, optional, tag = "1")]
     string: Option<String>,
-}
-
-/// LimitRangeItem — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message LimitRangeItem
-#[derive(Clone, PartialEq, Message)]
-struct LimitRangeItem {
-    /// type (field 1, string) — "Container", "Pod", or "PersistentVolumeClaim"
-    #[prost(string, tag = "1")]
-    r#type: String,
-    /// max (field 2, map<string, Quantity>)
-    #[prost(btree_map = "string, message", tag = "2")]
-    max: std::collections::BTreeMap<String, Quantity>,
-    /// min (field 3, map<string, Quantity>)
-    #[prost(btree_map = "string, message", tag = "3")]
-    min: std::collections::BTreeMap<String, Quantity>,
-    /// default (field 4, map<string, Quantity>)
-    #[prost(btree_map = "string, message", tag = "4")]
-    default: std::collections::BTreeMap<String, Quantity>,
-    /// defaultRequest (field 5, map<string, Quantity>)
-    #[prost(btree_map = "string, message", tag = "5")]
-    default_request: std::collections::BTreeMap<String, Quantity>,
-    /// maxLimitRequestRatio (field 6, map<string, Quantity>)
-    #[prost(btree_map = "string, message", tag = "6")]
-    max_limit_request_ratio: std::collections::BTreeMap<String, Quantity>,
-}
-
-/// LimitRangeSpec — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message LimitRangeSpec
-#[derive(Clone, PartialEq, Message)]
-struct LimitRangeSpec {
-    /// limits (field 1, repeated LimitRangeItem)
-    #[prost(message, repeated, tag = "1")]
-    limits: Vec<LimitRangeItem>,
-}
-
-/// LimitRange — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message LimitRange
-#[derive(Clone, PartialEq, Message)]
-struct LimitRange {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message LimitRangeSpec)
-    #[prost(message, optional, tag = "2")]
-    spec: Option<LimitRangeSpec>,
 }
 
 // --- k8s.io/api/policy/v1/generated.proto ---
@@ -3068,22 +2845,6 @@ pub fn decode_pod_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
-/// Decode a proto-encoded PodTemplate object into a `serde_json::Value`.
-///
-/// Only metadata is decoded; the template field (PodTemplateSpec) is omitted from the output
-/// because PodSpec is deeply nested and we do not need to round-trip it — the goal is to let
-/// CREATE return 201 instead of 400 so the e2e chunking test does not panic.
-pub fn decode_podtemplate_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let pt = PodTemplate::decode(data).ok()?;
-    let meta = object_meta_to_json(pt.metadata.unwrap_or_default());
-    Some(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "PodTemplate",
-        "metadata": meta,
-        "template": {}
-    }))
-}
-
 /// Decode a proto-encoded IntOrString (k8s.io/apimachinery/pkg/util/intstr) from raw bytes.
 /// k8s IntOrString (k8s.io/apimachinery/pkg/util/intstr/generated.proto):
 ///   field 1 (int64) = type: 0=Int 1=String
@@ -3292,46 +3053,6 @@ pub fn decode_service_proto(data: &[u8]) -> Option<serde_json::Value> {
         if !status_map.is_empty() {
             obj["status"] = serde_json::Value::Object(status_map);
         }
-    }
-
-    Some(obj)
-}
-
-/// Decode a proto-encoded Secret object into a `serde_json::Value`.
-pub fn decode_secret_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let secret = Secret::decode(data).ok()?;
-    let meta = object_meta_to_json(secret.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": meta
-    });
-
-    if !secret.r#type.is_empty() {
-        obj["type"] = serde_json::Value::String(secret.r#type);
-    }
-    if !secret.data.is_empty() {
-        let data_map: serde_json::Map<String, serde_json::Value> = secret
-            .data
-            .into_iter()
-            .map(|(k, v)| {
-                use base64::Engine;
-                (
-                    k,
-                    serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&v)),
-                )
-            })
-            .collect();
-        obj["data"] = serde_json::Value::Object(data_map);
-    }
-    if !secret.string_data.is_empty() {
-        let sd_map: serde_json::Map<String, serde_json::Value> = secret
-            .string_data
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        obj["stringData"] = serde_json::Value::Object(sd_map);
     }
 
     Some(obj)
@@ -5408,87 +5129,6 @@ pub fn decode_persistentvolumeclaim_proto(data: &[u8]) -> Option<serde_json::Val
     Some(result)
 }
 
-/// Decode a proto-encoded Endpoints object into a `serde_json::Value`.
-///
-/// Decodes metadata and subsets (field 2, repeated EndpointSubset).
-/// Without decoding subsets, a proto PUT/PATCH silently drops user-supplied subsets,
-/// leaving the stored object with null subsets and breaking EndpointSliceMirroring.
-pub fn decode_endpoints_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = Endpoints::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Endpoints",
-        "metadata": meta
-    });
-    if !obj.subsets.is_empty() {
-        let subsets: Vec<serde_json::Value> = obj
-            .subsets
-            .into_iter()
-            .map(|subset| {
-                let mut s = serde_json::json!({});
-                if !subset.addresses.is_empty() {
-                    s["addresses"] = subset
-                        .addresses
-                        .into_iter()
-                        .map(|a| {
-                            let mut addr = serde_json::json!({ "ip": a.ip });
-                            if !a.hostname.is_empty() {
-                                addr["hostname"] = serde_json::Value::String(a.hostname);
-                            }
-                            if !a.node_name.is_empty() {
-                                addr["nodeName"] = serde_json::Value::String(a.node_name);
-                            }
-                            addr
-                        })
-                        .collect::<Vec<_>>()
-                        .into();
-                }
-                if !subset.not_ready_addresses.is_empty() {
-                    s["notReadyAddresses"] = subset
-                        .not_ready_addresses
-                        .into_iter()
-                        .map(|a| {
-                            let mut addr = serde_json::json!({ "ip": a.ip });
-                            if !a.hostname.is_empty() {
-                                addr["hostname"] = serde_json::Value::String(a.hostname);
-                            }
-                            if !a.node_name.is_empty() {
-                                addr["nodeName"] = serde_json::Value::String(a.node_name);
-                            }
-                            addr
-                        })
-                        .collect::<Vec<_>>()
-                        .into();
-                }
-                if !subset.ports.is_empty() {
-                    s["ports"] = subset
-                        .ports
-                        .into_iter()
-                        .map(|p| {
-                            let mut port = serde_json::json!({ "port": p.port });
-                            if !p.name.is_empty() {
-                                port["name"] = serde_json::Value::String(p.name);
-                            }
-                            if !p.protocol.is_empty() {
-                                port["protocol"] = serde_json::Value::String(p.protocol);
-                            }
-                            if !p.app_protocol.is_empty() {
-                                port["appProtocol"] = serde_json::Value::String(p.app_protocol);
-                            }
-                            port
-                        })
-                        .collect::<Vec<_>>()
-                        .into();
-                }
-                s
-            })
-            .collect();
-        result["subsets"] = subsets.into();
-    }
-    Some(result)
-}
-
 /// Decode a proto-encoded StorageClass object into a `serde_json::Value`.
 ///
 /// kubectl sends StorageClass with Content-Type: application/vnd.kubernetes.protobuf.
@@ -5548,98 +5188,6 @@ pub fn decode_volumeattributesclass_proto(data: &[u8]) -> Option<serde_json::Val
             .map(|(k, v)| (k, serde_json::Value::String(v)))
             .collect();
         result["parameters"] = serde_json::Value::Object(params);
-    }
-    Some(result)
-}
-
-/// Decode a proto-encoded ResourceQuota object into a `serde_json::Value`.
-///
-/// kubectl sends ResourceQuota (core/v1) with proto encoding. Without this decoder,
-/// create_namespaced_resource returns "invalid JSON: expected value at line 1 column 1".
-pub fn decode_resourcequota_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ResourceQuota::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ResourceQuota",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        if !spec.hard.is_empty() || !spec.scopes.is_empty() || spec.scope_selector.is_some() {
-            let mut spec_json = serde_json::json!({});
-            if !spec.hard.is_empty() {
-                spec_json["hard"] = limitrange_quantity_map_to_json(spec.hard);
-            }
-            if !spec.scopes.is_empty() {
-                spec_json["scopes"] =
-                    serde_json::Value::Array(spec.scopes.into_iter().map(Into::into).collect());
-            }
-            if let Some(ss) = spec.scope_selector {
-                if !ss.match_expressions.is_empty() {
-                    let exprs: Vec<serde_json::Value> = ss
-                        .match_expressions
-                        .into_iter()
-                        .map(|expr| {
-                            let mut m = serde_json::json!({
-                                "scopeName": expr.scope_name,
-                                "operator": expr.operator,
-                            });
-                            if !expr.values.is_empty() {
-                                m["values"] = serde_json::Value::Array(
-                                    expr.values.into_iter().map(Into::into).collect(),
-                                );
-                            }
-                            m
-                        })
-                        .collect();
-                    spec_json["scopeSelector"] = serde_json::json!({ "matchExpressions": exprs });
-                }
-            }
-            result["spec"] = spec_json;
-        }
-    }
-    Some(result)
-}
-
-/// Decode a proto-encoded LimitRange object into a `serde_json::Value`.
-///
-/// Decodes metadata and spec.limits (with type, max, min, default, defaultRequest).
-/// The spec is required by the LimitRange admission plugin to inject defaults into pods;
-/// without it, pods created after a LimitRange get no defaults applied.
-pub fn decode_limitrange_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = LimitRange::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "LimitRange",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let limits: Vec<serde_json::Value> = spec
-            .limits
-            .into_iter()
-            .map(|item| {
-                let mut obj = serde_json::json!({ "type": item.r#type });
-                if !item.max.is_empty() {
-                    obj["max"] = limitrange_quantity_map_to_json(item.max);
-                }
-                if !item.min.is_empty() {
-                    obj["min"] = limitrange_quantity_map_to_json(item.min);
-                }
-                if !item.default.is_empty() {
-                    obj["default"] = limitrange_quantity_map_to_json(item.default);
-                }
-                if !item.default_request.is_empty() {
-                    obj["defaultRequest"] = limitrange_quantity_map_to_json(item.default_request);
-                }
-                if !item.max_limit_request_ratio.is_empty() {
-                    obj["maxLimitRequestRatio"] =
-                        limitrange_quantity_map_to_json(item.max_limit_request_ratio);
-                }
-                obj
-            })
-            .collect();
-        result["spec"] = serde_json::json!({ "limits": limits });
     }
     Some(result)
 }
@@ -7669,15 +7217,17 @@ pub fn decode_proto_by_kind_and_version(
 ) -> Option<serde_json::Value> {
     match kind {
         "CustomResourceDefinition" => decode_crd_proto(raw),
-        "Namespace" => decode_namespace_proto(raw),
-        "ConfigMap" => decode_configmap_proto(raw),
-        "Pod" => decode_pod_proto(raw),
-        "PodTemplate" => decode_podtemplate_proto(raw),
-        "Node" => decode_node_proto(raw),
-        "Service" => decode_service_proto(raw),
-        "Secret" => decode_secret_proto(raw),
-        "ReplicationController" => decode_replicationcontroller_proto(raw),
-        "PersistentVolume" => decode_persistentvolume_proto(raw),
+        "Namespace" => crate::core_gen_adapter::decode_namespace_proto_gen(raw),
+        "ConfigMap" => crate::core_gen_adapter::decode_configmap_proto_gen(raw),
+        "Pod" => crate::core_gen_adapter::decode_pod_proto_gen(raw),
+        "PodTemplate" => crate::core_gen_adapter::decode_podtemplate_proto_gen(raw),
+        "Node" => crate::core_gen_adapter::decode_node_proto_gen(raw),
+        "Service" => crate::core_gen_adapter::decode_service_proto_gen(raw),
+        "Secret" => crate::core_gen_adapter::decode_secret_proto_gen(raw),
+        "ReplicationController" => {
+            crate::core_gen_adapter::decode_replicationcontroller_proto_gen(raw)
+        }
+        "PersistentVolume" => crate::core_gen_adapter::decode_persistentvolume_proto_gen(raw),
         "Lease" => decode_lease_proto(raw),
         "CSINode" => decode_csinode_proto(raw),
         "CSIDriver" => decode_csidriver_proto(raw),
@@ -7686,7 +7236,7 @@ pub fn decode_proto_by_kind_and_version(
             if api_version == "events.k8s.io/v1" {
                 decode_events_v1_event_proto(raw)
             } else {
-                decode_event_proto(raw)
+                crate::core_gen_adapter::decode_event_proto_gen(raw)
             }
         }
         "ClusterRole" => decode_clusterrole_proto(raw),
@@ -7704,13 +7254,15 @@ pub fn decode_proto_by_kind_and_version(
         "Deployment" => crate::apps_gen_adapter::decode_deployment_proto_gen(raw),
         "DaemonSet" => crate::apps_gen_adapter::decode_daemonset_proto_gen(raw),
         "ReplicaSet" => crate::apps_gen_adapter::decode_replicaset_proto_gen(raw),
-        "ServiceAccount" => decode_serviceaccount_proto(raw),
-        "PersistentVolumeClaim" => decode_persistentvolumeclaim_proto(raw),
-        "Endpoints" => decode_endpoints_proto(raw),
+        "ServiceAccount" => crate::core_gen_adapter::decode_serviceaccount_proto_gen(raw),
+        "PersistentVolumeClaim" => {
+            crate::core_gen_adapter::decode_persistentvolumeclaim_proto_gen(raw)
+        }
+        "Endpoints" => crate::core_gen_adapter::decode_endpoints_proto_gen(raw),
         "StorageClass" => decode_storageclass_proto(raw),
         "VolumeAttributesClass" => decode_volumeattributesclass_proto(raw),
-        "ResourceQuota" => decode_resourcequota_proto(raw),
-        "LimitRange" => decode_limitrange_proto(raw),
+        "ResourceQuota" => crate::core_gen_adapter::decode_resourcequota_proto_gen(raw),
+        "LimitRange" => crate::core_gen_adapter::decode_limitrange_proto_gen(raw),
         "PodDisruptionBudget" => decode_poddisruptionbudget_proto(raw),
         "FlowSchema" => decode_flowschema_proto(raw),
         "PriorityLevelConfiguration" => decode_prioritylevelconfiguration_proto(raw),
