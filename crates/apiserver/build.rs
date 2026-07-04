@@ -74,6 +74,26 @@ fn main() {
                     )
                     .to_str()
                     .unwrap(),
+                include_dir
+                    .join("k8s.io/api/networking/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/discovery/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/certificates/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/policy/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/events/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
             ],
             &[include_dir.to_str().unwrap()],
         )
