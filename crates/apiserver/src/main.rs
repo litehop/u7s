@@ -1,4 +1,6 @@
 mod admission;
+mod admissionreg_gen;
+mod admissionreg_gen_adapter;
 mod apps_gen;
 mod apps_gen_adapter;
 mod auth;
@@ -14,6 +16,8 @@ mod patch;
 mod proto;
 mod quota;
 mod rbac;
+mod rbac_authz_authn_gen;
+mod rbac_gen_adapter;
 mod state;
 mod status;
 mod storage_node_flow_gen;

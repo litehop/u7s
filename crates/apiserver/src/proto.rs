@@ -1431,274 +1431,42 @@ struct Lease {
 
 // --- k8s.io/api/authorization/v1/generated.proto ---
 
-/// ResourceAttributes — describes a resource request in SubjectAccessReviewSpec.
-/// Source: k8s.io/api/authorization/v1/generated.proto message ResourceAttributes
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct ResourceAttributes {
-    /// namespace (field 1, string)
-    #[prost(string, tag = "1")]
-    namespace: String,
-    /// verb (field 2, string)
-    #[prost(string, tag = "2")]
-    verb: String,
-    /// group (field 3, string)
-    #[prost(string, tag = "3")]
-    group: String,
-    /// version (field 4, string)
-    #[prost(string, tag = "4")]
-    version: String,
-    /// resource (field 5, string)
-    #[prost(string, tag = "5")]
-    resource: String,
-    /// subresource (field 6, string)
-    #[prost(string, tag = "6")]
-    subresource: String,
-    /// name (field 7, string)
-    #[prost(string, tag = "7")]
-    name: String,
-}
-
-/// SubjectAccessReviewSpec — the input to a SubjectAccessReview.
-/// Source: k8s.io/api/authorization/v1/generated.proto message SubjectAccessReviewSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct SubjectAccessReviewSpec {
-    /// resourceAttributes (field 1, message ResourceAttributes)
-    #[prost(message, tag = "1")]
-    resource_attributes: Option<ResourceAttributes>,
-    // field 2 (NonResourceAttributes) — intentionally omitted
-    /// user (field 3, string)
-    #[prost(string, tag = "3")]
-    user: String,
-    /// groups (field 4, repeated string)
-    #[prost(string, repeated, tag = "4")]
-    groups: Vec<String>,
-}
-
-/// SubjectAccessReview — k8s.io/api/authorization/v1/generated.proto
-/// Source: k8s.io/api/authorization/v1/generated.proto message SubjectAccessReview
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct SubjectAccessReviewProto {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message SubjectAccessReviewSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<SubjectAccessReviewSpec>,
-    // status (field 3) — ignored on input
-}
-
-/// TokenReviewSpec — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenReviewSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct TokenReviewSpec {
-    /// token (field 1, string)
-    #[prost(string, tag = "1")]
-    token: String,
-    /// audiences (field 2, repeated string)
-    #[prost(string, repeated, tag = "2")]
-    audiences: Vec<String>,
-}
-
-/// TokenReview — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenReview
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct TokenReviewProto {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message TokenReviewSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<TokenReviewSpec>,
-    // status (field 3) — ignored on input
-}
-
-// --- k8s.io/api/authentication/v1/generated.proto ---
-
-/// BoundObjectReference — used in TokenRequestSpec
-/// Source: k8s.io/api/authentication/v1/generated.proto message BoundObjectReference
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct BoundObjectReference {
-    /// kind (field 1, string)
     #[prost(string, tag = "1")]
     kind: String,
-    /// apiVersion (field 2, string)
     #[prost(string, tag = "2")]
     api_version: String,
-    /// name (field 3, string)
     #[prost(string, tag = "3")]
     name: String,
-    /// uid (field 4, string)
     #[prost(string, tag = "4")]
     uid: String,
 }
 
-/// TokenRequestSpec — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenRequestSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenRequestSpec {
-    /// audiences (field 1, repeated string)
     #[prost(string, repeated, tag = "1")]
     audiences: Vec<String>,
-    /// expirationSeconds (field 4, int64) — optional, 0 = unset
     #[prost(int64, tag = "4")]
     expiration_seconds: i64,
-    /// boundObjectRef (field 3, message BoundObjectReference)
     #[prost(message, tag = "3")]
     bound_object_ref: Option<BoundObjectReference>,
 }
 
-/// TokenRequestStatus — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenRequestStatus
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenRequestStatus {
-    /// token (field 1, string)
     #[prost(string, tag = "1")]
     token: String,
-    /// expirationTimestamp (field 2, message Time)
-    #[prost(message, tag = "2")]
-    expiration_timestamp: Option<Time>,
 }
 
-/// TokenRequest — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenRequest
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenRequestProto {
-    /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
-    /// spec (field 2, message TokenRequestSpec)
     #[prost(message, tag = "2")]
     spec: Option<TokenRequestSpec>,
-    /// status (field 3, message TokenRequestStatus)
     #[prost(message, tag = "3")]
     status: Option<TokenRequestStatus>,
-}
-
-// --- k8s.io/api/rbac/v1/generated.proto ---
-
-/// PolicyRule — a single RBAC policy rule.
-/// Source: k8s.io/api/rbac/v1/generated.proto message PolicyRule
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct PolicyRule {
-    /// verbs (field 1, repeated string)
-    #[prost(string, repeated, tag = "1")]
-    verbs: Vec<String>,
-    /// apiGroups (field 2, repeated string)
-    #[prost(string, repeated, tag = "2")]
-    api_groups: Vec<String>,
-    /// resources (field 3, repeated string)
-    #[prost(string, repeated, tag = "3")]
-    resources: Vec<String>,
-    /// resourceNames (field 4, repeated string)
-    #[prost(string, repeated, tag = "4")]
-    resource_names: Vec<String>,
-    /// nonResourceURLs (field 5, repeated string)
-    #[prost(string, repeated, tag = "5")]
-    non_resource_urls: Vec<String>,
-}
-
-/// Subject — a user, group, or service account in a RoleBinding.
-/// Source: k8s.io/api/rbac/v1/generated.proto message Subject
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct Subject {
-    /// kind (field 1, string)
-    #[prost(string, tag = "1")]
-    kind: String,
-    /// apiGroup (field 2, string)
-    #[prost(string, tag = "2")]
-    api_group: String,
-    /// name (field 3, string)
-    #[prost(string, tag = "3")]
-    name: String,
-    /// namespace (field 4, string)
-    #[prost(string, tag = "4")]
-    namespace: String,
-}
-
-/// RoleRef — reference to the role being bound.
-/// Source: k8s.io/api/rbac/v1/generated.proto message RoleRef
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct RoleRef {
-    /// apiGroup (field 1, string)
-    #[prost(string, tag = "1")]
-    api_group: String,
-    /// kind (field 2, string)
-    #[prost(string, tag = "2")]
-    kind: String,
-    /// name (field 3, string)
-    #[prost(string, tag = "3")]
-    name: String,
-}
-
-/// ClusterRole — k8s.io/api/rbac/v1/generated.proto
-/// Source: k8s.io/api/rbac/v1/generated.proto message ClusterRole
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct ClusterRole {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// rules (field 2, repeated PolicyRule)
-    #[prost(message, repeated, tag = "2")]
-    rules: Vec<PolicyRule>,
-    // aggregationRule (field 3) is intentionally omitted — not needed for kubectl compat
-}
-
-/// ClusterRoleBinding — k8s.io/api/rbac/v1/generated.proto
-/// Source: k8s.io/api/rbac/v1/generated.proto message ClusterRoleBinding
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct ClusterRoleBinding {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// subjects (field 2, repeated Subject)
-    #[prost(message, repeated, tag = "2")]
-    subjects: Vec<Subject>,
-    /// roleRef (field 3, message RoleRef)
-    #[prost(message, tag = "3")]
-    role_ref: Option<RoleRef>,
-}
-
-/// Role — namespaced, same structure as ClusterRole but namespaced.
-/// Source: k8s.io/api/rbac/v1/generated.proto message Role
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct Role {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// rules (field 2, repeated PolicyRule)
-    #[prost(message, repeated, tag = "2")]
-    rules: Vec<PolicyRule>,
-}
-
-/// RoleBinding — namespaced.
-/// Source: k8s.io/api/rbac/v1/generated.proto message RoleBinding
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct RoleBinding {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// subjects (field 2, repeated Subject)
-    #[prost(message, repeated, tag = "2")]
-    subjects: Vec<Subject>,
-    /// roleRef (field 3, message RoleRef)
-    #[prost(message, tag = "3")]
-    role_ref: Option<RoleRef>,
 }
 
 // --- k8s.io/api/batch/v1/generated.proto ---
@@ -2127,6 +1895,53 @@ struct PodDisruptionBudgetStatus {
     conditions: Vec<MetaV1Condition>,
 }
 
+/// LabelSelectorRequirement for PodDisruptionBudget — metav1.LabelSelectorRequirement
+#[derive(Clone, PartialEq, Message)]
+struct PdbLabelSelectorRequirement {
+    #[prost(string, tag = "1")]
+    key: String,
+    #[prost(string, tag = "2")]
+    operator: String,
+    #[prost(string, repeated, tag = "3")]
+    values: Vec<String>,
+}
+
+/// LabelSelector for PodDisruptionBudget — metav1.LabelSelector
+#[derive(Clone, PartialEq, Message)]
+struct PdbLabelSelector {
+    #[prost(map = "string, string", tag = "1")]
+    match_labels: std::collections::HashMap<String, String>,
+    #[prost(message, repeated, tag = "2")]
+    match_expressions: Vec<PdbLabelSelectorRequirement>,
+}
+
+fn pdb_label_selector_to_json(sel: PdbLabelSelector) -> serde_json::Value {
+    let mut m = serde_json::json!({});
+    if !sel.match_labels.is_empty() {
+        let labels: serde_json::Map<String, serde_json::Value> = sel
+            .match_labels
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        m["matchLabels"] = serde_json::Value::Object(labels);
+    }
+    if !sel.match_expressions.is_empty() {
+        let exprs: Vec<serde_json::Value> = sel
+            .match_expressions
+            .into_iter()
+            .map(|req| {
+                serde_json::json!({
+                    "key": req.key,
+                    "operator": req.operator,
+                    "values": req.values,
+                })
+            })
+            .collect();
+        m["matchExpressions"] = serde_json::Value::Array(exprs);
+    }
+    m
+}
+
 /// PodDisruptionBudgetSpec — k8s.io/api/policy/v1/generated.proto
 /// Source: k8s.io/api/policy/v1/generated.proto message PodDisruptionBudgetSpec
 ///
@@ -2143,7 +1958,7 @@ struct PodDisruptionBudgetSpec {
     min_available: Option<IntOrString>,
     /// selector (field 2, metav1.LabelSelector)
     #[prost(message, optional, tag = "2")]
-    selector: Option<AdmissionLabelSelector>,
+    selector: Option<PdbLabelSelector>,
     /// maxUnavailable (field 3, IntOrString)
     #[prost(message, optional, tag = "3")]
     max_unavailable: Option<IntOrString>,
@@ -3170,337 +2985,6 @@ pub fn decode_token_request(raw: &[u8]) -> Option<TokenRequestFields> {
         expiration_seconds,
         bound_object_ref,
     })
-}
-
-/// Convert a prost PolicyRule into a serde_json::Value object.
-fn policy_rule_to_json(rule: PolicyRule) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !rule.verbs.is_empty() {
-        m.insert(
-            "verbs".to_string(),
-            serde_json::Value::Array(
-                rule.verbs
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !rule.api_groups.is_empty() {
-        m.insert(
-            "apiGroups".to_string(),
-            serde_json::Value::Array(
-                rule.api_groups
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !rule.resources.is_empty() {
-        m.insert(
-            "resources".to_string(),
-            serde_json::Value::Array(
-                rule.resources
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !rule.resource_names.is_empty() {
-        m.insert(
-            "resourceNames".to_string(),
-            serde_json::Value::Array(
-                rule.resource_names
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !rule.non_resource_urls.is_empty() {
-        m.insert(
-            "nonResourceURLs".to_string(),
-            serde_json::Value::Array(
-                rule.non_resource_urls
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Convert a prost Subject into a serde_json::Value object.
-fn subject_to_json(s: Subject) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !s.kind.is_empty() {
-        m.insert("kind".to_string(), serde_json::Value::String(s.kind));
-    }
-    if !s.api_group.is_empty() {
-        m.insert(
-            "apiGroup".to_string(),
-            serde_json::Value::String(s.api_group),
-        );
-    }
-    if !s.name.is_empty() {
-        m.insert("name".to_string(), serde_json::Value::String(s.name));
-    }
-    if !s.namespace.is_empty() {
-        m.insert(
-            "namespace".to_string(),
-            serde_json::Value::String(s.namespace),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Convert a prost RoleRef into a serde_json::Value object.
-fn role_ref_to_json(r: RoleRef) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !r.api_group.is_empty() {
-        m.insert(
-            "apiGroup".to_string(),
-            serde_json::Value::String(r.api_group),
-        );
-    }
-    if !r.kind.is_empty() {
-        m.insert("kind".to_string(), serde_json::Value::String(r.kind));
-    }
-    if !r.name.is_empty() {
-        m.insert("name".to_string(), serde_json::Value::String(r.name));
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Decode a proto-encoded ClusterRole object into a `serde_json::Value`.
-pub fn decode_clusterrole_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let cr = ClusterRole::decode(data).ok()?;
-    let meta = object_meta_to_json(cr.metadata.unwrap_or_default());
-    let rules: Vec<serde_json::Value> = cr.rules.into_iter().map(policy_rule_to_json).collect();
-    Some(serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": meta,
-        "rules": rules
-    }))
-}
-
-/// Decode a proto-encoded ClusterRoleBinding object into a `serde_json::Value`.
-pub fn decode_clusterrolebinding_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let crb = ClusterRoleBinding::decode(data).ok()?;
-    let meta = object_meta_to_json(crb.metadata.unwrap_or_default());
-    let subjects: Vec<serde_json::Value> = crb.subjects.into_iter().map(subject_to_json).collect();
-    let role_ref = crb
-        .role_ref
-        .map(role_ref_to_json)
-        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    Some(serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRoleBinding",
-        "metadata": meta,
-        "subjects": subjects,
-        "roleRef": role_ref
-    }))
-}
-
-/// Decode a proto-encoded Role object into a `serde_json::Value`.
-pub fn decode_role_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let role = Role::decode(data).ok()?;
-    let meta = object_meta_to_json(role.metadata.unwrap_or_default());
-    let rules: Vec<serde_json::Value> = role.rules.into_iter().map(policy_rule_to_json).collect();
-    Some(serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "Role",
-        "metadata": meta,
-        "rules": rules
-    }))
-}
-
-/// Decode a proto-encoded RoleBinding object into a `serde_json::Value`.
-pub fn decode_rolebinding_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let rb = RoleBinding::decode(data).ok()?;
-    let meta = object_meta_to_json(rb.metadata.unwrap_or_default());
-    let subjects: Vec<serde_json::Value> = rb.subjects.into_iter().map(subject_to_json).collect();
-    let role_ref = rb
-        .role_ref
-        .map(role_ref_to_json)
-        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    Some(serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "RoleBinding",
-        "metadata": meta,
-        "subjects": subjects,
-        "roleRef": role_ref
-    }))
-}
-
-/// Decode a proto-encoded SubjectAccessReview object into a `serde_json::Value`.
-///
-/// The kubelet uses Webhook authorization mode (default in k8s 1.36 with --config), which
-/// calls back to /apis/authorization.k8s.io/v1/subjectaccessreviews with
-/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder, the raw proto
-/// bytes reach serde_json::from_slice and produce "expected value at line 1 column 1".
-/// The kubelet interprets the 400/500 failure as an authorization denial.
-pub fn decode_subject_access_review_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let sar = SubjectAccessReviewProto::decode(data).ok()?;
-    let spec = sar.spec.unwrap_or_default();
-
-    let mut spec_map = serde_json::Map::new();
-    if !spec.user.is_empty() {
-        spec_map.insert("user".to_string(), serde_json::Value::String(spec.user));
-    }
-    if !spec.groups.is_empty() {
-        spec_map.insert(
-            "groups".to_string(),
-            serde_json::Value::Array(
-                spec.groups
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(ra) = spec.resource_attributes {
-        let mut ra_map = serde_json::Map::new();
-        if !ra.namespace.is_empty() {
-            ra_map.insert(
-                "namespace".to_string(),
-                serde_json::Value::String(ra.namespace),
-            );
-        }
-        if !ra.verb.is_empty() {
-            ra_map.insert("verb".to_string(), serde_json::Value::String(ra.verb));
-        }
-        if !ra.group.is_empty() {
-            ra_map.insert("group".to_string(), serde_json::Value::String(ra.group));
-        }
-        if !ra.version.is_empty() {
-            ra_map.insert("version".to_string(), serde_json::Value::String(ra.version));
-        }
-        if !ra.resource.is_empty() {
-            ra_map.insert(
-                "resource".to_string(),
-                serde_json::Value::String(ra.resource),
-            );
-        }
-        if !ra.subresource.is_empty() {
-            ra_map.insert(
-                "subresource".to_string(),
-                serde_json::Value::String(ra.subresource),
-            );
-        }
-        if !ra.name.is_empty() {
-            ra_map.insert("name".to_string(), serde_json::Value::String(ra.name));
-        }
-        if !ra_map.is_empty() {
-            spec_map.insert(
-                "resourceAttributes".to_string(),
-                serde_json::Value::Object(ra_map),
-            );
-        }
-    }
-
-    Some(serde_json::json!({
-        "apiVersion": "authorization.k8s.io/v1",
-        "kind": "SubjectAccessReview",
-        "spec": serde_json::Value::Object(spec_map)
-    }))
-}
-
-/// Decode a proto-encoded LocalSubjectAccessReview object into a `serde_json::Value`.
-///
-/// LocalSubjectAccessReview has the same wire format as SubjectAccessReview — the only
-/// difference is the kind field in the returned JSON.  When kubectl or a conformance test
-/// POSTs to /apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews with
-/// Content-Type: application/vnd.kubernetes.protobuf, the envelope kind is
-/// "LocalSubjectAccessReview".  Without this decoder, extract_body returns raw proto bytes
-/// and serde_json::from_slice produces "expected value at line 1 column 1" → 400.
-pub fn decode_local_subject_access_review_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let sar = SubjectAccessReviewProto::decode(data).ok()?;
-    let spec = sar.spec.unwrap_or_default();
-
-    let mut spec_map = serde_json::Map::new();
-    if !spec.user.is_empty() {
-        spec_map.insert("user".to_string(), serde_json::Value::String(spec.user));
-    }
-    if !spec.groups.is_empty() {
-        spec_map.insert(
-            "groups".to_string(),
-            serde_json::Value::Array(
-                spec.groups
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(ra) = spec.resource_attributes {
-        let mut ra_map = serde_json::Map::new();
-        if !ra.namespace.is_empty() {
-            ra_map.insert(
-                "namespace".to_string(),
-                serde_json::Value::String(ra.namespace),
-            );
-        }
-        if !ra.verb.is_empty() {
-            ra_map.insert("verb".to_string(), serde_json::Value::String(ra.verb));
-        }
-        if !ra.group.is_empty() {
-            ra_map.insert("group".to_string(), serde_json::Value::String(ra.group));
-        }
-        if !ra.version.is_empty() {
-            ra_map.insert("version".to_string(), serde_json::Value::String(ra.version));
-        }
-        if !ra.resource.is_empty() {
-            ra_map.insert(
-                "resource".to_string(),
-                serde_json::Value::String(ra.resource),
-            );
-        }
-        if !ra.subresource.is_empty() {
-            ra_map.insert(
-                "subresource".to_string(),
-                serde_json::Value::String(ra.subresource),
-            );
-        }
-        if !ra.name.is_empty() {
-            ra_map.insert("name".to_string(), serde_json::Value::String(ra.name));
-        }
-        if !ra_map.is_empty() {
-            spec_map.insert(
-                "resourceAttributes".to_string(),
-                serde_json::Value::Object(ra_map),
-            );
-        }
-    }
-
-    Some(serde_json::json!({
-        "apiVersion": "authorization.k8s.io/v1",
-        "kind": "LocalSubjectAccessReview",
-        "spec": serde_json::Value::Object(spec_map)
-    }))
-}
-
-/// Decode a proto-encoded TokenReview object into a `serde_json::Value`.
-///
-/// The kubelet uses Webhook authentication mode, which calls back to
-/// /apis/authentication.k8s.io/v1/tokenreviews with Content-Type: application/vnd.kubernetes.protobuf.
-/// Without this decoder, the raw proto bytes reach serde_json::from_slice and produce
-/// "expected value at line 1 column 1", causing authentication failures.
-pub fn decode_token_review_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let tr = TokenReviewProto::decode(data).ok()?;
-    let spec = tr.spec.unwrap_or_default();
-
-    Some(serde_json::json!({
-        "apiVersion": "authentication.k8s.io/v1",
-        "kind": "TokenReview",
-        "spec": {
-            "token": spec.token
-        }
-    }))
 }
 
 fn success_policy_to_json(sp: SuccessPolicy) -> serde_json::Value {
@@ -4741,7 +4225,7 @@ pub fn decode_poddisruptionbudget_proto(data: &[u8]) -> Option<serde_json::Value
             spec_json["minAvailable"] = min_available.to_json();
         }
         if let Some(selector) = spec.selector {
-            spec_json["selector"] = label_selector_to_json(selector);
+            spec_json["selector"] = pdb_label_selector_to_json(selector);
         }
         if let Some(max_unavailable) = spec.max_unavailable {
             spec_json["maxUnavailable"] = max_unavailable.to_json();
@@ -4954,1025 +4438,6 @@ pub fn decode_crd_proto(data: &[u8]) -> Option<serde_json::Value> {
         "metadata": meta,
         "spec": spec_val
     }))
-}
-
-/// ServiceReference — k8s.io/api/admissionregistration/v1/generated.proto
-/// field 1=namespace, field 2=name, field 3=path, field 4=port
-#[derive(Clone, PartialEq, Message)]
-struct AdmissionServiceReference {
-    #[prost(string, tag = "1")]
-    namespace: String,
-    #[prost(string, tag = "2")]
-    name: String,
-    #[prost(string, tag = "3")]
-    path: String,
-    #[prost(int32, tag = "4")]
-    port: i32,
-}
-
-/// WebhookClientConfig — k8s.io/api/admissionregistration/v1/generated.proto
-/// field 1=service, field 2=caBundle, field 3=url
-#[derive(Clone, PartialEq, Message)]
-struct WebhookClientConfig {
-    #[prost(message, tag = "1")]
-    service: Option<AdmissionServiceReference>,
-    #[prost(bytes = "vec", tag = "2")]
-    ca_bundle: Vec<u8>,
-    #[prost(string, tag = "3")]
-    url: String,
-}
-
-/// Rule — k8s.io/api/admissionregistration/v1/generated.proto
-/// field 1=apiGroups, field 2=apiVersions, field 3=resources, field 4=scope
-#[derive(Clone, PartialEq, Message)]
-struct AdmissionRule {
-    #[prost(string, repeated, tag = "1")]
-    api_groups: Vec<String>,
-    #[prost(string, repeated, tag = "2")]
-    api_versions: Vec<String>,
-    #[prost(string, repeated, tag = "3")]
-    resources: Vec<String>,
-    #[prost(string, tag = "4")]
-    scope: String,
-}
-
-/// RuleWithOperations — k8s.io/api/admissionregistration/v1/generated.proto
-/// field 1=operations, field 2=rule (embedded Rule message)
-#[derive(Clone, PartialEq, Message)]
-struct AdmissionRuleWithOperations {
-    #[prost(string, repeated, tag = "1")]
-    operations: Vec<String>,
-    #[prost(message, tag = "2")]
-    rule: Option<AdmissionRule>,
-}
-
-/// LabelSelectorRequirement — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
-/// field 1=key, field 2=operator, field 3=values (repeated string)
-#[derive(Clone, PartialEq, Message)]
-struct AdmissionLabelSelectorRequirement {
-    #[prost(string, tag = "1")]
-    key: String,
-    #[prost(string, tag = "2")]
-    operator: String,
-    #[prost(string, repeated, tag = "3")]
-    values: Vec<String>,
-}
-
-/// LabelSelector for admission webhooks — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
-/// field 1=matchLabels (map), field 2=matchExpressions (repeated LabelSelectorRequirement)
-#[derive(Clone, PartialEq, Message)]
-struct AdmissionLabelSelector {
-    #[prost(map = "string, string", tag = "1")]
-    match_labels: std::collections::HashMap<String, String>,
-    #[prost(message, repeated, tag = "2")]
-    match_expressions: Vec<AdmissionLabelSelectorRequirement>,
-}
-
-/// ValidatingWebhook — k8s.io/api/admissionregistration/v1/generated.proto
-/// field 1=name, field 2=clientConfig, field 3=rules, field 4=failurePolicy,
-/// field 5=namespaceSelector, field 6=sideEffects, field 7=timeoutSeconds,
-/// field 8=admissionReviewVersions, field 9=matchPolicy, field 10=objectSelector,
-/// field 11=matchConditions
-#[derive(Clone, PartialEq, Message)]
-struct ValidatingWebhook {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(message, tag = "2")]
-    client_config: Option<WebhookClientConfig>,
-    #[prost(message, repeated, tag = "3")]
-    rules: Vec<AdmissionRuleWithOperations>,
-    #[prost(string, tag = "4")]
-    failure_policy: String,
-    #[prost(message, tag = "5")]
-    namespace_selector: Option<AdmissionLabelSelector>,
-    #[prost(string, tag = "6")]
-    side_effects: String,
-    #[prost(int32, tag = "7")]
-    timeout_seconds: i32,
-    #[prost(string, repeated, tag = "8")]
-    admission_review_versions: Vec<String>,
-    #[prost(string, tag = "9")]
-    match_policy: String,
-    #[prost(message, tag = "10")]
-    object_selector: Option<AdmissionLabelSelector>,
-    #[prost(message, repeated, tag = "11")]
-    match_conditions: Vec<AdmissionMatchCondition>,
-}
-
-/// MatchCondition — k8s.io/api/admissionregistration/v1/generated.proto
-/// field 1=name (string), field 2=expression (string)
-#[derive(Clone, PartialEq, Message)]
-struct AdmissionMatchCondition {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(string, tag = "2")]
-    expression: String,
-}
-
-/// MutatingWebhook — k8s.io/api/admissionregistration/v1/generated.proto
-/// field 1=name, field 2=clientConfig, field 3=rules, field 4=failurePolicy,
-/// field 5=namespaceSelector, field 6=sideEffects, field 7=timeoutSeconds,
-/// field 8=admissionReviewVersions, field 9=matchPolicy, field 10=reinvocationPolicy,
-/// field 11=objectSelector, field 12=matchConditions
-#[derive(Clone, PartialEq, Message)]
-struct MutatingWebhook {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(message, tag = "2")]
-    client_config: Option<WebhookClientConfig>,
-    #[prost(message, repeated, tag = "3")]
-    rules: Vec<AdmissionRuleWithOperations>,
-    #[prost(string, tag = "4")]
-    failure_policy: String,
-    #[prost(message, tag = "5")]
-    namespace_selector: Option<AdmissionLabelSelector>,
-    #[prost(string, tag = "6")]
-    side_effects: String,
-    #[prost(int32, tag = "7")]
-    timeout_seconds: i32,
-    #[prost(string, repeated, tag = "8")]
-    admission_review_versions: Vec<String>,
-    #[prost(string, tag = "9")]
-    match_policy: String,
-    #[prost(string, tag = "10")]
-    reinvocation_policy: String,
-    #[prost(message, tag = "11")]
-    object_selector: Option<AdmissionLabelSelector>,
-    #[prost(message, repeated, tag = "12")]
-    match_conditions: Vec<AdmissionMatchCondition>,
-}
-
-/// ValidatingWebhookConfiguration — k8s.io/api/admissionregistration/v1/generated.proto
-#[derive(Clone, PartialEq, Message)]
-struct ValidatingWebhookConfiguration {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// webhooks (field 2, repeated ValidatingWebhook)
-    #[prost(message, repeated, tag = "2")]
-    webhooks: Vec<ValidatingWebhook>,
-}
-
-/// MutatingWebhookConfiguration — k8s.io/api/admissionregistration/v1/generated.proto
-#[derive(Clone, PartialEq, Message)]
-struct MutatingWebhookConfiguration {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// webhooks (field 2, repeated MutatingWebhook)
-    #[prost(message, repeated, tag = "2")]
-    webhooks: Vec<MutatingWebhook>,
-}
-
-/// Convert an AdmissionLabelSelector (which may include matchExpressions) to JSON.
-///
-/// Both matchLabels and matchExpressions must be preserved so that namespaceSelector
-/// evaluation in the admission pipeline correctly handles complex selectors like
-/// `matchExpressions: [{key: skip-webhook-admission, operator: DoesNotExist}]`.
-fn label_selector_to_json(sel: AdmissionLabelSelector) -> serde_json::Value {
-    let mut obj = serde_json::json!({});
-    if !sel.match_labels.is_empty() {
-        let labels: serde_json::Map<String, serde_json::Value> = sel
-            .match_labels
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        obj["matchLabels"] = serde_json::Value::Object(labels);
-    }
-    if !sel.match_expressions.is_empty() {
-        let exprs: Vec<serde_json::Value> = sel
-            .match_expressions
-            .into_iter()
-            .map(|req| {
-                serde_json::json!({
-                    "key": req.key,
-                    "operator": req.operator,
-                    "values": req.values,
-                })
-            })
-            .collect();
-        obj["matchExpressions"] = serde_json::Value::Array(exprs);
-    }
-    obj
-}
-
-fn admission_webhook_to_json(w: ValidatingWebhook) -> serde_json::Value {
-    let client_config = w
-        .client_config
-        .map(|cc| {
-            let mut cfg = serde_json::json!({});
-            if !cc.ca_bundle.is_empty() {
-                cfg["caBundle"] = serde_json::Value::String(base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &cc.ca_bundle,
-                ));
-            }
-            if let Some(svc) = cc.service {
-                let mut s = serde_json::json!({
-                    "namespace": svc.namespace,
-                    "name": svc.name,
-                });
-                if !svc.path.is_empty() {
-                    s["path"] = serde_json::Value::String(svc.path);
-                }
-                if svc.port != 0 {
-                    s["port"] = serde_json::Value::Number(serde_json::Number::from(svc.port));
-                }
-                cfg["service"] = s;
-            }
-            if !cc.url.is_empty() {
-                cfg["url"] = serde_json::Value::String(cc.url);
-            }
-            cfg
-        })
-        .unwrap_or(serde_json::json!({}));
-
-    let rules: Vec<serde_json::Value> = w
-        .rules
-        .into_iter()
-        .map(|r| {
-            let rule = r.rule.unwrap_or_default();
-            serde_json::json!({
-                "operations": r.operations,
-                "apiGroups": rule.api_groups,
-                "apiVersions": rule.api_versions,
-                "resources": rule.resources,
-                "scope": if rule.scope.is_empty() { "*".to_string() } else { rule.scope },
-            })
-        })
-        .collect();
-
-    let mut entry = serde_json::json!({
-        "name": w.name,
-        "clientConfig": client_config,
-        "rules": rules,
-        "admissionReviewVersions": w.admission_review_versions,
-    });
-    if !w.failure_policy.is_empty() {
-        entry["failurePolicy"] = serde_json::Value::String(w.failure_policy);
-    }
-    if !w.match_policy.is_empty() {
-        entry["matchPolicy"] = serde_json::Value::String(w.match_policy);
-    }
-    if !w.side_effects.is_empty() {
-        entry["sideEffects"] = serde_json::Value::String(w.side_effects);
-    }
-    if w.timeout_seconds != 0 {
-        entry["timeoutSeconds"] =
-            serde_json::Value::Number(serde_json::Number::from(w.timeout_seconds));
-    }
-    if let Some(ns) = w.namespace_selector {
-        entry["namespaceSelector"] = label_selector_to_json(ns);
-    }
-    if let Some(os) = w.object_selector {
-        entry["objectSelector"] = label_selector_to_json(os);
-    }
-    if !w.match_conditions.is_empty() {
-        let conds: Vec<serde_json::Value> = w
-            .match_conditions
-            .into_iter()
-            .map(|c| serde_json::json!({"name": c.name, "expression": c.expression}))
-            .collect();
-        entry["matchConditions"] = serde_json::Value::Array(conds);
-    }
-    entry
-}
-
-fn mutating_webhook_to_json(w: MutatingWebhook) -> serde_json::Value {
-    let client_config = w
-        .client_config
-        .map(|cc| {
-            let mut cfg = serde_json::json!({});
-            if !cc.ca_bundle.is_empty() {
-                cfg["caBundle"] = serde_json::Value::String(base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &cc.ca_bundle,
-                ));
-            }
-            if let Some(svc) = cc.service {
-                let mut s = serde_json::json!({
-                    "namespace": svc.namespace,
-                    "name": svc.name,
-                });
-                if !svc.path.is_empty() {
-                    s["path"] = serde_json::Value::String(svc.path);
-                }
-                if svc.port != 0 {
-                    s["port"] = serde_json::Value::Number(serde_json::Number::from(svc.port));
-                }
-                cfg["service"] = s;
-            }
-            if !cc.url.is_empty() {
-                cfg["url"] = serde_json::Value::String(cc.url);
-            }
-            cfg
-        })
-        .unwrap_or(serde_json::json!({}));
-
-    let rules: Vec<serde_json::Value> = w
-        .rules
-        .into_iter()
-        .map(|r| {
-            let rule = r.rule.unwrap_or_default();
-            serde_json::json!({
-                "operations": r.operations,
-                "apiGroups": rule.api_groups,
-                "apiVersions": rule.api_versions,
-                "resources": rule.resources,
-                "scope": if rule.scope.is_empty() { "*".to_string() } else { rule.scope },
-            })
-        })
-        .collect();
-
-    let mut entry = serde_json::json!({
-        "name": w.name,
-        "clientConfig": client_config,
-        "rules": rules,
-        "admissionReviewVersions": w.admission_review_versions,
-    });
-    if !w.failure_policy.is_empty() {
-        entry["failurePolicy"] = serde_json::Value::String(w.failure_policy);
-    }
-    if !w.match_policy.is_empty() {
-        entry["matchPolicy"] = serde_json::Value::String(w.match_policy);
-    }
-    if !w.side_effects.is_empty() {
-        entry["sideEffects"] = serde_json::Value::String(w.side_effects);
-    }
-    if w.timeout_seconds != 0 {
-        entry["timeoutSeconds"] =
-            serde_json::Value::Number(serde_json::Number::from(w.timeout_seconds));
-    }
-    if !w.reinvocation_policy.is_empty() {
-        entry["reinvocationPolicy"] = serde_json::Value::String(w.reinvocation_policy);
-    }
-    if let Some(ns) = w.namespace_selector {
-        entry["namespaceSelector"] = label_selector_to_json(ns);
-    }
-    if let Some(os) = w.object_selector {
-        entry["objectSelector"] = label_selector_to_json(os);
-    }
-    if !w.match_conditions.is_empty() {
-        let conds: Vec<serde_json::Value> = w
-            .match_conditions
-            .into_iter()
-            .map(|c| serde_json::json!({"name": c.name, "expression": c.expression}))
-            .collect();
-        entry["matchConditions"] = serde_json::Value::Array(conds);
-    }
-    entry
-}
-
-/// Decode a proto-encoded ValidatingWebhookConfiguration into a serde_json::Value.
-///
-/// The admissionwebhook conformance test POSTs ValidatingWebhookConfiguration with
-/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder,
-/// decode_core_proto_by_kind returns None, extract_body returns raw proto bytes, and
-/// the handler returns 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_validatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ValidatingWebhookConfiguration::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let webhooks: Vec<serde_json::Value> = obj
-        .webhooks
-        .into_iter()
-        .map(admission_webhook_to_json)
-        .collect();
-    Some(serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "ValidatingWebhookConfiguration",
-        "metadata": meta,
-        "webhooks": webhooks,
-    }))
-}
-
-/// Decode a proto-encoded MutatingWebhookConfiguration into a serde_json::Value.
-///
-/// The admissionwebhook conformance test POSTs MutatingWebhookConfiguration with
-/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder,
-/// decode_core_proto_by_kind returns None, extract_body returns raw proto bytes, and
-/// the handler returns 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_mutatingwebhookconfiguration_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = MutatingWebhookConfiguration::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let webhooks: Vec<serde_json::Value> = obj
-        .webhooks
-        .into_iter()
-        .map(mutating_webhook_to_json)
-        .collect();
-    Some(serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingWebhookConfiguration",
-        "metadata": meta,
-        "webhooks": webhooks,
-    }))
-}
-
-// ---------------------------------------------------------------------------
-// MutatingAdmissionPolicy proto structs
-// Source: k8s.io/api/admissionregistration/v1/generated.proto (v0.36.1)
-// Field numbers match the k8s 1.36 canonical proto definition.
-// ---------------------------------------------------------------------------
-
-/// Rule — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=apiGroups, field 2=apiVersions, field 3=resources, field 4=scope
-#[derive(Clone, PartialEq, Message)]
-struct MapRule {
-    /// apiGroups (field 1, repeated string)
-    #[prost(string, repeated, tag = "1")]
-    api_groups: Vec<String>,
-    /// apiVersions (field 2, repeated string)
-    #[prost(string, repeated, tag = "2")]
-    api_versions: Vec<String>,
-    /// resources (field 3, repeated string)
-    #[prost(string, repeated, tag = "3")]
-    resources: Vec<String>,
-    /// scope (field 4, string)
-    #[prost(string, tag = "4")]
-    scope: String,
-}
-
-/// RuleWithOperations — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=operations (repeated string), field 2=rule (Rule)
-#[derive(Clone, PartialEq, Message)]
-struct MapRuleWithOperations {
-    /// operations (field 1, repeated string)
-    #[prost(string, repeated, tag = "1")]
-    operations: Vec<String>,
-    /// rule (field 2, message Rule)
-    #[prost(message, tag = "2")]
-    rule: Option<MapRule>,
-}
-
-/// NamedRuleWithOperations — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=resourceNames (repeated string), field 2=ruleWithOperations (RuleWithOperations)
-#[derive(Clone, PartialEq, Message)]
-struct MapNamedRuleWithOperations {
-    /// resourceNames (field 1, repeated string)
-    #[prost(string, repeated, tag = "1")]
-    resource_names: Vec<String>,
-    /// ruleWithOperations (field 2, message RuleWithOperations)
-    #[prost(message, tag = "2")]
-    rule_with_operations: Option<MapRuleWithOperations>,
-}
-
-/// MatchResources — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=namespaceSelector, field 2=objectSelector, field 3=resourceRules,
-/// field 4=excludeResourceRules, field 7=matchPolicy
-#[derive(Clone, PartialEq, Message)]
-struct MapMatchResources {
-    /// namespaceSelector (field 1, message LabelSelector)
-    #[prost(message, tag = "1")]
-    namespace_selector: Option<AdmissionLabelSelector>,
-    /// objectSelector (field 2, message LabelSelector)
-    #[prost(message, tag = "2")]
-    object_selector: Option<AdmissionLabelSelector>,
-    /// resourceRules (field 3, repeated NamedRuleWithOperations)
-    #[prost(message, repeated, tag = "3")]
-    resource_rules: Vec<MapNamedRuleWithOperations>,
-    /// excludeResourceRules (field 4, repeated NamedRuleWithOperations)
-    #[prost(message, repeated, tag = "4")]
-    exclude_resource_rules: Vec<MapNamedRuleWithOperations>,
-    /// matchPolicy (field 7, string)
-    #[prost(string, tag = "7")]
-    match_policy: String,
-}
-
-/// ApplyConfiguration — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=expression (string)
-#[derive(Clone, PartialEq, Message)]
-struct MapApplyConfiguration {
-    /// expression (field 1, string)
-    #[prost(string, tag = "1")]
-    expression: String,
-}
-
-/// Mutation — admissionregistration.k8s.io/v1/generated.proto
-/// field 2=patchType (string), field 3=applyConfiguration (ApplyConfiguration),
-/// field 4=jsonPatch (JSONPatch)
-#[derive(Clone, PartialEq, Message)]
-struct MapMutation {
-    /// patchType (field 2, string)
-    #[prost(string, tag = "2")]
-    patch_type: String,
-    /// applyConfiguration (field 3, message ApplyConfiguration)
-    #[prost(message, tag = "3")]
-    apply_configuration: Option<MapApplyConfiguration>,
-}
-
-/// Variable — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=name (string), field 2=expression (string)
-#[derive(Clone, PartialEq, Message)]
-struct MapVariable {
-    /// name (field 1, string)
-    #[prost(string, tag = "1")]
-    name: String,
-    /// expression (field 2, string)
-    #[prost(string, tag = "2")]
-    expression: String,
-}
-
-/// MatchCondition — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=name (string), field 2=expression (string)
-#[derive(Clone, PartialEq, Message)]
-struct MapMatchCondition {
-    /// name (field 1, string)
-    #[prost(string, tag = "1")]
-    name: String,
-    /// expression (field 2, string)
-    #[prost(string, tag = "2")]
-    expression: String,
-}
-
-/// ParamKind — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=apiVersion (string), field 2=kind (string)
-#[derive(Clone, PartialEq, Message)]
-struct MapParamKind {
-    /// apiVersion (field 1, string)
-    #[prost(string, tag = "1")]
-    api_version: String,
-    /// kind (field 2, string)
-    #[prost(string, tag = "2")]
-    kind: String,
-}
-
-/// MutatingAdmissionPolicySpec — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=paramKind, field 2=matchConstraints, field 3=variables, field 4=mutations,
-/// field 5=failurePolicy, field 6=matchConditions, field 7=reinvocationPolicy
-#[derive(Clone, PartialEq, Message)]
-struct MapSpec {
-    /// paramKind (field 1, message ParamKind)
-    #[prost(message, tag = "1")]
-    param_kind: Option<MapParamKind>,
-    /// matchConstraints (field 2, message MatchResources)
-    #[prost(message, tag = "2")]
-    match_constraints: Option<MapMatchResources>,
-    /// variables (field 3, repeated Variable)
-    #[prost(message, repeated, tag = "3")]
-    variables: Vec<MapVariable>,
-    /// mutations (field 4, repeated Mutation)
-    #[prost(message, repeated, tag = "4")]
-    mutations: Vec<MapMutation>,
-    /// failurePolicy (field 5, string)
-    #[prost(string, tag = "5")]
-    failure_policy: String,
-    /// matchConditions (field 6, repeated MatchCondition)
-    #[prost(message, repeated, tag = "6")]
-    match_conditions: Vec<MapMatchCondition>,
-    /// reinvocationPolicy (field 7, string)
-    #[prost(string, tag = "7")]
-    reinvocation_policy: String,
-}
-
-/// MutatingAdmissionPolicy — admissionregistration.k8s.io/v1/generated.proto
-/// Source: k8s.io/api/admissionregistration/v1/generated.proto message MutatingAdmissionPolicy
-/// field 1 = metadata (ObjectMeta), field 2 = spec (MutatingAdmissionPolicySpec)
-#[derive(Clone, PartialEq, Message)]
-struct MutatingAdmissionPolicy {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message MutatingAdmissionPolicySpec)
-    #[prost(message, tag = "2")]
-    spec: Option<MapSpec>,
-}
-
-/// Convert a MapNamedRuleWithOperations to JSON.
-fn map_named_rule_to_json(r: MapNamedRuleWithOperations) -> serde_json::Value {
-    let rwo = r.rule_with_operations.unwrap_or_default();
-    let inner = rwo.rule.unwrap_or_default();
-    let mut rule = serde_json::json!({
-        "apiGroups": inner.api_groups,
-        "apiVersions": inner.api_versions,
-        "resources": inner.resources,
-        "operations": rwo.operations,
-    });
-    if !inner.scope.is_empty() {
-        rule["scope"] = serde_json::Value::String(inner.scope);
-    }
-    if !r.resource_names.is_empty() {
-        rule["resourceNames"] = serde_json::Value::Array(
-            r.resource_names
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        );
-    }
-    rule
-}
-
-/// Convert a MapMatchResources to JSON.
-fn map_match_resources_to_json(mc: MapMatchResources) -> serde_json::Value {
-    let mut obj = serde_json::json!({});
-    let resource_rules: Vec<serde_json::Value> = mc
-        .resource_rules
-        .into_iter()
-        .map(map_named_rule_to_json)
-        .collect();
-    if !resource_rules.is_empty() {
-        obj["resourceRules"] = serde_json::Value::Array(resource_rules);
-    }
-    let exclude_rules: Vec<serde_json::Value> = mc
-        .exclude_resource_rules
-        .into_iter()
-        .map(map_named_rule_to_json)
-        .collect();
-    if !exclude_rules.is_empty() {
-        obj["excludeResourceRules"] = serde_json::Value::Array(exclude_rules);
-    }
-    if let Some(ns) = mc.namespace_selector {
-        obj["namespaceSelector"] = label_selector_to_json(ns);
-    }
-    if let Some(os) = mc.object_selector {
-        obj["objectSelector"] = label_selector_to_json(os);
-    }
-    if !mc.match_policy.is_empty() {
-        obj["matchPolicy"] = serde_json::Value::String(mc.match_policy);
-    }
-    obj
-}
-
-/// Convert a MapSpec to JSON.
-fn map_spec_to_json(spec: MapSpec) -> serde_json::Value {
-    let mut obj = serde_json::json!({});
-    if let Some(mc) = spec.match_constraints {
-        obj["matchConstraints"] = map_match_resources_to_json(mc);
-    }
-    if !spec.failure_policy.is_empty() {
-        obj["failurePolicy"] = serde_json::Value::String(spec.failure_policy);
-    }
-    if !spec.reinvocation_policy.is_empty() {
-        obj["reinvocationPolicy"] = serde_json::Value::String(spec.reinvocation_policy);
-    }
-    if let Some(pk) = spec.param_kind {
-        obj["paramKind"] = serde_json::json!({
-            "apiVersion": pk.api_version,
-            "kind": pk.kind,
-        });
-    }
-    if !spec.variables.is_empty() {
-        let vars: Vec<serde_json::Value> = spec
-            .variables
-            .into_iter()
-            .map(|v| serde_json::json!({"name": v.name, "expression": v.expression}))
-            .collect();
-        obj["variables"] = serde_json::Value::Array(vars);
-    }
-    if !spec.mutations.is_empty() {
-        let mutations: Vec<serde_json::Value> = spec
-            .mutations
-            .into_iter()
-            .map(|m| {
-                let mut entry = serde_json::json!({"patchType": m.patch_type});
-                if let Some(ac) = m.apply_configuration {
-                    entry["applyConfiguration"] = serde_json::json!({"expression": ac.expression});
-                }
-                entry
-            })
-            .collect();
-        obj["mutations"] = serde_json::Value::Array(mutations);
-    }
-    if !spec.match_conditions.is_empty() {
-        let conds: Vec<serde_json::Value> = spec
-            .match_conditions
-            .into_iter()
-            .map(|c| serde_json::json!({"name": c.name, "expression": c.expression}))
-            .collect();
-        obj["matchConditions"] = serde_json::Value::Array(conds);
-    }
-    obj
-}
-
-/// Decode a proto-encoded MutatingAdmissionPolicy into a serde_json::Value.
-///
-/// The MutatingAdmissionPolicy conformance test POSTs with Content-Type:
-/// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
-/// returns None, extract_body returns raw proto bytes, and the handler returns
-/// 400 "invalid JSON: expected value at line 1 column 1".
-///
-/// The spec field (field 2) is fully decoded so that PUT/PATCH operations preserve
-/// spec content. Without spec decoding, a PUT with a new spec reverts the object to
-/// its previous spec because the decoder only emitted metadata.
-pub fn decode_mutatingadmissionpolicy_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = MutatingAdmissionPolicy::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingAdmissionPolicy",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        result["spec"] = map_spec_to_json(spec);
-    }
-    Some(result)
-}
-
-// ---------------------------------------------------------------------------
-// MutatingAdmissionPolicyBinding proto structs
-// Source: k8s.io/api/admissionregistration/v1/generated.proto
-// Field numbers verified against k8s 1.33 canonical source.
-// ---------------------------------------------------------------------------
-
-/// ParamRef — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=name (string), field 2=namespace (string), field 3=selector (LabelSelector),
-/// field 4=parameterNotFoundAction (string)
-#[derive(Clone, PartialEq, Message)]
-struct MapbParamRef {
-    /// name (field 1, string)
-    #[prost(string, tag = "1")]
-    name: String,
-    /// namespace (field 2, string)
-    #[prost(string, tag = "2")]
-    namespace: String,
-    /// selector (field 3, message LabelSelector)
-    #[prost(message, tag = "3")]
-    selector: Option<AdmissionLabelSelector>,
-    /// parameterNotFoundAction (field 4, string)
-    #[prost(string, tag = "4")]
-    parameter_not_found_action: String,
-}
-
-/// MutatingAdmissionPolicyBindingSpec — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=policyName (string), field 2=paramRef (ParamRef),
-/// field 3=matchResources (MatchResources), field 4=validationActions (repeated string)
-#[derive(Clone, PartialEq, Message)]
-struct MapbSpec {
-    /// policyName (field 1, string)
-    #[prost(string, tag = "1")]
-    policy_name: String,
-    /// paramRef (field 2, message ParamRef)
-    #[prost(message, tag = "2")]
-    param_ref: Option<MapbParamRef>,
-    /// matchResources (field 3, message MatchResources)
-    #[prost(message, tag = "3")]
-    match_resources: Option<MapMatchResources>,
-}
-
-/// MutatingAdmissionPolicyBinding — admissionregistration.k8s.io/v1/generated.proto
-/// Source: k8s.io/api/admissionregistration/v1/generated.proto message MutatingAdmissionPolicyBinding
-/// field 1 = metadata (ObjectMeta), field 2 = spec (MutatingAdmissionPolicyBindingSpec)
-#[derive(Clone, PartialEq, Message)]
-struct MutatingAdmissionPolicyBinding {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message MutatingAdmissionPolicyBindingSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<MapbSpec>,
-}
-
-/// Decode a proto-encoded MutatingAdmissionPolicyBinding into a serde_json::Value.
-///
-/// The MutatingAdmissionPolicyBinding conformance test POSTs with Content-Type:
-/// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
-/// returns None, extract_body returns raw proto bytes, and the handler returns
-/// 400 "invalid JSON: expected value at line 1 column 1".
-///
-/// The spec field (field 2) is fully decoded so that PUT/PATCH operations preserve
-/// spec content. Without spec decoding, a PUT with a new spec reverts the object to
-/// its previous spec because the decoder only emitted metadata.
-pub fn decode_mutatingadmissionpolicybinding_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = MutatingAdmissionPolicyBinding::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "MutatingAdmissionPolicyBinding",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({});
-        if !spec.policy_name.is_empty() {
-            spec_json["policyName"] = serde_json::Value::String(spec.policy_name);
-        }
-        if let Some(pr) = spec.param_ref {
-            let mut pr_json = serde_json::json!({});
-            if !pr.name.is_empty() {
-                pr_json["name"] = serde_json::Value::String(pr.name);
-            }
-            if !pr.namespace.is_empty() {
-                pr_json["namespace"] = serde_json::Value::String(pr.namespace);
-            }
-            if !pr.parameter_not_found_action.is_empty() {
-                pr_json["parameterNotFoundAction"] =
-                    serde_json::Value::String(pr.parameter_not_found_action);
-            }
-            if let Some(sel) = pr.selector {
-                pr_json["selector"] = label_selector_to_json(sel);
-            }
-            spec_json["paramRef"] = pr_json;
-        }
-        if let Some(mr) = spec.match_resources {
-            spec_json["matchResources"] = map_match_resources_to_json(mr);
-        }
-        result["spec"] = spec_json;
-    }
-    Some(result)
-}
-
-// ---------------------------------------------------------------------------
-// ValidatingAdmissionPolicy / ValidatingAdmissionPolicyBinding proto structs
-// Source: k8s.io/api/admissionregistration/v1/generated.proto (v0.36.1)
-// Field numbers match the canonical proto definition.
-// ---------------------------------------------------------------------------
-
-/// Validation — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=expression, field 2=message, field 3=reason, field 4=messageExpression
-#[derive(Clone, PartialEq, Message)]
-struct VapValidation {
-    /// expression (field 1, string)
-    #[prost(string, tag = "1")]
-    expression: String,
-    /// message (field 2, string)
-    #[prost(string, tag = "2")]
-    message: String,
-    /// reason (field 3, string)
-    #[prost(string, tag = "3")]
-    reason: String,
-    /// messageExpression (field 4, string)
-    #[prost(string, tag = "4")]
-    message_expression: String,
-}
-
-/// ValidatingAdmissionPolicySpec — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=paramKind, field 2=matchConstraints, field 3=validations (repeated),
-/// field 4=failurePolicy, field 5=auditAnnotations (repeated), field 6=matchConditions (repeated)
-#[derive(Clone, PartialEq, Message)]
-struct VapSpec {
-    /// paramKind (field 1, message ParamKind)
-    #[prost(message, tag = "1")]
-    param_kind: Option<MapParamKind>,
-    /// matchConstraints (field 2, message MatchResources)
-    #[prost(message, tag = "2")]
-    match_constraints: Option<MapMatchResources>,
-    /// validations (field 3, repeated Validation)
-    #[prost(message, repeated, tag = "3")]
-    validations: Vec<VapValidation>,
-    /// failurePolicy (field 4, string)
-    #[prost(string, tag = "4")]
-    failure_policy: String,
-    /// matchConditions (field 6, repeated MatchCondition)
-    #[prost(message, repeated, tag = "6")]
-    match_conditions: Vec<MapMatchCondition>,
-}
-
-/// ValidatingAdmissionPolicy — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=metadata (ObjectMeta), field 2=spec (ValidatingAdmissionPolicySpec)
-#[derive(Clone, PartialEq, Message)]
-struct ValidatingAdmissionPolicy {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message ValidatingAdmissionPolicySpec)
-    #[prost(message, tag = "2")]
-    spec: Option<VapSpec>,
-}
-
-/// Decode a proto-encoded ValidatingAdmissionPolicy into a serde_json::Value.
-///
-/// The ValidatingAdmissionPolicy conformance test POSTs with Content-Type:
-/// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
-/// returns None, extract_body returns raw proto bytes, and the handler returns
-/// 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_validatingadmissionpolicy_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ValidatingAdmissionPolicy::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "ValidatingAdmissionPolicy",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({});
-        if let Some(mc) = spec.match_constraints {
-            spec_json["matchConstraints"] = map_match_resources_to_json(mc);
-        }
-        if !spec.failure_policy.is_empty() {
-            spec_json["failurePolicy"] = serde_json::Value::String(spec.failure_policy);
-        }
-        if let Some(pk) = spec.param_kind {
-            spec_json["paramKind"] = serde_json::json!({
-                "apiVersion": pk.api_version,
-                "kind": pk.kind,
-            });
-        }
-        if !spec.validations.is_empty() {
-            let vals: Vec<serde_json::Value> = spec
-                .validations
-                .into_iter()
-                .map(|v| {
-                    let mut entry = serde_json::json!({"expression": v.expression});
-                    if !v.message.is_empty() {
-                        entry["message"] = serde_json::Value::String(v.message);
-                    }
-                    if !v.reason.is_empty() {
-                        entry["reason"] = serde_json::Value::String(v.reason);
-                    }
-                    if !v.message_expression.is_empty() {
-                        entry["messageExpression"] =
-                            serde_json::Value::String(v.message_expression);
-                    }
-                    entry
-                })
-                .collect();
-            spec_json["validations"] = serde_json::Value::Array(vals);
-        }
-        if !spec.match_conditions.is_empty() {
-            let conds: Vec<serde_json::Value> = spec
-                .match_conditions
-                .into_iter()
-                .map(|c| serde_json::json!({"name": c.name, "expression": c.expression}))
-                .collect();
-            spec_json["matchConditions"] = serde_json::Value::Array(conds);
-        }
-        result["spec"] = spec_json;
-    }
-    Some(result)
-}
-
-// ---------------------------------------------------------------------------
-// ValidatingAdmissionPolicyBinding proto structs
-// ---------------------------------------------------------------------------
-
-/// ValidatingAdmissionPolicyBindingSpec — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=policyName (string), field 2=paramRef (ParamRef),
-/// field 3=matchResources (MatchResources), field 4=validationActions (repeated string)
-#[derive(Clone, PartialEq, Message)]
-struct VapbSpec {
-    /// policyName (field 1, string)
-    #[prost(string, tag = "1")]
-    policy_name: String,
-    /// paramRef (field 2, message ParamRef)
-    #[prost(message, tag = "2")]
-    param_ref: Option<MapbParamRef>,
-    /// matchResources (field 3, message MatchResources)
-    #[prost(message, tag = "3")]
-    match_resources: Option<MapMatchResources>,
-    /// validationActions (field 4, repeated string)
-    #[prost(string, repeated, tag = "4")]
-    validation_actions: Vec<String>,
-}
-
-/// ValidatingAdmissionPolicyBinding — admissionregistration.k8s.io/v1/generated.proto
-/// field 1=metadata (ObjectMeta), field 2=spec (ValidatingAdmissionPolicyBindingSpec)
-#[derive(Clone, PartialEq, Message)]
-struct ValidatingAdmissionPolicyBinding {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message ValidatingAdmissionPolicyBindingSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<VapbSpec>,
-}
-
-/// Decode a proto-encoded ValidatingAdmissionPolicyBinding into a serde_json::Value.
-///
-/// The ValidatingAdmissionPolicyBinding conformance test POSTs with Content-Type:
-/// application/vnd.kubernetes.protobuf. Without this decoder, decode_core_proto_by_kind
-/// returns None, extract_body returns raw proto bytes, and the handler returns
-/// 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_validatingadmissionpolicybinding_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ValidatingAdmissionPolicyBinding::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "admissionregistration.k8s.io/v1",
-        "kind": "ValidatingAdmissionPolicyBinding",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({});
-        if !spec.policy_name.is_empty() {
-            spec_json["policyName"] = serde_json::Value::String(spec.policy_name);
-        }
-        if let Some(pr) = spec.param_ref {
-            let mut pr_json = serde_json::json!({});
-            if !pr.name.is_empty() {
-                pr_json["name"] = serde_json::Value::String(pr.name);
-            }
-            if !pr.namespace.is_empty() {
-                pr_json["namespace"] = serde_json::Value::String(pr.namespace);
-            }
-            if !pr.parameter_not_found_action.is_empty() {
-                pr_json["parameterNotFoundAction"] =
-                    serde_json::Value::String(pr.parameter_not_found_action);
-            }
-            if let Some(sel) = pr.selector {
-                pr_json["selector"] = label_selector_to_json(sel);
-            }
-            spec_json["paramRef"] = pr_json;
-        }
-        if let Some(mr) = spec.match_resources {
-            spec_json["matchResources"] = map_match_resources_to_json(mr);
-        }
-        if !spec.validation_actions.is_empty() {
-            spec_json["validationActions"] = serde_json::Value::Array(
-                spec.validation_actions
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            );
-        }
-        result["spec"] = spec_json;
-    }
-    Some(result)
 }
 
 // --- k8s.io/api/networking/v1/generated.proto ---
@@ -6645,13 +5110,17 @@ pub fn decode_proto_by_kind_and_version(
                 crate::core_gen_adapter::decode_event_proto_gen(raw)
             }
         }
-        "ClusterRole" => decode_clusterrole_proto(raw),
-        "ClusterRoleBinding" => decode_clusterrolebinding_proto(raw),
-        "Role" => decode_role_proto(raw),
-        "RoleBinding" => decode_rolebinding_proto(raw),
-        "SubjectAccessReview" => decode_subject_access_review_proto(raw),
-        "LocalSubjectAccessReview" => decode_local_subject_access_review_proto(raw),
-        "TokenReview" => decode_token_review_proto(raw),
+        "ClusterRole" => crate::rbac_gen_adapter::decode_clusterrole_proto_gen(raw),
+        "ClusterRoleBinding" => crate::rbac_gen_adapter::decode_clusterrolebinding_proto_gen(raw),
+        "Role" => crate::rbac_gen_adapter::decode_role_proto_gen(raw),
+        "RoleBinding" => crate::rbac_gen_adapter::decode_rolebinding_proto_gen(raw),
+        "SubjectAccessReview" => {
+            crate::rbac_gen_adapter::decode_subject_access_review_proto_gen(raw)
+        }
+        "LocalSubjectAccessReview" => {
+            crate::rbac_gen_adapter::decode_local_subject_access_review_proto_gen(raw)
+        }
+        "TokenReview" => crate::rbac_gen_adapter::decode_token_review_proto_gen(raw),
         "CronJob" => decode_cronjob_proto(raw),
         "Job" => decode_job_proto(raw),
         "RuntimeClass" => crate::storage_node_flow_gen_adapter::decode_runtimeclass_proto_gen(raw),
@@ -6678,12 +5147,24 @@ pub fn decode_proto_by_kind_and_version(
         "PriorityLevelConfiguration" => {
             crate::storage_node_flow_gen_adapter::decode_prioritylevelconfiguration_proto_gen(raw)
         }
-        "ValidatingWebhookConfiguration" => decode_validatingwebhookconfiguration_proto(raw),
-        "MutatingWebhookConfiguration" => decode_mutatingwebhookconfiguration_proto(raw),
-        "MutatingAdmissionPolicy" => decode_mutatingadmissionpolicy_proto(raw),
-        "MutatingAdmissionPolicyBinding" => decode_mutatingadmissionpolicybinding_proto(raw),
-        "ValidatingAdmissionPolicy" => decode_validatingadmissionpolicy_proto(raw),
-        "ValidatingAdmissionPolicyBinding" => decode_validatingadmissionpolicybinding_proto(raw),
+        "ValidatingWebhookConfiguration" => {
+            crate::admissionreg_gen_adapter::decode_validatingwebhookconfiguration_proto_gen(raw)
+        }
+        "MutatingWebhookConfiguration" => {
+            crate::admissionreg_gen_adapter::decode_mutatingwebhookconfiguration_proto_gen(raw)
+        }
+        "MutatingAdmissionPolicy" => {
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicy_proto_gen(raw)
+        }
+        "MutatingAdmissionPolicyBinding" => {
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicybinding_proto_gen(raw)
+        }
+        "ValidatingAdmissionPolicy" => {
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicy_proto_gen(raw)
+        }
+        "ValidatingAdmissionPolicyBinding" => {
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicybinding_proto_gen(raw)
+        }
         "IngressClass" => decode_ingressclass_proto(raw),
         "Ingress" => decode_ingress_proto(raw),
         "EndpointSlice" => decode_endpointslice_proto(raw),
@@ -9710,7 +8191,7 @@ mod tests {
         // Build SubjectAccessReview: field 2 = spec
         let sar_proto = encode_length_delimited(2, &spec);
 
-        let result = decode_subject_access_review_proto(&sar_proto)
+        let result = decode_core_proto_by_kind("SubjectAccessReview", &sar_proto)
             .expect("must decode SubjectAccessReview proto — without this decoder, kubelet Webhook authz fails");
 
         assert_eq!(result["apiVersion"], "authorization.k8s.io/v1");
@@ -9823,7 +8304,7 @@ mod tests {
         // Build TokenReview: field 2 = spec
         let tr_proto = encode_length_delimited(2, &spec);
 
-        let result = decode_token_review_proto(&tr_proto).expect(
+        let result = decode_core_proto_by_kind("TokenReview", &tr_proto).expect(
             "must decode TokenReview proto — without this decoder, kubelet Webhook authn fails",
         );
 
@@ -12168,7 +10649,10 @@ mod tests {
         let mut proto = meta;
         proto.extend_from_slice(&encode_length_delimited(2, &webhook));
 
-        let result = decode_validatingwebhookconfiguration_proto(&proto)
+        let result =
+            crate::admissionreg_gen_adapter::decode_validatingwebhookconfiguration_proto_gen(
+                &proto,
+            )
             .expect("ValidatingWebhookConfiguration must decode");
 
         let webhooks = result["webhooks"]
@@ -12213,8 +10697,9 @@ mod tests {
         let mut proto = meta;
         proto.extend_from_slice(&encode_length_delimited(2, &webhook));
 
-        let result = decode_mutatingwebhookconfiguration_proto(&proto)
-            .expect("MutatingWebhookConfiguration must decode");
+        let result =
+            crate::admissionreg_gen_adapter::decode_mutatingwebhookconfiguration_proto_gen(&proto)
+                .expect("MutatingWebhookConfiguration must decode");
 
         let webhooks = result["webhooks"]
             .as_array()
@@ -13898,7 +12383,12 @@ mod tests {
     /// decode_mutatingadmissionpolicy_proto must return None for malformed proto input.
     #[test]
     fn decode_mutatingadmissionpolicy_proto_returns_none_for_garbage() {
-        assert!(decode_mutatingadmissionpolicy_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicy_proto_gen(&[
+                0xff, 0xff, 0xff
+            ])
+            .is_none()
+        );
     }
 
     /// PUT to MutatingAdmissionPolicy must preserve the spec field (failurePolicy, matchConstraints,
@@ -13954,8 +12444,9 @@ mod tests {
         let mut proto = encode_length_delimited(1, &obj_meta);
         proto.extend_from_slice(&encode_length_delimited(2, &spec));
 
-        let result = decode_mutatingadmissionpolicy_proto(&proto)
-            .expect("MutatingAdmissionPolicy with spec must decode successfully");
+        let result =
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicy_proto_gen(&proto)
+                .expect("MutatingAdmissionPolicy with spec must decode successfully");
 
         assert_eq!(result["metadata"]["name"], "test-map-spec");
 
@@ -14017,7 +12508,10 @@ mod tests {
         let mut proto = encode_length_delimited(1, &obj_meta);
         proto.extend_from_slice(&encode_length_delimited(2, &spec));
 
-        let result = decode_mutatingadmissionpolicybinding_proto(&proto)
+        let result =
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicybinding_proto_gen(
+                &proto,
+            )
             .expect("MutatingAdmissionPolicyBinding with spec must decode successfully");
 
         assert_eq!(result["metadata"]["name"], "test-mapb-spec");
@@ -14066,7 +12560,12 @@ mod tests {
     /// decode_mutatingadmissionpolicybinding_proto must return None for malformed proto input.
     #[test]
     fn decode_mutatingadmissionpolicybinding_proto_returns_none_for_garbage() {
-        assert!(decode_mutatingadmissionpolicybinding_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(
+            crate::admissionreg_gen_adapter::decode_mutatingadmissionpolicybinding_proto_gen(&[
+                0xff, 0xff, 0xff
+            ])
+            .is_none()
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -14143,8 +12642,9 @@ mod tests {
         let mut proto = encode_length_delimited(1, &obj_meta);
         proto.extend_from_slice(&encode_length_delimited(2, &spec));
 
-        let result = decode_validatingadmissionpolicy_proto(&proto)
-            .expect("ValidatingAdmissionPolicy with spec must decode successfully");
+        let result =
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicy_proto_gen(&proto)
+                .expect("ValidatingAdmissionPolicy with spec must decode successfully");
 
         assert_eq!(result["metadata"]["name"], "test-vap-spec");
 
@@ -14186,7 +12686,12 @@ mod tests {
     /// decode_validatingadmissionpolicy_proto must return None for malformed proto input.
     #[test]
     fn decode_validatingadmissionpolicy_proto_returns_none_for_garbage() {
-        assert!(decode_validatingadmissionpolicy_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicy_proto_gen(&[
+                0xff, 0xff, 0xff
+            ])
+            .is_none()
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -14238,7 +12743,10 @@ mod tests {
         let mut proto = encode_length_delimited(1, &obj_meta);
         proto.extend_from_slice(&encode_length_delimited(2, &spec));
 
-        let result = decode_validatingadmissionpolicybinding_proto(&proto)
+        let result =
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicybinding_proto_gen(
+                &proto,
+            )
             .expect("ValidatingAdmissionPolicyBinding with spec must decode successfully");
 
         assert_eq!(result["metadata"]["name"], "test-vapb-spec");
@@ -14265,7 +12773,12 @@ mod tests {
     /// decode_validatingadmissionpolicybinding_proto must return None for malformed proto input.
     #[test]
     fn decode_validatingadmissionpolicybinding_proto_returns_none_for_garbage() {
-        assert!(decode_validatingadmissionpolicybinding_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(
+            crate::admissionreg_gen_adapter::decode_validatingadmissionpolicybinding_proto_gen(&[
+                0xff, 0xff, 0xff
+            ])
+            .is_none()
+        );
     }
 
     // ---------------------------------------------------------------------------
