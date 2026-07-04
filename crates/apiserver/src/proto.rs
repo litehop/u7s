@@ -973,21 +973,6 @@ struct PodSpec {
     runtime_class_name: Option<String>,
 }
 
-/// Pod — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message Pod
-#[derive(Clone, PartialEq, Message)]
-struct Pod {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message PodSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<PodSpec>,
-    /// status (field 3, bytes) — not decoded on input
-    #[prost(bytes = "vec", tag = "3")]
-    status: Vec<u8>,
-}
-
 /// ConfigMap — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ConfigMap
 #[derive(Clone, PartialEq, Message)]
@@ -1128,79 +1113,6 @@ struct Service {
     /// status (field 3, message ServiceStatus)
     #[prost(message, tag = "3")]
     status: Option<ServiceStatus>,
-}
-
-/// ReplicationControllerSpec — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ReplicationControllerSpec
-#[derive(Clone, PartialEq, Message)]
-struct ReplicationControllerSpec {
-    /// replicas (field 1, int32)
-    #[prost(int32, tag = "1")]
-    replicas: i32,
-    /// selector (field 2, map<string,string>)
-    #[prost(map = "string, string", tag = "2")]
-    selector: std::collections::HashMap<String, String>,
-    /// template (field 3, PodTemplateSpec)
-    #[prost(message, optional, tag = "3")]
-    template: Option<AppsPodTemplateSpec>,
-}
-
-/// ReplicationControllerCondition — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ReplicationControllerCondition
-#[derive(Clone, PartialEq, Message)]
-struct ReplicationControllerCondition {
-    /// type (field 1, string)
-    #[prost(string, tag = "1")]
-    r#type: String,
-    /// status (field 2, string)
-    #[prost(string, tag = "2")]
-    status: String,
-    // field 3 = lastTransitionTime (Time message) — skipped
-    /// reason (field 4, string)
-    #[prost(string, tag = "4")]
-    reason: String,
-    /// message (field 5, string)
-    #[prost(string, tag = "5")]
-    message: String,
-}
-
-/// ReplicationControllerStatus — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ReplicationControllerStatus
-#[derive(Clone, PartialEq, Message)]
-struct ReplicationControllerStatus {
-    /// replicas (field 1, int32)
-    #[prost(int32, tag = "1")]
-    replicas: i32,
-    /// fullyLabeledReplicas (field 2, int32)
-    #[prost(int32, tag = "2")]
-    fully_labeled_replicas: i32,
-    /// observedGeneration (field 3, int64)
-    #[prost(int64, tag = "3")]
-    observed_generation: i64,
-    /// readyReplicas (field 4, int32)
-    #[prost(int32, tag = "4")]
-    ready_replicas: i32,
-    /// availableReplicas (field 5, int32)
-    #[prost(int32, tag = "5")]
-    available_replicas: i32,
-    /// conditions (field 6, repeated ReplicationControllerCondition)
-    #[prost(message, repeated, tag = "6")]
-    conditions: Vec<ReplicationControllerCondition>,
-}
-
-/// ReplicationController — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ReplicationController
-#[derive(Clone, PartialEq, Message)]
-struct ReplicationController {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message ReplicationControllerSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<ReplicationControllerSpec>,
-    /// status (field 3, message ReplicationControllerStatus)
-    #[prost(message, tag = "3")]
-    status: Option<ReplicationControllerStatus>,
 }
 
 /// PersistentVolumeSpec — k8s.io/api/core/v1/generated.proto (key fields only)
@@ -1384,49 +1296,6 @@ struct Event {
     /// reportingInstance (field 15, string)
     #[prost(string, tag = "15")]
     reporting_instance: String,
-}
-
-// --- k8s.io/api/coordination/v1/generated.proto ---
-
-/// LeaseSpec — k8s.io/api/coordination/v1/generated.proto
-/// Source: k8s.io/api/coordination/v1/generated.proto message LeaseSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct LeaseSpec {
-    /// holderIdentity (field 1, string)
-    #[prost(string, tag = "1")]
-    holder_identity: String,
-    /// leaseDurationSeconds (field 2, int32)
-    #[prost(int32, tag = "2")]
-    lease_duration_seconds: i32,
-    /// acquireTime (field 3, MicroTime)
-    #[prost(message, tag = "3")]
-    acquire_time: Option<MicroTime>,
-    /// renewTime (field 4, MicroTime)
-    #[prost(message, tag = "4")]
-    renew_time: Option<MicroTime>,
-    /// leaseTransitions (field 5, int32)
-    #[prost(int32, tag = "5")]
-    lease_transitions: i32,
-    /// strategy (field 6, string) — CoordinatedLeaseStrategy
-    #[prost(string, tag = "6")]
-    strategy: String,
-    /// preferredHolder (field 7, string)
-    #[prost(string, tag = "7")]
-    preferred_holder: String,
-}
-
-/// Lease — k8s.io/api/coordination/v1/generated.proto
-/// Source: k8s.io/api/coordination/v1/generated.proto message Lease
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct Lease {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message LeaseSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<LeaseSpec>,
 }
 
 // --- k8s.io/api/storage/v1/generated.proto ---
@@ -1890,272 +1759,6 @@ struct RoleBinding {
     role_ref: Option<RoleRef>,
 }
 
-// --- k8s.io/api/batch/v1/generated.proto ---
-
-/// SuccessPolicyRule — k8s.io/api/batch/v1/generated.proto message SuccessPolicyRule
-#[derive(Clone, PartialEq, Message)]
-struct SuccessPolicyRule {
-    /// succeededIndexes (field 1, optional string)
-    #[prost(string, optional, tag = "1")]
-    succeeded_indexes: Option<String>,
-    /// succeededCount (field 2, optional int32)
-    #[prost(int32, optional, tag = "2")]
-    succeeded_count: Option<i32>,
-}
-
-/// SuccessPolicy — k8s.io/api/batch/v1/generated.proto message SuccessPolicy
-#[derive(Clone, PartialEq, Message)]
-struct SuccessPolicy {
-    /// rules (field 1, repeated SuccessPolicyRule)
-    #[prost(message, repeated, tag = "1")]
-    rules: Vec<SuccessPolicyRule>,
-}
-
-/// PodFailurePolicyOnExitCodesRequirement — k8s.io/api/batch/v1/generated.proto
-#[derive(Clone, PartialEq, Message)]
-struct PodFailurePolicyOnExitCodesRequirement {
-    /// containerName (field 1, optional string)
-    #[prost(string, optional, tag = "1")]
-    container_name: Option<String>,
-    /// operator (field 2, string)
-    #[prost(string, tag = "2")]
-    operator: String,
-    /// values (field 3, repeated int32)
-    #[prost(int32, repeated, tag = "3")]
-    values: Vec<i32>,
-}
-
-/// PodFailurePolicyOnPodConditionsPattern — k8s.io/api/batch/v1/generated.proto
-#[derive(Clone, PartialEq, Message)]
-struct PodFailurePolicyOnPodConditionsPattern {
-    /// type (field 1, string)
-    #[prost(string, tag = "1")]
-    r#type: String,
-    /// status (field 2, string)
-    #[prost(string, tag = "2")]
-    status: String,
-}
-
-/// PodFailurePolicyRule — k8s.io/api/batch/v1/generated.proto
-#[derive(Clone, PartialEq, Message)]
-struct PodFailurePolicyRule {
-    /// action (field 1, string)
-    #[prost(string, tag = "1")]
-    action: String,
-    /// onExitCodes (field 2, optional PodFailurePolicyOnExitCodesRequirement)
-    #[prost(message, optional, tag = "2")]
-    on_exit_codes: Option<PodFailurePolicyOnExitCodesRequirement>,
-    /// onPodConditions (field 3, repeated PodFailurePolicyOnPodConditionsPattern)
-    #[prost(message, repeated, tag = "3")]
-    on_pod_conditions: Vec<PodFailurePolicyOnPodConditionsPattern>,
-}
-
-/// PodFailurePolicy — k8s.io/api/batch/v1/generated.proto message PodFailurePolicy
-#[derive(Clone, PartialEq, Message)]
-struct PodFailurePolicy {
-    /// rules (field 1, repeated PodFailurePolicyRule)
-    #[prost(message, repeated, tag = "1")]
-    rules: Vec<PodFailurePolicyRule>,
-}
-
-/// JobSpec — k8s.io/api/batch/v1/generated.proto
-/// Source: k8s.io/api/batch/v1/generated.proto message JobSpec
-/// Field numbers verified against crates/apiserver/proto/api-batch-v1-generated.proto.
-/// Only scalar/string fields are decoded; template (field 6, PodTemplateSpec) is decoded
-/// as a nested message so container definitions are preserved and pods can start.
-#[derive(Clone, PartialEq, Message)]
-struct JobSpec {
-    /// parallelism (field 1, int32)
-    #[prost(int32, tag = "1")]
-    parallelism: i32,
-    /// completions (field 2, int32)
-    #[prost(int32, tag = "2")]
-    completions: i32,
-    /// activeDeadlineSeconds (field 3, int64)
-    #[prost(int64, tag = "3")]
-    active_deadline_seconds: i64,
-    /// selector (field 4, message LabelSelector) — decoded as raw bytes, not needed for routing
-    #[prost(bytes = "vec", tag = "4")]
-    selector: Vec<u8>,
-    /// manualSelector (field 5, bool)
-    #[prost(bool, tag = "5")]
-    manual_selector: bool,
-    /// template (field 6, PodTemplateSpec) — decoded as nested message to preserve containers
-    #[prost(message, tag = "6")]
-    template: Option<AppsPodTemplateSpec>,
-    /// backoffLimit (field 7, int32)
-    #[prost(int32, tag = "7")]
-    backoff_limit: i32,
-    /// ttlSecondsAfterFinished (field 8, int32)
-    #[prost(int32, tag = "8")]
-    ttl_seconds_after_finished: i32,
-    /// completionMode (field 9, string) — "NonIndexed" or "Indexed"
-    #[prost(string, tag = "9")]
-    completion_mode: String,
-    /// suspend (field 10, bool)
-    #[prost(bool, tag = "10")]
-    suspend: bool,
-    /// podFailurePolicy (field 11, message PodFailurePolicy)
-    #[prost(message, optional, tag = "11")]
-    pod_failure_policy: Option<PodFailurePolicy>,
-    /// backoffLimitPerIndex (field 12, optional int32) — proto2 optional; Some(0) means "set to 0"
-    #[prost(int32, optional, tag = "12")]
-    backoff_limit_per_index: Option<i32>,
-    /// maxFailedIndexes (field 13, optional int32) — proto2 optional; Some(0) means "set to 0"
-    #[prost(int32, optional, tag = "13")]
-    max_failed_indexes: Option<i32>,
-    /// podReplacementPolicy (field 14, string) — added k8s 1.28
-    #[prost(string, tag = "14")]
-    pod_replacement_policy: String,
-    /// managedBy (field 15, string) — added k8s 1.30
-    #[prost(string, tag = "15")]
-    managed_by: String,
-    /// successPolicy (field 16, message SuccessPolicy)
-    #[prost(message, optional, tag = "16")]
-    success_policy: Option<SuccessPolicy>,
-}
-
-/// JobTemplateSpec — field 1=ObjectMeta, field 2=JobSpec
-/// Source: k8s.io/api/batch/v1/generated.proto message JobTemplateSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct JobTemplateSpec {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message JobSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<JobSpec>,
-}
-
-/// CronJobSpec — k8s.io/api/batch/v1/generated.proto
-/// Source: k8s.io/api/batch/v1/generated.proto message CronJobSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct CronJobSpec {
-    /// schedule (field 1, string)
-    #[prost(string, tag = "1")]
-    schedule: String,
-    /// startingDeadlineSeconds (field 2, int64)
-    #[prost(int64, tag = "2")]
-    starting_deadline_seconds: i64,
-    /// concurrencyPolicy (field 3, string)
-    #[prost(string, tag = "3")]
-    concurrency_policy: String,
-    /// suspend (field 4, bool)
-    #[prost(bool, tag = "4")]
-    suspend: bool,
-    /// jobTemplate (field 5, message JobTemplateSpec)
-    #[prost(message, tag = "5")]
-    job_template: Option<JobTemplateSpec>,
-    /// successfulJobsHistoryLimit (field 6, int32)
-    #[prost(int32, tag = "6")]
-    successful_jobs_history_limit: i32,
-    /// failedJobsHistoryLimit (field 7, int32)
-    #[prost(int32, tag = "7")]
-    failed_jobs_history_limit: i32,
-    /// timeZone (field 8, string)
-    #[prost(string, tag = "8")]
-    time_zone: String,
-}
-
-/// CronJobStatus — k8s.io/api/batch/v1/generated.proto
-/// Source: api-batch-v1-generated.proto message CronJobStatus
-/// fields 4 (lastScheduleTime) and 5 (lastSuccessfulTime) are Time messages — skipped
-#[derive(Clone, PartialEq, Message)]
-struct CronJobStatus {
-    /// active (field 1, repeated ObjectReference) — stored as name/namespace only
-    #[prost(message, repeated, tag = "1")]
-    active: Vec<ObjectReference>,
-    // fields 4, 5 = lastScheduleTime, lastSuccessfulTime (Time messages) — skipped
-}
-
-/// CronJob — k8s.io/api/batch/v1/generated.proto
-/// Source: k8s.io/api/batch/v1/generated.proto message CronJob
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct CronJob {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message CronJobSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<CronJobSpec>,
-    /// status (field 3, message CronJobStatus)
-    #[prost(message, tag = "3")]
-    status: Option<CronJobStatus>,
-}
-
-/// JobCondition — k8s.io/api/batch/v1/generated.proto
-/// Source: api-batch-v1-generated.proto message JobCondition
-/// fields 3 (lastProbeTime) and 4 (lastTransitionTime) are Time messages — skipped
-#[derive(Clone, PartialEq, Message)]
-struct JobCondition {
-    /// type (field 1, string)
-    #[prost(string, tag = "1")]
-    r#type: String,
-    /// status (field 2, string)
-    #[prost(string, tag = "2")]
-    status: String,
-    // fields 3, 4 = lastProbeTime, lastTransitionTime (Time messages) — skipped
-    /// reason (field 5, string)
-    #[prost(string, tag = "5")]
-    reason: String,
-    /// message (field 6, string)
-    #[prost(string, tag = "6")]
-    message: String,
-}
-
-/// JobStatus — k8s.io/api/batch/v1/generated.proto
-/// Source: api-batch-v1-generated.proto message JobStatus
-/// fields 2 (startTime) and 3 (completionTime) are Time messages — skipped
-/// field 8 (uncountedTerminatedPods) is a complex message — skipped
-#[derive(Clone, PartialEq, Message)]
-struct JobStatus {
-    /// conditions (field 1, repeated JobCondition)
-    #[prost(message, repeated, tag = "1")]
-    conditions: Vec<JobCondition>,
-    // fields 2, 3 = startTime, completionTime (Time messages) — skipped
-    /// active (field 4, int32)
-    #[prost(int32, tag = "4")]
-    active: i32,
-    /// succeeded (field 5, int32)
-    #[prost(int32, tag = "5")]
-    succeeded: i32,
-    /// failed (field 6, int32)
-    #[prost(int32, tag = "6")]
-    failed: i32,
-    /// completedIndexes (field 7, string)
-    #[prost(string, tag = "7")]
-    completed_indexes: String,
-    // field 8 = uncountedTerminatedPods (complex message) — skipped
-    /// ready (field 9, int32)
-    #[prost(int32, tag = "9")]
-    ready: i32,
-    /// failedIndexes (field 10, string)
-    #[prost(string, tag = "10")]
-    failed_indexes: String,
-    /// terminating (field 11, int32)
-    #[prost(int32, tag = "11")]
-    terminating: i32,
-}
-
-/// Job — k8s.io/api/batch/v1/generated.proto
-/// Source: k8s.io/api/batch/v1/generated.proto message Job
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct Job {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message JobSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<JobSpec>,
-    /// status (field 3, message JobStatus)
-    #[prost(message, tag = "3")]
-    status: Option<JobStatus>,
-}
-
 // --- k8s.io/api/apps/v1/generated.proto ---
 
 /// LabelSelector — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
@@ -2169,22 +1772,6 @@ struct AppsLabelSelector {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
-}
-
-/// PodTemplateSpec (apps context) — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message PodTemplateSpec
-/// Decodes metadata (field 1) and spec (field 2, PodSpec).
-/// spec must be decoded so EqualIgnoreHash in KCM's FindNewReplicaSet can match the
-/// Deployment template against the ReplicaSet template — without it spec.template.spec
-/// is null in the stored Deployment JSON and the comparison always fails.
-#[derive(Clone, PartialEq, Message)]
-struct AppsPodTemplateSpec {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message PodSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<PodSpec>,
 }
 
 /// ServiceAccount — k8s.io/api/core/v1/generated.proto
@@ -2678,173 +2265,6 @@ pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
-/// Convert a decoded `Probe` struct into a `serde_json::Value`.
-///
-/// Only non-zero timing fields are emitted; zero means "not set" for proto3 scalars.
-/// Handler fields (exec/httpGet/tcpSocket) are omitted — they are not decoded.
-fn probe_to_json(p: Probe) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(handler) = p.handler {
-        if let Some(exec) = handler.exec {
-            if !exec.command.is_empty() {
-                m.insert(
-                    "exec".to_string(),
-                    serde_json::json!({ "command": exec.command }),
-                );
-            }
-        }
-        if let Some(http_get) = handler.http_get {
-            let mut hg = serde_json::Map::new();
-            if !http_get.path.is_empty() {
-                hg.insert("path".to_string(), serde_json::Value::String(http_get.path));
-            }
-            if let Some(port) = http_get.port {
-                hg.insert("port".to_string(), port.to_json());
-            }
-            if !http_get.host.is_empty() {
-                hg.insert("host".to_string(), serde_json::Value::String(http_get.host));
-            }
-            if !http_get.scheme.is_empty() {
-                hg.insert(
-                    "scheme".to_string(),
-                    serde_json::Value::String(http_get.scheme),
-                );
-            }
-            m.insert("httpGet".to_string(), serde_json::Value::Object(hg));
-        }
-        if let Some(tcp) = handler.tcp_socket {
-            let mut ts = serde_json::Map::new();
-            if let Some(port) = tcp.port {
-                ts.insert("port".to_string(), port.to_json());
-            }
-            if !tcp.host.is_empty() {
-                ts.insert("host".to_string(), serde_json::Value::String(tcp.host));
-            }
-            m.insert("tcpSocket".to_string(), serde_json::Value::Object(ts));
-        }
-        if let Some(grpc) = handler.grpc {
-            m.insert(
-                "grpc".to_string(),
-                serde_json::json!({ "port": grpc.port, "service": grpc.service }),
-            );
-        }
-    }
-    if p.initial_delay_seconds != 0 {
-        m.insert(
-            "initialDelaySeconds".to_string(),
-            serde_json::Value::Number(p.initial_delay_seconds.into()),
-        );
-    }
-    if p.timeout_seconds != 0 {
-        m.insert(
-            "timeoutSeconds".to_string(),
-            serde_json::Value::Number(p.timeout_seconds.into()),
-        );
-    }
-    if p.period_seconds != 0 {
-        m.insert(
-            "periodSeconds".to_string(),
-            serde_json::Value::Number(p.period_seconds.into()),
-        );
-    }
-    if p.success_threshold != 0 {
-        m.insert(
-            "successThreshold".to_string(),
-            serde_json::Value::Number(p.success_threshold.into()),
-        );
-    }
-    if p.failure_threshold != 0 {
-        m.insert(
-            "failureThreshold".to_string(),
-            serde_json::Value::Number(p.failure_threshold.into()),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Convert a decoded `LifecycleHandler` into a `serde_json::Value`.
-fn lifecycle_handler_to_json(h: LifecycleHandler) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(exec) = h.exec {
-        if !exec.command.is_empty() {
-            m.insert(
-                "exec".to_string(),
-                serde_json::json!({
-                    "command": exec.command
-                }),
-            );
-        }
-    }
-    if let Some(http_get) = h.http_get {
-        let mut hg = serde_json::Map::new();
-        if !http_get.path.is_empty() {
-            hg.insert("path".to_string(), serde_json::Value::String(http_get.path));
-        }
-        if let Some(port) = http_get.port {
-            hg.insert("port".to_string(), port.to_json());
-        }
-        if !http_get.host.is_empty() {
-            hg.insert("host".to_string(), serde_json::Value::String(http_get.host));
-        }
-        if !http_get.scheme.is_empty() {
-            hg.insert(
-                "scheme".to_string(),
-                serde_json::Value::String(http_get.scheme),
-            );
-        }
-        m.insert("httpGet".to_string(), serde_json::Value::Object(hg));
-    }
-    if let Some(tcp) = h.tcp_socket {
-        let mut ts = serde_json::Map::new();
-        if let Some(port) = tcp.port {
-            ts.insert("port".to_string(), port.to_json());
-        }
-        if !tcp.host.is_empty() {
-            ts.insert("host".to_string(), serde_json::Value::String(tcp.host));
-        }
-        m.insert("tcpSocket".to_string(), serde_json::Value::Object(ts));
-    }
-    if let Some(sleep) = h.sleep {
-        m.insert(
-            "sleep".to_string(),
-            serde_json::json!({ "seconds": sleep.seconds }),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Convert a decoded `Lifecycle` struct into a `serde_json::Value`.
-fn lifecycle_to_json(lc: Lifecycle) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if let Some(h) = lc.post_start {
-        m.insert("postStart".to_string(), lifecycle_handler_to_json(h));
-    }
-    if let Some(h) = lc.pre_stop {
-        m.insert("preStop".to_string(), lifecycle_handler_to_json(h));
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Decode a proto-encoded Pod object into a `serde_json::Value`.
-///
-/// Decodes metadata and spec (containers + scalar fields). All other PodSpec fields are omitted
-/// because PodSpec is deeply nested — the goal is to produce a valid JSON object that passes
-/// Object::from_bytes validation and can be stored, so CREATE returns 201 instead of 400.
-pub fn decode_pod_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let pod = Pod::decode(data).ok()?;
-    let meta = object_meta_to_json(pod.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": meta
-    });
-
-    obj["spec"] = pod_spec_to_json(pod.spec.unwrap_or_default());
-
-    Some(obj)
-}
-
 /// Decode a proto-encoded IntOrString (k8s.io/apimachinery/pkg/util/intstr) from raw bytes.
 /// k8s IntOrString (k8s.io/apimachinery/pkg/util/intstr/generated.proto):
 ///   field 1 (int64) = type: 0=Int 1=String
@@ -3059,91 +2479,6 @@ pub fn decode_service_proto(data: &[u8]) -> Option<serde_json::Value> {
 }
 
 /// Decode a proto-encoded ReplicationController object into a `serde_json::Value`.
-pub fn decode_replicationcontroller_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let rc = ReplicationController::decode(data).ok()?;
-    let meta = object_meta_to_json(rc.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ReplicationController",
-        "metadata": meta
-    });
-
-    if let Some(spec) = rc.spec {
-        let mut spec_map = serde_json::Map::new();
-        spec_map.insert(
-            "replicas".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(spec.replicas)),
-        );
-        if !spec.selector.is_empty() {
-            let sel: serde_json::Map<String, serde_json::Value> = spec
-                .selector
-                .into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                .collect();
-            spec_map.insert("selector".to_string(), serde_json::Value::Object(sel));
-        }
-        if let Some(tmpl) = spec.template {
-            let mut tmpl_json = serde_json::json!({});
-            if let Some(meta) = tmpl.metadata {
-                tmpl_json["metadata"] = object_meta_to_json(meta);
-            }
-            if let Some(pod_spec) = tmpl.spec {
-                tmpl_json["spec"] = pod_spec_to_json(pod_spec);
-            }
-            spec_map.insert("template".to_string(), tmpl_json);
-        }
-        obj["spec"] = serde_json::Value::Object(spec_map);
-    }
-
-    if let Some(status) = rc.status {
-        let mut status_json = serde_json::json!({});
-        if status.replicas != 0 {
-            status_json["replicas"] = status.replicas.into();
-        }
-        if status.fully_labeled_replicas != 0 {
-            status_json["fullyLabeledReplicas"] = status.fully_labeled_replicas.into();
-        }
-        if status.observed_generation != 0 {
-            status_json["observedGeneration"] = status.observed_generation.into();
-        }
-        if status.ready_replicas != 0 {
-            status_json["readyReplicas"] = status.ready_replicas.into();
-        }
-        if status.available_replicas != 0 {
-            status_json["availableReplicas"] = status.available_replicas.into();
-        }
-        if !status.conditions.is_empty() {
-            status_json["conditions"] = status
-                .conditions
-                .iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status,
-                    });
-                    if !c.reason.is_empty() {
-                        cond["reason"] = c.reason.clone().into();
-                    }
-                    if !c.message.is_empty() {
-                        cond["message"] = c.message.clone().into();
-                    }
-                    cond
-                })
-                .collect();
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            obj["status"] = status_json;
-        }
-    }
-
-    Some(obj)
-}
-
 /// Decode a proto-encoded RuntimeClass object into a `serde_json::Value`.
 pub fn decode_runtimeclass_proto(data: &[u8]) -> Option<serde_json::Value> {
     let rc = RuntimeClass::decode(data).ok()?;
@@ -3300,59 +2635,6 @@ pub fn decode_node_proto(data: &[u8]) -> Option<serde_json::Value> {
                         .map(serde_json::Value::String)
                         .collect(),
                 ),
-            );
-        }
-        if !spec_map.is_empty() {
-            obj["spec"] = serde_json::Value::Object(spec_map);
-        }
-    }
-
-    Some(obj)
-}
-
-/// Decode a proto-encoded Lease object into a `serde_json::Value`.
-pub fn decode_lease_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let lease = Lease::decode(data).ok()?;
-    let meta = object_meta_to_json(lease.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "coordination.k8s.io/v1",
-        "kind": "Lease",
-        "metadata": meta
-    });
-
-    if let Some(spec) = lease.spec {
-        let mut spec_map = serde_json::Map::new();
-        if !spec.holder_identity.is_empty() {
-            spec_map.insert(
-                "holderIdentity".to_string(),
-                serde_json::Value::String(spec.holder_identity),
-            );
-        }
-        if spec.lease_duration_seconds != 0 {
-            spec_map.insert(
-                "leaseDurationSeconds".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(spec.lease_duration_seconds)),
-            );
-        }
-        if let Some(t) = spec.acquire_time {
-            if t.seconds > 0 {
-                // MicroTime carries sub-second precision via nanos; truncate to microseconds.
-                let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
-                spec_map.insert("acquireTime".to_string(), serde_json::Value::String(ts));
-            }
-        }
-        if let Some(t) = spec.renew_time {
-            if t.seconds > 0 {
-                // MicroTime carries sub-second precision via nanos; truncate to microseconds.
-                let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
-                spec_map.insert("renewTime".to_string(), serde_json::Value::String(ts));
-            }
-        }
-        if spec.lease_transitions != 0 {
-            spec_map.insert(
-                "leaseTransitions".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(spec.lease_transitions)),
             );
         }
         if !spec_map.is_empty() {
@@ -3918,336 +3200,6 @@ pub fn decode_token_review_proto(data: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
-fn success_policy_to_json(sp: SuccessPolicy) -> serde_json::Value {
-    let rules: Vec<serde_json::Value> = sp
-        .rules
-        .into_iter()
-        .map(|r| {
-            let mut rule = serde_json::json!({});
-            if let Some(idx) = r.succeeded_indexes {
-                rule["succeededIndexes"] = idx.into();
-            }
-            if let Some(cnt) = r.succeeded_count {
-                rule["succeededCount"] = serde_json::Value::Number(serde_json::Number::from(cnt));
-            }
-            rule
-        })
-        .collect();
-    serde_json::json!({ "rules": rules })
-}
-
-fn pod_failure_policy_to_json(pfp: PodFailurePolicy) -> serde_json::Value {
-    let rules: Vec<serde_json::Value> = pfp
-        .rules
-        .into_iter()
-        .map(|r| {
-            let mut rule = serde_json::json!({ "action": r.action });
-            if let Some(ec) = r.on_exit_codes {
-                let mut oec = serde_json::json!({
-                    "operator": ec.operator,
-                    "values": ec.values,
-                });
-                if let Some(cn) = ec.container_name {
-                    oec["containerName"] = cn.into();
-                }
-                rule["onExitCodes"] = oec;
-            }
-            if !r.on_pod_conditions.is_empty() {
-                rule["onPodConditions"] = r
-                    .on_pod_conditions
-                    .into_iter()
-                    .map(|p| serde_json::json!({ "type": p.r#type, "status": p.status }))
-                    .collect::<Vec<_>>()
-                    .into();
-            }
-            rule
-        })
-        .collect();
-    serde_json::json!({ "rules": rules })
-}
-
-/// Convert a prost JobSpec into a serde_json::Value object.
-fn job_spec_to_json(spec: JobSpec) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if spec.parallelism != 0 {
-        m.insert(
-            "parallelism".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(spec.parallelism)),
-        );
-    }
-    if spec.completions != 0 {
-        m.insert(
-            "completions".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(spec.completions)),
-        );
-    }
-    if spec.active_deadline_seconds != 0 {
-        m.insert(
-            "activeDeadlineSeconds".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(spec.active_deadline_seconds)),
-        );
-    }
-    if spec.backoff_limit != 0 {
-        m.insert(
-            "backoffLimit".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(spec.backoff_limit)),
-        );
-    }
-    if spec.ttl_seconds_after_finished != 0 {
-        m.insert(
-            "ttlSecondsAfterFinished".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(spec.ttl_seconds_after_finished)),
-        );
-    }
-    if !spec.completion_mode.is_empty() {
-        m.insert(
-            "completionMode".to_string(),
-            serde_json::Value::String(spec.completion_mode),
-        );
-    }
-    if spec.suspend {
-        m.insert("suspend".to_string(), serde_json::Value::Bool(true));
-    }
-    if !spec.pod_replacement_policy.is_empty() {
-        m.insert(
-            "podReplacementPolicy".to_string(),
-            serde_json::Value::String(spec.pod_replacement_policy),
-        );
-    }
-    if let Some(v) = spec.backoff_limit_per_index {
-        m.insert(
-            "backoffLimitPerIndex".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(v)),
-        );
-    }
-    if let Some(v) = spec.max_failed_indexes {
-        m.insert(
-            "maxFailedIndexes".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(v)),
-        );
-    }
-    if !spec.managed_by.is_empty() {
-        m.insert(
-            "managedBy".to_string(),
-            serde_json::Value::String(spec.managed_by),
-        );
-    }
-    if let Some(pfp) = spec.pod_failure_policy {
-        m.insert(
-            "podFailurePolicy".to_string(),
-            pod_failure_policy_to_json(pfp),
-        );
-    }
-    if let Some(sp) = spec.success_policy {
-        m.insert("successPolicy".to_string(), success_policy_to_json(sp));
-    }
-    // Decode and include the pod template so containers are preserved.
-    // An empty template object is used as fallback so the k8s schema remains valid.
-    let tmpl_json = if let Some(tmpl) = spec.template {
-        let mut t = serde_json::json!({});
-        if let Some(meta) = tmpl.metadata {
-            t["metadata"] = object_meta_to_json(meta);
-        }
-        if let Some(pod_spec) = tmpl.spec {
-            t["spec"] = pod_spec_to_json(pod_spec);
-        }
-        t
-    } else {
-        serde_json::Value::Object(serde_json::Map::new())
-    };
-    m.insert("template".to_string(), tmpl_json);
-    serde_json::Value::Object(m)
-}
-
-/// Decode a proto-encoded CronJob object into a `serde_json::Value`.
-pub fn decode_cronjob_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let cj = CronJob::decode(data).ok()?;
-    let meta = object_meta_to_json(cj.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "batch/v1",
-        "kind": "CronJob",
-        "metadata": meta
-    });
-
-    if let Some(spec) = cj.spec {
-        let mut spec_map = serde_json::Map::new();
-        if !spec.schedule.is_empty() {
-            spec_map.insert(
-                "schedule".to_string(),
-                serde_json::Value::String(spec.schedule),
-            );
-        }
-        if spec.starting_deadline_seconds != 0 {
-            spec_map.insert(
-                "startingDeadlineSeconds".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(spec.starting_deadline_seconds)),
-            );
-        }
-        if !spec.concurrency_policy.is_empty() {
-            spec_map.insert(
-                "concurrencyPolicy".to_string(),
-                serde_json::Value::String(spec.concurrency_policy),
-            );
-        }
-        if spec.suspend {
-            spec_map.insert("suspend".to_string(), serde_json::Value::Bool(true));
-        }
-        if spec.successful_jobs_history_limit != 0 {
-            spec_map.insert(
-                "successfulJobsHistoryLimit".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(
-                    spec.successful_jobs_history_limit,
-                )),
-            );
-        }
-        if spec.failed_jobs_history_limit != 0 {
-            spec_map.insert(
-                "failedJobsHistoryLimit".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(spec.failed_jobs_history_limit)),
-            );
-        }
-        if !spec.time_zone.is_empty() {
-            spec_map.insert(
-                "timeZone".to_string(),
-                serde_json::Value::String(spec.time_zone),
-            );
-        }
-        // jobTemplate: always emit with at least an empty spec.template
-        let jt_meta = spec
-            .job_template
-            .as_ref()
-            .and_then(|jt| jt.metadata.clone())
-            .map(object_meta_to_json)
-            .unwrap_or_else(|| serde_json::json!({"creationTimestamp": serde_json::Value::Null}));
-        let jt_spec = spec
-            .job_template
-            .and_then(|jt| jt.spec)
-            .map(job_spec_to_json)
-            .unwrap_or_else(|| serde_json::json!({"template": {}}));
-        spec_map.insert(
-            "jobTemplate".to_string(),
-            serde_json::json!({
-                "metadata": jt_meta,
-                "spec": jt_spec
-            }),
-        );
-        obj["spec"] = serde_json::Value::Object(spec_map);
-    }
-
-    if let Some(status) = cj.status {
-        let mut status_json = serde_json::json!({});
-        if !status.active.is_empty() {
-            status_json["active"] = status
-                .active
-                .iter()
-                .filter_map(|r| {
-                    if r.name.is_empty() && r.namespace.is_empty() {
-                        None
-                    } else {
-                        let mut entry = serde_json::json!({});
-                        if !r.name.is_empty() {
-                            entry["name"] = r.name.clone().into();
-                        }
-                        if !r.namespace.is_empty() {
-                            entry["namespace"] = r.namespace.clone().into();
-                        }
-                        if !r.kind.is_empty() {
-                            entry["kind"] = r.kind.clone().into();
-                        }
-                        if !r.api_version.is_empty() {
-                            entry["apiVersion"] = r.api_version.clone().into();
-                        }
-                        if !r.uid.is_empty() {
-                            entry["uid"] = r.uid.clone().into();
-                        }
-                        Some(entry)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .into();
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            obj["status"] = status_json;
-        }
-    }
-
-    Some(obj)
-}
-
-/// Decode a proto-encoded Job object into a `serde_json::Value`.
-pub fn decode_job_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let job = Job::decode(data).ok()?;
-    let meta = object_meta_to_json(job.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": meta
-    });
-
-    if let Some(spec) = job.spec {
-        obj["spec"] = job_spec_to_json(spec);
-    }
-
-    if let Some(status) = job.status {
-        let mut status_json = serde_json::json!({});
-        if !status.conditions.is_empty() {
-            status_json["conditions"] = status
-                .conditions
-                .iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status,
-                    });
-                    if !c.reason.is_empty() {
-                        cond["reason"] = c.reason.clone().into();
-                    }
-                    if !c.message.is_empty() {
-                        cond["message"] = c.message.clone().into();
-                    }
-                    cond
-                })
-                .collect();
-        }
-        if status.active != 0 {
-            status_json["active"] = status.active.into();
-        }
-        if status.succeeded != 0 {
-            status_json["succeeded"] = status.succeeded.into();
-        }
-        if status.failed != 0 {
-            status_json["failed"] = status.failed.into();
-        }
-        if !status.completed_indexes.is_empty() {
-            status_json["completedIndexes"] = status.completed_indexes.into();
-        }
-        if status.ready != 0 {
-            status_json["ready"] = status.ready.into();
-        }
-        if !status.failed_indexes.is_empty() {
-            status_json["failedIndexes"] = status.failed_indexes.into();
-        }
-        if status.terminating != 0 {
-            status_json["terminating"] = status.terminating.into();
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            obj["status"] = status_json;
-        }
-    }
-
-    Some(obj)
-}
-
 /// Convert an `AppsLabelSelector` to the JSON form used in Kubernetes API objects.
 fn apps_label_selector_to_json(sel: AppsLabelSelector) -> serde_json::Value {
     let mut m = serde_json::json!({});
@@ -4260,741 +3212,6 @@ fn apps_label_selector_to_json(sel: AppsLabelSelector) -> serde_json::Value {
         m["matchLabels"] = serde_json::Value::Object(labels);
     }
     m
-}
-
-/// Convert a decoded `DownwardAPIVolumeFile` into a JSON object.
-/// This is used both by DownwardAPIVolumeSource items and DownwardAPIProjection items.
-fn downward_api_volume_file_to_json(f: DownwardAPIVolumeFile) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !f.path.is_empty() {
-        m.insert("path".to_string(), serde_json::Value::String(f.path));
-    }
-    if let Some(fr) = f.field_ref {
-        let mut fr_map = serde_json::Map::new();
-        if !fr.api_version.is_empty() {
-            fr_map.insert(
-                "apiVersion".to_string(),
-                serde_json::Value::String(fr.api_version),
-            );
-        }
-        if !fr.field_path.is_empty() {
-            fr_map.insert(
-                "fieldPath".to_string(),
-                serde_json::Value::String(fr.field_path),
-            );
-        }
-        m.insert("fieldRef".to_string(), serde_json::Value::Object(fr_map));
-    }
-    if let Some(rfr) = f.resource_field_ref {
-        let mut rfr_map = serde_json::Map::new();
-        if !rfr.container_name.is_empty() {
-            rfr_map.insert(
-                "containerName".to_string(),
-                serde_json::Value::String(rfr.container_name),
-            );
-        }
-        if !rfr.resource.is_empty() {
-            rfr_map.insert(
-                "resource".to_string(),
-                serde_json::Value::String(rfr.resource),
-            );
-        }
-        // divisor is required by the kubelet; if omitted or zero the volume fails to mount.
-        // The Kubernetes API server defaults an absent/zero divisor to "1".
-        // A zero Quantity serialises as string "0" in proto — treat that as the default too.
-        let divisor_str = rfr
-            .divisor
-            .and_then(|q| q.string)
-            .filter(|s| !s.is_empty() && s != "0")
-            .unwrap_or_else(|| "1".to_string());
-        rfr_map.insert(
-            "divisor".to_string(),
-            serde_json::Value::String(divisor_str),
-        );
-        m.insert(
-            "resourceFieldRef".to_string(),
-            serde_json::Value::Object(rfr_map),
-        );
-    }
-    if f.mode != 0 {
-        m.insert("mode".to_string(), serde_json::Value::Number(f.mode.into()));
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Convert decoded DownwardAPIVolumeSource fields into a JSON object.
-/// Called for spec.volumes[].downwardAPI.
-fn downward_api_volume_source_to_json(
-    items: Vec<DownwardAPIVolumeFile>,
-    default_mode: i32,
-) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !items.is_empty() {
-        let items_json: Vec<serde_json::Value> = items
-            .into_iter()
-            .map(downward_api_volume_file_to_json)
-            .collect();
-        m.insert("items".to_string(), serde_json::Value::Array(items_json));
-    }
-    // defaultMode is required by the kubelet; if omitted the volume mount fails with
-    // "no defaultMode used, not even the default value for it".
-    // The Kubernetes API server defaults an absent (proto zero) value to 0644 = 420.
-    let dm = if default_mode == 0 { 420 } else { default_mode };
-    m.insert(
-        "defaultMode".to_string(),
-        serde_json::Value::Number(dm.into()),
-    );
-    serde_json::Value::Object(m)
-}
-
-/// Serialize a slice of `KeyToPath` items into a JSON array.
-/// Each item becomes `{"key": k, "path": p}`, with `"mode"` included only when non-zero.
-fn key_to_path_items_to_json(items: Vec<KeyToPath>) -> serde_json::Value {
-    let arr: Vec<serde_json::Value> = items
-        .into_iter()
-        .filter(|it| !it.key.is_empty())
-        .map(|it| {
-            let mut m = serde_json::Map::new();
-            m.insert("key".to_string(), serde_json::Value::String(it.key));
-            m.insert("path".to_string(), serde_json::Value::String(it.path));
-            if it.mode != 0 {
-                m.insert(
-                    "mode".to_string(),
-                    serde_json::Value::Number(it.mode.into()),
-                );
-            }
-            serde_json::Value::Object(m)
-        })
-        .collect();
-    serde_json::Value::Array(arr)
-}
-
-/// Convert a decoded `ProjectedVolumeSource` into a JSON object.
-/// Called for spec.volumes[].projected.
-fn projected_volume_source_to_json(proj: ProjectedVolumeSource) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !proj.sources.is_empty() {
-        let sources_json: Vec<serde_json::Value> = proj
-            .sources
-            .into_iter()
-            .map(|src| {
-                let mut sm = serde_json::Map::new();
-                if let Some(s) = src.secret {
-                    if let Some(lor) = s.local_object_reference {
-                        if !lor.name.is_empty() {
-                            let mut secret_map = serde_json::Map::new();
-                            secret_map
-                                .insert("name".to_string(), serde_json::Value::String(lor.name));
-                            if !s.items.is_empty() {
-                                secret_map.insert(
-                                    "items".to_string(),
-                                    key_to_path_items_to_json(s.items),
-                                );
-                            }
-                            sm.insert("secret".to_string(), serde_json::Value::Object(secret_map));
-                        }
-                    }
-                }
-                if let Some(da) = src.downward_api {
-                    sm.insert(
-                        "downwardAPI".to_string(),
-                        downward_api_volume_source_to_json(da.items, 0),
-                    );
-                }
-                if let Some(cm) = src.config_map {
-                    if let Some(lor) = cm.local_object_reference {
-                        if !lor.name.is_empty() {
-                            let mut cm_map = serde_json::Map::new();
-                            cm_map.insert("name".to_string(), serde_json::Value::String(lor.name));
-                            if !cm.items.is_empty() {
-                                cm_map.insert(
-                                    "items".to_string(),
-                                    key_to_path_items_to_json(cm.items),
-                                );
-                            }
-                            sm.insert("configMap".to_string(), serde_json::Value::Object(cm_map));
-                        }
-                    }
-                }
-                if let Some(sat) = src.service_account_token {
-                    let mut sat_map = serde_json::Map::new();
-                    if !sat.audience.is_empty() {
-                        sat_map.insert(
-                            "audience".to_string(),
-                            serde_json::Value::String(sat.audience),
-                        );
-                    }
-                    if sat.expiration_seconds != 0 {
-                        sat_map.insert(
-                            "expirationSeconds".to_string(),
-                            serde_json::Value::Number(sat.expiration_seconds.into()),
-                        );
-                    }
-                    if !sat.path.is_empty() {
-                        sat_map.insert("path".to_string(), serde_json::Value::String(sat.path));
-                    }
-                    sm.insert(
-                        "serviceAccountToken".to_string(),
-                        serde_json::Value::Object(sat_map),
-                    );
-                }
-                serde_json::Value::Object(sm)
-            })
-            .collect();
-        m.insert(
-            "sources".to_string(),
-            serde_json::Value::Array(sources_json),
-        );
-    }
-    if proj.default_mode != 0 {
-        m.insert(
-            "defaultMode".to_string(),
-            serde_json::Value::Number(proj.default_mode.into()),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Serialize a decoded `PodSpec` into a JSON map.
-///
-/// Mirrors the container/spec serialization in `decode_pod_proto`, extracted here so
-/// `apps_spec_to_json` can embed the pod spec inside `spec.template.spec` for Deployment,
-/// StatefulSet, ReplicaSet, and DaemonSet without duplicating the logic.
-fn container_to_json(c: Container) -> serde_json::Value {
-    let mut cm = serde_json::Map::new();
-    if !c.name.is_empty() {
-        cm.insert("name".to_string(), serde_json::Value::String(c.name));
-    }
-    if !c.image.is_empty() {
-        cm.insert("image".to_string(), serde_json::Value::String(c.image));
-    }
-    if !c.image_pull_policy.is_empty() {
-        cm.insert(
-            "imagePullPolicy".to_string(),
-            serde_json::Value::String(c.image_pull_policy),
-        );
-    }
-    if !c.termination_message_path.is_empty() {
-        cm.insert(
-            "terminationMessagePath".to_string(),
-            serde_json::Value::String(c.termination_message_path),
-        );
-    }
-    if !c.termination_message_policy.is_empty() {
-        cm.insert(
-            "terminationMessagePolicy".to_string(),
-            serde_json::Value::String(c.termination_message_policy),
-        );
-    }
-    if !c.command.is_empty() {
-        cm.insert(
-            "command".to_string(),
-            serde_json::Value::Array(
-                c.command
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !c.args.is_empty() {
-        cm.insert(
-            "args".to_string(),
-            serde_json::Value::Array(c.args.into_iter().map(serde_json::Value::String).collect()),
-        );
-    }
-    if !c.ports.is_empty() {
-        let ports_json: Vec<serde_json::Value> = c
-            .ports
-            .into_iter()
-            .map(|p| {
-                let mut pm = serde_json::Map::new();
-                if !p.name.is_empty() {
-                    pm.insert("name".to_string(), serde_json::Value::String(p.name));
-                }
-                if p.container_port != 0 {
-                    pm.insert(
-                        "containerPort".to_string(),
-                        serde_json::Value::Number(p.container_port.into()),
-                    );
-                }
-                if p.host_port != 0 {
-                    pm.insert(
-                        "hostPort".to_string(),
-                        serde_json::Value::Number(p.host_port.into()),
-                    );
-                }
-                if !p.protocol.is_empty() {
-                    pm.insert(
-                        "protocol".to_string(),
-                        serde_json::Value::String(p.protocol),
-                    );
-                }
-                if !p.host_ip.is_empty() {
-                    pm.insert("hostIP".to_string(), serde_json::Value::String(p.host_ip));
-                }
-                serde_json::Value::Object(pm)
-            })
-            .collect();
-        cm.insert("ports".to_string(), serde_json::Value::Array(ports_json));
-    }
-    if !c.env.is_empty() {
-        let env_json: Vec<serde_json::Value> = c
-            .env
-            .into_iter()
-            .map(|ev| {
-                let mut em = serde_json::Map::new();
-                if !ev.name.is_empty() {
-                    em.insert("name".to_string(), serde_json::Value::String(ev.name));
-                }
-                if !ev.value.is_empty() {
-                    em.insert("value".to_string(), serde_json::Value::String(ev.value));
-                }
-                if let Some(vf) = ev.value_from {
-                    let mut vfm = serde_json::Map::new();
-                    if let Some(fr) = vf.field_ref {
-                        let mut frm = serde_json::Map::new();
-                        if !fr.api_version.is_empty() {
-                            frm.insert(
-                                "apiVersion".to_string(),
-                                serde_json::Value::String(fr.api_version),
-                            );
-                        }
-                        if !fr.field_path.is_empty() {
-                            frm.insert(
-                                "fieldPath".to_string(),
-                                serde_json::Value::String(fr.field_path),
-                            );
-                        }
-                        vfm.insert("fieldRef".to_string(), serde_json::Value::Object(frm));
-                    }
-                    if let Some(rfr) = vf.resource_field_ref {
-                        let mut rfrm = serde_json::Map::new();
-                        if !rfr.container_name.is_empty() {
-                            rfrm.insert(
-                                "containerName".to_string(),
-                                serde_json::Value::String(rfr.container_name),
-                            );
-                        }
-                        if !rfr.resource.is_empty() {
-                            rfrm.insert(
-                                "resource".to_string(),
-                                serde_json::Value::String(rfr.resource),
-                            );
-                        }
-                        if let Some(divisor_str) = rfr.divisor.and_then(|q| q.string) {
-                            if !divisor_str.is_empty() {
-                                rfrm.insert(
-                                    "divisor".to_string(),
-                                    serde_json::Value::String(divisor_str),
-                                );
-                            }
-                        }
-                        vfm.insert(
-                            "resourceFieldRef".to_string(),
-                            serde_json::Value::Object(rfrm),
-                        );
-                    }
-                    if let Some(cmkr) = vf.config_map_key_ref {
-                        let mut cmkrm = serde_json::Map::new();
-                        if let Some(lor) = cmkr.local_object_reference {
-                            if !lor.name.is_empty() {
-                                cmkrm.insert(
-                                    "name".to_string(),
-                                    serde_json::Value::String(lor.name),
-                                );
-                            }
-                        }
-                        if !cmkr.key.is_empty() {
-                            cmkrm.insert("key".to_string(), serde_json::Value::String(cmkr.key));
-                        }
-                        if cmkr.optional {
-                            cmkrm.insert(
-                                "optional".to_string(),
-                                serde_json::Value::Bool(cmkr.optional),
-                            );
-                        }
-                        vfm.insert(
-                            "configMapKeyRef".to_string(),
-                            serde_json::Value::Object(cmkrm),
-                        );
-                    }
-                    if let Some(skr) = vf.secret_key_ref {
-                        let mut skrm = serde_json::Map::new();
-                        if let Some(lor) = skr.local_object_reference {
-                            if !lor.name.is_empty() {
-                                skrm.insert(
-                                    "name".to_string(),
-                                    serde_json::Value::String(lor.name),
-                                );
-                            }
-                        }
-                        if !skr.key.is_empty() {
-                            skrm.insert("key".to_string(), serde_json::Value::String(skr.key));
-                        }
-                        if skr.optional {
-                            skrm.insert(
-                                "optional".to_string(),
-                                serde_json::Value::Bool(skr.optional),
-                            );
-                        }
-                        vfm.insert("secretKeyRef".to_string(), serde_json::Value::Object(skrm));
-                    }
-                    em.insert("valueFrom".to_string(), serde_json::Value::Object(vfm));
-                }
-                serde_json::Value::Object(em)
-            })
-            .collect();
-        cm.insert("env".to_string(), serde_json::Value::Array(env_json));
-    }
-    if !c.env_from.is_empty() {
-        let env_from_json: Vec<serde_json::Value> = c
-            .env_from
-            .into_iter()
-            .map(|ef| {
-                let mut efm = serde_json::Map::new();
-                if !ef.prefix.is_empty() {
-                    efm.insert("prefix".to_string(), serde_json::Value::String(ef.prefix));
-                }
-                if let Some(cmr) = ef.config_map_ref {
-                    let mut cmrm = serde_json::Map::new();
-                    if let Some(lor) = cmr.local_object_reference {
-                        if !lor.name.is_empty() {
-                            cmrm.insert("name".to_string(), serde_json::Value::String(lor.name));
-                        }
-                    }
-                    if cmr.optional {
-                        cmrm.insert(
-                            "optional".to_string(),
-                            serde_json::Value::Bool(cmr.optional),
-                        );
-                    }
-                    efm.insert("configMapRef".to_string(), serde_json::Value::Object(cmrm));
-                }
-                if let Some(sr) = ef.secret_ref {
-                    let mut srm = serde_json::Map::new();
-                    if let Some(lor) = sr.local_object_reference {
-                        if !lor.name.is_empty() {
-                            srm.insert("name".to_string(), serde_json::Value::String(lor.name));
-                        }
-                    }
-                    if sr.optional {
-                        srm.insert("optional".to_string(), serde_json::Value::Bool(sr.optional));
-                    }
-                    efm.insert("secretRef".to_string(), serde_json::Value::Object(srm));
-                }
-                serde_json::Value::Object(efm)
-            })
-            .collect();
-        cm.insert(
-            "envFrom".to_string(),
-            serde_json::Value::Array(env_from_json),
-        );
-    }
-    if let Some(res) = c.resources {
-        let mut res_map = serde_json::Map::new();
-        if !res.limits.is_empty() {
-            res_map.insert(
-                "limits".to_string(),
-                limitrange_quantity_map_to_json(res.limits),
-            );
-        }
-        if !res.requests.is_empty() {
-            res_map.insert(
-                "requests".to_string(),
-                limitrange_quantity_map_to_json(res.requests),
-            );
-        }
-        cm.insert("resources".to_string(), serde_json::Value::Object(res_map));
-    }
-    if let Some(p) = c.liveness_probe {
-        cm.insert("livenessProbe".to_string(), probe_to_json(p));
-    }
-    if let Some(p) = c.readiness_probe {
-        cm.insert("readinessProbe".to_string(), probe_to_json(p));
-    }
-    if let Some(p) = c.startup_probe {
-        cm.insert("startupProbe".to_string(), probe_to_json(p));
-    }
-    if let Some(lc) = c.lifecycle {
-        cm.insert("lifecycle".to_string(), lifecycle_to_json(lc));
-    }
-    if !c.resize_policy.is_empty() {
-        let rp_json: Vec<serde_json::Value> = c
-            .resize_policy
-            .into_iter()
-            .map(|rp| {
-                let mut rpm = serde_json::Map::new();
-                if !rp.resource_name.is_empty() {
-                    rpm.insert(
-                        "resourceName".to_string(),
-                        serde_json::Value::String(rp.resource_name),
-                    );
-                }
-                if !rp.restart_policy.is_empty() {
-                    rpm.insert(
-                        "restartPolicy".to_string(),
-                        serde_json::Value::String(rp.restart_policy),
-                    );
-                }
-                serde_json::Value::Object(rpm)
-            })
-            .collect();
-        cm.insert(
-            "resizePolicy".to_string(),
-            serde_json::Value::Array(rp_json),
-        );
-    }
-    if let Some(rp) = c.restart_policy {
-        if !rp.is_empty() {
-            cm.insert("restartPolicy".to_string(), serde_json::Value::String(rp));
-        }
-    }
-    if !c.volume_mounts.is_empty() {
-        let mounts: Vec<serde_json::Value> = c
-            .volume_mounts
-            .into_iter()
-            .map(|vm| {
-                let mut m = serde_json::Map::new();
-                if !vm.name.is_empty() {
-                    m.insert("name".to_string(), serde_json::Value::String(vm.name));
-                }
-                if !vm.mount_path.is_empty() {
-                    m.insert(
-                        "mountPath".to_string(),
-                        serde_json::Value::String(vm.mount_path),
-                    );
-                }
-                if vm.read_only {
-                    m.insert(
-                        "readOnly".to_string(),
-                        serde_json::Value::Bool(vm.read_only),
-                    );
-                }
-                if !vm.sub_path.is_empty() {
-                    m.insert(
-                        "subPath".to_string(),
-                        serde_json::Value::String(vm.sub_path),
-                    );
-                }
-                if !vm.sub_path_expr.is_empty() {
-                    m.insert(
-                        "subPathExpr".to_string(),
-                        serde_json::Value::String(vm.sub_path_expr),
-                    );
-                }
-                serde_json::Value::Object(m)
-            })
-            .collect();
-        cm.insert("volumeMounts".to_string(), serde_json::Value::Array(mounts));
-    }
-    serde_json::Value::Object(cm)
-}
-
-fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
-    let containers: Vec<serde_json::Value> =
-        spec.containers.into_iter().map(container_to_json).collect();
-
-    let mut spec_map = serde_json::Map::new();
-    if !spec.volumes.is_empty() {
-        let volumes_json: Vec<serde_json::Value> = spec
-            .volumes
-            .into_iter()
-            .map(|v| {
-                let mut vm = serde_json::Map::new();
-                if !v.name.is_empty() {
-                    vm.insert("name".to_string(), serde_json::Value::String(v.name));
-                }
-                if let Some(src) = v.volume_source {
-                    if let Some(hp) = src.host_path {
-                        let mut hp_map = serde_json::Map::new();
-                        if !hp.path.is_empty() {
-                            hp_map.insert("path".to_string(), serde_json::Value::String(hp.path));
-                        }
-                        if !hp.r#type.is_empty() {
-                            hp_map.insert("type".to_string(), serde_json::Value::String(hp.r#type));
-                        }
-                        vm.insert("hostPath".to_string(), serde_json::Value::Object(hp_map));
-                    }
-                    if let Some(_ed) = src.empty_dir {
-                        // emptyDir presence is sufficient for kubelet to use the plugin;
-                        // medium is included when set (e.g. "Memory" for tmpfs).
-                        let mut ed_map = serde_json::Map::new();
-                        if !_ed.medium.is_empty() {
-                            ed_map.insert(
-                                "medium".to_string(),
-                                serde_json::Value::String(_ed.medium),
-                            );
-                        }
-                        vm.insert("emptyDir".to_string(), serde_json::Value::Object(ed_map));
-                    }
-                    if let Some(s) = src.secret {
-                        if !s.secret_name.is_empty() {
-                            let mut secret_map = serde_json::Map::new();
-                            secret_map.insert(
-                                "secretName".to_string(),
-                                serde_json::Value::String(s.secret_name),
-                            );
-                            if !s.items.is_empty() {
-                                secret_map.insert(
-                                    "items".to_string(),
-                                    key_to_path_items_to_json(s.items),
-                                );
-                            }
-                            // defaultMode: kubelet applies these permission bits to files in the
-                            // volume; if absent the kubelet falls back to 0644, ignoring what the
-                            // pod spec requested (e.g. 0400 for read-only secrets).
-                            let dm = if s.default_mode == 0 {
-                                420
-                            } else {
-                                s.default_mode
-                            };
-                            secret_map.insert(
-                                "defaultMode".to_string(),
-                                serde_json::Value::Number(dm.into()),
-                            );
-                            vm.insert("secret".to_string(), serde_json::Value::Object(secret_map));
-                        }
-                    }
-                    if let Some(pvc) = src.persistent_volume_claim {
-                        if !pvc.claim_name.is_empty() {
-                            let mut pvc_map = serde_json::Map::new();
-                            pvc_map.insert(
-                                "claimName".to_string(),
-                                serde_json::Value::String(pvc.claim_name),
-                            );
-                            if pvc.read_only {
-                                pvc_map
-                                    .insert("readOnly".to_string(), serde_json::Value::Bool(true));
-                            }
-                            vm.insert(
-                                "persistentVolumeClaim".to_string(),
-                                serde_json::Value::Object(pvc_map),
-                            );
-                        }
-                    }
-                    if let Some(da) = src.downward_api {
-                        vm.insert(
-                            "downwardAPI".to_string(),
-                            downward_api_volume_source_to_json(da.items, da.default_mode),
-                        );
-                    }
-                    if let Some(cm) = src.config_map {
-                        if let Some(lor) = cm.local_object_reference {
-                            if !lor.name.is_empty() {
-                                let mut cm_map = serde_json::Map::new();
-                                cm_map.insert(
-                                    "name".to_string(),
-                                    serde_json::Value::String(lor.name),
-                                );
-                                if !cm.items.is_empty() {
-                                    cm_map.insert(
-                                        "items".to_string(),
-                                        key_to_path_items_to_json(cm.items),
-                                    );
-                                }
-                                // defaultMode: kubelet applies these permission bits to files in
-                                // the volume; if absent the kubelet falls back to 0644, ignoring
-                                // what the pod spec requested (e.g. 0400 for read-only configs).
-                                let dm = if cm.default_mode == 0 {
-                                    420
-                                } else {
-                                    cm.default_mode
-                                };
-                                cm_map.insert(
-                                    "defaultMode".to_string(),
-                                    serde_json::Value::Number(dm.into()),
-                                );
-                                vm.insert(
-                                    "configMap".to_string(),
-                                    serde_json::Value::Object(cm_map),
-                                );
-                            }
-                        }
-                    }
-                    if let Some(proj) = src.projected {
-                        vm.insert(
-                            "projected".to_string(),
-                            projected_volume_source_to_json(proj),
-                        );
-                    }
-                }
-                serde_json::Value::Object(vm)
-            })
-            .collect();
-        spec_map.insert(
-            "volumes".to_string(),
-            serde_json::Value::Array(volumes_json),
-        );
-    }
-    spec_map.insert(
-        "containers".to_string(),
-        serde_json::Value::Array(containers),
-    );
-    if !spec.restart_policy.is_empty() {
-        spec_map.insert(
-            "restartPolicy".to_string(),
-            serde_json::Value::String(spec.restart_policy),
-        );
-    }
-    if let Some(ads) = spec.active_deadline_seconds {
-        if ads > 0 {
-            spec_map.insert(
-                "activeDeadlineSeconds".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(ads)),
-            );
-        }
-    }
-    if !spec.service_account_name.is_empty() {
-        spec_map.insert(
-            "serviceAccountName".to_string(),
-            serde_json::Value::String(spec.service_account_name),
-        );
-    }
-    if !spec.node_name.is_empty() {
-        spec_map.insert(
-            "nodeName".to_string(),
-            serde_json::Value::String(spec.node_name),
-        );
-    }
-    if !spec.hostname.is_empty() {
-        spec_map.insert(
-            "hostname".to_string(),
-            serde_json::Value::String(spec.hostname),
-        );
-    }
-    if !spec.subdomain.is_empty() {
-        spec_map.insert(
-            "subdomain".to_string(),
-            serde_json::Value::String(spec.subdomain),
-        );
-    }
-    if !spec.init_containers.is_empty() {
-        let init_containers: Vec<serde_json::Value> = spec
-            .init_containers
-            .into_iter()
-            .map(container_to_json)
-            .collect();
-        spec_map.insert(
-            "initContainers".to_string(),
-            serde_json::Value::Array(init_containers),
-        );
-    }
-    if let Some(esl) = spec.enable_service_links {
-        spec_map.insert(
-            "enableServiceLinks".to_string(),
-            serde_json::Value::Bool(esl),
-        );
-    }
-    if let Some(rcn) = spec.runtime_class_name {
-        if !rcn.is_empty() {
-            spec_map.insert(
-                "runtimeClassName".to_string(),
-                serde_json::Value::String(rcn),
-            );
-        }
-    }
-    serde_json::Value::Object(spec_map)
 }
 
 /// Decode a proto-encoded Deployment object into a `serde_json::Value`.
@@ -7228,7 +5445,7 @@ pub fn decode_proto_by_kind_and_version(
             crate::core_gen_adapter::decode_replicationcontroller_proto_gen(raw)
         }
         "PersistentVolume" => crate::core_gen_adapter::decode_persistentvolume_proto_gen(raw),
-        "Lease" => decode_lease_proto(raw),
+        "Lease" => crate::coord_gen_adapter::decode_lease_proto_gen_a(raw),
         "CSINode" => decode_csinode_proto(raw),
         "CSIDriver" => decode_csidriver_proto(raw),
         "CSIStorageCapacity" => decode_csistoragecapacity_proto(raw),
@@ -7246,8 +5463,8 @@ pub fn decode_proto_by_kind_and_version(
         "SubjectAccessReview" => decode_subject_access_review_proto(raw),
         "LocalSubjectAccessReview" => decode_local_subject_access_review_proto(raw),
         "TokenReview" => decode_token_review_proto(raw),
-        "CronJob" => decode_cronjob_proto(raw),
-        "Job" => decode_job_proto(raw),
+        "CronJob" => crate::batch_gen_adapter::decode_cronjob_proto_gen(raw),
+        "Job" => crate::batch_gen_adapter::decode_job_proto_gen(raw),
         "RuntimeClass" => decode_runtimeclass_proto(raw),
         "VolumeAttachment" => decode_volumeattachment_proto(raw),
         "StatefulSet" => crate::apps_gen_adapter::decode_statefulset_proto_gen(raw),
@@ -7889,7 +6106,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta); // Pod.field 1 = ObjectMeta
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec)); // Pod.field 2 = PodSpec
 
-        let result = decode_pod_proto(&pod_proto).expect(
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto).expect(
             "decode_pod_proto must return Some — without this decoder, Pod creation via proto \
                      returns 400 'invalid JSON' and all container-related conformance tests fail",
         );
@@ -7950,7 +6167,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed for a pod with container ports");
 
         let ports = result["spec"]["containers"][0]["ports"]
@@ -8007,7 +6224,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed for a pod with runtimeClassName");
 
         assert_eq!(
@@ -8074,7 +6291,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed for a pod with activeDeadlineSeconds");
 
         assert_eq!(
@@ -8111,14 +6328,15 @@ mod tests {
         let mut container = encode_length_delimited(1, b"c");
         container.extend_from_slice(&encode_length_delimited(2, b"img"));
 
-        // PodSpec: containers at field 2, enableServiceLinks=false at field 26
+        // PodSpec: containers at field 2, enableServiceLinks=false at field 30
+        // (canonical proto field number from k8s.io/api/core/v1/generated.proto)
         let mut pod_spec = encode_length_delimited(2, &container);
-        pod_spec.extend_from_slice(&encode_varint_field(26, 0)); // false
+        pod_spec.extend_from_slice(&encode_varint_field(30, 0)); // false
 
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed for a pod with enableServiceLinks=false");
 
         assert_eq!(
@@ -8144,7 +6362,7 @@ mod tests {
         let mut pod_proto2 = encode_length_delimited(1, &obj_meta2);
         pod_proto2.extend_from_slice(&encode_length_delimited(2, &pod_spec2));
 
-        let result2 = decode_pod_proto(&pod_proto2)
+        let result2 = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto2)
             .expect("decode_pod_proto must succeed for a pod without enableServiceLinks");
 
         assert!(
@@ -8193,7 +6411,8 @@ mod tests {
         let obj_meta = encode_length_delimited(1, b"empty-pod");
         let pod_proto = encode_length_delimited(1, &obj_meta);
 
-        let result = decode_pod_proto(&pod_proto).expect("must decode Pod with no spec");
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
+            .expect("must decode Pod with no spec");
 
         assert_eq!(result["kind"], "Pod");
         assert_eq!(result["metadata"]["name"], "empty-pod");
@@ -8233,7 +6452,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto).expect(
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto).expect(
             "decode_pod_proto must return Some even when restartPolicy is present — \
              without the fix, prost tries to decode restartPolicy string as Container \
              sub-message, hits an invalid wire type, and returns Err; that causes \
@@ -8292,7 +6511,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto).expect(
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto).expect(
             "decode_pod_proto must succeed with serviceAccountName and nodeName — \
              wrong field numbers (9 vs 8 for serviceAccountName, 11 vs 10 for nodeName) \
              cause type mismatches with automountServiceAccountToken (bool) and \
@@ -8341,7 +6560,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with hostname/subdomain/initContainers");
 
         assert_eq!(
@@ -8417,7 +6636,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto).expect(
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto).expect(
             "decode_pod_proto must succeed — without probe decoding, kubelet fires probes immediately",
         );
 
@@ -8505,7 +6724,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed — lifecycle decoding must not break pod decode");
 
         assert_eq!(result["metadata"]["name"], "app");
@@ -8610,7 +6829,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto).expect(
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto).expect(
             "decode_pod_proto must succeed — lifecycle.postStart.httpGet decoding must not panic",
         );
 
@@ -8708,7 +6927,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto).expect(
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto).expect(
             "decode_pod_proto must succeed — without probe handler decoding, \
              kubelet reports 'missing probe handler'",
         );
@@ -8789,7 +7008,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto).expect(
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto).expect(
             "decode_pod_proto must succeed — without grpc probe decoding, \
              kubelet cannot determine which port to health-check",
         );
@@ -9537,7 +7756,8 @@ mod tests {
         let mut lease_proto = encode_length_delimited(1, &obj_meta);
         lease_proto.extend_from_slice(&encode_length_delimited(2, &lease_spec));
 
-        let result = decode_lease_proto(&lease_proto).expect("must decode Lease proto");
+        let result = crate::coord_gen_adapter::decode_lease_proto_gen_a(&lease_proto)
+            .expect("must decode Lease proto");
 
         assert_eq!(result["kind"], "Lease");
         assert_eq!(result["apiVersion"], "coordination.k8s.io/v1");
@@ -9601,7 +7821,8 @@ mod tests {
         let mut lease_proto = encode_length_delimited(1, &obj_meta);
         lease_proto.extend_from_slice(&encode_length_delimited(2, &lease_spec));
 
-        let result = decode_lease_proto(&lease_proto).expect("must decode Lease proto");
+        let result = crate::coord_gen_adapter::decode_lease_proto_gen_a(&lease_proto)
+            .expect("must decode Lease proto");
 
         assert_eq!(
             result["spec"]["acquireTime"], "2024-01-01T00:00:00.000000Z",
@@ -9662,7 +7883,8 @@ mod tests {
         let mut lease_proto = encode_length_delimited(1, &obj_meta);
         lease_proto.extend_from_slice(&encode_length_delimited(2, &lease_spec));
 
-        let result = decode_lease_proto(&lease_proto).expect("must decode Lease proto");
+        let result = crate::coord_gen_adapter::decode_lease_proto_gen_a(&lease_proto)
+            .expect("must decode Lease proto");
 
         assert!(
             result["spec"]["renewTime"].is_null(),
@@ -9708,7 +7930,8 @@ mod tests {
         let mut lease_proto = encode_length_delimited(1, &obj_meta);
         lease_proto.extend_from_slice(&encode_length_delimited(2, &lease_spec));
 
-        let result = decode_lease_proto(&lease_proto).expect("must decode Lease proto");
+        let result = crate::coord_gen_adapter::decode_lease_proto_gen_a(&lease_proto)
+            .expect("must decode Lease proto");
 
         assert_eq!(
             result["spec"]["renewTime"], "2024-01-01T00:00:15.123456Z",
@@ -10593,6 +8816,8 @@ mod tests {
     /// line 1 column 1" (HTTP 400).
     #[test]
     fn decode_cronjob_proto_handles_kubectl_wire_format_with_template_at_field6() {
+        use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
         use prost::Message as _;
 
         // Build the CronJob directly via prost structs so the encoding uses the correct
@@ -10601,28 +8826,28 @@ mod tests {
         // decodes the LEN field at tag=6 against `backoffLimit` (int32, wire type 0) and
         // returns DecodeError, making decode_cronjob_proto return None and the apiserver
         // return HTTP 400 "invalid JSON".
-        let cj = CronJob {
-            metadata: Some(ObjectMeta {
-                name: "my-cj".to_string(),
-                namespace: "cronjobtest".to_string(),
+        let cj = batch_v1::CronJob {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("my-cj".to_string()),
+                namespace: Some("cronjobtest".to_string()),
                 ..Default::default()
             }),
-            spec: Some(CronJobSpec {
-                schedule: "*/1 * * * *".to_string(),
-                job_template: Some(JobTemplateSpec {
+            spec: Some(batch_v1::CronJobSpec {
+                schedule: Some("*/1 * * * *".to_string()),
+                job_template: Some(batch_v1::JobTemplateSpec {
                     metadata: None,
-                    spec: Some(JobSpec {
+                    spec: Some(batch_v1::JobSpec {
                         // template at field 6 — if the field number were wrong (tag=5),
                         // prost would encode it at field 5 and then decode would succeed
                         // trivially (no cross-type mismatch). The regression only manifests
                         // when the struct has template at tag=5 and backoffLimit at tag=6,
                         // because kubectl puts template at wire field 6 (LEN type) which
                         // collides with the mislocated backoffLimit (int32, varint type).
-                        template: Some(AppsPodTemplateSpec {
+                        template: Some(crate::apps_gen::k8s::io::api::core::v1::PodTemplateSpec {
                             metadata: None,
                             spec: None,
                         }),
-                        backoff_limit: 3,
+                        backoff_limit: Some(3),
                         ..Default::default()
                     }),
                 }),
@@ -10644,7 +8869,7 @@ mod tests {
              if template is at field 5, tag 0x2a appears instead and the fix is not in effect"
         );
 
-        let result = decode_cronjob_proto(&buf).expect(
+        let result = crate::batch_gen_adapter::decode_cronjob_proto_gen(&buf).expect(
             "decode_cronjob_proto must return Some when JobSpec.template is at field 6 \
                      (LEN wire type) — before mayor-w00n fix, JobSpec had template at tag=5 \
                      causing a wire-type mismatch when kubectl sends template at field 6, \
@@ -10671,7 +8896,7 @@ mod tests {
     /// decode_cronjob_proto must return None for malformed proto input.
     #[test]
     fn decode_cronjob_proto_returns_none_for_garbage() {
-        assert!(decode_cronjob_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(crate::batch_gen_adapter::decode_cronjob_proto_gen(&[0xff, 0xff, 0xff]).is_none());
     }
 
     // ---------------------------------------------------------------------------
@@ -10732,7 +8957,7 @@ mod tests {
     /// decode_job_proto must return None for malformed proto input.
     #[test]
     fn decode_job_proto_returns_none_for_garbage() {
-        assert!(decode_job_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(crate::batch_gen_adapter::decode_job_proto_gen(&[0xff, 0xff, 0xff]).is_none());
     }
 
     /// decode_job_proto must handle an indexed Job with completionMode=Indexed,
@@ -10746,26 +8971,28 @@ mod tests {
     /// counted toward backoffLimit are handled with default behavior instead.
     #[test]
     fn decode_job_proto_handles_indexed_job_with_failure_policy() {
+        use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
         use prost::Message as _;
 
-        let job = Job {
-            metadata: Some(ObjectMeta {
-                name: "indexed-job".to_string(),
-                namespace: "default".to_string(),
+        let job = batch_v1::Job {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("indexed-job".to_string()),
+                namespace: Some("default".to_string()),
                 ..Default::default()
             }),
-            spec: Some(JobSpec {
-                completions: 5,
-                parallelism: 2,
-                backoff_limit: 6,
-                completion_mode: "Indexed".to_string(),
+            spec: Some(batch_v1::JobSpec {
+                completions: Some(5),
+                parallelism: Some(2),
+                backoff_limit: Some(6),
+                completion_mode: Some("Indexed".to_string()),
                 backoff_limit_per_index: Some(1),
                 max_failed_indexes: Some(3),
-                pod_failure_policy: Some(PodFailurePolicy {
-                    rules: vec![PodFailurePolicyRule {
-                        action: "Ignore".to_string(),
-                        on_exit_codes: Some(PodFailurePolicyOnExitCodesRequirement {
-                            operator: "In".to_string(),
+                pod_failure_policy: Some(batch_v1::PodFailurePolicy {
+                    rules: vec![batch_v1::PodFailurePolicyRule {
+                        action: Some("Ignore".to_string()),
+                        on_exit_codes: Some(batch_v1::PodFailurePolicyOnExitCodesRequirement {
+                            operator: Some("In".to_string()),
                             values: vec![42],
                             container_name: None,
                         }),
@@ -10780,7 +9007,7 @@ mod tests {
         let mut buf = Vec::new();
         job.encode(&mut buf).expect("prost encode must succeed");
 
-        let result = decode_job_proto(&buf).expect(
+        let result = crate::batch_gen_adapter::decode_job_proto_gen(&buf).expect(
             "decode_job_proto must return Some for indexed Job — conformance tests at job.go:621,:658,:753 \
              create Jobs with completionMode=Indexed, backoffLimitPerIndex, and podFailurePolicy; \
              returning None causes 400 'invalid JSON' responses"
@@ -10826,19 +9053,21 @@ mod tests {
     /// terminal condition via success criteria, conformance test hangs until timeout.
     #[test]
     fn decode_job_proto_handles_job_with_success_policy() {
+        use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
         use prost::Message as _;
 
-        let job = Job {
-            metadata: Some(ObjectMeta {
-                name: "success-policy-job".to_string(),
-                namespace: "test-ns".to_string(),
+        let job = batch_v1::Job {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("success-policy-job".to_string()),
+                namespace: Some("test-ns".to_string()),
                 ..Default::default()
             }),
-            spec: Some(JobSpec {
-                completions: 3,
-                completion_mode: "Indexed".to_string(),
-                success_policy: Some(SuccessPolicy {
-                    rules: vec![SuccessPolicyRule {
+            spec: Some(batch_v1::JobSpec {
+                completions: Some(3),
+                completion_mode: Some("Indexed".to_string()),
+                success_policy: Some(batch_v1::SuccessPolicy {
+                    rules: vec![batch_v1::SuccessPolicyRule {
                         succeeded_indexes: Some("0-1".to_string()),
                         succeeded_count: Some(2),
                     }],
@@ -10851,7 +9080,7 @@ mod tests {
         let mut buf = Vec::new();
         job.encode(&mut buf).expect("prost encode must succeed");
 
-        let result = decode_job_proto(&buf).expect(
+        let result = crate::batch_gen_adapter::decode_job_proto_gen(&buf).expect(
             "decode_job_proto must return Some for Job with successPolicy — conformance tests at \
              job.go:502 and job.go:582 fail with 400 'invalid JSON' when this field is present",
         );
@@ -10877,17 +9106,19 @@ mod tests {
     /// "fail immediately when any index fails". Losing either changes Job failure semantics.
     #[test]
     fn decode_job_proto_preserves_zero_valued_per_index_limits() {
+        use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
         use prost::Message as _;
 
-        let job = Job {
-            metadata: Some(ObjectMeta {
-                name: "zero-limits-job".to_string(),
-                namespace: "default".to_string(),
+        let job = batch_v1::Job {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("zero-limits-job".to_string()),
+                namespace: Some("default".to_string()),
                 ..Default::default()
             }),
-            spec: Some(JobSpec {
-                completions: 4,
-                completion_mode: "Indexed".to_string(),
+            spec: Some(batch_v1::JobSpec {
+                completions: Some(4),
+                completion_mode: Some("Indexed".to_string()),
                 backoff_limit_per_index: Some(0),
                 max_failed_indexes: Some(0),
                 ..Default::default()
@@ -10898,7 +9129,8 @@ mod tests {
         let mut buf = Vec::new();
         job.encode(&mut buf).expect("prost encode must succeed");
 
-        let result = decode_job_proto(&buf).expect("zero-valued per-index limits must decode");
+        let result = crate::batch_gen_adapter::decode_job_proto_gen(&buf)
+            .expect("zero-valued per-index limits must decode");
 
         assert_eq!(
             result["spec"]["backoffLimitPerIndex"], 0,
@@ -10920,29 +9152,32 @@ mod tests {
     /// and causing `[sig-apps] Job should delete a job [Conformance]` to time out.
     #[test]
     fn decode_job_proto_preserves_template_containers() {
+        use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
+        use crate::apps_gen::k8s::io::api::core::v1 as core_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
         use prost::Message as _;
 
-        let job = Job {
-            metadata: Some(ObjectMeta {
-                name: "pi".to_string(),
-                namespace: "default".to_string(),
+        let job = batch_v1::Job {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("pi".to_string()),
+                namespace: Some("default".to_string()),
                 ..Default::default()
             }),
-            spec: Some(JobSpec {
-                completions: 1,
-                template: Some(AppsPodTemplateSpec {
+            spec: Some(batch_v1::JobSpec {
+                completions: Some(1),
+                template: Some(core_v1::PodTemplateSpec {
                     metadata: None,
-                    spec: Some(PodSpec {
-                        containers: vec![Container {
-                            name: "pi".to_string(),
-                            image: "perl:5.34".to_string(),
+                    spec: Some(core_v1::PodSpec {
+                        containers: vec![core_v1::Container {
+                            name: Some("pi".to_string()),
+                            image: Some("perl:5.34".to_string()),
                             ..Default::default()
                         }],
-                        restart_policy: "Never".to_string(),
+                        restart_policy: Some("Never".to_string()),
                         ..Default::default()
                     }),
                 }),
-                backoff_limit: 4,
+                backoff_limit: Some(4),
                 ..Default::default()
             }),
             ..Default::default()
@@ -10951,7 +9186,7 @@ mod tests {
         let mut buf = Vec::new();
         job.encode(&mut buf).expect("prost encode must succeed");
 
-        let result = decode_job_proto(&buf).expect(
+        let result = crate::batch_gen_adapter::decode_job_proto_gen(&buf).expect(
             "decode_job_proto must return Some for Job with template containing containers — \
              if None is returned, Job creation via proto fails with 400",
         );
@@ -10995,30 +9230,25 @@ mod tests {
     /// cronjob" to fail (the cascade enumerated Jobs but found none owned by the deleted CronJob).
     #[test]
     fn decode_job_proto_preserves_owner_references() {
+        use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
         use prost::Message as _;
 
         let cj_uid = "cj-uid-1234-5678-abcd";
 
-        // Encode the OwnerReference as prost would.
-        let owner_ref = OwnerReference {
-            kind: "CronJob".to_string(),
-            name: "my-cj".to_string(),
-            uid: cj_uid.to_string(),
-            api_version: "batch/v1".to_string(),
-            controller: Some(true),
-            block_owner_deletion: Some(true),
-        };
-        let mut owner_ref_bytes = Vec::new();
-        owner_ref
-            .encode(&mut owner_ref_bytes)
-            .expect("OwnerReference encode must succeed");
-
-        let job = Job {
-            metadata: Some(ObjectMeta {
-                name: "my-cj-job".to_string(),
-                namespace: "default".to_string(),
-                uid: "job-uid-abcd".to_string(),
-                owner_references: vec![owner_ref_bytes],
+        let job = batch_v1::Job {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("my-cj-job".to_string()),
+                namespace: Some("default".to_string()),
+                uid: Some("job-uid-abcd".to_string()),
+                owner_references: vec![gen_meta_v1::OwnerReference {
+                    kind: Some("CronJob".to_string()),
+                    name: Some("my-cj".to_string()),
+                    uid: Some(cj_uid.to_string()),
+                    api_version: Some("batch/v1".to_string()),
+                    controller: Some(true),
+                    block_owner_deletion: Some(true),
+                }],
                 ..Default::default()
             }),
             ..Default::default()
@@ -11026,7 +9256,7 @@ mod tests {
         let mut buf = Vec::new();
         job.encode(&mut buf).expect("Job encode must succeed");
 
-        let result = decode_job_proto(&buf)
+        let result = crate::batch_gen_adapter::decode_job_proto_gen(&buf)
             .expect("decode_job_proto must return Some for Job with ownerReferences");
 
         let refs = result["metadata"]["ownerReferences"].as_array().expect(
@@ -12799,7 +11029,8 @@ mod tests {
             p
         };
 
-        let result = decode_pod_proto(&pod_proto).expect("Pod proto must decode");
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
+            .expect("Pod proto must decode");
         let containers = result["spec"]["containers"]
             .as_array()
             .expect("containers must be present");
@@ -12955,7 +11186,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec_containers));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with volumeMounts present");
 
         let mounts = result["spec"]["containers"][0]["volumeMounts"]
@@ -13092,7 +11323,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with spec.volumes present");
 
         let volumes = result["spec"]["volumes"].as_array().expect(
@@ -13152,7 +11383,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with a secret volume with defaultMode");
 
         let volumes = result["spec"]["volumes"]
@@ -13203,7 +11434,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with a configMap volume with defaultMode");
 
         let volumes = result["spec"]["volumes"]
@@ -13246,7 +11477,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with an emptyDir volume");
 
         let volumes = result["spec"]["volumes"].as_array().expect(
@@ -13294,7 +11525,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with emptyDir medium=Memory");
 
         let volumes = result["spec"]["volumes"].as_array().unwrap();
@@ -13341,7 +11572,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with a downwardAPI volume");
 
         let volumes = result["spec"]["volumes"].as_array().expect(
@@ -13423,7 +11654,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with a resourceFieldRef downwardAPI volume");
 
         let items = result["spec"]["volumes"][0]["downwardAPI"]["items"]
@@ -13488,7 +11719,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with resourceFieldRef missing divisor");
 
         let item = &result["spec"]["volumes"][0]["downwardAPI"]["items"][0];
@@ -13533,7 +11764,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with zero divisor Quantity");
 
         let item = &result["spec"]["volumes"][0]["downwardAPI"]["items"][0];
@@ -13573,7 +11804,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with absent defaultMode");
 
         let downward_api = &result["spec"]["volumes"][0]["downwardAPI"];
@@ -13628,7 +11859,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with a projected volume");
 
         let volumes = result["spec"]["volumes"]
@@ -13707,7 +11938,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed when Container has env vars at field 7");
 
         let env = result["spec"]["containers"][0]["env"].as_array().expect(
@@ -13796,7 +12027,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed when Container has configMapKeyRef env var");
 
         let env = result["spec"]["containers"][0]["env"].as_array().expect(
@@ -13872,7 +12103,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed when Container has envFrom at field 19");
 
         let env_from = result["spec"]["containers"][0]["envFrom"]
@@ -15266,7 +13497,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with projected configMap volume");
 
         let sources = result["spec"]["volumes"][0]["projected"]["sources"]
@@ -15343,7 +13574,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with projected secret volume");
 
         let sources = result["spec"]["volumes"][0]["projected"]["sources"]
@@ -15408,7 +13639,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with flat configMap volume with items");
 
         let cm = &result["spec"]["volumes"][0]["configMap"];
@@ -15458,7 +13689,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &podspec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("decode_pod_proto must succeed with flat secret volume with items");
 
         let sec = &result["spec"]["volumes"][0]["secret"];
@@ -15809,33 +14040,36 @@ mod tests {
     /// `decode_replicationcontroller_proto`.
     #[test]
     fn decode_replicationcontroller_proto_preserves_template_containers() {
+        use crate::apps_gen::k8s::io::api::core::v1 as core_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
         use prost::Message as _;
 
-        let rc = ReplicationController {
-            metadata: Some(ObjectMeta {
-                name: "my-rc".to_string(),
-                namespace: "default".to_string(),
+        let rc = core_v1::ReplicationController {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("my-rc".to_string()),
+                namespace: Some("default".to_string()),
                 ..Default::default()
             }),
-            spec: Some(ReplicationControllerSpec {
-                replicas: 2,
+            spec: Some(core_v1::ReplicationControllerSpec {
+                replicas: Some(2),
                 selector: {
                     let mut m = std::collections::HashMap::new();
                     m.insert("app".to_string(), "web".to_string());
                     m
                 },
-                template: Some(AppsPodTemplateSpec {
+                template: Some(core_v1::PodTemplateSpec {
                     metadata: None,
-                    spec: Some(PodSpec {
-                        containers: vec![Container {
-                            name: "web".to_string(),
-                            image: "nginx:latest".to_string(),
+                    spec: Some(core_v1::PodSpec {
+                        containers: vec![core_v1::Container {
+                            name: Some("web".to_string()),
+                            image: Some("nginx:latest".to_string()),
                             ..Default::default()
                         }],
-                        restart_policy: "Always".to_string(),
+                        restart_policy: Some("Always".to_string()),
                         ..Default::default()
                     }),
                 }),
+                ..Default::default()
             }),
             status: None,
         };
@@ -15843,7 +14077,7 @@ mod tests {
         let mut buf = Vec::new();
         rc.encode(&mut buf).expect("prost encode must succeed");
 
-        let result = decode_replicationcontroller_proto(&buf).expect(
+        let result = crate::core_gen_adapter::decode_replicationcontroller_proto_gen(&buf).expect(
             "decode_replicationcontroller_proto must return Some for RC with template — \
              proto write returns 200 OK but RC has no containers if template is not decoded",
         );
@@ -16018,7 +14252,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto)
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto)
             .expect("pod with resizePolicy must decode — proto field 23 is ContainerResizePolicy");
 
         let containers = result["spec"]["containers"]
@@ -16084,27 +14318,28 @@ mod tests {
     /// that compute desired-vs-actual replica counts will loop trying to scale up an already-full RC.
     #[test]
     fn decode_replicationcontroller_proto_preserves_status_else_controllers_see_zero_and_loop() {
-        let status = ReplicationControllerStatus {
-            replicas: 3,
-            fully_labeled_replicas: 3,
-            observed_generation: 7,
-            ready_replicas: 2,
-            available_replicas: 2,
-            conditions: vec![ReplicationControllerCondition {
-                r#type: "ReplicaFailure".to_string(),
-                status: "False".to_string(),
-                reason: "".to_string(),
-                message: "".to_string(),
+        use crate::apps_gen::k8s::io::api::core::v1 as core_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
+        use prost::Message as _;
+
+        let status = core_v1::ReplicationControllerStatus {
+            replicas: Some(3),
+            fully_labeled_replicas: Some(3),
+            observed_generation: Some(7),
+            ready_replicas: Some(2),
+            available_replicas: Some(2),
+            conditions: vec![core_v1::ReplicationControllerCondition {
+                r#type: Some("ReplicaFailure".to_string()),
+                status: Some("False".to_string()),
+                reason: None,
+                message: None,
+                last_transition_time: None,
             }],
         };
-        let mut status_bytes = Vec::new();
-        status
-            .encode(&mut status_bytes)
-            .expect("prost encode must succeed");
 
-        let rc = ReplicationController {
-            metadata: Some(ObjectMeta {
-                name: "my-rc".to_string(),
+        let rc = core_v1::ReplicationController {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("my-rc".to_string()),
                 ..Default::default()
             }),
             spec: None,
@@ -16220,24 +14455,25 @@ mod tests {
     /// the history limit.
     #[test]
     fn decode_job_proto_preserves_status_else_cronjob_gc_cannot_see_completion_and_loops() {
-        let status = JobStatus {
-            conditions: vec![JobCondition {
-                r#type: "Complete".to_string(),
-                status: "True".to_string(),
-                reason: "".to_string(),
-                message: "".to_string(),
+        use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
+        use prost::Message as _;
+        let status = batch_v1::JobStatus {
+            conditions: vec![batch_v1::JobCondition {
+                r#type: Some("Complete".to_string()),
+                status: Some("True".to_string()),
+                reason: None,
+                message: None,
+                ..Default::default()
             }],
-            active: 0,
-            succeeded: 3,
-            failed: 1,
-            completed_indexes: "0-2".to_string(),
-            ready: 0,
-            failed_indexes: "".to_string(),
-            terminating: 0,
+            succeeded: Some(3),
+            failed: Some(1),
+            completed_indexes: Some("0-2".to_string()),
+            ..Default::default()
         };
-        let job = Job {
-            metadata: Some(ObjectMeta {
-                name: "my-job".to_string(),
+        let job = batch_v1::Job {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("my-job".to_string()),
                 ..Default::default()
             }),
             spec: None,
@@ -16280,31 +14516,33 @@ mod tests {
     /// controller can fire multiple overlapping Jobs when ConcurrencyPolicy=Forbid/Replace.
     #[test]
     fn decode_cronjob_proto_preserves_status_active_else_concurrency_control_is_blind() {
-        let status = CronJobStatus {
-            active: vec![ObjectReference {
-                kind: "Job".to_string(),
-                namespace: "default".to_string(),
-                name: "my-cronjob-abc".to_string(),
-                uid: "uid-123".to_string(),
-                api_version: "batch/v1".to_string(),
-                resource_version: "".to_string(),
-                field_path: "".to_string(),
+        use crate::apps_gen::k8s::io::api::batch::v1 as batch_v1;
+        use crate::apps_gen::k8s::io::api::core::v1 as core_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
+        use prost::Message as _;
+        let status = batch_v1::CronJobStatus {
+            active: vec![core_v1::ObjectReference {
+                kind: Some("Job".to_string()),
+                namespace: Some("default".to_string()),
+                name: Some("my-cronjob-abc".to_string()),
+                uid: Some("uid-123".to_string()),
+                api_version: Some("batch/v1".to_string()),
+                ..Default::default()
             }],
+            ..Default::default()
         };
-        let cj = CronJob {
-            metadata: Some(ObjectMeta {
-                name: "my-cronjob".to_string(),
+        let cj = batch_v1::CronJob {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("my-cronjob".to_string()),
                 ..Default::default()
             }),
-            spec: Some(CronJobSpec {
-                schedule: "*/5 * * * *".to_string(),
-                concurrency_policy: "Forbid".to_string(),
-                starting_deadline_seconds: 0,
-                suspend: false,
-                successful_jobs_history_limit: 3,
-                failed_jobs_history_limit: 1,
+            spec: Some(batch_v1::CronJobSpec {
+                schedule: Some("*/5 * * * *".to_string()),
+                concurrency_policy: Some("Forbid".to_string()),
+                successful_jobs_history_limit: Some(3),
+                failed_jobs_history_limit: Some(1),
                 job_template: None,
-                time_zone: "".to_string(),
+                ..Default::default()
             }),
             status: Some(status),
         };
@@ -16358,7 +14596,7 @@ mod tests {
         let mut pod_proto = encode_length_delimited(1, &obj_meta);
         pod_proto.extend_from_slice(&encode_length_delimited(2, &pod_spec));
 
-        let result = decode_pod_proto(&pod_proto).expect(
+        let result = crate::core_gen_adapter::decode_pod_proto_gen(&pod_proto).expect(
             "pod with sidecar init container (restartPolicy=Always) must decode — \
              proto field 24 is Container.restartPolicy",
         );

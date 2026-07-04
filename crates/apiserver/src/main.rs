@@ -2,6 +2,7 @@ mod admission;
 mod apps_gen;
 mod apps_gen_adapter;
 mod auth;
+mod batch_gen_adapter;
 mod content_type;
 mod coord_gen;
 mod coord_gen_adapter;
