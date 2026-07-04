@@ -68,6 +68,12 @@ fn main() {
                     .join("k8s.io/api/authorization/v1/generated.proto")
                     .to_str()
                     .unwrap(),
+                include_dir
+                    .join(
+                        "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto",
+                    )
+                    .to_str()
+                    .unwrap(),
             ],
             &[include_dir.to_str().unwrap()],
         )

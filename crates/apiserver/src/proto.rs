@@ -88,25 +88,6 @@ struct MicroTime {
     nanos: i32,
 }
 
-/// DeleteOptions — controls how an object deletion is performed.
-/// Source: apimachinery-meta-v1-generated.proto message DeleteOptions
-/// Only the fields needed for propagationPolicy/orphanDependents are decoded.
-#[derive(Clone, PartialEq, Message)]
-struct DeleteOptionsProto {
-    /// gracePeriodSeconds (field 1, int64 optional)
-    #[prost(int64, optional, tag = "1")]
-    grace_period_seconds: Option<i64>,
-    /// preconditions (field 2, message) — skipped, decoded as bytes
-    #[prost(bytes = "vec", tag = "2")]
-    preconditions: Vec<u8>,
-    /// orphanDependents (field 3, bool optional) — deprecated, maps to Orphan
-    #[prost(bool, optional, tag = "3")]
-    orphan_dependents: Option<bool>,
-    /// propagationPolicy (field 4, string optional)
-    #[prost(string, optional, tag = "4")]
-    propagation_policy: Option<String>,
-}
-
 /// ObjectMeta — common metadata for all Kubernetes objects.
 /// Source: apimachinery-meta-v1-generated.proto message ObjectMeta
 #[derive(Clone, PartialEq, Message)]
@@ -2510,150 +2491,6 @@ pub fn decode_poddisruptionbudget_proto(data: &[u8]) -> Option<serde_json::Value
     Some(result)
 }
 
-// --- k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1/generated.proto ---
-
-/// CustomResourceDefinitionNames — names section of a CRD spec.
-/// Source: apiextensions-v1-generated.proto message CustomResourceDefinitionNames
-#[derive(Clone, PartialEq, Message)]
-struct CrdNames {
-    /// plural (field 1)
-    #[prost(string, tag = "1")]
-    plural: String,
-    /// singular (field 2)
-    #[prost(string, tag = "2")]
-    singular: String,
-    /// shortNames (field 3, repeated)
-    #[prost(string, repeated, tag = "3")]
-    short_names: Vec<String>,
-    /// kind (field 4)
-    #[prost(string, tag = "4")]
-    kind: String,
-    /// listKind (field 5)
-    #[prost(string, tag = "5")]
-    list_kind: String,
-    /// categories (field 6, repeated) — decoded but unused in output
-    #[prost(string, repeated, tag = "6")]
-    categories: Vec<String>,
-}
-
-/// CustomResourceDefinitionVersion — one entry in spec.versions.
-/// Source: apiextensions-v1-generated.proto message CustomResourceDefinitionVersion
-#[derive(Clone, PartialEq, Message)]
-struct CrdVersion {
-    /// name (field 1)
-    #[prost(string, tag = "1")]
-    name: String,
-    /// served (field 2)
-    #[prost(bool, tag = "2")]
-    served: bool,
-    /// storage (field 3)
-    #[prost(bool, tag = "3")]
-    storage: bool,
-    /// schema (field 4, bytes) — complex nested message; skipped
-    #[prost(bytes = "vec", tag = "4")]
-    schema: Vec<u8>,
-    /// subresources (field 5, bytes) — skipped
-    #[prost(bytes = "vec", tag = "5")]
-    subresources: Vec<u8>,
-    /// additionalPrinterColumns (field 6, bytes) — skipped
-    #[prost(bytes = "vec", tag = "6")]
-    additional_printer_columns: Vec<u8>,
-}
-
-/// CustomResourceDefinitionSpec — the spec section of a CRD.
-/// Source: apiextensions-v1-generated.proto message CustomResourceDefinitionSpec
-#[derive(Clone, PartialEq, Message)]
-struct CrdSpec {
-    /// group (field 1)
-    #[prost(string, tag = "1")]
-    group: String,
-    /// names (field 3, message)
-    #[prost(message, tag = "3")]
-    names: Option<CrdNames>,
-    /// scope (field 4)
-    #[prost(string, tag = "4")]
-    scope: String,
-    /// versions (field 7, repeated message)
-    #[prost(message, repeated, tag = "7")]
-    versions: Vec<CrdVersion>,
-    /// preserveUnknownFields (field 10)
-    #[prost(bool, tag = "10")]
-    preserve_unknown_fields: bool,
-}
-
-/// CustomResourceDefinition — top-level CRD object.
-/// Source: apiextensions-v1-generated.proto message CustomResourceDefinition
-#[derive(Clone, PartialEq, Message)]
-struct Crd {
-    /// metadata (field 1)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2)
-    #[prost(message, tag = "2")]
-    spec: Option<CrdSpec>,
-}
-
-/// Decode a proto-encoded CustomResourceDefinition into a serde_json::Value.
-pub fn decode_crd_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let crd = Crd::decode(data).ok()?;
-    let mut meta = object_meta_to_json(crd.metadata.unwrap_or_default());
-    // CrdMetadata.creation_timestamp is String (not Option<String>), so null fails serde.
-    // Replace the null that object_meta_to_json emits when the timestamp is zero.
-    if meta["creationTimestamp"].is_null() {
-        meta["creationTimestamp"] = serde_json::Value::String(String::new());
-    }
-
-    let spec = crd.spec.unwrap_or_default();
-    let names = spec.names.unwrap_or_default();
-
-    let versions: Vec<serde_json::Value> = spec
-        .versions
-        .iter()
-        .map(|v| {
-            serde_json::json!({
-                "name": v.name,
-                "served": v.served,
-                "storage": v.storage
-            })
-        })
-        .collect();
-
-    let mut names_val = serde_json::json!({
-        "plural": names.plural,
-        "singular": names.singular,
-        "kind": names.kind
-    });
-    if !names.short_names.is_empty() {
-        names_val["shortNames"] = serde_json::Value::Array(
-            names
-                .short_names
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        );
-    }
-    if !names.list_kind.is_empty() {
-        names_val["listKind"] = serde_json::Value::String(names.list_kind);
-    }
-
-    let mut spec_val = serde_json::json!({
-        "group": spec.group,
-        "names": names_val,
-        "scope": spec.scope,
-        "versions": versions
-    });
-    if spec.preserve_unknown_fields {
-        spec_val["preserveUnknownFields"] = serde_json::Value::Bool(true);
-    }
-
-    Some(serde_json::json!({
-        "apiVersion": "apiextensions.k8s.io/v1",
-        "kind": "CustomResourceDefinition",
-        "metadata": meta,
-        "spec": spec_val
-    }))
-}
-
 // --- k8s.io/api/networking/v1/generated.proto ---
 
 /// ServiceBackendPort — networking.k8s.io/v1/generated.proto
@@ -3267,39 +3104,13 @@ pub fn decode_controllerrevision_proto(data: &[u8]) -> Option<serde_json::Value>
     crate::apps_gen_adapter::decode_controllerrevision_proto_gen(data)
 }
 
-/// Decode a proto-encoded DeleteOptions message into a serde_json::Value.
-///
-/// The Kubernetes client sends DELETE request bodies as protobuf-encoded DeleteOptions
-/// (Content-Type: application/vnd.kubernetes.protobuf). Without this decoder,
-/// extract_body returns the raw proto bytes and serde_json::from_slice fails silently
-/// (unwrap_or_default), so propagationPolicy=Orphan is never honored.
-pub fn decode_delete_options_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let opts = DeleteOptionsProto::decode(data).ok()?;
-    let mut obj = serde_json::json!({
-        "apiVersion": "meta.k8s.io/v1",
-        "kind": "DeleteOptions"
-    });
-    if let Some(policy) = &opts.propagation_policy {
-        if !policy.is_empty() {
-            obj["propagationPolicy"] = serde_json::Value::String(policy.clone());
-        }
-    }
-    if let Some(orphan) = opts.orphan_dependents {
-        obj["orphanDependents"] = serde_json::Value::Bool(orphan);
-    }
-    if let Some(grace) = opts.grace_period_seconds {
-        obj["gracePeriodSeconds"] = serde_json::Value::Number(serde_json::Number::from(grace));
-    }
-    Some(obj)
-}
-
 pub fn decode_proto_by_kind_and_version(
     kind: &str,
     api_version: &str,
     raw: &[u8],
 ) -> Option<serde_json::Value> {
     match kind {
-        "CustomResourceDefinition" => decode_crd_proto(raw),
+        "CustomResourceDefinition" => crate::apiextensions_gen_adapter::decode_crd_proto_gen(raw),
         "Namespace" => crate::core_gen_adapter::decode_namespace_proto_gen(raw),
         "ConfigMap" => crate::core_gen_adapter::decode_configmap_proto_gen(raw),
         "Pod" => crate::core_gen_adapter::decode_pod_proto_gen(raw),
@@ -3387,7 +3198,7 @@ pub fn decode_proto_by_kind_and_version(
             crate::storage_node_flow_gen_adapter::decode_priorityclass_proto_gen(raw)
         }
         "ControllerRevision" => crate::apps_gen_adapter::decode_controllerrevision_proto_gen(raw),
-        "DeleteOptions" => decode_delete_options_proto(raw),
+        "DeleteOptions" => crate::apiextensions_gen_adapter::decode_delete_options_proto_gen(raw),
         _ => None,
     }
 }
@@ -12168,7 +11979,7 @@ mod tests {
         );
     }
 
-    /// decode_delete_options_proto must extract propagationPolicy=Orphan from proto-encoded body.
+    /// decode_delete_options_proto_gen must extract propagationPolicy=Orphan from proto-encoded body.
     ///
     /// The Kubernetes Go client sends DELETE request bodies as protobuf-encoded DeleteOptions.
     /// Without this decoder, extract_body returns raw proto bytes, serde_json::from_slice fails
@@ -12181,7 +11992,7 @@ mod tests {
         let policy_bytes = b"Orphan";
         let proto = encode_length_delimited(4, policy_bytes);
 
-        let result = decode_delete_options_proto(&proto)
+        let result = crate::apiextensions_gen_adapter::decode_delete_options_proto_gen(&proto)
             .expect("proto-encoded DeleteOptions with propagationPolicy must decode");
 
         assert_eq!(
@@ -12264,7 +12075,7 @@ mod tests {
         );
     }
 
-    /// decode_delete_options_proto must extract orphanDependents=true from proto-encoded body.
+    /// decode_delete_options_proto_gen must extract orphanDependents=true from proto-encoded body.
     ///
     /// The legacy orphanDependents boolean field (field 3) must also be decoded correctly,
     /// since some older clients use it instead of propagationPolicy.
@@ -12276,7 +12087,7 @@ mod tests {
         let mut proto = tag;
         proto.push(1); // true
 
-        let result = decode_delete_options_proto(&proto)
+        let result = crate::apiextensions_gen_adapter::decode_delete_options_proto_gen(&proto)
             .expect("proto-encoded DeleteOptions with orphanDependents must decode");
 
         assert_eq!(
@@ -12739,6 +12550,124 @@ mod tests {
         assert_eq!(
             result["status"]["conditions"][0]["status"], "False",
             "status.conditions[0].status must survive proto decode"
+        );
+    }
+
+    /// decode_crd_proto_gen must carry openAPIV3Schema and additionalPrinterColumns into the output.
+    ///
+    /// The hand CrdVersion struct skipped spec.versions[].schema (decoded as raw bytes) and
+    /// spec.versions[].additionalPrinterColumns (raw bytes). Without openAPIV3Schema, CR admission
+    /// validation never fires — the apiserver accepts CRs with invalid fields, silently breaking
+    /// spec contracts. Without additionalPrinterColumns, `kubectl get` shows only the Age column
+    /// for custom resources, hiding operator-defined status columns. This test MUST fail if
+    /// decode_crd_proto_gen reverts to the hand decoder that drops those fields.
+    #[test]
+    fn decode_crd_gen_carries_openapiv3schema_and_printer_columns_previously_dropped() {
+        use crate::apiextensions_gen::k8s::io::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiext_v1;
+        use crate::apiextensions_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
+        use prost::Message as _;
+
+        let schema_props = apiext_v1::JsonSchemaProps {
+            r#type: Some("object".to_string()),
+            description: Some("A test CRD schema".to_string()),
+            properties: {
+                let mut p = std::collections::HashMap::new();
+                p.insert(
+                    "spec".to_string(),
+                    apiext_v1::JsonSchemaProps {
+                        r#type: Some("object".to_string()),
+                        ..Default::default()
+                    },
+                );
+                p
+            },
+            required: vec!["spec".to_string()],
+            ..Default::default()
+        };
+
+        let version = apiext_v1::CustomResourceDefinitionVersion {
+            name: Some("v1".to_string()),
+            served: Some(true),
+            storage: Some(true),
+            schema: Some(apiext_v1::CustomResourceValidation {
+                open_apiv3_schema: Some(schema_props),
+            }),
+            additional_printer_columns: vec![apiext_v1::CustomResourceColumnDefinition {
+                name: Some("Phase".to_string()),
+                r#type: Some("string".to_string()),
+                json_path: Some(".status.phase".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let crd = apiext_v1::CustomResourceDefinition {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("widgets.example.io".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apiext_v1::CustomResourceDefinitionSpec {
+                group: Some("example.io".to_string()),
+                scope: Some("Namespaced".to_string()),
+                names: Some(apiext_v1::CustomResourceDefinitionNames {
+                    plural: Some("widgets".to_string()),
+                    singular: Some("widget".to_string()),
+                    kind: Some("Widget".to_string()),
+                    ..Default::default()
+                }),
+                versions: vec![version],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut buf = Vec::new();
+        crd.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = crate::apiextensions_gen_adapter::decode_crd_proto_gen(&buf).expect(
+            "CRD with openAPIV3Schema must decode — generated adapter must not drop schema",
+        );
+
+        let versions = result["spec"]["versions"]
+            .as_array()
+            .expect("spec.versions must be an array");
+        assert_eq!(versions.len(), 1);
+
+        let schema_type = &versions[0]["schema"]["openAPIV3Schema"]["type"];
+        assert_eq!(
+            schema_type, "object",
+            "spec.versions[0].schema.openAPIV3Schema.type must survive proto decode — \
+             without openAPIV3Schema the apiserver accepts CRs with any field, silently \
+             bypassing validation that the CRD author declared"
+        );
+
+        let required = versions[0]["schema"]["openAPIV3Schema"]["required"]
+            .as_array()
+            .expect("openAPIV3Schema.required must be present — hand CrdVersion dropped it");
+        assert!(
+            required.iter().any(|v| v == "spec"),
+            "openAPIV3Schema.required must contain 'spec' — without this, required-field \
+             enforcement never fires for this CRD"
+        );
+
+        let props = &versions[0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["type"];
+        assert_eq!(
+            props, "object",
+            "openAPIV3Schema.properties.spec.type must survive — nested schema properties \
+             are needed for recursive field validation"
+        );
+
+        let cols = versions[0]["additionalPrinterColumns"].as_array().expect(
+            "additionalPrinterColumns must be present — hand CrdVersion dropped them, \
+                 causing `kubectl get` to show only Age for custom resources",
+        );
+        assert_eq!(
+            cols[0]["name"], "Phase",
+            "additionalPrinterColumns[0].name must be 'Phase'"
+        );
+        assert_eq!(
+            cols[0]["jsonPath"], ".status.phase",
+            "additionalPrinterColumns[0].jsonPath must survive proto decode"
         );
     }
 }
