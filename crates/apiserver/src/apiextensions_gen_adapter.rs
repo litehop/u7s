@@ -47,6 +47,37 @@ fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
             .collect();
         m["annotations"] = serde_json::Value::Object(annotations);
     }
+    if !meta.owner_references.is_empty() {
+        let refs: Vec<serde_json::Value> = meta
+            .owner_references
+            .into_iter()
+            .map(|r| {
+                let mut entry = serde_json::json!({});
+                if let Some(v) = r.api_version.filter(|s| !s.is_empty()) {
+                    entry["apiVersion"] = serde_json::Value::String(v);
+                }
+                if let Some(v) = r.kind.filter(|s| !s.is_empty()) {
+                    entry["kind"] = serde_json::Value::String(v);
+                }
+                if let Some(v) = r.name.filter(|s| !s.is_empty()) {
+                    entry["name"] = serde_json::Value::String(v);
+                }
+                if let Some(v) = r.uid.filter(|s| !s.is_empty()) {
+                    entry["uid"] = serde_json::Value::String(v);
+                }
+                if let Some(ctrl) = r.controller {
+                    entry["controller"] = serde_json::Value::Bool(ctrl);
+                }
+                if let Some(bod) = r.block_owner_deletion {
+                    entry["blockOwnerDeletion"] = serde_json::Value::Bool(bod);
+                }
+                entry
+            })
+            .collect();
+        if !refs.is_empty() {
+            m["ownerReferences"] = serde_json::Value::Array(refs);
+        }
+    }
     if !meta.finalizers.is_empty() {
         let fins: Vec<serde_json::Value> = meta
             .finalizers
@@ -65,7 +96,7 @@ fn gen_json_raw_to_value(j: apiext_v1::Json) -> serde_json::Value {
 }
 
 fn gen_json_schema_props_to_json(schema: apiext_v1::JsonSchemaProps) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
+    let mut m = serde_json::Map::with_capacity(32);
 
     if let Some(v) = schema.r#type.filter(|s| !s.is_empty()) {
         m.insert("type".to_string(), serde_json::Value::String(v));
@@ -550,7 +581,7 @@ pub fn decode_crd_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     }
 
     let spec = crd.spec.unwrap_or_default();
-    let mut spec_m = serde_json::Map::new();
+    let mut spec_m = serde_json::Map::with_capacity(7);
 
     if let Some(g) = spec.group.filter(|s| !s.is_empty()) {
         spec_m.insert("group".to_string(), serde_json::Value::String(g));

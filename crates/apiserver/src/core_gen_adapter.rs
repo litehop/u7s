@@ -6,6 +6,13 @@ use crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString;
 
 // ---- shared helpers --------------------------------------------------------
 
+pub(crate) fn gen_microtime_fields_to_rfc3339(secs: i64, nanos: i32) -> Option<String> {
+    if secs <= 0 {
+        return None;
+    }
+    Some(crate::util::secs_nanos_to_rfc3339_micro(secs as u64, nanos))
+}
+
 fn gen_int_or_string_to_json(ios: &IntOrString) -> serde_json::Value {
     if ios.r#type.unwrap_or(0) == 0 {
         serde_json::Value::Number(ios.int_val.unwrap_or(0).into())
@@ -322,7 +329,7 @@ fn gen_lifecycle_to_json(lc: core_v1::Lifecycle) -> serde_json::Value {
 }
 
 fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
-    let mut cm = serde_json::Map::new();
+    let mut cm = serde_json::Map::with_capacity(18);
     if let Some(v) = c.name.filter(|s| !s.is_empty()) {
         cm.insert("name".to_string(), serde_json::Value::String(v));
     }
@@ -600,7 +607,7 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
         .map(gen_container_to_json)
         .collect();
 
-    let mut spec_map = serde_json::Map::new();
+    let mut spec_map = serde_json::Map::with_capacity(14);
     if !spec.volumes.is_empty() {
         let volumes_json: Vec<serde_json::Value> = spec
             .volumes
@@ -1057,7 +1064,7 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     });
 
     if let Some(spec) = svc.spec {
-        let mut spec_map = serde_json::Map::new();
+        let mut spec_map = serde_json::Map::with_capacity(10);
         if let Some(v) = spec.cluster_ip.filter(|s| !s.is_empty()) {
             spec_map.insert("clusterIP".to_string(), serde_json::Value::String(v));
         }
@@ -1730,9 +1737,7 @@ pub fn decode_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(t) = s.last_observed_time {
             if let Some(secs) = t.seconds {
-                if secs > 0 {
-                    let nanos = t.nanos.unwrap_or(0);
-                    let ts = crate::util::secs_nanos_to_rfc3339_micro(secs as u64, nanos);
+                if let Some(ts) = gen_microtime_fields_to_rfc3339(secs, t.nanos.unwrap_or(0)) {
                     sm.insert(
                         "lastObservedTime".to_string(),
                         serde_json::Value::String(ts),

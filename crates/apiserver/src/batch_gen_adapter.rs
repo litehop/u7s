@@ -160,8 +160,8 @@ pub fn decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                 .iter()
                 .map(|c| {
                     let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status,
+                        "type": c.r#type.clone().unwrap_or_default(),
+                        "status": c.status.clone().unwrap_or_default(),
                     });
                     if let Some(ref r) = c.reason {
                         if !r.is_empty() {
@@ -426,6 +426,47 @@ mod tests {
         assert_eq!(
             result["status"]["active"][0]["kind"], "Job",
             "status.active[0].kind must survive"
+        );
+    }
+
+    /// Job conditions with None type/status must serialize as "" not null.
+    ///
+    /// k8s Job controller checks condition.type == "Complete" / "Failed" to determine
+    /// terminal state. A null type causes JSON schema validation failures and breaks
+    /// controllers that do exact string comparison on condition fields.
+    /// This test fails if the unwrap_or_default() fix is reverted.
+    #[test]
+    fn batch_condition_none_type_status_emits_empty_string_not_null() {
+        let job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("job-null-cond".to_string()),
+                ..Default::default()
+            }),
+            status: Some(batch_v1::JobStatus {
+                conditions: vec![batch_v1::JobCondition {
+                    r#type: None,
+                    status: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).unwrap();
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        let cond = &result["status"]["conditions"][0];
+        assert_eq!(
+            cond["type"],
+            serde_json::Value::String(String::new()),
+            "condition.type must be \"\" not null — Job controller checks type == \"Complete\" \
+             and JSON schema validation rejects null in required condition fields"
+        );
+        assert_eq!(
+            cond["status"],
+            serde_json::Value::String(String::new()),
+            "condition.status must be \"\" not null — controllers doing string comparison \
+             (status == \"True\") panic or skip conditions with null status"
         );
     }
 }

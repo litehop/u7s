@@ -28,8 +28,8 @@ fn gen_label_selector_to_json(sel: meta_v1::LabelSelector) -> serde_json::Value 
 macro_rules! apps_condition_to_json {
     ($c:expr) => {{
         let mut cond = serde_json::json!({
-            "type": $c.r#type,
-            "status": $c.status,
+            "type": $c.r#type.clone().unwrap_or_default(),
+            "status": $c.status.clone().unwrap_or_default(),
         });
         if let Some(ref r) = $c.reason {
             if !r.is_empty() {
@@ -140,23 +140,7 @@ pub fn decode_statefulset_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             status_json["conditions"] = status
                 .conditions
                 .iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status,
-                    });
-                    if let Some(ref r) = c.reason {
-                        if !r.is_empty() {
-                            cond["reason"] = r.clone().into();
-                        }
-                    }
-                    if let Some(ref msg) = c.message {
-                        if !msg.is_empty() {
-                            cond["message"] = msg.clone().into();
-                        }
-                    }
-                    cond
-                })
+                .map(|c| apps_condition_to_json!(c))
                 .collect();
         }
         if !status_json
@@ -648,6 +632,49 @@ mod tests {
             Some(10),
             "spec.ordinals.start must survive round-trip — generated struct covers this field by \
              construction; hand struct omitted it, so pods started from index 0 instead of 10"
+        );
+    }
+
+    /// Conditions with None type/status must serialize as "" not null.
+    ///
+    /// k8s controllers (e.g. deployment controller) read condition.type to determine
+    /// rollout status. A null type causes JSON schema validation failures and breaks
+    /// controllers that do exact string comparison (e.g. `c.Type == "Available"`).
+    /// This test fails if the unwrap_or_default() fix is reverted.
+    #[test]
+    fn apps_condition_none_type_status_emits_empty_string_not_null() {
+        use prost::Message;
+        let sts = apps_v1::StatefulSet {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("sts-null-cond".to_string()),
+                ..Default::default()
+            }),
+            status: Some(apps_v1::StatefulSetStatus {
+                replicas: Some(1),
+                conditions: vec![apps_v1::StatefulSetCondition {
+                    r#type: None,
+                    status: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        sts.encode(&mut buf).unwrap();
+        let result = decode_statefulset_proto_gen(&buf).expect("StatefulSet must decode");
+        let cond = &result["status"]["conditions"][0];
+        assert_eq!(
+            cond["type"],
+            serde_json::Value::String(String::new()),
+            "condition.type must be \"\" not null — k8s controllers reject null type and \
+             JSON schema validation fails for conditions with null required fields"
+        );
+        assert_eq!(
+            cond["status"],
+            serde_json::Value::String(String::new()),
+            "condition.status must be \"\" not null — controllers doing string comparison \
+             (e.g. status == \"True\") panic or skip conditions with null status"
         );
     }
 }

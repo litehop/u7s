@@ -6,12 +6,7 @@ use crate::coord_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as meta_v1;
 // ---- shared helpers --------------------------------------------------------
 
 fn gen_microtime_to_rfc3339(t: &meta_v1::MicroTime) -> Option<String> {
-    let secs = t.seconds?;
-    if secs <= 0 {
-        return None;
-    }
-    let nanos = t.nanos.unwrap_or(0);
-    Some(crate::util::secs_nanos_to_rfc3339_micro(secs as u64, nanos))
+    crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(t.seconds?, t.nanos.unwrap_or(0))
 }
 
 fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
