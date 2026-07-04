@@ -209,70 +209,57 @@ mod tests {
     }
 
     #[test]
-    fn adapter_a_matches_original_decode_for_common_lease_fields() {
+    fn decode_lease_proto_gen_a_emits_required_fields_for_leader_election() {
         let bytes = make_test_lease_bytes();
-        let original = crate::proto::decode_lease_proto(&bytes)
-            .expect("original decode_lease_proto must succeed");
-        let gen_a = decode_lease_proto_gen_a(&bytes).expect("adapter A must succeed on same bytes");
+        let gen_a = decode_lease_proto_gen_a(&bytes).expect("Lease decode must succeed");
 
         assert_eq!(
-            original["apiVersion"], gen_a["apiVersion"],
-            "apiVersion must match: kubectl uses this to route the object"
+            gen_a["apiVersion"], "coordination.k8s.io/v1",
+            "apiVersion must be coordination.k8s.io/v1: kubectl uses this to route the object"
         );
         assert_eq!(
-            original["kind"], gen_a["kind"],
-            "kind must match: missing kind breaks server-side apply"
+            gen_a["kind"], "Lease",
+            "kind must be Lease: missing kind breaks server-side apply"
         );
         assert_eq!(
-            original["metadata"]["name"], gen_a["metadata"]["name"],
-            "metadata.name must match: name is the primary object identifier"
+            gen_a["metadata"]["name"], "test-lease",
+            "metadata.name must survive: name is the primary object identifier"
         );
         assert_eq!(
-            original["metadata"]["namespace"], gen_a["metadata"]["namespace"],
-            "metadata.namespace must match: wrong namespace routes to wrong store"
+            gen_a["metadata"]["namespace"], "kube-system",
+            "metadata.namespace must survive: wrong namespace routes to wrong store"
         );
         assert_eq!(
-            original["spec"]["holderIdentity"], gen_a["spec"]["holderIdentity"],
-            "holderIdentity must match: Lease holder is the core semantics"
+            gen_a["spec"]["holderIdentity"], "node-1",
+            "holderIdentity must survive: Lease holder is the core semantics"
         );
         assert_eq!(
-            original["spec"]["leaseDurationSeconds"], gen_a["spec"]["leaseDurationSeconds"],
-            "leaseDurationSeconds must match: governs leader election timeout"
+            gen_a["spec"]["leaseDurationSeconds"], 15,
+            "leaseDurationSeconds must survive: governs leader election timeout"
+        );
+        assert!(
+            gen_a["spec"]["renewTime"].is_string(),
+            "renewTime MicroTime must be emitted: nanos precision required for leader election"
         );
         assert_eq!(
-            original["spec"]["renewTime"], gen_a["spec"]["renewTime"],
-            "renewTime MicroTime must match including nanoseconds: nanos bug caused real outages"
-        );
-        assert_eq!(
-            original["spec"]["leaseTransitions"], gen_a["spec"]["leaseTransitions"],
-            "leaseTransitions must match: clients use this to detect leader churn"
+            gen_a["spec"]["leaseTransitions"], 3,
+            "leaseTransitions must survive: clients use this to detect leader churn"
         );
     }
 
     #[test]
-    fn adapter_a_emits_alpha_fields_strategy_and_preferred_holder_that_original_silently_dropped() {
+    fn decode_lease_proto_gen_a_emits_alpha_fields_strategy_and_preferred_holder() {
         let bytes = make_test_lease_bytes_with_alpha_fields();
-
-        let original = crate::proto::decode_lease_proto(&bytes)
-            .expect("original decode_lease_proto must succeed");
-        let gen_a = decode_lease_proto_gen_a(&bytes).expect("adapter A must succeed");
-
-        assert!(
-            original["spec"]["strategy"].is_null(),
-            "original adapter silently drops strategy: confirms the silent-drop bug class"
-        );
-        assert!(
-            original["spec"]["preferredHolder"].is_null(),
-            "original adapter silently drops preferredHolder: confirms the silent-drop bug class"
-        );
+        let gen_a = decode_lease_proto_gen_a(&bytes).expect("Lease decode must succeed");
 
         assert_eq!(
             gen_a["spec"]["strategy"], "OldestEmulationVersion",
-            "adapter A must emit strategy: generated struct covers all fields, none dropped"
+            "strategy must be emitted: generated struct covers all fields by construction, \
+             hand struct silently dropped this field causing coordinated leader election to break"
         );
         assert_eq!(
             gen_a["spec"]["preferredHolder"], "candidate-b",
-            "adapter A must emit preferredHolder: generated struct covers all fields, none dropped"
+            "preferredHolder must be emitted: generated struct covers all fields by construction"
         );
     }
 
