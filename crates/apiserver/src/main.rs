@@ -1,4 +1,6 @@
 mod admission;
+mod apps_gen;
+mod apps_gen_adapter;
 mod auth;
 mod content_type;
 mod coord_gen;

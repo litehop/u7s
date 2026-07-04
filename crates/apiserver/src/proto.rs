@@ -2228,310 +2228,6 @@ struct AppsPodTemplateSpec {
     spec: Option<PodSpec>,
 }
 
-/// DeploymentSpec — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message DeploymentSpec
-#[derive(Clone, PartialEq, Message)]
-struct DeploymentSpec {
-    /// replicas (field 1, int32)
-    #[prost(int32, tag = "1")]
-    replicas: i32,
-    /// selector (field 2, message LabelSelector)
-    #[prost(message, tag = "2")]
-    selector: Option<AppsLabelSelector>,
-    /// template (field 3, message PodTemplateSpec)
-    #[prost(message, tag = "3")]
-    template: Option<AppsPodTemplateSpec>,
-}
-
-/// RollingUpdateStatefulSetStrategy — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message RollingUpdateStatefulSetStrategy
-#[derive(Clone, PartialEq, Message)]
-struct RollingUpdateStatefulSetStrategy {
-    /// partition (field 1, int32) — ordinal at which the rolling update starts
-    #[prost(int32, tag = "1")]
-    partition: i32,
-}
-
-/// StatefulSetUpdateStrategy — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message StatefulSetUpdateStrategy
-#[derive(Clone, PartialEq, Message)]
-struct StatefulSetUpdateStrategy {
-    /// type (field 1, string): "RollingUpdate" or "OnDelete"
-    #[prost(string, tag = "1")]
-    r#type: String,
-    /// rollingUpdate (field 2, message RollingUpdateStatefulSetStrategy)
-    #[prost(message, tag = "2")]
-    rolling_update: Option<RollingUpdateStatefulSetStrategy>,
-}
-
-/// StatefulSetSpec — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message StatefulSetSpec
-#[derive(Clone, PartialEq, Message)]
-struct StatefulSetSpec {
-    /// replicas (field 1, int32)
-    #[prost(int32, tag = "1")]
-    replicas: i32,
-    /// selector (field 2, message LabelSelector)
-    #[prost(message, tag = "2")]
-    selector: Option<AppsLabelSelector>,
-    /// template (field 3, message PodTemplateSpec)
-    #[prost(message, tag = "3")]
-    template: Option<AppsPodTemplateSpec>,
-    // field 4 = volumeClaimTemplates (repeated PVC) — skipped
-    // field 5 = serviceName (string) — skipped
-    // field 6 = podManagementPolicy (string) — skipped
-    /// updateStrategy (field 7, message StatefulSetUpdateStrategy)
-    #[prost(message, tag = "7")]
-    update_strategy: Option<StatefulSetUpdateStrategy>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct StatefulSetCondition {
-    #[prost(string, tag = "1")]
-    r#type: String,
-    #[prost(string, tag = "2")]
-    status: String,
-    // tag 3 = lastTransitionTime (Time message) — skipped, not needed for round-trip
-    #[prost(string, tag = "4")]
-    reason: String,
-    #[prost(string, tag = "5")]
-    message: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct StatefulSetStatus {
-    #[prost(int64, tag = "1")]
-    observed_generation: i64,
-    #[prost(int32, tag = "2")]
-    replicas: i32,
-    #[prost(int32, tag = "3")]
-    ready_replicas: i32,
-    #[prost(int32, tag = "4")]
-    current_replicas: i32,
-    #[prost(int32, tag = "5")]
-    updated_replicas: i32,
-    #[prost(string, tag = "6")]
-    current_revision: String,
-    #[prost(string, tag = "7")]
-    update_revision: String,
-    #[prost(int32, tag = "9")]
-    collision_count: i32,
-    #[prost(message, repeated, tag = "10")]
-    conditions: Vec<StatefulSetCondition>,
-    #[prost(int32, tag = "11")]
-    available_replicas: i32,
-}
-
-/// ReplicaSetSpec — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message ReplicaSetSpec
-#[derive(Clone, PartialEq, Message)]
-struct ReplicaSetSpec {
-    /// replicas (field 1, int32)
-    #[prost(int32, tag = "1")]
-    replicas: i32,
-    /// selector (field 2, message LabelSelector)
-    #[prost(message, tag = "2")]
-    selector: Option<AppsLabelSelector>,
-    /// template (field 3, message PodTemplateSpec)
-    #[prost(message, tag = "3")]
-    template: Option<AppsPodTemplateSpec>,
-}
-
-/// StatefulSet — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message StatefulSet
-#[derive(Clone, PartialEq, Message)]
-struct StatefulSet {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message StatefulSetSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<StatefulSetSpec>,
-    /// status (field 3, message StatefulSetStatus)
-    #[prost(message, tag = "3")]
-    status: Option<StatefulSetStatus>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct DeploymentCondition {
-    #[prost(string, tag = "1")]
-    r#type: String,
-    #[prost(string, tag = "2")]
-    status: String,
-    // tag 6 = lastUpdateTime (Time) — skipped
-    // tag 7 = lastTransitionTime (Time) — skipped
-    #[prost(string, tag = "4")]
-    reason: String,
-    #[prost(string, tag = "5")]
-    message: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct DeploymentStatus {
-    #[prost(int64, tag = "1")]
-    observed_generation: i64,
-    #[prost(int32, tag = "2")]
-    replicas: i32,
-    #[prost(int32, tag = "3")]
-    updated_replicas: i32,
-    #[prost(int32, tag = "7")]
-    ready_replicas: i32,
-    #[prost(int32, tag = "4")]
-    available_replicas: i32,
-    #[prost(int32, tag = "5")]
-    unavailable_replicas: i32,
-    #[prost(int32, tag = "9")]
-    terminating_replicas: i32,
-    #[prost(message, repeated, tag = "6")]
-    conditions: Vec<DeploymentCondition>,
-    #[prost(int32, tag = "8")]
-    collision_count: i32,
-}
-
-/// Deployment — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message Deployment
-#[derive(Clone, PartialEq, Message)]
-struct Deployment {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message DeploymentSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<DeploymentSpec>,
-    /// status (field 3, message DeploymentStatus)
-    #[prost(message, tag = "3")]
-    status: Option<DeploymentStatus>,
-}
-
-/// DaemonSetSpec — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message DaemonSetSpec
-/// Only selector and template decoded; other fields not needed for selector defaulting.
-#[derive(Clone, PartialEq, Message)]
-struct DaemonSetSpec {
-    /// selector (field 1, message LabelSelector)
-    #[prost(message, tag = "1")]
-    selector: Option<AppsLabelSelector>,
-    /// template (field 2, message PodTemplateSpec)
-    #[prost(message, tag = "2")]
-    template: Option<AppsPodTemplateSpec>,
-}
-
-/// DaemonSetCondition — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message DaemonSetCondition
-#[derive(Clone, PartialEq, Message)]
-struct DaemonSetCondition {
-    /// type (field 1, string)
-    #[prost(string, tag = "1")]
-    r#type: String,
-    /// status (field 2, string)
-    #[prost(string, tag = "2")]
-    status: String,
-    // field 3 = lastTransitionTime (Time message) — skipped
-    /// reason (field 4, string)
-    #[prost(string, tag = "4")]
-    reason: String,
-    /// message (field 5, string)
-    #[prost(string, tag = "5")]
-    message: String,
-}
-
-/// DaemonSetStatus — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message DaemonSetStatus
-#[derive(Clone, PartialEq, Message)]
-struct DaemonSetStatus {
-    /// currentNumberScheduled (field 1, int32)
-    #[prost(int32, tag = "1")]
-    current_number_scheduled: i32,
-    /// numberMisscheduled (field 2, int32)
-    #[prost(int32, tag = "2")]
-    number_misscheduled: i32,
-    /// desiredNumberScheduled (field 3, int32)
-    #[prost(int32, tag = "3")]
-    desired_number_scheduled: i32,
-    /// numberReady (field 4, int32)
-    #[prost(int32, tag = "4")]
-    number_ready: i32,
-    /// observedGeneration (field 5, int64)
-    #[prost(int64, tag = "5")]
-    observed_generation: i64,
-    /// updatedNumberScheduled (field 6, int32)
-    #[prost(int32, tag = "6")]
-    updated_number_scheduled: i32,
-    /// numberAvailable (field 7, int32)
-    #[prost(int32, tag = "7")]
-    number_available: i32,
-    /// numberUnavailable (field 8, int32)
-    #[prost(int32, tag = "8")]
-    number_unavailable: i32,
-    /// collisionCount (field 9, int32)
-    #[prost(int32, tag = "9")]
-    collision_count: i32,
-    /// conditions (field 10, repeated DaemonSetCondition)
-    #[prost(message, repeated, tag = "10")]
-    conditions: Vec<DaemonSetCondition>,
-}
-
-/// DaemonSet — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message DaemonSet
-#[derive(Clone, PartialEq, Message)]
-struct DaemonSet {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message DaemonSetSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<DaemonSetSpec>,
-    /// status (field 3, message DaemonSetStatus)
-    #[prost(message, tag = "3")]
-    status: Option<DaemonSetStatus>,
-}
-
-/// ReplicaSet — k8s.io/api/apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message ReplicaSet
-#[derive(Clone, PartialEq, Message)]
-struct ReplicaSet {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message ReplicaSetSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<ReplicaSetSpec>,
-    /// status (field 3, message ReplicaSetStatus)
-    #[prost(message, tag = "3")]
-    status: Option<ReplicaSetStatus>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct ReplicaSetCondition {
-    #[prost(string, tag = "1")]
-    r#type: String,
-    #[prost(string, tag = "2")]
-    status: String,
-    // tag 3 = lastTransitionTime (Time) — skipped
-    #[prost(string, tag = "4")]
-    reason: String,
-    #[prost(string, tag = "5")]
-    message: String,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct ReplicaSetStatus {
-    #[prost(int32, tag = "1")]
-    replicas: i32,
-    #[prost(int32, tag = "2")]
-    fully_labeled_replicas: i32,
-    #[prost(int64, tag = "3")]
-    observed_generation: i64,
-    #[prost(int32, tag = "4")]
-    ready_replicas: i32,
-    #[prost(int32, tag = "5")]
-    available_replicas: i32,
-    #[prost(message, repeated, tag = "6")]
-    conditions: Vec<ReplicaSetCondition>,
-    #[prost(int32, tag = "7")]
-    terminating_replicas: i32,
-}
-
 /// ServiceAccount — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ServiceAccount
 #[derive(Clone, PartialEq, Message)]
@@ -5580,362 +5276,10 @@ fn pod_spec_to_json(spec: PodSpec) -> serde_json::Value {
     serde_json::Value::Object(spec_map)
 }
 
-/// Convert an apps-context `DeploymentSpec` / `StatefulSetSpec` / `ReplicaSetSpec`
-/// into the minimal JSON needed for selector defaulting.
-///
-/// Returns `None` when neither selector nor template labels are present (omit spec from output).
-fn apps_spec_to_json(
-    selector: Option<AppsLabelSelector>,
-    template: Option<AppsPodTemplateSpec>,
-) -> Option<serde_json::Value> {
-    let mut spec = serde_json::json!({});
-    let mut non_empty = false;
-
-    if let Some(sel) = selector {
-        if !sel.match_labels.is_empty() {
-            spec["selector"] = apps_label_selector_to_json(sel);
-            non_empty = true;
-        }
-    }
-
-    if let Some(tmpl) = template {
-        let mut tmpl_json = serde_json::json!({});
-        if let Some(meta) = tmpl.metadata {
-            let tmpl_meta = object_meta_to_json(meta);
-            tmpl_json["metadata"] = tmpl_meta;
-            non_empty = true;
-        }
-        if let Some(pod_spec) = tmpl.spec {
-            tmpl_json["spec"] = pod_spec_to_json(pod_spec);
-            non_empty = true;
-        }
-        if non_empty {
-            spec["template"] = tmpl_json;
-        }
-    }
-
-    if non_empty {
-        Some(spec)
-    } else {
-        None
-    }
-}
-
-/// Decode a proto-encoded StatefulSet object into a `serde_json::Value`.
-pub fn decode_statefulset_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = StatefulSet::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "StatefulSet",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let replicas = spec.replicas;
-        let update_strategy = spec.update_strategy;
-        let mut spec_json =
-            apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
-        spec_json["replicas"] = serde_json::Value::Number(replicas.into());
-        if let Some(us) = update_strategy {
-            let mut us_json = serde_json::json!({});
-            if !us.r#type.is_empty() {
-                us_json["type"] = us.r#type.clone().into();
-            }
-            if let Some(ru) = us.rolling_update {
-                us_json["rollingUpdate"] = serde_json::json!({ "partition": ru.partition });
-            }
-            if !us_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
-                spec_json["updateStrategy"] = us_json;
-            }
-        }
-        if spec_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            out["spec"] = spec_json;
-        }
-    }
-    if let Some(status) = obj.status {
-        let mut status_json = serde_json::json!({});
-        if status.observed_generation != 0 {
-            status_json["observedGeneration"] = status.observed_generation.into();
-        }
-        if status.replicas != 0 {
-            status_json["replicas"] = status.replicas.into();
-        }
-        if status.ready_replicas != 0 {
-            status_json["readyReplicas"] = status.ready_replicas.into();
-        }
-        if status.current_replicas != 0 {
-            status_json["currentReplicas"] = status.current_replicas.into();
-        }
-        if status.updated_replicas != 0 {
-            status_json["updatedReplicas"] = status.updated_replicas.into();
-        }
-        if !status.current_revision.is_empty() {
-            status_json["currentRevision"] = status.current_revision.into();
-        }
-        if !status.update_revision.is_empty() {
-            status_json["updateRevision"] = status.update_revision.into();
-        }
-        if status.collision_count != 0 {
-            status_json["collisionCount"] = status.collision_count.into();
-        }
-        if status.available_replicas != 0 {
-            status_json["availableReplicas"] = status.available_replicas.into();
-        }
-        if !status.conditions.is_empty() {
-            status_json["conditions"] = status
-                .conditions
-                .iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status,
-                    });
-                    if !c.reason.is_empty() {
-                        cond["reason"] = c.reason.clone().into();
-                    }
-                    if !c.message.is_empty() {
-                        cond["message"] = c.message.clone().into();
-                    }
-                    cond
-                })
-                .collect();
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            out["status"] = status_json;
-        }
-    }
-    Some(out)
-}
-
 /// Decode a proto-encoded Deployment object into a `serde_json::Value`.
+#[cfg(test)]
 pub fn decode_deployment_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = Deployment::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let replicas = spec.replicas;
-        let mut spec_json =
-            apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
-        spec_json["replicas"] = serde_json::Value::Number(replicas.into());
-        if spec_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            out["spec"] = spec_json;
-        }
-    }
-    if let Some(status) = obj.status {
-        let mut status_json = serde_json::json!({});
-        if status.observed_generation != 0 {
-            status_json["observedGeneration"] = status.observed_generation.into();
-        }
-        if status.replicas != 0 {
-            status_json["replicas"] = status.replicas.into();
-        }
-        if status.updated_replicas != 0 {
-            status_json["updatedReplicas"] = status.updated_replicas.into();
-        }
-        if status.ready_replicas != 0 {
-            status_json["readyReplicas"] = status.ready_replicas.into();
-        }
-        if status.available_replicas != 0 {
-            status_json["availableReplicas"] = status.available_replicas.into();
-        }
-        if status.unavailable_replicas != 0 {
-            status_json["unavailableReplicas"] = status.unavailable_replicas.into();
-        }
-        if status.terminating_replicas != 0 {
-            status_json["terminatingReplicas"] = status.terminating_replicas.into();
-        }
-        if status.collision_count != 0 {
-            status_json["collisionCount"] = status.collision_count.into();
-        }
-        if !status.conditions.is_empty() {
-            status_json["conditions"] = status
-                .conditions
-                .iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status,
-                    });
-                    if !c.reason.is_empty() {
-                        cond["reason"] = c.reason.clone().into();
-                    }
-                    if !c.message.is_empty() {
-                        cond["message"] = c.message.clone().into();
-                    }
-                    cond
-                })
-                .collect();
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            out["status"] = status_json;
-        }
-    }
-    Some(out)
-}
-
-/// Decode a proto-encoded DaemonSet object into a `serde_json::Value`.
-pub fn decode_daemonset_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = DaemonSet::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "DaemonSet",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        if let Some(spec_json) = apps_spec_to_json(spec.selector, spec.template) {
-            out["spec"] = spec_json;
-        }
-    }
-    if let Some(status) = obj.status {
-        let mut status_json = serde_json::json!({});
-        if status.current_number_scheduled != 0 {
-            status_json["currentNumberScheduled"] = status.current_number_scheduled.into();
-        }
-        if status.number_misscheduled != 0 {
-            status_json["numberMisscheduled"] = status.number_misscheduled.into();
-        }
-        if status.desired_number_scheduled != 0 {
-            status_json["desiredNumberScheduled"] = status.desired_number_scheduled.into();
-        }
-        if status.number_ready != 0 {
-            status_json["numberReady"] = status.number_ready.into();
-        }
-        if status.observed_generation != 0 {
-            status_json["observedGeneration"] = status.observed_generation.into();
-        }
-        if status.updated_number_scheduled != 0 {
-            status_json["updatedNumberScheduled"] = status.updated_number_scheduled.into();
-        }
-        if status.number_available != 0 {
-            status_json["numberAvailable"] = status.number_available.into();
-        }
-        if status.number_unavailable != 0 {
-            status_json["numberUnavailable"] = status.number_unavailable.into();
-        }
-        if status.collision_count != 0 {
-            status_json["collisionCount"] = status.collision_count.into();
-        }
-        if !status.conditions.is_empty() {
-            status_json["conditions"] = status
-                .conditions
-                .iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status,
-                    });
-                    if !c.reason.is_empty() {
-                        cond["reason"] = c.reason.clone().into();
-                    }
-                    if !c.message.is_empty() {
-                        cond["message"] = c.message.clone().into();
-                    }
-                    cond
-                })
-                .collect();
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            out["status"] = status_json;
-        }
-    }
-    Some(out)
-}
-
-/// Decode a proto-encoded ReplicaSet object into a `serde_json::Value`.
-pub fn decode_replicaset_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ReplicaSet::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "ReplicaSet",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let replicas = spec.replicas;
-        let mut spec_json =
-            apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
-        spec_json["replicas"] = serde_json::Value::Number(replicas.into());
-        if spec_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            out["spec"] = spec_json;
-        }
-    }
-    if let Some(status) = obj.status {
-        let mut status_json = serde_json::json!({});
-        if status.replicas != 0 {
-            status_json["replicas"] = status.replicas.into();
-        }
-        if status.fully_labeled_replicas != 0 {
-            status_json["fullyLabeledReplicas"] = status.fully_labeled_replicas.into();
-        }
-        if status.observed_generation != 0 {
-            status_json["observedGeneration"] = status.observed_generation.into();
-        }
-        if status.ready_replicas != 0 {
-            status_json["readyReplicas"] = status.ready_replicas.into();
-        }
-        if status.available_replicas != 0 {
-            status_json["availableReplicas"] = status.available_replicas.into();
-        }
-        if status.terminating_replicas != 0 {
-            status_json["terminatingReplicas"] = status.terminating_replicas.into();
-        }
-        if !status.conditions.is_empty() {
-            status_json["conditions"] = status
-                .conditions
-                .iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status,
-                    });
-                    if !c.reason.is_empty() {
-                        cond["reason"] = c.reason.clone().into();
-                    }
-                    if !c.message.is_empty() {
-                        cond["message"] = c.message.clone().into();
-                    }
-                    cond
-                })
-                .collect();
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            out["status"] = status_json;
-        }
-    }
-    Some(out)
+    crate::apps_gen_adapter::decode_deployment_proto_gen(data)
 }
 
 /// Decode a proto-encoded ServiceAccount object into a `serde_json::Value`.
@@ -8281,58 +7625,15 @@ pub fn decode_priorityclass_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(out)
 }
 
-// --- k8s.io/api/apps/v1/generated.proto (ControllerRevision) ---
-
-/// RawExtension — k8s.io/apimachinery/pkg/runtime/generated.proto
-/// Source: apimachinery-runtime-generated.proto message RawExtension
-/// field 1 = raw (bytes): the serialized object bytes.
-#[derive(Clone, PartialEq, Message)]
-struct ControllerRevisionRawExtension {
-    /// raw (field 1, bytes) — JSON-encoded serialization of the controller state
-    #[prost(bytes = "vec", tag = "1")]
-    raw: Vec<u8>,
-}
-
-/// ControllerRevision — apps/v1/generated.proto
-/// Source: api-apps-v1-generated.proto message ControllerRevision
-/// (field numbers verified from proto/api-apps-v1-generated.proto)
-#[derive(Clone, PartialEq, Message)]
-struct ControllerRevision {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// data (field 2, message RawExtension) — serialized snapshot of controller state
-    #[prost(message, tag = "2")]
-    data: Option<ControllerRevisionRawExtension>,
-    /// revision (field 3, int64) — monotonically increasing revision number
-    #[prost(int64, tag = "3")]
-    revision: i64,
-}
-
 /// Decode a proto-encoded ControllerRevision into a serde_json::Value.
 ///
 /// DaemonSet and StatefulSet controllers POST ControllerRevision objects with
 /// Content-Type: application/vnd.kubernetes.protobuf to track rollout history.
 /// Without this decoder, decode_core_proto_by_kind returns None, extract_body returns raw proto
 /// bytes, and the handler returns 400 "invalid JSON: expected value at line 1 column 1".
+#[cfg(test)]
 pub fn decode_controllerrevision_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ControllerRevision::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "apps/v1",
-        "kind": "ControllerRevision",
-        "metadata": meta,
-        "revision": obj.revision
-    });
-    // data.raw contains JSON-encoded state; include it as a parsed JSON value if possible.
-    if let Some(raw_ext) = obj.data {
-        if !raw_ext.raw.is_empty() {
-            if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&raw_ext.raw) {
-                out["data"] = parsed;
-            }
-        }
-    }
-    Some(out)
+    crate::apps_gen_adapter::decode_controllerrevision_proto_gen(data)
 }
 
 /// Decode a proto-encoded DeleteOptions message into a serde_json::Value.
@@ -8399,10 +7700,10 @@ pub fn decode_proto_by_kind_and_version(
         "Job" => decode_job_proto(raw),
         "RuntimeClass" => decode_runtimeclass_proto(raw),
         "VolumeAttachment" => decode_volumeattachment_proto(raw),
-        "StatefulSet" => decode_statefulset_proto(raw),
-        "Deployment" => decode_deployment_proto(raw),
-        "DaemonSet" => decode_daemonset_proto(raw),
-        "ReplicaSet" => decode_replicaset_proto(raw),
+        "StatefulSet" => crate::apps_gen_adapter::decode_statefulset_proto_gen(raw),
+        "Deployment" => crate::apps_gen_adapter::decode_deployment_proto_gen(raw),
+        "DaemonSet" => crate::apps_gen_adapter::decode_daemonset_proto_gen(raw),
+        "ReplicaSet" => crate::apps_gen_adapter::decode_replicaset_proto_gen(raw),
         "ServiceAccount" => decode_serviceaccount_proto(raw),
         "PersistentVolumeClaim" => decode_persistentvolumeclaim_proto(raw),
         "Endpoints" => decode_endpoints_proto(raw),
@@ -8424,7 +7725,7 @@ pub fn decode_proto_by_kind_and_version(
         "EndpointSlice" => decode_endpointslice_proto(raw),
         "CertificateSigningRequest" => decode_csr_proto(raw),
         "PriorityClass" => decode_priorityclass_proto(raw),
-        "ControllerRevision" => decode_controllerrevision_proto(raw),
+        "ControllerRevision" => crate::apps_gen_adapter::decode_controllerrevision_proto_gen(raw),
         "DeleteOptions" => decode_delete_options_proto(raw),
         _ => None,
     }
@@ -17298,26 +16599,29 @@ mod tests {
     /// zero scheduled/ready counts and never progress past initial state.
     #[test]
     fn decode_daemonset_proto_preserves_status_else_node_readiness_checks_see_zero_and_stall() {
-        let status = DaemonSetStatus {
-            current_number_scheduled: 5,
-            number_misscheduled: 1,
-            desired_number_scheduled: 5,
-            number_ready: 4,
-            observed_generation: 2,
-            updated_number_scheduled: 5,
-            number_available: 4,
-            number_unavailable: 1,
-            collision_count: 0,
-            conditions: vec![DaemonSetCondition {
-                r#type: "Available".to_string(),
-                status: "True".to_string(),
-                reason: "".to_string(),
-                message: "".to_string(),
+        use crate::apps_gen::k8s::io::api::apps::v1 as apps_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
+        let status = apps_v1::DaemonSetStatus {
+            current_number_scheduled: Some(5),
+            number_misscheduled: Some(1),
+            desired_number_scheduled: Some(5),
+            number_ready: Some(4),
+            observed_generation: Some(2),
+            updated_number_scheduled: Some(5),
+            number_available: Some(4),
+            number_unavailable: Some(1),
+            collision_count: None,
+            conditions: vec![apps_v1::DaemonSetCondition {
+                r#type: Some("Available".to_string()),
+                status: Some("True".to_string()),
+                reason: None,
+                message: None,
+                last_transition_time: None,
             }],
         };
-        let ds = DaemonSet {
-            metadata: Some(ObjectMeta {
-                name: "my-ds".to_string(),
+        let ds = apps_v1::DaemonSet {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("my-ds".to_string()),
                 ..Default::default()
             }),
             spec: None,
@@ -17528,25 +16832,29 @@ mod tests {
     /// for conditions that are never stored.
     #[test]
     fn decode_deployment_proto_preserves_status_else_controllers_see_empty_status_and_hang() {
-        let status = DeploymentStatus {
-            observed_generation: 3,
-            replicas: 5,
-            updated_replicas: 5,
-            ready_replicas: 4,
-            available_replicas: 4,
-            unavailable_replicas: 1,
-            terminating_replicas: 0,
-            collision_count: 0,
-            conditions: vec![DeploymentCondition {
-                r#type: "Available".to_string(),
-                status: "True".to_string(),
-                reason: "MinimumReplicasAvailable".to_string(),
-                message: "Deployment has minimum availability.".to_string(),
+        use crate::apps_gen::k8s::io::api::apps::v1 as apps_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
+        let status = apps_v1::DeploymentStatus {
+            observed_generation: Some(3),
+            replicas: Some(5),
+            updated_replicas: Some(5),
+            ready_replicas: Some(4),
+            available_replicas: Some(4),
+            unavailable_replicas: Some(1),
+            terminating_replicas: None,
+            collision_count: None,
+            conditions: vec![apps_v1::DeploymentCondition {
+                r#type: Some("Available".to_string()),
+                status: Some("True".to_string()),
+                reason: Some("MinimumReplicasAvailable".to_string()),
+                message: Some("Deployment has minimum availability.".to_string()),
+                last_update_time: None,
+                last_transition_time: None,
             }],
         };
-        let deploy = Deployment {
-            metadata: Some(ObjectMeta {
-                name: "my-deploy".to_string(),
+        let deploy = apps_v1::Deployment {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("my-deploy".to_string()),
                 ..Default::default()
             }),
             spec: None,
@@ -17606,23 +16914,26 @@ mod tests {
     /// if RS status is invisible the Deployment status never converges and conformance tests hang.
     #[test]
     fn decode_replicaset_proto_preserves_status_else_deployment_controller_cannot_compute_status() {
-        let status = ReplicaSetStatus {
-            replicas: 3,
-            fully_labeled_replicas: 3,
-            observed_generation: 2,
-            ready_replicas: 2,
-            available_replicas: 2,
-            terminating_replicas: 0,
-            conditions: vec![ReplicaSetCondition {
-                r#type: "ReplicaFailure".to_string(),
-                status: "False".to_string(),
-                reason: "".to_string(),
-                message: "".to_string(),
+        use crate::apps_gen::k8s::io::api::apps::v1 as apps_v1;
+        use crate::apps_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
+        let status = apps_v1::ReplicaSetStatus {
+            replicas: Some(3),
+            fully_labeled_replicas: Some(3),
+            observed_generation: Some(2),
+            ready_replicas: Some(2),
+            available_replicas: Some(2),
+            terminating_replicas: None,
+            conditions: vec![apps_v1::ReplicaSetCondition {
+                r#type: Some("ReplicaFailure".to_string()),
+                status: Some("False".to_string()),
+                reason: None,
+                message: None,
+                last_transition_time: None,
             }],
         };
-        let rs = ReplicaSet {
-            metadata: Some(ObjectMeta {
-                name: "my-rs".to_string(),
+        let rs = apps_v1::ReplicaSet {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("my-rs".to_string()),
                 ..Default::default()
             }),
             spec: None,

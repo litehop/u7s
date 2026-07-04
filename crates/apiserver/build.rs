@@ -24,10 +24,18 @@ fn main() {
                     .join("k8s.io/apimachinery/pkg/runtime/generated.proto")
                     .to_str()
                     .unwrap(),
+                include_dir
+                    .join("k8s.io/api/apps/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
+                    .join("k8s.io/api/core/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
             ],
             &[include_dir.to_str().unwrap()],
         )
-        .expect("prost-build failed for coordination/v1");
+        .expect("prost-build failed");
 
     println!(
         "cargo:rerun-if-changed={}",
