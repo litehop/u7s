@@ -46,3 +46,7 @@ yaml-rust2      = "0.11"
 prost           = "0.14"
 hmac            = "0.13"
 sha2            = "0.11"
+
+[build-dependencies]
+prost-build              = "0.14"
+protoc-bin-vendored      = "3.2"
