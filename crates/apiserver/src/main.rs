@@ -1,6 +1,8 @@
 mod admission;
 mod auth;
 mod content_type;
+mod coord_gen;
+mod coord_gen_adapter;
 mod handlers;
 mod inflight;
 mod keys;
