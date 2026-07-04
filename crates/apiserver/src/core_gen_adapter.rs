@@ -6,6 +6,13 @@ use crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString;
 
 // ---- shared helpers --------------------------------------------------------
 
+pub(crate) fn gen_microtime_fields_to_rfc3339(secs: i64, nanos: i32) -> Option<String> {
+    if secs <= 0 {
+        return None;
+    }
+    Some(crate::util::secs_nanos_to_rfc3339_micro(secs as u64, nanos))
+}
+
 fn gen_int_or_string_to_json(ios: &IntOrString) -> serde_json::Value {
     if ios.r#type.unwrap_or(0) == 0 {
         serde_json::Value::Number(ios.int_val.unwrap_or(0).into())
@@ -1730,9 +1737,7 @@ pub fn decode_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(t) = s.last_observed_time {
             if let Some(secs) = t.seconds {
-                if secs > 0 {
-                    let nanos = t.nanos.unwrap_or(0);
-                    let ts = crate::util::secs_nanos_to_rfc3339_micro(secs as u64, nanos);
+                if let Some(ts) = gen_microtime_fields_to_rfc3339(secs, t.nanos.unwrap_or(0)) {
                     sm.insert(
                         "lastObservedTime".to_string(),
                         serde_json::Value::String(ts),

@@ -620,9 +620,10 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
         "metadata": meta
     });
     if let Some(t) = ev.event_time {
-        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-            let nanos = t.nanos.unwrap_or(0);
-            let ts = crate::util::secs_nanos_to_rfc3339_micro(secs as u64, nanos);
+        if let Some(ts) = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
+            t.seconds.unwrap_or(0),
+            t.nanos.unwrap_or(0),
+        ) {
             out["eventTime"] = serde_json::Value::String(ts);
         }
     }
@@ -632,9 +633,10 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
             sj.insert("count".to_string(), serde_json::Value::Number(count.into()));
         }
         if let Some(t) = s.last_observed_time {
-            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                let nanos = t.nanos.unwrap_or(0);
-                let ts = crate::util::secs_nanos_to_rfc3339_micro(secs as u64, nanos);
+            if let Some(ts) = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
+                t.seconds.unwrap_or(0),
+                t.nanos.unwrap_or(0),
+            ) {
                 sj.insert(
                     "lastObservedTime".to_string(),
                     serde_json::Value::String(ts),
