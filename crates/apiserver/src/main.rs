@@ -1,4 +1,6 @@
 mod admission;
+mod admissionreg_gen;
+mod admissionreg_gen_adapter;
 mod apps_gen;
 mod apps_gen_adapter;
 mod auth;
