@@ -4,16 +4,10 @@ fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let include_dir = manifest_dir.join("proto-include");
 
-    // Compile coordination/v1 and its transitive dependencies.
-    // meta-v1 imports runtime, both are in our include tree.
-    // schema/generated is imported but empty (no types referenced from it).
-    let mut config = prost_build::Config::new();
+    let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc");
 
-    // Adapter B: add serde derives to ALL generated types in these packages.
-    // Using "." applies to every type in every compiled proto.
-    // This is needed because ObjectMeta transitively references ManagedFieldsEntry,
-    // FieldsV1, OwnerReference, Time, etc. — serde requires the full closure.
-    config.type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]");
+    let mut config = prost_build::Config::new();
+    config.protoc_executable(protoc);
 
     config
         .compile_protos(

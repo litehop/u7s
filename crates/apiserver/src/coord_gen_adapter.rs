@@ -157,41 +157,6 @@ pub fn decode_lease_proto_gen_a(data: &[u8]) -> Option<serde_json::Value> {
     Some(obj)
 }
 
-// ---- Adapter B: serde-derive on generated structs --------------------------
-//
-// serde::Serialize is derived on Lease/LeaseSpec/ObjectMeta/MicroTime via
-// prost-build type_attribute in build.rs. serde_json::to_value gives "free"
-// JSON — but with k8s-fidelity problems documented below.
-//
-// Known fidelity gaps (proven by the diff test below):
-//
-// 1. FIELD NAMING: prost-build uses snake_case field names. serde's default
-//    is to output as-is, so "holder_identity" not "holderIdentity". Fix would
-//    require #[serde(rename_all = "camelCase")] but that can only be added via
-//    type_attribute at the struct level — and then ALL fields camelCase, which
-//    conflicts with some that should not be renamed.
-//
-// 2. OMIT-IF-ZERO: serde emits Some(0) as JSON `0`. k8s convention is to omit
-//    numeric zero. No built-in serde mechanism for this without a custom
-//    serializer per field.
-//
-// 3. MICROTIME: serde emits MicroTime as {"seconds":N,"nanos":M} object.
-//    k8s JSON wire format expects RFC3339+microseconds string.
-//    Fix requires a custom serialize impl for MicroTime — not automatic.
-//
-// 4. CREATIONTIMESTAMP: k8s always emits `"creationTimestamp": null` even when
-//    not set. serde with skip_serializing_if="is_none" would omit it entirely.
-//
-// These four gaps mean adapter B (naive serde-derive) CANNOT produce k8s-wire-
-// compatible JSON without additional per-field customization that effectively
-// reaches adapter-A territory in total code. See findings doc for full cost
-// projection.
-
-pub fn decode_lease_proto_gen_b_naive(data: &[u8]) -> Option<serde_json::Value> {
-    let lease = coord_v1::Lease::decode(data).ok()?;
-    serde_json::to_value(lease).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,30 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn adapter_b_naive_serde_diverges_from_k8s_wire_format() {
-        let bytes = make_test_lease_bytes();
-
-        let gen_b = decode_lease_proto_gen_b_naive(&bytes).expect("adapter B must produce a value");
-
-        assert!(
-            gen_b["spec"]["holder_identity"].is_string(),
-            "adapter B emits snake_case 'holder_identity' not camelCase 'holderIdentity': \
-             this diverges from k8s JSON wire format and breaks kubectl"
-        );
-        assert!(
-            gen_b["spec"]["holderIdentity"].is_null(),
-            "adapter B must NOT produce camelCase holderIdentity: \
-             proving naming mismatch with k8s wire format"
-        );
-
-        assert!(
-            gen_b["spec"]["renew_time"].is_object(),
-            "adapter B emits MicroTime as object {{seconds, nanos}} not RFC3339 string: \
-             this breaks any client that parses the time field"
-        );
-    }
-
-    #[test]
     fn generated_lease_spec_covers_all_proto_fields_by_construction() {
         use crate::coord_gen::k8s::io::api::coordination::v1::LeaseSpec;
         let spec = LeaseSpec {
@@ -350,10 +291,17 @@ mod tests {
         let mut buf = Vec::new();
         spec.encode(&mut buf).unwrap();
         let decoded = LeaseSpec::decode(buf.as_slice()).unwrap();
-        assert_eq!(decoded.strategy.as_deref(), Some("y"),
-            "strategy field must survive round-trip: it's present in generated struct by construction, \
-             not by authoring discipline");
-        assert_eq!(decoded.preferred_holder.as_deref(), Some("z"),
-            "preferredHolder field must survive round-trip: present in generated struct by construction");
+        assert_eq!(
+            decoded.strategy.as_deref(),
+            Some("y"),
+            "strategy field must survive round-trip: it's present in generated struct by \
+             construction, not by authoring discipline"
+        );
+        assert_eq!(
+            decoded.preferred_holder.as_deref(),
+            Some("z"),
+            "preferredHolder field must survive round-trip: present in generated struct by \
+             construction"
+        );
     }
 }
