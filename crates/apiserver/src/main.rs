@@ -15,6 +15,8 @@ mod handlers;
 mod inflight;
 mod keys;
 mod limit_range;
+mod net_disc_cert_policy_events_gen;
+mod net_disc_cert_policy_events_gen_adapter;
 mod patch;
 mod proto;
 mod quota;

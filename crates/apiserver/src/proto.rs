@@ -279,16 +279,6 @@ struct IntOrString {
     str_val: String,
 }
 
-impl IntOrString {
-    fn to_json(&self) -> serde_json::Value {
-        if self.r#type == 0 {
-            serde_json::Value::Number(self.int_val.into())
-        } else {
-            serde_json::Value::String(self.str_val.clone())
-        }
-    }
-}
-
 /// HttpGetProbeAction — api-core-v1-generated.proto message HTTPGetAction
 /// field 1 = path (string), field 2 = port (IntOrString), field 3 = host (string), field 4 = scheme (string)
 #[derive(Clone, PartialEq, Message)]
@@ -1430,124 +1420,6 @@ struct Quantity {
     string: Option<String>,
 }
 
-// --- k8s.io/api/policy/v1/generated.proto ---
-
-/// PodDisruptionBudgetStatus — k8s.io/api/policy/v1/generated.proto
-/// Source: k8s.io/api/policy/v1/generated.proto message PodDisruptionBudgetStatus
-/// Fields match the official proto exactly.
-#[derive(Clone, PartialEq, Message)]
-struct PodDisruptionBudgetStatus {
-    /// observedGeneration (field 1, int64)
-    #[prost(int64, tag = "1")]
-    observed_generation: i64,
-    /// disruptedPods (field 2, map<string, Time>)
-    /// Maps pod names to the time when a disruption was allowed.
-    #[prost(btree_map = "string, message", tag = "2")]
-    disrupted_pods: std::collections::BTreeMap<String, Time>,
-    /// disruptionsAllowed (field 3, int32)
-    #[prost(int32, tag = "3")]
-    disruptions_allowed: i32,
-    /// currentHealthy (field 4, int32)
-    #[prost(int32, tag = "4")]
-    current_healthy: i32,
-    /// desiredHealthy (field 5, int32)
-    #[prost(int32, tag = "5")]
-    desired_healthy: i32,
-    /// expectedPods (field 6, int32)
-    #[prost(int32, tag = "6")]
-    expected_pods: i32,
-    /// conditions (field 7, repeated metav1.Condition)
-    #[prost(message, repeated, tag = "7")]
-    conditions: Vec<MetaV1Condition>,
-}
-
-/// LabelSelectorRequirement for PodDisruptionBudget — metav1.LabelSelectorRequirement
-#[derive(Clone, PartialEq, Message)]
-struct PdbLabelSelectorRequirement {
-    #[prost(string, tag = "1")]
-    key: String,
-    #[prost(string, tag = "2")]
-    operator: String,
-    #[prost(string, repeated, tag = "3")]
-    values: Vec<String>,
-}
-
-/// LabelSelector for PodDisruptionBudget — metav1.LabelSelector
-#[derive(Clone, PartialEq, Message)]
-struct PdbLabelSelector {
-    #[prost(map = "string, string", tag = "1")]
-    match_labels: std::collections::HashMap<String, String>,
-    #[prost(message, repeated, tag = "2")]
-    match_expressions: Vec<PdbLabelSelectorRequirement>,
-}
-
-fn pdb_label_selector_to_json(sel: PdbLabelSelector) -> serde_json::Value {
-    let mut m = serde_json::json!({});
-    if !sel.match_labels.is_empty() {
-        let labels: serde_json::Map<String, serde_json::Value> = sel
-            .match_labels
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        m["matchLabels"] = serde_json::Value::Object(labels);
-    }
-    if !sel.match_expressions.is_empty() {
-        let exprs: Vec<serde_json::Value> = sel
-            .match_expressions
-            .into_iter()
-            .map(|req| {
-                serde_json::json!({
-                    "key": req.key,
-                    "operator": req.operator,
-                    "values": req.values,
-                })
-            })
-            .collect();
-        m["matchExpressions"] = serde_json::Value::Array(exprs);
-    }
-    m
-}
-
-/// PodDisruptionBudgetSpec — k8s.io/api/policy/v1/generated.proto
-/// Source: k8s.io/api/policy/v1/generated.proto message PodDisruptionBudgetSpec
-///
-/// Must be decoded (not left as opaque bytes): the KCM disruption controller reads
-/// spec.selector to find the pods a PDB covers. If the apiserver drops spec on a
-/// proto-encoded create, the stored PDB has no selector, the controller matches no pods
-/// (expectedPods=0), and buildDisruptedPodMap clears status.disruptedPods — failing the
-/// conformance spec `[sig-apps] DisruptionController should update/patch PodDisruptionBudget
-/// status`.
-#[derive(Clone, PartialEq, Message)]
-struct PodDisruptionBudgetSpec {
-    /// minAvailable (field 1, IntOrString)
-    #[prost(message, optional, tag = "1")]
-    min_available: Option<IntOrString>,
-    /// selector (field 2, metav1.LabelSelector)
-    #[prost(message, optional, tag = "2")]
-    selector: Option<PdbLabelSelector>,
-    /// maxUnavailable (field 3, IntOrString)
-    #[prost(message, optional, tag = "3")]
-    max_unavailable: Option<IntOrString>,
-    /// unhealthyPodEvictionPolicy (field 4, string, optional)
-    #[prost(string, tag = "4")]
-    unhealthy_pod_eviction_policy: String,
-}
-
-/// PodDisruptionBudget — k8s.io/api/policy/v1/generated.proto
-/// Source: k8s.io/api/policy/v1/generated.proto message PodDisruptionBudget
-#[derive(Clone, PartialEq, Message)]
-struct PodDisruptionBudget {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message PodDisruptionBudgetSpec)
-    #[prost(message, optional, tag = "2")]
-    spec: Option<PodDisruptionBudgetSpec>,
-    /// status (field 3, message PodDisruptionBudgetStatus)
-    #[prost(message, optional, tag = "3")]
-    status: Option<PodDisruptionBudgetStatus>,
-}
-
 // ---------------------------------------------------------------------------
 // Encoder — produces Kubernetes protobuf wire format from a JSON value.
 // Used in tests only; not called from production handlers.
@@ -2396,703 +2268,6 @@ fn limitrange_quantity_map_to_json(
     serde_json::Value::Object(out)
 }
 
-/// Decode a proto-encoded PodDisruptionBudget object into a `serde_json::Value`.
-///
-/// The DisruptionController sends proto-encoded PUT /poddisruptionbudgets/*/status bodies with
-/// status.disruptedPods to record which pods are currently being disrupted.  Without decoding
-/// status (field 3), the put_namespaced_resource_status handler receives an incoming object where
-/// status is null, and then REMOVES status from the stored PDB (its null-status branch), causing
-/// disruptedPods written by the controller to disappear on read-back.
-///
-/// The conformance spec '[sig-apps] DisruptionController should update/patch PodDisruptionBudget
-/// status' fails with "got disruptedPods=nil" when proto-encoded status writes lose the field.
-pub fn decode_poddisruptionbudget_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = PodDisruptionBudget::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "policy/v1",
-        "kind": "PodDisruptionBudget",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({});
-        if let Some(min_available) = spec.min_available {
-            spec_json["minAvailable"] = min_available.to_json();
-        }
-        if let Some(selector) = spec.selector {
-            spec_json["selector"] = pdb_label_selector_to_json(selector);
-        }
-        if let Some(max_unavailable) = spec.max_unavailable {
-            spec_json["maxUnavailable"] = max_unavailable.to_json();
-        }
-        if !spec.unhealthy_pod_eviction_policy.is_empty() {
-            spec_json["unhealthyPodEvictionPolicy"] = spec.unhealthy_pod_eviction_policy.into();
-        }
-        result["spec"] = spec_json;
-    }
-    if let Some(status) = obj.status {
-        let mut status_json = serde_json::json!({});
-        if status.observed_generation != 0 {
-            status_json["observedGeneration"] = status.observed_generation.into();
-        }
-        if !status.disrupted_pods.is_empty() {
-            let pods_map: serde_json::Map<String, serde_json::Value> = status
-                .disrupted_pods
-                .into_iter()
-                .map(|(pod_name, t)| {
-                    let ts = if t.seconds > 0 {
-                        serde_json::Value::String(crate::util::secs_to_rfc3339(t.seconds as u64))
-                    } else {
-                        serde_json::Value::String("1970-01-01T00:00:00Z".into())
-                    };
-                    (pod_name, ts)
-                })
-                .collect();
-            status_json["disruptedPods"] = serde_json::Value::Object(pods_map);
-        }
-        // disruptionsAllowed, currentHealthy, desiredHealthy, expectedPods are always
-        // meaningful (even 0 means "zero allowed/healthy"). Always emit them when status is
-        // present so the DisruptionController can read them back correctly.
-        status_json["disruptionsAllowed"] = status.disruptions_allowed.into();
-        status_json["currentHealthy"] = status.current_healthy.into();
-        status_json["desiredHealthy"] = status.desired_healthy.into();
-        status_json["expectedPods"] = status.expected_pods.into();
-        if !status.conditions.is_empty() {
-            status_json["conditions"] = status
-                .conditions
-                .iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status,
-                    });
-                    if c.observed_generation != 0 {
-                        cond["observedGeneration"] = c.observed_generation.into();
-                    }
-                    if let Some(ref ts) = c.last_transition_time {
-                        if ts.seconds > 0 {
-                            cond["lastTransitionTime"] = serde_json::Value::String(
-                                crate::util::secs_to_rfc3339(ts.seconds as u64),
-                            );
-                        }
-                    }
-                    if !c.reason.is_empty() {
-                        cond["reason"] = c.reason.clone().into();
-                    }
-                    if !c.message.is_empty() {
-                        cond["message"] = c.message.clone().into();
-                    }
-                    cond
-                })
-                .collect();
-        }
-        result["status"] = status_json;
-    }
-    Some(result)
-}
-
-// --- k8s.io/api/networking/v1/generated.proto ---
-
-/// ServiceBackendPort — networking.k8s.io/v1/generated.proto
-/// field 1: name (string), field 2: number (int32)
-#[derive(Clone, PartialEq, Message)]
-struct ServiceBackendPort {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(int32, tag = "2")]
-    number: i32,
-}
-
-/// IngressServiceBackend — networking.k8s.io/v1/generated.proto
-/// field 1: name (string), field 2: port (ServiceBackendPort)
-#[derive(Clone, PartialEq, Message)]
-struct IngressServiceBackend {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(message, tag = "2")]
-    port: Option<ServiceBackendPort>,
-}
-
-/// IngressBackend — networking.k8s.io/v1/generated.proto
-/// field 1: service (IngressServiceBackend), field 2: resource (TypedLocalObjectReference — skipped)
-#[derive(Clone, PartialEq, Message)]
-struct IngressBackend {
-    #[prost(message, tag = "1")]
-    service: Option<IngressServiceBackend>,
-}
-
-/// HTTPIngressPath — networking.k8s.io/v1/generated.proto
-/// field 1: path (string), field 2: pathType (string), field 3: backend (IngressBackend)
-#[derive(Clone, PartialEq, Message)]
-struct HTTPIngressPath {
-    #[prost(string, tag = "1")]
-    path: String,
-    #[prost(string, tag = "2")]
-    path_type: String,
-    #[prost(message, tag = "3")]
-    backend: Option<IngressBackend>,
-}
-
-/// HTTPIngressRuleValue — networking.k8s.io/v1/generated.proto
-/// field 1: paths (repeated HTTPIngressPath)
-#[derive(Clone, PartialEq, Message)]
-struct HTTPIngressRuleValue {
-    #[prost(message, repeated, tag = "1")]
-    paths: Vec<HTTPIngressPath>,
-}
-
-/// IngressRule — networking.k8s.io/v1/generated.proto
-/// field 1: host (string), field 2: http (HTTPIngressRuleValue)
-#[derive(Clone, PartialEq, Message)]
-struct IngressRule {
-    #[prost(string, tag = "1")]
-    host: String,
-    #[prost(message, tag = "2")]
-    http: Option<HTTPIngressRuleValue>,
-}
-
-/// IngressTLS — networking.k8s.io/v1/generated.proto
-/// field 1: hosts (repeated string), field 2: secretName (string)
-#[derive(Clone, PartialEq, Message)]
-struct IngressTLS {
-    #[prost(string, repeated, tag = "1")]
-    hosts: Vec<String>,
-    #[prost(string, tag = "2")]
-    secret_name: String,
-}
-
-/// IngressSpec — networking.k8s.io/v1/generated.proto
-/// field 1: ingressClassName (string), field 2: defaultBackend (IngressBackend),
-/// field 3: tls (repeated IngressTLS), field 4: rules (repeated IngressRule)
-#[derive(Clone, PartialEq, Message)]
-struct IngressSpec {
-    #[prost(string, tag = "1")]
-    ingress_class_name: String,
-    #[prost(message, tag = "2")]
-    default_backend: Option<IngressBackend>,
-    #[prost(message, repeated, tag = "3")]
-    tls: Vec<IngressTLS>,
-    #[prost(message, repeated, tag = "4")]
-    rules: Vec<IngressRule>,
-}
-
-/// Ingress — networking.k8s.io/v1/generated.proto
-/// field 1: metadata (ObjectMeta), field 2: spec (IngressSpec), field 3: status (skipped)
-#[derive(Clone, PartialEq, Message)]
-struct Ingress {
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    #[prost(message, tag = "2")]
-    spec: Option<IngressSpec>,
-}
-
-fn ingress_backend_to_json(b: IngressBackend) -> serde_json::Value {
-    let mut out = serde_json::json!({});
-    if let Some(svc) = b.service {
-        let mut svc_json = serde_json::json!({ "name": svc.name });
-        if let Some(p) = svc.port {
-            let mut port_json = serde_json::json!({});
-            if !p.name.is_empty() {
-                port_json["name"] = serde_json::Value::String(p.name);
-            }
-            if p.number != 0 {
-                port_json["number"] = serde_json::Value::Number(serde_json::Number::from(p.number));
-            }
-            svc_json["port"] = port_json;
-        }
-        out["service"] = svc_json;
-    }
-    out
-}
-
-/// Decode a proto-encoded Ingress into a serde_json::Value.
-///
-/// kubectl/client-go POSTs Ingress with Content-Type: application/vnd.kubernetes.protobuf.
-/// Without this decoder, extract_body returns raw proto bytes and the handler returns
-/// 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_ingress_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = Ingress::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "Ingress",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({});
-        if !spec.ingress_class_name.is_empty() {
-            spec_json["ingressClassName"] = serde_json::Value::String(spec.ingress_class_name);
-        }
-        if let Some(db) = spec.default_backend {
-            spec_json["defaultBackend"] = ingress_backend_to_json(db);
-        }
-        if !spec.tls.is_empty() {
-            let tls_arr: Vec<serde_json::Value> = spec
-                .tls
-                .into_iter()
-                .map(|t| {
-                    let mut tj = serde_json::json!({});
-                    if !t.hosts.is_empty() {
-                        tj["hosts"] = serde_json::Value::Array(
-                            t.hosts.into_iter().map(serde_json::Value::String).collect(),
-                        );
-                    }
-                    if !t.secret_name.is_empty() {
-                        tj["secretName"] = serde_json::Value::String(t.secret_name);
-                    }
-                    tj
-                })
-                .collect();
-            spec_json["tls"] = serde_json::Value::Array(tls_arr);
-        }
-        if !spec.rules.is_empty() {
-            let rules_arr: Vec<serde_json::Value> = spec
-                .rules
-                .into_iter()
-                .map(|r| {
-                    let mut rj = serde_json::json!({});
-                    if !r.host.is_empty() {
-                        rj["host"] = serde_json::Value::String(r.host);
-                    }
-                    if let Some(http) = r.http {
-                        let paths_arr: Vec<serde_json::Value> = http
-                            .paths
-                            .into_iter()
-                            .map(|p| {
-                                let mut pj = serde_json::json!({});
-                                if !p.path.is_empty() {
-                                    pj["path"] = serde_json::Value::String(p.path);
-                                }
-                                if !p.path_type.is_empty() {
-                                    pj["pathType"] = serde_json::Value::String(p.path_type);
-                                }
-                                if let Some(b) = p.backend {
-                                    pj["backend"] = ingress_backend_to_json(b);
-                                }
-                                pj
-                            })
-                            .collect();
-                        rj["http"] = serde_json::json!({ "paths": paths_arr });
-                    }
-                    rj
-                })
-                .collect();
-            spec_json["rules"] = serde_json::Value::Array(rules_arr);
-        }
-        out["spec"] = spec_json;
-    }
-    Some(out)
-}
-
-/// IngressClassSpec — networking.k8s.io/v1/generated.proto
-/// Source: k8s.io/api/networking/v1/generated.proto message IngressClassSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-/// Only `controller` (field 1) is decoded; `parameters` (field 2) is a complex optional
-/// TypedLocalObjectReference that the apiserver does not need to inspect.
-#[derive(Clone, PartialEq, Message)]
-struct IngressClassSpec {
-    /// controller (field 1, string)
-    #[prost(string, tag = "1")]
-    controller: String,
-}
-
-/// IngressClass — networking.k8s.io/v1/generated.proto
-/// Source: k8s.io/api/networking/v1/generated.proto message IngressClass
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct IngressClass {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message IngressClassSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<IngressClassSpec>,
-}
-
-/// Decode a proto-encoded IngressClass into a serde_json::Value.
-///
-/// The conformance test POSTs IngressClass with Content-Type: application/vnd.kubernetes.protobuf.
-/// Without this decoder, decode_core_proto_by_kind returns None, extract_body returns raw proto
-/// bytes, and the handler returns 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_ingressclass_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = IngressClass::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "IngressClass",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        out["spec"] = serde_json::json!({ "controller": spec.controller });
-    }
-    Some(out)
-}
-
-// --- k8s.io/api/discovery/v1/generated.proto ---
-
-/// DiscoveryEndpointConditions — discovery.k8s.io/v1/generated.proto
-/// field 1: ready (bool), field 2: serving (bool), field 3: terminating (bool)
-#[derive(Clone, PartialEq, Message)]
-struct DiscoveryEndpointConditions {
-    #[prost(bool, tag = "1")]
-    ready: bool,
-    #[prost(bool, tag = "2")]
-    serving: bool,
-    #[prost(bool, tag = "3")]
-    terminating: bool,
-}
-
-/// DiscoveryEndpoint — discovery.k8s.io/v1/generated.proto
-/// field 1: addresses (repeated string), field 2: conditions, field 3: hostname,
-/// field 4: targetRef (ObjectReference), field 6: nodeName, field 7: zone (string wrapper — skipped)
-#[derive(Clone, PartialEq, Message)]
-struct DiscoveryEndpoint {
-    #[prost(string, repeated, tag = "1")]
-    addresses: Vec<String>,
-    #[prost(message, tag = "2")]
-    conditions: Option<DiscoveryEndpointConditions>,
-    #[prost(string, tag = "3")]
-    hostname: String,
-    #[prost(message, tag = "4")]
-    target_ref: Option<ObjectReference>,
-    #[prost(string, tag = "6")]
-    node_name: String,
-}
-
-/// DiscoveryEndpointPort — discovery.k8s.io/v1/generated.proto
-/// field 1: name (string), field 2: protocol (string), field 3: port (int32),
-/// field 4: appProtocol (string)
-#[derive(Clone, PartialEq, Message)]
-struct DiscoveryEndpointPort {
-    #[prost(string, tag = "1")]
-    name: String,
-    #[prost(string, tag = "2")]
-    protocol: String,
-    #[prost(int32, tag = "3")]
-    port: i32,
-    #[prost(string, tag = "4")]
-    app_protocol: String,
-}
-
-/// EndpointSlice — discovery.k8s.io/v1/generated.proto
-/// field 1: metadata (ObjectMeta), field 2: endpoints (repeated DiscoveryEndpoint),
-/// field 3: ports (repeated DiscoveryEndpointPort), field 4: addressType (string)
-#[derive(Clone, PartialEq, Message)]
-struct EndpointSlice {
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    #[prost(message, repeated, tag = "2")]
-    endpoints: Vec<DiscoveryEndpoint>,
-    #[prost(message, repeated, tag = "3")]
-    ports: Vec<DiscoveryEndpointPort>,
-    #[prost(string, tag = "4")]
-    address_type: String,
-}
-
-/// Decode a proto-encoded EndpointSlice into a serde_json::Value.
-///
-/// The EndpointSlice conformance test POSTs/PATCHes with Content-Type: application/vnd.kubernetes.protobuf.
-/// Without this decoder, the handler returns 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_endpointslice_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = EndpointSlice::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "discovery.k8s.io/v1",
-        "kind": "EndpointSlice",
-        "metadata": meta,
-        "addressType": obj.address_type
-    });
-    let endpoints_arr: Vec<serde_json::Value> = obj
-        .endpoints
-        .into_iter()
-        .map(|ep| {
-            let mut ej = serde_json::json!({
-                "addresses": ep.addresses
-            });
-            if let Some(c) = ep.conditions {
-                ej["conditions"] = serde_json::json!({
-                    "ready": c.ready,
-                    "serving": c.serving,
-                    "terminating": c.terminating
-                });
-            }
-            if !ep.hostname.is_empty() {
-                ej["hostname"] = serde_json::Value::String(ep.hostname);
-            }
-            if let Some(r) = ep.target_ref {
-                let mut rj = serde_json::json!({});
-                if !r.kind.is_empty() {
-                    rj["kind"] = serde_json::Value::String(r.kind);
-                }
-                if !r.namespace.is_empty() {
-                    rj["namespace"] = serde_json::Value::String(r.namespace);
-                }
-                if !r.name.is_empty() {
-                    rj["name"] = serde_json::Value::String(r.name);
-                }
-                if !r.uid.is_empty() {
-                    rj["uid"] = serde_json::Value::String(r.uid);
-                }
-                ej["targetRef"] = rj;
-            }
-            if !ep.node_name.is_empty() {
-                ej["nodeName"] = serde_json::Value::String(ep.node_name);
-            }
-            ej
-        })
-        .collect();
-    out["endpoints"] = serde_json::Value::Array(endpoints_arr);
-    let ports_arr: Vec<serde_json::Value> = obj
-        .ports
-        .into_iter()
-        .map(|p| {
-            let mut pj = serde_json::json!({});
-            if !p.name.is_empty() {
-                pj["name"] = serde_json::Value::String(p.name);
-            }
-            if !p.protocol.is_empty() {
-                pj["protocol"] = serde_json::Value::String(p.protocol);
-            }
-            pj["port"] = serde_json::Value::Number(serde_json::Number::from(p.port));
-            if !p.app_protocol.is_empty() {
-                pj["appProtocol"] = serde_json::Value::String(p.app_protocol);
-            }
-            pj
-        })
-        .collect();
-    out["ports"] = serde_json::Value::Array(ports_arr);
-    Some(out)
-}
-
-// --- k8s.io/api/events/v1/generated.proto ---
-
-/// EventSeries (events.k8s.io/v1) — discovery.k8s.io/v1/generated.proto
-/// field 1: count (int32), field 2: lastObservedTime (MicroTime)
-#[derive(Clone, PartialEq, Message)]
-struct EventsV1EventSeries {
-    #[prost(int32, tag = "1")]
-    count: i32,
-    #[prost(message, tag = "2")]
-    last_observed_time: Option<MicroTime>,
-}
-
-/// Event (events.k8s.io/v1) — events/v1/generated.proto
-/// field 1: metadata, field 2: eventTime, field 3: series, field 4: reportingController,
-/// field 5: reportingInstance, field 6: action, field 7: reason, field 8: regarding,
-/// field 9: related, field 10: note, field 11: type,
-/// field 12: deprecatedSource, field 13: deprecatedFirstTimestamp, field 14: deprecatedLastTimestamp,
-/// field 15: deprecatedCount
-#[derive(Clone, PartialEq, Message)]
-struct EventsV1Event {
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    #[prost(message, tag = "2")]
-    event_time: Option<MicroTime>,
-    #[prost(message, tag = "3")]
-    series: Option<EventsV1EventSeries>,
-    #[prost(string, tag = "4")]
-    reporting_controller: String,
-    #[prost(string, tag = "5")]
-    reporting_instance: String,
-    #[prost(string, tag = "6")]
-    action: String,
-    #[prost(string, tag = "7")]
-    reason: String,
-    #[prost(message, tag = "8")]
-    regarding: Option<ObjectReference>,
-    #[prost(message, tag = "9")]
-    related: Option<ObjectReference>,
-    #[prost(string, tag = "10")]
-    note: String,
-    #[prost(string, tag = "11")]
-    r#type: String,
-    #[prost(message, tag = "12")]
-    deprecated_source: Option<EventSource>,
-    #[prost(message, tag = "13")]
-    deprecated_first_timestamp: Option<Time>,
-    #[prost(message, tag = "14")]
-    deprecated_last_timestamp: Option<Time>,
-    #[prost(int32, tag = "15")]
-    deprecated_count: i32,
-}
-
-/// Decode a proto-encoded events.k8s.io/v1 Event into a serde_json::Value.
-///
-/// The Events API conformance test POSTs events.k8s.io/v1 Event objects with
-/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder, the handler
-/// returns 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_events_v1_event_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let ev = EventsV1Event::decode(data).ok()?;
-    let meta = object_meta_to_json(ev.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "events.k8s.io/v1",
-        "kind": "Event",
-        "metadata": meta
-    });
-    if let Some(t) = ev.event_time {
-        if t.seconds > 0 {
-            let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
-            out["eventTime"] = serde_json::Value::String(ts);
-        }
-    }
-    if let Some(s) = ev.series {
-        let mut sj = serde_json::json!({});
-        if s.count != 0 {
-            sj["count"] = serde_json::Value::Number(serde_json::Number::from(s.count));
-        }
-        if let Some(t) = s.last_observed_time {
-            if t.seconds > 0 {
-                let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
-                sj["lastObservedTime"] = serde_json::Value::String(ts);
-            }
-        }
-        out["series"] = sj;
-    }
-    if !ev.reporting_controller.is_empty() {
-        out["reportingController"] = serde_json::Value::String(ev.reporting_controller);
-    }
-    if !ev.reporting_instance.is_empty() {
-        out["reportingInstance"] = serde_json::Value::String(ev.reporting_instance);
-    }
-    if !ev.action.is_empty() {
-        out["action"] = serde_json::Value::String(ev.action);
-    }
-    if !ev.reason.is_empty() {
-        out["reason"] = serde_json::Value::String(ev.reason);
-    }
-    if let Some(r) = ev.regarding {
-        let mut rj = serde_json::json!({});
-        if !r.api_version.is_empty() {
-            rj["apiVersion"] = serde_json::Value::String(r.api_version);
-        }
-        if !r.kind.is_empty() {
-            rj["kind"] = serde_json::Value::String(r.kind);
-        }
-        if !r.namespace.is_empty() {
-            rj["namespace"] = serde_json::Value::String(r.namespace);
-        }
-        if !r.name.is_empty() {
-            rj["name"] = serde_json::Value::String(r.name);
-        }
-        if !r.uid.is_empty() {
-            rj["uid"] = serde_json::Value::String(r.uid);
-        }
-        out["regarding"] = rj;
-    }
-    if let Some(r) = ev.related {
-        let mut rj = serde_json::json!({});
-        if !r.kind.is_empty() {
-            rj["kind"] = serde_json::Value::String(r.kind);
-        }
-        if !r.namespace.is_empty() {
-            rj["namespace"] = serde_json::Value::String(r.namespace);
-        }
-        if !r.name.is_empty() {
-            rj["name"] = serde_json::Value::String(r.name);
-        }
-        out["related"] = rj;
-    }
-    if !ev.note.is_empty() {
-        out["note"] = serde_json::Value::String(ev.note);
-    }
-    if !ev.r#type.is_empty() {
-        out["type"] = serde_json::Value::String(ev.r#type);
-    }
-    if ev.deprecated_count != 0 {
-        out["deprecatedCount"] =
-            serde_json::Value::Number(serde_json::Number::from(ev.deprecated_count));
-    }
-    Some(out)
-}
-
-// --- k8s.io/api/certificates/v1/generated.proto ---
-
-/// CertificateSigningRequestSpec — certificates.k8s.io/v1/generated.proto
-/// field 1: request (bytes), field 2: signerName (string), field 3: expirationSeconds (int32),
-/// field 4: usages (repeated string), field 5: username, field 6: uid,
-/// field 7: groups (repeated string)
-#[derive(Clone, PartialEq, Message)]
-struct CertificateSigningRequestSpecProto {
-    #[prost(bytes = "vec", tag = "1")]
-    request: Vec<u8>,
-    #[prost(string, tag = "2")]
-    signer_name: String,
-    #[prost(int32, tag = "3")]
-    expiration_seconds: i32,
-    #[prost(string, repeated, tag = "4")]
-    usages: Vec<String>,
-    #[prost(string, tag = "5")]
-    username: String,
-    #[prost(string, tag = "6")]
-    uid: String,
-    #[prost(string, repeated, tag = "7")]
-    groups: Vec<String>,
-}
-
-/// CertificateSigningRequest — certificates.k8s.io/v1/generated.proto
-/// field 1: metadata (ObjectMeta), field 2: spec, field 3: status (skipped)
-#[derive(Clone, PartialEq, Message)]
-struct CertificateSigningRequestProto {
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    #[prost(message, tag = "2")]
-    spec: Option<CertificateSigningRequestSpecProto>,
-}
-
-/// Decode a proto-encoded CertificateSigningRequest into a serde_json::Value.
-///
-/// The CSR conformance test POSTs/PUTs with Content-Type: application/vnd.kubernetes.protobuf.
-/// Without this decoder, the handler returns 400 "invalid JSON: expected value at line 1 column 1".
-/// spec.request (bytes) is base64-encoded in JSON; we use standard base64 to match Kubernetes.
-pub fn decode_csr_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = CertificateSigningRequestProto::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "certificates.k8s.io/v1",
-        "kind": "CertificateSigningRequest",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({});
-        if !spec.request.is_empty() {
-            use base64::Engine as _;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&spec.request);
-            spec_json["request"] = serde_json::Value::String(b64);
-        }
-        if !spec.signer_name.is_empty() {
-            spec_json["signerName"] = serde_json::Value::String(spec.signer_name);
-        }
-        if spec.expiration_seconds != 0 {
-            spec_json["expirationSeconds"] =
-                serde_json::Value::Number(serde_json::Number::from(spec.expiration_seconds));
-        }
-        if !spec.usages.is_empty() {
-            spec_json["usages"] = serde_json::Value::Array(
-                spec.usages
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            );
-        }
-        if !spec.username.is_empty() {
-            spec_json["username"] = serde_json::Value::String(spec.username);
-        }
-        if !spec.uid.is_empty() {
-            spec_json["uid"] = serde_json::Value::String(spec.uid);
-        }
-        if !spec.groups.is_empty() {
-            spec_json["groups"] = serde_json::Value::Array(
-                spec.groups
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            );
-        }
-        out["spec"] = spec_json;
-    }
-    Some(out)
-}
-
 /// Decode a proto-encoded ControllerRevision into a serde_json::Value.
 ///
 /// DaemonSet and StatefulSet controllers POST ControllerRevision objects with
@@ -3130,7 +2305,9 @@ pub fn decode_proto_by_kind_and_version(
         }
         "Event" => {
             if api_version == "events.k8s.io/v1" {
-                decode_events_v1_event_proto(raw)
+                crate::net_disc_cert_policy_events_gen_adapter::decode_events_v1_event_proto_gen(
+                    raw,
+                )
             } else {
                 crate::core_gen_adapter::decode_event_proto_gen(raw)
             }
@@ -3167,7 +2344,11 @@ pub fn decode_proto_by_kind_and_version(
         }
         "ResourceQuota" => crate::core_gen_adapter::decode_resourcequota_proto_gen(raw),
         "LimitRange" => crate::core_gen_adapter::decode_limitrange_proto_gen(raw),
-        "PodDisruptionBudget" => decode_poddisruptionbudget_proto(raw),
+        "PodDisruptionBudget" => {
+            crate::net_disc_cert_policy_events_gen_adapter::decode_poddisruptionbudget_proto_gen(
+                raw,
+            )
+        }
         "FlowSchema" => crate::storage_node_flow_gen_adapter::decode_flowschema_proto_gen(raw),
         "PriorityLevelConfiguration" => {
             crate::storage_node_flow_gen_adapter::decode_prioritylevelconfiguration_proto_gen(raw)
@@ -3190,10 +2371,16 @@ pub fn decode_proto_by_kind_and_version(
         "ValidatingAdmissionPolicyBinding" => {
             crate::admissionreg_gen_adapter::decode_validatingadmissionpolicybinding_proto_gen(raw)
         }
-        "IngressClass" => decode_ingressclass_proto(raw),
-        "Ingress" => decode_ingress_proto(raw),
-        "EndpointSlice" => decode_endpointslice_proto(raw),
-        "CertificateSigningRequest" => decode_csr_proto(raw),
+        "IngressClass" => {
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ingressclass_proto_gen(raw)
+        }
+        "Ingress" => crate::net_disc_cert_policy_events_gen_adapter::decode_ingress_proto_gen(raw),
+        "EndpointSlice" => {
+            crate::net_disc_cert_policy_events_gen_adapter::decode_endpointslice_proto_gen(raw)
+        }
+        "CertificateSigningRequest" => {
+            crate::net_disc_cert_policy_events_gen_adapter::decode_csr_proto_gen(raw)
+        }
         "PriorityClass" => {
             crate::storage_node_flow_gen_adapter::decode_priorityclass_proto_gen(raw)
         }
@@ -8267,32 +7454,34 @@ mod tests {
     /// `decode_poddisruptionbudget_proto`.
     #[test]
     fn decode_poddisruptionbudget_proto_preserves_status_disrupted_pods() {
+        use crate::net_disc_cert_policy_events_gen::k8s::io::api::policy::v1 as gen_policy_v1;
+        use crate::net_disc_cert_policy_events_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
         use prost::Message as _;
 
-        let pdb = PodDisruptionBudget {
-            metadata: Some(ObjectMeta {
-                name: "status-pdb".to_string(),
-                namespace: "default".to_string(),
+        let pdb = gen_policy_v1::PodDisruptionBudget {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("status-pdb".to_string()),
+                namespace: Some("default".to_string()),
                 ..Default::default()
             }),
             spec: None,
-            status: Some(PodDisruptionBudgetStatus {
-                observed_generation: 1,
+            status: Some(gen_policy_v1::PodDisruptionBudgetStatus {
+                observed_generation: Some(1),
                 disrupted_pods: {
-                    let mut m = std::collections::BTreeMap::new();
+                    let mut m = std::collections::HashMap::new();
                     m.insert(
                         "pod-0".to_string(),
-                        Time {
-                            seconds: 1_700_000_000,
-                            nanos: 0,
+                        gen_meta_v1::Time {
+                            seconds: Some(1_700_000_000),
+                            nanos: Some(0),
                         },
                     );
                     m
                 },
-                disruptions_allowed: 2,
-                current_healthy: 3,
-                desired_healthy: 2,
-                expected_pods: 3,
+                disruptions_allowed: Some(2),
+                current_healthy: Some(3),
+                desired_healthy: Some(2),
+                expected_pods: Some(3),
                 conditions: vec![],
             }),
         };
@@ -8300,10 +7489,14 @@ mod tests {
         let mut buf = Vec::new();
         pdb.encode(&mut buf).expect("prost encode must succeed");
 
-        let result = decode_poddisruptionbudget_proto(&buf).expect(
-            "decode_poddisruptionbudget_proto must return Some for a proto /status body — \
+        let result =
+            crate::net_disc_cert_policy_events_gen_adapter::decode_poddisruptionbudget_proto_gen(
+                &buf,
+            )
+            .expect(
+                "decode_poddisruptionbudget_proto must return Some for a proto /status body — \
              the DisruptionController sends proto-encoded PUT /status writes",
-        );
+            );
 
         assert_eq!(result["kind"], "PodDisruptionBudget");
         assert_eq!(result["metadata"]["name"], "status-pdb");
@@ -8378,7 +7571,10 @@ mod tests {
         let mut pdb_bytes = encode_length_delimited(1, &meta_bytes);
         pdb_bytes.extend_from_slice(&encode_length_delimited(2, &spec_bytes));
 
-        let result = decode_poddisruptionbudget_proto(&pdb_bytes)
+        let result =
+            crate::net_disc_cert_policy_events_gen_adapter::decode_poddisruptionbudget_proto_gen(
+                &pdb_bytes,
+            )
             .expect("decode_poddisruptionbudget_proto must return Some for a proto create body");
 
         assert_eq!(
@@ -9951,7 +9147,12 @@ mod tests {
     /// decode_ingressclass_proto must return None for malformed proto input.
     #[test]
     fn decode_ingressclass_proto_returns_none_for_garbage() {
-        assert!(decode_ingressclass_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ingressclass_proto_gen(&[
+                0xff, 0xff, 0xff
+            ])
+            .is_none()
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -9966,12 +9167,13 @@ mod tests {
     fn decode_proto_by_kind_and_version_dispatches_ingress() {
         let obj_meta = encode_length_delimited(1, b"test-ingress"); // ObjectMeta.name
 
-        // IngressSpec: field 1 = ingressClassName (string), field 4 = rules (repeated IngressRule)
-        // IngressRule proto bytes: field 1 = host (string "example.com")
+        // IngressSpec (networking.k8s.io/v1/generated.proto):
+        //   field 1 = defaultBackend, field 2 = tls, field 3 = rules, field 4 = ingressClassName
+        // IngressRule: field 1 = host (string)
         let rule = encode_length_delimited(1, b"example.com"); // IngressRule: field 1 = host
 
-        let mut spec_proto = encode_length_delimited(1, b"nginx"); // field 1 = ingressClassName
-        spec_proto.extend_from_slice(&encode_length_delimited(4, &rule)); // field 4 = rules
+        let mut spec_proto = encode_length_delimited(4, b"nginx"); // field 4 = ingressClassName
+        spec_proto.extend_from_slice(&encode_length_delimited(3, &rule)); // field 3 = rules
 
         // Ingress: field 1 = ObjectMeta, field 2 = IngressSpec
         let mut ingress_proto = encode_length_delimited(1, &obj_meta);
@@ -10017,19 +9219,21 @@ mod tests {
         let mut svc_backend = encode_length_delimited(1, b"my-service");
         svc_backend.extend_from_slice(&encode_length_delimited(2, &port_proto));
 
-        // IngressBackend: field 1 = service
-        let backend = encode_length_delimited(1, &svc_backend);
+        // IngressBackend (networking.k8s.io/v1/generated.proto): field 4 = service
+        let backend = encode_length_delimited(4, &svc_backend);
 
-        // IngressSpec: field 2 = defaultBackend
-        let spec = encode_length_delimited(2, &backend);
+        // IngressSpec (networking.k8s.io/v1/generated.proto): field 1 = defaultBackend
+        let spec = encode_length_delimited(1, &backend);
 
         // Ingress: field 1 = ObjectMeta (minimal), field 2 = spec
         let obj_meta = encode_length_delimited(1, b"backend-ingress");
         let mut ingress_proto = encode_length_delimited(1, &obj_meta);
         ingress_proto.extend_from_slice(&encode_length_delimited(2, &spec));
 
-        let result = decode_ingress_proto(&ingress_proto)
-            .expect("Ingress with defaultBackend must decode successfully");
+        let result = crate::net_disc_cert_policy_events_gen_adapter::decode_ingress_proto_gen(
+            &ingress_proto,
+        )
+        .expect("Ingress with defaultBackend must decode successfully");
 
         assert_eq!(
             result["spec"]["defaultBackend"]["service"]["name"], "my-service",
@@ -10135,12 +9339,16 @@ mod tests {
         eps_proto.extend_from_slice(&encode_length_delimited(3, &port_content)); // ports[0]
         eps_proto.extend_from_slice(&encode_length_delimited(4, b"IPv4")); // addressType
 
-        let result = decode_endpointslice_proto(&eps_proto).expect(
-            "decode_endpointslice_proto must succeed for a valid EndpointSlice with \
+        let result =
+            crate::net_disc_cert_policy_events_gen_adapter::decode_endpointslice_proto_gen(
+                &eps_proto,
+            )
+            .expect(
+                "decode_endpointslice_proto must succeed for a valid EndpointSlice with \
                  conditions and port — if it returns None, the handler gets raw proto bytes \
                  and returns 400 'invalid JSON: expected value at line 1 column 1', \
                  failing the conformance test",
-        );
+            );
 
         assert_eq!(result["kind"], "EndpointSlice");
         assert_eq!(result["apiVersion"], "discovery.k8s.io/v1");
@@ -10255,18 +9463,16 @@ mod tests {
     fn decode_proto_by_kind_and_version_dispatches_csr() {
         let obj_meta = encode_length_delimited(1, b"test-csr");
 
-        // CertificateSigningRequestSpec:
-        //   field 1 = request (bytes) — raw PEM bytes
-        //   field 2 = signerName (string)
-        //   field 4 = usages (repeated string)
+        // CertificateSigningRequestSpec (certificates.k8s.io/v1/generated.proto):
+        //   field 1 = request (bytes), field 7 = signerName (string), field 5 = usages (repeated string)
         let fake_csr_bytes =
             b"-----BEGIN CERTIFICATE REQUEST-----\nfake\n-----END CERTIFICATE REQUEST-----";
         let mut spec_proto = encode_length_delimited(1, fake_csr_bytes); // request bytes
         spec_proto.extend_from_slice(&encode_length_delimited(
-            2,
+            7,
             b"kubernetes.io/kube-apiserver-client",
         ));
-        spec_proto.extend_from_slice(&encode_length_delimited(4, b"client auth")); // usages
+        spec_proto.extend_from_slice(&encode_length_delimited(5, b"client auth")); // usages
 
         // CertificateSigningRequest: field 1 = metadata, field 2 = spec
         let mut csr_proto = encode_length_delimited(1, &obj_meta);
@@ -10308,6 +9514,158 @@ mod tests {
             decoded, fake_csr_bytes,
             "spec.request bytes must survive base64 encode/decode round-trip — \
              the signer controller needs the raw DER bytes"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // By-construction tests: previously-dropped fields now decoded via generated structs
+    // ---------------------------------------------------------------------------
+
+    /// EndpointSlice endpoints[].hints.forZones was silently dropped by the hand decoder because
+    /// EndpointHints was not represented in the hand struct. The generated decoder must preserve it
+    /// so that topology-aware routing works (the kube-proxy reads hints to select zone-local endpoints).
+    #[test]
+    fn decode_endpointslice_hints_for_zones_previously_dropped_now_preserved() {
+        // ForZone: field 1 = name (string)
+        let for_zone = encode_length_delimited(1, b"us-east-1a");
+        // EndpointHints: field 1 = forZones (repeated ForZone)
+        let hints = encode_length_delimited(1, &for_zone);
+        // Endpoint: field 1 = addresses, field 8 = hints
+        let mut ep = encode_length_delimited(1, b"10.0.0.5");
+        ep.extend_from_slice(&encode_length_delimited(8, &hints));
+        // EndpointSlice: field 1 = metadata, field 2 = endpoints, field 4 = addressType
+        let meta = encode_length_delimited(1, b"my-slice");
+        let mut eps = encode_length_delimited(1, &meta);
+        eps.extend_from_slice(&encode_length_delimited(2, &ep));
+        eps.extend_from_slice(&encode_length_delimited(4, b"IPv4"));
+
+        let result =
+            crate::net_disc_cert_policy_events_gen_adapter::decode_endpointslice_proto_gen(&eps)
+                .expect(
+                "EndpointSlice with hints must decode — hints.forZones enables zone-local routing",
+            );
+
+        assert_eq!(
+            result["endpoints"][0]["hints"]["forZones"][0]["name"], "us-east-1a",
+            "hints.forZones[0].name must be preserved — kube-proxy uses this for topology-aware routing; \
+             the hand decoder silently dropped all hints because EndpointHints was absent from the hand struct"
+        );
+    }
+
+    /// PDB spec.unhealthyPodEvictionPolicy was absent from the hand decoder struct and therefore
+    /// silently dropped. The generated decoder must preserve it so that eviction controllers can
+    /// enforce the correct policy (AlwaysAllow vs IfHealthyBudget).
+    #[test]
+    fn decode_pdb_unhealthy_pod_eviction_policy_previously_dropped_now_preserved() {
+        // PodDisruptionBudgetSpec: field 4 = unhealthyPodEvictionPolicy (string)
+        let spec = encode_length_delimited(4, b"AlwaysAllow");
+        // PodDisruptionBudget: field 1 = metadata, field 2 = spec
+        let meta = encode_length_delimited(1, b"my-pdb");
+        let mut pdb = encode_length_delimited(1, &meta);
+        pdb.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result =
+            crate::net_disc_cert_policy_events_gen_adapter::decode_poddisruptionbudget_proto_gen(
+                &pdb,
+            )
+            .expect("PDB with unhealthyPodEvictionPolicy must decode");
+
+        assert_eq!(
+            result["spec"]["unhealthyPodEvictionPolicy"], "AlwaysAllow",
+            "unhealthyPodEvictionPolicy must be preserved — eviction controllers route by this field; \
+             the hand decoder silently dropped it because the field was absent from the hand struct"
+        );
+    }
+
+    /// Ingress spec.ingressClassName was decoded from wrong proto field 1 (now correct field 4)
+    /// by the hand decoder. The generated decoder uses the real upstream field number so
+    /// the value survives encode/decode without silent corruption.
+    #[test]
+    fn decode_ingress_ingress_class_name_correct_field_number_now_preserved() {
+        // IngressSpec: field 4 = ingressClassName (string) — real upstream field number
+        let spec = encode_length_delimited(4, b"nginx");
+        // Ingress: field 1 = metadata, field 2 = spec
+        let meta = encode_length_delimited(1, b"my-ingress");
+        let mut ingress = encode_length_delimited(1, &meta);
+        ingress.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result =
+            crate::net_disc_cert_policy_events_gen_adapter::decode_ingress_proto_gen(&ingress)
+                .expect("Ingress with ingressClassName must decode");
+
+        assert_eq!(
+            result["spec"]["ingressClassName"], "nginx",
+            "ingressClassName must survive decode at proto field 4 — the hand decoder used wrong \
+             field 1, causing silent field corruption when real upstream protos encode it at field 4"
+        );
+    }
+
+    /// CSR spec.expirationSeconds was missing from the hand decoder and therefore silently dropped.
+    /// The generated decoder must preserve it so that short-lived certificates can be issued
+    /// (the signer reads expirationSeconds to cap certificate lifetime).
+    #[test]
+    fn decode_csr_expiration_seconds_previously_dropped_now_preserved() {
+        // CertificateSigningRequestSpec: field 1 = request, field 7 = signerName, field 8 = expirationSeconds
+        let mut spec = encode_length_delimited(1, b"fakecertrequest");
+        spec.extend_from_slice(&encode_length_delimited(
+            7,
+            b"kubernetes.io/kube-apiserver-client",
+        ));
+        // expirationSeconds = 3600: tag = (8 << 3) | 0 = 0x40; varint 3600 = 0xB0, 0x1C
+        spec.push(0x40); // field 8, wire type 0
+        spec.extend_from_slice(&encode_varint(3600));
+
+        // CertificateSigningRequest: field 1 = metadata, field 2 = spec
+        let meta = encode_length_delimited(1, b"my-csr");
+        let mut csr = encode_length_delimited(1, &meta);
+        csr.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result = crate::net_disc_cert_policy_events_gen_adapter::decode_csr_proto_gen(&csr)
+            .expect("CSR with expirationSeconds must decode");
+
+        assert_eq!(
+            result["spec"]["expirationSeconds"], 3600,
+            "expirationSeconds must be preserved — signers use this to cap certificate lifetime; \
+             the hand decoder silently dropped it because the field was absent from the hand struct"
+        );
+    }
+
+    /// events.k8s.io/v1 Event.series was absent from the hand decoder and therefore silently
+    /// dropped. The generated decoder must preserve series.count and series.lastObservedTime
+    /// so that event aggregation metadata survives the round-trip.
+    #[test]
+    fn decode_events_v1_event_series_previously_dropped_now_preserved() {
+        // EventSeries: field 1 = count (int32), field 2 = lastObservedTime (MicroTime)
+        // MicroTime is a message with field 1 = seconds (int64), field 2 = nanos (int32)
+        let mut micro_time = Vec::new();
+        micro_time.push(0x08); // field 1, wire type 0
+        micro_time.extend_from_slice(&encode_varint(1_700_000_000u64));
+        micro_time.push(0x10); // field 2, wire type 0
+        micro_time.extend_from_slice(&encode_varint(0u64));
+
+        let mut series = Vec::new();
+        series.push(0x08); // field 1 (count), wire type 0
+        series.extend_from_slice(&encode_varint(5u64));
+        series.extend_from_slice(&encode_length_delimited(2, &micro_time));
+
+        // events.k8s.io/v1 Event: field 1 = metadata, field 3 = series
+        let meta = encode_length_delimited(1, b"test-event-series");
+        let mut ev = encode_length_delimited(1, &meta);
+        ev.extend_from_slice(&encode_length_delimited(3, &series));
+
+        let result =
+            crate::net_disc_cert_policy_events_gen_adapter::decode_events_v1_event_proto_gen(&ev)
+                .expect("events.k8s.io/v1 Event with series must decode");
+
+        assert_eq!(
+            result["series"]["count"], 5,
+            "series.count must be preserved — event aggregation UI shows the repeat count; \
+             the hand decoder silently dropped series because the field was absent from the hand struct"
+        );
+        assert!(
+            result["series"]["lastObservedTime"].as_str().is_some(),
+            "series.lastObservedTime must be preserved as RFC3339 string — \
+             the hand decoder silently dropped it because series was absent from the hand struct"
         );
     }
 
