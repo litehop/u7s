@@ -1429,197 +1429,7 @@ struct Lease {
     spec: Option<LeaseSpec>,
 }
 
-// --- k8s.io/api/storage/v1/generated.proto ---
-
-/// VolumeNodeResources — used in CSINodeAllocatable
-/// Source: k8s.io/api/storage/v1/generated.proto message VolumeNodeResources
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct VolumeNodeResources {
-    /// count (field 1, int32) — maximum number of unique volumes managed by the CSI driver
-    #[prost(int32, tag = "1")]
-    count: i32,
-}
-
-/// CSINodeDriver — k8s.io/api/storage/v1/generated.proto
-/// Source: k8s.io/api/storage/v1/generated.proto message CSINodeDriver
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct CsiNodeDriver {
-    /// name (field 1, string)
-    #[prost(string, tag = "1")]
-    name: String,
-    /// nodeID (field 2, string)
-    #[prost(string, tag = "2")]
-    node_id: String,
-    /// topologyKeys (field 3, repeated string)
-    #[prost(string, repeated, tag = "3")]
-    topology_keys: Vec<String>,
-    /// allocatable (field 4, message VolumeNodeResources)
-    #[prost(message, tag = "4")]
-    allocatable: Option<VolumeNodeResources>,
-}
-
-/// CSINodeSpec — k8s.io/api/storage/v1/generated.proto
-/// Source: k8s.io/api/storage/v1/generated.proto message CSINodeSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct CsiNodeSpec {
-    /// drivers (field 1, repeated CSINodeDriver)
-    #[prost(message, repeated, tag = "1")]
-    drivers: Vec<CsiNodeDriver>,
-}
-
-/// CSINode — k8s.io/api/storage/v1/generated.proto
-/// Source: k8s.io/api/storage/v1/generated.proto message CSINode
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct CsiNode {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message CSINodeSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<CsiNodeSpec>,
-}
-
-/// CSIDriverSpec — k8s.io/api/storage/v1/generated.proto
-/// Source: api-storage-v1-generated.proto message CSIDriverSpec
-#[derive(Clone, PartialEq, Message)]
-struct CsiDriverSpec {
-    /// attachRequired (field 1, bool)
-    #[prost(bool, optional, tag = "1")]
-    attach_required: Option<bool>,
-    /// podInfoOnMount (field 2, bool)
-    #[prost(bool, optional, tag = "2")]
-    pod_info_on_mount: Option<bool>,
-    /// volumeLifecycleModes (field 3, repeated string)
-    #[prost(string, repeated, tag = "3")]
-    volume_lifecycle_modes: Vec<String>,
-    /// storageCapacity (field 4, bool)
-    #[prost(bool, optional, tag = "4")]
-    storage_capacity: Option<bool>,
-    /// fsGroupPolicy (field 5, string)
-    #[prost(string, optional, tag = "5")]
-    fs_group_policy: Option<String>,
-    /// requiresRepublish (field 7, bool) — field 6 is tokenRequests (skipped)
-    #[prost(bool, optional, tag = "7")]
-    requires_republish: Option<bool>,
-    /// seLinuxMount (field 8, bool)
-    #[prost(bool, optional, tag = "8")]
-    se_linux_mount: Option<bool>,
-}
-
-/// CSIDriver — k8s.io/api/storage/v1/generated.proto
-/// Source: api-storage-v1-generated.proto message CSIDriver
-#[derive(Clone, PartialEq, Message)]
-struct CsiDriver {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message CSIDriverSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<CsiDriverSpec>,
-}
-
-/// CSIStorageCapacity — k8s.io/api/storage/v1/generated.proto
-/// Source: api-storage-v1-generated.proto message CSIStorageCapacity
-#[derive(Clone, PartialEq, Message)]
-struct CsiStorageCapacity {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// nodeTopology (field 2, message LabelSelector)
-    #[prost(message, tag = "2")]
-    node_topology: Option<AppsLabelSelector>,
-    /// storageClassName (field 3, string)
-    #[prost(string, tag = "3")]
-    storage_class_name: String,
-    /// capacity (field 4, message Quantity)
-    #[prost(message, tag = "4")]
-    capacity: Option<Quantity>,
-    /// maximumVolumeSize (field 5, message Quantity)
-    #[prost(message, tag = "5")]
-    maximum_volume_size: Option<Quantity>,
-}
-
-/// VolumeAttachmentSource — k8s.io/api/storage/v1/generated.proto
-/// Source: k8s.io/api/storage/v1/generated.proto message VolumeAttachmentSource
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct VolumeAttachmentSource {
-    /// persistentVolumeName (field 1, string)
-    #[prost(string, tag = "1")]
-    persistent_volume_name: String,
-    /// inlineVolumeSpec (field 2, bytes) — complex, decoded as raw bytes
-    #[prost(bytes = "vec", tag = "2")]
-    inline_volume_spec: Vec<u8>,
-}
-
-/// VolumeAttachmentSpec — k8s.io/api/storage/v1/generated.proto
-/// Source: k8s.io/api/storage/v1/generated.proto message VolumeAttachmentSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct VolumeAttachmentSpec {
-    /// attacher (field 1, string)
-    #[prost(string, tag = "1")]
-    attacher: String,
-    /// source (field 2, message VolumeAttachmentSource)
-    #[prost(message, tag = "2")]
-    source: Option<VolumeAttachmentSource>,
-    /// nodeName (field 3, string)
-    #[prost(string, tag = "3")]
-    node_name: String,
-}
-
-/// VolumeAttachment — k8s.io/api/storage/v1/generated.proto
-/// Source: k8s.io/api/storage/v1/generated.proto message VolumeAttachment
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct VolumeAttachment {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message VolumeAttachmentSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<VolumeAttachmentSpec>,
-    /// status (field 3, bytes) — not decoded on input
-    #[prost(bytes = "vec", tag = "3")]
-    status: Vec<u8>,
-}
-
-// --- k8s.io/api/node/v1/generated.proto ---
-
-/// Overhead — k8s.io/api/node/v1/generated.proto message Overhead
-/// podFixed (field 1, map<string, Quantity>) — per-pod resource overhead.
-#[derive(Clone, PartialEq, Message)]
-struct Overhead {
-    /// podFixed (field 1, map<string, Quantity>)
-    #[prost(btree_map = "string, message", tag = "1")]
-    pod_fixed: std::collections::BTreeMap<String, Quantity>,
-}
-
-/// RuntimeClass — k8s.io/api/node/v1/generated.proto
-/// Source: k8s.io/api/node/v1/generated.proto message RuntimeClass
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct RuntimeClass {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// handler (field 2, string)
-    #[prost(string, tag = "2")]
-    handler: String,
-    /// overhead (field 3, message Overhead)
-    #[prost(message, tag = "3")]
-    overhead: Option<Overhead>,
-    /// scheduling (field 4, bytes) — complex message, decoded as raw bytes
-    #[prost(bytes = "vec", tag = "4")]
-    scheduling: Vec<u8>,
-}
-
-// --- k8s.io/api/authentication/v1/generated.proto (TokenRequest only) ---
-// TokenReview is migrated to rbac_gen_adapter; these structs serve decode_token_request only.
+// --- k8s.io/api/authorization/v1/generated.proto ---
 
 #[derive(Clone, PartialEq, Message)]
 struct BoundObjectReference {
@@ -1927,19 +1737,6 @@ struct Job {
 
 // --- k8s.io/api/apps/v1/generated.proto ---
 
-/// LabelSelector — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
-/// Source: apimachinery-meta-v1-generated.proto message LabelSelector
-/// Only matchLabels decoded; matchExpressions (field 2) not needed for selector defaulting.
-#[derive(Clone, PartialEq, Message)]
-struct AppsLabelSelector {
-    /// matchLabels (field 1, map<string,string>)
-    #[prost(btree_map = "string, string", tag = "1")]
-    match_labels: ::prost::alloc::collections::BTreeMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
-}
-
 /// PodTemplateSpec (apps context) — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message PodTemplateSpec
 /// Decodes metadata (field 1) and spec (field 2, PodSpec).
@@ -2052,50 +1849,6 @@ struct PersistentVolumeClaim {
     /// status (field 3, message PersistentVolumeClaimStatus)
     #[prost(message, optional, tag = "3")]
     status: Option<PersistentVolumeClaimStatus>,
-}
-
-// --- k8s.io/api/storage/v1/generated.proto ---
-
-/// StorageClass — k8s.io/api/storage/v1/generated.proto
-/// Source: api-storage-v1-generated.proto message StorageClass
-#[derive(Clone, PartialEq, Message)]
-struct StorageClass {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// provisioner (field 2, string)
-    #[prost(string, tag = "2")]
-    provisioner: String,
-    /// parameters (field 3, map<string,string>)
-    #[prost(map = "string, string", tag = "3")]
-    parameters: std::collections::HashMap<String, String>,
-    /// reclaimPolicy (field 4, string)
-    #[prost(string, tag = "4")]
-    reclaim_policy: String,
-    /// mountOptions (field 5, repeated string)
-    #[prost(string, repeated, tag = "5")]
-    mount_options: Vec<String>,
-    /// allowVolumeExpansion (field 6, bool)
-    #[prost(bool, optional, tag = "6")]
-    allow_volume_expansion: Option<bool>,
-    /// volumeBindingMode (field 7, string)
-    #[prost(string, tag = "7")]
-    volume_binding_mode: String,
-}
-
-/// VolumeAttributesClass — k8s.io/api/storage/v1/generated.proto
-/// Source: api-storage-v1-generated.proto message VolumeAttributesClass
-#[derive(Clone, PartialEq, Message)]
-struct VolumeAttributesClass {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// driverName (field 2, string)
-    #[prost(string, tag = "2")]
-    driver_name: String,
-    /// parameters (field 3, map<string,string>)
-    #[prost(map = "string, string", tag = "3")]
-    parameters: std::collections::HashMap<String, String>,
 }
 
 /// Quantity — k8s.io/apimachinery/pkg/api/resource/generated.proto
@@ -2960,37 +2713,6 @@ pub fn decode_replicationcontroller_proto(data: &[u8]) -> Option<serde_json::Val
     Some(obj)
 }
 
-/// Decode a proto-encoded RuntimeClass object into a `serde_json::Value`.
-pub fn decode_runtimeclass_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let rc = RuntimeClass::decode(data).ok()?;
-    let meta = object_meta_to_json(rc.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "node.k8s.io/v1",
-        "kind": "RuntimeClass",
-        "metadata": meta,
-        "handler": rc.handler
-    });
-
-    if obj["handler"]
-        .as_str()
-        .map(|s| s.is_empty())
-        .unwrap_or(true)
-    {
-        obj["handler"] = serde_json::Value::String(String::new());
-    }
-
-    if let Some(overhead) = rc.overhead {
-        if !overhead.pod_fixed.is_empty() {
-            obj["overhead"] = serde_json::json!({
-                "podFixed": limitrange_quantity_map_to_json(overhead.pod_fixed)
-            });
-        }
-    }
-
-    Some(obj)
-}
-
 /// Decode a proto-encoded PersistentVolume object into a `serde_json::Value`.
 pub fn decode_persistentvolume_proto(data: &[u8]) -> Option<serde_json::Value> {
     let pv = PersistentVolume::decode(data).ok()?;
@@ -3036,47 +2758,6 @@ pub fn decode_persistentvolume_proto(data: &[u8]) -> Option<serde_json::Value> {
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
         }
-    }
-
-    Some(obj)
-}
-
-/// Decode a proto-encoded VolumeAttachment object into a `serde_json::Value`.
-pub fn decode_volumeattachment_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let va = VolumeAttachment::decode(data).ok()?;
-    let meta = object_meta_to_json(va.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "storage.k8s.io/v1",
-        "kind": "VolumeAttachment",
-        "metadata": meta
-    });
-
-    if let Some(spec) = va.spec {
-        let mut spec_map = serde_json::Map::new();
-        if !spec.attacher.is_empty() {
-            spec_map.insert(
-                "attacher".to_string(),
-                serde_json::Value::String(spec.attacher),
-            );
-        }
-        if !spec.node_name.is_empty() {
-            spec_map.insert(
-                "nodeName".to_string(),
-                serde_json::Value::String(spec.node_name),
-            );
-        }
-        let mut source_map = serde_json::Map::new();
-        if let Some(src) = spec.source {
-            if !src.persistent_volume_name.is_empty() {
-                source_map.insert(
-                    "persistentVolumeName".to_string(),
-                    serde_json::Value::String(src.persistent_volume_name),
-                );
-            }
-        }
-        spec_map.insert("source".to_string(), serde_json::Value::Object(source_map));
-        obj["spec"] = serde_json::Value::Object(spec_map);
     }
 
     Some(obj)
@@ -3173,103 +2854,6 @@ pub fn decode_lease_proto(data: &[u8]) -> Option<serde_json::Value> {
         }
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
-        }
-    }
-
-    Some(obj)
-}
-
-/// Decode a proto-encoded CSINode object into a `serde_json::Value`.
-pub fn decode_csinode_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let csinode = CsiNode::decode(data).ok()?;
-    let meta = object_meta_to_json(csinode.metadata.unwrap_or_default());
-
-    let drivers: Vec<serde_json::Value> = csinode
-        .spec
-        .map(|s| s.drivers)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|d| {
-            serde_json::json!({
-                "name": d.name,
-                "nodeID": d.node_id
-            })
-        })
-        .collect();
-
-    Some(serde_json::json!({
-        "apiVersion": "storage.k8s.io/v1",
-        "kind": "CSINode",
-        "metadata": meta,
-        "spec": {
-            "drivers": drivers
-        }
-    }))
-}
-
-/// Decode a proto-encoded CSIDriver object into a `serde_json::Value`.
-pub fn decode_csidriver_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let csidriver = CsiDriver::decode(data).ok()?;
-    let meta = object_meta_to_json(csidriver.metadata.unwrap_or_default());
-
-    let mut spec = serde_json::json!({});
-    if let Some(s) = csidriver.spec {
-        if let Some(v) = s.attach_required {
-            spec["attachRequired"] = serde_json::Value::Bool(v);
-        }
-        if let Some(v) = s.pod_info_on_mount {
-            spec["podInfoOnMount"] = serde_json::Value::Bool(v);
-        }
-        if !s.volume_lifecycle_modes.is_empty() {
-            spec["volumeLifecycleModes"] = serde_json::json!(s.volume_lifecycle_modes);
-        }
-        if let Some(v) = s.storage_capacity {
-            spec["storageCapacity"] = serde_json::Value::Bool(v);
-        }
-        if let Some(v) = s.fs_group_policy {
-            if !v.is_empty() {
-                spec["fsGroupPolicy"] = serde_json::Value::String(v);
-            }
-        }
-        if let Some(v) = s.requires_republish {
-            spec["requiresRepublish"] = serde_json::Value::Bool(v);
-        }
-        if let Some(v) = s.se_linux_mount {
-            spec["seLinuxMount"] = serde_json::Value::Bool(v);
-        }
-    }
-
-    Some(serde_json::json!({
-        "apiVersion": "storage.k8s.io/v1",
-        "kind": "CSIDriver",
-        "metadata": meta,
-        "spec": spec
-    }))
-}
-
-/// Decode a proto-encoded CSIStorageCapacity object into a `serde_json::Value`.
-pub fn decode_csistoragecapacity_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let csc = CsiStorageCapacity::decode(data).ok()?;
-    let meta = object_meta_to_json(csc.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "storage.k8s.io/v1",
-        "kind": "CSIStorageCapacity",
-        "metadata": meta,
-        "storageClassName": csc.storage_class_name
-    });
-
-    if let Some(sel) = csc.node_topology {
-        obj["nodeTopology"] = apps_label_selector_to_json(sel);
-    }
-    if let Some(q) = csc.capacity {
-        if let Some(s) = q.string {
-            obj["capacity"] = serde_json::Value::String(s);
-        }
-    }
-    if let Some(q) = csc.maximum_volume_size {
-        if let Some(s) = q.string {
-            obj["maximumVolumeSize"] = serde_json::Value::String(s);
         }
     }
 
@@ -3731,20 +3315,6 @@ pub fn decode_job_proto(data: &[u8]) -> Option<serde_json::Value> {
     }
 
     Some(obj)
-}
-
-/// Convert an `AppsLabelSelector` to the JSON form used in Kubernetes API objects.
-fn apps_label_selector_to_json(sel: AppsLabelSelector) -> serde_json::Value {
-    let mut m = serde_json::json!({});
-    if !sel.match_labels.is_empty() {
-        let labels: serde_json::Map<String, serde_json::Value> = sel
-            .match_labels
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        m["matchLabels"] = serde_json::Value::Object(labels);
-    }
-    m
 }
 
 /// Convert a decoded `DownwardAPIVolumeFile` into a JSON object.
@@ -4614,69 +4184,6 @@ pub fn decode_persistentvolumeclaim_proto(data: &[u8]) -> Option<serde_json::Val
     Some(result)
 }
 
-/// Decode a proto-encoded StorageClass object into a `serde_json::Value`.
-///
-/// kubectl sends StorageClass with Content-Type: application/vnd.kubernetes.protobuf.
-/// Without decoding the top-level fields (provisioner, parameters, reclaimPolicy, etc.),
-/// a proto write returns 200 OK but the stored object has no provisioner, breaking dynamic
-/// provisioning for any PVC that references this StorageClass.
-pub fn decode_storageclass_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = StorageClass::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "storage.k8s.io/v1",
-        "kind": "StorageClass",
-        "metadata": meta
-    });
-    if !obj.provisioner.is_empty() {
-        result["provisioner"] = obj.provisioner.into();
-    }
-    if !obj.parameters.is_empty() {
-        let params: serde_json::Map<String, serde_json::Value> = obj
-            .parameters
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        result["parameters"] = serde_json::Value::Object(params);
-    }
-    if !obj.reclaim_policy.is_empty() {
-        result["reclaimPolicy"] = obj.reclaim_policy.into();
-    }
-    if !obj.mount_options.is_empty() {
-        result["mountOptions"] = obj.mount_options.into();
-    }
-    if let Some(v) = obj.allow_volume_expansion {
-        result["allowVolumeExpansion"] = v.into();
-    }
-    if !obj.volume_binding_mode.is_empty() {
-        result["volumeBindingMode"] = obj.volume_binding_mode.into();
-    }
-    Some(result)
-}
-
-/// Decode a proto-encoded VolumeAttributesClass object into a `serde_json::Value`.
-pub fn decode_volumeattributesclass_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = VolumeAttributesClass::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "storage.k8s.io/v1",
-        "kind": "VolumeAttributesClass",
-        "metadata": meta
-    });
-    if !obj.driver_name.is_empty() {
-        result["driverName"] = obj.driver_name.into();
-    }
-    if !obj.parameters.is_empty() {
-        let params: serde_json::Map<String, serde_json::Value> = obj
-            .parameters
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        result["parameters"] = serde_json::Value::Object(params);
-    }
-    Some(result)
-}
-
 /// Convert a map of resource name to Quantity into a serde_json::Value object.
 ///
 /// Only quantities that have a non-empty string representation are included.
@@ -4930,59 +4437,6 @@ pub fn decode_crd_proto(data: &[u8]) -> Option<serde_json::Value> {
         "kind": "CustomResourceDefinition",
         "metadata": meta,
         "spec": spec_val
-    }))
-}
-
-// --- k8s.io/api/flowcontrol/v1/generated.proto ---
-
-/// FlowSchema — k8s.io/api/flowcontrol/v1/generated.proto
-/// Source: k8s.io/api/flowcontrol/v1/generated.proto message FlowSchema
-/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
-/// Only the metadata field is decoded; the spec is opaque to u7s.
-#[derive(Clone, PartialEq, Message)]
-struct FlowSchema {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-}
-
-/// PriorityLevelConfiguration — k8s.io/api/flowcontrol/v1/generated.proto
-/// Source: k8s.io/api/flowcontrol/v1/generated.proto message PriorityLevelConfiguration
-/// (proto file not in repo; only metadata decoded — field 1 is standard across all types)
-/// Only the metadata field is decoded; the spec is opaque to u7s.
-#[derive(Clone, PartialEq, Message)]
-struct PriorityLevelConfiguration {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-}
-
-/// Decode a proto-encoded FlowSchema into a serde_json::Value.
-///
-/// The conformance test POSTs FlowSchema with Content-Type: application/vnd.kubernetes.protobuf.
-/// Without this decoder, decode_core_proto_by_kind returns None, extract_body returns raw proto
-/// bytes, and the handler returns 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_flowschema_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = FlowSchema::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
-        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
-        "kind": "FlowSchema",
-        "metadata": meta
-    }))
-}
-
-/// Decode a proto-encoded PriorityLevelConfiguration into a serde_json::Value.
-///
-/// The conformance test POSTs PriorityLevelConfiguration with Content-Type:
-/// application/vnd.kubernetes.protobuf. Without this decoder, the handler returns 400.
-pub fn decode_prioritylevelconfiguration_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = PriorityLevelConfiguration::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    Some(serde_json::json!({
-        "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
-        "kind": "PriorityLevelConfiguration",
-        "metadata": meta
     }))
 }
 
@@ -5588,57 +5042,6 @@ pub fn decode_csr_proto(data: &[u8]) -> Option<serde_json::Value> {
     Some(out)
 }
 
-// --- k8s.io/api/scheduling/v1/generated.proto ---
-
-/// PriorityClass — scheduling.k8s.io/v1/generated.proto
-/// Source: k8s.io/api/scheduling/v1/generated.proto message PriorityClass
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct PriorityClass {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// value (field 2, int32) — the scheduling priority of this class
-    #[prost(int32, tag = "2")]
-    value: i32,
-    /// globalDefault (field 3, bool) — if true, this is the default priority for pods
-    #[prost(bool, tag = "3")]
-    global_default: bool,
-    /// description (field 4, string) — human-readable description
-    #[prost(string, tag = "4")]
-    description: String,
-    /// preemptionPolicy (field 5, string) — e.g. "PreemptLowerPriority", added in k8s 1.19
-    #[prost(string, tag = "5")]
-    preemption_policy: String,
-}
-
-/// Decode a proto-encoded PriorityClass into a serde_json::Value.
-///
-/// The SchedulerPreemption conformance test POSTs PriorityClass objects with
-/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder,
-/// decode_core_proto_by_kind returns None, extract_body returns raw proto bytes, and the
-/// handler returns 400 "invalid JSON: expected value at line 1 column 1".
-pub fn decode_priorityclass_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = PriorityClass::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut out = serde_json::json!({
-        "apiVersion": "scheduling.k8s.io/v1",
-        "kind": "PriorityClass",
-        "metadata": meta,
-        "value": obj.value
-    });
-    if !obj.preemption_policy.is_empty() {
-        out["preemptionPolicy"] = serde_json::Value::String(obj.preemption_policy);
-    }
-    if obj.global_default {
-        out["globalDefault"] = serde_json::Value::Bool(true);
-    }
-    if !obj.description.is_empty() {
-        out["description"] = serde_json::Value::String(obj.description);
-    }
-    Some(out)
-}
-
 /// Decode a proto-encoded ControllerRevision into a serde_json::Value.
 ///
 /// DaemonSet and StatefulSet controllers POST ControllerRevision objects with
@@ -5695,9 +5098,11 @@ pub fn decode_proto_by_kind_and_version(
         }
         "PersistentVolume" => crate::core_gen_adapter::decode_persistentvolume_proto_gen(raw),
         "Lease" => decode_lease_proto(raw),
-        "CSINode" => decode_csinode_proto(raw),
-        "CSIDriver" => decode_csidriver_proto(raw),
-        "CSIStorageCapacity" => decode_csistoragecapacity_proto(raw),
+        "CSINode" => crate::storage_node_flow_gen_adapter::decode_csinode_proto_gen(raw),
+        "CSIDriver" => crate::storage_node_flow_gen_adapter::decode_csidriver_proto_gen(raw),
+        "CSIStorageCapacity" => {
+            crate::storage_node_flow_gen_adapter::decode_csistoragecapacity_proto_gen(raw)
+        }
         "Event" => {
             if api_version == "events.k8s.io/v1" {
                 decode_events_v1_event_proto(raw)
@@ -5718,8 +5123,10 @@ pub fn decode_proto_by_kind_and_version(
         "TokenReview" => crate::rbac_gen_adapter::decode_token_review_proto_gen(raw),
         "CronJob" => decode_cronjob_proto(raw),
         "Job" => decode_job_proto(raw),
-        "RuntimeClass" => decode_runtimeclass_proto(raw),
-        "VolumeAttachment" => decode_volumeattachment_proto(raw),
+        "RuntimeClass" => crate::storage_node_flow_gen_adapter::decode_runtimeclass_proto_gen(raw),
+        "VolumeAttachment" => {
+            crate::storage_node_flow_gen_adapter::decode_volumeattachment_proto_gen(raw)
+        }
         "StatefulSet" => crate::apps_gen_adapter::decode_statefulset_proto_gen(raw),
         "Deployment" => crate::apps_gen_adapter::decode_deployment_proto_gen(raw),
         "DaemonSet" => crate::apps_gen_adapter::decode_daemonset_proto_gen(raw),
@@ -5729,13 +5136,17 @@ pub fn decode_proto_by_kind_and_version(
             crate::core_gen_adapter::decode_persistentvolumeclaim_proto_gen(raw)
         }
         "Endpoints" => crate::core_gen_adapter::decode_endpoints_proto_gen(raw),
-        "StorageClass" => decode_storageclass_proto(raw),
-        "VolumeAttributesClass" => decode_volumeattributesclass_proto(raw),
+        "StorageClass" => crate::storage_node_flow_gen_adapter::decode_storageclass_proto_gen(raw),
+        "VolumeAttributesClass" => {
+            crate::storage_node_flow_gen_adapter::decode_volumeattributesclass_proto_gen(raw)
+        }
         "ResourceQuota" => crate::core_gen_adapter::decode_resourcequota_proto_gen(raw),
         "LimitRange" => crate::core_gen_adapter::decode_limitrange_proto_gen(raw),
         "PodDisruptionBudget" => decode_poddisruptionbudget_proto(raw),
-        "FlowSchema" => decode_flowschema_proto(raw),
-        "PriorityLevelConfiguration" => decode_prioritylevelconfiguration_proto(raw),
+        "FlowSchema" => crate::storage_node_flow_gen_adapter::decode_flowschema_proto_gen(raw),
+        "PriorityLevelConfiguration" => {
+            crate::storage_node_flow_gen_adapter::decode_prioritylevelconfiguration_proto_gen(raw)
+        }
         "ValidatingWebhookConfiguration" => {
             crate::admissionreg_gen_adapter::decode_validatingwebhookconfiguration_proto_gen(raw)
         }
@@ -5758,7 +5169,9 @@ pub fn decode_proto_by_kind_and_version(
         "Ingress" => decode_ingress_proto(raw),
         "EndpointSlice" => decode_endpointslice_proto(raw),
         "CertificateSigningRequest" => decode_csr_proto(raw),
-        "PriorityClass" => decode_priorityclass_proto(raw),
+        "PriorityClass" => {
+            crate::storage_node_flow_gen_adapter::decode_priorityclass_proto_gen(raw)
+        }
         "ControllerRevision" => crate::apps_gen_adapter::decode_controllerrevision_proto_gen(raw),
         "DeleteOptions" => decode_delete_options_proto(raw),
         _ => None,
@@ -8227,7 +7640,8 @@ mod tests {
         let mut csinode_proto = encode_length_delimited(1, &obj_meta);
         csinode_proto.extend_from_slice(&encode_length_delimited(2, &csinode_spec));
 
-        let result = decode_csinode_proto(&csinode_proto).expect("must decode CSINode proto");
+        let result = crate::storage_node_flow_gen_adapter::decode_csinode_proto_gen(&csinode_proto)
+            .expect("must decode CSINode proto");
 
         assert_eq!(result["kind"], "CSINode");
         assert_eq!(result["apiVersion"], "storage.k8s.io/v1");
@@ -8278,7 +7692,9 @@ mod tests {
         let mut csidriver_proto = encode_length_delimited(1, &obj_meta);
         csidriver_proto.extend_from_slice(&encode_length_delimited(2, &spec));
 
-        let result = decode_csidriver_proto(&csidriver_proto).expect("must decode CSIDriver proto");
+        let result =
+            crate::storage_node_flow_gen_adapter::decode_csidriver_proto_gen(&csidriver_proto)
+                .expect("must decode CSIDriver proto");
 
         assert_eq!(result["kind"], "CSIDriver");
         assert_eq!(result["apiVersion"], "storage.k8s.io/v1");
@@ -8297,6 +7713,63 @@ mod tests {
         assert_eq!(
             result["spec"]["volumeLifecycleModes"][0], "Ephemeral",
             "volumeLifecycleModes must be decoded — required for CSI inline volume conformance test"
+        );
+    }
+
+    /// decode_csidriver_proto_gen must decode spec.tokenRequests — a field that the old hand
+    /// struct silently dropped because it was not declared.
+    ///
+    /// Without tokenRequests, a CSI driver that requires bound service-account tokens cannot be
+    /// registered: the kubelet reads tokenRequests from the stored CSIDriver to know which
+    /// audiences to request tokens for when mounting volumes. Silent drop means the field is
+    /// missing on read-back even though the POST/PUT returned 200 OK.
+    ///
+    /// This test fails if tokenRequests handling is removed from decode_csidriver_proto_gen.
+    #[test]
+    fn decode_csidriver_proto_gen_decodes_tokenrequests_which_old_hand_struct_dropped() {
+        // Build: CSIDriver {
+        //   metadata: { name: "token-driver" },
+        //   spec: CSIDriverSpec {
+        //     tokenRequests: [TokenRequest { audience: "my-audience", expirationSeconds: 3600 }]
+        //   }
+        // }
+        // CSIDriverSpec.tokenRequests = field 6 (repeated message TokenRequest)
+        // TokenRequest: field 1=audience (string), field 2=expirationSeconds (int64 varint)
+        let obj_meta = encode_length_delimited(1, b"token-driver");
+
+        // TokenRequest { audience: "my-audience", expirationSeconds: 3600 }
+        let mut token_request = encode_length_delimited(1, b"my-audience");
+        // expirationSeconds = 3600: field 2, wire type 0 (varint)
+        token_request.push(2 << 3); // field 2, wire type 0 (varint)
+        token_request.extend_from_slice(&encode_varint(3600));
+
+        // CSIDriverSpec: field 6 = repeated TokenRequest (length-delimited)
+        let spec = encode_length_delimited(6, &token_request);
+
+        let mut csidriver_proto = encode_length_delimited(1, &obj_meta);
+        csidriver_proto.extend_from_slice(&encode_length_delimited(2, &spec));
+
+        let result =
+            crate::storage_node_flow_gen_adapter::decode_csidriver_proto_gen(&csidriver_proto)
+                .expect("must decode CSIDriver proto with tokenRequests");
+
+        let token_requests = result["spec"]["tokenRequests"]
+            .as_array()
+            .expect("tokenRequests must be an array — old hand struct silently dropped this field");
+        assert_eq!(
+            token_requests.len(),
+            1,
+            "tokenRequests must have one entry — protobuf typegen migration now decodes this field"
+        );
+        assert_eq!(
+            token_requests[0]["audience"], "my-audience",
+            "tokenRequest.audience must survive proto decode — kubelet uses it to request the \
+             correct service account token for CSI volume mounts"
+        );
+        assert_eq!(
+            token_requests[0]["expirationSeconds"], 3600,
+            "tokenRequest.expirationSeconds must survive proto decode — kubelet uses it to set \
+             the token TTL"
         );
     }
 
@@ -8341,8 +7814,9 @@ mod tests {
         csc_proto.extend_from_slice(&encode_length_delimited(3, b"fast-ssd"));
         csc_proto.extend_from_slice(&encode_length_delimited(4, &capacity_quantity));
 
-        let result = decode_csistoragecapacity_proto(&csc_proto)
-            .expect("must decode CSIStorageCapacity proto");
+        let result =
+            crate::storage_node_flow_gen_adapter::decode_csistoragecapacity_proto_gen(&csc_proto)
+                .expect("must decode CSIStorageCapacity proto");
 
         assert_eq!(result["kind"], "CSIStorageCapacity");
         assert_eq!(result["apiVersion"], "storage.k8s.io/v1");
@@ -12863,10 +12337,15 @@ mod tests {
         );
     }
 
-    /// decode_priorityclass_proto must return None for malformed proto input.
+    /// decode_priorityclass_proto_gen must return None for malformed proto input.
     #[test]
     fn decode_priorityclass_proto_returns_none_for_garbage() {
-        assert!(decode_priorityclass_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(
+            crate::storage_node_flow_gen_adapter::decode_priorityclass_proto_gen(&[
+                0xff, 0xff, 0xff
+            ])
+            .is_none()
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -14197,42 +13676,36 @@ mod tests {
         );
     }
 
-    /// decode_storageclass_proto must preserve top-level fields from the proto body.
+    /// decode_storageclass_proto_gen must preserve top-level fields from the proto body.
     ///
     /// Without decoding provisioner, parameters, and reclaimPolicy, a proto write returns 200 OK
     /// but the stored StorageClass has no provisioner, breaking dynamic provisioning for any PVC
     /// that references this StorageClass (same silent-drop bug class as #583).
-    ///
-    /// This test fails if the `provisioner`, `parameters`, or `reclaim_policy` fields are removed
-    /// from `StorageClass`, or if the serialization block is removed from `decode_storageclass_proto`.
     #[test]
     fn decode_storageclass_proto_preserves_provisioner_and_parameters() {
-        use prost::Message as _;
+        // StorageClass: field 1=metadata, 2=provisioner, 3=parameters(map), 4=reclaimPolicy,
+        // 6=allowVolumeExpansion(bool), 7=volumeBindingMode
+        // ObjectMeta bytes: field 1 = name (string "fast")
+        let obj_meta = encode_length_delimited(1, b"fast");
 
-        let sc = StorageClass {
-            metadata: Some(ObjectMeta {
-                name: "fast".to_string(),
-                ..Default::default()
-            }),
-            provisioner: "kubernetes.io/no-provisioner".to_string(),
-            parameters: {
-                let mut m = std::collections::HashMap::new();
-                m.insert("type".to_string(), "gp2".to_string());
-                m
-            },
-            reclaim_policy: "Retain".to_string(),
-            volume_binding_mode: "WaitForFirstConsumer".to_string(),
-            allow_volume_expansion: Some(true),
-            ..Default::default()
-        };
+        // map entry: field 1=key, field 2=value
+        let mut param_entry = encode_length_delimited(1, b"type");
+        param_entry.extend_from_slice(&encode_length_delimited(2, b"gp2"));
 
-        let mut buf = Vec::new();
-        sc.encode(&mut buf).expect("prost encode must succeed");
+        let mut buf = encode_length_delimited(1, &obj_meta);
+        buf.extend_from_slice(&encode_length_delimited(2, b"kubernetes.io/no-provisioner"));
+        buf.extend_from_slice(&encode_length_delimited(3, &param_entry));
+        buf.extend_from_slice(&encode_length_delimited(4, b"Retain"));
+        // allowVolumeExpansion = true: field 6, wire type 0, value 1
+        buf.push(6 << 3); // field 6, wire type 0 (varint), value follows
+        buf.push(1);
+        buf.extend_from_slice(&encode_length_delimited(7, b"WaitForFirstConsumer"));
 
-        let result = decode_storageclass_proto(&buf).expect(
-            "decode_storageclass_proto must return Some — proto write returns 200 OK but caller \
-             reads back a provisioner-less StorageClass if decoding fails",
-        );
+        let result = crate::storage_node_flow_gen_adapter::decode_storageclass_proto_gen(&buf)
+            .expect(
+                "decode_storageclass_proto_gen must return Some — proto write returns 200 OK but \
+                 caller reads back a provisioner-less StorageClass if decoding fails",
+            );
 
         assert_eq!(result["kind"], "StorageClass");
         assert_eq!(result["metadata"]["name"], "fast");
@@ -14262,39 +13735,31 @@ mod tests {
         );
     }
 
-    /// decode_volumeattributesclass_proto must preserve driverName and parameters.
+    /// decode_volumeattributesclass_proto_gen must preserve driverName and parameters.
     ///
     /// Without decoding driverName (field 2) and parameters (field 3), a proto write returns
     /// 200 OK but the stored VolumeAttributesClass has no driverName, so the CSI driver cannot
     /// apply the attributes to the volume (same silent-drop bug class as #583).
-    ///
-    /// This test fails if the `driver_name` or `parameters` fields are removed from
-    /// `VolumeAttributesClass`, or if the serialization block is removed from
-    /// `decode_volumeattributesclass_proto`.
     #[test]
     fn decode_volumeattributesclass_proto_preserves_driver_name_and_parameters() {
-        use prost::Message as _;
+        // VolumeAttributesClass: field 1=metadata, 2=driverName, 3=parameters(map)
+        // ObjectMeta bytes: field 1 = name (string "silver")
+        let obj_meta = encode_length_delimited(1, b"silver");
 
-        let vac = VolumeAttributesClass {
-            metadata: Some(ObjectMeta {
-                name: "silver".to_string(),
-                ..Default::default()
-            }),
-            driver_name: "pd.csi.storage.gke.io".to_string(),
-            parameters: {
-                let mut m = std::collections::HashMap::new();
-                m.insert("iops".to_string(), "3000".to_string());
-                m
-            },
-        };
+        let mut param_entry = encode_length_delimited(1, b"iops");
+        param_entry.extend_from_slice(&encode_length_delimited(2, b"3000"));
 
-        let mut buf = Vec::new();
-        vac.encode(&mut buf).expect("prost encode must succeed");
+        let mut buf = encode_length_delimited(1, &obj_meta);
+        buf.extend_from_slice(&encode_length_delimited(2, b"pd.csi.storage.gke.io"));
+        buf.extend_from_slice(&encode_length_delimited(3, &param_entry));
 
-        let result = decode_volumeattributesclass_proto(&buf).expect(
-            "decode_volumeattributesclass_proto must return Some — proto write returns 200 OK but \
-             caller reads back a driverName-less VolumeAttributesClass if decoding fails",
-        );
+        let result =
+            crate::storage_node_flow_gen_adapter::decode_volumeattributesclass_proto_gen(&buf)
+                .expect(
+                "decode_volumeattributesclass_proto_gen must return Some — proto write returns \
+                     200 OK but caller reads back a driverName-less VolumeAttributesClass if \
+                     decoding fails",
+            );
 
         assert_eq!(result["kind"], "VolumeAttributesClass");
         assert_eq!(result["metadata"]["name"], "silver");
