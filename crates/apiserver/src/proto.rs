@@ -1618,276 +1618,45 @@ struct RuntimeClass {
     scheduling: Vec<u8>,
 }
 
-// --- k8s.io/api/authorization/v1/generated.proto ---
+// --- k8s.io/api/authentication/v1/generated.proto (TokenRequest only) ---
+// TokenReview is migrated to rbac_gen_adapter; these structs serve decode_token_request only.
 
-/// ResourceAttributes — describes a resource request in SubjectAccessReviewSpec.
-/// Source: k8s.io/api/authorization/v1/generated.proto message ResourceAttributes
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct ResourceAttributes {
-    /// namespace (field 1, string)
-    #[prost(string, tag = "1")]
-    namespace: String,
-    /// verb (field 2, string)
-    #[prost(string, tag = "2")]
-    verb: String,
-    /// group (field 3, string)
-    #[prost(string, tag = "3")]
-    group: String,
-    /// version (field 4, string)
-    #[prost(string, tag = "4")]
-    version: String,
-    /// resource (field 5, string)
-    #[prost(string, tag = "5")]
-    resource: String,
-    /// subresource (field 6, string)
-    #[prost(string, tag = "6")]
-    subresource: String,
-    /// name (field 7, string)
-    #[prost(string, tag = "7")]
-    name: String,
-}
-
-/// SubjectAccessReviewSpec — the input to a SubjectAccessReview.
-/// Source: k8s.io/api/authorization/v1/generated.proto message SubjectAccessReviewSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct SubjectAccessReviewSpec {
-    /// resourceAttributes (field 1, message ResourceAttributes)
-    #[prost(message, tag = "1")]
-    resource_attributes: Option<ResourceAttributes>,
-    // field 2 (NonResourceAttributes) — intentionally omitted
-    /// user (field 3, string)
-    #[prost(string, tag = "3")]
-    user: String,
-    /// groups (field 4, repeated string)
-    #[prost(string, repeated, tag = "4")]
-    groups: Vec<String>,
-}
-
-/// SubjectAccessReview — k8s.io/api/authorization/v1/generated.proto
-/// Source: k8s.io/api/authorization/v1/generated.proto message SubjectAccessReview
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct SubjectAccessReviewProto {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message SubjectAccessReviewSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<SubjectAccessReviewSpec>,
-    // status (field 3) — ignored on input
-}
-
-/// TokenReviewSpec — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenReviewSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct TokenReviewSpec {
-    /// token (field 1, string)
-    #[prost(string, tag = "1")]
-    token: String,
-    /// audiences (field 2, repeated string)
-    #[prost(string, repeated, tag = "2")]
-    audiences: Vec<String>,
-}
-
-/// TokenReview — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenReview
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct TokenReviewProto {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message TokenReviewSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<TokenReviewSpec>,
-    // status (field 3) — ignored on input
-}
-
-// --- k8s.io/api/authentication/v1/generated.proto ---
-
-/// BoundObjectReference — used in TokenRequestSpec
-/// Source: k8s.io/api/authentication/v1/generated.proto message BoundObjectReference
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct BoundObjectReference {
-    /// kind (field 1, string)
     #[prost(string, tag = "1")]
     kind: String,
-    /// apiVersion (field 2, string)
     #[prost(string, tag = "2")]
     api_version: String,
-    /// name (field 3, string)
     #[prost(string, tag = "3")]
     name: String,
-    /// uid (field 4, string)
     #[prost(string, tag = "4")]
     uid: String,
 }
 
-/// TokenRequestSpec — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenRequestSpec
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenRequestSpec {
-    /// audiences (field 1, repeated string)
     #[prost(string, repeated, tag = "1")]
     audiences: Vec<String>,
-    /// expirationSeconds (field 4, int64) — optional, 0 = unset
     #[prost(int64, tag = "4")]
     expiration_seconds: i64,
-    /// boundObjectRef (field 3, message BoundObjectReference)
     #[prost(message, tag = "3")]
     bound_object_ref: Option<BoundObjectReference>,
 }
 
-/// TokenRequestStatus — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenRequestStatus
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenRequestStatus {
-    /// token (field 1, string)
     #[prost(string, tag = "1")]
     token: String,
-    /// expirationTimestamp (field 2, message Time)
-    #[prost(message, tag = "2")]
-    expiration_timestamp: Option<Time>,
 }
 
-/// TokenRequest — k8s.io/api/authentication/v1/generated.proto
-/// Source: k8s.io/api/authentication/v1/generated.proto message TokenRequest
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
 #[derive(Clone, PartialEq, Message)]
 struct TokenRequestProto {
-    /// metadata (field 1, message ObjectMeta)
     #[prost(message, tag = "1")]
     metadata: Option<ObjectMeta>,
-    /// spec (field 2, message TokenRequestSpec)
     #[prost(message, tag = "2")]
     spec: Option<TokenRequestSpec>,
-    /// status (field 3, message TokenRequestStatus)
     #[prost(message, tag = "3")]
     status: Option<TokenRequestStatus>,
-}
-
-// --- k8s.io/api/rbac/v1/generated.proto ---
-
-/// PolicyRule — a single RBAC policy rule.
-/// Source: k8s.io/api/rbac/v1/generated.proto message PolicyRule
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct PolicyRule {
-    /// verbs (field 1, repeated string)
-    #[prost(string, repeated, tag = "1")]
-    verbs: Vec<String>,
-    /// apiGroups (field 2, repeated string)
-    #[prost(string, repeated, tag = "2")]
-    api_groups: Vec<String>,
-    /// resources (field 3, repeated string)
-    #[prost(string, repeated, tag = "3")]
-    resources: Vec<String>,
-    /// resourceNames (field 4, repeated string)
-    #[prost(string, repeated, tag = "4")]
-    resource_names: Vec<String>,
-    /// nonResourceURLs (field 5, repeated string)
-    #[prost(string, repeated, tag = "5")]
-    non_resource_urls: Vec<String>,
-}
-
-/// Subject — a user, group, or service account in a RoleBinding.
-/// Source: k8s.io/api/rbac/v1/generated.proto message Subject
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct Subject {
-    /// kind (field 1, string)
-    #[prost(string, tag = "1")]
-    kind: String,
-    /// apiGroup (field 2, string)
-    #[prost(string, tag = "2")]
-    api_group: String,
-    /// name (field 3, string)
-    #[prost(string, tag = "3")]
-    name: String,
-    /// namespace (field 4, string)
-    #[prost(string, tag = "4")]
-    namespace: String,
-}
-
-/// RoleRef — reference to the role being bound.
-/// Source: k8s.io/api/rbac/v1/generated.proto message RoleRef
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct RoleRef {
-    /// apiGroup (field 1, string)
-    #[prost(string, tag = "1")]
-    api_group: String,
-    /// kind (field 2, string)
-    #[prost(string, tag = "2")]
-    kind: String,
-    /// name (field 3, string)
-    #[prost(string, tag = "3")]
-    name: String,
-}
-
-/// ClusterRole — k8s.io/api/rbac/v1/generated.proto
-/// Source: k8s.io/api/rbac/v1/generated.proto message ClusterRole
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct ClusterRole {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// rules (field 2, repeated PolicyRule)
-    #[prost(message, repeated, tag = "2")]
-    rules: Vec<PolicyRule>,
-    // aggregationRule (field 3) is intentionally omitted — not needed for kubectl compat
-}
-
-/// ClusterRoleBinding — k8s.io/api/rbac/v1/generated.proto
-/// Source: k8s.io/api/rbac/v1/generated.proto message ClusterRoleBinding
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct ClusterRoleBinding {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// subjects (field 2, repeated Subject)
-    #[prost(message, repeated, tag = "2")]
-    subjects: Vec<Subject>,
-    /// roleRef (field 3, message RoleRef)
-    #[prost(message, tag = "3")]
-    role_ref: Option<RoleRef>,
-}
-
-/// Role — namespaced, same structure as ClusterRole but namespaced.
-/// Source: k8s.io/api/rbac/v1/generated.proto message Role
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct Role {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// rules (field 2, repeated PolicyRule)
-    #[prost(message, repeated, tag = "2")]
-    rules: Vec<PolicyRule>,
-}
-
-/// RoleBinding — namespaced.
-/// Source: k8s.io/api/rbac/v1/generated.proto message RoleBinding
-/// (proto file not in repo; field numbers verified against k8s 1.34 canonical source)
-#[derive(Clone, PartialEq, Message)]
-struct RoleBinding {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// subjects (field 2, repeated Subject)
-    #[prost(message, repeated, tag = "2")]
-    subjects: Vec<Subject>,
-    /// roleRef (field 3, message RoleRef)
-    #[prost(message, tag = "3")]
-    role_ref: Option<RoleRef>,
 }
 
 // --- k8s.io/api/batch/v1/generated.proto ---
@@ -3585,337 +3354,6 @@ pub fn decode_token_request(raw: &[u8]) -> Option<TokenRequestFields> {
         expiration_seconds,
         bound_object_ref,
     })
-}
-
-/// Convert a prost PolicyRule into a serde_json::Value object.
-fn policy_rule_to_json(rule: PolicyRule) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !rule.verbs.is_empty() {
-        m.insert(
-            "verbs".to_string(),
-            serde_json::Value::Array(
-                rule.verbs
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !rule.api_groups.is_empty() {
-        m.insert(
-            "apiGroups".to_string(),
-            serde_json::Value::Array(
-                rule.api_groups
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !rule.resources.is_empty() {
-        m.insert(
-            "resources".to_string(),
-            serde_json::Value::Array(
-                rule.resources
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !rule.resource_names.is_empty() {
-        m.insert(
-            "resourceNames".to_string(),
-            serde_json::Value::Array(
-                rule.resource_names
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if !rule.non_resource_urls.is_empty() {
-        m.insert(
-            "nonResourceURLs".to_string(),
-            serde_json::Value::Array(
-                rule.non_resource_urls
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Convert a prost Subject into a serde_json::Value object.
-fn subject_to_json(s: Subject) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !s.kind.is_empty() {
-        m.insert("kind".to_string(), serde_json::Value::String(s.kind));
-    }
-    if !s.api_group.is_empty() {
-        m.insert(
-            "apiGroup".to_string(),
-            serde_json::Value::String(s.api_group),
-        );
-    }
-    if !s.name.is_empty() {
-        m.insert("name".to_string(), serde_json::Value::String(s.name));
-    }
-    if !s.namespace.is_empty() {
-        m.insert(
-            "namespace".to_string(),
-            serde_json::Value::String(s.namespace),
-        );
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Convert a prost RoleRef into a serde_json::Value object.
-fn role_ref_to_json(r: RoleRef) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
-    if !r.api_group.is_empty() {
-        m.insert(
-            "apiGroup".to_string(),
-            serde_json::Value::String(r.api_group),
-        );
-    }
-    if !r.kind.is_empty() {
-        m.insert("kind".to_string(), serde_json::Value::String(r.kind));
-    }
-    if !r.name.is_empty() {
-        m.insert("name".to_string(), serde_json::Value::String(r.name));
-    }
-    serde_json::Value::Object(m)
-}
-
-/// Decode a proto-encoded ClusterRole object into a `serde_json::Value`.
-pub fn decode_clusterrole_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let cr = ClusterRole::decode(data).ok()?;
-    let meta = object_meta_to_json(cr.metadata.unwrap_or_default());
-    let rules: Vec<serde_json::Value> = cr.rules.into_iter().map(policy_rule_to_json).collect();
-    Some(serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRole",
-        "metadata": meta,
-        "rules": rules
-    }))
-}
-
-/// Decode a proto-encoded ClusterRoleBinding object into a `serde_json::Value`.
-pub fn decode_clusterrolebinding_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let crb = ClusterRoleBinding::decode(data).ok()?;
-    let meta = object_meta_to_json(crb.metadata.unwrap_or_default());
-    let subjects: Vec<serde_json::Value> = crb.subjects.into_iter().map(subject_to_json).collect();
-    let role_ref = crb
-        .role_ref
-        .map(role_ref_to_json)
-        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    Some(serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "ClusterRoleBinding",
-        "metadata": meta,
-        "subjects": subjects,
-        "roleRef": role_ref
-    }))
-}
-
-/// Decode a proto-encoded Role object into a `serde_json::Value`.
-pub fn decode_role_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let role = Role::decode(data).ok()?;
-    let meta = object_meta_to_json(role.metadata.unwrap_or_default());
-    let rules: Vec<serde_json::Value> = role.rules.into_iter().map(policy_rule_to_json).collect();
-    Some(serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "Role",
-        "metadata": meta,
-        "rules": rules
-    }))
-}
-
-/// Decode a proto-encoded RoleBinding object into a `serde_json::Value`.
-pub fn decode_rolebinding_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let rb = RoleBinding::decode(data).ok()?;
-    let meta = object_meta_to_json(rb.metadata.unwrap_or_default());
-    let subjects: Vec<serde_json::Value> = rb.subjects.into_iter().map(subject_to_json).collect();
-    let role_ref = rb
-        .role_ref
-        .map(role_ref_to_json)
-        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-    Some(serde_json::json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "RoleBinding",
-        "metadata": meta,
-        "subjects": subjects,
-        "roleRef": role_ref
-    }))
-}
-
-/// Decode a proto-encoded SubjectAccessReview object into a `serde_json::Value`.
-///
-/// The kubelet uses Webhook authorization mode (default in k8s 1.36 with --config), which
-/// calls back to /apis/authorization.k8s.io/v1/subjectaccessreviews with
-/// Content-Type: application/vnd.kubernetes.protobuf. Without this decoder, the raw proto
-/// bytes reach serde_json::from_slice and produce "expected value at line 1 column 1".
-/// The kubelet interprets the 400/500 failure as an authorization denial.
-pub fn decode_subject_access_review_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let sar = SubjectAccessReviewProto::decode(data).ok()?;
-    let spec = sar.spec.unwrap_or_default();
-
-    let mut spec_map = serde_json::Map::new();
-    if !spec.user.is_empty() {
-        spec_map.insert("user".to_string(), serde_json::Value::String(spec.user));
-    }
-    if !spec.groups.is_empty() {
-        spec_map.insert(
-            "groups".to_string(),
-            serde_json::Value::Array(
-                spec.groups
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(ra) = spec.resource_attributes {
-        let mut ra_map = serde_json::Map::new();
-        if !ra.namespace.is_empty() {
-            ra_map.insert(
-                "namespace".to_string(),
-                serde_json::Value::String(ra.namespace),
-            );
-        }
-        if !ra.verb.is_empty() {
-            ra_map.insert("verb".to_string(), serde_json::Value::String(ra.verb));
-        }
-        if !ra.group.is_empty() {
-            ra_map.insert("group".to_string(), serde_json::Value::String(ra.group));
-        }
-        if !ra.version.is_empty() {
-            ra_map.insert("version".to_string(), serde_json::Value::String(ra.version));
-        }
-        if !ra.resource.is_empty() {
-            ra_map.insert(
-                "resource".to_string(),
-                serde_json::Value::String(ra.resource),
-            );
-        }
-        if !ra.subresource.is_empty() {
-            ra_map.insert(
-                "subresource".to_string(),
-                serde_json::Value::String(ra.subresource),
-            );
-        }
-        if !ra.name.is_empty() {
-            ra_map.insert("name".to_string(), serde_json::Value::String(ra.name));
-        }
-        if !ra_map.is_empty() {
-            spec_map.insert(
-                "resourceAttributes".to_string(),
-                serde_json::Value::Object(ra_map),
-            );
-        }
-    }
-
-    Some(serde_json::json!({
-        "apiVersion": "authorization.k8s.io/v1",
-        "kind": "SubjectAccessReview",
-        "spec": serde_json::Value::Object(spec_map)
-    }))
-}
-
-/// Decode a proto-encoded LocalSubjectAccessReview object into a `serde_json::Value`.
-///
-/// LocalSubjectAccessReview has the same wire format as SubjectAccessReview — the only
-/// difference is the kind field in the returned JSON.  When kubectl or a conformance test
-/// POSTs to /apis/authorization.k8s.io/v1/namespaces/{ns}/localsubjectaccessreviews with
-/// Content-Type: application/vnd.kubernetes.protobuf, the envelope kind is
-/// "LocalSubjectAccessReview".  Without this decoder, extract_body returns raw proto bytes
-/// and serde_json::from_slice produces "expected value at line 1 column 1" → 400.
-pub fn decode_local_subject_access_review_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let sar = SubjectAccessReviewProto::decode(data).ok()?;
-    let spec = sar.spec.unwrap_or_default();
-
-    let mut spec_map = serde_json::Map::new();
-    if !spec.user.is_empty() {
-        spec_map.insert("user".to_string(), serde_json::Value::String(spec.user));
-    }
-    if !spec.groups.is_empty() {
-        spec_map.insert(
-            "groups".to_string(),
-            serde_json::Value::Array(
-                spec.groups
-                    .into_iter()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-    if let Some(ra) = spec.resource_attributes {
-        let mut ra_map = serde_json::Map::new();
-        if !ra.namespace.is_empty() {
-            ra_map.insert(
-                "namespace".to_string(),
-                serde_json::Value::String(ra.namespace),
-            );
-        }
-        if !ra.verb.is_empty() {
-            ra_map.insert("verb".to_string(), serde_json::Value::String(ra.verb));
-        }
-        if !ra.group.is_empty() {
-            ra_map.insert("group".to_string(), serde_json::Value::String(ra.group));
-        }
-        if !ra.version.is_empty() {
-            ra_map.insert("version".to_string(), serde_json::Value::String(ra.version));
-        }
-        if !ra.resource.is_empty() {
-            ra_map.insert(
-                "resource".to_string(),
-                serde_json::Value::String(ra.resource),
-            );
-        }
-        if !ra.subresource.is_empty() {
-            ra_map.insert(
-                "subresource".to_string(),
-                serde_json::Value::String(ra.subresource),
-            );
-        }
-        if !ra.name.is_empty() {
-            ra_map.insert("name".to_string(), serde_json::Value::String(ra.name));
-        }
-        if !ra_map.is_empty() {
-            spec_map.insert(
-                "resourceAttributes".to_string(),
-                serde_json::Value::Object(ra_map),
-            );
-        }
-    }
-
-    Some(serde_json::json!({
-        "apiVersion": "authorization.k8s.io/v1",
-        "kind": "LocalSubjectAccessReview",
-        "spec": serde_json::Value::Object(spec_map)
-    }))
-}
-
-/// Decode a proto-encoded TokenReview object into a `serde_json::Value`.
-///
-/// The kubelet uses Webhook authentication mode, which calls back to
-/// /apis/authentication.k8s.io/v1/tokenreviews with Content-Type: application/vnd.kubernetes.protobuf.
-/// Without this decoder, the raw proto bytes reach serde_json::from_slice and produce
-/// "expected value at line 1 column 1", causing authentication failures.
-pub fn decode_token_review_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let tr = TokenReviewProto::decode(data).ok()?;
-    let spec = tr.spec.unwrap_or_default();
-
-    Some(serde_json::json!({
-        "apiVersion": "authentication.k8s.io/v1",
-        "kind": "TokenReview",
-        "spec": {
-            "token": spec.token
-        }
-    }))
 }
 
 fn success_policy_to_json(sp: SuccessPolicy) -> serde_json::Value {
@@ -7239,13 +6677,17 @@ pub fn decode_proto_by_kind_and_version(
                 crate::core_gen_adapter::decode_event_proto_gen(raw)
             }
         }
-        "ClusterRole" => decode_clusterrole_proto(raw),
-        "ClusterRoleBinding" => decode_clusterrolebinding_proto(raw),
-        "Role" => decode_role_proto(raw),
-        "RoleBinding" => decode_rolebinding_proto(raw),
-        "SubjectAccessReview" => decode_subject_access_review_proto(raw),
-        "LocalSubjectAccessReview" => decode_local_subject_access_review_proto(raw),
-        "TokenReview" => decode_token_review_proto(raw),
+        "ClusterRole" => crate::rbac_gen_adapter::decode_clusterrole_proto_gen(raw),
+        "ClusterRoleBinding" => crate::rbac_gen_adapter::decode_clusterrolebinding_proto_gen(raw),
+        "Role" => crate::rbac_gen_adapter::decode_role_proto_gen(raw),
+        "RoleBinding" => crate::rbac_gen_adapter::decode_rolebinding_proto_gen(raw),
+        "SubjectAccessReview" => {
+            crate::rbac_gen_adapter::decode_subject_access_review_proto_gen(raw)
+        }
+        "LocalSubjectAccessReview" => {
+            crate::rbac_gen_adapter::decode_local_subject_access_review_proto_gen(raw)
+        }
+        "TokenReview" => crate::rbac_gen_adapter::decode_token_review_proto_gen(raw),
         "CronJob" => decode_cronjob_proto(raw),
         "Job" => decode_job_proto(raw),
         "RuntimeClass" => decode_runtimeclass_proto(raw),
@@ -10235,7 +9677,7 @@ mod tests {
         // Build SubjectAccessReview: field 2 = spec
         let sar_proto = encode_length_delimited(2, &spec);
 
-        let result = decode_subject_access_review_proto(&sar_proto)
+        let result = decode_core_proto_by_kind("SubjectAccessReview", &sar_proto)
             .expect("must decode SubjectAccessReview proto — without this decoder, kubelet Webhook authz fails");
 
         assert_eq!(result["apiVersion"], "authorization.k8s.io/v1");
@@ -10348,7 +9790,7 @@ mod tests {
         // Build TokenReview: field 2 = spec
         let tr_proto = encode_length_delimited(2, &spec);
 
-        let result = decode_token_review_proto(&tr_proto).expect(
+        let result = decode_core_proto_by_kind("TokenReview", &tr_proto).expect(
             "must decode TokenReview proto — without this decoder, kubelet Webhook authn fails",
         );
 

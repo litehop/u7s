@@ -14,6 +14,8 @@ mod patch;
 mod proto;
 mod quota;
 mod rbac;
+mod rbac_authz_authn_gen;
+mod rbac_gen_adapter;
 mod state;
 mod status;
 mod tls;
