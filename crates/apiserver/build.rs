@@ -33,6 +33,10 @@ fn main() {
                     .to_str()
                     .unwrap(),
                 include_dir
+                    .join("k8s.io/api/admissionregistration/v1/generated.proto")
+                    .to_str()
+                    .unwrap(),
+                include_dir
                     .join("k8s.io/api/rbac/v1/generated.proto")
                     .to_str()
                     .unwrap(),
