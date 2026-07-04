@@ -329,7 +329,7 @@ fn gen_lifecycle_to_json(lc: core_v1::Lifecycle) -> serde_json::Value {
 }
 
 fn gen_container_to_json(c: core_v1::Container) -> serde_json::Value {
-    let mut cm = serde_json::Map::new();
+    let mut cm = serde_json::Map::with_capacity(18);
     if let Some(v) = c.name.filter(|s| !s.is_empty()) {
         cm.insert("name".to_string(), serde_json::Value::String(v));
     }
@@ -607,7 +607,7 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
         .map(gen_container_to_json)
         .collect();
 
-    let mut spec_map = serde_json::Map::new();
+    let mut spec_map = serde_json::Map::with_capacity(14);
     if !spec.volumes.is_empty() {
         let volumes_json: Vec<serde_json::Value> = spec
             .volumes
@@ -1064,7 +1064,7 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     });
 
     if let Some(spec) = svc.spec {
-        let mut spec_map = serde_json::Map::new();
+        let mut spec_map = serde_json::Map::with_capacity(10);
         if let Some(v) = spec.cluster_ip.filter(|s| !s.is_empty()) {
             spec_map.insert("clusterIP".to_string(), serde_json::Value::String(v));
         }

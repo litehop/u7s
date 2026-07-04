@@ -96,7 +96,7 @@ fn gen_json_raw_to_value(j: apiext_v1::Json) -> serde_json::Value {
 }
 
 fn gen_json_schema_props_to_json(schema: apiext_v1::JsonSchemaProps) -> serde_json::Value {
-    let mut m = serde_json::Map::new();
+    let mut m = serde_json::Map::with_capacity(32);
 
     if let Some(v) = schema.r#type.filter(|s| !s.is_empty()) {
         m.insert("type".to_string(), serde_json::Value::String(v));
@@ -581,7 +581,7 @@ pub fn decode_crd_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     }
 
     let spec = crd.spec.unwrap_or_default();
-    let mut spec_m = serde_json::Map::new();
+    let mut spec_m = serde_json::Map::with_capacity(7);
 
     if let Some(g) = spec.group.filter(|s| !s.is_empty()) {
         spec_m.insert("group".to_string(), serde_json::Value::String(g));
