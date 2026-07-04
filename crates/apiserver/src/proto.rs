@@ -78,16 +78,6 @@ struct Time {
     nanos: i32,
 }
 
-/// MicroTime — same as Time but microsecond precision.
-/// Source: apimachinery-meta-v1-generated.proto message MicroTime
-#[derive(Clone, PartialEq, Message)]
-struct MicroTime {
-    #[prost(int64, tag = "1")]
-    seconds: i64,
-    #[prost(int32, tag = "2")]
-    nanos: i32,
-}
-
 /// ObjectMeta — common metadata for all Kubernetes objects.
 /// Source: apimachinery-meta-v1-generated.proto message ObjectMeta
 #[derive(Clone, PartialEq, Message)]
@@ -162,39 +152,6 @@ struct OwnerReference {
 }
 
 // --- k8s.io/api/core/v1/generated.proto ---
-
-/// NamespaceSpec (field 1=finalizers repeated string)
-/// Source: api-core-v1-generated.proto message NamespaceSpec
-#[derive(Clone, PartialEq, Message)]
-struct NamespaceSpec {
-    #[prost(string, repeated, tag = "1")]
-    finalizers: Vec<String>,
-}
-
-/// NamespaceStatus (field 1=phase string, field 2=conditions repeated bytes)
-/// Source: api-core-v1-generated.proto message NamespaceStatus
-#[derive(Clone, PartialEq, Message)]
-struct NamespaceStatus {
-    #[prost(string, tag = "1")]
-    phase: String,
-    #[prost(bytes = "vec", repeated, tag = "2")]
-    conditions: Vec<Vec<u8>>,
-}
-
-/// Namespace — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message Namespace
-#[derive(Clone, PartialEq, Message)]
-struct Namespace {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message NamespaceSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<NamespaceSpec>,
-    /// status (field 3, message NamespaceStatus)
-    #[prost(message, tag = "3")]
-    status: Option<NamespaceStatus>,
-}
 
 /// ResourceRequirements — k8s.io/api/core/v1/generated.proto
 /// Source: api-core-v1-generated.proto message ResourceRequirements
@@ -944,232 +901,7 @@ struct PodSpec {
     runtime_class_name: Option<String>,
 }
 
-/// ConfigMap — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ConfigMap
-#[derive(Clone, PartialEq, Message)]
-struct ConfigMap {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// data (field 2, map<string, string>)
-    #[prost(map = "string, string", tag = "2")]
-    data: std::collections::HashMap<String, String>,
-    /// binaryData (field 3, map<string, bytes>)
-    #[prost(map = "string, bytes", tag = "3")]
-    binary_data: std::collections::HashMap<String, Vec<u8>>,
-    /// immutable (field 4, bool)
-    #[prost(bool, tag = "4")]
-    immutable: bool,
-}
-
-/// ServicePort — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ServicePort
-#[derive(Clone, PartialEq, Message)]
-struct ServicePort {
-    /// name (field 1, string)
-    #[prost(string, tag = "1")]
-    name: String,
-    /// protocol (field 2, string)
-    #[prost(string, tag = "2")]
-    protocol: String,
-    /// port (field 3, int32)
-    #[prost(int32, tag = "3")]
-    port: i32,
-    /// targetPort (field 4, IntOrString) — decoded as raw bytes (union type)
-    #[prost(bytes = "vec", tag = "4")]
-    target_port: Vec<u8>,
-    /// nodePort (field 5, int32)
-    #[prost(int32, tag = "5")]
-    node_port: i32,
-    /// appProtocol (field 6, string)
-    #[prost(string, tag = "6")]
-    app_protocol: String,
-}
-
-/// ServiceSpec — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message ServiceSpec
-#[derive(Clone, PartialEq, Message)]
-struct ServiceSpec {
-    /// ports (field 1, repeated ServicePort)
-    #[prost(message, repeated, tag = "1")]
-    ports: Vec<ServicePort>,
-    /// selector (field 2, map<string,string>)
-    #[prost(map = "string, string", tag = "2")]
-    selector: std::collections::HashMap<String, String>,
-    /// clusterIP (field 3, string)
-    #[prost(string, tag = "3")]
-    cluster_ip: String,
-    /// type (field 4, string)
-    #[prost(string, tag = "4")]
-    r#type: String,
-    /// externalIPs (field 5, repeated string)
-    #[prost(string, repeated, tag = "5")]
-    external_ips: Vec<String>,
-    /// sessionAffinity (field 7, string)
-    #[prost(string, tag = "7")]
-    session_affinity: String,
-    /// externalName (field 10, string)
-    #[prost(string, tag = "10")]
-    external_name: String,
-    /// externalTrafficPolicy (field 11, string)
-    #[prost(string, tag = "11")]
-    external_traffic_policy: String,
-    /// ipFamilyPolicy (field 17, string)
-    #[prost(string, tag = "17")]
-    ip_family_policy: String,
-    /// internalTrafficPolicy (field 22, string)
-    #[prost(string, tag = "22")]
-    internal_traffic_policy: String,
-}
-
-/// metav1.Condition — k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto
-/// Field numbers match the official proto exactly.
-#[derive(Clone, PartialEq, Message)]
-struct MetaV1Condition {
-    #[prost(string, tag = "1")]
-    r#type: String,
-    #[prost(string, tag = "2")]
-    status: String,
-    /// observedGeneration (field 3, int64)
-    #[prost(int64, tag = "3")]
-    observed_generation: i64,
-    /// lastTransitionTime (field 4, Time message)
-    #[prost(message, tag = "4")]
-    last_transition_time: Option<Time>,
-    /// reason (field 5, string)
-    #[prost(string, tag = "5")]
-    reason: String,
-    /// message (field 6, string)
-    #[prost(string, tag = "6")]
-    message: String,
-}
-
-/// LoadBalancerIngress — k8s.io/api/core/v1/generated.proto
-#[derive(Clone, PartialEq, Message)]
-struct LoadBalancerIngress {
-    #[prost(string, tag = "1")]
-    ip: String,
-    #[prost(string, tag = "2")]
-    hostname: String,
-}
-
-/// LoadBalancerStatus — k8s.io/api/core/v1/generated.proto
-#[derive(Clone, PartialEq, Message)]
-struct LoadBalancerStatus {
-    #[prost(message, repeated, tag = "1")]
-    ingress: Vec<LoadBalancerIngress>,
-}
-
-/// ServiceStatus — k8s.io/api/core/v1/generated.proto
-/// field 1 = loadBalancer (LoadBalancerStatus, message)
-/// field 2 = conditions (repeated metav1.Condition, message)
-#[derive(Clone, PartialEq, Message)]
-struct ServiceStatus {
-    #[prost(message, tag = "1")]
-    load_balancer: Option<LoadBalancerStatus>,
-    #[prost(message, repeated, tag = "2")]
-    conditions: Vec<MetaV1Condition>,
-}
-
-/// Service — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message Service
-#[derive(Clone, PartialEq, Message)]
-struct Service {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message ServiceSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<ServiceSpec>,
-    /// status (field 3, message ServiceStatus)
-    #[prost(message, tag = "3")]
-    status: Option<ServiceStatus>,
-}
-
-/// PersistentVolumeSpec — k8s.io/api/core/v1/generated.proto (key fields only)
-/// Source: api-core-v1-generated.proto message PersistentVolumeSpec
-#[derive(Clone, PartialEq, Message)]
-struct PersistentVolumeSpec {
-    /// capacity (field 1, map<string,Quantity>) — decoded as raw bytes (Quantity is complex)
-    #[prost(bytes = "vec", tag = "1")]
-    capacity: Vec<u8>,
-    /// accessModes (field 3, repeated string)
-    #[prost(string, repeated, tag = "3")]
-    access_modes: Vec<String>,
-    /// claimRef (field 4, message ObjectReference) — decoded as raw bytes
-    #[prost(bytes = "vec", tag = "4")]
-    claim_ref: Vec<u8>,
-    /// persistentVolumeReclaimPolicy (field 5, string)
-    #[prost(string, tag = "5")]
-    persistent_volume_reclaim_policy: String,
-    /// storageClassName (field 6, string)
-    #[prost(string, tag = "6")]
-    storage_class_name: String,
-    /// volumeMode (field 8, string)
-    #[prost(string, tag = "8")]
-    volume_mode: String,
-}
-
-/// PersistentVolume — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message PersistentVolume
-#[derive(Clone, PartialEq, Message)]
-struct PersistentVolume {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message PersistentVolumeSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<PersistentVolumeSpec>,
-    /// status (field 3, bytes) — not decoded on input
-    #[prost(bytes = "vec", tag = "3")]
-    status: Vec<u8>,
-}
-
-/// NodeSpec — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message NodeSpec
-#[derive(Clone, PartialEq, Message)]
-struct NodeSpec {
-    /// podCIDR (field 1, string)
-    #[prost(string, tag = "1")]
-    pod_cidr: String,
-    /// externalID (field 2, string) — deprecated
-    #[prost(string, tag = "2")]
-    external_id: String,
-    /// providerID (field 3, string)
-    #[prost(string, tag = "3")]
-    provider_id: String,
-    /// unschedulable (field 4, bool)
-    #[prost(bool, tag = "4")]
-    unschedulable: bool,
-    /// taints (field 5, repeated) — decoded as raw bytes (complex nested message)
-    #[prost(bytes = "vec", repeated, tag = "5")]
-    taints: Vec<Vec<u8>>,
-    /// configSource (field 6, bytes) — deprecated, decoded as raw bytes
-    #[prost(bytes = "vec", tag = "6")]
-    config_source: Vec<u8>,
-    /// podCIDRs (field 7, repeated string)
-    #[prost(string, repeated, tag = "7")]
-    pod_cidrs: Vec<String>,
-}
-
-/// Node — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message Node
-/// NodeStatus (field 3) is decoded as raw bytes — it contains complex repeated fields
-/// (conditions, addresses, capacity, etc.) that we don't need to read.
-#[derive(Clone, PartialEq, Message)]
-struct Node {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// spec (field 2, message NodeSpec)
-    #[prost(message, tag = "2")]
-    spec: Option<NodeSpec>,
-    /// status (field 3, bytes) — opaque, not decoded
-    #[prost(bytes = "vec", tag = "3")]
-    status: Vec<u8>,
-}
-
-/// ObjectReference — used in Event.involvedObject
+/// ObjectReference — used in ServiceAccount.secrets
 /// Source: api-core-v1-generated.proto message ObjectReference
 #[derive(Clone, PartialEq, Message)]
 struct ObjectReference {
@@ -1194,79 +926,6 @@ struct ObjectReference {
     /// fieldPath (field 7, string)
     #[prost(string, tag = "7")]
     field_path: String,
-}
-
-/// EventSource — source component of an Event
-/// Source: api-core-v1-generated.proto message EventSource
-#[derive(Clone, PartialEq, Message)]
-struct EventSource {
-    #[prost(string, tag = "1")]
-    component: String,
-    #[prost(string, tag = "2")]
-    host: String,
-}
-
-/// EventSeries — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message EventSeries
-#[derive(Clone, PartialEq, Message)]
-struct EventSeries {
-    /// count (field 1, int32)
-    #[prost(int32, tag = "1")]
-    count: i32,
-    /// lastObservedTime (field 2, MicroTime)
-    #[prost(message, tag = "2")]
-    last_observed_time: Option<MicroTime>,
-}
-
-/// Event — k8s.io/api/core/v1/generated.proto
-/// Source: api-core-v1-generated.proto message Event
-#[derive(Clone, PartialEq, Message)]
-struct Event {
-    /// metadata (field 1, message ObjectMeta)
-    #[prost(message, tag = "1")]
-    metadata: Option<ObjectMeta>,
-    /// involvedObject (field 2, message ObjectReference)
-    #[prost(message, tag = "2")]
-    involved_object: Option<ObjectReference>,
-    /// reason (field 3, string)
-    #[prost(string, tag = "3")]
-    reason: String,
-    /// message (field 4, string)
-    #[prost(string, tag = "4")]
-    message: String,
-    /// source (field 5, message EventSource)
-    #[prost(message, tag = "5")]
-    source: Option<EventSource>,
-    /// firstTimestamp (field 6, message Time)
-    #[prost(message, tag = "6")]
-    first_timestamp: Option<Time>,
-    /// lastTimestamp (field 7, message Time)
-    #[prost(message, tag = "7")]
-    last_timestamp: Option<Time>,
-    /// count (field 8, int32)
-    #[prost(int32, tag = "8")]
-    count: i32,
-    /// type (field 9, string)
-    #[prost(string, tag = "9")]
-    r#type: String,
-    /// eventTime (field 10, MicroTime)
-    #[prost(message, tag = "10")]
-    event_time: Option<MicroTime>,
-    /// series (field 11, message EventSeries)
-    #[prost(message, tag = "11")]
-    series: Option<EventSeries>,
-    /// action (field 12, string)
-    #[prost(string, tag = "12")]
-    action: String,
-    /// related (field 13, message ObjectReference)
-    #[prost(message, tag = "13")]
-    related: Option<ObjectReference>,
-    /// reportingComponent (field 14, string)
-    #[prost(string, tag = "14")]
-    reporting_component: String,
-    /// reportingInstance (field 15, string)
-    #[prost(string, tag = "15")]
-    reporting_instance: String,
 }
 
 // --- k8s.io/api/authorization/v1/generated.proto ---
@@ -1538,545 +1197,6 @@ pub fn decode_k8s_proto_envelope(body: &[u8]) -> Option<ProtoEnvelope> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Type-specific decoders — convert prost-decoded structs to serde_json::Value
-// ---------------------------------------------------------------------------
-
-/// Convert a prost ObjectMeta into a serde_json::Value map.
-fn object_meta_to_json(meta: ObjectMeta) -> serde_json::Value {
-    let mut m = serde_json::json!({ "creationTimestamp": serde_json::Value::Null });
-    if !meta.name.is_empty() {
-        m["name"] = serde_json::Value::String(meta.name);
-    }
-    if !meta.generate_name.is_empty() {
-        m["generateName"] = serde_json::Value::String(meta.generate_name);
-    }
-    if !meta.namespace.is_empty() {
-        m["namespace"] = serde_json::Value::String(meta.namespace);
-    }
-    if !meta.uid.is_empty() {
-        m["uid"] = serde_json::Value::String(meta.uid);
-    }
-    if !meta.resource_version.is_empty() {
-        m["resourceVersion"] = serde_json::Value::String(meta.resource_version);
-    }
-    if meta.generation != 0 {
-        m["generation"] = serde_json::Value::Number(meta.generation.into());
-    }
-    if let Some(ts) = meta.creation_timestamp {
-        if ts.seconds > 0 {
-            m["creationTimestamp"] =
-                serde_json::Value::String(crate::util::secs_to_rfc3339(ts.seconds as u64));
-        }
-    }
-    if !meta.labels.is_empty() {
-        let labels: serde_json::Map<String, serde_json::Value> = meta
-            .labels
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        m["labels"] = serde_json::Value::Object(labels);
-    }
-    if !meta.annotations.is_empty() {
-        let annotations: serde_json::Map<String, serde_json::Value> = meta
-            .annotations
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        m["annotations"] = serde_json::Value::Object(annotations);
-    }
-    if !meta.owner_references.is_empty() {
-        let refs: Vec<serde_json::Value> = meta
-            .owner_references
-            .iter()
-            .filter_map(|raw| OwnerReference::decode(raw.as_slice()).ok())
-            .map(|r| {
-                let mut entry = serde_json::json!({});
-                if !r.api_version.is_empty() {
-                    entry["apiVersion"] = serde_json::Value::String(r.api_version);
-                }
-                if !r.kind.is_empty() {
-                    entry["kind"] = serde_json::Value::String(r.kind);
-                }
-                if !r.name.is_empty() {
-                    entry["name"] = serde_json::Value::String(r.name);
-                }
-                if !r.uid.is_empty() {
-                    entry["uid"] = serde_json::Value::String(r.uid);
-                }
-                if let Some(ctrl) = r.controller {
-                    entry["controller"] = serde_json::Value::Bool(ctrl);
-                }
-                if let Some(bod) = r.block_owner_deletion {
-                    entry["blockOwnerDeletion"] = serde_json::Value::Bool(bod);
-                }
-                entry
-            })
-            .collect();
-        if !refs.is_empty() {
-            m["ownerReferences"] = serde_json::Value::Array(refs);
-        }
-    }
-    if !meta.finalizers.is_empty() {
-        let fins: Vec<serde_json::Value> = meta
-            .finalizers
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect();
-        m["finalizers"] = serde_json::Value::Array(fins);
-    }
-    m
-}
-
-/// Decode a proto-encoded Namespace object into a `serde_json::Value`.
-pub fn decode_namespace_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let ns = Namespace::decode(data).ok()?;
-    let meta = object_meta_to_json(ns.metadata.unwrap_or_default());
-    let mut obj = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": meta
-    });
-    if let Some(spec) = ns.spec {
-        if !spec.finalizers.is_empty() {
-            let fins: Vec<serde_json::Value> = spec
-                .finalizers
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect();
-            obj["spec"] = serde_json::json!({ "finalizers": fins });
-        }
-    }
-    Some(obj)
-}
-
-/// Decode a proto-encoded ConfigMap object into a `serde_json::Value`.
-pub fn decode_configmap_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let cm = ConfigMap::decode(data).ok()?;
-    let meta = object_meta_to_json(cm.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": meta
-    });
-    if !cm.data.is_empty() {
-        let data_map: serde_json::Map<String, serde_json::Value> = cm
-            .data
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-        obj["data"] = serde_json::Value::Object(data_map);
-    }
-    if !cm.binary_data.is_empty() {
-        let binary_data_map: serde_json::Map<String, serde_json::Value> = cm
-            .binary_data
-            .into_iter()
-            .map(|(k, v)| {
-                use base64::Engine;
-                (
-                    k,
-                    serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&v)),
-                )
-            })
-            .collect();
-        obj["binaryData"] = serde_json::Value::Object(binary_data_map);
-    }
-    Some(obj)
-}
-
-/// Decode a proto-encoded IntOrString (k8s.io/apimachinery/pkg/util/intstr) from raw bytes.
-/// k8s IntOrString (k8s.io/apimachinery/pkg/util/intstr/generated.proto):
-///   field 1 (int64) = type: 0=Int 1=String
-///   field 2 (int32) = intVal (used when type=0)
-///   field 3 (string) = strVal (used when type=1)
-fn decode_int_or_string(bytes: &[u8]) -> Option<serde_json::Value> {
-    #[derive(Clone, PartialEq, prost::Message)]
-    struct IntOrString {
-        #[prost(int64, tag = "1")]
-        r#type: i64,
-        #[prost(int32, tag = "2")]
-        int_val: i32,
-        #[prost(string, tag = "3")]
-        str_val: String,
-    }
-    let ios = IntOrString::decode(bytes).ok()?;
-    if ios.r#type == 0 {
-        Some(serde_json::Value::Number(serde_json::Number::from(
-            ios.int_val,
-        )))
-    } else if !ios.str_val.is_empty() {
-        Some(serde_json::Value::String(ios.str_val))
-    } else {
-        None
-    }
-}
-
-/// Decode a proto-encoded Service object into a `serde_json::Value`.
-pub fn decode_service_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let svc = Service::decode(data).ok()?;
-    let meta = object_meta_to_json(svc.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": meta
-    });
-
-    if let Some(spec) = svc.spec {
-        let mut spec_map = serde_json::Map::new();
-
-        if !spec.cluster_ip.is_empty() {
-            spec_map.insert(
-                "clusterIP".to_string(),
-                serde_json::Value::String(spec.cluster_ip),
-            );
-        }
-        if !spec.r#type.is_empty() {
-            spec_map.insert("type".to_string(), serde_json::Value::String(spec.r#type));
-        }
-        if !spec.session_affinity.is_empty() {
-            spec_map.insert(
-                "sessionAffinity".to_string(),
-                serde_json::Value::String(spec.session_affinity),
-            );
-        }
-        if !spec.external_name.is_empty() {
-            spec_map.insert(
-                "externalName".to_string(),
-                serde_json::Value::String(spec.external_name),
-            );
-        }
-        if !spec.external_traffic_policy.is_empty() {
-            spec_map.insert(
-                "externalTrafficPolicy".to_string(),
-                serde_json::Value::String(spec.external_traffic_policy),
-            );
-        }
-        if !spec.ip_family_policy.is_empty() {
-            spec_map.insert(
-                "ipFamilyPolicy".to_string(),
-                serde_json::Value::String(spec.ip_family_policy),
-            );
-        }
-        if !spec.internal_traffic_policy.is_empty() {
-            spec_map.insert(
-                "internalTrafficPolicy".to_string(),
-                serde_json::Value::String(spec.internal_traffic_policy),
-            );
-        }
-        if !spec.selector.is_empty() {
-            let sel: serde_json::Map<String, serde_json::Value> = spec
-                .selector
-                .into_iter()
-                .map(|(k, v)| (k, serde_json::Value::String(v)))
-                .collect();
-            spec_map.insert("selector".to_string(), serde_json::Value::Object(sel));
-        }
-        if !spec.external_ips.is_empty() {
-            spec_map.insert(
-                "externalIPs".to_string(),
-                serde_json::Value::Array(
-                    spec.external_ips
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        let ports: Vec<serde_json::Value> = spec
-            .ports
-            .into_iter()
-            .map(|p| {
-                let mut pm = serde_json::Map::new();
-                if !p.name.is_empty() {
-                    pm.insert("name".to_string(), serde_json::Value::String(p.name));
-                }
-                if !p.protocol.is_empty() {
-                    pm.insert(
-                        "protocol".to_string(),
-                        serde_json::Value::String(p.protocol),
-                    );
-                }
-                if p.port != 0 {
-                    pm.insert(
-                        "port".to_string(),
-                        serde_json::Value::Number(serde_json::Number::from(p.port)),
-                    );
-                }
-                if !p.target_port.is_empty() {
-                    if let Some(tv) = decode_int_or_string(&p.target_port) {
-                        pm.insert("targetPort".to_string(), tv);
-                    }
-                }
-                if p.node_port != 0 {
-                    pm.insert(
-                        "nodePort".to_string(),
-                        serde_json::Value::Number(serde_json::Number::from(p.node_port)),
-                    );
-                }
-                if !p.app_protocol.is_empty() {
-                    pm.insert(
-                        "appProtocol".to_string(),
-                        serde_json::Value::String(p.app_protocol),
-                    );
-                }
-                serde_json::Value::Object(pm)
-            })
-            .collect();
-        if !ports.is_empty() {
-            spec_map.insert("ports".to_string(), serde_json::Value::Array(ports));
-        }
-
-        obj["spec"] = serde_json::Value::Object(spec_map);
-    }
-
-    if let Some(status) = svc.status {
-        let mut status_map = serde_json::Map::new();
-
-        if let Some(lb) = status.load_balancer {
-            if !lb.ingress.is_empty() {
-                let ingress: Vec<serde_json::Value> = lb
-                    .ingress
-                    .into_iter()
-                    .map(|i| {
-                        let mut im = serde_json::Map::new();
-                        if !i.ip.is_empty() {
-                            im.insert("ip".into(), serde_json::Value::String(i.ip));
-                        }
-                        if !i.hostname.is_empty() {
-                            im.insert("hostname".into(), serde_json::Value::String(i.hostname));
-                        }
-                        serde_json::Value::Object(im)
-                    })
-                    .collect();
-                status_map.insert(
-                    "loadBalancer".into(),
-                    serde_json::json!({ "ingress": ingress }),
-                );
-            }
-        }
-
-        if !status.conditions.is_empty() {
-            status_map.insert(
-                "conditions".into(),
-                status
-                    .conditions
-                    .iter()
-                    .map(|c| {
-                        let mut cond = serde_json::json!({
-                            "type": c.r#type,
-                            "status": c.status,
-                        });
-                        if c.observed_generation != 0 {
-                            cond["observedGeneration"] = c.observed_generation.into();
-                        }
-                        if let Some(ref ts) = c.last_transition_time {
-                            if ts.seconds > 0 {
-                                cond["lastTransitionTime"] = serde_json::Value::String(
-                                    crate::util::secs_to_rfc3339(ts.seconds as u64),
-                                );
-                            }
-                        }
-                        if !c.reason.is_empty() {
-                            cond["reason"] = c.reason.clone().into();
-                        }
-                        if !c.message.is_empty() {
-                            cond["message"] = c.message.clone().into();
-                        }
-                        cond
-                    })
-                    .collect::<serde_json::Value>(),
-            );
-        }
-
-        if !status_map.is_empty() {
-            obj["status"] = serde_json::Value::Object(status_map);
-        }
-    }
-
-    Some(obj)
-}
-
-/// Decode a proto-encoded PersistentVolume object into a `serde_json::Value`.
-pub fn decode_persistentvolume_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let pv = PersistentVolume::decode(data).ok()?;
-    let meta = object_meta_to_json(pv.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "PersistentVolume",
-        "metadata": meta
-    });
-
-    if let Some(spec) = pv.spec {
-        let mut spec_map = serde_json::Map::new();
-        if !spec.access_modes.is_empty() {
-            spec_map.insert(
-                "accessModes".to_string(),
-                serde_json::Value::Array(
-                    spec.access_modes
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        if !spec.persistent_volume_reclaim_policy.is_empty() {
-            spec_map.insert(
-                "persistentVolumeReclaimPolicy".to_string(),
-                serde_json::Value::String(spec.persistent_volume_reclaim_policy),
-            );
-        }
-        if !spec.storage_class_name.is_empty() {
-            spec_map.insert(
-                "storageClassName".to_string(),
-                serde_json::Value::String(spec.storage_class_name),
-            );
-        }
-        if !spec.volume_mode.is_empty() {
-            spec_map.insert(
-                "volumeMode".to_string(),
-                serde_json::Value::String(spec.volume_mode),
-            );
-        }
-        if !spec_map.is_empty() {
-            obj["spec"] = serde_json::Value::Object(spec_map);
-        }
-    }
-
-    Some(obj)
-}
-
-/// Decode a proto-encoded Node object into a `serde_json::Value`.
-pub fn decode_node_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let node = Node::decode(data).ok()?;
-    let meta = object_meta_to_json(node.metadata.unwrap_or_default());
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Node",
-        "metadata": meta
-    });
-
-    if let Some(spec) = node.spec {
-        let mut spec_map = serde_json::Map::new();
-        if !spec.pod_cidr.is_empty() {
-            spec_map.insert(
-                "podCIDR".to_string(),
-                serde_json::Value::String(spec.pod_cidr),
-            );
-        }
-        if !spec.provider_id.is_empty() {
-            spec_map.insert(
-                "providerID".to_string(),
-                serde_json::Value::String(spec.provider_id),
-            );
-        }
-        if !spec.pod_cidrs.is_empty() {
-            spec_map.insert(
-                "podCIDRs".to_string(),
-                serde_json::Value::Array(
-                    spec.pod_cidrs
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        if !spec_map.is_empty() {
-            obj["spec"] = serde_json::Value::Object(spec_map);
-        }
-    }
-
-    Some(obj)
-}
-
-/// Decode a proto-encoded Event object into a `serde_json::Value`.
-pub fn decode_event_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let event = Event::decode(data).ok()?;
-    let meta = object_meta_to_json(event.metadata.unwrap_or_default());
-
-    let involved_object = event.involved_object.map(|r| {
-        let mut m = serde_json::Map::new();
-        if !r.kind.is_empty() {
-            m.insert("kind".to_string(), serde_json::Value::String(r.kind));
-        }
-        if !r.namespace.is_empty() {
-            m.insert(
-                "namespace".to_string(),
-                serde_json::Value::String(r.namespace),
-            );
-        }
-        if !r.name.is_empty() {
-            m.insert("name".to_string(), serde_json::Value::String(r.name));
-        }
-        if !r.uid.is_empty() {
-            m.insert("uid".to_string(), serde_json::Value::String(r.uid));
-        }
-        if !r.api_version.is_empty() {
-            m.insert(
-                "apiVersion".to_string(),
-                serde_json::Value::String(r.api_version),
-            );
-        }
-        if !r.resource_version.is_empty() {
-            m.insert(
-                "resourceVersion".to_string(),
-                serde_json::Value::String(r.resource_version),
-            );
-        }
-        if !r.field_path.is_empty() {
-            m.insert(
-                "fieldPath".to_string(),
-                serde_json::Value::String(r.field_path),
-            );
-        }
-        serde_json::Value::Object(m)
-    });
-
-    let mut obj = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Event",
-        "metadata": meta,
-        "involvedObject": involved_object.unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
-    });
-    if !event.reason.is_empty() {
-        obj["reason"] = serde_json::Value::String(event.reason);
-    }
-    if !event.message.is_empty() {
-        obj["message"] = serde_json::Value::String(event.message);
-    }
-    if event.count != 0 {
-        obj["count"] = serde_json::Value::Number(serde_json::Number::from(event.count));
-    }
-    if !event.r#type.is_empty() {
-        obj["type"] = serde_json::Value::String(event.r#type);
-    }
-    if let Some(s) = event.series {
-        let mut sm = serde_json::Map::new();
-        if s.count != 0 {
-            sm.insert(
-                "count".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(s.count)),
-            );
-        }
-        if let Some(t) = s.last_observed_time {
-            if t.seconds > 0 {
-                let ts = crate::util::secs_nanos_to_rfc3339_micro(t.seconds as u64, t.nanos);
-                sm.insert(
-                    "lastObservedTime".to_string(),
-                    serde_json::Value::String(ts),
-                );
-            }
-        }
-        if !sm.is_empty() {
-            obj["series"] = serde_json::Value::Object(sm);
-        }
-    }
-    Some(obj)
-}
-
 /// Decoded fields from a protobuf-encoded TokenRequest.
 pub struct TokenRequestFields {
     pub audiences: Vec<String>,
@@ -2117,166 +1237,6 @@ pub fn decode_token_request(raw: &[u8]) -> Option<TokenRequestFields> {
         expiration_seconds,
         bound_object_ref,
     })
-}
-
-/// Decode a proto-encoded Deployment object into a `serde_json::Value`.
-#[cfg(test)]
-pub fn decode_deployment_proto(data: &[u8]) -> Option<serde_json::Value> {
-    crate::apps_gen_adapter::decode_deployment_proto_gen(data)
-}
-
-/// Decode a proto-encoded ServiceAccount object into a `serde_json::Value`.
-pub fn decode_serviceaccount_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = ServiceAccount::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "ServiceAccount",
-        "metadata": meta
-    });
-    if !obj.secrets.is_empty() {
-        result["secrets"] = obj
-            .secrets
-            .into_iter()
-            .filter_map(|r| {
-                if r.name.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::json!({ "name": r.name }))
-                }
-            })
-            .collect::<Vec<_>>()
-            .into();
-    }
-    if !obj.image_pull_secrets.is_empty() {
-        result["imagePullSecrets"] = obj
-            .image_pull_secrets
-            .into_iter()
-            .filter_map(|r| {
-                if r.name.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::json!({ "name": r.name }))
-                }
-            })
-            .collect::<Vec<_>>()
-            .into();
-    }
-    if let Some(v) = obj.automount_service_account_token {
-        result["automountServiceAccountToken"] = v.into();
-    }
-    Some(result)
-}
-
-/// Decode a proto-encoded PersistentVolumeClaim object into a `serde_json::Value`.
-pub fn decode_persistentvolumeclaim_proto(data: &[u8]) -> Option<serde_json::Value> {
-    let obj = PersistentVolumeClaim::decode(data).ok()?;
-    let meta = object_meta_to_json(obj.metadata.unwrap_or_default());
-    let mut result = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "PersistentVolumeClaim",
-        "metadata": meta
-    });
-    if let Some(spec) = obj.spec {
-        let mut spec_json = serde_json::json!({});
-        if !spec.access_modes.is_empty() {
-            spec_json["accessModes"] = spec.access_modes.into();
-        }
-        if !spec.volume_name.is_empty() {
-            spec_json["volumeName"] = spec.volume_name.into();
-        }
-        if !spec.storage_class_name.is_empty() {
-            spec_json["storageClassName"] = spec.storage_class_name.into();
-        }
-        if !spec.volume_mode.is_empty() {
-            spec_json["volumeMode"] = spec.volume_mode.into();
-        }
-        if let Some(res) = spec.resources {
-            let mut res_json = serde_json::json!({});
-            if !res.requests.is_empty() {
-                res_json["requests"] = limitrange_quantity_map_to_json(res.requests);
-            }
-            if !res.limits.is_empty() {
-                res_json["limits"] = limitrange_quantity_map_to_json(res.limits);
-            }
-            if res_json.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
-                spec_json["resources"] = res_json;
-            }
-        }
-        if spec_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            result["spec"] = spec_json;
-        }
-    }
-    // Decode status — CSI provisioners and PV controllers send proto-encoded PUT /pvc/status
-    // bodies to set phase and conditions.  Without decoding status here, the put_resource_status
-    // handler receives an incoming object with status=null and removes status from the stored
-    // PVC, causing conditions written by controllers to disappear on read-back.
-    if let Some(status) = obj.status {
-        let mut status_json = serde_json::json!({});
-        if !status.phase.is_empty() {
-            status_json["phase"] = serde_json::Value::String(status.phase);
-        }
-        if !status.conditions.is_empty() {
-            let conditions: Vec<serde_json::Value> = status
-                .conditions
-                .into_iter()
-                .map(|c| {
-                    let mut cond = serde_json::json!({
-                        "type": c.r#type,
-                        "status": c.status
-                    });
-                    if !c.reason.is_empty() {
-                        cond["reason"] = serde_json::Value::String(c.reason);
-                    }
-                    if !c.message.is_empty() {
-                        cond["message"] = serde_json::Value::String(c.message);
-                    }
-                    cond
-                })
-                .collect();
-            status_json["conditions"] = serde_json::Value::Array(conditions);
-        }
-        if status_json
-            .as_object()
-            .map(|m| !m.is_empty())
-            .unwrap_or(false)
-        {
-            result["status"] = status_json;
-        }
-    }
-    Some(result)
-}
-
-/// Convert a map of resource name to Quantity into a serde_json::Value object.
-///
-/// Only quantities that have a non-empty string representation are included.
-/// Quantities with no string field (binary/decimal only) are skipped.
-fn limitrange_quantity_map_to_json(
-    map: std::collections::BTreeMap<String, Quantity>,
-) -> serde_json::Value {
-    let mut out = serde_json::Map::new();
-    for (k, v) in map {
-        let s = v.string.unwrap_or_default();
-        if !s.is_empty() {
-            out.insert(k, serde_json::Value::String(s));
-        }
-    }
-    serde_json::Value::Object(out)
-}
-
-/// Decode a proto-encoded ControllerRevision into a serde_json::Value.
-///
-/// DaemonSet and StatefulSet controllers POST ControllerRevision objects with
-/// Content-Type: application/vnd.kubernetes.protobuf to track rollout history.
-/// Without this decoder, decode_core_proto_by_kind returns None, extract_body returns raw proto
-/// bytes, and the handler returns 400 "invalid JSON: expected value at line 1 column 1".
-#[cfg(test)]
-pub fn decode_controllerrevision_proto(data: &[u8]) -> Option<serde_json::Value> {
-    crate::apps_gen_adapter::decode_controllerrevision_proto_gen(data)
 }
 
 pub fn decode_proto_by_kind_and_version(
@@ -2750,7 +1710,8 @@ mod tests {
         // Namespace field 1 (ObjectMeta, wire 2):
         let namespace_proto = encode_length_delimited(1, &obj_meta);
 
-        let result = decode_namespace_proto(&namespace_proto).expect("must decode namespace proto");
+        let result = decode_core_proto_by_kind("Namespace", &namespace_proto)
+            .expect("must decode namespace proto");
 
         assert_eq!(result["kind"], "Namespace");
         assert_eq!(result["apiVersion"], "v1");
@@ -2774,17 +1735,17 @@ mod tests {
         obj_meta.extend_from_slice(&encode_length_delimited(12, &annot_entry));
 
         let namespace_proto = encode_length_delimited(1, &obj_meta);
-        let result = decode_namespace_proto(&namespace_proto).expect("must decode");
+        let result = decode_core_proto_by_kind("Namespace", &namespace_proto).expect("must decode");
 
         assert_eq!(result["metadata"]["name"], "ns");
         assert_eq!(result["metadata"]["labels"]["env"], "test");
         assert_eq!(result["metadata"]["annotations"]["note"], "hi");
     }
 
-    /// decode_namespace_proto must return None for malformed proto input.
+    /// The gen-path Namespace decoder must return None for malformed proto input.
     #[test]
     fn decode_namespace_proto_returns_none_for_garbage() {
-        assert!(decode_namespace_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(decode_core_proto_by_kind("Namespace", &[0xff, 0xff, 0xff]).is_none());
     }
 
     /// Full round-trip: kubectl create namespace smoke-test sends a k8s proto envelope
@@ -2818,8 +1779,9 @@ mod tests {
         let env = decode_k8s_proto_envelope(&body).expect("envelope decode must succeed");
         assert_eq!(env.content_type, "application/vnd.kubernetes.protobuf");
 
-        // Decode the inner proto-encoded Namespace
-        let json = decode_namespace_proto(&env.raw).expect("namespace proto decode must succeed");
+        // Decode the inner proto-encoded Namespace via the live dispatch path
+        let json = decode_core_proto_by_kind("Namespace", &env.raw)
+            .expect("namespace proto decode must succeed");
         assert_eq!(
             json["metadata"]["name"], "smoke-test",
             "name must be extracted from proto"
@@ -2850,7 +1812,8 @@ mod tests {
         let mut configmap_proto = encode_length_delimited(1, &obj_meta); // ObjectMeta
         configmap_proto.extend_from_slice(&encode_length_delimited(2, &data_entry)); // data entry
 
-        let result = decode_configmap_proto(&configmap_proto).expect("must decode configmap proto");
+        let result = decode_core_proto_by_kind("ConfigMap", &configmap_proto)
+            .expect("must decode configmap proto");
 
         assert_eq!(result["kind"], "ConfigMap");
         assert_eq!(result["apiVersion"], "v1");
@@ -2879,7 +1842,8 @@ mod tests {
         let mut configmap_proto = encode_length_delimited(1, &obj_meta);
         configmap_proto.extend_from_slice(&encode_length_delimited(3, &binary_entry));
 
-        let result = decode_configmap_proto(&configmap_proto).expect("must decode configmap proto");
+        let result = decode_core_proto_by_kind("ConfigMap", &configmap_proto)
+            .expect("must decode configmap proto");
 
         assert_eq!(result["kind"], "ConfigMap");
         assert_eq!(result["metadata"]["name"], "bin-cm");
@@ -3942,7 +2906,8 @@ mod tests {
         let obj_meta = encode_length_delimited(1, b"node-1"); // field 1 = name
         let node_proto = encode_length_delimited(1, &obj_meta); // Node.field 1 = ObjectMeta
 
-        let result = decode_node_proto(&node_proto).expect("must decode node proto");
+        let result =
+            decode_core_proto_by_kind("Node", &node_proto).expect("must decode node proto");
 
         assert_eq!(result["kind"], "Node");
         assert_eq!(result["apiVersion"], "v1");
@@ -3968,7 +2933,8 @@ mod tests {
         let mut node_proto = encode_length_delimited(1, &obj_meta); // Node.field 1 = ObjectMeta
         node_proto.extend_from_slice(&encode_length_delimited(2, &node_spec)); // Node.field 2 = NodeSpec
 
-        let result = decode_node_proto(&node_proto).expect("must decode node with spec");
+        let result =
+            decode_core_proto_by_kind("Node", &node_proto).expect("must decode node with spec");
 
         assert_eq!(result["kind"], "Node");
         assert_eq!(result["apiVersion"], "v1");
@@ -3987,22 +2953,23 @@ mod tests {
         );
     }
 
-    /// decode_node_proto must not panic when NodeSpec contains unrecognized fields (e.g. taints).
+    /// decode_node_proto must not panic when NodeSpec contains taints (nested Taint messages).
     /// Guards against kubelet sending a full Node proto with complex nested spec fields.
     #[test]
     fn decode_node_proto_with_unknown_spec_fields_does_not_panic() {
-        // Build: Node { metadata: ObjectMeta { name: "node-2" }, spec: NodeSpec { podCIDR: "10.0.0.0/24", <unknown field> } }
+        // Build: Node { metadata: ObjectMeta { name: "node-2" }, spec: NodeSpec { podCIDR: "10.0.0.0/24", taints: [Taint{effect:"NoSchedule"}] } }
         let obj_meta = encode_length_delimited(1, b"node-2"); // ObjectMeta.name
         let mut node_spec = Vec::new();
         node_spec.extend_from_slice(&encode_length_delimited(1, b"10.0.0.0/24")); // NodeSpec.podCIDR
-                                                                                  // field 5 = taints (repeated Taint message) — not decoded, must be silently skipped
-        node_spec.extend_from_slice(&encode_length_delimited(5, b"\x0a\x08NoSchedule")); // opaque Taint bytes
+                                                                                  // field 5 = taints (repeated Taint message); Taint.effect is field 3 (string)
+        let taint_bytes = encode_length_delimited(3, b"NoSchedule"); // Taint { effect: "NoSchedule" }
+        node_spec.extend_from_slice(&encode_length_delimited(5, &taint_bytes)); // NodeSpec.taints[0]
 
         let mut node_proto = encode_length_delimited(1, &obj_meta);
         node_proto.extend_from_slice(&encode_length_delimited(2, &node_spec));
 
-        let result =
-            decode_node_proto(&node_proto).expect("must not panic on unknown NodeSpec fields");
+        let result = decode_core_proto_by_kind("Node", &node_proto)
+            .expect("gen path must handle valid Node proto with taint fields without panicking");
 
         assert_eq!(result["metadata"]["name"], "node-2");
         assert_eq!(result["spec"]["podCIDR"], "10.0.0.0/24");
@@ -4036,8 +3003,8 @@ mod tests {
         node_proto.extend_from_slice(&encode_length_delimited(2, &node_spec));
 
         // Must return Some — the varint field must be silently skipped, not cause a panic or None.
-        let result = decode_node_proto(&node_proto)
-            .expect("decode_node_proto must return Some even when unschedulable=true is present");
+        let result = decode_core_proto_by_kind("Node", &node_proto)
+            .expect("Node proto decoder must return Some even when unschedulable=true is present");
 
         assert_eq!(result["metadata"]["name"], "maintenance-node");
         assert_eq!(result["spec"]["podCIDR"], "10.0.1.0/24");
@@ -4103,12 +3070,12 @@ mod tests {
     /// "proto: illegal wireType N" — the smoke CI gate failure this bead addresses.
     #[test]
     fn encode_proto_response_no_illegal_wire_types_namespace_create() {
-        // Reproduce what create_namespace returns after decode_namespace_proto:
+        // Reproduce what create_namespace returns after decoding the Namespace proto:
         let mut obj_meta = encode_length_delimited(1, b"smoke-test");
         obj_meta.extend_from_slice(&encode_length_delimited(8, &[])); // creationTimestamp (empty Time{})
         let namespace_proto = encode_length_delimited(1, &obj_meta);
-        let mut ns_json =
-            decode_namespace_proto(&namespace_proto).expect("decode_namespace_proto must succeed");
+        let mut ns_json = decode_core_proto_by_kind("Namespace", &namespace_proto)
+            .expect("Namespace proto decode must succeed");
         ns_json["status"] = serde_json::json!({ "phase": "Active" });
         ns_json["metadata"]["resourceVersion"] = serde_json::Value::String("1".to_string());
 
@@ -5117,7 +4084,8 @@ mod tests {
         event_proto.extend_from_slice(&count_bytes);
         event_proto.extend_from_slice(&encode_length_delimited(9, b"Normal"));
 
-        let result = decode_event_proto(&event_proto).expect("must decode Event proto");
+        let result =
+            decode_core_proto_by_kind("Event", &event_proto).expect("must decode Event proto");
 
         assert_eq!(result["kind"], "Event");
         assert_eq!(result["apiVersion"], "v1");
@@ -5158,7 +4126,8 @@ mod tests {
         let mut event_proto = encode_length_delimited(1, &obj_meta);
         event_proto.extend_from_slice(&encode_length_delimited(11, &event_series));
 
-        let result = decode_event_proto(&event_proto).expect("must decode Event proto with series");
+        let result = decode_core_proto_by_kind("Event", &event_proto)
+            .expect("must decode Event proto with series");
 
         assert_eq!(
             result["series"]["count"], 100,
@@ -6325,7 +5294,8 @@ mod tests {
         let mut svc_proto = encode_length_delimited(1, &obj_meta);
         svc_proto.extend_from_slice(&encode_length_delimited(2, &svc_spec));
 
-        let result = decode_service_proto(&svc_proto).expect("Service with targetPort must decode");
+        let result = decode_core_proto_by_kind("Service", &svc_proto)
+            .expect("Service with targetPort must decode");
         let ports = result["spec"]["ports"].as_array().expect("ports array");
         assert_eq!(ports[0]["port"], 8443, "port must be 8443");
         assert_eq!(
@@ -6347,7 +5317,7 @@ mod tests {
         let mut svc_proto = encode_length_delimited(1, &obj_meta);
         svc_proto.extend_from_slice(&encode_length_delimited(2, &svc_spec));
 
-        let result = decode_service_proto(&svc_proto)
+        let result = decode_core_proto_by_kind("Service", &svc_proto)
             .expect("must decode headless Service — conformance test creates headless Services");
 
         assert_eq!(result["kind"], "Service");
@@ -8039,7 +7009,8 @@ mod tests {
         let mut svc_proto = encode_length_delimited(1, &obj_meta);
         svc_proto.extend_from_slice(&encode_length_delimited(2, &svc_spec));
 
-        let result = decode_service_proto(&svc_proto).expect("Service proto must decode");
+        let result =
+            decode_core_proto_by_kind("Service", &svc_proto).expect("Service proto must decode");
 
         assert_eq!(
             result["spec"]["ipFamilyPolicy"], "SingleStack",
@@ -8079,8 +7050,8 @@ mod tests {
         let mut pv_proto = encode_length_delimited(1, &obj_meta);
         pv_proto.extend_from_slice(&encode_length_delimited(2, &pv_spec));
 
-        let result =
-            decode_persistentvolume_proto(&pv_proto).expect("PersistentVolume proto must decode");
+        let result = decode_core_proto_by_kind("PersistentVolume", &pv_proto)
+            .expect("PersistentVolume proto must decode");
 
         let access_modes = result["spec"]["accessModes"]
             .as_array()
@@ -8226,10 +7197,10 @@ mod tests {
         let mut deployment_proto = encode_length_delimited(1, &meta_name);
         deployment_proto.extend_from_slice(&encode_length_delimited(2, &dep_spec));
 
-        let result = decode_deployment_proto(&deployment_proto);
+        let result = decode_core_proto_by_kind("Deployment", &deployment_proto);
         assert!(
             result.is_some(),
-            "decode_deployment_proto must succeed when a VolumeMount has readOnly=true (field 2, \
+            "Deployment proto decoder must succeed when a VolumeMount has readOnly=true (field 2, \
              varint); before the fix, VolumeMount.mountPath was at field 2 causing a wire-type \
              mismatch that made decode return None and the apiserver return 400"
         );
@@ -10228,10 +9199,10 @@ mod tests {
         );
     }
 
-    /// decode_controllerrevision_proto must return None for malformed proto input.
+    /// The gen-path ControllerRevision decoder must return None for malformed proto input.
     #[test]
     fn decode_controllerrevision_proto_returns_none_for_garbage() {
-        assert!(decode_controllerrevision_proto(&[0xff, 0xff, 0xff]).is_none());
+        assert!(decode_core_proto_by_kind("ControllerRevision", &[0xff, 0xff, 0xff]).is_none());
     }
 
     // ---------------------------------------------------------------------------
@@ -10894,8 +9865,8 @@ mod tests {
         let mut buf = Vec::new();
         sa.encode(&mut buf).expect("prost encode must succeed");
 
-        let result = decode_serviceaccount_proto(&buf).expect(
-            "decode_serviceaccount_proto must return Some — proto write returns 200 OK but \
+        let result = decode_core_proto_by_kind("ServiceAccount", &buf).expect(
+            "ServiceAccount proto decoder must return Some — proto write returns 200 OK but \
              caller reads back a spec-less object if decoding fails",
         );
 
@@ -10963,8 +9934,8 @@ mod tests {
         let mut buf = Vec::new();
         pvc.encode(&mut buf).expect("prost encode must succeed");
 
-        let result = decode_persistentvolumeclaim_proto(&buf).expect(
-            "decode_persistentvolumeclaim_proto must return Some — proto write returns 200 OK but \
+        let result = decode_core_proto_by_kind("PersistentVolumeClaim", &buf).expect(
+            "PVC proto decoder must return Some — proto write returns 200 OK but \
              caller reads back a spec-less PVC if decoding fails",
         );
 
@@ -11037,8 +10008,8 @@ mod tests {
         let mut buf = Vec::new();
         pvc.encode(&mut buf).expect("prost encode must succeed");
 
-        let result = decode_persistentvolumeclaim_proto(&buf)
-            .expect("decode_persistentvolumeclaim_proto must return Some for a proto /status body");
+        let result = decode_core_proto_by_kind("PersistentVolumeClaim", &buf)
+            .expect("PVC proto decoder must return Some for a proto /status body");
 
         assert_eq!(result["kind"], "PersistentVolumeClaim");
         assert_eq!(result["metadata"]["name"], "status-pvc");

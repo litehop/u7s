@@ -138,9 +138,9 @@ pub async fn create_namespace<S: Store>(
             }
             Some(env) => {
                 // Inner bytes are proto-encoded. kubectl sends contentType="" (empty) with a
-                // proto-encoded Namespace in Unknown.raw — not JSON. Decode using the
-                // Namespace-specific proto decoder; fall back to JSON only if proto fails.
-                match proto::decode_namespace_proto(&env.raw) {
+                // proto-encoded Namespace in Unknown.raw — not JSON. Decode via the dispatch
+                // table; fall back to JSON only if proto fails.
+                match proto::decode_proto_by_kind_and_version("Namespace", "", &env.raw) {
                     Some(json_val) => Object { body: json_val },
                     None => Object::from_bytes(&bytes::Bytes::from(env.raw))
                         .map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?,
