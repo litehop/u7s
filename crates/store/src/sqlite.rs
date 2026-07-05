@@ -879,6 +879,33 @@ impl Store for SqliteStore {
         Ok((revision, last_value))
     }
 
+    async fn list_namespace_objects(&self, namespace: &str) -> Result<Vec<StoreObject>> {
+        let conn = self.write_conn.clone();
+        let ns = namespace.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt =
+                conn.prepare("SELECT key, value, revision FROM objects WHERE ns = ?1")?;
+            let items: Vec<StoreObject> = stmt
+                .query_map(rusqlite::params![ns], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Vec<u8>>(1)?,
+                        r.get::<_, i64>(2).map(|v| v as u64)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .map(|(key, value, revision)| StoreObject {
+                    key,
+                    value: Bytes::from(value),
+                    revision,
+                })
+                .collect();
+            Ok(items)
+        })
+        .await?
+    }
+
     async fn delete_namespace_resources(&self, namespace: &str) -> Result<Vec<String>> {
         let conn = self.write_conn.clone();
         let ns = namespace.to_string();

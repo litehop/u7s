@@ -707,6 +707,10 @@ pub async fn patch_pod<S: Store>(
                 .delete(&key, None)
                 .await
                 .map_err(|e| store_err_to_status(e, &name))?;
+            // After hard-deleting a pod, check if its namespace is ready to complete deletion.
+            // This handles OrderedNamespaceDeletion: once all finalizer'd pods are cleared,
+            // the Terminating namespace hard-deletes.
+            super::namespaces::maybe_finalize_terminating_namespace(&state, ns.as_str()).await;
             return Ok(Json(current_obj.body));
         }
 
@@ -8488,6 +8492,16 @@ mod handler_tests {
             let inner = self.inner.clone();
             let key = key.to_string();
             async move { inner.delete(&key, expected_revision).await }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
         }
 
         fn delete_namespace_resources(

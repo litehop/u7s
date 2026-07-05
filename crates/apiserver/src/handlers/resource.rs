@@ -794,6 +794,12 @@ pub(crate) async fn do_patch<S: Store>(
         if group == ADMISSION_GROUP {
             state.refresh_admission_config(plural).await;
         }
+        // If this object lived in a namespace, check whether its namespace is now ready
+        // to complete deletion. This handles the OrderedNamespaceDeletion flow: after all
+        // finalizer'd objects are cleared, the Terminating namespace hard-deletes.
+        if let Some(namespace) = ns {
+            super::namespaces::maybe_finalize_terminating_namespace(state, namespace).await;
+        }
         return Ok(Json(current.body).into_response());
     }
 
@@ -12541,6 +12547,16 @@ mod tests {
             }
         }
 
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
         fn delete_namespace_resources(
             &self,
             namespace: &str,
@@ -12786,6 +12802,16 @@ mod tests {
                     inner.delete(&key, expected_revision).await
                 }
             }
+        }
+
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
         }
 
         fn delete_namespace_resources(
