@@ -527,6 +527,30 @@ fn build_router(state: AppState) -> Router {
                 .put(handlers::proxy::node_proxy)
                 .delete(handlers::proxy::node_proxy),
         )
+        // Services — proxy subresource: forward to a ready endpoint backing the Service.
+        // axum's `{*path}` wildcard requires a NON-EMPTY segment. Register the no-subpath
+        // forms before the wildcard route so /proxy and /proxy/ reach the root handler.
+        .route(
+            "/api/v1/namespaces/{ns}/services/{name}/proxy",
+            get(handlers::proxy::service_proxy_root)
+                .post(handlers::proxy::service_proxy_root)
+                .put(handlers::proxy::service_proxy_root)
+                .delete(handlers::proxy::service_proxy_root),
+        )
+        .route(
+            "/api/v1/namespaces/{ns}/services/{name}/proxy/",
+            get(handlers::proxy::service_proxy_root)
+                .post(handlers::proxy::service_proxy_root)
+                .put(handlers::proxy::service_proxy_root)
+                .delete(handlers::proxy::service_proxy_root),
+        )
+        .route(
+            "/api/v1/namespaces/{ns}/services/{name}/proxy/{*path}",
+            get(handlers::proxy::service_proxy)
+                .post(handlers::proxy::service_proxy)
+                .put(handlers::proxy::service_proxy)
+                .delete(handlers::proxy::service_proxy),
+        )
         // Core group (group="", apiVersion=v1) — cluster-scoped resources (e.g. nodes)
         .route(
             "/api/v1/{resource}",

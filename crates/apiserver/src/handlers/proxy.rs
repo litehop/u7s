@@ -19,12 +19,12 @@ use axum::{
 };
 use serde::Deserialize;
 
-use u7s_store::Store;
+use u7s_store::{ListOptions, Store};
 
 use crate::{
     admission::{run_validating_webhooks, AdmissionContext},
     handlers::stream::{splice, AxumWs, BiStream, BiStreamReader, BiStreamWriter, TungsteniteWs},
-    keys::{cluster_object_key, object_key},
+    keys::{cluster_object_key, group_list_prefix, object_key},
     state::AppState,
     status::Status,
 };
@@ -1425,6 +1425,206 @@ pub async fn pod_proxy_root<S: Store>(
 }
 
 // ---------------------------------------------------------------------------
+// /api/v1/namespaces/{ns}/services/{name}/proxy/{*path} — forward to a ready endpoint
+// ---------------------------------------------------------------------------
+
+/// Resolve the IP and port of a ready endpoint backing the Service.
+///
+/// Returns (endpoint_ip, port, konnectivity_proxy_addr). Separated from the
+/// handler so the resolution logic can be unit-tested without a live network.
+pub async fn resolve_service_proxy_target<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    svc_name: &str,
+) -> Result<(String, u16, Option<String>), crate::status::StatusError> {
+    // 1. Confirm the Service exists (404 if not).
+    let svc_key = object_key("services", ns, svc_name);
+    state
+        .store
+        .get(&svc_key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(svc_name, "Service"))?;
+
+    // 2. List all EndpointSlices in the namespace and find one owned by this Service.
+    //    KCM stamps the "kubernetes.io/service-name" label on every slice it manages.
+    let eps_prefix = group_list_prefix("discovery.k8s.io", "endpointslices", Some(ns));
+    let eps_list = state
+        .store
+        .list(&eps_prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    for item in &eps_list.items {
+        let eps: serde_json::Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let svc_label = eps["metadata"]["labels"]["kubernetes.io/service-name"]
+            .as_str()
+            .unwrap_or("");
+        if svc_label != svc_name {
+            continue;
+        }
+        // Pick the port number from the slice's ports array (first entry).
+        let port = eps["ports"][0]["port"]
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .unwrap_or(80);
+
+        // Find the first endpoint with conditions.ready == true.
+        if let Some(endpoints) = eps["endpoints"].as_array() {
+            for ep in endpoints {
+                let ready = ep["conditions"]["ready"].as_bool().unwrap_or(false);
+                if !ready {
+                    continue;
+                }
+                if let Some(addr) = ep["addresses"][0].as_str().filter(|s| !s.is_empty()) {
+                    return Ok((addr.to_owned(), port, state.konnectivity_proxy_addr.clone()));
+                }
+            }
+        }
+    }
+
+    Err(crate::status::StatusError(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        crate::status::Status {
+            kind: "Status",
+            api_version: "v1",
+            status: "Failure",
+            message: format!(
+                "service \"{svc_name}\" has no ready endpoints — service is not ready to serve traffic"
+            ),
+            reason: "ServiceUnavailable",
+            code: 503,
+            metadata: None,
+        },
+    ))
+}
+
+/// Proxy a request to a ready endpoint backing the Service.
+///
+/// Shared implementation for both the with-subpath and no-subpath service proxy routes.
+async fn service_proxy_dispatch<S: Store>(
+    state: &AppState<S>,
+    ns: &str,
+    svc_name: &str,
+    path_suffix: &str,
+    req: axum::http::Request<Body>,
+) -> Result<Response, crate::status::StatusError> {
+    let (ep_ip, port, proxy_addr) = resolve_service_proxy_target(state, ns, svc_name).await?;
+    // Reuse the pod_proxy_dispatch path: build the URL and forward the request.
+    // Service endpoints are reached the same way as pod IPs — via konnectivity
+    // when configured, or directly otherwise.
+    let method = req.method().clone();
+    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .map_err(|e| Status::internal(format!("failed to read request body: {e}")))?;
+
+    if let Some(addr) = proxy_addr.as_deref() {
+        let (status, body) = pod_proxy_via_connect_tunnel(
+            addr,
+            &ep_ip,
+            port,
+            path_suffix,
+            method,
+            body_bytes,
+            state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+            state
+                .kubelet_client_identity_pem
+                .as_deref()
+                .map(|v| v.as_slice()),
+        )
+        .await
+        .map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("service endpoint unreachable via konnectivity: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                },
+            )
+        })?;
+
+        return Response::builder()
+            .status(status)
+            .body(Body::from(body))
+            .map_err(|e| Status::internal(e.to_string()));
+    }
+
+    let target_url = format!("http://{ep_ip}:{port}/{path_suffix}");
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .map_err(|e| Status::internal(format!("invalid method: {e}")))?;
+
+    let client = build_pod_proxy_client(
+        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
+        state
+            .kubelet_client_identity_pem
+            .as_deref()
+            .map(|v| v.as_slice()),
+    );
+
+    let ep_resp = client
+        .request(reqwest_method, &target_url)
+        .body(body_bytes)
+        .send()
+        .await
+        .map_err(|e| {
+            crate::status::StatusError(
+                axum::http::StatusCode::BAD_GATEWAY,
+                crate::status::Status {
+                    kind: "Status",
+                    api_version: "v1",
+                    status: "Failure",
+                    message: format!("service endpoint unreachable: {e}"),
+                    reason: "BadGateway",
+                    code: 502,
+                    metadata: None,
+                },
+            )
+        })?;
+
+    let ep_status = ep_resp.status();
+    let body = Body::from_stream(ep_resp.bytes_stream());
+
+    Response::builder()
+        .status(ep_status.as_u16())
+        .body(body)
+        .map_err(|e| Status::internal(e.to_string()))
+}
+
+/// Proxy a request to a Service-backing endpoint (with sub-path).
+///
+/// GET /api/v1/namespaces/{ns}/services/{name}/proxy/{*path} → http://{endpointIP}:{port}/{path}
+///
+/// Resolves a ready endpoint via the Service's EndpointSlices. Returns 404 if the
+/// Service is absent, 503 if no ready endpoint exists, and streams the response otherwise.
+pub async fn service_proxy<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, svc_name, path_suffix)): Path<(String, String, String)>,
+    req: axum::http::Request<Body>,
+) -> Result<Response, crate::status::StatusError> {
+    service_proxy_dispatch(&state, &ns, &svc_name, &path_suffix, req).await
+}
+
+/// Proxy a request to a Service-backing endpoint (no sub-path form).
+///
+/// GET /api/v1/namespaces/{ns}/services/{name}/proxy  → http://{endpointIP}:{port}/
+/// GET /api/v1/namespaces/{ns}/services/{name}/proxy/ → http://{endpointIP}:{port}/
+pub async fn service_proxy_root<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((ns, svc_name)): Path<(String, String)>,
+    req: axum::http::Request<Body>,
+) -> Result<Response, crate::status::StatusError> {
+    service_proxy_dispatch(&state, &ns, &svc_name, "", req).await
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -1487,6 +1687,27 @@ mod tests {
                     .post(pod_proxy)
                     .put(pod_proxy)
                     .delete(pod_proxy),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/services/{name}/proxy",
+                get(service_proxy_root)
+                    .post(service_proxy_root)
+                    .put(service_proxy_root)
+                    .delete(service_proxy_root),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/services/{name}/proxy/",
+                get(service_proxy_root)
+                    .post(service_proxy_root)
+                    .put(service_proxy_root)
+                    .delete(service_proxy_root),
+            )
+            .route(
+                "/api/v1/namespaces/{ns}/services/{name}/proxy/{*path}",
+                get(service_proxy)
+                    .post(service_proxy)
+                    .put(service_proxy)
+                    .delete(service_proxy),
             )
             .with_state(state)
     }
@@ -3699,5 +3920,266 @@ mod tests {
             "the denial message from the webhook must be propagated to the client: {}",
             body_json
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // service_proxy: resolve_service_proxy_target unit tests
+    //
+    // Service proxy forwards to a ready endpoint found via EndpointSlices.
+    // resolve_service_proxy_target handles the pre-flight checks. We test it
+    // directly because the handler is a thin wrapper around this function.
+    // -----------------------------------------------------------------------
+
+    /// Service proxy must return 404 when the Service does not exist.
+    ///
+    /// A 404 tells the caller the Service is missing rather than suggesting
+    /// its endpoints are unreachable (502) or that something internal failed (500).
+    /// Without the Service existence check, a missing Service produces 503 when
+    /// no EndpointSlices match — an incorrect status that misleads the caller.
+    #[tokio::test]
+    async fn service_proxy_missing_service_returns_404() {
+        let state = make_state();
+        let result = resolve_service_proxy_target(&state, "default", "ghost-svc").await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            404,
+            "service proxy must return 404 when the Service is not in the store — \
+             returning 503 instead would make it look like the service has no endpoints \
+             rather than that the service itself is missing"
+        );
+    }
+
+    /// Service proxy must return 503 when the Service exists but has no ready endpoints.
+    ///
+    /// A 503 tells the caller to retry; the Service exists but its endpoints are not
+    /// yet ready. Returning 502 or 500 would mislead the caller.
+    #[tokio::test]
+    async fn service_proxy_no_ready_endpoints_returns_503() {
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80, "targetPort": 8080}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        // No EndpointSlices seeded — the service has no backing endpoints.
+        let result = resolve_service_proxy_target(&state, "default", "my-svc").await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            503,
+            "service proxy must return 503 when the Service has no ready endpoints — \
+             the service exists but cannot serve traffic; 404 would incorrectly imply \
+             the service is gone"
+        );
+    }
+
+    /// Service proxy resolves the ready endpoint IP and port from the EndpointSlice.
+    ///
+    /// The handler constructs the forward URL from these values; an incorrect IP or
+    /// port would silently route to the wrong backend. The slice must be matched by
+    /// the kubernetes.io/service-name label, and only ready endpoints are used.
+    #[tokio::test]
+    async fn service_proxy_resolves_ready_endpoint_ip_and_port() {
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "my-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "my-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [
+                {
+                    "addresses": ["10.2.3.4"],
+                    "conditions": {"ready": true, "serving": true, "terminating": false}
+                }
+            ],
+            "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "my-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let (ip, port, _) = resolve_service_proxy_target(&state, "default", "my-svc")
+            .await
+            .expect("resolve must succeed for a service with a ready endpoint");
+        assert_eq!(
+            ip, "10.2.3.4",
+            "service proxy must use the ready endpoint address — using any other address \
+             would route to the wrong backend"
+        );
+        assert_eq!(
+            port, 8080,
+            "service proxy must use the port from the EndpointSlice ports array — \
+             using port 80 when 8080 is configured routes to the wrong port"
+        );
+    }
+
+    /// Service proxy must not use an endpoint whose conditions.ready is false.
+    ///
+    /// A not-ready endpoint is either initializing or terminating; forwarding to it
+    /// would cause request failures. The handler must skip non-ready entries and
+    /// return 503 if no ready endpoint remains.
+    #[tokio::test]
+    async fn service_proxy_skips_not_ready_endpoints_returns_503() {
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "my-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "my-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [
+                {
+                    "addresses": ["10.2.3.4"],
+                    "conditions": {"ready": false, "serving": false, "terminating": true}
+                }
+            ],
+            "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "my-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let result = resolve_service_proxy_target(&state, "default", "my-svc").await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            503,
+            "service proxy must return 503 when all endpoints have conditions.ready=false — \
+             forwarding to a terminating or initializing endpoint causes request failures"
+        );
+    }
+
+    /// Service proxy route must resolve to the handler, not return 404.
+    ///
+    /// Without the route registration in main.rs the request falls through to the
+    /// generic handler and 404s — the Guestbook and Services proxy conformance tests
+    /// never reach the service_proxy handler.
+    #[tokio::test]
+    async fn service_proxy_route_is_registered_not_404() {
+        let state = make_state();
+
+        // Seed a Service with no EndpointSlice → handler returns 503 (service has no
+        // ready endpoints), not 404. 503 proves the handler was reached; 404 proves
+        // the route was never registered.
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let mut router = make_router(state);
+
+        for path in [
+            "/api/v1/namespaces/default/services/my-svc/proxy",
+            "/api/v1/namespaces/default/services/my-svc/proxy/",
+            "/api/v1/namespaces/default/services/my-svc/proxy/some/subpath",
+        ] {
+            let req = Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.call(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "GET {path} must NOT return 404 — the Guestbook and Services proxy \
+                 conformance tests reach this route; a 404 means the route was never registered"
+            );
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "GET {path} must reach the service proxy handler and return 503 \
+                 (service exists but has no ready endpoints) — any other status means \
+                 routing is broken"
+            );
+        }
     }
 }
