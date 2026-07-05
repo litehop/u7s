@@ -3222,7 +3222,7 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
     // (including initContainers). Real kube-apiserver stamps both fields before storing.
     // Absent fieldRef.apiVersion causes kubelet "unsupported pod version: <empty>".
     // Absent port protocol causes KCM endpointslice controller to emit ports:[].
-    for containers_key in &["containers", "initContainers"] {
+    for containers_key in &["containers", "initContainers", "ephemeralContainers"] {
         if let Some(containers) = pod["spec"][containers_key].as_array_mut() {
             for container in containers {
                 if let Some(env) = container["env"].as_array_mut() {
@@ -3239,6 +3239,35 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
                     for port in ports {
                         if port["protocol"].is_null() {
                             port["protocol"] = serde_json::Value::String("TCP".to_string());
+                        }
+                    }
+                }
+                // Apply upstream SetDefaults_Probe defaults for all three probe types.
+                // kubelet calls time.NewTicker(periodSeconds) — a value of 0 panics with
+                // "non-positive interval for NewTicker" (prober/worker.go:169), crash-looping
+                // the kubelet. Clients rely on the apiserver to default these fields.
+                for probe_key in &["livenessProbe", "readinessProbe", "startupProbe"] {
+                    if container[probe_key].is_object() {
+                        let probe = &mut container[*probe_key];
+                        if probe["periodSeconds"].is_null()
+                            || probe["periodSeconds"].as_i64() == Some(0)
+                        {
+                            probe["periodSeconds"] = serde_json::json!(10);
+                        }
+                        if probe["timeoutSeconds"].is_null()
+                            || probe["timeoutSeconds"].as_i64() == Some(0)
+                        {
+                            probe["timeoutSeconds"] = serde_json::json!(1);
+                        }
+                        if probe["successThreshold"].is_null()
+                            || probe["successThreshold"].as_i64() == Some(0)
+                        {
+                            probe["successThreshold"] = serde_json::json!(1);
+                        }
+                        if probe["failureThreshold"].is_null()
+                            || probe["failureThreshold"].as_i64() == Some(0)
+                        {
+                            probe["failureThreshold"] = serde_json::json!(3);
                         }
                     }
                 }
@@ -4071,6 +4100,156 @@ mod create_defaults_tests {
         assert_eq!(
             probe["failureThreshold"], 3,
             "livenessProbe.failureThreshold must be preserved"
+        );
+    }
+
+    /// Probe fields missing periodSeconds must be defaulted to 10 on pod create.
+    ///
+    /// kubelet calls time.NewTicker(periodSeconds) in prober/worker.go:169. When
+    /// periodSeconds == 0 (the value for an unset field), Go panics with
+    /// "non-positive interval for NewTicker", crash-looping the kubelet (236 restarts
+    /// observed). Clients rely on the apiserver to default these fields — omitting
+    /// periodSeconds is the normal usage. This test fails if the defaulting is removed,
+    /// proving it is a genuine regression guard.
+    #[test]
+    fn probe_missing_period_seconds_defaults_to_10() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "probe-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox",
+                    "livenessProbe": {
+                        "exec": {"command": ["cat", "/tmp/health"]},
+                        "initialDelaySeconds": 15
+                    },
+                    "readinessProbe": {
+                        "exec": {"command": ["cat", "/tmp/ready"]}
+                    }
+                }],
+                "initContainers": [{
+                    "name": "init",
+                    "image": "busybox",
+                    "startupProbe": {
+                        "exec": {"command": ["cat", "/tmp/started"]}
+                    }
+                }]
+            }
+        });
+
+        apply_pod_create_defaults(&mut pod);
+
+        let liveness = &pod["spec"]["containers"][0]["livenessProbe"];
+        assert_eq!(
+            liveness["periodSeconds"], 10,
+            "livenessProbe.periodSeconds must default to 10 — 0 panics kubelet NewTicker"
+        );
+        assert_eq!(
+            liveness["timeoutSeconds"], 1,
+            "livenessProbe.timeoutSeconds must default to 1 — upstream SetDefaults_Probe"
+        );
+        assert_eq!(
+            liveness["successThreshold"], 1,
+            "livenessProbe.successThreshold must default to 1 — upstream SetDefaults_Probe"
+        );
+        assert_eq!(
+            liveness["failureThreshold"], 3,
+            "livenessProbe.failureThreshold must default to 3 — upstream SetDefaults_Probe"
+        );
+        assert_eq!(
+            liveness["initialDelaySeconds"], 15,
+            "livenessProbe.initialDelaySeconds must be preserved (client-supplied)"
+        );
+
+        let readiness = &pod["spec"]["containers"][0]["readinessProbe"];
+        assert_eq!(
+            readiness["periodSeconds"], 10,
+            "readinessProbe.periodSeconds must default to 10 — 0 panics kubelet NewTicker"
+        );
+
+        let startup = &pod["spec"]["initContainers"][0]["startupProbe"];
+        assert_eq!(
+            startup["periodSeconds"], 10,
+            "initContainers startupProbe.periodSeconds must default to 10 — applies to all container lists"
+        );
+    }
+
+    /// An explicit periodSeconds must not be overwritten.
+    ///
+    /// A probe with periodSeconds: 5 must stay at 5 — the defaulting must only fill
+    /// absent (0/null) values, not overwrite client-supplied ones.
+    #[test]
+    fn probe_explicit_period_seconds_not_overwritten() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "probe-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox",
+                    "livenessProbe": {
+                        "exec": {"command": ["cat", "/tmp/health"]},
+                        "periodSeconds": 5,
+                        "timeoutSeconds": 10,
+                        "successThreshold": 2,
+                        "failureThreshold": 1
+                    }
+                }]
+            }
+        });
+
+        apply_pod_create_defaults(&mut pod);
+
+        let probe = &pod["spec"]["containers"][0]["livenessProbe"];
+        assert_eq!(
+            probe["periodSeconds"], 5,
+            "explicit periodSeconds must not be overwritten by defaulting"
+        );
+        assert_eq!(
+            probe["timeoutSeconds"], 10,
+            "explicit timeoutSeconds must not be overwritten by defaulting"
+        );
+        assert_eq!(
+            probe["successThreshold"], 2,
+            "explicit successThreshold must not be overwritten by defaulting"
+        );
+        assert_eq!(
+            probe["failureThreshold"], 1,
+            "explicit failureThreshold must not be overwritten by defaulting"
+        );
+    }
+
+    /// A container with no probe must not get a probe injected.
+    ///
+    /// Probe defaulting must only fill fields on probes that EXIST — it must not
+    /// invent a livenessProbe on containers that have none.
+    #[test]
+    fn container_without_probe_stays_without_probe() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "noprobe-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        apply_pod_create_defaults(&mut pod);
+
+        assert!(
+            pod["spec"]["containers"][0]["livenessProbe"].is_null(),
+            "a container without livenessProbe must not have one injected by defaulting"
+        );
+        assert!(
+            pod["spec"]["containers"][0]["readinessProbe"].is_null(),
+            "a container without readinessProbe must not have one injected by defaulting"
+        );
+        assert!(
+            pod["spec"]["containers"][0]["startupProbe"].is_null(),
+            "a container without startupProbe must not have one injected by defaulting"
         );
     }
 
