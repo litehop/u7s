@@ -219,6 +219,39 @@ pub(crate) enum LabelSelectorTerm<'a> {
     NotEquals { key: &'a str, value: &'a str },
     Exists { key: &'a str },
     DoesNotExist { key: &'a str },
+    In { key: &'a str, values: Vec<&'a str> },
+    NotIn { key: &'a str, values: Vec<&'a str> },
+}
+
+/// Split a label selector string into top-level comma-separated terms,
+/// without splitting inside parentheses (which appear in `key in (v1,v2)` forms).
+fn split_label_selector_terms(selector: &str) -> Vec<&str> {
+    let mut terms = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+    for (i, c) in selector.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                terms.push(selector[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    terms.push(selector[start..].trim());
+    terms
+}
+
+/// Parse the values list from a set-based selector: `(v1, v2, v3)` → `["v1", "v2", "v3"]`.
+fn parse_set_values_generic(s: &str) -> Vec<&str> {
+    let inner = s.trim().trim_start_matches('(').trim_end_matches(')');
+    inner
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect()
 }
 
 /// Parse a label selector string into typed terms.
@@ -228,14 +261,15 @@ pub(crate) enum LabelSelectorTerm<'a> {
 /// - `key!=value` — NotEquals
 /// - `key` (bare) — Exists
 /// - `!key` — DoesNotExist
+/// - `key in (v1,v2)` — In
+/// - `key notin (v1,v2)` — NotIn
 ///
 /// Returns an error on malformed input (e.g. empty key, bare `=`).
 pub(crate) fn parse_label_selector(
     selector: &str,
 ) -> Result<Vec<LabelSelectorTerm<'_>>, crate::status::StatusError> {
     let mut terms = Vec::new();
-    for part in selector.split(',') {
-        let part = part.trim();
+    for part in split_label_selector_terms(selector) {
         if part.is_empty() {
             continue;
         }
@@ -247,6 +281,28 @@ pub(crate) fn parse_label_selector(
                 )));
             }
             terms.push(LabelSelectorTerm::DoesNotExist { key });
+            continue;
+        }
+        if let Some((key, rest)) = part.split_once(" notin ") {
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(Status::bad_request(format!(
+                    "invalid label selector '{part}': empty key"
+                )));
+            }
+            let values = parse_set_values_generic(rest);
+            terms.push(LabelSelectorTerm::NotIn { key, values });
+            continue;
+        }
+        if let Some((key, rest)) = part.split_once(" in ") {
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(Status::bad_request(format!(
+                    "invalid label selector '{part}': empty key"
+                )));
+            }
+            let values = parse_set_values_generic(rest);
+            terms.push(LabelSelectorTerm::In { key, values });
             continue;
         }
         if let Some((key, value)) = part.split_once("!=") {
@@ -307,6 +363,14 @@ pub(crate) fn apply_label_selector(
                 }
                 LabelSelectorTerm::Exists { key } => labels.contains_key(*key),
                 LabelSelectorTerm::DoesNotExist { key } => !labels.contains_key(*key),
+                LabelSelectorTerm::In { key, values } => labels
+                    .get(*key)
+                    .map(|s| s.as_str())
+                    .is_some_and(|v| values.contains(&v)),
+                LabelSelectorTerm::NotIn { key, values } => !labels
+                    .get(*key)
+                    .map(|s| s.as_str())
+                    .is_some_and(|v| values.contains(&v)),
             })
         })
         .collect()
@@ -3096,6 +3160,140 @@ mod apply_delete_policy_tests {
         assert!(
             body["metadata"]["deletionTimestamp"].as_str().is_some(),
             "deletionTimestamp must still be stamped for non-Namespace soft-delete"
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_based_selector_tests {
+    use super::{apply_label_selector, parse_label_selector, LabelSelectorTerm};
+
+    fn ok<T>(r: Result<T, crate::status::StatusError>) -> T {
+        match r {
+            Ok(v) => v,
+            Err(_) => panic!("expected Ok but got Err"),
+        }
+    }
+
+    fn item_with_label(key: &str, value: &str) -> serde_json::Value {
+        serde_json::json!({"metadata": {"labels": {key: value}}})
+    }
+
+    fn item_without_label() -> serde_json::Value {
+        serde_json::json!({"metadata": {"labels": {}}})
+    }
+
+    /// `parse_label_selector` must produce `In` term for `key in (v1,v2)`.
+    ///
+    /// Without this fix, the `in` operator falls to the bare-key Exists branch, causing
+    /// controllers that use set-based selectors to see nothing in LIST responses.
+    #[test]
+    fn parse_label_selector_in_operator_produces_in_term() {
+        let terms = ok(parse_label_selector("color in (red,blue)"));
+        assert_eq!(terms.len(), 1, "must produce exactly one term");
+        match &terms[0] {
+            LabelSelectorTerm::In { key, values } => {
+                assert_eq!(*key, "color");
+                assert!(values.contains(&"red"), "values must include 'red'");
+                assert!(values.contains(&"blue"), "values must include 'blue'");
+            }
+            other => panic!("expected In term, got {other:?}"),
+        }
+    }
+
+    /// `parse_label_selector` must produce `NotIn` term for `key notin (v1,v2)`.
+    #[test]
+    fn parse_label_selector_notin_operator_produces_notin_term() {
+        let terms = ok(parse_label_selector("env notin (prod,staging)"));
+        assert_eq!(terms.len(), 1);
+        match &terms[0] {
+            LabelSelectorTerm::NotIn { key, values } => {
+                assert_eq!(*key, "env");
+                assert!(values.contains(&"prod"));
+                assert!(values.contains(&"staging"));
+            }
+            other => panic!("expected NotIn term, got {other:?}"),
+        }
+    }
+
+    /// The paren-safe term splitter must not split `a=b,c in (d,e),f!=g` at the inner comma.
+    ///
+    /// Before the fix, `selector.split(',')` split `c in (d,e)` into `c in (d` and `e)`,
+    /// causing the In parser to never see a well-formed term and falling through to a bogus parse.
+    #[test]
+    fn parse_label_selector_term_split_does_not_split_inside_parens() {
+        let terms = ok(parse_label_selector("a=b,c in (d,e),f!=g"));
+        assert_eq!(
+            terms.len(),
+            3,
+            "must produce 3 terms: Equality, In, NotEquals; \
+             the comma inside `in (d,e)` must not be treated as a term separator — \
+             controllers using set-based selectors would get no results otherwise"
+        );
+        assert!(matches!(
+            &terms[0],
+            LabelSelectorTerm::Equality {
+                key: "a",
+                value: "b"
+            }
+        ));
+        assert!(matches!(&terms[1], LabelSelectorTerm::In { key: "c", .. }));
+        assert!(matches!(
+            &terms[2],
+            LabelSelectorTerm::NotEquals {
+                key: "f",
+                value: "g"
+            }
+        ));
+    }
+
+    /// `apply_label_selector` with `In` term must keep objects with listed values, drop others.
+    ///
+    /// Without this fix, LIST responses to set-based selectors return empty lists and
+    /// controllers think no objects exist.
+    #[test]
+    fn apply_label_selector_in_term_filters_correctly() {
+        let red = item_with_label("color", "red");
+        let blue = item_with_label("color", "blue");
+        let green = item_with_label("color", "green");
+        let absent = item_without_label();
+
+        let terms = vec![LabelSelectorTerm::In {
+            key: "color",
+            values: vec!["red", "blue"],
+        }];
+        let result = apply_label_selector(vec![red, blue, green, absent], &terms);
+        assert_eq!(
+            result.len(),
+            2,
+            "In filter must keep only red and blue; \
+             set-based-selector LIST returns empty without this fix"
+        );
+        let colors: Vec<&str> = result
+            .iter()
+            .map(|i| i["metadata"]["labels"]["color"].as_str().unwrap_or(""))
+            .collect();
+        assert!(colors.contains(&"red"));
+        assert!(colors.contains(&"blue"));
+    }
+
+    /// `apply_label_selector` with `NotIn` term must keep objects NOT in the list (and missing key).
+    #[test]
+    fn apply_label_selector_notin_term_filters_correctly() {
+        let red = item_with_label("color", "red");
+        let green = item_with_label("color", "green");
+        let absent = item_without_label();
+
+        let terms = vec![LabelSelectorTerm::NotIn {
+            key: "color",
+            values: vec!["red", "blue"],
+        }];
+        let result = apply_label_selector(vec![red, green, absent], &terms);
+        assert_eq!(
+            result.len(),
+            2,
+            "NotIn filter must keep green and the object with absent key; \
+             set-based-selector LIST filters out all non-listed values"
         );
     }
 }
