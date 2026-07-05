@@ -416,6 +416,8 @@ pub async fn create_pod<S: Store>(
 
     obj.set_resource_version(new_rv);
 
+    crate::quota::update_quota_status(&state, ns.as_str()).await;
+
     Ok((StatusCode::CREATED, Json(obj.body)).into_response())
 }
 
@@ -598,6 +600,8 @@ pub async fn delete_pod<S: Store>(
             .delete(&key, None)
             .await
             .map_err(|e| store_err_to_status(e, &name))?;
+
+        crate::quota::update_quota_status(&state, ns.as_str()).await;
 
         return Ok(Json(serde_json::json!({
             "kind": "Status",

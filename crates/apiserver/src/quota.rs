@@ -8,8 +8,8 @@
 /// - Usage is recomputed on every admission check by listing the store.  This is
 ///   correct for pre-alpha (no in-memory cache needed) and avoids a separate quota
 ///   controller.
-/// - Quota decrements (delete) are not tracked here. The full Kubernetes quota
-///   controller reconciliation loop is out of scope.
+/// - `status.used` is recomputed and written after every successful CREATE or DELETE
+///   of a quota-covered object so that `kubectl get resourcequota` reflects live counts.
 /// - Only object count quotas are implemented. Resource usage quotas (CPU/memory
 ///   sums across pods) would require parsing container specs and are left for a
 ///   future bead.
@@ -282,6 +282,69 @@ pub async fn count_quota_usage<S: Store>(
         }
     }
     used
+}
+
+/// Recompute and persist `status.used` (and `status.hard`) for every ResourceQuota
+/// in `namespace` whose `spec.hard` covers at least one known resource.
+///
+/// Called after a successful CREATE or DELETE of a quota-covered object. Errors are
+/// logged and silently swallowed — the primary operation already succeeded and quota
+/// status is best-effort observability, not a correctness gate.
+pub async fn update_quota_status<S: Store>(state: &AppState<S>, namespace: &str) {
+    let quotas = fetch_resource_quotas(state, namespace).await;
+    if quotas.is_empty() {
+        return;
+    }
+
+    for quota in quotas {
+        let quota_name = match quota["metadata"]["name"].as_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        let used = count_quota_usage(&*state.store, &quota).await;
+        if used.is_empty() {
+            continue;
+        }
+
+        let key = crate::keys::group_object_key("", "resourcequotas", Some(namespace), &quota_name);
+
+        let stored = match state.store.get(&key).await {
+            Ok(Some(s)) => s,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("quota status: failed to fetch {quota_name}: {e}");
+                continue;
+            }
+        };
+
+        let mut obj: Value = match serde_json::from_slice(&stored.value) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("quota status: corrupt quota {quota_name}: {e}");
+                continue;
+            }
+        };
+
+        // status.hard mirrors spec.hard.
+        let hard = obj["spec"]["hard"].clone();
+
+        let used_map: serde_json::Map<String, Value> = used
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+
+        obj["status"] = serde_json::json!({
+            "hard": hard,
+            "used": Value::Object(used_map),
+        });
+
+        let bytes =
+            bytes::Bytes::from(serde_json::to_vec(&obj).expect("Value always serializable"));
+        if let Err(e) = state.store.put(&key, bytes, None).await {
+            tracing::warn!("quota status: failed to write status for {quota_name}: {e}");
+        }
+    }
 }
 
 /// Check ResourceQuota constraints before a CREATE operation.
@@ -791,6 +854,121 @@ mod tests {
         assert!(
             !pod_is_best_effort(&pod),
             "pod with CPU requests must NOT be BestEffort"
+        );
+    }
+
+    // -- update_quota_status --
+
+    /// After a pod is added to the store (simulating CREATE), update_quota_status must
+    /// write status.used.pods = 1 to the ResourceQuota. Without this, the conformance
+    /// test polling status.used.pods times out after 5 minutes.
+    #[tokio::test]
+    async fn update_quota_status_reflects_pod_count_after_create() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "test-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/test-quota", quota).await;
+
+        // Initially no pods → update should write used.pods = "0".
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/test-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["pods"].as_str(),
+            Some("0"),
+            "status.used.pods must be 0 when no pods exist — \
+             conformance test polls this field; absent or wrong value causes 5 min timeout"
+        );
+        assert_eq!(
+            obj["status"]["hard"]["pods"].as_str(),
+            Some("10"),
+            "status.hard must mirror spec.hard so kubectl get resourcequota shows limits"
+        );
+
+        // Seed a pod → used.pods must become "1".
+        let pod = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "p1", "namespace": "default" }
+        });
+        seed(&state, "/registry/pods/default/p1", pod).await;
+
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/test-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["pods"].as_str(),
+            Some("1"),
+            "status.used.pods must be 1 after a pod is created — \
+             this is the field the conformance test 'capture the life of a pod' polls"
+        );
+    }
+
+    /// After a pod is removed from the store (simulating hard-DELETE), update_quota_status
+    /// must write status.used.pods = 0. Without this, the quota status is stale forever
+    /// and any subsequent quota check would incorrectly count the deleted pod.
+    #[tokio::test]
+    async fn update_quota_status_reflects_pod_count_after_delete() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "test-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/test-quota", quota).await;
+
+        let pod = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "p1", "namespace": "default" }
+        });
+        seed(&state, "/registry/pods/default/p1", pod).await;
+
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/test-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(obj["status"]["used"]["pods"].as_str(), Some("1"));
+
+        // Delete the pod.
+        state
+            .store
+            .delete("/registry/pods/default/p1", None)
+            .await
+            .unwrap();
+
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/test-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["pods"].as_str(),
+            Some("0"),
+            "status.used.pods must decrement to 0 after the pod is hard-deleted — \
+             stale counts prevent new pods from being created when the quota is tight"
         );
     }
 }
