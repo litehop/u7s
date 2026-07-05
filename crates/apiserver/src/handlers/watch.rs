@@ -254,19 +254,50 @@ pub(crate) async fn fetch_initial_events<S: Store>(
     Ok(Some((items, resp.revision)))
 }
 
+/// Split a label selector string into top-level comma-separated terms,
+/// without splitting inside parentheses (which appear in `key in (v1,v2)` forms).
+fn split_selector_terms(selector: &str) -> Vec<&str> {
+    let mut terms = Vec::new();
+    let mut depth: usize = 0;
+    let mut start = 0;
+    for (i, c) in selector.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                terms.push(selector[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    terms.push(selector[start..].trim());
+    terms
+}
+
+/// Parse the values list from a set-based selector: `(v1, v2, v3)` → `["v1", "v2", "v3"]`.
+fn parse_set_values(s: &str) -> Vec<&str> {
+    let inner = s.trim().trim_start_matches('(').trim_end_matches(')');
+    inner
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
 /// Test whether a JSON object matches a label selector string.
 /// Returns true if the selector is empty (pass-through) or all terms match
 /// `metadata.labels` in the object. Used to filter live watch events.
 ///
 /// Supported operators: `key=value` (Equality), `key!=value` (NotEquals),
-/// `!key` (DoesNotExist), bare `key` (Exists).
+/// `!key` (DoesNotExist), bare `key` (Exists),
+/// `key in (v1,v2)` (In), `key notin (v1,v2)` (NotIn).
 pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &str) -> bool {
     if selector.is_empty() {
         return true;
     }
     let labels = &obj["metadata"]["labels"];
-    for part in selector.split(',') {
-        let part = part.trim();
+    for part in split_selector_terms(selector) {
         if part.is_empty() {
             continue;
         }
@@ -276,6 +307,30 @@ pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &
                 continue;
             }
             if labels.get(key).is_some() {
+                return false;
+            }
+            continue;
+        }
+        if let Some((key, rest)) = part.split_once(" notin ") {
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let values = parse_set_values(rest);
+            let label_val = labels.get(key).and_then(|v| v.as_str());
+            if label_val.is_some_and(|v| values.contains(&v)) {
+                return false;
+            }
+            continue;
+        }
+        if let Some((key, rest)) = part.split_once(" in ") {
+            let key = key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let values = parse_set_values(rest);
+            let label_val = labels.get(key).and_then(|v| v.as_str());
+            if !label_val.is_some_and(|v| values.contains(&v)) {
                 return false;
             }
             continue;
@@ -493,6 +548,12 @@ pub(crate) async fn watch_generic<S: Store>(
         let mut bookmark_tick = interval(Duration::from_secs(60));
         bookmark_tick.tick().await; // skip initial immediate tick
 
+        // Track keys for which this watcher has already emitted a DELETED (real or synthetic).
+        // Prevents duplicate synthetic DELETEDs when an object is modified multiple times
+        // after leaving the watch scope, and also suppresses real DELETEDs for objects that
+        // never entered the watch scope (body didn't match the selector).
+        let mut locally_deleted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         // Use the client-requested timeout. When absent, default to 30 minutes
         // (1800s) to match the Kubernetes apiserver --min-request-timeout default.
         // The 5-minute value that was here caused watch streams to expire 6× more
@@ -579,13 +640,23 @@ pub(crate) async fn watch_generic<S: Store>(
                             // Bookmark and Compacted are handled above.
                             if let WatchEvent::Added(obj) | WatchEvent::Modified(obj) = &event {
                                 let is_modified = matches!(&event, WatchEvent::Modified(_));
-                                let event_type = if is_modified { "MODIFIED" } else { "ADDED" };
                                 if let Ok(s) = std::str::from_utf8(&obj.value) {
                                     let mut parsed: serde_json::Value =
                                         serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
                                     if object_matches_label_selector(&parsed, &label_selector)
                                         && object_matches_field_selector(&parsed, &field_selector)
                                     {
+                                        // When an object re-enters the watch scope after a synthetic
+                                        // DELETED was sent (e.g. label was restored), emit ADDED so
+                                        // the watcher treats it as a newly-appearing object.
+                                        let locally_was_deleted = locally_deleted.remove(&obj.key);
+                                        let event_type = if is_modified && locally_was_deleted {
+                                            "ADDED"
+                                        } else if is_modified {
+                                            "MODIFIED"
+                                        } else {
+                                            "ADDED"
+                                        };
                                         let obj_name = parsed["metadata"]["name"].as_str().unwrap_or("");
                                         let obj_ns = parsed["metadata"]["namespace"].as_str().unwrap_or("");
                                         tracing::debug!(
@@ -605,12 +676,16 @@ pub(crate) async fn watch_generic<S: Store>(
                                             parsed
                                         };
                                         yield Ok::<Bytes, axum::BoxError>(ndjson_event_value(event_type, &emit));
-                                    } else if is_modified {
+                                    } else if is_modified && !locally_deleted.contains(&obj.key) {
                                         // The object no longer matches the selector after this
                                         // MODIFIED update. Emit a synthetic DELETED so watchers
                                         // remove it from their cache. Without this, informers
                                         // with a labelSelector would never learn that a previously-
                                         // matching object exited their watch scope.
+                                        // Only emit once — if locally_deleted already contains
+                                        // this key, the watcher already sent a DELETED and a
+                                        // subsequent MODIFIED-without-match must be suppressed.
+                                        locally_deleted.insert(obj.key.clone());
                                         let name = parsed["metadata"]["name"].as_str().unwrap_or("");
                                         let ns = parsed["metadata"]["namespace"].as_str().unwrap_or("");
                                         let rv = obj.revision.to_string();
@@ -637,7 +712,40 @@ pub(crate) async fn watch_generic<S: Store>(
                                         yield Ok::<Bytes, axum::BoxError>(ndjson_event_value("DELETED", &tombstone));
                                     }
                                 } else {
+                                    let event_type = if is_modified { "MODIFIED" } else { "ADDED" };
                                     tracing::warn!("watch {event_type} event has invalid UTF-8, skipping");
+                                }
+                            } else if let WatchEvent::Deleted { key, body, .. } = &event {
+                                // For DELETED events: apply the label selector against the
+                                // last-known object body (if available). If the object never
+                                // matched the watch selector, do not send the DELETED — the
+                                // watcher never saw an ADDED for it and has nothing to clean up.
+                                // If no body is available, send unconditionally (conservative).
+                                // Also skip if we already emitted a synthetic DELETED for this key
+                                // (locally_deleted tracks keys for which DELETED was already sent).
+                                let should_send = if locally_deleted.contains(key.as_str()) {
+                                    // Already sent a synthetic DELETED for this object; the real
+                                    // DELETED is redundant for this watcher. Clear the tracking entry.
+                                    locally_deleted.remove(key.as_str());
+                                    false
+                                } else if let Some(body_bytes) = body {
+                                    if let Ok(s) = std::str::from_utf8(body_bytes) {
+                                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                                            object_matches_label_selector(&parsed, &label_selector)
+                                                && object_matches_field_selector(&parsed, &field_selector)
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    true
+                                };
+                                if should_send {
+                                    if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
+                                        yield Ok::<Bytes, axum::BoxError>(chunk);
+                                    }
                                 }
                             } else if !matches!(&event, WatchEvent::Bookmark { .. }) || allow_watch_bookmarks {
                                 if let Some(chunk) = encode_watch_event(&event, &api_version, &kind, as_partial_object_metadata) {
@@ -1568,15 +1676,16 @@ mod tests {
         }
     }
 
-    /// DELETED events must always pass through label selector filtering.
-    /// Even if the deleted object did not match the selector, the client must still
-    /// receive the DELETED event so it can remove the object from its local cache.
-    /// Suppressing DELETED for non-matching objects would cause informer cache leaks.
+    /// DELETED events must be filtered by label selector when the body is available.
+    /// An object whose last-known body does NOT match the watch selector was never
+    /// delivered as ADDED to this watcher — so its DELETED must be suppressed too.
+    /// Sending a DELETED for an object the watcher never saw would inject phantom
+    /// tombstones that pollute informer caches with objects that were never there.
     ///
-    /// Implementation note: watch_generic uses `_ => false` in the `skip` match arm
-    /// for non-Added/Modified events, ensuring Deleted always passes through.
+    /// Kubernetes conformance (watch.go): watcher-A must NOT receive DELETED events for
+    /// objects that only had label B (because watcher-A never received ADDED for them).
     #[tokio::test]
-    async fn watch_generic_deleted_event_always_passes_label_selector() {
+    async fn watch_generic_deleted_event_filtered_when_body_does_not_match_selector() {
         use crate::state::AppState;
         use std::sync::Arc;
         use u7s_store::SqliteStore;
@@ -1615,7 +1724,7 @@ mod tests {
         );
 
         // Watch with label selector "app=frontend" — the object has "app=backend".
-        // The DELETED event must still arrive (not suppressed by the selector).
+        // The DELETED event must be suppressed because the watcher never received ADDED.
         let resp = watch_generic(
             state,
             WatchConfig {
@@ -1639,12 +1748,14 @@ mod tests {
 
         let lines = read_watch_body_with_timeout(resp).await;
 
-        // Ring buffer has: ADDED (backend, suppressed) and DELETED (always passes).
+        // Ring buffer has: ADDED (backend, suppressed) and DELETED (also suppressed — body doesn't match).
         let deleted_count = lines.iter().filter(|v| v["type"] == "DELETED").count();
         assert_eq!(
-            deleted_count, 1,
-            "DELETED event must pass through label selector filtering; \
-             suppressing it would cause informer cache leaks: got lines {:?}",
+            deleted_count, 0,
+            "DELETED for an object that never matched the selector must be suppressed; \
+             sending it would inject a phantom tombstone for an object the watcher never saw \
+             (Kubernetes conformance: watcher-A must not receive DELETED for label-B objects): \
+             got lines {:?}",
             lines
         );
 
@@ -3322,6 +3433,125 @@ mod tests {
             "watcher with non-matching label selector must NOT receive the ADDED event; \
              selector filtering must be preserved despite the shared-serialization refactor — \
              receiving a non-matching event would cause informer cache divergence"
+        );
+    }
+
+    /// `key in (v1,v2)`: objects with key=v1 or key=v2 must match; others must not.
+    ///
+    /// Without this fix the `in` operator falls through to bare-key Exists, matching
+    /// anything that has any label named "key in (v1,v2)" — which is never true —
+    /// so ALL events are dropped and set-based-selector watchers get nothing.
+    #[test]
+    fn label_selector_in_operator_matches_listed_values_only() {
+        let val_a = serde_json::json!({"metadata": {"labels": {"color": "red"}}});
+        let val_b = serde_json::json!({"metadata": {"labels": {"color": "blue"}}});
+        let val_c = serde_json::json!({"metadata": {"labels": {"color": "green"}}});
+        let missing = serde_json::json!({"metadata": {"labels": {"other": "x"}}});
+
+        assert!(
+            object_matches_label_selector(&val_a, "color in (red,blue)"),
+            "color=red must match `color in (red,blue)`; set-based-selector watchers get no events otherwise"
+        );
+        assert!(
+            object_matches_label_selector(&val_b, "color in (red,blue)"),
+            "color=blue must match `color in (red,blue)`"
+        );
+        assert!(
+            !object_matches_label_selector(&val_c, "color in (red,blue)"),
+            "color=green must NOT match `color in (red,blue)`"
+        );
+        assert!(
+            !object_matches_label_selector(&missing, "color in (red,blue)"),
+            "object without the key must NOT match `in` selector"
+        );
+    }
+
+    /// `key notin (v1,v2)`: objects NOT in the list (or missing key) must match; listed values must not.
+    ///
+    /// k8s semantics: notin matches objects whose key is absent or whose value is not in the set.
+    #[test]
+    fn label_selector_notin_operator_excludes_listed_values() {
+        let val_a = serde_json::json!({"metadata": {"labels": {"color": "red"}}});
+        let val_b = serde_json::json!({"metadata": {"labels": {"color": "green"}}});
+        let missing = serde_json::json!({"metadata": {"labels": {"other": "x"}}});
+
+        assert!(
+            !object_matches_label_selector(&val_a, "color notin (red,blue)"),
+            "color=red must NOT match `color notin (red,blue)`; set-based-selector watchers see it as excluded"
+        );
+        assert!(
+            object_matches_label_selector(&val_b, "color notin (red,blue)"),
+            "color=green must match `color notin (red,blue)` (value not in list)"
+        );
+        assert!(
+            object_matches_label_selector(&missing, "color notin (red,blue)"),
+            "object without the key must match `notin` selector (absent key satisfies notin)"
+        );
+    }
+
+    /// Combined multi-term selector mixing equality and set-based operators.
+    ///
+    /// Verifies the paren-safe term splitter doesn't break when commas appear inside parens.
+    #[test]
+    fn label_selector_combined_equality_and_in_terms() {
+        let matches = serde_json::json!({"metadata": {"labels": {"x": "1", "y": "a"}}});
+        let wrong_x = serde_json::json!({"metadata": {"labels": {"x": "2", "y": "a"}}});
+        let wrong_y = serde_json::json!({"metadata": {"labels": {"x": "1", "y": "c"}}});
+
+        assert!(
+            object_matches_label_selector(&matches, "x=1,y in (a,b)"),
+            "x=1,y=a must match `x=1,y in (a,b)`; commas inside parens must not be treated as term separators"
+        );
+        assert!(
+            !object_matches_label_selector(&wrong_x, "x=1,y in (a,b)"),
+            "x=2 must fail the x=1 equality term"
+        );
+        assert!(
+            !object_matches_label_selector(&wrong_y, "x=1,y in (a,b)"),
+            "y=c must fail the y in (a,b) set term"
+        );
+    }
+
+    /// The exact selector used by the failing conformance test: `watch-this-configmap in (multiple-watchers-A)`.
+    ///
+    /// Before the fix this selector had no `=`, `!=`, or `!` prefix so it fell to the bare-key
+    /// Exists branch: `labels.get("watch-this-configmap in (multiple-watchers-A)")` returns None,
+    /// causing every event to be dropped and the test to time out at exactly 60s.
+    #[test]
+    fn label_selector_conformance_watcher_selector_matches_correctly() {
+        let matching = serde_json::json!({
+            "metadata": {
+                "labels": {"watch-this-configmap": "multiple-watchers-A"}
+            }
+        });
+        let wrong_value = serde_json::json!({
+            "metadata": {
+                "labels": {"watch-this-configmap": "multiple-watchers-B"}
+            }
+        });
+        let missing_key = serde_json::json!({"metadata": {"labels": {}}});
+
+        assert!(
+            object_matches_label_selector(
+                &matching,
+                "watch-this-configmap in (multiple-watchers-A)"
+            ),
+            "the conformance watcher selector must match the labeled configmap; \
+             without this fix the Watchers test times out at 60s because all events are dropped"
+        );
+        assert!(
+            !object_matches_label_selector(
+                &wrong_value,
+                "watch-this-configmap in (multiple-watchers-A)"
+            ),
+            "a configmap with a different watcher-label value must not match"
+        );
+        assert!(
+            !object_matches_label_selector(
+                &missing_key,
+                "watch-this-configmap in (multiple-watchers-A)"
+            ),
+            "a configmap without the watcher label must not match"
         );
     }
 }
