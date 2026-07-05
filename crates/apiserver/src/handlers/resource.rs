@@ -1295,6 +1295,8 @@ pub async fn create_namespaced_resource<S: Store>(
         propagate_rs_revision_to_deployment(&state, &rs_revision_info, &ns).await;
     }
 
+    quota::update_quota_status(&state, &ns).await;
+
     let mut resp = (StatusCode::CREATED, Json(obj.body)).into_response();
     if let Some(hv) = warn_header {
         resp.headers_mut().insert(axum::http::header::WARNING, hv);
@@ -1694,6 +1696,7 @@ pub async fn delete_namespaced_resource<S: Store>(
             let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
             state.rbac_index.remove_object(&rbac_key);
         }
+        quota::update_quota_status(&state, &ns).await;
         return Ok(Json(serde_json::json!({
             "kind": "Status",
             "apiVersion": "v1",
@@ -1780,6 +1783,8 @@ pub async fn delete_namespaced_resource<S: Store>(
     if group == "batch" && plural == "jobs" && !owner_uid.is_empty() {
         remove_job_tracking_finalizer_from_pods(&state, &ns, &owner_uid).await;
     }
+
+    quota::update_quota_status(&state, &ns).await;
 
     Ok(Json(serde_json::json!({
         "kind": "Status",

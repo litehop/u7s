@@ -8,11 +8,10 @@
 /// - Usage is recomputed on every admission check by listing the store.  This is
 ///   correct for pre-alpha (no in-memory cache needed) and avoids a separate quota
 ///   controller.
-/// - Quota decrements (delete) are not tracked here. The full Kubernetes quota
-///   controller reconciliation loop is out of scope.
-/// - Only object count quotas are implemented. Resource usage quotas (CPU/memory
-///   sums across pods) would require parsing container specs and are left for a
-///   future bead.
+/// - `status.used` is recomputed and written after every successful CREATE or DELETE
+///   of a quota-covered object so that `kubectl get resourcequota` reflects live counts.
+/// - Both count-based quotas (pods, services) and resource-request-based quotas
+///   (cpu, memory, ephemeral-storage) are enforced at admission.
 ///
 /// Kubernetes spec reference:
 ///   https://kubernetes.io/docs/concepts/policy/resource-quotas/
@@ -54,6 +53,220 @@ fn quota_resource_to_group_plural(resource: &str) -> Option<(&'static str, &'sta
 /// Quota hard limits for object counts are always plain integers.
 fn parse_count(s: &str) -> Option<u64> {
     s.parse::<u64>().ok()
+}
+
+// ---------------------------------------------------------------------------
+// Resource quantity arithmetic (for resource-request quotas)
+// ---------------------------------------------------------------------------
+
+/// Parse a Kubernetes quantity string into a raw integer in milli-units.
+/// For CPU: "500m" → 500, "1" → 1000, "1.5" → 1500.
+/// For memory/storage: "252Mi" → 252*1024*1024*1000, "30Gi" → 30*1024^3*1000.
+/// For plain integers: "2" → 2000.
+/// Returns None if the string cannot be parsed.
+fn parse_quantity_milli(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    // Milli suffix
+    if let Some(rest) = s.strip_suffix('m') {
+        return rest.parse::<i64>().ok();
+    }
+    // Binary suffixes (Ki, Mi, Gi, Ti, Pi, Ei)
+    let binary_suffixes = [
+        ("Ki", 1024i64),
+        ("Mi", 1024 * 1024),
+        ("Gi", 1024 * 1024 * 1024),
+        ("Ti", 1024 * 1024 * 1024 * 1024),
+        ("Pi", 1024 * 1024 * 1024 * 1024 * 1024),
+        ("Ei", 1024 * 1024 * 1024 * 1024 * 1024 * 1024),
+    ];
+    for (suf, mult) in &binary_suffixes {
+        if let Some(rest) = s.strip_suffix(suf) {
+            return rest.parse::<i64>().ok().map(|n| n * mult * 1000);
+        }
+    }
+    // Decimal SI suffixes (k, M, G, T, P, E)
+    let decimal_suffixes = [
+        ("k", 1_000i64),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
+        ("E", 1_000_000_000_000_000_000),
+    ];
+    for (suf, mult) in &decimal_suffixes {
+        if let Some(rest) = s.strip_suffix(suf) {
+            return rest.parse::<i64>().ok().map(|n| n * mult * 1000);
+        }
+    }
+    // Plain integer
+    s.parse::<i64>().ok().map(|n| n * 1000)
+}
+
+/// Format a milli-quantity back to a canonical Kubernetes quantity string.
+/// For CPU use format_milli_cpu; for memory/storage use format_milli_bytes.
+fn format_milli_cpu(milli: i64) -> String {
+    if milli == 0 {
+        return "0".to_string();
+    }
+    if milli % 1000 == 0 {
+        (milli / 1000).to_string()
+    } else {
+        format!("{}m", milli)
+    }
+}
+
+fn format_milli_bytes(milli: i64) -> String {
+    if milli == 0 {
+        return "0".to_string();
+    }
+    let bytes = milli / 1000;
+    const EI: i64 = 1024 * 1024 * 1024 * 1024 * 1024 * 1024;
+    const PI: i64 = 1024 * 1024 * 1024 * 1024 * 1024;
+    const TI: i64 = 1024 * 1024 * 1024 * 1024;
+    const GI: i64 = 1024 * 1024 * 1024;
+    const MI: i64 = 1024 * 1024;
+    const KI: i64 = 1024;
+    for (unit, mult) in &[
+        ("Ei", EI),
+        ("Pi", PI),
+        ("Ti", TI),
+        ("Gi", GI),
+        ("Mi", MI),
+        ("Ki", KI),
+    ] {
+        if bytes % mult == 0 {
+            return format!("{}{}", bytes / mult, unit);
+        }
+    }
+    bytes.to_string()
+}
+
+fn format_milli_integer(milli: i64) -> String {
+    (milli / 1000).to_string()
+}
+
+/// Classify a quota resource name into its resource-request category.
+///
+/// Returns (request_or_limits, resource_name_in_container) where:
+/// - request_or_limits: "requests" or "limits"
+/// - resource_name_in_container: the key to look up in container resources
+///
+/// Returns None for count-based resources (handled by `quota_resource_to_group_plural`).
+fn quota_to_pod_resource(quota_resource: &str) -> Option<(&'static str, String)> {
+    // "requests.cpu" → ("requests", "cpu")
+    if let Some(rest) = quota_resource.strip_prefix("requests.") {
+        return Some(("requests", rest.to_string()));
+    }
+    // "limits.cpu" → ("limits", "cpu")
+    if let Some(rest) = quota_resource.strip_prefix("limits.") {
+        return Some(("limits", rest.to_string()));
+    }
+    // Bare resource names that map to requests: cpu, memory, ephemeral-storage, hugepages-*
+    // Also extended resources under other namespaced names are treated as requests.
+    match quota_resource {
+        "cpu" | "memory" | "ephemeral-storage" => Some(("requests", quota_resource.to_string())),
+        // hugepages-* treated as requests
+        s if s.starts_with("hugepages-") => Some(("requests", s.to_string())),
+        _ => None,
+    }
+}
+
+/// Classify a quota resource as CPU, memory/storage, or integer for output formatting.
+fn quantity_format_type(resource_name: &str) -> &'static str {
+    match resource_name {
+        "cpu" => "cpu",
+        r if r.ends_with("cpu") => "cpu",
+        "memory" | "ephemeral-storage" => "bytes",
+        r if r.ends_with("memory") || r.ends_with("storage") => "bytes",
+        r if r.starts_with("hugepages-") => "bytes",
+        _ => "integer",
+    }
+}
+
+/// Extract the total milli-quantity of a resource from a single pod's containers.
+/// Returns 0 if the pod is None or has no matching resource entries.
+fn pod_resource_milli(pod: Option<&Value>, field: &str, resource: &str) -> i64 {
+    let pod = match pod {
+        Some(p) => p,
+        None => return 0,
+    };
+    let mut total: i64 = 0;
+    for containers_key in &["containers", "initContainers"] {
+        if let Some(arr) = pod["spec"][containers_key].as_array() {
+            for container in arr {
+                if let Some(val) = container["resources"][field][resource].as_str() {
+                    if let Some(milli) = parse_quantity_milli(val) {
+                        total += milli;
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Sum resource requests or limits across all existing pods in a namespace for a given resource.
+/// Returns the total in milli-units.
+async fn sum_pod_resource_milli<S: Store>(
+    store: &S,
+    namespace: &str,
+    quota: &Value,
+    field: &str,
+    resource: &str,
+) -> i64 {
+    let prefix = group_list_prefix("", "pods", Some(namespace));
+    let items = match store.list(&prefix, ListOptions::default()).await {
+        Ok(resp) => resp.items,
+        Err(_) => return 0,
+    };
+
+    let scopes: Vec<&str> = quota["spec"]["scopes"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    let scope_selector = &quota["spec"]["scopeSelector"];
+    let has_scopes = !scopes.is_empty() || scope_selector.is_object();
+
+    let mut total_milli: i64 = 0;
+    for item in &items {
+        let pod: Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if has_scopes {
+            let matches = scopes.iter().all(|s| object_matches_scope(s, Some(&pod)));
+            if !matches {
+                continue;
+            }
+            if scope_selector.is_object()
+                && !object_matches_scope_selector(scope_selector, Some(&pod))
+            {
+                continue;
+            }
+        }
+        total_milli += pod_resource_milli(Some(&pod), field, resource);
+    }
+    total_milli
+}
+
+/// Sum resource requests or limits across all pods in a namespace for a given resource.
+/// `field` is "requests" or "limits"; `resource` is e.g. "cpu", "memory", "example.com/dongle".
+async fn sum_pod_resource<S: Store>(
+    store: &S,
+    namespace: &str,
+    quota: &Value,
+    field: &str,
+    resource: &str,
+    format: &str,
+) -> String {
+    let total_milli = sum_pod_resource_milli(store, namespace, quota, field, resource).await;
+    match format {
+        "cpu" => format_milli_cpu(total_milli),
+        "bytes" => format_milli_bytes(total_milli),
+        _ => format_milli_integer(total_milli),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -279,20 +492,87 @@ pub async fn count_quota_usage<S: Store>(
                 }
             };
             used.insert(resource_name.clone(), count.to_string());
+        } else if let Some((field, resource_key)) = quota_to_pod_resource(resource_name) {
+            let format = quantity_format_type(resource_name);
+            let sum = sum_pod_resource(store, namespace, quota, field, &resource_key, format).await;
+            used.insert(resource_name.clone(), sum);
         }
     }
     used
 }
 
+/// Recompute and persist `status.used` (and `status.hard`) for every ResourceQuota
+/// in `namespace` whose `spec.hard` covers at least one known resource.
+///
+/// Called after a successful CREATE or DELETE of a quota-covered object. Errors are
+/// logged and silently swallowed — the primary operation already succeeded and quota
+/// status is best-effort observability, not a correctness gate.
+pub async fn update_quota_status<S: Store>(state: &AppState<S>, namespace: &str) {
+    let quotas = fetch_resource_quotas(state, namespace).await;
+    if quotas.is_empty() {
+        return;
+    }
+
+    for quota in quotas {
+        let quota_name = match quota["metadata"]["name"].as_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        let used = count_quota_usage(&*state.store, &quota).await;
+        if used.is_empty() {
+            continue;
+        }
+
+        let key = crate::keys::group_object_key("", "resourcequotas", Some(namespace), &quota_name);
+
+        let stored = match state.store.get(&key).await {
+            Ok(Some(s)) => s,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("quota status: failed to fetch {quota_name}: {e}");
+                continue;
+            }
+        };
+
+        let mut obj: Value = match serde_json::from_slice(&stored.value) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("quota status: corrupt quota {quota_name}: {e}");
+                continue;
+            }
+        };
+
+        // status.hard mirrors spec.hard.
+        let hard = obj["spec"]["hard"].clone();
+
+        let used_map: serde_json::Map<String, Value> = used
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+
+        obj["status"] = serde_json::json!({
+            "hard": hard,
+            "used": Value::Object(used_map),
+        });
+
+        let bytes =
+            bytes::Bytes::from(serde_json::to_vec(&obj).expect("Value always serializable"));
+        if let Err(e) = state.store.put(&key, bytes, None).await {
+            tracing::warn!("quota status: failed to write status for {quota_name}: {e}");
+        }
+    }
+}
+
 /// Check ResourceQuota constraints before a CREATE operation.
 ///
-/// Fetches all ResourceQuota objects in `namespace` and, for each hard limit that
-/// covers the incoming `resource` (by count), checks whether the current usage
-/// plus one exceeds the hard limit.
+/// Fetches all ResourceQuota objects in `namespace` and checks two quota types:
+/// - Count-based: pods, services, configmaps, etc. — checks current count + 1 vs hard limit.
+/// - Resource-request-based: cpu, memory, ephemeral-storage, etc. — sums existing pod
+///   requests, adds the incoming pod's requests, and checks against the hard limit.
 ///
-/// `object` is the pod (or other object) being created; it is used for scope
-/// matching. Pass `None` for non-pod resources — unrecognised scopes are
-/// treated as matching (safe default).
+/// `object` is the pod (or other object) being created; it is used for scope matching
+/// and for reading the incoming pod's resource requests. Pass `None` for non-pod resources.
 ///
 /// Returns Ok(()) if all quotas allow the create, or a 403 StatusError if any
 /// quota would be exceeded. Returns Ok(()) immediately for cluster-scoped
@@ -336,34 +616,65 @@ pub async fn check_resource_quota<S: Store>(
 
         if let Some(map) = hard.as_object() {
             for (quota_resource, limit_val) in map {
-                // Does this quota entry cover the resource being created?
-                let covers = quota_resource_covers(quota_resource, group, resource);
-                if !covers {
+                let limit_str = limit_val.as_str().unwrap_or("");
+
+                // Path 1: count-based quota — covers the API resource type being created.
+                if quota_resource_covers(quota_resource, group, resource) {
+                    let hard_limit = match parse_count(limit_str) {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    let (count_group, count_plural) =
+                        match quota_resource_to_group_plural(quota_resource) {
+                            Some(p) => p,
+                            None => (group, resource),
+                        };
+                    let current = count_objects(state, namespace, count_group, count_plural).await;
+                    if current >= hard_limit {
+                        return Err(Status::forbidden(format!(
+                            "exceeded quota: {quota_name}, requested: {quota_resource}=1, \
+                             used: {current}, limited: {hard_limit}"
+                        )));
+                    }
                     continue;
                 }
 
-                let limit_str = limit_val.as_str().unwrap_or("");
-                let hard_limit = match parse_count(limit_str) {
-                    Some(l) => l,
-                    None => continue, // non-count quota (e.g. CPU/memory sum) — skip
-                };
-
-                // Determine the (group, plural) pair for counting.
-                let (count_group, count_plural) =
-                    match quota_resource_to_group_plural(quota_resource) {
-                        Some(p) => p,
-                        None => {
-                            // Try deriving from the incoming resource directly.
-                            (group, resource)
+                // Path 2: resource-request quota (cpu, memory, ephemeral-storage, etc.).
+                // Only applies when creating pods.
+                if resource == "pods" && group.is_empty() {
+                    if let Some((field, resource_key)) = quota_to_pod_resource(quota_resource) {
+                        let hard_milli = match parse_quantity_milli(limit_str) {
+                            Some(m) => m,
+                            None => continue,
+                        };
+                        let existing_milli = sum_pod_resource_milli(
+                            &*state.store,
+                            namespace,
+                            quota,
+                            field,
+                            &resource_key,
+                        )
+                        .await;
+                        let incoming_milli = pod_resource_milli(object, field, &resource_key);
+                        if existing_milli + incoming_milli > hard_milli {
+                            let format = quantity_format_type(quota_resource);
+                            let used_str = match format {
+                                "cpu" => format_milli_cpu(existing_milli),
+                                "bytes" => format_milli_bytes(existing_milli),
+                                _ => format_milli_integer(existing_milli),
+                            };
+                            let req_str = match format {
+                                "cpu" => format_milli_cpu(incoming_milli),
+                                "bytes" => format_milli_bytes(incoming_milli),
+                                _ => format_milli_integer(incoming_milli),
+                            };
+                            return Err(Status::forbidden(format!(
+                                "exceeded quota: {quota_name}, requested: \
+                                 {quota_resource}={req_str}, used: {used_str}, \
+                                 limited: {limit_str}"
+                            )));
                         }
-                    };
-
-                let current = count_objects(state, namespace, count_group, count_plural).await;
-                if current >= hard_limit {
-                    return Err(Status::forbidden(format!(
-                        "exceeded quota: {quota_name}, requested: {quota_resource}=1, \
-                         used: {current}, limited: {hard_limit}"
-                    )));
+                    }
                 }
             }
         }
@@ -791,6 +1102,216 @@ mod tests {
         assert!(
             !pod_is_best_effort(&pod),
             "pod with CPU requests must NOT be BestEffort"
+        );
+    }
+
+    // -- update_quota_status --
+
+    /// After a pod is added to the store (simulating CREATE), update_quota_status must
+    /// write status.used.pods = 1 to the ResourceQuota. Without this, the conformance
+    /// test polling status.used.pods times out after 5 minutes.
+    #[tokio::test]
+    async fn update_quota_status_reflects_pod_count_after_create() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "test-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/test-quota", quota).await;
+
+        // Initially no pods → update should write used.pods = "0".
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/test-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["pods"].as_str(),
+            Some("0"),
+            "status.used.pods must be 0 when no pods exist — \
+             conformance test polls this field; absent or wrong value causes 5 min timeout"
+        );
+        assert_eq!(
+            obj["status"]["hard"]["pods"].as_str(),
+            Some("10"),
+            "status.hard must mirror spec.hard so kubectl get resourcequota shows limits"
+        );
+
+        // Seed a pod → used.pods must become "1".
+        let pod = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "p1", "namespace": "default" }
+        });
+        seed(&state, "/registry/pods/default/p1", pod).await;
+
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/test-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["pods"].as_str(),
+            Some("1"),
+            "status.used.pods must be 1 after a pod is created — \
+             this is the field the conformance test 'capture the life of a pod' polls"
+        );
+    }
+
+    /// After a pod is removed from the store (simulating hard-DELETE), update_quota_status
+    /// must write status.used.pods = 0. Without this, the quota status is stale forever
+    /// and any subsequent quota check would incorrectly count the deleted pod.
+    #[tokio::test]
+    async fn update_quota_status_reflects_pod_count_after_delete() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "test-quota", "namespace": "default" },
+            "spec": { "hard": { "pods": "10" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/test-quota", quota).await;
+
+        let pod = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": { "name": "p1", "namespace": "default" }
+        });
+        seed(&state, "/registry/pods/default/p1", pod).await;
+
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/test-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(obj["status"]["used"]["pods"].as_str(), Some("1"));
+
+        // Delete the pod.
+        state
+            .store
+            .delete("/registry/pods/default/p1", None)
+            .await
+            .unwrap();
+
+        update_quota_status(&state, "default").await;
+        let stored = state
+            .store
+            .get("/registry/resourcequotas/default/test-quota")
+            .await
+            .unwrap()
+            .unwrap();
+        let obj: Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            obj["status"]["used"]["pods"].as_str(),
+            Some("0"),
+            "status.used.pods must decrement to 0 after the pod is hard-deleted — \
+             stale counts prevent new pods from being created when the quota is tight"
+        );
+    }
+
+    /// A pod whose CPU request would push total CPU usage over the hard limit must be denied.
+    /// Without resource-request enforcement, cpu/memory/ephemeral-storage quotas are silently
+    /// skipped at admission and pods can consume unbounded resources.
+    #[tokio::test]
+    async fn check_quota_cpu_request_exceeds_limit_denies() {
+        let state = make_state();
+
+        // Quota: max 1 CPU total
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "cpu-quota", "namespace": "default" },
+            "spec": { "hard": { "cpu": "1" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/cpu-quota", quota).await;
+
+        // Existing pod already using 500m CPU
+        let existing_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "existing", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "resources": { "requests": { "cpu": "500m" } }
+                }]
+            }
+        });
+        seed(&state, "/registry/pods/default/existing", existing_pod).await;
+
+        // Incoming pod requests 750m CPU — total would be 1250m > 1000m limit
+        let new_pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "resources": { "requests": { "cpu": "750m" } }
+                }]
+            }
+        });
+        let result = check_resource_quota(&state, "default", "", "pods", Some(&new_pod)).await;
+        assert!(
+            result.is_err(),
+            "pod that pushes total CPU over quota limit must be denied at admission"
+        );
+        assert_eq!(
+            result.unwrap_err().0,
+            axum::http::StatusCode::FORBIDDEN,
+            "cpu quota exceeded must return 403 Forbidden"
+        );
+    }
+
+    /// A pod whose requests fit within remaining quota must be allowed.
+    /// Verifies the enforcement is not overly strict (no false denials).
+    #[tokio::test]
+    async fn check_quota_cpu_request_within_limit_allows() {
+        let state = make_state();
+
+        let quota = json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": { "name": "cpu-quota", "namespace": "default" },
+            "spec": { "hard": { "cpu": "1" } }
+        });
+        seed(&state, "/registry/resourcequotas/default/cpu-quota", quota).await;
+
+        // Existing pod using 500m CPU
+        let existing_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": { "name": "existing", "namespace": "default" },
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "resources": { "requests": { "cpu": "500m" } }
+                }]
+            }
+        });
+        seed(&state, "/registry/pods/default/existing", existing_pod).await;
+
+        // Incoming pod requests 499m CPU — total 999m < 1000m — must be allowed
+        let new_pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "c",
+                    "resources": { "requests": { "cpu": "499m" } }
+                }]
+            }
+        });
+        let result = check_resource_quota(&state, "default", "", "pods", Some(&new_pod)).await;
+        assert!(
+            result.is_ok(),
+            "pod within remaining CPU quota must be allowed"
         );
     }
 }
