@@ -1432,19 +1432,68 @@ pub async fn pod_proxy_root<S: Store>(
 ///
 /// Returns (endpoint_ip, port, konnectivity_proxy_addr). Separated from the
 /// handler so the resolution logic can be unit-tested without a live network.
+/// Strip the `:<port-or-portName>` suffix from a service proxy URL name segment.
+///
+/// k8s proxy URLs allow `services/<name>:<port-or-portName>/proxy/` to target a
+/// specific port. Service names are DNS-1123 labels (no colons), so a single
+/// rsplit_once(':') on the last colon is safe. Returns (bare_name, Some(port_spec))
+/// when a suffix is present, or (full_name, None) when absent.
+pub fn split_service_port(svc_name: &str) -> (&str, Option<&str>) {
+    match svc_name.rsplit_once(':') {
+        Some((bare, port)) => (bare, Some(port)),
+        None => (svc_name, None),
+    }
+}
+
+/// Resolve the port number from an EndpointSlice's ports array using an optional
+/// port spec from the URL suffix (e.g. `:80` or `:portname1`).
+///
+/// - None → first port entry (existing behavior for bare `services/<name>/proxy/`)
+/// - Some(spec) that parses as u16 → find the EPS port entry with that number
+/// - Some(spec) that is a name → find the EPS port entry whose name field matches
+///
+/// Returns None when the spec doesn't match any port in the slice.
+pub fn resolve_eps_port(eps_ports: &serde_json::Value, port_spec: Option<&str>) -> Option<u16> {
+    let ports = eps_ports.as_array()?;
+    match port_spec {
+        None => ports[0]["port"]
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok()),
+        Some(spec) => {
+            if let Ok(num) = spec.parse::<u16>() {
+                ports
+                    .iter()
+                    .find(|p| p["port"].as_u64().map(|n| n as u16) == Some(num))
+                    .and_then(|p| p["port"].as_u64())
+                    .and_then(|p| u16::try_from(p).ok())
+                    .or(Some(num))
+            } else {
+                ports
+                    .iter()
+                    .find(|p| p["name"].as_str() == Some(spec))
+                    .and_then(|p| p["port"].as_u64())
+                    .and_then(|p| u16::try_from(p).ok())
+            }
+        }
+    }
+}
+
 pub async fn resolve_service_proxy_target<S: Store>(
     state: &AppState<S>,
     ns: &str,
     svc_name: &str,
 ) -> Result<(String, u16, Option<String>), crate::status::StatusError> {
+    // Strip optional :<port-or-portName> suffix; Service names are DNS-1123 (no colons).
+    let (bare_name, port_spec) = split_service_port(svc_name);
+
     // 1. Confirm the Service exists (404 if not).
-    let svc_key = object_key("services", ns, svc_name);
+    let svc_key = object_key("services", ns, bare_name);
     state
         .store
         .get(&svc_key)
         .await
         .map_err(|e| Status::internal(e.to_string()))?
-        .ok_or_else(|| Status::not_found(svc_name, "Service"))?;
+        .ok_or_else(|| Status::not_found(bare_name, "Service"))?;
 
     // 2. List all EndpointSlices in the namespace and find one owned by this Service.
     //    KCM stamps the "kubernetes.io/service-name" label on every slice it manages.
@@ -1463,14 +1512,13 @@ pub async fn resolve_service_proxy_target<S: Store>(
         let svc_label = eps["metadata"]["labels"]["kubernetes.io/service-name"]
             .as_str()
             .unwrap_or("");
-        if svc_label != svc_name {
+        if svc_label != bare_name {
             continue;
         }
-        // Pick the port number from the slice's ports array (first entry).
-        let port = eps["ports"][0]["port"]
-            .as_u64()
-            .and_then(|p| u16::try_from(p).ok())
-            .unwrap_or(80);
+        // Pick the port number from the slice's ports array, guided by the URL port spec.
+        let Some(port) = resolve_eps_port(&eps["ports"], port_spec) else {
+            continue;
+        };
 
         // Find the first endpoint with conditions.ready == true.
         if let Some(endpoints) = eps["endpoints"].as_array() {
@@ -4181,5 +4229,323 @@ mod tests {
                  routing is broken"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // split_service_port + resolve_eps_port unit tests
+    //
+    // Proxy URLs allow services/<name>:<port-or-portName>/proxy/. Without the
+    // split, the raw name (including the colon suffix) is used for the store
+    // lookup, which always 404s — breaking kubectl proxy and the named-port
+    // conformance test.
+    // -----------------------------------------------------------------------
+
+    /// split_service_port must strip the port suffix from a named-port URL segment.
+    ///
+    /// If the split is removed, "svc:portname1" hits the store as the full name,
+    /// which 404s — the named-port conformance test loops on 404 for 122 s.
+    #[test]
+    fn split_service_port_strips_named_port_suffix() {
+        assert_eq!(
+            super::split_service_port("my-svc:portname1"),
+            ("my-svc", Some("portname1")),
+            "named-port suffix must be split off so the bare name is used for the store lookup"
+        );
+    }
+
+    /// split_service_port must strip a numeric port suffix.
+    #[test]
+    fn split_service_port_strips_numeric_port_suffix() {
+        assert_eq!(
+            super::split_service_port("my-svc:80"),
+            ("my-svc", Some("80")),
+            "numeric port suffix must be split off — without this, 'my-svc:80' 404s in the store"
+        );
+    }
+
+    /// split_service_port must leave bare names (no colon) unchanged.
+    ///
+    /// Without this, bare services/<name>/proxy/ would regress and every existing
+    /// service proxy test would 404.
+    #[test]
+    fn split_service_port_bare_name_unchanged() {
+        assert_eq!(
+            super::split_service_port("my-svc"),
+            ("my-svc", None),
+            "bare service name must pass through unchanged — adding a colon erroneously would \
+             break all existing service proxy requests with no port suffix"
+        );
+    }
+
+    /// resolve_eps_port with None picks the first port entry.
+    ///
+    /// This is the fallback for bare services/<name>/proxy/ — removing it regresses
+    /// all existing service proxy requests that don't specify a port.
+    #[test]
+    fn resolve_eps_port_none_returns_first_port() {
+        let ports = serde_json::json!([{"name": "http", "port": 8080}]);
+        assert_eq!(
+            super::resolve_eps_port(&ports, None),
+            Some(8080),
+            "bare service proxy (no port spec) must use the first EndpointSlice port — \
+             returning None or a wrong port would break all non-named-port proxy requests"
+        );
+    }
+
+    /// resolve_eps_port with a named spec picks the port whose name matches.
+    ///
+    /// Without this, ':portname1' in the URL never matches and the slice is skipped,
+    /// so the handler falls through to 503 even when a ready endpoint exists.
+    #[test]
+    fn resolve_eps_port_named_spec_matches_port_name() {
+        let ports = serde_json::json!([
+            {"name": "metrics", "port": 9090},
+            {"name": "portname1", "port": 8080}
+        ]);
+        assert_eq!(
+            super::resolve_eps_port(&ports, Some("portname1")),
+            Some(8080),
+            "named port spec must resolve by matching the EndpointSlice port name — \
+             returning None or the wrong port makes the proxy forward to the wrong backend"
+        );
+    }
+
+    /// resolve_eps_port with a numeric spec picks the matching port entry.
+    ///
+    /// Without this, ':80' in the URL fails to locate the EPS port and the handler
+    /// falls through to 503 even when port 80 is configured.
+    #[test]
+    fn resolve_eps_port_numeric_spec_matches_port_number() {
+        let ports = serde_json::json!([
+            {"name": "http", "port": 80},
+            {"name": "https", "port": 443}
+        ]);
+        assert_eq!(
+            super::resolve_eps_port(&ports, Some("80")),
+            Some(80),
+            "numeric port spec must resolve to the matching port — using the wrong port \
+             silently routes to the wrong backend"
+        );
+    }
+
+    /// resolve_service_proxy_target must look up the Service by bare name, not the raw
+    /// name including the colon suffix.
+    ///
+    /// Without the split, "svc:portname1" hits the store as the full name, always 404s,
+    /// and the named-port conformance test times out after 122 s.
+    #[tokio::test]
+    async fn service_proxy_named_port_strips_suffix_resolves_service() {
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "ports": [{"name": "portname1", "port": 80, "targetPort": 8080}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "my-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "my-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [
+                {
+                    "addresses": ["10.2.3.4"],
+                    "conditions": {"ready": true, "serving": true, "terminating": false}
+                }
+            ],
+            "ports": [{"name": "portname1", "port": 8080, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "my-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        // The svc_name as it arrives from the URL: includes the colon suffix.
+        let (ip, port, _) = resolve_service_proxy_target(&state, "default", "my-svc:portname1")
+            .await
+            .expect(
+                "named-port service proxy must resolve — 404 means the bare name was not \
+                     extracted and the store lookup used the raw 'my-svc:portname1' key",
+            );
+        assert_eq!(ip, "10.2.3.4", "must return the ready endpoint address");
+        assert_eq!(
+            port, 8080,
+            "named port 'portname1' must resolve to port 8080 via the EndpointSlice ports array — \
+             returning a wrong port silently routes to the wrong backend"
+        );
+    }
+
+    /// resolve_service_proxy_target with a numeric port suffix resolves to that port.
+    ///
+    /// Without the split, "svc:80" 404s. With the split but wrong port lookup, the
+    /// wrong port is used and the proxy forwards to the wrong backend.
+    #[tokio::test]
+    async fn service_proxy_numeric_port_suffix_resolves() {
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "num-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"port": 80, "targetPort": 9090}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "num-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "num-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "num-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [{"addresses": ["10.0.0.1"], "conditions": {"ready": true}}],
+            "ports": [{"name": "http", "port": 9090, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "num-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let (ip, port, _) = resolve_service_proxy_target(&state, "default", "num-svc:9090")
+            .await
+            .expect(
+                "numeric-port service proxy must resolve — 404 means bare name was not extracted",
+            );
+        assert_eq!(ip, "10.0.0.1");
+        assert_eq!(
+            port, 9090,
+            "numeric port suffix must select the matching endpoint port — returning the wrong \
+             port silently proxies to the wrong backend"
+        );
+    }
+
+    /// resolve_service_proxy_target must still 404 when the BARE name doesn't exist.
+    ///
+    /// Removing the 404 check would cause a missing service to return 503 instead,
+    /// misleading the caller into thinking the service exists but has no endpoints.
+    #[tokio::test]
+    async fn service_proxy_bare_name_missing_still_404s() {
+        let state = make_state();
+        let result = resolve_service_proxy_target(&state, "default", "ghost-svc:portname1").await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            404,
+            "a service that does not exist must return 404 even with a port suffix — \
+             returning 503 would mislead the caller into thinking the service exists"
+        );
+    }
+
+    /// resolve_service_proxy_target with a port name that doesn't match any EPS port
+    /// must return 503, not silently forward to the wrong port.
+    ///
+    /// Without this, an unknown port name falls back to the first port entry, silently
+    /// routing to the wrong backend.
+    #[tokio::test]
+    async fn service_proxy_unknown_named_port_returns_503() {
+        let state = make_state();
+
+        let svc = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "my-svc", "namespace": "default", "resourceVersion": "1"},
+            "spec": {"ports": [{"name": "http", "port": 80}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("services", "default", "my-svc"),
+                bytes::Bytes::from(svc.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed service");
+
+        let eps = serde_json::json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {
+                "name": "my-svc-abc",
+                "namespace": "default",
+                "resourceVersion": "1",
+                "labels": {"kubernetes.io/service-name": "my-svc"}
+            },
+            "addressType": "IPv4",
+            "endpoints": [{"addresses": ["10.0.0.1"], "conditions": {"ready": true}}],
+            "ports": [{"name": "http", "port": 8080, "protocol": "TCP"}]
+        });
+        state
+            .store
+            .put(
+                &crate::keys::group_object_key(
+                    "discovery.k8s.io",
+                    "endpointslices",
+                    Some("default"),
+                    "my-svc-abc",
+                ),
+                bytes::Bytes::from(eps.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed endpointslice");
+
+        let result =
+            resolve_service_proxy_target(&state, "default", "my-svc:nonexistent-port").await;
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.0.as_u16(),
+            503,
+            "an unknown named port must return 503, not silently forward to the wrong port — \
+             falling back to port[0] when the named port is absent hides misconfiguration"
+        );
     }
 }
