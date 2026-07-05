@@ -144,11 +144,15 @@ pub struct AppState<S = SqliteStore> {
     pub watch_limit: WatchLimitState,
     /// HTTP client for admission webhook calls.
     pub webhook_client: reqwest::Client,
+    /// Shared HTTP client for kubelet proxy calls (log/node-proxy). Built once at startup
+    /// from the cluster CA and kubelet client identity so all requests share the connection
+    /// pool — avoids per-request TLS handshakes that kubelet resets under concurrent load.
+    /// None when no cluster CA is configured (tests / no-CA deployments); handlers return 503.
+    pub kubelet_client: Option<reqwest::Client>,
     /// DER-encoded cluster CA certificate used to verify kubelet TLS. None in tests.
     pub cluster_ca_der: Option<Arc<Vec<u8>>>,
     /// Concatenated PEM (cert + key) for the kubelet proxy client certificate.
     /// Kubelet accepts clients with O=system:masters when --client-ca-file is our cluster CA.
-    /// Stored as bytes so reqwest::Identity can be constructed per-request (Identity: !Clone).
     pub kubelet_client_identity_pem: Option<Arc<Vec<u8>>>,
     /// When set, use this hostname/IP instead of node_address() for all kubelet proxy
     /// requests. Needed when the apiserver runs on a different host than the kubelet
@@ -230,6 +234,7 @@ impl<S> Clone for AppState<S> {
             server_address: self.server_address.clone(),
             watch_limit: self.watch_limit.clone(),
             webhook_client: self.webhook_client.clone(),
+            kubelet_client: self.kubelet_client.clone(),
             cluster_ca_der: self.cluster_ca_der.clone(),
             kubelet_client_identity_pem: self.kubelet_client_identity_pem.clone(),
             kubelet_preferred_address: self.kubelet_preferred_address.clone(),
@@ -339,6 +344,43 @@ impl<S: Store> AppState<S> {
             .map_err(|e| format!("webhook HTTP client failed to build: {e}"))
     }
 
+    /// Build a `reqwest::Client` for kubelet proxy calls (log, node-proxy).
+    ///
+    /// Requires a cluster CA to pin TLS verification — returns `None` when no CA is
+    /// provided so the apiserver fails with 503 rather than connecting to the kubelet
+    /// without certificate verification (MITM vector).
+    ///
+    /// Uses rustls and `tls_certs_only` to trust only the cluster CA, not the system
+    /// root store. Presents an mTLS client cert when `client_identity_pem` is `Some`.
+    pub fn build_kubelet_client(
+        ca_der: Option<&[u8]>,
+        client_identity_pem: Option<&[u8]>,
+    ) -> Option<reqwest::Client> {
+        let der = ca_der?;
+        let cert = reqwest::Certificate::from_der(der)
+            .map_err(|e| tracing::error!("kubelet client: failed to parse cluster CA DER: {e}"))
+            .ok()?;
+        let mut builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .tls_certs_only([cert]);
+        if let Some(identity_pem) = client_identity_pem {
+            match reqwest::Identity::from_pem(identity_pem) {
+                Ok(identity) => {
+                    builder = builder.identity(identity);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "kubelet client: failed to build mTLS identity from PEM: {e}; proceeding without client cert"
+                    );
+                }
+            }
+        }
+        builder
+            .build()
+            .map_err(|e| tracing::error!("kubelet client: failed to build: {e}"))
+            .ok()
+    }
+
     /// Construct an `AppState` from an [`AppStateConfig`].
     ///
     /// This is the primary constructor used by both production code (`main.rs`) and tests.
@@ -352,6 +394,10 @@ impl<S: Store> AppState<S> {
             cfg.konnectivity_proxy_addr.as_deref(),
         )
         .expect("corrupt cluster CA or invalid webhook client configuration — cannot start");
+        let kubelet_client = Self::build_kubelet_client(
+            cfg.cluster_ca_der.as_deref(),
+            cfg.kubelet_client_identity_pem.as_deref(),
+        );
         // If no key is supplied, generate a fresh random 32-byte key from the OS CSPRNG.
         // uuid::Uuid::new_v4() uses getrandom internally — two UUIDs give 32 bytes.
         let continue_token_key: [u8; 32] = cfg.continue_token_key.unwrap_or_else(|| {
@@ -372,6 +418,7 @@ impl<S: Store> AppState<S> {
             server_address: cfg.server_address,
             watch_limit: WatchLimitState::new(),
             webhook_client,
+            kubelet_client,
             cluster_ca_der: cfg.cluster_ca_der.map(Arc::new),
             kubelet_client_identity_pem: cfg.kubelet_client_identity_pem.map(Arc::new),
             kubelet_preferred_address: cfg.kubelet_preferred_address.map(Arc::new),
