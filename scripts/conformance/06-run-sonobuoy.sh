@@ -188,8 +188,23 @@ mkdir -p "$WORKDIR/../e2e"
 limactl copy "${VM_NAME}:/tmp/sonobuoy-results.tar.gz" "$OUTFILE"
 echo "Results: $OUTFILE"
 
+# Collect host-side and VM-side logs into <run>/host-logs/ for post-run diagnosis.
+# Kubelet runs as a systemd unit on the Lima VM — its log is in the journal, not a file.
+# Without this, a kubelet crash-loop (as in run 0705-1409) is undiagnosable post-hoc.
+RUN_DIR="${OUTFILE%.tar.gz}"
+HOST_LOGS_DIR="$RUN_DIR/host-logs"
+mkdir -p "$HOST_LOGS_DIR"
+[ -f "$WORKDIR/apiserver.log" ]              && cp "$WORKDIR/apiserver.log"   "$HOST_LOGS_DIR/apiserver.log"
+[ -f "$WORKDIR/scheduler.log" ]              && cp "$WORKDIR/scheduler.log"   "$HOST_LOGS_DIR/scheduler.log"
+[ -f "$WORKDIR/konnectivity-server.log" ]    && cp "$WORKDIR/konnectivity-server.log" "$HOST_LOGS_DIR/konnectivity-server.log"
+limactl shell "$VM_NAME" sudo journalctl -u kubelet --no-pager \
+  > "$HOST_LOGS_DIR/kubelet.log" 2>/dev/null || true
+limactl shell "$VM_NAME" sudo cat /tmp/kcm.log \
+  > "$HOST_LOGS_DIR/kcm.log" 2>/dev/null || true
+echo "Host logs: $HOST_LOGS_DIR"
+
 if [ "$UNPACK" -eq 1 ]; then
-  UNPACK_DIR="${OUTFILE%.tar.gz}"
+  UNPACK_DIR="$RUN_DIR"
   mkdir -p "$UNPACK_DIR"
   tar xzf "$OUTFILE" -C "$UNPACK_DIR"
   JUNIT="$UNPACK_DIR/plugins/e2e/results/global/junit_01.xml"
