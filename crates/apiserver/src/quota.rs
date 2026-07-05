@@ -57,6 +57,196 @@ fn parse_count(s: &str) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Resource quantity arithmetic (for resource-request quotas)
+// ---------------------------------------------------------------------------
+
+/// Parse a Kubernetes quantity string into a raw integer in milli-units.
+/// For CPU: "500m" → 500, "1" → 1000, "1.5" → 1500.
+/// For memory/storage: "252Mi" → 252*1024*1024*1000, "30Gi" → 30*1024^3*1000.
+/// For plain integers: "2" → 2000.
+/// Returns None if the string cannot be parsed.
+fn parse_quantity_milli(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return None;
+    }
+    // Milli suffix
+    if let Some(rest) = s.strip_suffix('m') {
+        return rest.parse::<i64>().ok();
+    }
+    // Binary suffixes (Ki, Mi, Gi, Ti, Pi, Ei)
+    let binary_suffixes = [
+        ("Ki", 1024i64),
+        ("Mi", 1024 * 1024),
+        ("Gi", 1024 * 1024 * 1024),
+        ("Ti", 1024 * 1024 * 1024 * 1024),
+        ("Pi", 1024 * 1024 * 1024 * 1024 * 1024),
+        ("Ei", 1024 * 1024 * 1024 * 1024 * 1024 * 1024),
+    ];
+    for (suf, mult) in &binary_suffixes {
+        if let Some(rest) = s.strip_suffix(suf) {
+            return rest.parse::<i64>().ok().map(|n| n * mult * 1000);
+        }
+    }
+    // Decimal SI suffixes (k, M, G, T, P, E)
+    let decimal_suffixes = [
+        ("k", 1_000i64),
+        ("M", 1_000_000),
+        ("G", 1_000_000_000),
+        ("T", 1_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
+        ("E", 1_000_000_000_000_000_000),
+    ];
+    for (suf, mult) in &decimal_suffixes {
+        if let Some(rest) = s.strip_suffix(suf) {
+            return rest.parse::<i64>().ok().map(|n| n * mult * 1000);
+        }
+    }
+    // Plain integer
+    s.parse::<i64>().ok().map(|n| n * 1000)
+}
+
+/// Format a milli-quantity back to a canonical Kubernetes quantity string.
+/// For CPU use format_milli_cpu; for memory/storage use format_milli_bytes.
+fn format_milli_cpu(milli: i64) -> String {
+    if milli == 0 {
+        return "0".to_string();
+    }
+    if milli % 1000 == 0 {
+        (milli / 1000).to_string()
+    } else {
+        format!("{}m", milli)
+    }
+}
+
+fn format_milli_bytes(milli: i64) -> String {
+    if milli == 0 {
+        return "0".to_string();
+    }
+    let bytes = milli / 1000;
+    const EI: i64 = 1024 * 1024 * 1024 * 1024 * 1024 * 1024;
+    const PI: i64 = 1024 * 1024 * 1024 * 1024 * 1024;
+    const TI: i64 = 1024 * 1024 * 1024 * 1024;
+    const GI: i64 = 1024 * 1024 * 1024;
+    const MI: i64 = 1024 * 1024;
+    const KI: i64 = 1024;
+    for (unit, mult) in &[
+        ("Ei", EI),
+        ("Pi", PI),
+        ("Ti", TI),
+        ("Gi", GI),
+        ("Mi", MI),
+        ("Ki", KI),
+    ] {
+        if bytes % mult == 0 {
+            return format!("{}{}", bytes / mult, unit);
+        }
+    }
+    bytes.to_string()
+}
+
+fn format_milli_integer(milli: i64) -> String {
+    (milli / 1000).to_string()
+}
+
+/// Classify a quota resource name into its resource-request category.
+///
+/// Returns (request_or_limits, resource_name_in_container) where:
+/// - request_or_limits: "requests" or "limits"
+/// - resource_name_in_container: the key to look up in container resources
+///
+/// Returns None for count-based resources (handled by `quota_resource_to_group_plural`).
+fn quota_to_pod_resource(quota_resource: &str) -> Option<(&'static str, String)> {
+    // "requests.cpu" → ("requests", "cpu")
+    if let Some(rest) = quota_resource.strip_prefix("requests.") {
+        return Some(("requests", rest.to_string()));
+    }
+    // "limits.cpu" → ("limits", "cpu")
+    if let Some(rest) = quota_resource.strip_prefix("limits.") {
+        return Some(("limits", rest.to_string()));
+    }
+    // Bare resource names that map to requests: cpu, memory, ephemeral-storage, hugepages-*
+    // Also extended resources under other namespaced names are treated as requests.
+    match quota_resource {
+        "cpu" | "memory" | "ephemeral-storage" => Some(("requests", quota_resource.to_string())),
+        // hugepages-* treated as requests
+        s if s.starts_with("hugepages-") => Some(("requests", s.to_string())),
+        _ => None,
+    }
+}
+
+/// Classify a quota resource as CPU, memory/storage, or integer for output formatting.
+fn quantity_format_type(resource_name: &str) -> &'static str {
+    match resource_name {
+        "cpu" => "cpu",
+        r if r.ends_with("cpu") => "cpu",
+        "memory" | "ephemeral-storage" => "bytes",
+        r if r.ends_with("memory") || r.ends_with("storage") => "bytes",
+        r if r.starts_with("hugepages-") => "bytes",
+        _ => "integer",
+    }
+}
+
+/// Sum resource requests or limits across all pods in a namespace for a given resource.
+/// `field` is "requests" or "limits"; `resource` is e.g. "cpu", "memory", "example.com/dongle".
+async fn sum_pod_resource<S: Store>(
+    store: &S,
+    namespace: &str,
+    quota: &Value,
+    field: &str,
+    resource: &str,
+    format: &str,
+) -> String {
+    let prefix = group_list_prefix("", "pods", Some(namespace));
+    let items = match store.list(&prefix, ListOptions::default()).await {
+        Ok(resp) => resp.items,
+        Err(_) => return "0".to_string(),
+    };
+
+    let scopes: Vec<&str> = quota["spec"]["scopes"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|s| s.as_str()).collect())
+        .unwrap_or_default();
+    let scope_selector = &quota["spec"]["scopeSelector"];
+    let has_scopes = !scopes.is_empty() || scope_selector.is_object();
+
+    let mut total_milli: i64 = 0;
+    for item in &items {
+        let pod: Value = match serde_json::from_slice(&item.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if has_scopes {
+            let matches = scopes.iter().all(|s| object_matches_scope(s, Some(&pod)));
+            if !matches {
+                continue;
+            }
+            if scope_selector.is_object()
+                && !object_matches_scope_selector(scope_selector, Some(&pod))
+            {
+                continue;
+            }
+        }
+        for containers_key in &["containers", "initContainers"] {
+            if let Some(arr) = pod["spec"][containers_key].as_array() {
+                for container in arr {
+                    if let Some(val) = container["resources"][field][resource].as_str() {
+                        if let Some(milli) = parse_quantity_milli(val) {
+                            total_milli += milli;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match format {
+        "cpu" => format_milli_cpu(total_milli),
+        "bytes" => format_milli_bytes(total_milli),
+        _ => format_milli_integer(total_milli),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Store helpers
 // ---------------------------------------------------------------------------
 
@@ -279,6 +469,10 @@ pub async fn count_quota_usage<S: Store>(
                 }
             };
             used.insert(resource_name.clone(), count.to_string());
+        } else if let Some((field, resource_key)) = quota_to_pod_resource(resource_name) {
+            let format = quantity_format_type(resource_name);
+            let sum = sum_pod_resource(store, namespace, quota, field, &resource_key, format).await;
+            used.insert(resource_name.clone(), sum);
         }
     }
     used
