@@ -332,3 +332,12 @@ you interrupted a run and want to re-issue one, or to abort without re-running.
 | KCM                 | `limactl shell <VM> tail -f /tmp/kcm.log`                     |
 | kubelet             | `limactl shell <VM> sudo journalctl -u kubelet -n 50`         |
 | konnectivity-agent  | `kubectl --kubeconfig temp/u7s/kubeconfig logs -n kube-system konnectivity-agent` |
+
+After a sonobuoy run completes, `06-run-sonobuoy.sh` automatically collects all logs into
+`temp/e2e/<TIMESTAMP>-<FOCUS>/host-logs/`: `apiserver.log`, `scheduler.log`,
+`konnectivity-server.log`, `kcm.log` (from in-VM `/tmp/kcm.log`), and `kubelet.log`
+(from `journalctl -u kubelet --no-pager` — captures the full boot history, including any
+crash-loops). To collect manually (e.g. after a `--stack-only` run):
+```bash
+limactl shell <VM> sudo journalctl -u kubelet --no-pager > kubelet.log
+```
