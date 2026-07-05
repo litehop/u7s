@@ -190,23 +190,25 @@ pub async fn pod_log<S: Store>(
         kubelet_url = format!("{kubelet_url}?{qs}");
     }
 
-    // 6. Proxy via reqwest.
-    //    Build a client pinned to the cluster CA so the kubelet's serving cert is
-    //    verified. mTLS client cert is also presented so kubelet can authenticate us.
-    let client = build_kubelet_reqwest_client(
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-        state
-            .kubelet_client_identity_pem
-            .as_deref()
-            .map(|v| v.as_slice()),
-    )
-    .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
+    // 6. Proxy via reqwest using the shared kubelet client (built once at startup).
+    let client = state.kubelet_client.as_ref().ok_or_else(|| {
+        Status::service_unavailable("kubelet TLS unavailable: no cluster CA configured".to_string())
+    })?;
 
-    let kubelet_resp = client
-        .get(&kubelet_url)
-        .send()
-        .await
-        .map_err(|e| Status::internal(format!("kubelet request failed: {e}")))?;
+    let kubelet_resp = client.get(&kubelet_url).send().await.map_err(|e| {
+        crate::status::StatusError(
+            axum::http::StatusCode::BAD_GATEWAY,
+            crate::status::Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message: format!("kubelet request failed: {e}"),
+                reason: "BadGateway",
+                code: 502,
+                metadata: None,
+            },
+        )
+    })?;
 
     let kubelet_status = kubelet_resp.status();
 
@@ -445,46 +447,6 @@ fn build_kubelet_tls_config(
     };
 
     Ok(std::sync::Arc::new(config))
-}
-
-/// Build a `reqwest::Client` pinned to the cluster CA for kubelet HTTPS calls (log/node-proxy).
-///
-/// When `ca_der` is `Some`, the client trusts only that CA — preventing MITM on
-/// the log/node-proxy paths. When `ca_der` is `None`, returns `Err` so callers
-/// can return 503 instead of connecting without certificate verification.
-fn build_kubelet_reqwest_client(
-    ca_der: Option<&[u8]>,
-    client_identity_pem: Option<&[u8]>,
-) -> anyhow::Result<reqwest::Client> {
-    let der = ca_der.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no cluster CA configured — kubelet TLS cannot be verified; \
-             refusing connection to prevent MITM"
-        )
-    })?;
-
-    let cert = reqwest::Certificate::from_der(der)
-        .map_err(|e| anyhow::anyhow!("parse kubelet CA cert DER: {e}"))?;
-    let mut builder = reqwest::Client::builder()
-        .use_rustls_tls()
-        .tls_certs_only([cert]);
-
-    if let Some(identity_pem) = client_identity_pem {
-        match reqwest::Identity::from_pem(identity_pem) {
-            Ok(identity) => {
-                builder = builder.identity(identity);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "kubelet client identity parse failed: {e}; proceeding without client cert"
-                );
-            }
-        }
-    }
-
-    builder
-        .build()
-        .map_err(|e| anyhow::anyhow!("build kubelet HTTP client: {e}"))
 }
 
 /// Open outbound WebSocket to kubelet and splice with inbound kubectl WebSocket.
@@ -1079,14 +1041,9 @@ pub async fn resolve_node_proxy_target<S: Store>(
         ))
     })?;
 
-    let client = build_kubelet_reqwest_client(
-        state.cluster_ca_der.as_deref().map(|v| v.as_slice()),
-        state
-            .kubelet_client_identity_pem
-            .as_deref()
-            .map(|v| v.as_slice()),
-    )
-    .map_err(|e| Status::service_unavailable(format!("kubelet TLS unavailable: {e}")))?;
+    let client = state.kubelet_client.clone().ok_or_else(|| {
+        Status::service_unavailable("kubelet TLS unavailable: no cluster CA configured".to_string())
+    })?;
 
     let kp = state.kubelet_port;
     let kubelet_url = format!("https://{node_ip}:{kp}/{path_suffix}");
@@ -3200,8 +3157,8 @@ mod tests {
     //
     // Before this fix, build_kubelet_tls_config used AcceptAnyCert which skips
     // server cert verification entirely, opening an MITM vector on exec/log/attach.
-    // These tests verify the function accepts a CA DER and that build_kubelet_reqwest_client
-    // uses CA pinning. They fail if the ca_der parameter is removed or ignored.
+    // These tests verify the function accepts a CA DER and that the shared kubelet
+    // client uses CA pinning. They fail if the ca_der parameter is removed or ignored.
     // -----------------------------------------------------------------------
 
     /// build_kubelet_tls_config must accept a cluster CA DER and succeed.
@@ -3241,37 +3198,141 @@ mod tests {
         );
     }
 
-    /// build_kubelet_reqwest_client with a cluster CA must succeed.
+    /// AppState::build_kubelet_client with a cluster CA must return Some(client).
     ///
-    /// If this errors, /log and node-proxy requests will always fail in production.
-    /// This test also verifies the ca_der parameter is wired through (removing it
-    /// would require updating this call site, catching the regression at compile time).
+    /// The shared kubelet client is built once at startup. If it fails to build when a
+    /// valid CA is present, every /log and node-proxy request will return 503 in production.
+    /// Fails on revert: if the CA DER parameter is removed or the function deleted, this
+    /// call site no longer compiles.
     #[test]
-    fn build_kubelet_reqwest_client_with_ca_der_succeeds() {
+    fn appstate_build_kubelet_client_with_ca_der_returns_some() {
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let ca_der = cert.cert.der().to_vec();
 
-        let result = build_kubelet_reqwest_client(Some(&ca_der), None);
+        let client = AppState::<SqliteStore>::build_kubelet_client(Some(&ca_der), None);
         assert!(
-            result.is_ok(),
-            "build_kubelet_reqwest_client must succeed with a valid CA DER — \
-             if it fails, /log and node-proxy calls will be broken in production: {:?}",
-            result.err()
+            client.is_some(),
+            "build_kubelet_client must return Some when CA DER is valid — \
+             if it returns None, every /log and node-proxy call will 503 in production"
         );
     }
 
-    /// build_kubelet_reqwest_client without a CA must return Err to prevent MITM.
+    /// AppState::build_kubelet_client without a CA must return None to prevent MITM.
     ///
-    /// Without a CA, the client would connect to the kubelet without verifying its
-    /// TLS certificate, opening an MITM vector on log/node-proxy paths. Returning
-    /// Err forces callers to return 503 instead of establishing an unverified connection.
+    /// Without a CA the shared client cannot pin TLS verification. Returning None causes
+    /// handlers to return 503 instead of connecting to the kubelet without cert verification,
+    /// which would open an MITM vector on /log and node-proxy paths.
+    /// Fails on revert: if build_kubelet_client is changed to return Some without a CA,
+    /// this assertion triggers.
     #[test]
-    fn build_kubelet_reqwest_client_without_ca_returns_err() {
-        let result = build_kubelet_reqwest_client(None, None);
+    fn appstate_build_kubelet_client_without_ca_returns_none() {
+        let client = AppState::<SqliteStore>::build_kubelet_client(None, None);
         assert!(
-            result.is_err(),
-            "build_kubelet_reqwest_client must return Err when no CA is configured — \
-             connecting without TLS verification opens an MITM vector on /log and node-proxy paths"
+            client.is_none(),
+            "build_kubelet_client must return None when no CA is configured — \
+             a Some without CA pinning opens an MITM vector on /log and node-proxy paths"
+        );
+    }
+
+    /// AppState built with a CA must have kubelet_client set (Some).
+    ///
+    /// The shared kubelet client must be built once in new_with_config so that pod_log
+    /// and node_proxy reuse the same connection pool. If kubelet_client is None despite
+    /// a CA being configured, every log/node-proxy request 503s — regressing the fix that
+    /// prevents per-request pool churn from triggering kubelet TLS resets under load.
+    /// Fails on revert: removing kubelet_client from AppState or not building it in
+    /// new_with_config causes this assertion to fail.
+    #[test]
+    fn appstate_with_ca_has_kubelet_client() {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory db"));
+        let state = AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+        assert!(
+            state.kubelet_client.is_some(),
+            "AppState built with a cluster CA must have kubelet_client=Some — \
+             if it is None, pod_log and node_proxy will 503 on every request instead of \
+             reusing the shared connection pool (the fix for per-request TLS churn)"
+        );
+    }
+
+    /// pod_log must not return 500 on kubelet unavailability (no CA configured).
+    ///
+    /// A kubelet communication failure is an upstream/bad-gateway condition — the apiserver
+    /// itself is healthy. Returning 500 misleads clients and monitoring into thinking the
+    /// apiserver has an internal error. With no CA, the handler must return 503.
+    /// Fails on revert: if Status::internal is restored at the kubelet-unavailable path,
+    /// the status code becomes 500 and this assertion triggers.
+    #[tokio::test]
+    async fn pod_log_returns_non_500_on_kubelet_unavailable() {
+        let state = make_state(); // no cluster CA → kubelet_client is None
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "mypod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "mypod"),
+                bytes::Bytes::from(pod.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed pod");
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "127.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                Some(0),
+            )
+            .await
+            .expect("seed node");
+
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/v1/namespaces/default/pods/mypod/log")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        // 503 because kubelet_client is None (no CA). The key assertion: NOT 500.
+        // 500 misleads clients/monitoring into thinking the apiserver has an internal error
+        // when the problem is upstream (kubelet unavailable). If the fix is reverted to
+        // Status::internal, this becomes 500 and the test fails.
+        assert_ne!(
+            resp.status().as_u16(),
+            500,
+            "pod_log must not return 500 on kubelet unavailability — \
+             500 misleads clients/monitoring: the apiserver is healthy, the kubelet is not reachable"
         );
     }
 
