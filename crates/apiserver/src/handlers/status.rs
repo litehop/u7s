@@ -1794,6 +1794,16 @@ mod tests {
             async move { inner.delete(&key, expected_revision).await }
         }
 
+        fn list_namespace_objects(
+            &self,
+            namespace: &str,
+        ) -> impl std::future::Future<Output = u7s_store::Result<Vec<u7s_store::StoreObject>>> + Send
+        {
+            let inner = self.inner.clone();
+            let ns = namespace.to_string();
+            async move { inner.list_namespace_objects(&ns).await }
+        }
+
         fn delete_namespace_resources(
             &self,
             namespace: &str,

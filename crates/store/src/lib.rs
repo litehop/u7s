@@ -179,6 +179,17 @@ pub trait Store: Send + Sync + 'static {
         Output = Result<impl futures_core::Stream<Item = WatchEvent> + Send + 'static>,
     > + Send;
 
+    /// List all objects belonging to the given namespace with their bodies.
+    ///
+    /// Returns every stored object whose `metadata.namespace` matches `namespace`.
+    /// Unlike `delete_namespace_resources` this does not remove the objects; it is
+    /// used by the namespace cascade path to inspect each object's finalizers before
+    /// deciding whether to hard-delete or soft-delete (set deletionTimestamp).
+    fn list_namespace_objects(
+        &self,
+        namespace: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<StoreObject>>> + Send;
+
     /// Delete all objects belonging to the given namespace.
     ///
     /// Atomically removes every stored object whose `metadata.namespace` matches

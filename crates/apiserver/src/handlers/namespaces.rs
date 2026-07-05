@@ -676,6 +676,136 @@ pub async fn patch_namespace_status<S: Store>(
     Ok(Json(current.body))
 }
 
+/// Cascade-delete all objects in a namespace, respecting `metadata.finalizers`.
+///
+/// Objects with non-empty `metadata.finalizers` are soft-deleted: `deletionTimestamp` is
+/// stamped and the object is persisted so the owning controller can observe the deletion
+/// signal and remove its finalizer. Objects without finalizers are hard-deleted immediately.
+///
+/// Returns `true` if any objects were soft-deleted (i.e. had finalizers and were not
+/// immediately removed). The caller uses this to decide whether the namespace itself must
+/// remain alive in Terminating state — the namespace cannot hard-delete until all contained
+/// objects with finalizers are cleared, matching Kubernetes OrderedNamespaceDeletion semantics.
+///
+/// The fast path (no finalizers on any object) is unaffected: all objects hard-delete and
+/// the function returns `false`, allowing the namespace to hard-delete immediately.
+async fn cascade_delete_namespace_resources<S: Store>(
+    state: &AppState<S>,
+    namespace: &str,
+) -> bool {
+    let objects = match state.store.list_namespace_objects(namespace).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("namespace {namespace}: cascade list failed: {e}");
+            return false;
+        }
+    };
+
+    let now = utc_now_rfc3339();
+    let mut any_soft_deleted = false;
+    for obj_stored in objects {
+        let mut val: serde_json::Value = match serde_json::from_slice(&obj_stored.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let has_finalizers = val["metadata"]["finalizers"]
+            .as_array()
+            .is_some_and(|f| !f.is_empty());
+        if has_finalizers {
+            // Soft-delete: stamp deletionTimestamp so the controller observes deletion.
+            // Use an unconditional put (None) — we just read this object; a race
+            // that adds a finalizer between our read and this write is acceptable
+            // because deletionTimestamp is monotonically stamped (never cleared).
+            val["metadata"]["deletionTimestamp"] = serde_json::Value::String(now.clone());
+            let updated = serde_json::to_vec(&val).unwrap_or_default();
+            if let Err(e) = state
+                .store
+                .put(&obj_stored.key, bytes::Bytes::from(updated), None)
+                .await
+            {
+                tracing::warn!(
+                    "namespace {namespace}: soft-delete {} failed: {e}",
+                    obj_stored.key
+                );
+            } else {
+                any_soft_deleted = true;
+            }
+        } else {
+            if let Err(e) = state.store.delete(&obj_stored.key, None).await {
+                tracing::warn!(
+                    "namespace {namespace}: hard-delete {} failed: {e}",
+                    obj_stored.key
+                );
+            }
+        }
+    }
+    any_soft_deleted
+}
+
+/// Check if a Terminating namespace can now be hard-deleted.
+///
+/// Called after an object in a namespace has its finalizers cleared and is hard-deleted.
+/// If the namespace has `deletionTimestamp` set and `spec.finalizers` is empty, and no
+/// remaining objects in the namespace have `metadata.finalizers`, the namespace is
+/// hard-deleted (along with any remaining finalizer-free objects).
+///
+/// This is the completion trigger for the OrderedNamespaceDeletion flow:
+///   1. delete_namespace soft-deletes finalizer'd objects + keeps namespace Terminating
+///   2. controller removes finalizer from object → object is hard-deleted → this function runs
+///   3. if no more finalizer'd objects remain → namespace hard-deletes
+pub(crate) async fn maybe_finalize_terminating_namespace<S: Store>(
+    state: &AppState<S>,
+    namespace: &str,
+) {
+    let ns_key = cluster_object_key("namespaces", namespace);
+    let ns_stored = match state.store.get(&ns_key).await {
+        Ok(Some(v)) => v,
+        _ => return,
+    };
+    let ns_val: serde_json::Value = match serde_json::from_slice(&ns_stored.value) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let ns_meta: ObjectMeta =
+        serde_json::from_value(ns_val["metadata"].clone()).unwrap_or_default();
+    if ns_meta.deletion_timestamp.is_none() {
+        return;
+    }
+    let ns_spec: NamespaceSpec = serde_json::from_value(ns_val["spec"].clone()).unwrap_or_default();
+    let spec_finalizers_empty = ns_spec
+        .finalizers
+        .as_deref()
+        .map(|f| f.is_empty())
+        .unwrap_or(true);
+    if !spec_finalizers_empty {
+        return;
+    }
+    // Check if any objects in the namespace still have metadata.finalizers.
+    let objects = match state.store.list_namespace_objects(namespace).await {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let any_remaining_finalizers = objects.iter().any(|obj| {
+        serde_json::from_slice::<serde_json::Value>(&obj.value)
+            .ok()
+            .and_then(|v| {
+                v["metadata"]["finalizers"]
+                    .as_array()
+                    .map(|f| !f.is_empty())
+            })
+            .unwrap_or(false)
+    });
+    if any_remaining_finalizers {
+        return;
+    }
+    // No remaining finalizer'd objects — hard-delete remaining objects and the namespace.
+    for obj in objects {
+        let _ = state.store.delete(&obj.key, None).await;
+    }
+    delete_namespace_scoped_crds(state, namespace).await;
+    let _ = state.store.delete(&ns_key, None).await;
+}
+
 /// Delete all CRDs whose `spec.group` contains `namespace_name` as a substring.
 ///
 /// CRDs created by test frameworks (e.g. VAP conformance) embed the namespace name in their
@@ -765,19 +895,33 @@ pub async fn delete_namespace<S: Store>(
         obj.body = soft;
 
         if remaining.is_empty() {
-            // No remaining finalizers — hard-delete now.
+            // No remaining spec.finalizers — attempt hard-delete.
+            // But first cascade-delete contained objects, respecting their metadata.finalizers.
             delete_namespace_scoped_crds(&state, &name).await;
-            if let Err(e) = state.store.delete_namespace_resources(&name).await {
-                tracing::warn!("namespace {name}: cascade delete failed: {e}");
+            let has_soft_deleted = cascade_delete_namespace_resources(&state, &name).await;
+            if has_soft_deleted {
+                // Some contained objects have finalizers and were soft-deleted (Terminating).
+                // The namespace must stay alive until those objects' controllers clear their
+                // finalizers (OrderedNamespaceDeletion semantics). Persist as Terminating;
+                // maybe_finalize_terminating_namespace will complete the deletion later.
+                let expected_rv = parse_resource_version(obj.resource_version())?;
+                let new_rv = state
+                    .store
+                    .put(&key, obj.to_bytes(), expected_rv)
+                    .await
+                    .map_err(|e| store_err_to_status(e, &name))?;
+                obj.set_resource_version(new_rv);
+            } else {
+                state
+                    .store
+                    .delete(&key, None)
+                    .await
+                    .map_err(|e| store_err_to_status(e, &name))?;
             }
-            state
-                .store
-                .delete(&key, None)
-                .await
-                .map_err(|e| store_err_to_status(e, &name))?;
         } else {
             // External controllers still have finalizers — persist Terminating state.
             delete_namespace_scoped_crds(&state, &name).await;
+            cascade_delete_namespace_resources(&state, &name).await;
             let expected_rv = parse_resource_version(obj.resource_version())?;
             let new_rv = state
                 .store
@@ -789,13 +933,13 @@ pub async fn delete_namespace<S: Store>(
         return Ok(Json(obj.body).into_response());
     }
 
-    // No finalizers — hard-delete immediately.
-    // Cascade-delete all resources in the namespace first so that re-creating
-    // a namespace with the same name does not inherit orphaned objects and
-    // cause false 409 AlreadyExists errors on subsequent POSTs.
-    if let Err(e) = state.store.delete_namespace_resources(&name).await {
-        tracing::warn!("namespace {name}: cascade delete failed: {e}");
-    }
+    // No spec.finalizers — hard-delete immediately (namespace was not given a lifecycle
+    // controller, e.g. seeded directly in tests). Cascade-delete all resources first so
+    // that re-creating the namespace does not inherit stale objects (false 409).
+    // Objects with metadata.finalizers are still soft-deleted for correctness but the
+    // namespace itself is immediately gone (no Terminating state mechanism without
+    // deletionTimestamp on the namespace).
+    cascade_delete_namespace_resources(&state, &name).await;
     state
         .store
         .delete(&key, None)
@@ -3032,6 +3176,180 @@ mod tests {
              AppState was destroyed — the _store_keepalive fix in watch_generic is needed to \
              keep the store alive for the stream's lifetime (mayor-8tiu)",
             elapsed.as_millis()
+        );
+    }
+
+    /// Regression: namespace cascade delete must respect object metadata.finalizers.
+    ///
+    /// An object with non-empty metadata.finalizers must NOT be hard-deleted immediately
+    /// when its namespace is deleted. Instead it must receive deletionTimestamp and remain
+    /// in the store (Terminating) until its controller removes the finalizer.
+    ///
+    /// An object without finalizers must be hard-deleted immediately (fast path preserved).
+    ///
+    /// Without the fix (cascade uses raw delete_namespace_resources):
+    ///   - the finalizer'd object vanishes immediately → controller never sees the signal
+    ///   - OrderedNamespaceDeletion fails because the pod is gone before cleanup runs
+    ///
+    /// Fails on revert: reverting to delete_namespace_resources causes the finalizer'd object
+    /// to be absent from the store after namespace deletion instead of being in Terminating.
+    #[tokio::test]
+    async fn cascade_delete_respects_object_finalizers() {
+        use crate::keys::object_key;
+        use u7s_store::Store;
+
+        let state = make_state();
+
+        // Create the namespace via the proper handler (stamps spec.finalizers=["kubernetes"]).
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("fin-cascade-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        // Seed a pod WITH metadata.finalizers in the namespace.
+        let pod_key = object_key("pods", "fin-cascade-ns", "protected-pod");
+        let pod_with_finalizer = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "protected-pod",
+                "namespace": "fin-cascade-ns",
+                "finalizers": ["test.io/delete-me"]
+            },
+            "spec": { "containers": [] }
+        });
+        state
+            .store
+            .put(
+                &pod_key,
+                bytes::Bytes::from(pod_with_finalizer.to_string()),
+                None,
+            )
+            .await
+            .expect("pod-with-finalizer write must succeed");
+
+        // Seed a pod WITHOUT finalizers in the namespace.
+        let plain_pod_key = object_key("pods", "fin-cascade-ns", "plain-pod");
+        let pod_no_finalizer = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "plain-pod",
+                "namespace": "fin-cascade-ns"
+            },
+            "spec": { "containers": [] }
+        });
+        state
+            .store
+            .put(
+                &plain_pod_key,
+                bytes::Bytes::from(pod_no_finalizer.to_string()),
+                None,
+            )
+            .await
+            .expect("plain-pod write must succeed");
+
+        // Delete the namespace — triggers cascade with finalizer awareness.
+        assert!(
+            delete_namespace(State(state.clone()), Path("fin-cascade-ns".to_string()))
+                .await
+                .is_ok(),
+            "namespace delete must succeed"
+        );
+
+        // Pod WITH finalizer must still exist with deletionTimestamp set (Terminating).
+        let stored_pod = state
+            .store
+            .get(&pod_key)
+            .await
+            .expect("store get must not error")
+            .expect(
+                "pod with metadata.finalizers must NOT be hard-deleted during namespace cascade — \
+                 it must remain in Terminating (deletionTimestamp set) until its controller \
+                 removes the finalizer; without the fix, delete_namespace_resources erases it \
+                 immediately and OrderedNamespaceDeletion fails",
+            );
+        let pod_body: serde_json::Value =
+            serde_json::from_slice(&stored_pod.value).expect("pod body must parse");
+        assert!(
+            pod_body["metadata"]["deletionTimestamp"].is_string(),
+            "pod with finalizer must have deletionTimestamp set after namespace cascade delete — \
+             the controller needs to observe this to trigger its cleanup logic"
+        );
+
+        // Pod WITHOUT finalizer must be hard-deleted (fast path preserved).
+        let plain_stored = state
+            .store
+            .get(&plain_pod_key)
+            .await
+            .expect("store get must not error");
+        assert!(
+            plain_stored.is_none(),
+            "pod without finalizers must be hard-deleted immediately during namespace cascade — \
+             the finalizer-less fast path must not regress; objects without finalizers must still \
+             be cleaned up promptly to avoid orphan accumulation"
+        );
+
+        // Namespace itself must still exist (Terminating) — it must NOT hard-delete while
+        // contained objects with finalizers are still present. This is the
+        // OrderedNamespaceDeletion invariant: the namespace waits for all finalizer'd objects
+        // to be cleared before it disappears. Without this fix the namespace hard-deletes
+        // immediately, making the finalizer'd pod inaccessible via the API.
+        let ns_stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "fin-cascade-ns",
+            ))
+            .await
+            .expect("store get must not error")
+            .expect(
+                "namespace must still exist while it contains objects with metadata.finalizers — \
+                 without the fix the namespace hard-deletes immediately, cutting off API access \
+                 to the finalizer'd pod and breaking OrderedNamespaceDeletion",
+            );
+        let ns_body: serde_json::Value =
+            serde_json::from_slice(&ns_stored.value).expect("namespace body must parse");
+        assert_eq!(
+            ns_body["status"]["phase"], "Terminating",
+            "namespace must be in Terminating phase while it has finalizer'd contained objects"
+        );
+        assert!(
+            ns_body["metadata"]["deletionTimestamp"].is_string(),
+            "namespace must have deletionTimestamp set (Terminating) while contained objects have finalizers"
+        );
+
+        // Now simulate the controller removing the pod's finalizer + hard-delete the pod.
+        // After this, maybe_finalize_terminating_namespace should complete the namespace deletion.
+        // We directly remove the pod (simulating the controller clearing the finalizer):
+        state
+            .store
+            .delete(&pod_key, None)
+            .await
+            .expect("pod hard-delete must succeed");
+        // Trigger namespace completion check.
+        maybe_finalize_terminating_namespace(&state, "fin-cascade-ns").await;
+
+        // Namespace must now be gone — all finalizer'd objects are cleared.
+        let ns_after = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "fin-cascade-ns",
+            ))
+            .await
+            .expect("store get must not error");
+        assert!(
+            ns_after.is_none(),
+            "namespace must hard-delete once all finalizer'd contained objects are cleared — \
+             without maybe_finalize_terminating_namespace the namespace stays Terminating forever"
         );
     }
 }
