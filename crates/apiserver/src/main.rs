@@ -639,7 +639,9 @@ fn build_router(state: AppState) -> Router {
         // CRDs — cluster-scoped, specific paths before generic catch-all
         .route(
             "/apis/apiextensions.k8s.io/v1/customresourcedefinitions",
-            get(handlers::crd::list_crds).post(handlers::crd::create_crd),
+            get(handlers::crd::list_crds)
+                .post(handlers::crd::create_crd)
+                .delete(handlers::crd::delete_collection_crds),
         )
         .route(
             "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}",

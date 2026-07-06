@@ -572,6 +572,58 @@ pub async fn delete_crd<S: Store>(
     })))
 }
 
+/// DELETE /apis/apiextensions.k8s.io/v1/customresourcedefinitions (delete collection)
+///
+/// Honors ?labelSelector= like the generic delete_collection_resource, so tooling that
+/// labels its own CRDs can clean them up in one call. Without this route the collection
+/// endpoint only supported GET/POST, so DeleteCollection returned 405 — conformance's
+/// "listing custom resource definition objects works" test creates 10 labeled CRDs and
+/// relies on DeleteCollection(labelSelector) to remove exactly those.
+pub async fn delete_collection_crds<S: Store>(
+    State(state): State<AppState<S>>,
+    Query(query): Query<super::generic::CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let prefix = list_prefix();
+    let resp = state
+        .store
+        .list(&prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let label_pairs = query
+        .label_selector
+        .as_deref()
+        .map(super::generic::parse_label_selector)
+        .transpose()?;
+
+    for obj in resp.items {
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
+            continue;
+        };
+        let name = parsed["metadata"]["name"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(ref pairs) = label_pairs {
+            if super::generic::apply_label_selector(vec![parsed], pairs).is_empty() {
+                continue;
+            }
+        }
+        delete_crd(State(state.clone()), Path(name), Extension(user.clone())).await?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "code": 200
+    })))
+}
+
 pub async fn patch_crd<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
@@ -1225,6 +1277,91 @@ mod tests {
             vec!["foos.example.io"],
             "labelSelector=team=a must scope the list to matching CRDs only — \
              returning every CRD breaks tooling that lists only its own CRDs"
+        );
+    }
+
+    /// DELETE on the CRD collection with a labelSelector must remove only the matching
+    /// CRDs — before this route existed the collection endpoint only supported GET/POST
+    /// and DeleteCollection returned 405, failing conformance's "listing custom resource
+    /// definition objects works" test (which cleans up its 10 labeled CRDs this way).
+    #[tokio::test]
+    async fn delete_collection_crds_honors_label_selector() {
+        let state = make_state();
+
+        let matching = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "foos.example.io", "labels": { "team": "a" } },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "foos", "singular": "foo", "kind": "Foo" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+        let non_matching = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "bars.example.io", "labels": { "team": "b" } },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "bars", "singular": "bar", "kind": "Bar" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            matching,
+        )
+        .await
+        .expect("create matching CRD must succeed");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            non_matching,
+        )
+        .await
+        .expect("create non-matching CRD must succeed");
+
+        let query = Query(crate::handlers::generic::CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: Some("team=a".to_string()),
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        });
+        delete_collection_crds(State(state.clone()), query, test_user())
+            .await
+            .expect(
+                "delete collection must succeed — before the fix this route did not \
+                     exist and DELETE on the collection returned 405",
+            );
+
+        assert!(
+            get_crd(State(state.clone()), Path("foos.example.io".to_string()))
+                .await
+                .is_err(),
+            "the labeled CRD must be deleted"
+        );
+        assert!(
+            get_crd(State(state), Path("bars.example.io".to_string()))
+                .await
+                .is_ok(),
+            "the non-matching CRD must survive a label-scoped delete collection"
         );
     }
 
