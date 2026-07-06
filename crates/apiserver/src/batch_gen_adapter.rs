@@ -173,6 +173,16 @@ pub fn decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                             cond["message"] = msg.clone().into();
                         }
                     }
+                    if let Some(t) = c.last_probe_time.as_ref() {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cond["lastProbeTime"] = crate::util::secs_to_rfc3339(secs).into();
+                        }
+                    }
+                    if let Some(t) = c.last_transition_time.as_ref() {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cond["lastTransitionTime"] = crate::util::secs_to_rfc3339(secs).into();
+                        }
+                    }
                     cond
                 })
                 .collect();
@@ -294,6 +304,16 @@ pub fn decode_cronjob_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                 })
                 .collect::<Vec<_>>()
                 .into();
+        }
+        if let Some(t) = status.last_schedule_time.as_ref() {
+            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                status_json["lastScheduleTime"] = crate::util::secs_to_rfc3339(secs).into();
+            }
+        }
+        if let Some(t) = status.last_successful_time.as_ref() {
+            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                status_json["lastSuccessfulTime"] = crate::util::secs_to_rfc3339(secs).into();
+            }
         }
         if status_json
             .as_object()
@@ -429,6 +449,50 @@ mod tests {
         );
     }
 
+    /// decode_cronjob_proto_gen must preserve status.lastScheduleTime and lastSuccessfulTime.
+    ///
+    /// The CronJob controller gates the next scheduled run on lastScheduleTime; if it is
+    /// dropped, the controller cannot tell when the CronJob last fired and
+    /// "should support CronJob API operations" conformance sees lastScheduleTime as nil
+    /// after a status update.
+    #[test]
+    fn decode_cronjob_proto_gen_preserves_last_schedule_and_successful_time() {
+        let cj = batch_v1::CronJob {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("timed-cj".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(batch_v1::CronJobSpec {
+                schedule: Some("*/5 * * * *".to_string()),
+                ..Default::default()
+            }),
+            status: Some(batch_v1::CronJobStatus {
+                last_schedule_time: Some(meta_v1::Time {
+                    seconds: Some(1_704_067_200),
+                    nanos: Some(0),
+                }),
+                last_successful_time: Some(meta_v1::Time {
+                    seconds: Some(1_704_067_215),
+                    nanos: Some(0),
+                }),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        cj.encode(&mut buf).unwrap();
+        let result = decode_cronjob_proto_gen(&buf).expect("CronJob with status must decode");
+
+        assert_eq!(
+            result["status"]["lastScheduleTime"], "2024-01-01T00:00:00Z",
+            "lastScheduleTime must survive decode; before the fix status only mapped .active, \
+             so the controller would see lastScheduleTime as nil and could re-fire a job early"
+        );
+        assert_eq!(
+            result["status"]["lastSuccessfulTime"], "2024-01-01T00:00:15Z",
+            "lastSuccessfulTime must survive decode; before the fix this field was never mapped"
+        );
+    }
+
     /// Job conditions with None type/status must serialize as "" not null.
     ///
     /// k8s Job controller checks condition.type == "Complete" / "Failed" to determine
@@ -467,6 +531,53 @@ mod tests {
             serde_json::Value::String(String::new()),
             "condition.status must be \"\" not null — controllers doing string comparison \
              (status == \"True\") panic or skip conditions with null status"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve JobCondition.lastTransitionTime and lastProbeTime.
+    ///
+    /// Controllers and `kubectl get job` order status changes by LastTransitionTime; if it is
+    /// dropped, every Job condition looks un-transitioned (zero-valued), which breaks
+    /// "should apply changes to a job status" conformance and any client waiting on the
+    /// transition timestamp to detect a state change.
+    #[test]
+    fn decode_job_proto_gen_preserves_condition_last_transition_and_probe_time() {
+        let job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("timed-job".to_string()),
+                ..Default::default()
+            }),
+            status: Some(batch_v1::JobStatus {
+                conditions: vec![batch_v1::JobCondition {
+                    r#type: Some("Complete".to_string()),
+                    status: Some("True".to_string()),
+                    last_probe_time: Some(meta_v1::Time {
+                        seconds: Some(1_704_067_200),
+                        nanos: Some(0),
+                    }),
+                    last_transition_time: Some(meta_v1::Time {
+                        seconds: Some(1_704_067_215),
+                        nanos: Some(0),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).unwrap();
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        let cond = &result["status"]["conditions"][0];
+
+        assert_eq!(
+            cond["lastTransitionTime"], "2024-01-01T00:00:15Z",
+            "lastTransitionTime must survive decode; before the fix this field was never mapped \
+             and the condition would look un-transitioned (0001-01-01) to every client"
+        );
+        assert_eq!(
+            cond["lastProbeTime"], "2024-01-01T00:00:00Z",
+            "lastProbeTime must survive decode; before the fix this field was silently dropped"
         );
     }
 }
