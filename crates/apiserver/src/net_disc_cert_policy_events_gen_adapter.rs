@@ -295,6 +295,56 @@ pub fn decode_ingress_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             out["spec"] = serde_json::Value::Object(spec_json);
         }
     }
+    if let Some(status) = obj.status {
+        if let Some(lb) = status.load_balancer {
+            if !lb.ingress.is_empty() {
+                let ingress: Vec<serde_json::Value> = lb
+                    .ingress
+                    .into_iter()
+                    .map(|i| {
+                        let mut im = serde_json::Map::new();
+                        if let Some(v) = i.ip.filter(|s| !s.is_empty()) {
+                            im.insert("ip".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = i.hostname.filter(|s| !s.is_empty()) {
+                            im.insert("hostname".to_string(), serde_json::Value::String(v));
+                        }
+                        if !i.ports.is_empty() {
+                            let ports: Vec<serde_json::Value> = i
+                                .ports
+                                .into_iter()
+                                .map(|p| {
+                                    let mut pm = serde_json::Map::new();
+                                    if let Some(v) = p.port.filter(|&n| n != 0) {
+                                        pm.insert(
+                                            "port".to_string(),
+                                            serde_json::Value::Number(v.into()),
+                                        );
+                                    }
+                                    if let Some(v) = p.protocol.filter(|s| !s.is_empty()) {
+                                        pm.insert(
+                                            "protocol".to_string(),
+                                            serde_json::Value::String(v),
+                                        );
+                                    }
+                                    if let Some(v) = p.error.filter(|s| !s.is_empty()) {
+                                        pm.insert(
+                                            "error".to_string(),
+                                            serde_json::Value::String(v),
+                                        );
+                                    }
+                                    serde_json::Value::Object(pm)
+                                })
+                                .collect();
+                            im.insert("ports".to_string(), serde_json::Value::Array(ports));
+                        }
+                        serde_json::Value::Object(im)
+                    })
+                    .collect();
+                out["status"] = serde_json::json!({ "loadBalancer": { "ingress": ingress } });
+            }
+        }
+    }
     Some(out)
 }
 
@@ -683,4 +733,57 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
         out["deprecatedCount"] = serde_json::Value::Number(count.into());
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// decode_ingress_proto_gen must preserve status.loadBalancer.ingress (ip/hostname/ports).
+    ///
+    /// Clients read Ingress status to learn the load-balancer IP/hostname assigned by the
+    /// ingress controller; decode_ingress_proto_gen never read `.status` at all, so
+    /// "should support creating Ingress API operations" conformance saw an empty
+    /// IngressLoadBalancerStatus after the controller updated it — the Ingress looked
+    /// permanently unprovisioned.
+    #[test]
+    fn decode_ingress_proto_gen_preserves_load_balancer_status() {
+        let obj = networking_v1::Ingress {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-ingress".to_string()),
+                ..Default::default()
+            }),
+            status: Some(networking_v1::IngressStatus {
+                load_balancer: Some(networking_v1::IngressLoadBalancerStatus {
+                    ingress: vec![networking_v1::IngressLoadBalancerIngress {
+                        ip: Some("203.0.113.10".to_string()),
+                        hostname: Some("lb.example.com".to_string()),
+                        ports: vec![networking_v1::IngressPortStatus {
+                            port: Some(443),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        }],
+                    }],
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_ingress_proto_gen(&buf).expect("Ingress with status must decode");
+
+        assert_eq!(
+            result["status"]["loadBalancer"]["ingress"][0]["ip"], "203.0.113.10",
+            "status.loadBalancer.ingress[0].ip must survive decode; before the fix .status was \
+             never read, so clients could not discover the assigned load-balancer IP"
+        );
+        assert_eq!(
+            result["status"]["loadBalancer"]["ingress"][0]["hostname"], "lb.example.com",
+            "status.loadBalancer.ingress[0].hostname must survive decode"
+        );
+        assert_eq!(
+            result["status"]["loadBalancer"]["ingress"][0]["ports"][0]["port"], 443,
+            "status.loadBalancer.ingress[0].ports[0].port must survive decode"
+        );
+    }
 }
