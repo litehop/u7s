@@ -374,6 +374,45 @@ pub async fn create_pod<S: Store>(
         }
     }
 
+    // PriorityClass admission: resolve spec.priorityClassName -> spec.priority.
+    // Must happen here (not in the pure apply_pod_create_defaults) because it
+    // requires a store lookup. Without this, spec.priority is always absent
+    // (defaults to 0 for the scheduler), so the scheduler's preemption logic
+    // (crates/scheduler) can never tell pods apart by priority (mayor-2u9x).
+    if let Some(pc_name) = obj.body["spec"]["priorityClassName"]
+        .as_str()
+        .filter(|n| !n.is_empty())
+        .map(str::to_owned)
+    {
+        let pc_key = group_object_key("scheduling.k8s.io", "priorityclasses", None, &pc_name);
+        let priority_result = match state.store.get(&pc_key).await {
+            Ok(Some(stored_pc)) => {
+                match serde_json::from_slice::<serde_json::Value>(&stored_pc.value) {
+                    Ok(pc_obj) => resolve_pod_priority_class(&mut obj.body, Some(&pc_obj)),
+                    Err(e) => {
+                        tracing::warn!(priority_class = %pc_name, err = %e, "failed to parse stored PriorityClass — priority not resolved");
+                        Ok(())
+                    }
+                }
+            }
+            // Not found in the store: resolve_pod_priority_class still succeeds for
+            // the two built-in system class names (it ignores `stored_class` for
+            // those); any other name is rejected below.
+            Ok(None) => resolve_pod_priority_class(&mut obj.body, None),
+            Err(e) => {
+                tracing::warn!(priority_class = %pc_name, err = %e, "store error looking up PriorityClass — priority not resolved");
+                Ok(())
+            }
+        };
+        if let Err(msg) = priority_result {
+            // Real kube-apiserver's PriorityClass admission plugin rejects pod
+            // creation outright when priorityClassName doesn't resolve, rather
+            // than silently persisting the pod at the default priority (0) where
+            // preemption could never distinguish it from any other pod.
+            return Err(Status::forbidden(format!("pod rejected: {msg}")));
+        }
+    }
+
     // Admission webhook pipeline (mutating then validating).
     let admission_ctx = AdmissionContext {
         group: "",
@@ -3338,6 +3377,76 @@ pub fn apply_runtime_class_overhead(pod: &mut serde_json::Value, rc: &serde_json
     }
 }
 
+/// The two built-in Kubernetes PriorityClasses that are always resolvable, even
+/// when no PriorityClass object has been created for them. Upstream's
+/// PriorityClass admission plugin (plugin/pkg/admission/priority) special-cases
+/// these two names regardless of what's in the PriorityClass store.
+pub const SYSTEM_CLUSTER_CRITICAL_VALUE: i32 = 2_000_000_000;
+pub const SYSTEM_NODE_CRITICAL_VALUE: i32 = 2_000_001_000;
+
+/// Resolve `spec.priorityClassName` into `spec.priority` (and `spec.preemptionPolicy`
+/// when the pod didn't already set one), mirroring upstream's PriorityClass
+/// admission plugin.
+///
+/// The scheduler's preemption logic (crates/scheduler) keys entirely off
+/// `spec.priority` — without this resolution every pod looks like priority 0
+/// and preemption can never distinguish a high-priority pod from a low-priority
+/// one (mayor-2u9x).
+///
+/// `stored_class` is the PriorityClass object already fetched from the store by
+/// name (`None` if no such object exists). It is ignored for the two built-in
+/// system class names above, which always resolve to their fixed values
+/// regardless of what (if anything) is stored under that name.
+///
+/// No-op (`Ok`) when the pod has no `priorityClassName`, or already carries an
+/// explicit `spec.priority` — a value the client set directly is left alone
+/// rather than silently overwritten.
+///
+/// Returns `Err(message)` when `priorityClassName` is set but does not resolve
+/// to any PriorityClass: upstream rejects such pod creates outright rather than
+/// silently defaulting to priority 0, and a rejected pod must never be
+/// persisted with an unresolved priority the scheduler cannot act on.
+///
+/// NOTE: does not implement `globalDefault` (the PriorityClass applied when a
+/// pod sets no `priorityClassName` at all) — tracked as a known gap, see
+/// mayor-2u9x follow-up discussion.
+pub fn resolve_pod_priority_class(
+    pod: &mut serde_json::Value,
+    stored_class: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let class_name = match pod["spec"]["priorityClassName"].as_str() {
+        Some(n) if !n.is_empty() => n.to_owned(),
+        _ => return Ok(()),
+    };
+    if !pod["spec"]["priority"].is_null() {
+        return Ok(());
+    }
+
+    let (value, preemption_policy): (i32, Option<String>) = match class_name.as_str() {
+        "system-cluster-critical" => (SYSTEM_CLUSTER_CRITICAL_VALUE, None),
+        "system-node-critical" => (SYSTEM_NODE_CRITICAL_VALUE, None),
+        _ => match stored_class {
+            Some(pc) => (
+                pc["value"].as_i64().unwrap_or(0) as i32,
+                pc["preemptionPolicy"].as_str().map(str::to_owned),
+            ),
+            None => {
+                return Err(format!(
+                    "no PriorityClass with name \"{class_name}\" was found"
+                ));
+            }
+        },
+    };
+
+    pod["spec"]["priority"] = serde_json::json!(value);
+    if pod["spec"]["preemptionPolicy"].is_null() {
+        if let Some(policy) = preemption_policy {
+            pod["spec"]["preemptionPolicy"] = serde_json::json!(policy);
+        }
+    }
+    Ok(())
+}
+
 /// Compute the QoS class for a pod from its container resource requests/limits.
 ///
 /// Kubernetes sets `status.qosClass` at admission time based on the resource
@@ -5739,6 +5848,198 @@ mod pure_logic_tests {
 }
 
 // ---------------------------------------------------------------------------
+// resolve_pod_priority_class
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod priority_class_tests {
+    use super::*;
+
+    /// A pod with priorityClassName referencing a stored PriorityClass must have
+    /// spec.priority resolved to that class's value.
+    ///
+    /// The scheduler's preemption logic (crates/scheduler) keys entirely off
+    /// spec.priority — without this resolution every pod looks like priority 0
+    /// and a pod that explicitly asked for a high PriorityClass could never
+    /// preempt a lower-priority one (mayor-2u9x).
+    #[test]
+    fn resolves_priority_from_stored_priority_class_value() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "priorityClassName": "high",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        let stored_class = serde_json::json!({"value": 12345});
+
+        resolve_pod_priority_class(&mut pod, Some(&stored_class))
+            .expect("a found PriorityClass must resolve without error");
+
+        assert_eq!(
+            pod["spec"]["priority"], 12345,
+            "spec.priority must equal the referenced PriorityClass's value — \
+             the scheduler cannot preempt on a priority it never sees"
+        );
+    }
+
+    /// A pod whose priorityClassName does not resolve to any stored PriorityClass
+    /// (and isn't a built-in system class) must be rejected, not silently default
+    /// to priority 0.
+    ///
+    /// Upstream's PriorityClass admission plugin rejects such pod creates outright;
+    /// silently defaulting here would let a typo'd priorityClassName sail through
+    /// with no signal that the intended priority was ignored.
+    #[test]
+    fn errors_when_priority_class_name_does_not_resolve() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "priorityClassName": "does-not-exist",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let err = resolve_pod_priority_class(&mut pod, None)
+            .expect_err("an unresolvable priorityClassName must error, not be ignored");
+
+        assert!(
+            err.contains("does-not-exist"),
+            "the error must name the missing PriorityClass so the caller can \
+             surface a useful message; got: {err}"
+        );
+        assert!(
+            pod["spec"]["priority"].is_null(),
+            "priority must remain unset when resolution fails — a rejected pod \
+             must not be left half-defaulted"
+        );
+    }
+
+    /// system-cluster-critical must resolve to its fixed value even when no
+    /// PriorityClass object exists for it in the store.
+    ///
+    /// Real Kubernetes clusters bootstrap this PriorityClass automatically; u7s
+    /// does not seed it as a stored object, so control-plane-critical pods that
+    /// reference it by name must not be rejected just because the store lookup
+    /// misses.
+    #[test]
+    fn resolves_system_cluster_critical_without_a_stored_object() {
+        let mut pod = serde_json::json!({
+            "spec": { "priorityClassName": "system-cluster-critical" }
+        });
+
+        resolve_pod_priority_class(&mut pod, None)
+            .expect("system-cluster-critical must always resolve, stored or not");
+
+        assert_eq!(
+            pod["spec"]["priority"], SYSTEM_CLUSTER_CRITICAL_VALUE,
+            "system-cluster-critical must resolve to its well-known value 2000000000"
+        );
+    }
+
+    /// system-node-critical must resolve to its fixed value even when no
+    /// PriorityClass object exists for it in the store.
+    #[test]
+    fn resolves_system_node_critical_without_a_stored_object() {
+        let mut pod = serde_json::json!({
+            "spec": { "priorityClassName": "system-node-critical" }
+        });
+
+        resolve_pod_priority_class(&mut pod, None)
+            .expect("system-node-critical must always resolve, stored or not");
+
+        assert_eq!(
+            pod["spec"]["priority"], SYSTEM_NODE_CRITICAL_VALUE,
+            "system-node-critical must resolve to its well-known value 2000001000"
+        );
+    }
+
+    /// A pod with no priorityClassName at all must be left with priority unset.
+    ///
+    /// Real kube-apiserver only runs priority resolution when priorityClassName
+    /// is present (globalDefault PriorityClass is a separate mechanism, not yet
+    /// implemented here). Without this guard a plain pod could have a priority
+    /// invented for it that no one asked for.
+    #[test]
+    fn leaves_priority_unset_when_no_priority_class_name() {
+        let mut pod = serde_json::json!({
+            "spec": { "containers": [{"name": "app", "image": "nginx"}] }
+        });
+
+        resolve_pod_priority_class(&mut pod, None).expect("a no-op must never error");
+
+        assert!(
+            pod["spec"]["priority"].is_null(),
+            "a pod that never asked for a PriorityClass must not have spec.priority \
+             invented for it"
+        );
+    }
+
+    /// A pod that already carries an explicit spec.priority must keep it, even
+    /// when priorityClassName also resolves to a different value.
+    ///
+    /// u7s currently lets a client set spec.priority directly and it survives the
+    /// wire round-trip (mayor-osuq); silently overwriting that value here would
+    /// break whichever caller relies on their explicit priority sticking.
+    #[test]
+    fn does_not_overwrite_an_explicit_client_set_priority() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "priorityClassName": "high",
+                "priority": 99
+            }
+        });
+        let stored_class = serde_json::json!({"value": 12345});
+
+        resolve_pod_priority_class(&mut pod, Some(&stored_class))
+            .expect("no-op path must not error");
+
+        assert_eq!(
+            pod["spec"]["priority"], 99,
+            "an explicit client-set spec.priority must not be clobbered by \
+             priorityClassName resolution"
+        );
+    }
+
+    /// When the PriorityClass sets preemptionPolicy and the pod didn't, the
+    /// policy must be copied onto the pod — matching upstream's admission plugin.
+    #[test]
+    fn copies_preemption_policy_from_priority_class_when_pod_has_none() {
+        let mut pod = serde_json::json!({
+            "spec": { "priorityClassName": "high" }
+        });
+        let stored_class = serde_json::json!({"value": 100, "preemptionPolicy": "Never"});
+
+        resolve_pod_priority_class(&mut pod, Some(&stored_class)).expect("resolution must succeed");
+
+        assert_eq!(
+            pod["spec"]["preemptionPolicy"], "Never",
+            "preemptionPolicy must be copied from the PriorityClass when the pod \
+             didn't set its own — otherwise a Never-preemption class silently \
+             behaves like the PreemptLowerPriority default"
+        );
+    }
+
+    /// An explicit pod-level preemptionPolicy must not be overwritten by the
+    /// PriorityClass's preemptionPolicy.
+    #[test]
+    fn does_not_overwrite_an_explicit_preemption_policy() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "priorityClassName": "high",
+                "preemptionPolicy": "PreemptLowerPriority"
+            }
+        });
+        let stored_class = serde_json::json!({"value": 100, "preemptionPolicy": "Never"});
+
+        resolve_pod_priority_class(&mut pod, Some(&stored_class)).expect("resolution must succeed");
+
+        assert_eq!(
+            pod["spec"]["preemptionPolicy"], "PreemptLowerPriority",
+            "an explicit pod-level preemptionPolicy must win over the PriorityClass's"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // compute_qos_class
 // ---------------------------------------------------------------------------
 
@@ -6461,6 +6762,185 @@ mod handler_tests {
         assert!(
             stored.is_none(),
             "rejected pod must not be persisted in the store"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // priorityClassName -> priority resolution (mayor-2u9x)
+    // -----------------------------------------------------------------------
+
+    /// Creating a pod with spec.priorityClassName referencing a stored PriorityClass
+    /// must result in the stored (and returned) pod having spec.priority set to
+    /// that class's value.
+    ///
+    /// The scheduler's preemption logic (crates/scheduler, mayor-rsei) reads
+    /// spec.priority off the pod watch stream. Before this fix the apiserver never
+    /// resolved priorityClassName at all, so every pod looked like priority 0 and
+    /// preemption could never fire. This test fails if the store lookup + resolve
+    /// step is removed from create_pod.
+    #[tokio::test]
+    async fn create_pod_resolves_priority_class_name_to_priority() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let pc = serde_json::json!({
+            "apiVersion": "scheduling.k8s.io/v1",
+            "kind": "PriorityClass",
+            "metadata": {"name": "high-priority"},
+            "value": 12345
+        });
+        store
+            .put(
+                "/registry/scheduling.k8s.io/priorityclasses/high-priority",
+                Bytes::from(serde_json::to_vec(&pc).unwrap()),
+                None,
+            )
+            .await
+            .expect("seed PriorityClass");
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pc-pod", "namespace": "default"},
+            "spec": {
+                "priorityClassName": "high-priority",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/pc-pod")
+            .await
+            .unwrap()
+            .expect("pod must be in store");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["spec"]["priority"], 12345,
+            "spec.priority must be resolved from the referenced PriorityClass's \
+             value — without this the scheduler can never preempt on this pod's \
+             priority"
+        );
+    }
+
+    /// Creating a pod with spec.priorityClassName that does not resolve to any
+    /// PriorityClass must be rejected with 403, matching the RuntimeClass
+    /// admission rejection pattern above.
+    ///
+    /// Without this, a pod with a typo'd (or deleted) priorityClassName would be
+    /// silently persisted at priority 0 instead of failing loudly — masking the
+    /// mistake from the user submitting it.
+    #[tokio::test]
+    async fn create_pod_missing_priority_class_returns_403() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        // Deliberately do NOT seed any PriorityClass for "missing-pc".
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pc-missing-pod", "namespace": "default"},
+            "spec": {
+                "priorityClassName": "missing-pc",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "pod referencing a non-existent PriorityClass must be rejected 403 — \
+             otherwise it is silently persisted at priority 0, hiding the mistake"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/pc-missing-pod")
+            .await
+            .unwrap();
+        assert!(
+            stored.is_none(),
+            "rejected pod must not be persisted in the store"
+        );
+    }
+
+    /// system-cluster-critical must resolve to its well-known priority even though
+    /// u7s does not seed it as a stored PriorityClass object.
+    ///
+    /// Real clusters bootstrap this PriorityClass automatically; control-plane
+    /// pods that reference it by name (e.g. via a static manifest) must not be
+    /// rejected just because u7s has no stored object under that name.
+    #[tokio::test]
+    async fn create_pod_resolves_system_cluster_critical_without_seeded_object() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+        // Deliberately do NOT seed a PriorityClass named "system-cluster-critical".
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "critical-pod", "namespace": "default"},
+            "spec": {
+                "priorityClassName": "system-cluster-critical",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "system-cluster-critical must resolve and succeed even without a \
+             seeded PriorityClass object"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/critical-pod")
+            .await
+            .unwrap()
+            .expect("pod must be in store");
+        let stored_v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_v["spec"]["priority"], 2_000_000_000,
+            "system-cluster-critical must resolve to its well-known value 2000000000"
         );
     }
 
