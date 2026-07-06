@@ -165,6 +165,16 @@ fn known_top_level_fields(group: &str, plural: &str) -> &'static [&'static str] 
         ("apps", "controllerrevisions") => &["apiVersion", "kind", "metadata", "data", "revision"],
         // Lease
         ("coordination.k8s.io", "leases") => &["apiVersion", "kind", "metadata", "spec"],
+        // ValidatingWebhookConfiguration / MutatingWebhookConfiguration — top-level field is
+        // "webhooks", not spec/status. Without these entries, fieldValidation=Strict (kubectl's
+        // default) rejects every valid webhook config with 422 "unknown field \"webhooks\"",
+        // breaking `kubectl apply` of webhook configs.
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations") => {
+            &["apiVersion", "kind", "metadata", "webhooks"]
+        }
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations") => {
+            &["apiVersion", "kind", "metadata", "webhooks"]
+        }
         // EndpointSlice — top-level fields are not spec/status but addressType/endpoints/ports.
         // Without this entry, fieldValidation=Strict rejects valid EndpointSlice bodies with
         // 422 "unknown field" for addressType, endpoints, and ports.
@@ -851,6 +861,114 @@ mod tests {
         assert_eq!(mf[0]["operation"], "Apply");
         assert_eq!(mf[0]["apiVersion"], "apps/v1");
         assert_eq!(mf[0]["time"], "2026-05-23T00:00:00Z");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Webhook configuration field validation — regression for mayor-i5x4
+    // ---------------------------------------------------------------------------
+
+    /// ValidatingWebhookConfiguration and MutatingWebhookConfiguration top-level field
+    /// `webhooks` must not be reported as unknown by detect_unknown_fields.
+    ///
+    /// Both types use a non-standard schema: `webhooks` sits directly at the top level
+    /// instead of under `spec`. Before this fix, `known_top_level_fields` had no entry
+    /// for either type, so both fell through to the default `[apiVersion, kind, metadata,
+    /// spec, status]` set, and `webhooks` was flagged as unknown — rejecting every valid
+    /// webhook config under fieldValidation=Strict.
+    #[test]
+    fn webhook_configuration_webhooks_field_is_not_unknown() {
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": { "name": "my-vwc" },
+            "webhooks": []
+        });
+        let unknown = detect_unknown_fields(
+            &vwc,
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations",
+        );
+        assert!(
+            unknown.is_empty(),
+            "ValidatingWebhookConfiguration's webhooks field must not be flagged as unknown — \
+             before the fix, fieldValidation=Strict returned 422 for every valid \
+             ValidatingWebhookConfiguration, blocking kubectl apply. Got unknown: {:?}",
+            unknown
+        );
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": { "name": "my-mwc" },
+            "webhooks": []
+        });
+        let unknown = detect_unknown_fields(
+            &mwc,
+            "admissionregistration.k8s.io",
+            "mutatingwebhookconfigurations",
+        );
+        assert!(
+            unknown.is_empty(),
+            "MutatingWebhookConfiguration's webhooks field must not be flagged as unknown — \
+             before the fix, fieldValidation=Strict returned 422 for every valid \
+             MutatingWebhookConfiguration, blocking kubectl apply. Got unknown: {:?}",
+            unknown
+        );
+    }
+
+    /// apply_field_validation with Strict mode must accept a ValidatingWebhookConfiguration
+    /// or MutatingWebhookConfiguration body whose only resource-specific field is `webhooks`.
+    ///
+    /// This is the end-to-end regression for mayor-i5x4: `kubectl apply` sends
+    /// `?fieldValidation=Strict` by default, so a false "unknown field" positive here means
+    /// every webhook config POST is rejected with 422, and the 8 [sig-api-machinery]
+    /// AdmissionWebhook conformance tests fail during setup because they can't register
+    /// their webhook configuration.
+    #[test]
+    fn strict_validation_accepts_webhooks_field_else_kubectl_apply_of_webhook_configs_fails_422() {
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": { "name": "my-vwc" },
+            "webhooks": [{"name": "example.com"}]
+        });
+        let raw = serde_json::to_vec(&vwc).unwrap();
+        let result = apply_field_validation(
+            &vwc,
+            &raw,
+            Some("Strict"),
+            "admissionregistration.k8s.io",
+            "validatingwebhookconfigurations",
+        );
+        assert!(
+            result.is_ok(),
+            "ValidatingWebhookConfiguration with a webhooks array must pass Strict validation — \
+             before the fix this returned Err(422), which is exactly the 'strict decoding error: \
+             unknown field \"webhooks\"' seen live against the running server. Error: {:?}",
+            result.err()
+        );
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": { "name": "my-mwc" },
+            "webhooks": [{"name": "example.com"}]
+        });
+        let raw = serde_json::to_vec(&mwc).unwrap();
+        let result = apply_field_validation(
+            &mwc,
+            &raw,
+            Some("Strict"),
+            "admissionregistration.k8s.io",
+            "mutatingwebhookconfigurations",
+        );
+        assert!(
+            result.is_ok(),
+            "MutatingWebhookConfiguration with a webhooks array must pass Strict validation — \
+             before the fix this returned Err(422), blocking kubectl apply of every mutating \
+             webhook config. Error: {:?}",
+            result.err()
+        );
     }
 
     // ---------------------------------------------------------------------------
