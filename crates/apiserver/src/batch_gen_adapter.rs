@@ -173,6 +173,16 @@ pub fn decode_job_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                             cond["message"] = msg.clone().into();
                         }
                     }
+                    if let Some(t) = c.last_probe_time.as_ref() {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cond["lastProbeTime"] = crate::util::secs_to_rfc3339(secs).into();
+                        }
+                    }
+                    if let Some(t) = c.last_transition_time.as_ref() {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cond["lastTransitionTime"] = crate::util::secs_to_rfc3339(secs).into();
+                        }
+                    }
                     cond
                 })
                 .collect();
@@ -467,6 +477,53 @@ mod tests {
             serde_json::Value::String(String::new()),
             "condition.status must be \"\" not null — controllers doing string comparison \
              (status == \"True\") panic or skip conditions with null status"
+        );
+    }
+
+    /// decode_job_proto_gen must preserve JobCondition.lastTransitionTime and lastProbeTime.
+    ///
+    /// Controllers and `kubectl get job` order status changes by LastTransitionTime; if it is
+    /// dropped, every Job condition looks un-transitioned (zero-valued), which breaks
+    /// "should apply changes to a job status" conformance and any client waiting on the
+    /// transition timestamp to detect a state change.
+    #[test]
+    fn decode_job_proto_gen_preserves_condition_last_transition_and_probe_time() {
+        let job = batch_v1::Job {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("timed-job".to_string()),
+                ..Default::default()
+            }),
+            status: Some(batch_v1::JobStatus {
+                conditions: vec![batch_v1::JobCondition {
+                    r#type: Some("Complete".to_string()),
+                    status: Some("True".to_string()),
+                    last_probe_time: Some(meta_v1::Time {
+                        seconds: Some(1_704_067_200),
+                        nanos: Some(0),
+                    }),
+                    last_transition_time: Some(meta_v1::Time {
+                        seconds: Some(1_704_067_215),
+                        nanos: Some(0),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        job.encode(&mut buf).unwrap();
+        let result = decode_job_proto_gen(&buf).expect("Job must decode");
+        let cond = &result["status"]["conditions"][0];
+
+        assert_eq!(
+            cond["lastTransitionTime"], "2024-01-01T00:00:15Z",
+            "lastTransitionTime must survive decode; before the fix this field was never mapped \
+             and the condition would look un-transitioned (0001-01-01) to every client"
+        );
+        assert_eq!(
+            cond["lastProbeTime"], "2024-01-01T00:00:00Z",
+            "lastProbeTime must survive decode; before the fix this field was silently dropped"
         );
     }
 }
