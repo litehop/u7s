@@ -2998,7 +2998,12 @@ pub(crate) async fn write_vap_status<S: Store>(
     }
 }
 
-fn inject_type_meta(body: &mut serde_json::Value, group: &str, version: &str, kind: &str) {
+pub(crate) fn inject_type_meta(
+    body: &mut serde_json::Value,
+    group: &str,
+    version: &str,
+    kind: &str,
+) {
     let api_version = if group.is_empty() {
         version.to_string()
     } else {

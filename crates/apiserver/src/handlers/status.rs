@@ -17,7 +17,7 @@ use crate::{
 
 use super::generic::{lookup, store_err, validate_name};
 use super::json_patch::{apply_json_patch, detect_patch_type, PatchType};
-use super::resource::{get_namespaced_resource, get_resource};
+use super::resource::{get_namespaced_resource, get_resource, inject_type_meta};
 
 /// Merge incoming metadata onto the current object's metadata, preserving fields that
 /// must never change via a status subresource write.
@@ -119,6 +119,7 @@ pub async fn put_resource_status<S: Store>(
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
     current.set_resource_version(new_rv);
+    inject_type_meta(&mut current.body, &group, &version, &meta.kind);
     Ok(Json(current.body))
 }
 
@@ -181,6 +182,7 @@ pub async fn patch_resource_status<S: Store>(
         .map_err(|e| store_err(e, &name, &meta.kind))?;
 
     current.set_resource_version(new_rv);
+    inject_type_meta(&mut current.body, &group, &version, &meta.kind);
     Ok(Json(current.body))
 }
 
@@ -254,6 +256,7 @@ pub async fn put_namespaced_resource_status<S: Store>(
         .map_err(|e| store_err(e, &name, &kind))?;
 
     current.set_resource_version(new_rv);
+    inject_type_meta(&mut current.body, &group, &version, &kind);
     Ok(Json(current.body))
 }
 
@@ -267,11 +270,17 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     validate_name("name", &name)?;
     let patch_type = detect_patch_type(&headers)?;
 
-    let key = match lookup(&state, &group, &version, &plural) {
-        Ok(_) => group_object_key(&group, &plural, Some(&ns), &name),
+    let (key, kind_fallback) = match lookup(&state, &group, &version, &plural) {
+        Ok(meta) => (
+            group_object_key(&group, &plural, Some(&ns), &name),
+            meta.kind.clone(),
+        ),
         Err(_) => {
             // CR fallback: CRs are stored under /registry/cr/<group>/<version>/<plural>/<ns>/<name>
-            format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}")
+            (
+                format!("/registry/cr/{group}/{version}/{plural}/{ns}/{name}"),
+                plural.clone(),
+            )
         }
     };
 
@@ -288,7 +297,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
     let kind = current.body["kind"]
         .as_str()
         .map(str::to_owned)
-        .unwrap_or_else(|| plural.clone());
+        .unwrap_or(kind_fallback);
 
     let patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
@@ -328,6 +337,7 @@ pub async fn patch_namespaced_resource_status<S: Store>(
         .map_err(|e| store_err(e, &name, &kind))?;
 
     current.set_resource_version(new_rv);
+    inject_type_meta(&mut current.body, &group, &version, &kind);
     Ok(Json(current.body))
 }
 
@@ -3561,6 +3571,109 @@ mod tests {
             result.is_ok(),
             "PATCH namespaced /status without metadata.resourceVersion must succeed — \
              the PATCH CAS fix must not break controllers that omit the resourceVersion"
+        );
+    }
+
+    /// PUT and PATCH on /status must stamp kind/apiVersion on the response even when the
+    /// request body (and the stored object) omit them.
+    ///
+    /// UpdateStatus() in typed and dynamic clients decodes the response body and requires
+    /// TypeMeta to resolve the object's Go type; without kind/apiVersion the client returns
+    /// "Object 'Kind' is missing", which is exactly what breaks the
+    /// '[sig-apps] Deployment should run the lifecycle of a Deployment' conformance test
+    /// (it calls UpdateStatus on the Deployment after mutating replicas).
+    ///
+    /// This test fails if the inject_type_meta call is removed from either status handler.
+    #[tokio::test]
+    async fn status_put_and_patch_responses_always_include_type_meta() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Stored object omits kind/apiVersion, simulating a client that never set TypeMeta.
+        let deploy_without_type_meta = serde_json::json!({
+            "metadata": { "name": "notm-deploy", "namespace": "default", "resourceVersion": "1" },
+            "spec": { "replicas": 1 }
+        });
+        let key = "/registry/apps/deployments/default/notm-deploy";
+        store
+            .put(
+                key,
+                bytes::Bytes::from(serde_json::to_vec(&deploy_without_type_meta).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // PUT body also omits kind/apiVersion — the server must stamp TypeMeta regardless.
+        let put_body = serde_json::json!({
+            "metadata": { "name": "notm-deploy", "namespace": "default" },
+            "status": { "readyReplicas": 1 }
+        });
+        let put_result = put_namespaced_resource_status(
+            axum::extract::State(state.clone()),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "notm-deploy".into(),
+            )),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&put_body).unwrap()),
+        )
+        .await
+        .expect("PUT /status must succeed")
+        .into_response();
+        let put_body_bytes = to_bytes(put_result.into_body(), usize::MAX).await.unwrap();
+        let put_json: serde_json::Value = serde_json::from_slice(&put_body_bytes).unwrap();
+        assert_eq!(
+            put_json["kind"], "Deployment",
+            "PUT /status response must include kind even when the request and stored body omit it; \
+             UpdateStatus() clients reject responses missing TypeMeta"
+        );
+        assert_eq!(
+            put_json["apiVersion"], "apps/v1",
+            "PUT /status response must include apiVersion even when the request and stored body omit it"
+        );
+
+        // PATCH body also omits kind/apiVersion.
+        let patch = serde_json::json!({"status": {"readyReplicas": 2}});
+        let patch_result = patch_namespaced_resource_status(
+            axum::extract::State(state),
+            axum::extract::Path((
+                "apps".into(),
+                "v1".into(),
+                "default".into(),
+                "deployments".into(),
+                "notm-deploy".into(),
+            )),
+            merge_patch_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&patch).unwrap()),
+        )
+        .await
+        .expect("PATCH /status must succeed")
+        .into_response();
+        let patch_body_bytes = to_bytes(patch_result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let patch_json: serde_json::Value = serde_json::from_slice(&patch_body_bytes).unwrap();
+        assert_eq!(
+            patch_json["kind"], "Deployment",
+            "PATCH /status response must include kind even when the request and stored body omit it; \
+             UpdateStatus() clients reject responses missing TypeMeta"
+        );
+        assert_eq!(
+            patch_json["apiVersion"], "apps/v1",
+            "PATCH /status response must include apiVersion even when the request and stored body omit it"
         );
     }
 }
