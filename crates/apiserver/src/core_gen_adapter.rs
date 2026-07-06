@@ -982,6 +982,47 @@ pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             obj["spec"] = serde_json::json!({ "finalizers": fins });
         }
     }
+    // Status must round-trip through protobuf too: KCM's namespace controller and
+    // typed-client e2e tests GET a namespace (protobuf-encoded), mutate status, then
+    // PUT it back to /status. put_namespace_status wholesale-replaces stored status
+    // with whatever this decoder returns — before this fix that was nothing, so a
+    // protobuf-encoded UpdateStatus silently wiped status.phase and status.conditions.
+    if let Some(status) = ns.status {
+        let mut status_map = serde_json::Map::new();
+        if let Some(phase) = status.phase.filter(|s| !s.is_empty()) {
+            status_map.insert("phase".to_string(), serde_json::Value::String(phase));
+        }
+        if !status.conditions.is_empty() {
+            let conds: Vec<serde_json::Value> = status
+                .conditions
+                .into_iter()
+                .map(|c| {
+                    let mut cm = serde_json::json!({
+                        "type": c.r#type.unwrap_or_default(),
+                        "status": c.status.unwrap_or_default(),
+                    });
+                    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                        cm["reason"] = v.into();
+                    }
+                    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                        cm["message"] = v.into();
+                    }
+                    if let Some(t) = c.last_transition_time {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cm["lastTransitionTime"] = serde_json::Value::String(
+                                crate::util::secs_to_rfc3339(secs as u64),
+                            );
+                        }
+                    }
+                    cm
+                })
+                .collect();
+            status_map.insert("conditions".to_string(), serde_json::Value::Array(conds));
+        }
+        if !status_map.is_empty() {
+            obj["status"] = serde_json::Value::Object(status_map);
+        }
+    }
     Some(obj)
 }
 
@@ -1932,5 +1973,50 @@ mod tests {
         assert_eq!(containers.len(), 1);
         assert_eq!(containers[0]["name"], "web");
         assert_eq!(containers[0]["image"], "nginx:latest");
+    }
+
+    /// Namespace status.phase and status.conditions must survive proto decode.
+    ///
+    /// Before this fix, decode_namespace_proto_gen never read `ns.status` at all, so any
+    /// protobuf-encoded Namespace object (e.g. a status subresource PUT/PATCH from a
+    /// protobuf-content-type client) silently lost its entire status — put_namespace_status
+    /// wholesale-replaces stored status with whatever this decoder returns, so a
+    /// protobuf-encoded UpdateStatus call would wipe status.phase, corrupting the object
+    /// the KCM namespace controller and e2e clients rely on to detect Terminating vs Active.
+    #[test]
+    fn namespace_status_put_preserves_phase_else_conformance_apply_status_test_panics() {
+        let ns = core_v1::Namespace {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-ns".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(core_v1::NamespaceStatus {
+                phase: Some("Active".to_string()),
+                conditions: vec![core_v1::NamespaceCondition {
+                    r#type: Some("StatusUpdate".to_string()),
+                    status: Some("True".to_string()),
+                    reason: Some("E2E".to_string()),
+                    message: Some("Updated by an e2e test".to_string()),
+                    ..Default::default()
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        ns.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_namespace_proto_gen(&buf).expect("Namespace with status must decode");
+
+        assert_eq!(
+            result["status"]["phase"], "Active",
+            "status.phase must survive proto decode — without it, a protobuf-encoded \
+             UpdateStatus silently drops phase, and the e2e client's next GET .../status \
+             assertion on Status.Phase fails"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "StatusUpdate",
+            "status.conditions must survive proto decode alongside phase — losing either \
+             one corrupts the status object KCM and e2e clients round-trip through PUT /status"
+        );
     }
 }

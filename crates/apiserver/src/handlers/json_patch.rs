@@ -181,6 +181,37 @@ fn known_top_level_fields(group: &str, plural: &str) -> &'static [&'static str] 
     }
 }
 
+/// Known `spec` fields for resource types with nested field validation enabled.
+///
+/// `known_top_level_fields` treats `spec` as an opaque known key — it does not look
+/// inside it. That means a body like `{"spec": {"unknownField": ...}}` passes
+/// unknown-field detection even though `unknownField` is not part of the resource's
+/// schema. Most resource types return `None` here (nested spec validation is not
+/// implemented for them) so they keep the pre-existing top-level-only behaviour;
+/// only types actually exercised by fieldValidation=Strict conformance tests are
+/// covered, to avoid false positives from an incomplete schema guess.
+fn known_spec_fields(group: &str, plural: &str) -> Option<&'static [&'static str]> {
+    match (group, plural) {
+        // Deployment — matches k8s.io/api/apps/v1 DeploymentSpec exactly (8 fields).
+        // Conformance test "should detect unknown and duplicate fields of a typed
+        // object" POSTs a Deployment with `spec.unknownField` and
+        // `?fieldValidation=Strict`, expecting 422. Before this table, u7s accepted
+        // the request (HTTP success), and the Go test client panicked calling
+        // `.Error()` on the nil error it expected instead.
+        ("apps", "deployments") => Some(&[
+            "replicas",
+            "selector",
+            "template",
+            "strategy",
+            "minReadySeconds",
+            "revisionHistoryLimit",
+            "paused",
+            "progressDeadlineSeconds",
+        ]),
+        _ => None,
+    }
+}
+
 /// Known fields within `metadata` for any Kubernetes object.
 ///
 /// This matches the full `ObjectMeta` schema from the Kubernetes API.
@@ -229,6 +260,19 @@ pub(crate) fn detect_unknown_fields(
             for key in meta.keys() {
                 if !KNOWN_METADATA_FIELDS.contains(&key.as_str()) {
                     unknown.push(format!("metadata.{key}"));
+                }
+            }
+        }
+
+        // Check nested spec fields for resource types with a known spec schema.
+        // Types not covered by known_spec_fields return None and are unaffected —
+        // see known_spec_fields for why most types are intentionally excluded.
+        if let Some(known_spec) = known_spec_fields(group, plural) {
+            if let Some(spec) = obj.get("spec").and_then(|s| s.as_object()) {
+                for key in spec.keys() {
+                    if !known_spec.contains(&key.as_str()) {
+                        unknown.push(format!("spec.{key}"));
+                    }
                 }
             }
         }
@@ -757,5 +801,98 @@ mod tests {
              422 blocking all EndpointSlice conformance tests. Error: {:?}",
             result.err()
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Nested spec field validation — regression for mayor-ftkl (PANIC 2)
+    // ---------------------------------------------------------------------------
+
+    /// detect_unknown_fields must recurse into `spec` for resource types with a known
+    /// spec schema (e.g. Deployment), not just check top-level/metadata keys.
+    ///
+    /// Before this fix, `known_top_level_fields` treated `spec` as an opaque known
+    /// key and never looked inside it, so `spec.unknownField` was silently accepted —
+    /// this is exactly the body the upstream FieldValidation conformance test
+    /// ("should detect unknown and duplicate fields of a typed object") POSTs.
+    #[test]
+    fn detect_unknown_fields_recurses_into_deployment_spec() {
+        let body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "my-dep", "labels": { "app": "nginx" } },
+            "spec": {
+                "unknownField": "foo",
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "nginx" } },
+                "template": {
+                    "metadata": { "labels": { "app": "nginx" } },
+                    "spec": { "containers": [{ "name": "nginx", "image": "nginx:latest" }] }
+                }
+            }
+        });
+
+        let unknown = detect_unknown_fields(&body, "apps", "deployments");
+
+        assert!(
+            unknown.contains(&"spec.unknownField".to_string()),
+            "spec.unknownField must be detected as unknown for Deployment — \
+             before the fix, detect_unknown_fields only checked top-level and metadata \
+             keys, so any bogus field nested under spec was silently accepted. Got: {:?}",
+            unknown
+        );
+        // Known spec fields (replicas, selector, template) must not be flagged.
+        assert!(
+            !unknown.iter().any(|f| f.starts_with("spec.replicas")
+                || f.starts_with("spec.selector")
+                || f.starts_with("spec.template")),
+            "known Deployment spec fields must not be flagged as unknown — a false \
+             positive here would reject every valid Deployment under fieldValidation=Strict. \
+             Got: {:?}",
+            unknown
+        );
+    }
+
+    /// POST with `?fieldValidation=Strict` and an unknown field nested under
+    /// `spec.unknownField` on a Deployment must return Err(422), not Ok.
+    ///
+    /// This is the exact scenario from the upstream FieldValidation conformance test:
+    /// before the fix, u7s returned Ok (HTTP success) because unknown-field detection
+    /// never looked inside `spec`; the Go e2e client then panicked calling `.Error()`
+    /// on the nil error it expected instead of a 422.
+    #[test]
+    fn apply_field_validation_strict_rejects_unknown_deployment_spec_field_else_conformance_test_panics_on_nil_error(
+    ) {
+        let body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "my-dep", "labels": { "app": "nginx" } },
+            "spec": {
+                "unknownField": "foo",
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "nginx" } },
+                "template": {
+                    "metadata": { "labels": { "app": "nginx" } },
+                    "spec": { "containers": [{ "name": "nginx", "image": "nginx:latest" }] }
+                }
+            }
+        });
+
+        let result = apply_field_validation(&body, Some("Strict"), "apps", "deployments");
+
+        match result {
+            Err(e) => {
+                assert!(
+                    e.1.message.contains("spec.unknownField"),
+                    "422 error message must name the unknown field so kubectl users can \
+                     find the typo; got: {}",
+                    e.1.message
+                );
+            }
+            Ok(_) => panic!(
+                "fieldValidation=Strict must reject a Deployment with spec.unknownField; \
+                 the conformance test client panics calling .Error() on the nil error it \
+                 gets instead of the expected 422"
+            ),
+        }
     }
 }
