@@ -654,12 +654,68 @@ pub fn decode_crd_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         spec_m.insert("conversion".to_string(), serde_json::Value::Object(cm));
     }
 
-    Some(serde_json::json!({
+    let mut obj = serde_json::json!({
         "apiVersion": "apiextensions.k8s.io/v1",
         "kind": "CustomResourceDefinition",
         "metadata": meta,
         "spec": serde_json::Value::Object(spec_m)
-    }))
+    });
+
+    // status carries Established/NamesAccepted conditions (and acceptedNames,
+    // storedVersions). Without decoding it, a protobuf status subresource PUT/PATCH
+    // (the typed clientset's default content type for this built-in-shaped resource)
+    // silently drops the client's status entirely — the status subresource conformance
+    // test then reads back an empty conditions list.
+    if let Some(status) = crd.status {
+        let mut status_m = serde_json::Map::new();
+        if !status.conditions.is_empty() {
+            let conds: Vec<serde_json::Value> = status
+                .conditions
+                .into_iter()
+                .map(|c| {
+                    let mut cm = serde_json::json!({
+                        "type": c.r#type.unwrap_or_default(),
+                        "status": c.status.unwrap_or_default(),
+                    });
+                    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                        cm["reason"] = v.into();
+                    }
+                    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                        cm["message"] = v.into();
+                    }
+                    if let Some(t) = c.last_transition_time {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cm["lastTransitionTime"] = serde_json::Value::String(
+                                crate::util::secs_to_rfc3339(secs as u64),
+                            );
+                        }
+                    }
+                    cm
+                })
+                .collect();
+            status_m.insert("conditions".to_string(), serde_json::Value::Array(conds));
+        }
+        if let Some(names) = status.accepted_names {
+            status_m.insert("acceptedNames".to_string(), gen_crd_names_to_json(names));
+        }
+        if !status.stored_versions.is_empty() {
+            status_m.insert(
+                "storedVersions".to_string(),
+                serde_json::Value::Array(
+                    status
+                        .stored_versions
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        if !status_m.is_empty() {
+            obj["status"] = serde_json::Value::Object(status_m);
+        }
+    }
+
+    Some(obj)
 }
 
 pub fn decode_delete_options_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
