@@ -253,9 +253,10 @@ pub async fn create_resource<S: Store>(
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    // Field validation: detect unknown fields per ?fieldValidation= query param.
+    // Field validation: detect unknown/duplicate fields per ?fieldValidation= query param.
     let warn_header = apply_field_validation(
         &obj.body,
+        &body,
         create_query.field_validation.as_deref(),
         &group,
         &plural,
@@ -1166,9 +1167,10 @@ pub async fn create_namespaced_resource<S: Store>(
     let mut obj =
         Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
 
-    // Field validation: detect unknown fields per ?fieldValidation= query param.
+    // Field validation: detect unknown/duplicate fields per ?fieldValidation= query param.
     let warn_header = apply_field_validation(
         &obj.body,
+        &body,
         create_query.field_validation.as_deref(),
         &group,
         &plural,

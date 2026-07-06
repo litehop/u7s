@@ -982,6 +982,52 @@ pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             obj["spec"] = serde_json::json!({ "finalizers": fins });
         }
     }
+    // (mayor-oww6) This decoder never read `ns.status` at all, so any protobuf-encoded
+    // Namespace write (Content-Type: application/vnd.kubernetes.protobuf) silently lost
+    // status.phase and status.conditions together — put_namespace_status wholesale-
+    // replaces stored status with whatever this decoder returns, which was nothing.
+    // This is a real, standalone proto-decode gap, NOT the mayor-ftkl "should apply
+    // changes to a namespace status" conformance panic: that test's client (and this
+    // stack's kube-controller-manager, started with --kube-api-content-type=
+    // application/json) uses plain JSON, which was never affected — verified live that
+    // a JSON GET/PATCH/GET/PUT round trip already preserves status.phase without this
+    // fix. Kept because it's a correctness bug for any protobuf-content-type client.
+    if let Some(status) = ns.status {
+        let mut status_map = serde_json::Map::new();
+        if let Some(phase) = status.phase.filter(|s| !s.is_empty()) {
+            status_map.insert("phase".to_string(), serde_json::Value::String(phase));
+        }
+        if !status.conditions.is_empty() {
+            let conds: Vec<serde_json::Value> = status
+                .conditions
+                .into_iter()
+                .map(|c| {
+                    let mut cm = serde_json::json!({
+                        "type": c.r#type.unwrap_or_default(),
+                        "status": c.status.unwrap_or_default(),
+                    });
+                    if let Some(v) = c.reason.filter(|s| !s.is_empty()) {
+                        cm["reason"] = v.into();
+                    }
+                    if let Some(v) = c.message.filter(|s| !s.is_empty()) {
+                        cm["message"] = v.into();
+                    }
+                    if let Some(t) = c.last_transition_time {
+                        if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                            cm["lastTransitionTime"] = serde_json::Value::String(
+                                crate::util::secs_to_rfc3339(secs as u64),
+                            );
+                        }
+                    }
+                    cm
+                })
+                .collect();
+            status_map.insert("conditions".to_string(), serde_json::Value::Array(conds));
+        }
+        if !status_map.is_empty() {
+            obj["status"] = serde_json::Value::Object(status_map);
+        }
+    }
     Some(obj)
 }
 
@@ -1932,5 +1978,54 @@ mod tests {
         assert_eq!(containers.len(), 1);
         assert_eq!(containers[0]["name"], "web");
         assert_eq!(containers[0]["image"], "nginx:latest");
+    }
+
+    /// Namespace status.phase and status.conditions must survive proto decode (mayor-oww6).
+    ///
+    /// Before this fix, decode_namespace_proto_gen never read `ns.status` at all, so any
+    /// protobuf-encoded Namespace write (Content-Type: application/vnd.kubernetes.protobuf)
+    /// silently lost its entire status — put_namespace_status wholesale-replaces stored
+    /// status with whatever this decoder returns, which was nothing. This is a standalone
+    /// proto-decode correctness bug for protobuf-content-type clients; it is NOT the
+    /// mayor-ftkl "should apply changes to a namespace status" conformance panic — that
+    /// test's client, and this stack's kube-controller-manager (started with
+    /// --kube-api-content-type=application/json), use plain JSON, which was never affected
+    /// (verified live: a JSON GET/PATCH/GET/PUT round trip already preserves status.phase).
+    #[test]
+    fn namespace_status_proto_decode_preserves_phase_and_conditions() {
+        let ns = core_v1::Namespace {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-ns".to_string()),
+                ..Default::default()
+            }),
+            spec: None,
+            status: Some(core_v1::NamespaceStatus {
+                phase: Some("Active".to_string()),
+                conditions: vec![core_v1::NamespaceCondition {
+                    r#type: Some("StatusUpdate".to_string()),
+                    status: Some("True".to_string()),
+                    reason: Some("E2E".to_string()),
+                    message: Some("Updated by an e2e test".to_string()),
+                    ..Default::default()
+                }],
+            }),
+        };
+        let mut buf = Vec::new();
+        ns.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_namespace_proto_gen(&buf).expect("Namespace with status must decode");
+
+        assert_eq!(
+            result["status"]["phase"], "Active",
+            "status.phase must survive proto decode — without it, any protobuf-content-type \
+             client's status write (e.g. a kube-controller-manager run without the JSON \
+             content-type override) silently drops phase from the stored Namespace"
+        );
+        assert_eq!(
+            result["status"]["conditions"][0]["type"], "StatusUpdate",
+            "status.conditions must survive proto decode alongside phase — losing either \
+             one corrupts the status object for any protobuf-content-type client's \
+             GET-modify-PUT round trip through /status"
+        );
     }
 }

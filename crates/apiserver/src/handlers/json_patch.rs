@@ -181,6 +181,37 @@ fn known_top_level_fields(group: &str, plural: &str) -> &'static [&'static str] 
     }
 }
 
+/// Known `spec` fields for resource types with nested field validation enabled.
+///
+/// `known_top_level_fields` treats `spec` as an opaque known key — it does not look
+/// inside it. That means a body like `{"spec": {"unknownField": ...}}` passes
+/// unknown-field detection even though `unknownField` is not part of the resource's
+/// schema. Most resource types return `None` here (nested spec validation is not
+/// implemented for them) so they keep the pre-existing top-level-only behaviour;
+/// only types actually exercised by fieldValidation=Strict conformance tests are
+/// covered, to avoid false positives from an incomplete schema guess.
+fn known_spec_fields(group: &str, plural: &str) -> Option<&'static [&'static str]> {
+    match (group, plural) {
+        // Deployment — matches k8s.io/api/apps/v1 DeploymentSpec exactly (8 fields).
+        // Conformance test "should detect unknown and duplicate fields of a typed
+        // object" POSTs a Deployment with `spec.unknownField` and
+        // `?fieldValidation=Strict`, expecting 422. Before this table, u7s accepted
+        // the request (HTTP success), and the Go test client panicked calling
+        // `.Error()` on the nil error it expected instead.
+        ("apps", "deployments") => Some(&[
+            "replicas",
+            "selector",
+            "template",
+            "strategy",
+            "minReadySeconds",
+            "revisionHistoryLimit",
+            "paused",
+            "progressDeadlineSeconds",
+        ]),
+        _ => None,
+    }
+}
+
 /// Known fields within `metadata` for any Kubernetes object.
 ///
 /// This matches the full `ObjectMeta` schema from the Kubernetes API.
@@ -204,6 +235,137 @@ const KNOWN_METADATA_FIELDS: &[&str] = &[
     "managedFields",
     "clusterName",
 ];
+
+// ---------------------------------------------------------------------------
+// Duplicate-key detection — needs the raw bytes, not the parsed Value
+// ---------------------------------------------------------------------------
+
+/// A JSON value that preserves ALL object keys, including duplicates, in
+/// encounter order.
+///
+/// `serde_json::Value` silently keeps only the last occurrence of a repeated
+/// object key while parsing — by the time a handler has a parsed `Value`, the
+/// fact that a key was ever duplicated is gone. Detecting duplicates requires
+/// re-deserializing the raw bytes into a shape that doesn't collapse them.
+/// Leaf scalars and array elements are not preserved: this type only needs to
+/// reconstruct enough structure to find duplicate keys, not to read values —
+/// arrays are consumed (so nested objects inside them still parse correctly)
+/// but their elements are discarded rather than kept.
+enum DupCheckValue {
+    Leaf,
+    Array,
+    Object(Vec<(String, DupCheckValue)>),
+}
+
+impl<'de> serde::de::Deserialize<'de> for DupCheckValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        struct DupCheckVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DupCheckVisitor {
+            type Value = DupCheckValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E> {
+                Ok(DupCheckValue::Leaf)
+            }
+            fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E> {
+                Ok(DupCheckValue::Leaf)
+            }
+            fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E> {
+                Ok(DupCheckValue::Leaf)
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E> {
+                Ok(DupCheckValue::Leaf)
+            }
+            fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E> {
+                Ok(DupCheckValue::Leaf)
+            }
+            fn visit_string<E>(self, _v: String) -> Result<Self::Value, E> {
+                Ok(DupCheckValue::Leaf)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(DupCheckValue::Leaf)
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(DupCheckValue::Leaf)
+            }
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::de::Deserializer<'de>,
+            {
+                serde::de::Deserialize::deserialize(deserializer)
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                // Consume (and discard) every element so the deserializer advances
+                // correctly past the array; contents aren't needed for key-duplicate
+                // detection, which only looks at "spec"'s immediate object keys.
+                while seq.next_element::<DupCheckValue>()?.is_some() {}
+                Ok(DupCheckValue::Array)
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some((k, v)) = map.next_entry::<String, DupCheckValue>()? {
+                    entries.push((k, v));
+                }
+                Ok(DupCheckValue::Object(entries))
+            }
+        }
+
+        deserializer.deserialize_any(DupCheckVisitor)
+    }
+}
+
+/// Return keys that appear more than once in `entries`, each reported once,
+/// in the order their second occurrence appears.
+fn repeated_keys(entries: &[(String, DupCheckValue)]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut reported = std::collections::HashSet::new();
+    let mut duplicates = Vec::new();
+    for (key, _) in entries {
+        if !seen.insert(key.as_str()) && reported.insert(key.as_str()) {
+            duplicates.push(key.clone());
+        }
+    }
+    duplicates
+}
+
+/// Detect duplicate object keys within `spec`, by re-parsing the raw request
+/// bytes into a structure that preserves repeated keys (see `DupCheckValue`).
+///
+/// Scoped to resource types with a known spec schema (see `known_spec_fields`)
+/// to match exactly what the FieldValidation conformance test needs, rather
+/// than scanning every request body for a rare, always-invalid shape.
+pub(crate) fn detect_duplicate_fields(raw: &[u8], group: &str, plural: &str) -> Vec<String> {
+    if known_spec_fields(group, plural).is_none() {
+        return Vec::new();
+    }
+    let root: DupCheckValue = match serde_json::from_slice(raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(), // malformed JSON is reported elsewhere
+    };
+    if let DupCheckValue::Object(top) = root {
+        if let Some((_, DupCheckValue::Object(spec_entries))) =
+            top.iter().find(|(k, _)| k == "spec")
+        {
+            return repeated_keys(spec_entries)
+                .into_iter()
+                .map(|k| format!("spec.{k}"))
+                .collect();
+        }
+    }
+    Vec::new()
+}
 
 /// Detect unknown top-level keys and unknown metadata keys in `body`.
 ///
@@ -232,6 +394,19 @@ pub(crate) fn detect_unknown_fields(
                 }
             }
         }
+
+        // Check nested spec fields for resource types with a known spec schema.
+        // Types not covered by known_spec_fields return None and are unaffected —
+        // see known_spec_fields for why most types are intentionally excluded.
+        if let Some(known_spec) = known_spec_fields(group, plural) {
+            if let Some(spec) = obj.get("spec").and_then(|s| s.as_object()) {
+                for key in spec.keys() {
+                    if !known_spec.contains(&key.as_str()) {
+                        unknown.push(format!("spec.{key}"));
+                    }
+                }
+            }
+        }
     }
 
     unknown
@@ -239,12 +414,16 @@ pub(crate) fn detect_unknown_fields(
 
 /// Apply `?fieldValidation=` semantics.
 ///
-/// - `Strict`  → returns `Err(422)` when unknown fields are detected.
-/// - `Warn`    → returns `Ok(Some(warning_header_value))` when unknown fields are detected.
+/// - `Strict`  → returns `Err(422)` when unknown or duplicate fields are detected.
+/// - `Warn`    → returns `Ok(Some(warning_header_value))` when they are detected.
 /// - `Ignore`  → returns `Ok(None)` unconditionally (existing strip-and-store behaviour).
 /// - absent    → same as `Ignore`.
+///
+/// `raw` is the undecoded request body, needed to detect duplicate object keys —
+/// see `detect_duplicate_fields` for why the parsed `body` can't be used for that.
 pub(crate) fn apply_field_validation(
     body: &serde_json::Value,
+    raw: &[u8],
     mode: Option<&str>,
     group: &str,
     plural: &str,
@@ -255,20 +434,27 @@ pub(crate) fn apply_field_validation(
     }
 
     let unknown = detect_unknown_fields(body, group, plural);
-    if unknown.is_empty() {
+    let duplicate = detect_duplicate_fields(raw, group, plural);
+    if unknown.is_empty() && duplicate.is_empty() {
         return Ok(None);
     }
 
+    // Upstream renders each issue as its own "<kind> field \"<path>\"" phrase, unknown
+    // fields first, then duplicate fields, comma-separated, e.g.:
+    //   strict decoding error: unknown field "spec.unknownField", duplicate field "spec.replicas"
+    let phrases: Vec<String> = unknown
+        .iter()
+        .map(|f| format!("unknown field \"{f}\""))
+        .chain(duplicate.iter().map(|f| format!("duplicate field \"{f}\"")))
+        .collect();
+    let joined = phrases.join(", ");
+
     match mode {
-        "Strict" => {
-            let fields = unknown.join(", ");
-            Err(Status::unprocessable_entity(format!(
-                "strict decoding error: unknown field \"{fields}\""
-            )))
-        }
+        "Strict" => Err(Status::unprocessable_entity(format!(
+            "strict decoding error: {joined}"
+        ))),
         "Warn" => {
-            let fields = unknown.join(", ");
-            let msg = format!("299 - \"unknown field: {fields}\"");
+            let msg = format!("299 - \"{joined}\"");
             let hv = HeaderValue::from_str(&msg).unwrap_or_else(|_| {
                 HeaderValue::from_static("299 - \"unknown field(s) detected\"")
             });
@@ -747,8 +933,14 @@ mod tests {
             "ports": [{"name": "http", "port": 80, "protocol": "TCP"}]
         });
 
-        let result =
-            apply_field_validation(&body, Some("Strict"), "discovery.k8s.io", "endpointslices");
+        let raw = serde_json::to_vec(&body).unwrap();
+        let result = apply_field_validation(
+            &body,
+            &raw,
+            Some("Strict"),
+            "discovery.k8s.io",
+            "endpointslices",
+        );
 
         assert!(
             result.is_ok(),
@@ -757,5 +949,172 @@ mod tests {
              422 blocking all EndpointSlice conformance tests. Error: {:?}",
             result.err()
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Nested spec field validation — regression for mayor-ftkl (PANIC 2)
+    // ---------------------------------------------------------------------------
+
+    /// detect_unknown_fields must recurse into `spec` for resource types with a known
+    /// spec schema (e.g. Deployment), not just check top-level/metadata keys.
+    ///
+    /// Before this fix, `known_top_level_fields` treated `spec` as an opaque known
+    /// key and never looked inside it, so `spec.unknownField` was silently accepted —
+    /// this is exactly the body the upstream FieldValidation conformance test
+    /// ("should detect unknown and duplicate fields of a typed object") POSTs.
+    #[test]
+    fn detect_unknown_fields_recurses_into_deployment_spec() {
+        let body = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "my-dep", "labels": { "app": "nginx" } },
+            "spec": {
+                "unknownField": "foo",
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "nginx" } },
+                "template": {
+                    "metadata": { "labels": { "app": "nginx" } },
+                    "spec": { "containers": [{ "name": "nginx", "image": "nginx:latest" }] }
+                }
+            }
+        });
+
+        let unknown = detect_unknown_fields(&body, "apps", "deployments");
+
+        assert!(
+            unknown.contains(&"spec.unknownField".to_string()),
+            "spec.unknownField must be detected as unknown for Deployment — \
+             before the fix, detect_unknown_fields only checked top-level and metadata \
+             keys, so any bogus field nested under spec was silently accepted. Got: {:?}",
+            unknown
+        );
+        // Known spec fields (replicas, selector, template) must not be flagged.
+        assert!(
+            !unknown.iter().any(|f| f.starts_with("spec.replicas")
+                || f.starts_with("spec.selector")
+                || f.starts_with("spec.template")),
+            "known Deployment spec fields must not be flagged as unknown — a false \
+             positive here would reject every valid Deployment under fieldValidation=Strict. \
+             Got: {:?}",
+            unknown
+        );
+    }
+
+    /// detect_duplicate_fields must find a JSON key repeated within `spec`, which
+    /// `serde_json::Value` can no longer see once the raw bytes are parsed (last
+    /// occurrence silently wins). This is the other half of the upstream
+    /// FieldValidation conformance body: `"replicas": 2, "replicas": 3`.
+    #[test]
+    fn detect_duplicate_fields_finds_repeated_spec_key() {
+        let raw = br#"{
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "my-dep" },
+            "spec": {
+                "replicas": 2,
+                "replicas": 3,
+                "selector": { "matchLabels": { "app": "nginx" } }
+            }
+        }"#;
+
+        let duplicate = detect_duplicate_fields(raw, "apps", "deployments");
+
+        assert_eq!(
+            duplicate,
+            vec!["spec.replicas".to_string()],
+            "spec.replicas must be reported as duplicated exactly once — without raw-byte \
+             scanning, this information is unrecoverable once serde_json collapses the \
+             repeated key to its last value, and the conformance test's expected error \
+             message would be missing the \"duplicate field\" half entirely. Got: {:?}",
+            duplicate
+        );
+    }
+
+    /// detect_duplicate_fields must not flag anything for resource types without a
+    /// known spec schema — it must not scan (or false-positive on) arbitrary bodies.
+    #[test]
+    fn detect_duplicate_fields_is_noop_for_uncovered_resource_type() {
+        let raw = br#"{"spec": {"replicas": 1, "replicas": 2}}"#;
+
+        let duplicate = detect_duplicate_fields(raw, "", "configmaps");
+
+        assert!(
+            duplicate.is_empty(),
+            "duplicate-key scanning must stay scoped to known_spec_fields types — \
+             scanning every resource type would be unnecessary work for a shape upstream \
+             kube-apiserver never sees in practice for uncovered types. Got: {:?}",
+            duplicate
+        );
+    }
+
+    /// POST with `?fieldValidation=Strict` and a Deployment body containing BOTH an
+    /// unknown field and a duplicate key under `spec` must return Err(422) with the
+    /// combined message, matching the upstream conformance assertion exactly.
+    ///
+    /// This is the exact body and expected message from the upstream FieldValidation
+    /// conformance test ("should detect unknown and duplicate fields of a typed
+    /// object"): before this fix, u7s returned Ok (HTTP success) because neither
+    /// unknown- nor duplicate-field detection looked inside `spec`; the Go e2e client
+    /// then panicked calling `.Error()` on the nil error it expected instead of a 422
+    /// containing both `unknown field "spec.unknownField"` and
+    /// `duplicate field "spec.replicas"`.
+    #[test]
+    fn apply_field_validation_strict_rejects_unknown_deployment_spec_field_else_conformance_test_panics_on_nil_error(
+    ) {
+        // Raw text (not serde_json::json!) because the macro can't represent a
+        // JSON object with a literally duplicated key — it builds a Map directly.
+        let raw = br#"{
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "my-dep",
+                "labels": {"app": "nginx"}
+            },
+            "spec": {
+                "unknownField": "foo",
+                "replicas": 2,
+                "replicas": 3,
+                "selector": {
+                    "matchLabels": {
+                        "app": "nginx"
+                    }
+                },
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app": "nginx"
+                        }
+                    },
+                    "spec": {
+                        "containers": [{
+                            "name":  "nginx",
+                            "image": "nginx:latest"
+                        }]
+                    }
+                }
+            }
+        }"#;
+        let body: serde_json::Value =
+            serde_json::from_slice(raw).expect("test body must be valid JSON");
+
+        let result = apply_field_validation(&body, raw, Some("Strict"), "apps", "deployments");
+
+        match result {
+            Err(e) => {
+                assert_eq!(
+                    e.1.message,
+                    "strict decoding error: unknown field \"spec.unknownField\", duplicate field \"spec.replicas\"",
+                    "422 error message must match the upstream conformance test's \
+                     strings.Contains assertion exactly — a differently-worded or \
+                     differently-ordered message fails the conformance test even though \
+                     the status code is correct"
+                );
+            }
+            Ok(_) => panic!(
+                "fieldValidation=Strict must reject a Deployment with spec.unknownField and \
+                 duplicate spec.replicas; the conformance test client panics calling .Error() \
+                 on the nil error it gets instead of the expected 422"
+            ),
+        }
     }
 }
