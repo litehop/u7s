@@ -481,13 +481,14 @@ fn build_router(state: AppState) -> Router {
         )
         // Pods — exec/attach/portforward: 501 stubs until SPDY/WebSocket is implemented.
         //
-        // attach's POST leg runs the same pre-upgrade checks (pod lookup + admission)
-        // as its GET/WebSocket sibling before returning 501 — see pod_attach_post: a
-        // denied GET/WebSocket dial is retried by client-go as POST/SPDY, and that
-        // retry must surface the same denial Status instead of a generic 405 (mayor-u6eb).
+        // exec/attach's POST legs run the same pre-upgrade checks (pod lookup +
+        // admission) as their GET/WebSocket siblings before returning 501 — see
+        // pod_exec_post/pod_attach_post: a denied GET/WebSocket dial is retried by
+        // client-go as POST/SPDY, and that retry must surface the same denial Status
+        // instead of a generic 405 (mayor-u6eb, mayor-c7r3).
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/exec",
-            get(handlers::proxy::pod_exec).post(handlers::proxy::pod_exec),
+            get(handlers::proxy::pod_exec).post(handlers::proxy::pod_exec_post),
         )
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/attach",
