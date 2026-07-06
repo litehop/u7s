@@ -123,6 +123,21 @@ struct WebhookEntry {
     /// Per-webhook timeout in seconds. Kubernetes spec default is 10s.
     #[serde(default)]
     timeout_seconds: Option<i64>,
+    /// CEL pre-filters evaluated at invocation time (after rules/selectors, before the
+    /// HTTP call). The webhook fires only if every expression evaluates to `true`; see
+    /// `webhook_match_conditions_pass`. Syntax is validated at config-write time by
+    /// `validate_webhook_match_conditions_cel`.
+    #[serde(default)]
+    match_conditions: Vec<MatchCondition>,
+}
+
+/// One `webhooks[*].matchConditions[*]` entry: a named CEL expression gating whether
+/// this webhook is invoked for a given request.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MatchCondition {
+    name: String,
+    expression: String,
 }
 
 /// Kubernetes LabelSelector: both fields are optional; absence means match-all.
@@ -205,6 +220,75 @@ pub(crate) fn label_selector_matches(
     }
 
     true
+}
+
+/// Evaluate a webhook's `matchConditions` and report whether the webhook should be invoked.
+///
+/// Kubernetes runs matchConditions as the final, most expensive filter — after
+/// rules/namespaceSelector/objectSelector match — so operators can exclude specific objects
+/// (e.g. "skip objects named skip-me") by CEL expression instead of label plumbing. The webhook
+/// fires only if every condition's expression evaluates to `true` (logical AND); if any
+/// evaluates to `false`, the webhook must be skipped entirely, as if it had not matched.
+/// Without this check a webhook mutates/validates objects it was explicitly configured to
+/// exclude (verified live: mayor-prtw).
+///
+/// A condition that fails to evaluate (parse error, or references a variable this evaluator
+/// subset doesn't support, e.g. `authorizer`) is treated as satisfied rather than as a skip —
+/// the same fail-open choice already used for ValidatingAdmissionPolicy matchConditions in this
+/// file (see `run_validating_admission_policies`). This favors availability: the webhook still
+/// runs, subject to its own failurePolicy for the actual HTTP call, instead of an expression
+/// this MVP evaluator can't parse silently disabling policy enforcement.
+pub(crate) fn webhook_match_conditions_pass(
+    conditions: &[MatchCondition],
+    object: &serde_json::Value,
+    request: &serde_json::Value,
+) -> bool {
+    let vars = serde_json::Map::new();
+    for cond in conditions {
+        match eval_cel_bool_expr(&cond.expression, object, &vars, request) {
+            Some(false) => return false,
+            Some(true) => {}
+            None => {
+                tracing::warn!(
+                    "admission: webhook matchCondition \"{}\" eval error, treating as pass",
+                    cond.name
+                );
+            }
+        }
+    }
+    true
+}
+
+/// Build the `request` JSON value exposed to webhook `matchConditions` CEL expressions.
+///
+/// Mirrors the `request` shape already built for ValidatingAdmissionPolicy matchConditions
+/// (operation/name/namespace/dryRun/userInfo) so the same expressions work in both places.
+fn webhook_match_condition_request(ctx: &AdmissionContext<'_>) -> serde_json::Value {
+    let mut req = serde_json::Map::new();
+    req.insert(
+        "operation".to_string(),
+        serde_json::Value::String(ctx.operation.to_string()),
+    );
+    req.insert(
+        "name".to_string(),
+        serde_json::Value::String(ctx.name.to_string()),
+    );
+    req.insert(
+        "namespace".to_string(),
+        ctx.namespace
+            .map(|ns| serde_json::Value::String(ns.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    req.insert("dryRun".to_string(), serde_json::Value::Bool(ctx.dry_run));
+    if let Some(ref ui) = ctx.user_info {
+        req.insert("userInfo".to_string(), ui.clone());
+    } else {
+        req.insert(
+            "userInfo".to_string(),
+            serde_json::json!({"username": "", "groups": []}),
+        );
+    }
+    serde_json::Value::Object(req)
 }
 
 /// Fetch the namespace object labels from the store.
@@ -848,6 +932,19 @@ async fn invoke_mutating_webhook<S: Store>(
         if !label_selector_matches(webhook.object_selector.as_ref(), &obj_labels) {
             tracing::debug!(
                 "admission: mutating webhook \"{}\" skipped: object does not match objectSelector",
+                webhook.name
+            );
+            return Ok((object.clone(), false));
+        }
+    }
+
+    // matchConditions: the final, most expensive filter. Skip this webhook if any CEL
+    // expression evaluates to false — see webhook_match_conditions_pass.
+    if !webhook.match_conditions.is_empty() {
+        let request_val = webhook_match_condition_request(ctx);
+        if !webhook_match_conditions_pass(&webhook.match_conditions, object, &request_val) {
+            tracing::debug!(
+                "admission: mutating webhook \"{}\" skipped: matchCondition evaluated false",
                 webhook.name
             );
             return Ok((object.clone(), false));
@@ -2678,6 +2775,19 @@ pub async fn run_validating_webhooks<S: Store>(
             }
         }
 
+        // matchConditions: the final, most expensive filter. Skip this webhook if any CEL
+        // expression evaluates to false — see webhook_match_conditions_pass.
+        if !webhook.match_conditions.is_empty() {
+            let request_val = webhook_match_condition_request(ctx);
+            if !webhook_match_conditions_pass(&webhook.match_conditions, object, &request_val) {
+                tracing::debug!(
+                    "admission: validating webhook \"{}\" skipped: matchCondition evaluated false",
+                    webhook.name
+                );
+                continue;
+            }
+        }
+
         let target = match webhook_url(state, &webhook.client_config, &webhook.name).await {
             Ok(t) => t,
             Err(e) => {
@@ -3977,6 +4087,106 @@ mod tests {
         );
     }
 
+    // -- webhook_match_conditions_pass unit tests --
+    //
+    // Regression coverage for mayor-prtw: matchConditions were validated syntactically at
+    // config-write time but never evaluated at invocation, so a webhook configured to skip
+    // e.g. "skip-me" objects fired identically for every object. These tests exercise the
+    // pure skip-decision helper directly (see also the run_mutating_webhooks /
+    // run_validating_webhooks integration tests below for end-to-end wiring coverage).
+
+    fn empty_request() -> serde_json::Value {
+        json!({"operation": "CREATE", "name": "irrelevant", "namespace": null, "dryRun": false})
+    }
+
+    /// A matchCondition that evaluates to false must skip the webhook.
+    ///
+    /// This is the exact scenario verified live in mayor-prtw: a webhook with
+    /// `object.metadata.name != "skip-me"` must NOT fire for an object named "skip-me" — if it
+    /// does, the webhook mutates/validates an object it was explicitly configured to exclude.
+    #[test]
+    fn webhook_match_conditions_pass_returns_false_when_condition_evaluates_false() {
+        let conditions = vec![MatchCondition {
+            name: "skip-named-skip-me".into(),
+            expression: "object.metadata.name != \"skip-me\"".into(),
+        }];
+        let object = json!({"metadata": {"name": "skip-me"}});
+        assert!(
+            !webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            "a matchCondition evaluating to false must skip the webhook, else it acts on \
+             objects it was configured to exclude"
+        );
+    }
+
+    /// A matchCondition that evaluates to true must NOT skip the webhook.
+    ///
+    /// Complements the false case above: an object that does not match the exclusion
+    /// expression must still be processed by the webhook.
+    #[test]
+    fn webhook_match_conditions_pass_returns_true_when_condition_evaluates_true() {
+        let conditions = vec![MatchCondition {
+            name: "skip-named-skip-me".into(),
+            expression: "object.metadata.name != \"skip-me\"".into(),
+        }];
+        let object = json!({"metadata": {"name": "other"}});
+        assert!(
+            webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            "an object not matched by the exclusion expression must still be processed by \
+             the webhook"
+        );
+    }
+
+    /// Multiple matchConditions are ANDed: any single false must skip the webhook even if
+    /// earlier conditions passed.
+    #[test]
+    fn webhook_match_conditions_pass_ands_multiple_conditions() {
+        let conditions = vec![
+            MatchCondition {
+                name: "always-true".into(),
+                expression: "true".into(),
+            },
+            MatchCondition {
+                name: "name-is-not-skip-me".into(),
+                expression: "object.metadata.name != \"skip-me\"".into(),
+            },
+        ];
+        let object = json!({"metadata": {"name": "skip-me"}});
+        assert!(
+            !webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            "matchConditions are combined with logical AND; one false condition must skip \
+             the webhook regardless of how many other conditions passed"
+        );
+    }
+
+    /// A matchCondition expression this evaluator cannot parse/evaluate must NOT skip the
+    /// webhook (fail open), matching the existing ValidatingAdmissionPolicy matchConditions
+    /// behavior in this file. Silently skipping a webhook whenever it uses CEL this MVP
+    /// evaluator doesn't support would disable policy enforcement without any signal.
+    #[test]
+    fn webhook_match_conditions_pass_treats_eval_error_as_pass() {
+        let conditions = vec![MatchCondition {
+            name: "unsupported".into(),
+            expression: "authorizer.group('').resource('pods').check().allowed()".into(),
+        }];
+        let object = json!({"metadata": {"name": "anything"}});
+        assert!(
+            webhook_match_conditions_pass(&conditions, &object, &empty_request()),
+            "a matchCondition this evaluator cannot parse must fail open (webhook still \
+             invoked) rather than silently disabling the webhook"
+        );
+    }
+
+    /// A webhook with no matchConditions must always be invoked — matchConditions is optional
+    /// and its absence must not change existing behavior for webhooks that don't use it.
+    #[test]
+    fn webhook_match_conditions_pass_returns_true_when_no_conditions_configured() {
+        let object = json!({"metadata": {"name": "anything"}});
+        assert!(
+            webhook_match_conditions_pass(&[], &object, &empty_request()),
+            "absent matchConditions must match everything, same as an absent selector"
+        );
+    }
+
     /// A webhook with namespaceSelector must be skipped for namespaces whose labels don't match.
     /// This test stores a real Namespace object in the in-memory store and seeds a
     /// MutatingWebhookConfiguration with a namespaceSelector. The webhook points to an
@@ -5202,6 +5412,217 @@ mod tests {
             result.is_ok(),
             "validating webhook with non-matching objectSelector must be skipped; \
              invoking it would fail because the URL is unreachable with failurePolicy=Fail"
+        );
+    }
+
+    /// End-to-end (mayor-prtw): a mutating webhook with a matchCondition excluding
+    /// name="skip-me" must be skipped, not invoked, for an object actually named "skip-me".
+    ///
+    /// This is the exact live-verified bug: matchConditions were checked syntactically at
+    /// config-write time but never evaluated at invocation, so this webhook (pointed at an
+    /// unreachable URL with failurePolicy=Fail) would have errored instead of being skipped.
+    /// Reverting the matchConditions wiring in invoke_mutating_webhook makes this test fail.
+    #[tokio::test]
+    async fn match_condition_false_skips_mutating_webhook() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "skip-me-excluding-mwc"},
+            "webhooks": [{
+                "name": "exclude.skip-me.webhook.example.com",
+                "clientConfig": {
+                    "url": "http://127.0.0.1:1"  // unreachable — would cause Fail if invoked
+                },
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "matchConditions": [{
+                    "name": "exclude-skip-me",
+                    "expression": "object.metadata.name != \"skip-me\""
+                }]
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/skip-me-excluding-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({
+            "kind": "ConfigMap",
+            "metadata": {"name": "skip-me"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "skip-me",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
+
+        assert!(
+            result.is_ok(),
+            "webhook with a false matchCondition must be skipped, not invoked; invoking it \
+             would fail because the URL is unreachable with failurePolicy=Fail"
+        );
+        assert_eq!(
+            result.unwrap_or_else(|_| panic!("must succeed")),
+            obj,
+            "object must be unchanged when the webhook is skipped by matchCondition"
+        );
+    }
+
+    /// Complements the skip test above: an object NOT excluded by the matchCondition must
+    /// still cause the webhook to be invoked. An unreachable URL with failurePolicy=Fail
+    /// must cause an error — confirming the webhook actually fired.
+    #[tokio::test]
+    async fn match_condition_true_invokes_mutating_webhook() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "skip-me-excluding-mwc-match"},
+            "webhooks": [{
+                "name": "exclude.skip-me.match.webhook.example.com",
+                "clientConfig": {
+                    "url": "http://127.0.0.1:1"  // unreachable — causes Fail when invoked
+                },
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "matchConditions": [{
+                    "name": "exclude-skip-me",
+                    "expression": "object.metadata.name != \"skip-me\""
+                }]
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/skip-me-excluding-mwc-match",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({
+            "kind": "ConfigMap",
+            "metadata": {"name": "other"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "other",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
+
+        assert!(
+            result.is_err(),
+            "webhook with a true matchCondition must be invoked; the unreachable URL with \
+             failurePolicy=Fail must cause an error"
+        );
+    }
+
+    /// Same matchCondition skip requirement as the mutating case, for validating webhooks.
+    #[tokio::test]
+    async fn match_condition_false_skips_validating_webhook() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "skip-me-excluding-vwc"},
+            "webhooks": [{
+                "name": "exclude.skip-me.validating.webhook.example.com",
+                "clientConfig": {
+                    "url": "http://127.0.0.1:1"
+                },
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["configmaps"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "matchConditions": [{
+                    "name": "exclude-skip-me",
+                    "expression": "object.metadata.name != \"skip-me\""
+                }]
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/skip-me-excluding-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({
+            "kind": "ConfigMap",
+            "metadata": {"name": "skip-me"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "configmaps",
+            name: "skip-me",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_validating_webhooks(&state, &obj, None, &ctx).await;
+
+        assert!(
+            result.is_ok(),
+            "validating webhook with a false matchCondition must be skipped; invoking it \
+             would fail because the URL is unreachable with failurePolicy=Fail"
         );
     }
 
