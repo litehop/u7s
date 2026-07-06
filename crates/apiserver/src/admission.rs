@@ -244,8 +244,18 @@ pub(crate) fn webhook_match_conditions_pass(
     request: &serde_json::Value,
 ) -> bool {
     let vars = serde_json::Map::new();
+    // Webhook matchConditions have no `namespaceObject` CEL variable in the upstream spec
+    // (only ValidatingAdmissionPolicy does) — Null makes any such reference resolve rather
+    // than fall through the unbound-identifier fallback further down the parser.
+    let no_namespace_object = serde_json::Value::Null;
     for cond in conditions {
-        match eval_cel_bool_expr(&cond.expression, object, &vars, request) {
+        match eval_cel_bool_expr(
+            &cond.expression,
+            object,
+            &vars,
+            request,
+            &no_namespace_object,
+        ) {
             Some(false) => return false,
             Some(true) => {}
             None => {
@@ -316,6 +326,25 @@ async fn fetch_namespace_labels<S: Store>(
             }
         }
         _ => BTreeMap::new(),
+    }
+}
+
+/// Fetch the full namespace object from the store, for the VAP CEL `namespaceObject` variable.
+///
+/// Returns `Value::Null` if the namespace is not found or the resource is cluster-scoped —
+/// this matches the upstream contract ("the namespace object that the incoming object belongs
+/// to. The value is null for cluster-scoped resources"). Without this, `namespaceObject` field
+/// access always fails to resolve, and VAP validations referencing it (e.g.
+/// `namespaceObject.metadata.name == '...'`) always fail evaluation, which is treated as a
+/// denial — wrongly rejecting requests the policy was written to allow.
+async fn fetch_namespace_object<S: Store>(
+    state: &AppState<S>,
+    namespace: &str,
+) -> serde_json::Value {
+    let key = format!("/registry/namespaces/{namespace}");
+    match state.store.get(&key).await {
+        Ok(Some(obj)) => serde_json::from_slice(&obj.value).unwrap_or(serde_json::Value::Null),
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -1143,7 +1172,8 @@ pub(crate) fn eval_cel_apply_config(
 /// Evaluate a CEL boolean expression for ValidatingAdmissionPolicy validations.
 ///
 /// Supports the VAP subset of CEL:
-/// - Field access: `object.spec.replicas`, `variables.X`, `request.userInfo.username`
+/// - Field access: `object.spec.replicas`, `variables.X`, `request.userInfo.username`,
+///   `namespaceObject.metadata.name`
 /// - Arithmetic: `+`, `-`, `*`, `/`, `%`
 /// - Comparisons: `==`, `!=`, `<`, `<=`, `>`, `>=`
 /// - Boolean: `&&`, `||`, `!`
@@ -1151,17 +1181,27 @@ pub(crate) fn eval_cel_apply_config(
 ///
 /// `variables` is a map of intermediate values computed from `spec.variables`.
 /// `request` is the admission request context (operation, name, namespace, userInfo, dryRun).
+/// `namespace_object` is the Namespace object the admitted resource belongs to, or `Value::Null`
+/// for cluster-scoped resources (matches the upstream `namespaceObject` CEL variable contract).
 /// Returns `Some(true)` / `Some(false)`, or `None` on parse/eval error.
 pub(crate) fn eval_cel_bool_expr(
     expr: &str,
     object: &serde_json::Value,
     variables: &serde_json::Map<String, serde_json::Value>,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<bool> {
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
-    let val = parse_vap_or(&tokens, &mut pos, object, &variables_val, request)?;
+    let val = parse_vap_or(
+        &tokens,
+        &mut pos,
+        object,
+        &variables_val,
+        request,
+        namespace_object,
+    )?;
     val.as_bool()
 }
 
@@ -1171,11 +1211,19 @@ pub(crate) fn eval_cel_vap_value(
     object: &serde_json::Value,
     variables: &serde_json::Map<String, serde_json::Value>,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let tokens = tokenize_cel(expr.trim())?;
     let mut pos = 0usize;
     let variables_val = serde_json::Value::Object(variables.clone());
-    parse_vap_or(&tokens, &mut pos, object, &variables_val, request)
+    parse_vap_or(
+        &tokens,
+        &mut pos,
+        object,
+        &variables_val,
+        request,
+        namespace_object,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,12 +1237,13 @@ fn parse_vap_or(
     object: &serde_json::Value,
     variables: &serde_json::Value,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_and(tokens, pos, object, variables, request)?;
+    let mut left = parse_vap_and(tokens, pos, object, variables, request, namespace_object)?;
     while *pos < tokens.len() {
         if let CelToken::Pipe = &tokens[*pos] {
             *pos += 1;
-            let right = parse_vap_and(tokens, pos, object, variables, request)?;
+            let right = parse_vap_and(tokens, pos, object, variables, request, namespace_object)?;
             let result = left.as_bool().unwrap_or(false) || right.as_bool().unwrap_or(false);
             left = serde_json::Value::Bool(result);
         } else {
@@ -1211,12 +1260,13 @@ fn parse_vap_and(
     object: &serde_json::Value,
     variables: &serde_json::Value,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_cmp(tokens, pos, object, variables, request)?;
+    let mut left = parse_vap_cmp(tokens, pos, object, variables, request, namespace_object)?;
     while *pos < tokens.len() {
         if let CelToken::Ampersand = &tokens[*pos] {
             *pos += 1;
-            let right = parse_vap_cmp(tokens, pos, object, variables, request)?;
+            let right = parse_vap_cmp(tokens, pos, object, variables, request, namespace_object)?;
             let result = left.as_bool().unwrap_or(false) && right.as_bool().unwrap_or(false);
             left = serde_json::Value::Bool(result);
         } else {
@@ -1233,8 +1283,9 @@ fn parse_vap_cmp(
     object: &serde_json::Value,
     variables: &serde_json::Value,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let left = parse_vap_add(tokens, pos, object, variables, request)?;
+    let left = parse_vap_add(tokens, pos, object, variables, request, namespace_object)?;
     if *pos >= tokens.len() {
         return Some(left);
     }
@@ -1247,7 +1298,7 @@ fn parse_vap_cmp(
         | CelToken::Gt
         | CelToken::Gte => {
             *pos += 1;
-            let right = parse_vap_add(tokens, pos, object, variables, request)?;
+            let right = parse_vap_add(tokens, pos, object, variables, request, namespace_object)?;
             let result = compare_values(&op, &left, &right)?;
             Some(serde_json::Value::Bool(result))
         }
@@ -1294,14 +1345,16 @@ fn parse_vap_add(
     object: &serde_json::Value,
     variables: &serde_json::Value,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_mul(tokens, pos, object, variables, request)?;
+    let mut left = parse_vap_mul(tokens, pos, object, variables, request, namespace_object)?;
     while *pos < tokens.len() {
         let op = tokens[*pos].clone();
         match op {
             CelToken::Plus | CelToken::Minus => {
                 *pos += 1;
-                let right = parse_vap_mul(tokens, pos, object, variables, request)?;
+                let right =
+                    parse_vap_mul(tokens, pos, object, variables, request, namespace_object)?;
                 left = apply_add_op(&op, &left, &right)?;
             }
             _ => break,
@@ -1352,14 +1405,16 @@ fn parse_vap_mul(
     object: &serde_json::Value,
     variables: &serde_json::Value,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
-    let mut left = parse_vap_unary(tokens, pos, object, variables, request)?;
+    let mut left = parse_vap_unary(tokens, pos, object, variables, request, namespace_object)?;
     while *pos < tokens.len() {
         let op = tokens[*pos].clone();
         match op {
             CelToken::Star | CelToken::Slash | CelToken::Percent => {
                 *pos += 1;
-                let right = parse_vap_unary(tokens, pos, object, variables, request)?;
+                let right =
+                    parse_vap_unary(tokens, pos, object, variables, request, namespace_object)?;
                 left = apply_mul_op(&op, &left, &right)?;
             }
             _ => break,
@@ -1397,6 +1452,7 @@ fn parse_vap_unary(
     object: &serde_json::Value,
     variables: &serde_json::Value,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     if *pos >= tokens.len() {
         return None;
@@ -1404,12 +1460,12 @@ fn parse_vap_unary(
     match &tokens[*pos] {
         CelToken::Bang => {
             *pos += 1;
-            let inner = parse_vap_unary(tokens, pos, object, variables, request)?;
+            let inner = parse_vap_unary(tokens, pos, object, variables, request, namespace_object)?;
             Some(serde_json::Value::Bool(!inner.as_bool()?))
         }
         CelToken::Minus => {
             *pos += 1;
-            let inner = parse_vap_unary(tokens, pos, object, variables, request)?;
+            let inner = parse_vap_unary(tokens, pos, object, variables, request, namespace_object)?;
             match inner {
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
@@ -1422,7 +1478,7 @@ fn parse_vap_unary(
                 _ => None,
             }
         }
-        _ => parse_vap_primary(tokens, pos, object, variables, request),
+        _ => parse_vap_primary(tokens, pos, object, variables, request, namespace_object),
     }
 }
 
@@ -1433,6 +1489,7 @@ fn parse_vap_primary(
     object: &serde_json::Value,
     variables: &serde_json::Value,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     if *pos >= tokens.len() {
         return None;
@@ -1460,7 +1517,7 @@ fn parse_vap_primary(
         }
         CelToken::LParen => {
             *pos += 1;
-            let val = parse_vap_or(tokens, pos, object, variables, request)?;
+            let val = parse_vap_or(tokens, pos, object, variables, request, namespace_object)?;
             if *pos < tokens.len() {
                 if let CelToken::RParen = &tokens[*pos] {
                     *pos += 1;
@@ -1477,13 +1534,22 @@ fn parse_vap_primary(
                 variables.clone()
             } else if name == "request" {
                 request.clone()
+            } else if name == "namespaceObject" {
+                namespace_object.clone()
             } else {
                 // Unknown identifier — return as string (struct constructor handled below)
                 // Check for struct constructor: TypeName{...}
                 if *pos < tokens.len() {
                     if let CelToken::LBrace = &tokens[*pos] {
                         *pos += 1;
-                        return parse_vap_object_body(tokens, pos, object, variables, request);
+                        return parse_vap_object_body(
+                            tokens,
+                            pos,
+                            object,
+                            variables,
+                            request,
+                            namespace_object,
+                        );
                     }
                 }
                 return Some(serde_json::Value::String(name));
@@ -1491,11 +1557,19 @@ fn parse_vap_primary(
 
             // Skip qualifier segments before LBrace (e.g. Object.metadata{...}).
             // Also handle dot-access chains: object.spec.replicas.
-            parse_vap_field_chain(tokens, pos, root, object, variables, request)
+            parse_vap_field_chain(
+                tokens,
+                pos,
+                root,
+                object,
+                variables,
+                request,
+                namespace_object,
+            )
         }
         CelToken::LBrace => {
             *pos += 1;
-            parse_vap_object_body(tokens, pos, object, variables, request)
+            parse_vap_object_body(tokens, pos, object, variables, request, namespace_object)
         }
         CelToken::LBracket => {
             *pos += 1;
@@ -1505,7 +1579,7 @@ fn parse_vap_primary(
                     *pos += 1;
                     break;
                 }
-                let val = parse_vap_or(tokens, pos, object, variables, request)?;
+                let val = parse_vap_or(tokens, pos, object, variables, request, namespace_object)?;
                 arr.push(val);
                 if *pos < tokens.len() {
                     if let CelToken::Comma = &tokens[*pos] {
@@ -1527,6 +1601,7 @@ fn parse_vap_field_chain(
     object: &serde_json::Value,
     variables: &serde_json::Value,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     loop {
         if *pos >= tokens.len() {
@@ -1545,7 +1620,14 @@ fn parse_vap_field_chain(
                         if let CelToken::LBrace = &tokens[*pos] {
                             // TypeName.qualifier{...} — treat as constructor, discard qualifier
                             *pos += 1;
-                            return parse_vap_object_body(tokens, pos, object, variables, request);
+                            return parse_vap_object_body(
+                                tokens,
+                                pos,
+                                object,
+                                variables,
+                                request,
+                                namespace_object,
+                            );
                         }
                     }
                     // Field navigation
@@ -1557,7 +1639,14 @@ fn parse_vap_field_chain(
             CelToken::LBrace => {
                 // Struct constructor on this identifier
                 *pos += 1;
-                return parse_vap_object_body(tokens, pos, object, variables, request);
+                return parse_vap_object_body(
+                    tokens,
+                    pos,
+                    object,
+                    variables,
+                    request,
+                    namespace_object,
+                );
             }
             _ => break,
         }
@@ -1572,6 +1661,7 @@ fn parse_vap_object_body(
     object: &serde_json::Value,
     variables: &serde_json::Value,
     request: &serde_json::Value,
+    namespace_object: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let mut map = serde_json::Map::new();
     while *pos < tokens.len() {
@@ -1598,7 +1688,7 @@ fn parse_vap_object_body(
         } else {
             return None;
         }
-        let val = parse_vap_or(tokens, pos, object, variables, request)?;
+        let val = parse_vap_or(tokens, pos, object, variables, request, namespace_object)?;
         map.insert(key, val);
         if *pos < tokens.len() {
             if let CelToken::Comma = &tokens[*pos] {
@@ -2463,6 +2553,14 @@ async fn run_validating_admission_policies<S: Store>(
         return Ok(());
     }
 
+    // Resolve the `namespaceObject` CEL root once per request (same object for every
+    // binding/policy pair evaluated below). Null for cluster-scoped resources, per the
+    // upstream ValidatingAdmissionPolicy CEL variable contract.
+    let namespace_object_val = match ctx.namespace {
+        Some(ns) => fetch_namespace_object(state, ns).await,
+        None => serde_json::Value::Null,
+    };
+
     for binding in &bindings {
         let policy_name = binding["spec"]["policyName"].as_str().unwrap_or("");
         if policy_name.is_empty() {
@@ -2578,7 +2676,7 @@ async fn run_validating_admission_policies<S: Store>(
                     continue;
                 }
                 let vars = serde_json::Map::new();
-                match eval_cel_bool_expr(expr, object, &vars, &request_val) {
+                match eval_cel_bool_expr(expr, object, &vars, &request_val, &namespace_object_val) {
                     Some(true) => {} // condition passes, continue
                     Some(false) => {
                         // matchCondition returned false → skip this webhook (not deny)
@@ -2613,7 +2711,13 @@ async fn run_validating_admission_policies<S: Store>(
                 if var_name.is_empty() || var_expr.is_empty() {
                     continue;
                 }
-                match eval_cel_vap_value(var_expr, object, &variables, &request_val) {
+                match eval_cel_vap_value(
+                    var_expr,
+                    object,
+                    &variables,
+                    &request_val,
+                    &namespace_object_val,
+                ) {
                     Some(val) => {
                         variables.insert(var_name.to_string(), val);
                     }
@@ -2645,7 +2749,13 @@ async fn run_validating_admission_policies<S: Store>(
                 if expr.is_empty() {
                     continue;
                 }
-                let result = eval_cel_bool_expr(expr, object, &variables, &request_val);
+                let result = eval_cel_bool_expr(
+                    expr,
+                    object,
+                    &variables,
+                    &request_val,
+                    &namespace_object_val,
+                );
                 let passed = match result {
                     Some(b) => b,
                     None => {
@@ -6291,7 +6401,13 @@ mod tests {
         let object = json!({"metadata": {"name": "x"}});
         let vars = serde_json::Map::new();
         let req = json!({});
-        let result = eval_cel_vap_value("9223372036854775807 * 2", &object, &vars, &req);
+        let result = eval_cel_vap_value(
+            "9223372036854775807 * 2",
+            &object,
+            &vars,
+            &req,
+            &serde_json::Value::Null,
+        );
         assert!(
             result.is_none(),
             "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
@@ -6306,7 +6422,13 @@ mod tests {
         let object = json!({"metadata": {"name": "x"}});
         let vars = serde_json::Map::new();
         let req = json!({});
-        let result = eval_cel_vap_value("-9223372036854775808 / -1", &object, &vars, &req);
+        let result = eval_cel_vap_value(
+            "-9223372036854775808 / -1",
+            &object,
+            &vars,
+            &req,
+            &serde_json::Value::Null,
+        );
         assert!(
             result.is_none(),
             "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
@@ -6319,7 +6441,13 @@ mod tests {
         let object = json!({"metadata": {"name": "x"}});
         let vars = serde_json::Map::new();
         let req = json!({});
-        let result = eval_cel_vap_value("9223372036854775807 + 1", &object, &vars, &req);
+        let result = eval_cel_vap_value(
+            "9223372036854775807 + 1",
+            &object,
+            &vars,
+            &req,
+            &serde_json::Value::Null,
+        );
         assert!(
             result.is_none(),
             "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
@@ -6332,7 +6460,13 @@ mod tests {
         let object = json!({"metadata": {"name": "x"}});
         let vars = serde_json::Map::new();
         let req = json!({});
-        let result = eval_cel_vap_value("-9223372036854775808 % -1", &object, &vars, &req);
+        let result = eval_cel_vap_value(
+            "-9223372036854775808 % -1",
+            &object,
+            &vars,
+            &req,
+            &serde_json::Value::Null,
+        );
         assert!(
             result.is_none(),
             "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
@@ -6346,7 +6480,13 @@ mod tests {
         let vars = serde_json::Map::new();
         let req = json!({});
         // Unary negation of i64::MIN overflows because i64::MAX = -i64::MIN - 1.
-        let result = eval_cel_vap_value("-(-9223372036854775808)", &object, &vars, &req);
+        let result = eval_cel_vap_value(
+            "-(-9223372036854775808)",
+            &object,
+            &vars,
+            &req,
+            &serde_json::Value::Null,
+        );
         assert!(
             result.is_none(),
             "overflowing CEL arithmetic must yield an eval error, not panic the admission request thread (DoS)"
@@ -6701,11 +6841,17 @@ mod tests {
         let mut variables = serde_json::Map::new();
 
         let no_request = serde_json::Value::Null;
+        let no_namespace = serde_json::Value::Null;
 
         // Step 1: evaluate `replicas = object.spec.replicas`
-        let replicas_val =
-            eval_cel_vap_value("object.spec.replicas", &object, &variables, &no_request)
-                .expect("object.spec.replicas must evaluate");
+        let replicas_val = eval_cel_vap_value(
+            "object.spec.replicas",
+            &object,
+            &variables,
+            &no_request,
+            &no_namespace,
+        )
+        .expect("object.spec.replicas must evaluate");
         variables.insert("replicas".into(), replicas_val);
 
         // Step 2: evaluate `oddReplicas = variables.replicas % 2 == 1`
@@ -6714,14 +6860,20 @@ mod tests {
             &object,
             &variables,
             &no_request,
+            &no_namespace,
         )
         .expect("variables.replicas % 2 == 1 must evaluate");
         variables.insert("oddReplicas".into(), odd_val);
 
         // Validate: replicas > 1 → true (3 > 1)
-        let gt_result =
-            eval_cel_bool_expr("variables.replicas > 1", &object, &variables, &no_request)
-                .expect("variables.replicas > 1 must evaluate");
+        let gt_result = eval_cel_bool_expr(
+            "variables.replicas > 1",
+            &object,
+            &variables,
+            &no_request,
+            &no_namespace,
+        )
+        .expect("variables.replicas > 1 must evaluate");
         assert!(
             gt_result,
             "variables.replicas (3) > 1 must be true; \
@@ -6729,9 +6881,14 @@ mod tests {
         );
 
         // Validate: oddReplicas → true (3 is odd)
-        let odd_result =
-            eval_cel_bool_expr("variables.oddReplicas", &object, &variables, &no_request)
-                .expect("variables.oddReplicas must evaluate");
+        let odd_result = eval_cel_bool_expr(
+            "variables.oddReplicas",
+            &object,
+            &variables,
+            &no_request,
+            &no_namespace,
+        )
+        .expect("variables.oddReplicas must evaluate");
         assert!(
             odd_result,
             "variables.oddReplicas must be true for replicas=3; \
@@ -6746,6 +6903,7 @@ mod tests {
             &object_even,
             &variables_even,
             &no_request,
+            &no_namespace,
         )
         .unwrap();
         variables_even.insert("replicas".into(), r2);
@@ -6754,6 +6912,7 @@ mod tests {
             &object_even,
             &variables_even,
             &no_request,
+            &no_namespace,
         )
         .unwrap();
         variables_even.insert("oddReplicas".into(), o2);
@@ -6763,6 +6922,7 @@ mod tests {
             &object_even,
             &variables_even,
             &no_request,
+            &no_namespace,
         )
         .expect("oddReplicas must evaluate for even replicas");
         assert!(
@@ -8015,6 +8175,213 @@ mod tests {
             "Deployment retrieved from store with spec.replicas=2 must be allowed by \
              'object.spec.replicas > 1' — if the store round-trip loses replicas, \
              the VAP wrongly denies valid UPDATE operations. Error: {:?}",
+            result.err()
+        );
+    }
+
+    /// A VAP expression using `namespaceObject.metadata.name` must resolve the actual
+    /// Namespace object of the admitted resource and allow a request when it matches.
+    ///
+    /// This is the regression test for mayor-kxht / the upstream conformance test
+    /// `[sig-api-machinery] ValidatingAdmissionPolicy should validate against a Deployment`,
+    /// which binds a policy to namespace `f.UniqueName` and validates
+    /// `namespaceObject.metadata.name == f.UniqueName`. Before this fix, `namespaceObject`
+    /// was not a resolvable CEL root (only `object`/`variables`/`request` were), so the
+    /// expression always failed to evaluate; a failed evaluation is treated as validation
+    /// failure, so every Deployment in the matched namespace was wrongly denied with
+    /// "Internal error! Other namespace should not be allowed." even though it was created
+    /// in exactly the right namespace. Live-verified: reverting this fix reproduces the
+    /// same denial against a `u7s-apiserver` built from this commit.
+    #[tokio::test]
+    async fn vap_namespace_object_metadata_name_resolves_and_allows_matching_namespace() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let ns = json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "vap-nsobj-ns",
+                "labels": {"vap-nsobj-ns": "true"}
+            }
+        });
+        store
+            .put(
+                "/registry/namespaces/vap-nsobj-ns",
+                bytes::Bytes::from(serde_json::to_vec(&ns).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "nsobj-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "namespaceSelector": {"matchLabels": {"vap-nsobj-ns": "true"}},
+                    "resourceRules": [{
+                        "apiGroups": ["apps"],
+                        "apiVersions": ["v1"],
+                        "resources": ["deployments"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "validations": [{
+                    "expression": "namespaceObject.metadata.name == 'vap-nsobj-ns'",
+                    "message": "Internal error! Other namespace should not be allowed."
+                }]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/nsobj-policy",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "nsobj-binding"},
+            "spec": {
+                "policyName": "nsobj-policy",
+                "validationActions": ["Deny"],
+                "matchResources": {
+                    "namespaceSelector": {"matchLabels": {"vap-nsobj-ns": "true"}}
+                }
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/nsobj-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let deploy = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "replicated", "namespace": "vap-nsobj-ns"},
+            "spec": {"replicas": 2}
+        });
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "replicated",
+            namespace: Some("vap-nsobj-ns"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_validating_webhooks(&state, &deploy, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "namespaceObject.metadata.name must resolve to the real Namespace object and \
+             equal 'vap-nsobj-ns' for a Deployment created in that namespace; an unresolved \
+             namespaceObject makes the validation always fail-closed, wrongly denying the \
+             request. Error: {:?}",
+            result.err()
+        );
+    }
+
+    /// `namespaceObject` must be `Value::Null` for cluster-scoped resources (no namespace).
+    ///
+    /// Matches the upstream ValidatingAdmissionPolicy CEL variable contract: "the namespace
+    /// object that the incoming object belongs to. The value is null for cluster-scoped
+    /// resources." If namespaceObject resolution instead reused a stale/empty object or
+    /// failed to evaluate for cluster-scoped requests, `namespaceObject == null` would
+    /// evaluate to false (or fail evaluation, which is treated as false), incorrectly
+    /// denying admission of cluster-scoped resources like Nodes.
+    #[tokio::test]
+    async fn vap_namespace_object_is_null_for_cluster_scoped_resource() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let policy = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": "nsobj-null-policy"},
+            "spec": {
+                "matchConstraints": {
+                    "resourceRules": [{
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "resources": ["nodes"],
+                        "operations": ["CREATE"]
+                    }]
+                },
+                "validations": [{"expression": "namespaceObject == null"}]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicies/nsobj-null-policy",
+                bytes::Bytes::from(serde_json::to_vec(&policy).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let binding = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": "nsobj-null-binding"},
+            "spec": {
+                "policyName": "nsobj-null-policy",
+                "validationActions": ["Deny"]
+            }
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingadmissionpolicybindings/nsobj-null-binding",
+                bytes::Bytes::from(serde_json::to_vec(&binding).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let node = json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-node-1"}
+        });
+        let ctx = AdmissionContext {
+            group: "",
+            version: "v1",
+            resource: "nodes",
+            name: "worker-node-1",
+            namespace: None,
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+
+        let result = run_validating_webhooks(&state, &node, None, &ctx).await;
+        assert!(
+            result.is_ok(),
+            "namespaceObject must be null for a cluster-scoped resource (Node has no \
+             namespace); if it resolves to anything else, `namespaceObject == null` \
+             evaluates false and Node admission is wrongly denied. Error: {:?}",
             result.err()
         );
     }
