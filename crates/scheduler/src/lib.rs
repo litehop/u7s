@@ -54,6 +54,19 @@ pub async fn http_post_json(
     client.request(Method::POST, path, Some(body_str)).await
 }
 
+pub async fn http_delete(
+    connector: &TlsConnector,
+    base: &str,
+    path: &str,
+) -> anyhow::Result<(StatusCode, String)> {
+    let client = HyperApiClient {
+        server: base.to_owned(),
+        connector: connector.clone(),
+        bearer: None,
+    };
+    client.request(Method::DELETE, path, None).await
+}
+
 // ---------------------------------------------------------------------------
 // Watch streaming — reads newline-delimited JSON from a watch endpoint
 // ---------------------------------------------------------------------------
@@ -102,6 +115,10 @@ struct WatchEvent<T> {
 struct PodSpec {
     node_name: Option<String>,
     node_selector: Option<std::collections::HashMap<String, String>>,
+    /// Scheduling priority. Absent means the apiserver never resolved a
+    /// priorityClassName to a value (or none was set) — treated as 0, the
+    /// lowest rung, by `needs_scheduling`.
+    priority: Option<i32>,
 }
 
 /// Minimal typed view of a Pod's metadata needed by the scheduler.
@@ -120,15 +137,23 @@ struct PodObject {
 
 /// Determine whether a watch event represents a pod that needs scheduling.
 ///
-/// Returns `Some((namespace, pod_name, node_selector))` when the event is an
-/// ADDED or MODIFIED pod with an empty `spec.nodeName`; `None` otherwise.
+/// Returns `Some((namespace, pod_name, node_selector, priority))` when the event
+/// is an ADDED or MODIFIED pod with an empty `spec.nodeName`; `None` otherwise.
 /// `node_selector` is the pod's `spec.nodeSelector` map (empty if absent).
+/// `priority` is the pod's `spec.priority`, defaulting to 0 (the lowest rung)
+/// when absent, so preemption has a value to compare even for pods that never
+/// had a priority resolved.
 ///
 /// Extracted as a pure function so the decision can be unit-tested without
 /// standing up an API server.
 pub fn needs_scheduling(
     event: &Value,
-) -> Option<(String, String, std::collections::HashMap<String, String>)> {
+) -> Option<(
+    String,
+    String,
+    std::collections::HashMap<String, String>,
+    i32,
+)> {
     let watch_event: WatchEvent<PodObject> =
         serde_json::from_value(event.clone()).unwrap_or_else(|_| WatchEvent {
             event_type: String::new(),
@@ -156,7 +181,8 @@ pub fn needs_scheduling(
         .namespace
         .unwrap_or_else(|| "default".to_owned());
     let node_selector = watch_event.object.spec.node_selector.unwrap_or_default();
-    Some((namespace, pod_name.to_owned(), node_selector))
+    let priority = watch_event.object.spec.priority.unwrap_or(0);
+    Some((namespace, pod_name.to_owned(), node_selector, priority))
 }
 
 /// Return `true` if a spawn for `key` ("namespace/name") should proceed.
@@ -250,6 +276,57 @@ pub fn count_non_terminated_pods(body: &str) -> anyhow::Result<u32> {
     Ok(count as u32)
 }
 
+/// A pod already on a node, as needed by preemption victim selection: its
+/// "namespace/name" key (to DELETE it) and its scheduling priority (to decide
+/// whether it is a legal victim for a given pending pod).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodePod {
+    pub key: String,
+    pub priority: i32,
+}
+
+/// Minimal typed view of a pod list item needed for preemption: unlike
+/// `PodListItem` (used by `count_non_terminated_pods`), this retains identity
+/// (namespace/name) and priority instead of collapsing to a count.
+#[derive(Deserialize)]
+struct PreemptionPodListItem {
+    metadata: PodMetadata,
+    #[serde(default)]
+    spec: PodSpec,
+    #[serde(default)]
+    status: PodListItemStatus,
+}
+
+/// Parse a raw pod-list JSON response body (GET /api/v1/pods?fieldSelector=...)
+/// into the non-terminated pods on that node, keyed for preemption eviction.
+///
+/// Mirrors `count_non_terminated_pods`'s terminal-phase filter (Succeeded/Failed
+/// pods are not occupying a slot and so can never be preemption victims) but
+/// keeps each pod's namespace/name and priority instead of reducing to a count.
+///
+/// Returns Err if the body cannot be parsed as a pod list.
+pub fn parse_node_pods(body: &str) -> anyhow::Result<Vec<NodePod>> {
+    #[derive(Deserialize)]
+    struct PodList {
+        items: Vec<PreemptionPodListItem>,
+    }
+    let list: PodList =
+        serde_json::from_str(body).context("parse pod list for preemption victim selection")?;
+    Ok(list
+        .items
+        .into_iter()
+        .filter(|p| p.status.phase != "Succeeded" && p.status.phase != "Failed")
+        .map(|p| NodePod {
+            key: format!(
+                "{}/{}",
+                p.metadata.namespace.unwrap_or_else(|| "default".to_owned()),
+                p.metadata.name.unwrap_or_default()
+            ),
+            priority: p.spec.priority.unwrap_or(0),
+        })
+        .collect())
+}
+
 /// Select the first node from `list` whose labels satisfy `selector` AND that
 /// has at least one free pod slot.
 ///
@@ -291,6 +368,57 @@ pub fn select_node_with_capacity(
     found.map(|n| n.metadata.name).context(
         "no node satisfies the pod's nodeSelector with free pod capacity (NodeResourcesFit)",
     )
+}
+
+/// Select the pods to evict from one node so that a pending pod at
+/// `pending_priority` fits, given the node's pod-count `capacity`.
+///
+/// This is the MVP preemption model: it mirrors `select_node_with_capacity`'s
+/// pod-count-only capacity dimension (no CPU/memory/extended-resource
+/// accounting — the scheduler does not track those at all today).
+///
+/// Only pods with priority STRICTLY LOWER than `pending_priority` are eligible
+/// victims: kube-scheduler never preempts equal-or-higher-priority pods, and
+/// neither must u7s — otherwise same-priority pods could evict each other in a
+/// cycle and scheduling would never stabilize. Eligible victims are evicted
+/// lowest-priority-first (cheapest disruption) until just enough slots are
+/// freed — never more than necessary.
+///
+/// Returns an empty `Vec` — meaning "do not evict anything" — when:
+/// - `capacity` is 0 (unknown/unparseable; `select_node_with_capacity` treats
+///   this as unlimited, so `pick_node` would already have chosen this node), OR
+/// - the pod already fits (fewer pods than capacity) — preemption must never
+///   run when there was room, or it would kill a workload for no reason, OR
+/// - evicting every eligible lower-priority pod still would not free enough
+///   capacity — the pending pod would not fit even after the disruption, so
+///   evicting anyone would be pointless.
+pub fn select_preemption_victims(
+    pending_priority: i32,
+    node_pods: &[NodePod],
+    capacity: u32,
+) -> Vec<String> {
+    if capacity == 0 {
+        return Vec::new();
+    }
+    let used = node_pods.len() as u32;
+    if used < capacity {
+        return Vec::new();
+    }
+    let needed = used - capacity + 1;
+
+    let mut candidates: Vec<&NodePod> = node_pods
+        .iter()
+        .filter(|p| p.priority < pending_priority)
+        .collect();
+    if (candidates.len() as u32) < needed {
+        return Vec::new();
+    }
+    candidates.sort_by_key(|p| p.priority);
+    candidates
+        .into_iter()
+        .take(needed as usize)
+        .map(|p| p.key.clone())
+        .collect()
 }
 
 /// Return true when all entries in `selector` are satisfied by `labels`.
@@ -397,6 +525,97 @@ pub async fn pick_node(
     select_node_with_capacity(list, node_selector, &pod_counts)
 }
 
+/// A viable preemption outcome: the node to bind the pending pod to, and the
+/// "namespace/name" keys of the pods that must be evicted first to free a slot.
+#[derive(Debug, PartialEq)]
+pub struct PreemptionPlan {
+    pub node_name: String,
+    pub victims: Vec<String>,
+}
+
+/// Search every node satisfying `node_selector` for a viable preemption target:
+/// a node where evicting some lower-priority pods would free a slot for a pod
+/// at `pending_priority`.
+///
+/// Intended to run only after `pick_node` has already failed for the same pod —
+/// this is the fallback that stops a higher-priority pod from staying Pending
+/// forever just because lower-priority pods claimed every slot first (mayor-rsei).
+///
+/// Among nodes where preemption would work, the node requiring the FEWEST
+/// victims is chosen (cheapest disruption); ties keep the API server's node-list
+/// order. Returns `Err` when no candidate node — even after preempting every
+/// eligible lower-priority pod on it — could fit the pending pod.
+pub async fn find_preemption_plan(
+    connector: &TlsConnector,
+    server: &str,
+    node_selector: &std::collections::HashMap<String, String>,
+    pending_priority: i32,
+) -> anyhow::Result<PreemptionPlan> {
+    let (status, body) = http_get(connector, server, "/api/v1/nodes").await?;
+    if !status.is_success() {
+        bail!("GET /api/v1/nodes returned {status}: {body}");
+    }
+    let list: NodeList = serde_json::from_str(&body).context("parse NodeList")?;
+
+    let mut best: Option<PreemptionPlan> = None;
+    for node in &list.items {
+        if !node_selector_matches(&node.metadata.labels, node_selector) {
+            continue;
+        }
+        let cap_str = if !node.status.allocatable.pods.is_empty() {
+            &node.status.allocatable.pods
+        } else {
+            &node.status.capacity.pods
+        };
+        let capacity = parse_pod_capacity(cap_str);
+        if capacity == 0 {
+            // Unknown/unlimited capacity — pick_node would already have picked
+            // this node, so it cannot be why scheduling failed.
+            continue;
+        }
+
+        let node_name = &node.metadata.name;
+        let pods_path = format!("/api/v1/pods?fieldSelector=spec.nodeName%3D{node_name}");
+        let node_pods = match http_get(connector, server, &pods_path).await {
+            Ok((ps, pb)) if ps.is_success() => match parse_node_pods(&pb) {
+                Ok(pods) => pods,
+                Err(e) => {
+                    tracing::warn!("failed to parse pods on {node_name} for preemption: {e}");
+                    continue;
+                }
+            },
+            Ok((ps, pb)) => {
+                tracing::warn!(
+                    "GET pods for node {node_name} returned {ps}: {pb} — skipping for preemption"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "GET pods for node {node_name} failed: {e} — skipping for preemption"
+                );
+                continue;
+            }
+        };
+
+        let victims = select_preemption_victims(pending_priority, &node_pods, capacity);
+        if victims.is_empty() {
+            continue;
+        }
+        let is_cheaper = best
+            .as_ref()
+            .is_none_or(|b| victims.len() < b.victims.len());
+        if is_cheaper {
+            best = Some(PreemptionPlan {
+                node_name: node_name.clone(),
+                victims,
+            });
+        }
+    }
+
+    best.context("no node can fit the pending pod even after preempting lower-priority pods")
+}
+
 /// The target of a Binding — identifies the node to bind to.
 #[derive(Serialize)]
 struct BindingTarget<'a> {
@@ -478,6 +697,56 @@ pub async fn bind_pod(
     let (status, body) = http_post_json(connector, server, &path, &payload).await?;
     check_bind_response(status.as_u16(), &body)?;
     info!("bound pod {namespace}/{pod_name} → node {node_name}");
+    Ok(())
+}
+
+/// Build the DELETE path for a pod in a given namespace.
+///
+/// Pure function extracted so callers can test path construction without
+/// network access — mirrors `binding_path`.
+pub fn delete_pod_path(namespace: &str, pod_name: &str) -> String {
+    format!("/api/v1/namespaces/{namespace}/pods/{pod_name}")
+}
+
+/// Check a pod-eviction DELETE response status, returning Err on failures other
+/// than "already gone".
+///
+/// A 404 means the pod was already removed — by a previous retry of this same
+/// eviction, or another actor — which is the outcome preemption wants, so it
+/// must be treated as success rather than aborting the eviction loop.
+pub fn check_delete_response(status: u16) -> anyhow::Result<()> {
+    if (200..300).contains(&status) || status == 404 {
+        return Ok(());
+    }
+    bail!("evict failed with HTTP {status}")
+}
+
+/// Evict a pod (preemption's victim-removal step) via DELETE .../pods/:name.
+///
+/// The apiserver's pod DELETE always soft-deletes on the first call (stamps
+/// `deletionTimestamp` so a real kubelet can gracefully terminate the
+/// container) and only hard-deletes once the pod is already Terminating with
+/// no finalizers. kube-scheduler's real preemption waits out that grace
+/// period via its scheduling queue; this MVP explicitly skips that
+/// multi-round wait (no such queue exists here) and instead issues the
+/// DELETE twice to force immediate removal — equivalent to `kubectl delete
+/// --grace-period=0 --force`, and the same force-hard-delete pattern already
+/// used by this codebase's Job/CronJob GC (see `delete_pods_owned_by` in the
+/// apiserver). Without this, the freed slot would not be visible yet when the
+/// caller immediately tries to bind the preemptor into it.
+pub async fn delete_pod(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pod_name: &str,
+) -> anyhow::Result<()> {
+    let path = delete_pod_path(namespace, pod_name);
+    for _ in 0..2 {
+        let (status, body) = http_delete(connector, server, &path).await?;
+        check_delete_response(status.as_u16())
+            .with_context(|| format!("evicting {namespace}/{pod_name}: {body}"))?;
+    }
+    info!("evicted pod {namespace}/{pod_name} (preemption)");
     Ok(())
 }
 
@@ -701,7 +970,7 @@ mod tests {
         });
         let result = needs_scheduling(&event);
         assert!(result.is_some(), "expected Some for unscheduled pod");
-        let (ns, name, _) = result.unwrap();
+        let (ns, name, _, _) = result.unwrap();
         assert_eq!(ns, "kube-system", "namespace must come from event metadata");
         assert_eq!(name, "coredns-abc");
     }
@@ -717,7 +986,7 @@ mod tests {
         });
         let result = needs_scheduling(&event);
         assert!(result.is_some());
-        let (ns, name, _) = result.unwrap();
+        let (ns, name, _, _) = result.unwrap();
         assert_eq!(ns, "default");
         assert_eq!(name, "my-pod");
     }
@@ -757,7 +1026,7 @@ mod tests {
                 "spec": {}
             }
         });
-        let (ns, name, _) = needs_scheduling(&event).expect("should schedule");
+        let (ns, name, _, _) = needs_scheduling(&event).expect("should schedule");
         assert_eq!(ns, "default");
         assert_eq!(name, "no-ns-pod");
     }
@@ -775,7 +1044,7 @@ mod tests {
         });
         let result = needs_scheduling(&event);
         assert!(result.is_some());
-        let (ns, name, _) = result.unwrap();
+        let (ns, name, _, _) = result.unwrap();
         assert_eq!(ns, "staging");
         assert_eq!(name, "pending-pod");
     }
@@ -1023,7 +1292,7 @@ mod tests {
             result.is_some(),
             "null nodeName must be treated as unscheduled"
         );
-        let (ns, name, _) = result.unwrap();
+        let (ns, name, _, _) = result.unwrap();
         assert_eq!(ns, "default");
         assert_eq!(name, "null-node-pod");
     }
@@ -1402,7 +1671,7 @@ mod tests {
             result.is_some(),
             "expected Some for unscheduled pod with nodeSelector"
         );
-        let (ns, name, selector) = result.unwrap();
+        let (ns, name, selector, _) = result.unwrap();
         assert_eq!(ns, "sched-pred");
         assert_eq!(name, "restricted-pod");
         assert_eq!(
@@ -1427,10 +1696,245 @@ mod tests {
                 "spec": {}
             }
         });
-        let (_, _, selector) = needs_scheduling(&event).expect("should schedule");
+        let (_, _, selector, _) = needs_scheduling(&event).expect("should schedule");
         assert!(
             selector.is_empty(),
             "pod without nodeSelector must produce an empty selector (matches any node)"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Preemption (mayor-rsei): needs_scheduling priority extraction,
+    // parse_node_pods, and select_preemption_victims.
+    //
+    // Without priority-aware preemption, a higher-priority pod stays Pending
+    // forever whenever lower-priority pods already claimed every slot on every
+    // matching node — priority would be metadata nobody ever acts on.
+    // ---------------------------------------------------------------------------
+
+    /// needs_scheduling extracts spec.priority from the watch event.
+    ///
+    /// If priority is silently dropped here (as it once was — mayor-osuq), every
+    /// pod looks identical to preemption and a high-priority pod can never
+    /// legitimately evict a low-priority one.
+    #[test]
+    fn needs_scheduling_returns_priority_from_event() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "high-pod", "namespace": "default" },
+                "spec": { "priority": 1000 }
+            }
+        });
+        let (_, _, _, priority) = needs_scheduling(&event).expect("should schedule");
+        assert_eq!(
+            priority, 1000,
+            "spec.priority must be extracted from the watch event — otherwise \
+             preemption cannot distinguish this pod from a default-priority one"
+        );
+    }
+
+    /// A pod with no spec.priority (no PriorityClass resolved) must default to 0,
+    /// the lowest rung — matching Kubernetes' default pod priority. Without this
+    /// default, such pods would be indistinguishable from `Option::None` and
+    /// preemption's integer comparisons would need special-casing everywhere.
+    #[test]
+    fn needs_scheduling_defaults_priority_to_zero_when_absent() {
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "plain-pod", "namespace": "default" },
+                "spec": {}
+            }
+        });
+        let (_, _, _, priority) = needs_scheduling(&event).expect("should schedule");
+        assert_eq!(
+            priority, 0,
+            "a pod with no priority set must default to 0, not be treated as \
+             missing/unschedulable"
+        );
+    }
+
+    // parse_node_pods tests — the per-node pod listing that drives preemption
+    // victim selection. Unlike count_non_terminated_pods, this retains identity
+    // (to DELETE the victim) and priority (to decide if it's a legal victim).
+
+    /// parse_node_pods excludes terminal-phase pods (they are not occupying a
+    /// slot, so evicting them would help nobody) and extracts each pod's key and
+    /// priority.
+    #[test]
+    fn parse_node_pods_excludes_terminal_phases_and_extracts_priority() {
+        let body = serde_json::json!({
+            "items": [
+                { "metadata": {"name": "a", "namespace": "ns1"}, "spec": {"priority": 100}, "status": {"phase": "Running"} },
+                { "metadata": {"name": "b", "namespace": "ns1"}, "spec": {"priority": 5}, "status": {"phase": "Succeeded"} },
+            ]
+        })
+        .to_string();
+        let pods = parse_node_pods(&body).expect("should parse");
+        assert_eq!(
+            pods.len(),
+            1,
+            "a Succeeded pod is not consuming a slot and must never be offered as \
+             a preemption victim"
+        );
+        assert_eq!(pods[0].key, "ns1/a");
+        assert_eq!(pods[0].priority, 100);
+    }
+
+    /// A pod with no spec.priority must default to 0 in parse_node_pods too —
+    /// the same default needs_scheduling applies, so a pending pod at priority 1
+    /// can still legally preempt it.
+    #[test]
+    fn parse_node_pods_defaults_priority_to_zero_when_absent() {
+        let body = serde_json::json!({
+            "items": [
+                { "metadata": {"name": "a", "namespace": "default"}, "spec": {}, "status": {"phase": "Running"} },
+            ]
+        })
+        .to_string();
+        let pods = parse_node_pods(&body).expect("should parse");
+        assert_eq!(
+            pods[0].priority, 0,
+            "a node-resident pod with no priority set must default to 0"
+        );
+    }
+
+    // select_preemption_victims tests — the victim-selection decision at the
+    // heart of preemption.
+
+    fn np(key: &str, priority: i32) -> NodePod {
+        NodePod {
+            key: key.to_owned(),
+            priority,
+        }
+    }
+
+    /// A full node's only lower-priority pod must be selected as a victim.
+    /// Without this, a higher-priority pod stays Pending forever whenever a
+    /// lower-priority pod got scheduled first — priority would be meaningless.
+    #[test]
+    fn select_preemption_victims_evicts_lower_priority_pod_when_node_is_full() {
+        let node_pods = vec![np("default/low", 1)];
+        let victims = select_preemption_victims(100, &node_pods, 1);
+        assert_eq!(
+            victims,
+            vec!["default/low".to_owned()],
+            "the node's only pod is lower priority and must be evicted to fit \
+             the pending pod"
+        );
+    }
+
+    /// kube-scheduler never preempts equal-or-higher-priority pods; if u7s did,
+    /// same-priority pods could evict each other in a cycle and scheduling would
+    /// never stabilize.
+    #[test]
+    fn select_preemption_victims_never_evicts_equal_or_higher_priority_pods() {
+        let node_pods = vec![np("default/same", 100), np("default/higher", 500)];
+        let victims = select_preemption_victims(100, &node_pods, 1);
+        assert!(
+            victims.is_empty(),
+            "equal/higher priority pods must never be preemption victims — got {victims:?}"
+        );
+    }
+
+    /// If the pending pod already fits (the node has a free slot), no eviction may
+    /// happen — killing a running workload when there was room to spare would be
+    /// a pure regression, not preemption.
+    #[test]
+    fn select_preemption_victims_returns_empty_when_pod_already_fits() {
+        let node_pods = vec![np("default/low", 1)];
+        let victims = select_preemption_victims(100, &node_pods, 5);
+        assert!(
+            victims.is_empty(),
+            "no eviction is needed when the node already has free capacity; got {victims:?}"
+        );
+    }
+
+    /// If evicting every eligible lower-priority pod still would not free enough
+    /// capacity, preemption must give up rather than evict pods for nothing — the
+    /// pending pod would still not fit, so the disruption would help no one.
+    #[test]
+    fn select_preemption_victims_returns_empty_when_evicting_all_lower_priority_pods_still_not_enough(
+    ) {
+        // capacity=1, 3 pods present → 3 slots must free (needed = 3-1+1 = 3).
+        // Only one pod (priority 1) is an eligible (lower-priority) victim; the
+        // other two outrank the pending pod and can never be evicted. Evicting
+        // the sole eligible pod only frees 1 of the 3 needed slots.
+        let node_pods = vec![
+            np("default/low", 1),
+            np("default/high-1", 500),
+            np("default/high-2", 500),
+        ];
+        let victims = select_preemption_victims(100, &node_pods, 1);
+        assert!(
+            victims.is_empty(),
+            "must not evict any pod when doing so still would not free enough \
+             capacity for the pending pod; got {victims:?}"
+        );
+    }
+
+    /// When several lower-priority pods are eligible but only one eviction is
+    /// needed, preemption must evict the cheapest (lowest-priority) pod and no
+    /// more than necessary — over-eviction disrupts workloads for no benefit.
+    #[test]
+    fn select_preemption_victims_evicts_lowest_priority_first_and_no_more_than_needed() {
+        let node_pods = vec![np("default/mid", 50), np("default/lowest", 1)];
+        // capacity=2, used=2 (node exactly full) → needed = 2-2+1 = 1 slot.
+        let victims = select_preemption_victims(100, &node_pods, 2);
+        assert_eq!(
+            victims,
+            vec!["default/lowest".to_owned()],
+            "must evict the single lowest-priority pod, not the mid-priority one, \
+             and must not evict more pods than needed to fit the pending pod"
+        );
+    }
+
+    /// A node with unknown pod-capacity (0 — see parse_pod_capacity) is treated as
+    /// unlimited by select_node_with_capacity, so pick_node would already have
+    /// chosen it; preemption must never trigger for such a node.
+    #[test]
+    fn select_preemption_victims_returns_empty_for_unknown_capacity_node() {
+        let node_pods = vec![np("default/low", 1)];
+        let victims = select_preemption_victims(100, &node_pods, 0);
+        assert!(
+            victims.is_empty(),
+            "unknown capacity (0) must never trigger eviction; got {victims:?}"
+        );
+    }
+
+    // delete_pod_path / check_delete_response tests — the eviction request shape
+    // and error handling, mirroring binding_path / check_bind_response.
+
+    #[test]
+    fn delete_pod_path_produces_correct_api_path() {
+        let path = delete_pod_path("default", "victim-pod");
+        assert_eq!(path, "/api/v1/namespaces/default/pods/victim-pod");
+    }
+
+    /// A 404 means the victim is already gone (e.g. a retried eviction) — that is
+    /// the desired end state, so it must be treated as success, not an error that
+    /// aborts the rest of the preemption flow.
+    #[test]
+    fn check_delete_response_ok_on_404_already_gone() {
+        assert!(
+            check_delete_response(404).is_ok(),
+            "404 (already deleted) must be treated as success for eviction"
+        );
+    }
+
+    #[test]
+    fn check_delete_response_ok_on_2xx() {
+        assert!(check_delete_response(200).is_ok());
+        assert!(check_delete_response(202).is_ok());
+    }
+
+    /// A genuine failure (e.g. 500, or 403 if RBAC forbids the scheduler from
+    /// deleting pods) must surface as Err so the caller aborts rather than binding
+    /// the preemptor onto a node that never actually freed capacity.
+    #[test]
+    fn check_delete_response_err_on_failure() {
+        assert!(check_delete_response(500).is_err());
+        assert!(check_delete_response(403).is_err());
     }
 }
