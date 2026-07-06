@@ -3219,6 +3219,20 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
         pod["spec"]["dnsPolicy"] = serde_json::json!("ClusterFirst");
     }
 
+    // serviceAccountName: default to "default" when absent or empty, mirroring
+    // upstream's ServiceAccount admission plugin. client-go's token-fetch machinery
+    // rejects an empty resource name ("failed to fetch token: resource name may not
+    // be empty"), so a pod with no serviceAccountName can never start — the kubelet
+    // needs a real name to request the projected SA token for. This also unblocks
+    // inject_sa_token_volume below, which only fires when serviceAccountName is set.
+    if pod["spec"]["serviceAccountName"]
+        .as_str()
+        .unwrap_or("")
+        .is_empty()
+    {
+        pod["spec"]["serviceAccountName"] = serde_json::json!("default");
+    }
+
     // defaultMode for volume sources that require it.
     // The kubelet refuses to mount ConfigMap/Secret volumes whose defaultMode is absent:
     //   "no defaultMode used, not even the default value for it"
@@ -4012,6 +4026,106 @@ mod create_defaults_tests {
             serde_json::json!("None"),
             "dnsPolicy=None must be preserved — user-managed DNS pods configure \
              nameservers via dnsConfig; overriding would silently redirect DNS traffic"
+        );
+    }
+
+    // --- serviceAccountName defaulting tests ---
+
+    /// A pod created with no serviceAccountName must get "default".
+    ///
+    /// Without this default, client-go's token-fetch machinery rejects the empty
+    /// resource name ("failed to fetch token: resource name may not be empty") and
+    /// the pod never starts — this was the live-reproduced failure behind
+    /// "[sig-auth] ServiceAccounts should mount projected service account token".
+    /// It also gates inject_sa_token_volume, which only injects the token volume
+    /// when serviceAccountName is non-empty.
+    #[test]
+    fn service_account_name_defaults_to_default_when_absent() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "bare-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["serviceAccountName"], "default",
+            "spec.serviceAccountName must default to \"default\" when absent — an empty \
+             name fails kubelet's token fetch and the pod never runs"
+        );
+    }
+
+    /// A pod with serviceAccountName == "" (empty string) must also get "default".
+    ///
+    /// Some clients send an explicit empty string rather than omitting the field
+    /// entirely; both must be treated as "unset" per upstream ServiceAccount admission.
+    #[test]
+    fn service_account_name_empty_string_defaults_to_default() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "serviceAccountName": "",
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["serviceAccountName"], "default",
+            "empty-string serviceAccountName must be treated as absent and defaulted"
+        );
+    }
+
+    /// An explicit non-default serviceAccountName must not be overwritten.
+    ///
+    /// Overwriting a caller's chosen SA would silently change the pod's identity
+    /// and RBAC permissions.
+    #[test]
+    fn service_account_name_explicit_value_preserved() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "serviceAccountName": "custom-sa",
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["serviceAccountName"], "custom-sa",
+            "an explicit serviceAccountName must not be overwritten by the default"
+        );
+    }
+
+    /// End-to-end: a bare pod with no serviceAccountName must still receive the
+    /// kube-api-access token volume once defaulting runs before injection.
+    ///
+    /// This is the exact bug scenario: bare pods had no
+    /// /var/run/secrets/kubernetes.io/serviceaccount because inject_sa_token_volume
+    /// requires a non-empty serviceAccountName, which was never defaulted. If the
+    /// serviceAccountName default is removed or reordered after injection, this
+    /// test fails and in-cluster clients (extension apiservers, sonobuoy) lose
+    /// their token again.
+    #[test]
+    fn bare_pod_gets_token_volume_via_defaulted_service_account_name() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "bare-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        inject_sa_token_volume(&mut pod, "bare-pod");
+        let volumes = pod["spec"]["volumes"]
+            .as_array()
+            .expect("volumes must be set once serviceAccountName is defaulted");
+        assert!(
+            volumes.iter().any(|v| v["name"]
+                .as_str()
+                .map(|n| n.starts_with("kube-api-access-"))
+                .unwrap_or(false)),
+            "a bare pod (no explicit serviceAccountName) must still get the \
+             kube-api-access-* token volume via the defaulted \"default\" SA"
         );
     }
 
