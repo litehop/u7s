@@ -393,6 +393,45 @@ pub async fn pod_attach<S: Store>(
     Ok(resp)
 }
 
+/// /attach (POST) — client-go's `remotecommand` executor dials WebSocket (GET) first;
+/// its websocket transport treats ANY non-101 handshake response as an upgrade
+/// failure — including a clean 403 admission denial — and silently retries the
+/// exact same request via SPDY (POST), discarding the original error and message
+/// entirely (see `httpstream.IsUpgradeFailure` / `NewFallbackExecutor` upstream).
+///
+/// Previously this route mapped POST to `pod_attach`, whose `WebSocketUpgrade`
+/// extractor rejects any non-GET method before the handler body runs — so the
+/// fallback request never reached `resolve_attach_target`/admission a second time,
+/// and the client's terminal error was axum's generic "Request method must be
+/// `GET`" instead of the webhook's denial message (mayor-u6eb).
+///
+/// Run the same pre-upgrade checks here so the fallback surfaces the same Status
+/// (denial, not-found, not-scheduled, ...) that the GET attempt already computed.
+/// Real SPDY streaming is not implemented; if every check passes there is nothing
+/// left to report here — the GET/WebSocket attempt above already succeeds in that
+/// case, so a working client never depends on this branch.
+pub async fn pod_attach_post<S: Store>(
+    State(state): State<AppState<S>>,
+    Path((raw_ns, pod_name)): Path<(String, String)>,
+    Query(query): Query<AttachQuery>,
+) -> Result<Response, crate::status::StatusError> {
+    resolve_attach_target(&state, &raw_ns, &pod_name, &query).await?;
+    Err(crate::status::StatusError(
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        crate::status::Status {
+            kind: "Status",
+            api_version: "v1",
+            status: "Failure",
+            message:
+                "attach via SPDY (POST upgrade) is not implemented; use a WebSocket-capable client"
+                    .to_string(),
+            reason: "NotImplemented",
+            code: 501,
+            metadata: None,
+        },
+    ))
+}
+
 /// Build a rustls `ClientConfig` that pins trust to the cluster CA and optionally
 /// presents a client certificate to the kubelet.
 ///
@@ -1709,7 +1748,7 @@ mod tests {
             )
             .route(
                 "/api/v1/namespaces/{ns}/pods/{name}/attach",
-                get(pod_attach).post(pod_attach),
+                get(pod_attach).post(pod_attach_post),
             )
             .route(
                 "/api/v1/namespaces/{ns}/pods/{name}/portforward",
@@ -3967,6 +4006,152 @@ mod tests {
             body_json.contains("is not allowed"),
             "the denial message from the webhook must be propagated to the client: {}",
             body_json
+        );
+    }
+
+    /// A denied attach must surface the webhook's message even through client-go's
+    /// SPDY (POST) fallback — not just the pure `resolve_attach_target` call above.
+    ///
+    /// client-go's remotecommand executor dials WebSocket (GET) first; its transport
+    /// treats ANY non-101 handshake response — including our correct 403 denial — as
+    /// an upgrade failure and silently retries the identical request via POST,
+    /// discarding the GET attempt's error and message entirely. kubectl only ever
+    /// prints the *retry's* result. Before this fix, POST was routed to `pod_attach`,
+    /// whose `WebSocketUpgrade` extractor 405s any non-GET method before admission
+    /// runs — so the retry (the only error the user sees) was axum's generic
+    /// "Request method must be `GET`", not the webhook's message. This test fails if
+    /// the POST route reverts to `pod_attach`.
+    #[tokio::test]
+    async fn pod_attach_post_fallback_surfaces_webhook_denial_not_generic_405() {
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let denial_router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": false,
+                        "status": {
+                            "code": 403,
+                            "message": "attaching to pod 'to-be-attached-pod' is not allowed"
+                        }
+                    }
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let webhook_url = format!("http://{addr}/webhook");
+        tokio::spawn(async move {
+            axum::serve(listener, denial_router).await.ok();
+        });
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("open in-memory db"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "deny-attach-post"},
+            "webhooks": [{
+                "name": "deny-attach-post.example.com",
+                "clientConfig": {"url": webhook_url},
+                "rules": [{
+                    "apiGroups": [""],
+                    "apiVersions": ["v1"],
+                    "resources": ["pods/attach"],
+                    "operations": ["CONNECT"]
+                }],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/deny-attach-post",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "to-be-attached-pod", "namespace": "default", "resourceVersion": "1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+        state
+            .store
+            .put(
+                &crate::keys::object_key("pods", "default", "to-be-attached-pod"),
+                bytes::Bytes::from(pod.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-1", "resourceVersion": "1"},
+            "status": {"addresses": [{"type": "InternalIP", "address": "10.0.0.1"}]}
+        });
+        state
+            .store
+            .put(
+                &crate::keys::cluster_object_key("nodes", "node-1"),
+                bytes::Bytes::from(node.to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Simulate client-go's SPDY fallback: a POST to the exact URL the denied
+        // GET/WebSocket dial already used.
+        let mut router = make_router(state);
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/to-be-attached-pod/attach")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.call(req).await.unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "the POST fallback must return the webhook's 403 denial, not axum's generic \
+             405 'Request method must be `GET`' — kubectl discards the GET attempt's \
+             error and shows only this response to the user"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains("is not allowed"),
+            "the webhook's denial message must reach the client through the POST \
+             fallback path — kubectl only prints this response's body: {body_str}"
+        );
+        assert!(
+            !body_str.contains("Request method must be"),
+            "regression guard: this is axum's generic WebSocketUpgrade rejection text — \
+             seeing it here means the POST route fell back to pod_attach and admission \
+             never ran on the retried request: {body_str}"
         );
     }
 
