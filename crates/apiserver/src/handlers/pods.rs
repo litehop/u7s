@@ -7305,6 +7305,91 @@ mod handler_tests {
         );
     }
 
+    /// A bare pod (POST with no spec.serviceAccountName at all) must come back
+    /// from the full create_pod handler with a "default" serviceAccountName AND
+    /// the kube-api-access-* token volume mounted into its container.
+    ///
+    /// This is the exact live-reproduced scenario behind the Aggregator
+    /// sample-apiserver and "[sig-auth] ServiceAccounts should mount an API
+    /// token into pods" conformance failures: `kubectl run` sends a pod with no
+    /// serviceAccountName, kube-apiserver defaults it to "default" and the
+    /// ServiceAccount admission plugin injects the token volume — without both
+    /// steps wired into the same create path, in-cluster clients (extension
+    /// apiservers, sonobuoy) find no token file and crash-loop.
+    #[tokio::test]
+    async fn create_bare_pod_gets_default_sa_and_token_volume() {
+        let (state, store) = make_state();
+        seed_namespace(&store, "default").await;
+
+        let app = Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create_pod))
+            .layer(auth_layer())
+            .with_state(state);
+
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "bare-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&pod))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let stored = store
+            .get("/registry/pods/default/bare-pod")
+            .await
+            .unwrap()
+            .expect("pod must be in store");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+
+        assert_eq!(
+            v["spec"]["serviceAccountName"], "default",
+            "a pod with no serviceAccountName must be defaulted to \"default\" — \
+             without it, kubelet's token fetch fails with 'resource name may not be empty'"
+        );
+        let has_token_volume = v["spec"]["volumes"]
+            .as_array()
+            .map(|vols| {
+                vols.iter().any(|vol| {
+                    vol["name"]
+                        .as_str()
+                        .map(|n| n.starts_with("kube-api-access-"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            has_token_volume,
+            "a bare pod must get the kube-api-access-* token volume — without it \
+             /var/run/secrets/kubernetes.io/serviceaccount is missing and in-cluster \
+             clients (extension apiservers, sonobuoy) cannot authenticate"
+        );
+        let has_mount = v["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .map(|mounts| {
+                mounts.iter().any(|m| {
+                    m["mountPath"].as_str() == Some("/var/run/secrets/kubernetes.io/serviceaccount")
+                })
+            })
+            .unwrap_or(false);
+        assert!(
+            has_mount,
+            "the container must have a volumeMount at \
+             /var/run/secrets/kubernetes.io/serviceaccount — without it the SA \
+             token volume is mounted nowhere and clients still can't read the token"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // replace_pod (PUT)
     // -----------------------------------------------------------------------
