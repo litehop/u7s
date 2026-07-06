@@ -2026,6 +2026,7 @@ pub async fn delete_collection_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural)): Path<(String, String, String)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     // Verify the resource is known; return 404 for unknown resource types.
     let _meta = lookup(&state, &group, &version, &plural)
@@ -2044,6 +2045,13 @@ pub async fn delete_collection_resource<S: Store>(
         .as_deref()
         .map(parse_label_selector)
         .transpose()?;
+
+    // Built once — reused for every per-object AdmissionContext below.
+    let user_info = Some(serde_json::json!({
+        "username": user.username,
+        "uid": user.uid,
+        "groups": user.groups,
+    }));
 
     for obj in resp.items {
         // Extract name from the stored JSON for RBAC index eviction and protection.
@@ -2065,6 +2073,26 @@ pub async fn delete_collection_resource<S: Store>(
             if is_seeded_rbac_object(&group, &name) {
                 continue;
             }
+
+            // Admission webhook pipeline (validating only — mutating webhooks do not apply
+            // to DELETE), invoked per object exactly like the single-delete handlers above.
+            // Upstream kube-apiserver's DeleteCollection runs admission per object too; a
+            // Fail-policy deny propagates here and aborts the whole request at this object —
+            // objects already deleted earlier in this loop stay deleted (DeleteCollection is
+            // not transactional upstream either), matching the fail-fast handling the store
+            // error branch below already uses for this same loop.
+            let admission_ctx = AdmissionContext {
+                group: &group,
+                version: &version,
+                resource: &plural,
+                name: &name,
+                namespace: None,
+                operation: "DELETE",
+                user_info: user_info.clone(),
+                dry_run: false,
+            };
+            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+
             if group == RBAC_GROUP && !name.is_empty() {
                 let rbac_key = rbac_cluster_key(&group, &version, &plural, &name);
                 state.rbac_index.remove_object(&rbac_key);
@@ -2111,6 +2139,7 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural)): Path<(String, String, String, String)>,
     Query(query): Query<CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     validate_name("namespace", &ns)?;
     let _meta = lookup(&state, &group, &version, &plural)
@@ -2130,6 +2159,13 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
         .map(parse_label_selector)
         .transpose()?;
 
+    // Built once — reused for every per-object AdmissionContext below.
+    let user_info = Some(serde_json::json!({
+        "username": user.username,
+        "uid": user.uid,
+        "groups": user.groups,
+    }));
+
     for obj in resp.items {
         let mut cluster_ip_to_release: Option<String> = None;
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) {
@@ -2146,12 +2182,33 @@ pub async fn delete_collection_namespaced_resource<S: Store>(
                     cluster_ip_to_release = Some(ip);
                 }
             }
+            // Clone (rather than move) `parsed` into the label-selector check — the
+            // admission call below still needs the full object.
             if let Some(ref pairs) = label_pairs {
-                let kept = apply_label_selector(vec![parsed], pairs);
+                let kept = apply_label_selector(vec![parsed.clone()], pairs);
                 if kept.is_empty() {
                     continue;
                 }
             }
+
+            // Admission webhook pipeline (validating only — mutating webhooks do not apply
+            // to DELETE), invoked per object exactly like the single-delete handlers and
+            // mirroring delete_collection_resource above. A Fail-policy deny propagates here
+            // and aborts the whole request at this object — objects already deleted earlier
+            // in this loop stay deleted, matching the fail-fast handling the store error
+            // branch below already uses for this same loop.
+            let admission_ctx = AdmissionContext {
+                group: &group,
+                version: &version,
+                resource: &plural,
+                name: &name,
+                namespace: Some(&ns),
+                operation: "DELETE",
+                user_info: user_info.clone(),
+                dry_run: false,
+            };
+            run_validating_webhooks(&state, &parsed, Some(&parsed), &admission_ctx).await?;
+
             if group == RBAC_GROUP && !name.is_empty() {
                 let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
                 state.rbac_index.remove_object(&rbac_key);
@@ -5261,6 +5318,7 @@ mod tests {
                 allow_watch_bookmarks: None,
                 timeout_seconds: None,
             }),
+            test_user(),
         )
         .await;
         assert!(result.is_ok(), "collection delete must succeed");
@@ -7639,6 +7697,7 @@ mod tests {
                 allow_watch_bookmarks: None,
                 timeout_seconds: None,
             }),
+            test_user(),
         )
         .await
         .unwrap_or_else(|_| panic!("delete_collection must succeed"));
@@ -8039,6 +8098,7 @@ mod tests {
                 allow_watch_bookmarks: None,
                 timeout_seconds: None,
             }),
+            test_user(),
         )
         .await
         .unwrap_or_else(|_| panic!("delete_collection must succeed"));
@@ -12717,6 +12777,7 @@ mod tests {
                 allow_watch_bookmarks: None,
                 timeout_seconds: None,
             }),
+            test_user(),
         )
         .await;
 
@@ -12790,6 +12851,7 @@ mod tests {
                 allow_watch_bookmarks: None,
                 timeout_seconds: None,
             }),
+            test_user(),
         )
         .await;
 
@@ -12977,6 +13039,7 @@ mod tests {
                 allow_watch_bookmarks: None,
                 timeout_seconds: None,
             }),
+            test_user(),
         )
         .await;
 
@@ -12985,6 +13048,199 @@ mod tests {
             "delete_collection must tolerate NotFound (concurrent-delete race) \
              and still return 200 — treating NotFound as fatal would cause spurious \
              errors during normal namespace teardown"
+        );
+    }
+
+    /// A validating webhook with failurePolicy=Fail and an unreachable URL must deny a
+    /// namespaced deletecollection, not just single-object DELETE.
+    ///
+    /// Regression test for mayor-07he: mayor-w354 (PR #700) wired admission into the
+    /// single-delete handlers but explicitly deferred deletecollection, so
+    /// `kubectl delete configmaps --all` bypassed a Fail-policy validating webhook that
+    /// would have blocked each object individually — a webhook must be able to deny a
+    /// deletecollection, else bulk deletes bypass admission that single deletes enforce.
+    /// If delete_collection_namespaced_resource stops calling run_validating_webhooks per
+    /// object (i.e. this fix is reverted), the delete below succeeds and both ConfigMaps
+    /// disappear from the store — this test then fails, proving the admission invocation
+    /// was removed.
+    #[tokio::test]
+    async fn delete_collection_namespaced_calls_validating_admission_fail_policy_denies() {
+        let state = make_state();
+        let ns = "cm-delcol-ns";
+
+        for name in ["cm-one", "cm-two"] {
+            let key = crate::keys::group_object_key("", "configmaps", Some(ns), name);
+            let val = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": { "name": name, "namespace": ns },
+                "data": {}
+            });
+            state
+                .store
+                .put(
+                    &key,
+                    bytes::Bytes::from(serde_json::to_vec(&val).unwrap()),
+                    None,
+                )
+                .await
+                .expect("seed configmap must succeed");
+        }
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "cm-delcol-vwc"},
+            "webhooks": [{
+                "name": "cm.deny-delete.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["DELETE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/cm-delcol-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = delete_collection_namespaced_resource(
+            State(state.clone()),
+            Path(("".into(), "v1".into(), ns.into(), "configmaps".into())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a validating webhook must be able to deny a deletecollection, else bulk \
+             deletes bypass admission that single deletes enforce"
+        );
+
+        // Both ConfigMaps must survive — a webhook denial must not remove any matched object.
+        let prefix = crate::keys::group_list_prefix("", "configmaps", Some(ns));
+        let remaining = state
+            .store
+            .list(&prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list must succeed");
+        assert_eq!(
+            remaining.items.len(),
+            2,
+            "deletecollection denied by admission must leave every matched object in \
+             place — a partial delete would mean bulk delete only partially enforces \
+             admission"
+        );
+    }
+
+    /// A validating webhook with failurePolicy=Fail and an unreachable URL must deny a
+    /// cluster-scoped deletecollection too, not just namespaced ones.
+    ///
+    /// Companion to delete_collection_namespaced_calls_validating_admission_fail_policy_denies
+    /// above: proves delete_collection_resource (the cluster-scoped sibling handler) also
+    /// invokes admission per object on DELETE. If this handler stops calling
+    /// run_validating_webhooks, the delete below wipes both ClusterRoleBindings and this
+    /// test fails.
+    #[tokio::test]
+    async fn delete_collection_calls_validating_admission_fail_policy_denies_cluster_scoped() {
+        let state = make_state();
+
+        let group = "rbac.authorization.k8s.io";
+        let version = "v1";
+        let plural = "clusterrolebindings";
+
+        for name in ["crb-one", "crb-two"] {
+            let key = crate::keys::group_object_key(group, plural, None, name);
+            let val = serde_json::json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRoleBinding",
+                "metadata": { "name": name },
+                "subjects": [{ "kind": "Group", "name": "some-group" }],
+                "roleRef": { "apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "view" }
+            });
+            state
+                .store
+                .put(
+                    &key,
+                    bytes::Bytes::from(serde_json::to_vec(&val).unwrap()),
+                    None,
+                )
+                .await
+                .expect("seed clusterrolebinding must succeed");
+        }
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "crb-delcol-vwc"},
+            "webhooks": [{
+                "name": "crb.deny-delete.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["DELETE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/crb-delcol-vwc",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = delete_collection_resource(
+            State(state.clone()),
+            Path((group.to_string(), version.to_string(), plural.to_string())),
+            Query(CollectionQuery {
+                watch: None,
+                resource_version: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+                send_initial_events: None,
+                allow_watch_bookmarks: None,
+                timeout_seconds: None,
+            }),
+            test_user(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a validating webhook must be able to deny a cluster-scoped deletecollection \
+             too — otherwise bulk delete of cluster-scoped resources bypasses admission \
+             that single-object delete enforces"
+        );
+
+        let prefix = crate::keys::group_list_prefix(group, plural, None);
+        let remaining = state
+            .store
+            .list(&prefix, u7s_store::ListOptions::default())
+            .await
+            .expect("list must succeed");
+        assert_eq!(
+            remaining.items.len(),
+            2,
+            "deletecollection denied by admission must leave every matched cluster-scoped \
+             object in place"
         );
     }
 }
