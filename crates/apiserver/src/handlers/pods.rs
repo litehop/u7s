@@ -439,6 +439,7 @@ pub async fn create_pod<S: Store>(
     // defaulted above are unchanged. Must run before validation so validating
     // webhooks see the fully-defaulted object, matching upstream ordering.
     apply_pod_spec_defaults(&mut obj.body);
+    validate_pod_sysctls(&obj.body).map_err(Status::unprocessable_entity)?;
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // LimitRange: inject defaults then validate min/max bounds.
@@ -3189,6 +3190,56 @@ mod patch_type_tests {
             pod["metadata"]["labels"].get("app").is_none(),
             "remove op must delete the key"
         );
+    }
+}
+
+/// Mirrors upstream apimachinery's `IsValidSysctlName`: a sysctl name is a sequence of
+/// segments of lowercase alphanumerics with optional interior '-'/'_' (each segment must
+/// start and end alphanumeric), joined by '.' or '/' — the kernel treats either separator
+/// as equivalent (e.g. "kernel.shm_rmid_forced" == "kernel/shm_rmid_forced").
+fn is_valid_sysctl_name(name: &str) -> bool {
+    const MAX_LEN: usize = 253;
+    if name.is_empty() || name.len() > MAX_LEN {
+        return false;
+    }
+    let is_lower_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    name.split(['.', '/']).all(|segment| {
+        let bytes = segment.as_bytes();
+        !bytes.is_empty()
+            && is_lower_alnum(bytes[0])
+            && is_lower_alnum(bytes[bytes.len() - 1])
+            && bytes
+                .iter()
+                .all(|&b| is_lower_alnum(b) || b == b'-' || b == b'_')
+    })
+}
+
+/// Validates `spec.securityContext.sysctls[].name` at pod admission.
+///
+/// Real kube-apiserver rejects malformed sysctl names (a pure syntax check — allow/deny
+/// listing valid-but-unsafe sysctls is a separate, kubelet-side mechanism) at CREATE with
+/// 422. Without this, u7s persists pods with malformed sysctl names and the kubelet later
+/// kills the pod with a misleading "SysctlForbidden" event — the wrong layer and the wrong
+/// message for what is really a syntax error the apiserver should catch up front.
+fn validate_pod_sysctls(pod: &serde_json::Value) -> Result<(), String> {
+    let Some(sysctls) = pod["spec"]["securityContext"]["sysctls"].as_array() else {
+        return Ok(());
+    };
+    let mut errors = Vec::new();
+    for (i, s) in sysctls.iter().enumerate() {
+        let name = s["name"].as_str().unwrap_or("");
+        if !is_valid_sysctl_name(name) {
+            errors.push(format!(
+                "spec.securityContext.sysctls[{i}].name: Invalid value: \"{name}\": \
+                 must have at most 253 characters and match regex \
+                 [a-z0-9]([-_a-z0-9]*[a-z0-9])?((\\.|/)[a-z0-9]([-_a-z0-9]*[a-z0-9])?)*"
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(", "))
     }
 }
 
@@ -6316,6 +6367,77 @@ mod qos_class_tests {
             "Burstable",
             "request < limit numerically must remain Burstable — \
              value-based comparison must not mistakenly promote this to Guaranteed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// validate_pod_sysctls
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod sysctl_validation_tests {
+    use super::*;
+
+    /// A sysctl name using '/' as a separator must be accepted: the kernel treats '.'
+    /// and '/' as equivalent separators, and real conformance ("should support sysctls
+    /// with slashes as separator") relies on the apiserver not rejecting this form.
+    #[test]
+    fn is_valid_sysctl_name_accepts_slash_as_separator() {
+        assert!(
+            is_valid_sysctl_name("kernel/shm_rmid_forced"),
+            "slash-separated sysctl names must be accepted — rejecting them would break \
+             the 'sysctls with slashes as separator' conformance test"
+        );
+    }
+
+    /// Malformed sysctl names must be rejected at the apiserver (422), not silently
+    /// persisted and later killed by the kubelet with a misleading "SysctlForbidden"
+    /// event — that mechanism is for valid-but-unsafe names, not syntax errors.
+    /// Syntactically valid names (even ones later blocked by the allowlist) must NOT be
+    /// rejected or even mentioned here: that's a separate, kubelet-side check.
+    #[test]
+    fn create_pod_rejects_malformed_sysctl_names_but_not_syntactically_valid_ones() {
+        let pod = serde_json::json!({
+            "spec": {
+                "securityContext": {
+                    "sysctls": [
+                        {"name": "foo-", "value": "bar"},
+                        {"name": "kernel.shmmax", "value": "100000000"},
+                        {"name": "safe-and-unsafe", "value": "100000000"},
+                        {"name": "bar..", "value": "42"}
+                    ]
+                }
+            }
+        });
+
+        let result = validate_pod_sysctls(&pod);
+
+        assert!(
+            result.is_err(),
+            "a pod with malformed sysctl names ('foo-', 'bar..') must be rejected at create"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("Invalid value: \"foo-\""),
+            "error must name the malformed sysctl 'foo-' so the client knows what to fix; \
+             got: {msg}"
+        );
+        assert!(
+            msg.contains("Invalid value: \"bar..\""),
+            "error must name the malformed sysctl 'bar..' so the client knows what to fix; \
+             got: {msg}"
+        );
+        assert!(
+            !msg.contains("kernel.shmmax"),
+            "the syntactically valid 'kernel.shmmax' must not be rejected or mentioned — \
+             conformance asserts the error does NOT reference it; got: {msg}"
+        );
+        assert!(
+            !msg.contains("safe-and-unsafe"),
+            "the syntactically valid 'safe-and-unsafe' must not be rejected or mentioned \
+             (allow/deny-listing of valid-but-unsafe names is a separate, kubelet-side \
+             check) — conformance asserts the error does NOT reference it; got: {msg}"
         );
     }
 }
