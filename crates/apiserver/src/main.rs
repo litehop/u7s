@@ -5911,11 +5911,17 @@ mod tests {
         let mut router = build_router(state);
 
         // Issue DELETE to the collection endpoint (no object name).
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::DELETE)
             .uri("/apis/rbac.authorization.k8s.io/v1/clusterrolebindings")
             .body(axum::body::Body::empty())
             .expect("request build must not fail");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
         let resp = router.call(req).await.expect("router must not error");
 
         // Must not return 405 Method Not Allowed — the route must accept DELETE.
@@ -5984,11 +5990,17 @@ mod tests {
 
         let mut router = build_router(state);
 
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(Method::DELETE)
             .uri("/apis/rbac.authorization.k8s.io/v1/namespaces/sonobuoy/rolebindings")
             .body(axum::body::Body::empty())
             .expect("request build must not fail");
+        req.extensions_mut().insert(auth::UserInfo {
+            username: "admin".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        });
         let resp = router.call(req).await.expect("router must not error");
 
         assert_ne!(
