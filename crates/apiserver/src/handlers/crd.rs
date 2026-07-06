@@ -257,9 +257,20 @@ pub async fn list_crds<S: Store>(
         .await;
     }
 
+    let store_field_selector = query
+        .field_selector
+        .as_deref()
+        .map(super::generic::parse_field_selector)
+        .transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions::default())
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector: store_field_selector,
+                ..ListOptions::default()
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -269,6 +280,13 @@ pub async fn list_crds<S: Store>(
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(v);
     }
+
+    let items = if let Some(ref sel) = query.label_selector {
+        let pairs = super::generic::parse_label_selector(sel)?;
+        super::generic::apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
 
     let body = serde_json::json!({
         "kind": "CustomResourceDefinitionList",
@@ -970,6 +988,92 @@ mod tests {
                 .await
                 .is_ok(),
             "correct name widgets.example.io must be accepted"
+        );
+    }
+
+    // list_crds must apply ?labelSelector= like the generic resource list does.
+    // Without this, tooling that scopes itself to "only my CRDs" via a label
+    // selector would instead see every CRD in the cluster.
+    #[tokio::test]
+    async fn list_crds_applies_label_selector() {
+        let state = make_state();
+
+        let matching = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "foos.example.io", "labels": { "team": "a" } },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "foos", "singular": "foo", "kind": "Foo" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+        let non_matching = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "bars.example.io", "labels": { "team": "b" } },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "bars", "singular": "bar", "kind": "Bar" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            matching,
+        )
+        .await
+        .expect("create matching CRD must succeed");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            non_matching,
+        )
+        .await
+        .expect("create non-matching CRD must succeed");
+
+        let query = Query(crate::handlers::generic::CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: Some("team=a".to_string()),
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        });
+
+        let resp = list_crds(State(state), query, HeaderMap::new(), test_user())
+            .await
+            .expect("list must succeed");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["metadata"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["foos.example.io"],
+            "labelSelector=team=a must scope the list to matching CRDs only — \
+             returning every CRD breaks tooling that lists only its own CRDs"
         );
     }
 
