@@ -2984,6 +2984,180 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Regression: PUT /status with Content-Type: application/vnd.kubernetes.protobuf
+    // must persist status.conditions (mayor-ftkl PANIC-1)
+    // -----------------------------------------------------------------------
+
+    /// Build a protobuf varint (LEB128) encoding of v.
+    fn encode_varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out
+    }
+
+    /// Encode a length-delimited protobuf field (wire type 2).
+    fn encode_ld(field: u64, payload: &[u8]) -> Vec<u8> {
+        let tag = (field << 3) | 2;
+        let mut out = encode_varint(tag);
+        out.extend_from_slice(&encode_varint(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Build a k8s proto envelope for a PUT `.../namespaces/{name}/status` body carrying
+    /// two conditions — the exact shape client-go's typed clientset sends for
+    /// `nsClient.UpdateStatus(...)` once the e2e "should apply changes to a namespace
+    /// status" test has GET'd the namespace, appended a condition locally, and calls
+    /// UpdateStatus. The upstream e2e framework defaults every typed clientset's REST
+    /// ContentType to `application/vnd.kubernetes.protobuf`
+    /// (test/e2e/framework/test_context.go's `--kube-api-content-type` flag) — a
+    /// different client/process than this stack's kube-controller-manager, which we
+    /// start with `--kube-api-content-type=application/json`.
+    fn build_namespace_status_put_proto_envelope(name: &str) -> Vec<u8> {
+        // NamespaceCondition{type:"StatusPatch", status:"True", reason:"E2E", message:"Patched by an e2e test"}
+        let mut cond1 = encode_ld(1, b"StatusPatch");
+        cond1.extend(encode_ld(2, b"True"));
+        cond1.extend(encode_ld(5, b"E2E"));
+        cond1.extend(encode_ld(6, b"Patched by an e2e test"));
+
+        // NamespaceCondition{type:"StatusUpdate", status:"True", reason:"E2E", message:"Updated by an e2e test"}
+        let mut cond2 = encode_ld(1, b"StatusUpdate");
+        cond2.extend(encode_ld(2, b"True"));
+        cond2.extend(encode_ld(5, b"E2E"));
+        cond2.extend(encode_ld(6, b"Updated by an e2e test"));
+
+        // NamespaceStatus{phase:"Active", conditions:[cond1, cond2]}  (field 1 = phase, field 2 = conditions)
+        let mut status = encode_ld(1, b"Active");
+        status.extend(encode_ld(2, &cond1));
+        status.extend(encode_ld(2, &cond2));
+
+        // ObjectMeta{name: name}  (field 1 = name)
+        let obj_meta = encode_ld(1, name.as_bytes());
+
+        // Namespace{metadata: field 1, status: field 3}
+        let mut namespace_proto = encode_ld(1, &obj_meta);
+        namespace_proto.extend(encode_ld(3, &status));
+
+        // TypeMeta{apiVersion:"v1", kind:"Namespace"}
+        let mut type_meta = encode_ld(1, b"v1");
+        type_meta.extend(encode_ld(2, b"Namespace"));
+
+        // Unknown{typeMeta: field 1, raw: field 2} — contentType (field 4) left empty,
+        // matching what client-go sends for core types with a registered proto codec.
+        let mut unknown = encode_ld(1, &type_meta);
+        unknown.extend(encode_ld(2, &namespace_proto));
+
+        let mut body = vec![0x6b, 0x38, 0x73, 0x00]; // k8s proto magic
+        body.extend(unknown);
+        body
+    }
+
+    // put_namespace_status must persist status.conditions sent with Content-Type:
+    // application/vnd.kubernetes.protobuf, not just application/json.
+    //
+    // The existing put_namespace_status_updates_conditions test above only sends plain
+    // JSON, so it never exercised proto decoding and could not have caught this. But the
+    // real "should apply changes to a namespace status" e2e test's typed clientset
+    // defaults to protobuf (see build_namespace_status_put_proto_envelope's doc comment),
+    // so that is the content type the conformance run actually hits. Before mayor-oww6's
+    // fix to decode_namespace_proto_gen, this decoder never read `ns.status` at all, so a
+    // protobuf-encoded PUT /status silently stored an empty status; the e2e client then
+    // read back an empty Conditions slice and panicked with "index out of range [-1]"
+    // indexing `Conditions[len(Conditions)-1]` (namespace.go:365). Namespace status
+    // conditions must persist through this exact apply-status sequence or that panic
+    // reproduces. This test fails on revert: reverting the `if let Some(status) =
+    // ns.status` block in decode_namespace_proto_gen makes the asserted conditions
+    // vanish from both the response and the store.
+    #[tokio::test]
+    async fn put_namespace_status_persists_conditions_from_protobuf_content_type() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        assert!(
+            create_namespace(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                namespace_body("status-put-proto-ns"),
+            )
+            .await
+            .is_ok(),
+            "create must succeed"
+        );
+
+        let proto_body = Bytes::from(build_namespace_status_put_proto_envelope(
+            "status-put-proto-ns",
+        ));
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/vnd.kubernetes.protobuf".parse().unwrap(),
+        );
+
+        let resp = put_namespace_status(
+            State(state.clone()),
+            Path("status-put-proto-ns".to_string()),
+            headers,
+            proto_body,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "put_namespace_status must accept a protobuf-encoded body (got {:?})",
+                e.0
+            )
+        })
+        .into_response();
+
+        let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("response must be valid JSON");
+
+        assert_eq!(
+            body["status"]["conditions"].as_array().map(Vec::len),
+            Some(2),
+            "namespace status.conditions must persist through the apply-status sequence \
+             or the conformance test panics on Conditions[-1]; got {:?}",
+            body["status"]["conditions"]
+        );
+        assert_eq!(
+            body["status"]["conditions"][1]["type"], "StatusUpdate",
+            "the last condition must be the one the e2e client appended before calling \
+             UpdateStatus — this is exactly \
+             `statusUpdated.Status.Conditions[len(statusUpdated.Status.Conditions)-1].Type` \
+             at namespace.go:365"
+        );
+
+        // Persisted, not just echoed back in the response.
+        let stored = state
+            .store
+            .get(&crate::keys::cluster_object_key(
+                "namespaces",
+                "status-put-proto-ns",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_body: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            stored_body["status"]["conditions"].as_array().map(Vec::len),
+            Some(2),
+            "conditions must be durably persisted to the store, not merely echoed back \
+             in the PUT response"
+        );
+    }
+
     // SSA PATCH on Namespace must return a non-empty JSON body with the full object.
     //
     // Before the fix, patch_namespace rejected apply-patch+yaml with 415 Unsupported

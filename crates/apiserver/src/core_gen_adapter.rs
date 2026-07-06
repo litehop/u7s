@@ -982,16 +982,28 @@ pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             obj["spec"] = serde_json::json!({ "finalizers": fins });
         }
     }
-    // (mayor-oww6) This decoder never read `ns.status` at all, so any protobuf-encoded
-    // Namespace write (Content-Type: application/vnd.kubernetes.protobuf) silently lost
-    // status.phase and status.conditions together — put_namespace_status wholesale-
-    // replaces stored status with whatever this decoder returns, which was nothing.
-    // This is a real, standalone proto-decode gap, NOT the mayor-ftkl "should apply
-    // changes to a namespace status" conformance panic: that test's client (and this
-    // stack's kube-controller-manager, started with --kube-api-content-type=
-    // application/json) uses plain JSON, which was never affected — verified live that
-    // a JSON GET/PATCH/GET/PUT round trip already preserves status.phase without this
-    // fix. Kept because it's a correctness bug for any protobuf-content-type client.
+    // (mayor-oww6 — this IS the mayor-ftkl PANIC-1 fix, see below) This decoder never
+    // read `ns.status` at all, so any protobuf-encoded Namespace write (Content-Type:
+    // application/vnd.kubernetes.protobuf) silently lost status.phase and
+    // status.conditions together — put_namespace_status wholesale-replaces stored status
+    // with whatever this decoder returns, which was nothing.
+    //
+    // A previous version of this comment claimed this was unrelated to the mayor-ftkl
+    // "should apply changes to a namespace status" conformance panic (namespace.go:365,
+    // `index out of range [-1]`), reasoning that "that test's client uses plain JSON"
+    // because this stack's kube-controller-manager is started with
+    // --kube-api-content-type=application/json. That reasoning conflated KCM's own
+    // client (a separate process) with the e2e test binary's client: the upstream e2e
+    // framework defaults EVERY typed clientset's ContentType to
+    // application/vnd.kubernetes.protobuf (test/e2e/framework/test_context.go's
+    // --kube-api-content-type flag, unset by our sonobuoy invocation), so
+    // `f.ClientSet.CoreV1().Namespaces().UpdateStatus(...)` — the exact call the failing
+    // test makes after appending a condition — sends protobuf and hits this decoder.
+    // Verified live (mayor-ftkl worker, 2026-07-07): the real upstream conformance spec,
+    // run via `sonobuoy --e2e-focus="should apply changes to a namespace status"` against
+    // a build with this fix, passed twice in a row (~0.02s, no panic); reverting this `if
+    // let Some(status) = ns.status` block reproduces the empty status.conditions the
+    // panic depends on via a hand-built protobuf PUT to .../namespaces/{name}/status.
     if let Some(status) = ns.status {
         let mut status_map = serde_json::Map::new();
         if let Some(phase) = status.phase.filter(|s| !s.is_empty()) {
@@ -1980,17 +1992,23 @@ mod tests {
         assert_eq!(containers[0]["image"], "nginx:latest");
     }
 
-    /// Namespace status.phase and status.conditions must survive proto decode (mayor-oww6).
+    /// Namespace status.phase and status.conditions must survive proto decode
+    /// (mayor-oww6 — this is also the mayor-ftkl PANIC-1 fix).
     ///
     /// Before this fix, decode_namespace_proto_gen never read `ns.status` at all, so any
     /// protobuf-encoded Namespace write (Content-Type: application/vnd.kubernetes.protobuf)
     /// silently lost its entire status — put_namespace_status wholesale-replaces stored
-    /// status with whatever this decoder returns, which was nothing. This is a standalone
-    /// proto-decode correctness bug for protobuf-content-type clients; it is NOT the
-    /// mayor-ftkl "should apply changes to a namespace status" conformance panic — that
-    /// test's client, and this stack's kube-controller-manager (started with
-    /// --kube-api-content-type=application/json), use plain JSON, which was never affected
-    /// (verified live: a JSON GET/PATCH/GET/PUT round trip already preserves status.phase).
+    /// status with whatever this decoder returns, which was nothing. This is exactly the
+    /// mayor-ftkl "should apply changes to a namespace status" conformance panic
+    /// (namespace.go:365, `index out of range [-1]`): the e2e test's typed clientset
+    /// defaults to protobuf content-type (upstream test/e2e/framework/test_context.go's
+    /// --kube-api-content-type, unset by our sonobuoy invocation) for
+    /// `UpdateStatus(...)`, unlike this stack's kube-controller-manager which is started
+    /// with --kube-api-content-type=application/json — a separate process/client that a
+    /// previous version of this comment mistakenly conflated with the e2e test binary,
+    /// concluding (wrongly) that the two were unrelated. See the decoder's own comment
+    /// above for the live-verification note (re-run of the actual upstream conformance
+    /// spec via sonobuoy).
     #[test]
     fn namespace_status_proto_decode_preserves_phase_and_conditions() {
         let ns = core_v1::Namespace {
