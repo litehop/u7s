@@ -4,6 +4,11 @@
 /// via a long-poll watch on the API server, picks the first available node,
 /// and binds via POST /api/v1/namespaces/:ns/pods/:name/binding.
 ///
+/// When no node has free capacity, falls back to preemption: evicts
+/// lower-priority pods to make room rather than leaving a higher-priority pod
+/// Pending forever (see `find_preemption_plan` in lib.rs for the MVP model —
+/// pod-count capacity only, no CPU/memory/extended-resource accounting).
+///
 /// No leader election logic is implemented; the --leader-elect flag is
 /// accepted and silently ignored.
 use std::collections::HashSet;
@@ -12,7 +17,10 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use tracing::{error, info};
 use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
-use u7s_scheduler::{bind_pod, needs_scheduling, pick_node, should_schedule, stream_watch_events};
+use u7s_scheduler::{
+    bind_pod, delete_pod, find_preemption_plan, needs_scheduling, pick_node, should_schedule,
+    stream_watch_events,
+};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -85,7 +93,8 @@ async fn main() -> anyhow::Result<()> {
         let in_flight_ref = &in_flight;
 
         let result = stream_watch_events(connector_ref, server_ref, path, |event| {
-            let Some((namespace, pod_name, node_selector)) = needs_scheduling(&event) else {
+            let Some((namespace, pod_name, node_selector, priority)) = needs_scheduling(&event)
+            else {
                 return;
             };
 
@@ -108,16 +117,50 @@ async fn main() -> anyhow::Result<()> {
             let server_clone = server_ref.to_string();
             let in_flight_clone = in_flight_ref.clone();
             tokio::spawn(async move {
-                let result = async {
-                    let node = pick_node(&connector_clone, &server_clone, &node_selector).await?;
-                    bind_pod(
-                        &connector_clone,
-                        &server_clone,
-                        &namespace,
-                        &pod_name,
-                        &node,
-                    )
-                    .await
+                let result: anyhow::Result<()> = async {
+                    match pick_node(&connector_clone, &server_clone, &node_selector).await {
+                        Ok(node) => {
+                            bind_pod(
+                                &connector_clone,
+                                &server_clone,
+                                &namespace,
+                                &pod_name,
+                                &node,
+                            )
+                            .await
+                        }
+                        Err(_no_capacity) => {
+                            // No node has a free slot — try preemption before giving
+                            // up: evict lower-priority pods to make room rather than
+                            // leaving a higher-priority pod Pending forever (mayor-rsei).
+                            let plan = find_preemption_plan(
+                                &connector_clone,
+                                &server_clone,
+                                &node_selector,
+                                priority,
+                            )
+                            .await?;
+                            info!(
+                                "preempting {} pod(s) on {} to schedule higher-priority pod {namespace}/{pod_name}",
+                                plan.victims.len(),
+                                plan.node_name
+                            );
+                            for victim in &plan.victims {
+                                let Some((v_ns, v_name)) = victim.split_once('/') else {
+                                    continue;
+                                };
+                                delete_pod(&connector_clone, &server_clone, v_ns, v_name).await?;
+                            }
+                            bind_pod(
+                                &connector_clone,
+                                &server_clone,
+                                &namespace,
+                                &pod_name,
+                                &plan.node_name,
+                            )
+                            .await
+                        }
+                    }
                 }
                 .await;
                 // Always remove the key, whether binding succeeded or failed.
