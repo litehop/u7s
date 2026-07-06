@@ -503,21 +503,30 @@ fn build_router(state: AppState) -> Router {
             get(handlers::proxy::pod_proxy_root)
                 .post(handlers::proxy::pod_proxy_root)
                 .put(handlers::proxy::pod_proxy_root)
-                .delete(handlers::proxy::pod_proxy_root),
+                .delete(handlers::proxy::pod_proxy_root)
+                .patch(handlers::proxy::pod_proxy_root)
+                .options(handlers::proxy::pod_proxy_root)
+                .head(handlers::proxy::pod_proxy_root),
         )
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/proxy/",
             get(handlers::proxy::pod_proxy_root)
                 .post(handlers::proxy::pod_proxy_root)
                 .put(handlers::proxy::pod_proxy_root)
-                .delete(handlers::proxy::pod_proxy_root),
+                .delete(handlers::proxy::pod_proxy_root)
+                .patch(handlers::proxy::pod_proxy_root)
+                .options(handlers::proxy::pod_proxy_root)
+                .head(handlers::proxy::pod_proxy_root),
         )
         .route(
             "/api/v1/namespaces/{ns}/pods/{name}/proxy/{*path}",
             get(handlers::proxy::pod_proxy)
                 .post(handlers::proxy::pod_proxy)
                 .put(handlers::proxy::pod_proxy)
-                .delete(handlers::proxy::pod_proxy),
+                .delete(handlers::proxy::pod_proxy)
+                .patch(handlers::proxy::pod_proxy)
+                .options(handlers::proxy::pod_proxy)
+                .head(handlers::proxy::pod_proxy),
         )
         // Nodes — proxy subresource: forward to kubelet at https://<node-ip>:10250/<path>
         .route(
@@ -525,7 +534,10 @@ fn build_router(state: AppState) -> Router {
             get(handlers::proxy::node_proxy)
                 .post(handlers::proxy::node_proxy)
                 .put(handlers::proxy::node_proxy)
-                .delete(handlers::proxy::node_proxy),
+                .delete(handlers::proxy::node_proxy)
+                .patch(handlers::proxy::node_proxy)
+                .options(handlers::proxy::node_proxy)
+                .head(handlers::proxy::node_proxy),
         )
         // Services — proxy subresource: forward to a ready endpoint backing the Service.
         // axum's `{*path}` wildcard requires a NON-EMPTY segment. Register the no-subpath
@@ -535,21 +547,30 @@ fn build_router(state: AppState) -> Router {
             get(handlers::proxy::service_proxy_root)
                 .post(handlers::proxy::service_proxy_root)
                 .put(handlers::proxy::service_proxy_root)
-                .delete(handlers::proxy::service_proxy_root),
+                .delete(handlers::proxy::service_proxy_root)
+                .patch(handlers::proxy::service_proxy_root)
+                .options(handlers::proxy::service_proxy_root)
+                .head(handlers::proxy::service_proxy_root),
         )
         .route(
             "/api/v1/namespaces/{ns}/services/{name}/proxy/",
             get(handlers::proxy::service_proxy_root)
                 .post(handlers::proxy::service_proxy_root)
                 .put(handlers::proxy::service_proxy_root)
-                .delete(handlers::proxy::service_proxy_root),
+                .delete(handlers::proxy::service_proxy_root)
+                .patch(handlers::proxy::service_proxy_root)
+                .options(handlers::proxy::service_proxy_root)
+                .head(handlers::proxy::service_proxy_root),
         )
         .route(
             "/api/v1/namespaces/{ns}/services/{name}/proxy/{*path}",
             get(handlers::proxy::service_proxy)
                 .post(handlers::proxy::service_proxy)
                 .put(handlers::proxy::service_proxy)
-                .delete(handlers::proxy::service_proxy),
+                .delete(handlers::proxy::service_proxy)
+                .patch(handlers::proxy::service_proxy)
+                .options(handlers::proxy::service_proxy)
+                .head(handlers::proxy::service_proxy),
         )
         // Core group (group="", apiVersion=v1) — cluster-scoped resources (e.g. nodes)
         .route(
@@ -6448,6 +6469,73 @@ mod tests {
             delete_status.is_success(),
             "DELETE /api/v1/persistentvolumes/test-pv must succeed (2xx), got {delete_status}"
         );
+    }
+
+    /// PATCH/OPTIONS/HEAD on every pod/node/service proxy route must not return 405.
+    ///
+    /// The `[sig-network] Proxy version v1` conformance tests issue all 7 HTTP verbs
+    /// (DELETE GET HEAD OPTIONS PATCH POST PUT) through both the pod-proxy and the
+    /// service-proxy subresource, each wrapped in `wait.PollImmediate(10ms, 1min)`.
+    /// Before this fix, `build_router` wired only `.get().post().put().delete()` on
+    /// all 7 proxy route blocks, so PATCH and OPTIONS returned 405 Method Not Allowed.
+    /// Each failing verb then polled for up to a full minute before giving up — turning
+    /// a routing gap into hours of conformance wall-clock burn (mayor-gjy0).
+    ///
+    /// None of the targets below exist, so a request that actually reaches the proxy
+    /// handler must 404 ("pod/node/service not found in store"). A 404 proves the verb
+    /// was dispatched to the handler; a 405 proves axum's method router rejected the
+    /// verb before the handler ever ran — the bug this test guards against.
+    #[tokio::test]
+    async fn proxy_accepts_all_verbs_else_conformance_proxy_tests_405_and_poll_to_timeout() {
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        let store = std::sync::Arc::new(make_store());
+        let state = state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+        let mut router = build_router(state);
+
+        // Covers all 7 proxy route blocks in build_router: pod_proxy_root (x2: /proxy
+        // and /proxy/), pod_proxy (/proxy/{*path}), node_proxy, service_proxy_root
+        // (x2), service_proxy.
+        let paths = [
+            "/api/v1/namespaces/default/pods/ghost/proxy",
+            "/api/v1/namespaces/default/pods/ghost/proxy/",
+            "/api/v1/namespaces/default/pods/ghost/proxy/x",
+            "/api/v1/nodes/ghost/proxy/x",
+            "/api/v1/namespaces/default/services/ghost/proxy",
+            "/api/v1/namespaces/default/services/ghost/proxy/",
+            "/api/v1/namespaces/default/services/ghost/proxy/x",
+        ];
+
+        for method in [Method::PATCH, Method::OPTIONS, Method::HEAD] {
+            for path in paths {
+                let req = Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .body(axum::body::Body::empty())
+                    .expect("request must build");
+                let resp = router.call(req).await.expect("router must not error");
+                assert_ne!(
+                    resp.status(),
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path} must not return 405 — the Proxy conformance test \
+                     issues this verb and wait.PollImmediate()s on it for up to 1 minute \
+                     before giving up, which is the wall-clock sink this fix removes"
+                );
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::NOT_FOUND,
+                    "{method} {path} must reach the proxy handler and 404 (target does \
+                     not exist) — any other status means the route never dispatched"
+                );
+            }
+        }
     }
 
     /// POST /api/v1/namespaces/default/secrets with a JSON body must return 201 Created.
