@@ -31,7 +31,7 @@ fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
         if let Some(secs) = ts.seconds {
             if secs > 0 {
                 m["creationTimestamp"] =
-                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64));
+                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
             }
         }
     }
@@ -295,6 +295,56 @@ pub fn decode_ingress_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             out["spec"] = serde_json::Value::Object(spec_json);
         }
     }
+    if let Some(status) = obj.status {
+        if let Some(lb) = status.load_balancer {
+            if !lb.ingress.is_empty() {
+                let ingress: Vec<serde_json::Value> = lb
+                    .ingress
+                    .into_iter()
+                    .map(|i| {
+                        let mut im = serde_json::Map::new();
+                        if let Some(v) = i.ip.filter(|s| !s.is_empty()) {
+                            im.insert("ip".to_string(), serde_json::Value::String(v));
+                        }
+                        if let Some(v) = i.hostname.filter(|s| !s.is_empty()) {
+                            im.insert("hostname".to_string(), serde_json::Value::String(v));
+                        }
+                        if !i.ports.is_empty() {
+                            let ports: Vec<serde_json::Value> = i
+                                .ports
+                                .into_iter()
+                                .map(|p| {
+                                    let mut pm = serde_json::Map::new();
+                                    if let Some(v) = p.port.filter(|&n| n != 0) {
+                                        pm.insert(
+                                            "port".to_string(),
+                                            serde_json::Value::Number(v.into()),
+                                        );
+                                    }
+                                    if let Some(v) = p.protocol.filter(|s| !s.is_empty()) {
+                                        pm.insert(
+                                            "protocol".to_string(),
+                                            serde_json::Value::String(v),
+                                        );
+                                    }
+                                    if let Some(v) = p.error.filter(|s| !s.is_empty()) {
+                                        pm.insert(
+                                            "error".to_string(),
+                                            serde_json::Value::String(v),
+                                        );
+                                    }
+                                    serde_json::Value::Object(pm)
+                                })
+                                .collect();
+                            im.insert("ports".to_string(), serde_json::Value::Array(ports));
+                        }
+                        serde_json::Value::Object(im)
+                    })
+                    .collect();
+                out["status"] = serde_json::json!({ "loadBalancer": { "ingress": ingress } });
+            }
+        }
+    }
     Some(out)
 }
 
@@ -537,7 +587,7 @@ pub fn decode_poddisruptionbudget_proto_gen(data: &[u8]) -> Option<serde_json::V
                 .map(|(pod_name, t)| {
                     let secs = t.seconds.unwrap_or(0);
                     let ts = if secs > 0 {
-                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64))
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs))
                     } else {
                         serde_json::Value::String("1970-01-01T00:00:00Z".into())
                     };
@@ -587,9 +637,7 @@ pub fn decode_poddisruptionbudget_proto_gen(data: &[u8]) -> Option<serde_json::V
                         if let Some(secs) = ts.seconds.filter(|&s| s > 0) {
                             cond.insert(
                                 "lastTransitionTime".to_string(),
-                                serde_json::Value::String(crate::util::secs_to_rfc3339(
-                                    secs as u64,
-                                )),
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
                             );
                         }
                     }
@@ -620,10 +668,13 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
         "metadata": meta
     });
     if let Some(t) = ev.event_time {
-        if let Some(ts) = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
-            t.seconds.unwrap_or(0),
-            t.nanos.unwrap_or(0),
-        ) {
+        // `seconds` must be explicitly present (not defaulted via unwrap_or(0)) — a MicroTime
+        // message with no seconds field on the wire is "not set", not the Unix epoch.
+        if let Some(secs) = t.seconds {
+            let ts = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
+                secs,
+                t.nanos.unwrap_or(0),
+            );
             out["eventTime"] = serde_json::Value::String(ts);
         }
     }
@@ -633,10 +684,11 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
             sj.insert("count".to_string(), serde_json::Value::Number(count.into()));
         }
         if let Some(t) = s.last_observed_time {
-            if let Some(ts) = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
-                t.seconds.unwrap_or(0),
-                t.nanos.unwrap_or(0),
-            ) {
+            if let Some(secs) = t.seconds {
+                let ts = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
+                    secs,
+                    t.nanos.unwrap_or(0),
+                );
                 sj.insert(
                     "lastObservedTime".to_string(),
                     serde_json::Value::String(ts),
@@ -681,4 +733,57 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
         out["deprecatedCount"] = serde_json::Value::Number(count.into());
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// decode_ingress_proto_gen must preserve status.loadBalancer.ingress (ip/hostname/ports).
+    ///
+    /// Clients read Ingress status to learn the load-balancer IP/hostname assigned by the
+    /// ingress controller; decode_ingress_proto_gen never read `.status` at all, so
+    /// "should support creating Ingress API operations" conformance saw an empty
+    /// IngressLoadBalancerStatus after the controller updated it — the Ingress looked
+    /// permanently unprovisioned.
+    #[test]
+    fn decode_ingress_proto_gen_preserves_load_balancer_status() {
+        let obj = networking_v1::Ingress {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-ingress".to_string()),
+                ..Default::default()
+            }),
+            status: Some(networking_v1::IngressStatus {
+                load_balancer: Some(networking_v1::IngressLoadBalancerStatus {
+                    ingress: vec![networking_v1::IngressLoadBalancerIngress {
+                        ip: Some("203.0.113.10".to_string()),
+                        hostname: Some("lb.example.com".to_string()),
+                        ports: vec![networking_v1::IngressPortStatus {
+                            port: Some(443),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        }],
+                    }],
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        obj.encode(&mut buf).unwrap();
+        let result = decode_ingress_proto_gen(&buf).expect("Ingress with status must decode");
+
+        assert_eq!(
+            result["status"]["loadBalancer"]["ingress"][0]["ip"], "203.0.113.10",
+            "status.loadBalancer.ingress[0].ip must survive decode; before the fix .status was \
+             never read, so clients could not discover the assigned load-balancer IP"
+        );
+        assert_eq!(
+            result["status"]["loadBalancer"]["ingress"][0]["hostname"], "lb.example.com",
+            "status.loadBalancer.ingress[0].hostname must survive decode"
+        );
+        assert_eq!(
+            result["status"]["loadBalancer"]["ingress"][0]["ports"][0]["port"], 443,
+            "status.loadBalancer.ingress[0].ports[0].port must survive decode"
+        );
+    }
 }

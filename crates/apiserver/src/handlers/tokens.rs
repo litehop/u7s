@@ -217,7 +217,7 @@ pub async fn create_token<S: Store>(
     //
     // expirationTimestamp uses the requested (short) lifetime so kubelet computes the
     // correct refresh window.  The JWT itself uses jwt_exp (≥ 24 h) as the safety net.
-    let expiration_timestamp = secs_to_rfc3339(now + spec.expiration_seconds);
+    let expiration_timestamp = secs_to_rfc3339((now + spec.expiration_seconds) as i64);
     let mut spec_resp = serde_json::json!({
         "audiences": claims.aud,
         "expirationSeconds": spec.expiration_seconds

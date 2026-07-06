@@ -27,7 +27,7 @@ fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
         if let Some(secs) = ts.seconds {
             if secs > 0 {
                 m["creationTimestamp"] =
-                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64));
+                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
             }
         }
     }
@@ -457,7 +457,7 @@ fn gen_vap_status_to_json(status: ar_v1::ValidatingAdmissionPolicyStatus) -> ser
                 if let Some(t) = c.last_transition_time {
                     if let Some(secs) = t.seconds.filter(|&s| s > 0) {
                         cm["lastTransitionTime"] =
-                            serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64));
+                            serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                     }
                 }
                 cm
