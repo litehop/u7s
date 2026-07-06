@@ -735,6 +735,16 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                             gen_projected_volume_source_to_json(proj),
                         );
                     }
+                    if let Some(img) = src.image {
+                        let mut img_map = serde_json::Map::new();
+                        if let Some(r) = img.reference.filter(|s| !s.is_empty()) {
+                            img_map.insert("reference".to_string(), serde_json::Value::String(r));
+                        }
+                        if let Some(pp) = img.pull_policy.filter(|s| !s.is_empty()) {
+                            img_map.insert("pullPolicy".to_string(), serde_json::Value::String(pp));
+                        }
+                        vm.insert("image".to_string(), serde_json::Value::Object(img_map));
+                    }
                 }
                 serde_json::Value::Object(vm)
             })
@@ -2232,6 +2242,56 @@ mod tests {
         assert_eq!(
             proj_sources[1]["secret"]["optional"], true,
             "projected secret source's optional flag must survive decode"
+        );
+    }
+
+    /// ImageVolumeSource (spec.volumes[].image) must survive proto decode.
+    ///
+    /// ImageVolume mounts an OCI image/artifact as a read-only volume; the volume-source
+    /// match had no branch for it at all, so the volume was silently dropped and the
+    /// container started without the content it expected.
+    #[test]
+    fn generated_pod_spec_preserves_image_volume_source() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("image-vol-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![core_v1::Volume {
+                    name: Some("image-vol".to_string()),
+                    volume_source: Some(core_v1::VolumeSource {
+                        image: Some(core_v1::ImageVolumeSource {
+                            reference: Some("registry.example/artifact:v1".to_string()),
+                            pull_policy: Some("Always".to_string()),
+                        }),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with image volume must decode");
+
+        let volumes = result["spec"]["volumes"].as_array().unwrap();
+        assert_eq!(
+            volumes[0]["image"]["reference"], "registry.example/artifact:v1",
+            "spec.volumes[].image.reference must survive decode — without it the container \
+             never gets the OCI image/artifact content it was mounted to receive"
+        );
+        assert_eq!(
+            volumes[0]["image"]["pullPolicy"], "Always",
+            "spec.volumes[].image.pullPolicy must survive decode"
         );
     }
 }
