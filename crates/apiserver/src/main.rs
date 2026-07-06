@@ -648,6 +648,15 @@ fn build_router(state: AppState) -> Router {
                 .patch(handlers::crd::patch_crd)
                 .delete(handlers::crd::delete_crd),
         )
+        // CRD status subresource — must be registered before the generic cluster-scoped
+        // /apis/{group}/{version}/{resource}/{name}/status catch-all, whose CR-aware
+        // handler searches for a CRD-of-CRDs that can never exist.
+        .route(
+            "/apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}/status",
+            get(handlers::crd::get_crd_status)
+                .put(handlers::crd::put_crd_status)
+                .patch(handlers::crd::patch_crd_status),
+        )
         // Authorization reviews (specific paths before generic catch-all)
         .route(
             "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
