@@ -429,6 +429,16 @@ pub async fn create_pod<S: Store>(
         dry_run: create_query.is_dry_run(),
     };
     obj.body = run_mutating_webhooks(&state, obj.body, None, &admission_ctx).await?;
+    // Re-apply spec/container defaults (terminationMessagePolicy etc.) after mutating
+    // webhooks run, so a container a webhook injects via JSON patch is defaulted too.
+    // apply_pod_create_defaults (above, before the webhook chain) only ever saw the
+    // client-supplied containers; a webhook can add new ones the first pass never
+    // touched. Real kube-apiserver re-runs defaulting after each mutating-webhook
+    // round; this single re-apply is the MVP form of that (mayor-nu77). Idempotent —
+    // apply_pod_spec_defaults only fills absent/empty fields, so containers already
+    // defaulted above are unchanged. Must run before validation so validating
+    // webhooks see the fully-defaulted object, matching upstream ordering.
+    apply_pod_spec_defaults(&mut obj.body);
     run_validating_webhooks(&state, &obj.body, None, &admission_ctx).await?;
 
     // LimitRange: inject defaults then validate min/max bounds.
@@ -3284,6 +3294,24 @@ pub fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
     for containers_key in &["containers", "initContainers", "ephemeralContainers"] {
         if let Some(containers) = pod["spec"][containers_key].as_array_mut() {
             for container in containers {
+                // Default terminationMessagePolicy to "File", matching upstream
+                // SetDefaults_Container. Real clients (kubectl, client-go) already stamp
+                // this field themselves: encoding a Pod as protobuf round-trips it through
+                // the client's own scheme defaulting, so containers the *client* wrote
+                // always arrive with this field set. A container a mutating webhook injects
+                // via JSON patch has no such client — the apiserver adds it directly to the
+                // JSON body — so it needs this apiserver-side default or it is stored with
+                // no terminationMessagePolicy at all. This function runs both before and
+                // after the mutating webhook chain (see create_pod), so webhook-injected
+                // containers get the same default a real client would have supplied.
+                // Breaks conformance "[sig-api-machinery] AdmissionWebhook ... should mutate
+                // pod and apply defaults after mutation" otherwise (mayor-nu77).
+                if container["terminationMessagePolicy"].is_null()
+                    || container["terminationMessagePolicy"] == ""
+                {
+                    container["terminationMessagePolicy"] =
+                        serde_json::Value::String("File".to_string());
+                }
                 if let Some(env) = container["env"].as_array_mut() {
                     for var in env {
                         let field_ref = &mut var["valueFrom"]["fieldRef"];
@@ -3555,8 +3583,9 @@ pub fn initialize_pod_generation(pod: &mut serde_json::Value) {
 ///
 /// Both sides are spec-defaulted before comparing so that a client omitting
 /// defaulted fields (dnsPolicy, enableServiceLinks, volume defaultMode,
-/// container env fieldRef.apiVersion, port protocol) does not produce a
-/// spurious generation bump — upstream k8s only bumps on a real spec change.
+/// container env fieldRef.apiVersion, port protocol, terminationMessagePolicy)
+/// does not produce a spurious generation bump — upstream k8s only bumps on a
+/// real spec change.
 pub fn increment_pod_generation_if_spec_changed(
     pod: &mut serde_json::Value,
     spec_before: &serde_json::Value,
@@ -4577,6 +4606,56 @@ mod create_defaults_tests {
                 .any(|c| c["type"].as_str() == Some("PodScheduled")),
             "PodScheduled condition must be present — conformance scheduling tests wait \
              for it before declaring scheduling success"
+        );
+    }
+
+    /// A container added AFTER initial create-time defaulting (simulating a mutating
+    /// webhook injecting a container via JSON patch) must still get
+    /// terminationMessagePolicy defaulted when create_pod re-applies spec defaults
+    /// post-mutation — otherwise the injected container is stored with no
+    /// terminationMessagePolicy at all, which fails conformance
+    /// "[sig-api-machinery] AdmissionWebhook ... should mutate pod and apply defaults
+    /// after mutation" (mayor-nu77). This also proves the re-apply is idempotent: the
+    /// container defaulted on the first pass must be unchanged by the second pass.
+    #[test]
+    fn post_mutation_defaults_apply_to_webhook_injected_container() {
+        let mut pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "webhook-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        });
+
+        // First pass: what create_pod does BEFORE the mutating webhook chain runs.
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["containers"][0]["terminationMessagePolicy"], "File",
+            "sanity check: the client-supplied container must be defaulted by the first pass"
+        );
+
+        // Simulate a mutating webhook injecting an initContainer via JSON patch: the
+        // apiserver adds this container directly to the JSON body with no client
+        // involved, so it has none of the fields a real client's protobuf encoding
+        // would have stamped.
+        pod["spec"]["initContainers"] = serde_json::json!([
+            {"name": "webhook-injected", "image": "busybox"}
+        ]);
+
+        // Second pass: what create_pod does AFTER the mutating webhook chain runs.
+        apply_pod_spec_defaults(&mut pod);
+
+        assert_eq!(
+            pod["spec"]["initContainers"][0]["terminationMessagePolicy"], "File",
+            "webhook-injected container must get terminationMessagePolicy defaulted by \
+             the post-mutation re-apply — without it, a webhook-added container is stored \
+             with no terminationMessagePolicy, failing the AdmissionWebhook conformance test"
+        );
+        assert_eq!(
+            pod["spec"]["containers"][0]["terminationMessagePolicy"], "File",
+            "the pre-existing container's terminationMessagePolicy must be unchanged by \
+             the second pass — the re-apply must be idempotent, not just additive"
         );
     }
 }
@@ -10470,6 +10549,36 @@ mod admission_tests {
         )
     }
 
+    /// A mutating webhook that injects an initContainer with no terminationMessagePolicy
+    /// (or any other field a real client would have stamped) — mirrors what a real
+    /// sidecar-injection webhook does, e.g. Istio/linkerd-style init container injection.
+    fn inject_init_container_router() -> Router {
+        Router::new().route(
+            "/webhook",
+            post(|| async {
+                let patch = serde_json::json!([
+                    {"op": "add", "path": "/spec/initContainers", "value": [
+                        {"name": "webhook-injected", "image": "busybox"}
+                    ]}
+                ]);
+                let patch_b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    serde_json::to_string(&patch).unwrap(),
+                );
+                axum::Json(serde_json::json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {
+                        "uid": "test-uid",
+                        "allowed": true,
+                        "patch": patch_b64,
+                        "patchType": "JSONPatch"
+                    }
+                }))
+            }),
+        )
+    }
+
     fn deny_router() -> Router {
         Router::new().route(
             "/webhook",
@@ -10563,6 +10672,95 @@ mod admission_tests {
             v["metadata"]["labels"]["admitted"], "yes",
             "mutating webhook label must be present in stored pod — \
              without the fix, create_pod bypassed admission and the label was never injected"
+        );
+    }
+
+    /// create_pod must default a container a mutating webhook injects, not just the
+    /// containers the client supplied.
+    ///
+    /// VERIFIED live (scout aa9f7278): a mutating webhook that injects an initContainer
+    /// produced a stored container with no terminationMessagePolicy, because
+    /// apply_pod_create_defaults ran once, before run_mutating_webhooks, so the
+    /// webhook-added container was never seen by the defaulting pass. This breaks
+    /// conformance "[sig-api-machinery] AdmissionWebhook ... should mutate pod and
+    /// apply defaults after mutation" (mayor-nu77). If create_pod stops re-applying
+    /// defaults after the mutating webhook chain, this test fails because the injected
+    /// container comes back with terminationMessagePolicy absent.
+    #[tokio::test]
+    async fn create_pod_defaults_container_injected_by_mutating_webhook() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = make_state(store.clone());
+
+        seed_namespace(&store, "default").await;
+
+        let (url, _handle) = start_mock_webhook(inject_init_container_router()).await;
+
+        let mwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "test-inject-init-container"},
+            "webhooks": [{
+                "name": "inject.webhook.io",
+                "clientConfig": {"url": format!("{url}/webhook")},
+                "rules": [{"apiGroups": [""], "apiVersions": ["v1"], "resources": ["pods"], "operations": ["CREATE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/test-inject-init-container",
+                Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let pod_body = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "webhook-injected-pod", "namespace": "default"},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            })
+            .to_string(),
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+
+        let result = create_pod(
+            axum::extract::State(state),
+            axum::extract::Path(("default".to_string(),)),
+            axum::extract::Query(crate::handlers::json_patch::CreateQuery::default()),
+            test_user(),
+            headers,
+            pod_body,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "create_pod must succeed when the mutating webhook allows"
+        );
+
+        let stored = store
+            .get("/registry/pods/default/webhook-injected-pod")
+            .await
+            .unwrap()
+            .expect("pod must be stored");
+        let v: serde_json::Value = serde_json::from_slice(&stored.value).unwrap();
+        assert_eq!(
+            v["spec"]["initContainers"][0]["name"], "webhook-injected",
+            "sanity check: the webhook's initContainer must be present in the stored pod"
+        );
+        assert_eq!(
+            v["spec"]["initContainers"][0]["terminationMessagePolicy"], "File",
+            "the webhook-injected container must have terminationMessagePolicy defaulted \
+             to File — without the post-mutation re-apply, this field is absent because \
+             the defaulting pass ran before the webhook added the container"
         );
     }
 
