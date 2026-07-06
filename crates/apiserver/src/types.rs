@@ -208,6 +208,14 @@ static V1_RESOURCES: &[ApiResource] = &[
         short_names: None,
     },
     ApiResource {
+        name: "podtemplates",
+        singular_name: "podtemplate",
+        namespaced: true,
+        kind: "PodTemplate",
+        verbs: CORE_VERBS,
+        short_names: None,
+    },
+    ApiResource {
         name: "replicationcontrollers",
         singular_name: "replicationcontroller",
         namespaced: true,
@@ -920,6 +928,37 @@ mod tests {
         assert!(
             names.contains(&"replicationcontrollers"),
             "replicationcontrollers must be in /api/v1 — legacy but required for API conformance"
+        );
+    }
+
+    /// podtemplates must be advertised in /api/v1 discovery. kubectl resolves Kind -> resource
+    /// name via client-side discovery (RESTMapper) before issuing any request, so without this
+    /// entry `kubectl get/apply/describe podtemplates` fails locally with "the server doesn't
+    /// have a resource type" — even though the registry (state.rs::build_registry) and the
+    /// generic core-resource handlers already serve podtemplates correctly.
+    #[test]
+    fn podtemplates_advertised_in_v1_discovery() {
+        let list = ApiResourceList::v1();
+        let podtemplates = list
+            .resources
+            .iter()
+            .find(|r| r.name == "podtemplates")
+            .expect(
+                "podtemplates absent from /api/v1 discovery — kubectl get/apply/describe \
+                 podtemplates fails client-side before ever reaching the apiserver",
+            );
+        assert_eq!(
+            podtemplates.singular_name, "podtemplate",
+            "singularName must be 'podtemplate' so `kubectl get podtemplate <name>` resolves"
+        );
+        assert_eq!(
+            podtemplates.kind, "PodTemplate",
+            "kind must be 'PodTemplate' so kubectl maps the resource to the correct type"
+        );
+        assert!(
+            podtemplates.namespaced,
+            "podtemplates are namespaced — build_registry stores them per-namespace, \
+             and mismatched discovery would send kubectl to the wrong URL shape"
         );
     }
 
