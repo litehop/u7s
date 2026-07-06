@@ -14,7 +14,8 @@ use crate::{
     auth::UserInfo,
     state::AppState,
     status::Status,
-    util::{extract_body, utc_now_rfc3339},
+    types::Object,
+    util::{extract_body, parse_resource_version, utc_now_rfc3339},
 };
 
 const GROUP: &str = "apiextensions.k8s.io";
@@ -257,9 +258,20 @@ pub async fn list_crds<S: Store>(
         .await;
     }
 
+    let store_field_selector = query
+        .field_selector
+        .as_deref()
+        .map(super::generic::parse_field_selector)
+        .transpose()?;
     let resp = state
         .store
-        .list(&prefix, ListOptions::default())
+        .list(
+            &prefix,
+            ListOptions {
+                field_selector: store_field_selector,
+                ..ListOptions::default()
+            },
+        )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -269,6 +281,13 @@ pub async fn list_crds<S: Store>(
             serde_json::from_slice(&obj.value).map_err(|e| Status::internal(e.to_string()))?;
         items.push(v);
     }
+
+    let items = if let Some(ref sel) = query.label_selector {
+        let pairs = super::generic::parse_label_selector(sel)?;
+        super::generic::apply_label_selector(items, &pairs)
+    } else {
+        items
+    };
 
     let body = serde_json::json!({
         "kind": "CustomResourceDefinitionList",
@@ -553,6 +572,58 @@ pub async fn delete_crd<S: Store>(
     })))
 }
 
+/// DELETE /apis/apiextensions.k8s.io/v1/customresourcedefinitions (delete collection)
+///
+/// Honors ?labelSelector= like the generic delete_collection_resource, so tooling that
+/// labels its own CRDs can clean them up in one call. Without this route the collection
+/// endpoint only supported GET/POST, so DeleteCollection returned 405 — conformance's
+/// "listing custom resource definition objects works" test creates 10 labeled CRDs and
+/// relies on DeleteCollection(labelSelector) to remove exactly those.
+pub async fn delete_collection_crds<S: Store>(
+    State(state): State<AppState<S>>,
+    Query(query): Query<super::generic::CollectionQuery>,
+    Extension(user): Extension<UserInfo>,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let prefix = list_prefix();
+    let resp = state
+        .store
+        .list(&prefix, ListOptions::default())
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let label_pairs = query
+        .label_selector
+        .as_deref()
+        .map(super::generic::parse_label_selector)
+        .transpose()?;
+
+    for obj in resp.items {
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&obj.value) else {
+            continue;
+        };
+        let name = parsed["metadata"]["name"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(ref pairs) = label_pairs {
+            if super::generic::apply_label_selector(vec![parsed], pairs).is_empty() {
+                continue;
+            }
+        }
+        delete_crd(State(state.clone()), Path(name), Extension(user.clone())).await?;
+    }
+
+    Ok(Json(serde_json::json!({
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Success",
+        "code": 200
+    })))
+}
+
 pub async fn patch_crd<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
@@ -629,6 +700,133 @@ pub async fn patch_crd<S: Store>(
     Ok(Json(crd))
 }
 
+/// GET /apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}/status
+///
+/// A CRD's status (Established/NamesAccepted/StoredVersions conditions) is embedded
+/// in the object, not a separate subresource store — so GET returns the full object,
+/// mirroring get_namespace_status.
+pub async fn get_crd_status<S: Store>(
+    state: State<AppState<S>>,
+    Path(name): Path<String>,
+) -> Result<Response, crate::status::StatusError> {
+    get_crd(state, Path(name)).await
+}
+
+/// PUT /apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}/status
+///
+/// Replaces only the status field. Without this route, status requests fell through
+/// to the generic CR catch-all, which searched for a CRD-of-CRDs that can never exist
+/// and returned 404 — so controllers gating on CRD readiness (Established, NamesAccepted)
+/// could never observe or set those conditions.
+pub async fn put_crd_status<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let body = extract_body(&body, ct);
+    let incoming =
+        Object::from_bytes(&body).map_err(|e| Status::bad_request(format!("invalid JSON: {e}")))?;
+
+    let key = store_key(&name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, KIND))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    match &incoming.body["status"] {
+        serde_json::Value::Null => {
+            current.body.as_object_mut().map(|m| m.remove("status"));
+        }
+        v => {
+            current.body["status"] = v.clone();
+        }
+    }
+
+    crate::handlers::status::merge_incoming_metadata(&mut current.body, &incoming.body);
+
+    let expected_rv = parse_resource_version(incoming.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_crd(e, &name))?;
+
+    current.set_resource_version(new_rv);
+    Ok(Json(current.body))
+}
+
+/// PATCH /apis/apiextensions.k8s.io/v1/customresourcedefinitions/{name}/status
+///
+/// Patches only the status field. Supports merge-patch, strategic-merge-patch, and
+/// json-patch, mirroring patch_namespace_status.
+pub async fn patch_crd_status<S: Store>(
+    State(state): State<AppState<S>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<impl IntoResponse, crate::status::StatusError> {
+    let patch_type = detect_patch_type(&headers)?;
+
+    let key = store_key(&name);
+    let stored = state
+        .store
+        .get(&key)
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .ok_or_else(|| Status::not_found(&name, KIND))?;
+
+    let mut current = Object::from_bytes(&stored.value)
+        .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    let patch: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| Status::bad_request(format!("invalid patch JSON: {e}")))?;
+
+    match patch_type {
+        PatchType::Json => {
+            apply_json_patch(&mut current.body, &patch)?;
+        }
+        _ => {
+            if let Some(status_patch) = patch.get("status") {
+                let entry = current.body.as_object_mut().map(|m| {
+                    m.entry("status")
+                        .or_insert(serde_json::Value::Object(Default::default()))
+                });
+                if let Some(entry) = entry {
+                    match patch_type {
+                        PatchType::Merge => crate::patch::merge_patch(entry, status_patch),
+                        PatchType::StrategicMerge => {
+                            crate::patch::strategic_merge_patch(entry, status_patch)
+                                .map_err(|e| Status::bad_request(e.to_string()))?;
+                        }
+                        PatchType::Json => unreachable!(),
+                    }
+                }
+            }
+            crate::handlers::status::merge_incoming_metadata(&mut current.body, &patch);
+        }
+    }
+
+    let expected_rv = parse_resource_version(current.resource_version())?;
+    let new_rv = state
+        .store
+        .put(&key, current.to_bytes(), expected_rv)
+        .await
+        .map_err(|e| store_err_crd(e, &name))?;
+
+    current.set_resource_version(new_rv);
+    Ok(Json(current.body))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -676,6 +874,29 @@ mod tests {
                     "scope": "Namespaced",
                     "versions": [
                         { "name": "v1alpha1", "served": true, "storage": true }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    fn minimal_crd_bytes_with_group(name: &str, group: &str, plural: &str) -> Bytes {
+        Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": name },
+                "spec": {
+                    "group": group,
+                    "names": {
+                        "plural": plural,
+                        "singular": plural.trim_end_matches('s'),
+                        "kind": "Widget"
+                    },
+                    "scope": "Namespaced",
+                    "versions": [
+                        { "name": "v1", "served": true, "storage": true }
                     ]
                 }
             })
@@ -973,6 +1194,177 @@ mod tests {
         );
     }
 
+    // list_crds must apply ?labelSelector= like the generic resource list does.
+    // Without this, tooling that scopes itself to "only my CRDs" via a label
+    // selector would instead see every CRD in the cluster.
+    #[tokio::test]
+    async fn list_crds_applies_label_selector() {
+        let state = make_state();
+
+        let matching = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "foos.example.io", "labels": { "team": "a" } },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "foos", "singular": "foo", "kind": "Foo" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+        let non_matching = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "bars.example.io", "labels": { "team": "b" } },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "bars", "singular": "bar", "kind": "Bar" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            matching,
+        )
+        .await
+        .expect("create matching CRD must succeed");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            non_matching,
+        )
+        .await
+        .expect("create non-matching CRD must succeed");
+
+        let query = Query(crate::handlers::generic::CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: Some("team=a".to_string()),
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        });
+
+        let resp = list_crds(State(state), query, HeaderMap::new(), test_user())
+            .await
+            .expect("list must succeed");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["metadata"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["foos.example.io"],
+            "labelSelector=team=a must scope the list to matching CRDs only — \
+             returning every CRD breaks tooling that lists only its own CRDs"
+        );
+    }
+
+    /// DELETE on the CRD collection with a labelSelector must remove only the matching
+    /// CRDs — before this route existed the collection endpoint only supported GET/POST
+    /// and DeleteCollection returned 405, failing conformance's "listing custom resource
+    /// definition objects works" test (which cleans up its 10 labeled CRDs this way).
+    #[tokio::test]
+    async fn delete_collection_crds_honors_label_selector() {
+        let state = make_state();
+
+        let matching = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "foos.example.io", "labels": { "team": "a" } },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "foos", "singular": "foo", "kind": "Foo" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+        let non_matching = Bytes::from(
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": { "name": "bars.example.io", "labels": { "team": "b" } },
+                "spec": {
+                    "group": "example.io",
+                    "names": { "plural": "bars", "singular": "bar", "kind": "Bar" },
+                    "scope": "Namespaced",
+                    "versions": [{ "name": "v1", "served": true, "storage": true }]
+                }
+            })
+            .to_string(),
+        );
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            matching,
+        )
+        .await
+        .expect("create matching CRD must succeed");
+        create_crd(
+            State(state.clone()),
+            test_user(),
+            HeaderMap::new(),
+            non_matching,
+        )
+        .await
+        .expect("create non-matching CRD must succeed");
+
+        let query = Query(crate::handlers::generic::CollectionQuery {
+            watch: None,
+            resource_version: None,
+            label_selector: Some("team=a".to_string()),
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+            send_initial_events: None,
+            allow_watch_bookmarks: None,
+            timeout_seconds: None,
+        });
+        delete_collection_crds(State(state.clone()), query, test_user())
+            .await
+            .expect(
+                "delete collection must succeed — before the fix this route did not \
+                     exist and DELETE on the collection returned 405",
+            );
+
+        assert!(
+            get_crd(State(state.clone()), Path("foos.example.io".to_string()))
+                .await
+                .is_err(),
+            "the labeled CRD must be deleted"
+        );
+        assert!(
+            get_crd(State(state), Path("bars.example.io".to_string()))
+                .await
+                .is_ok(),
+            "the non-matching CRD must survive a label-scoped delete collection"
+        );
+    }
+
     // When ?watch=true, list_crds must route to the watch stream (chunked transfer)
     // rather than returning a normal CustomResourceDefinitionList. This verifies that
     // clients watching /apis/apiextensions.k8s.io/v1/customresourcedefinitions get a
@@ -1140,6 +1532,177 @@ mod tests {
             json["code"], 404,
             "PATCH on missing CRD must return 404 NotFound"
         );
+    }
+
+    // -- CRD status subresource: without a dedicated route these fell through to the
+    // generic CR catch-all, which looked for a CRD-of-CRDs that can never exist and
+    // returned 404 — so controllers gating on Established/NamesAccepted conditions
+    // could never observe or set them. --
+
+    /// GET .../{name}/status must return the full CRD (status is embedded, not a
+    /// separate store) — this is what conformance's "getting" CRD status subresource
+    /// scenario asserts.
+    #[tokio::test]
+    async fn get_crd_status_returns_full_object() {
+        let state = make_state();
+        let name = "widgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "widgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let resp = get_crd_status(State(state), Path(name.to_string()))
+            .await
+            .expect(
+                "get status must succeed — before the fix this fell through to the \
+                     generic CR catch-all and returned 404",
+            );
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["metadata"]["name"], name);
+    }
+
+    /// PUT .../{name}/status must round-trip a status update (e.g. the Established
+    /// condition) without touching spec — this is exactly what the conformance
+    /// "updating" CRD status subresource scenario does.
+    #[tokio::test]
+    async fn put_crd_status_round_trips_conditions() {
+        let state = make_state();
+        let name = "widgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "widgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let get_resp = get_crd(State(state.clone()), Path(name.to_string()))
+            .await
+            .expect("get must succeed");
+        let get_body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mut current: serde_json::Value = serde_json::from_slice(&get_body).unwrap();
+        current["status"] = serde_json::json!({
+            "conditions": [{ "type": "Established", "status": "True", "reason": "InitialNamesAccepted" }]
+        });
+        let put_body = Bytes::from(current.to_string());
+
+        let resp = put_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            HeaderMap::new(),
+            put_body,
+        )
+        .await
+        .expect(
+            "put status must succeed — before the fix this route did not exist \
+                     and the request 404'd on the generic CR catch-all",
+        )
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["status"]["conditions"][0]["type"], "Established",
+            "the Established condition set via PUT status must be persisted and echoed back"
+        );
+        assert_eq!(
+            v["spec"]["group"], "example.io",
+            "PUT on the status subresource must not touch spec"
+        );
+
+        // Verify the update actually persisted, not just echoed in the response.
+        let reget = get_crd(State(state), Path(name.to_string()))
+            .await
+            .expect("get must succeed after status update");
+        let reget_body = axum::body::to_bytes(reget.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&reget_body).unwrap();
+        assert_eq!(v2["status"]["conditions"][0]["type"], "Established");
+    }
+
+    /// PATCH .../{name}/status with a merge-patch must update only the status field —
+    /// this is exactly what conformance's "patching" CRD status subresource scenario does.
+    #[tokio::test]
+    async fn patch_crd_status_merge_patch_updates_status_only() {
+        let state = make_state();
+        let name = "widgets.example.io";
+        let body = minimal_crd_bytes_with_group(name, "example.io", "widgets");
+        create_crd(State(state.clone()), test_user(), HeaderMap::new(), body)
+            .await
+            .expect("create must succeed");
+
+        let patch = serde_json::json!({
+            "status": { "conditions": [{ "type": "NamesAccepted", "status": "True" }] }
+        });
+        let patch_bytes = Bytes::from(serde_json::to_vec(&patch).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+
+        let resp = patch_crd_status(State(state), Path(name.to_string()), headers, patch_bytes)
+            .await
+            .expect("patch status must succeed — before the fix this route did not exist")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"]["conditions"][0]["type"], "NamesAccepted");
+        assert_eq!(
+            v["spec"]["group"], "example.io",
+            "PATCH on the status subresource must not touch spec"
+        );
+    }
+
+    /// GET/PUT/PATCH .../{name}/status on a missing CRD must return 404, not fall through
+    /// to the generic CR catch-all's "CRD-of-CRDs not found" error.
+    #[tokio::test]
+    async fn crd_status_missing_returns_404() {
+        let state = make_state();
+        let name = "missing.example.io";
+
+        let err = match get_crd_status(State(state.clone()), Path(name.to_string())).await {
+            Ok(_) => panic!("expected 404"),
+            Err(e) => e,
+        };
+        assert_eq!(serde_json::to_value(&err.1).unwrap()["code"], 404);
+
+        let put_body = Bytes::from(serde_json::json!({"status": {}}).to_string());
+        let err = match put_crd_status(
+            State(state.clone()),
+            Path(name.to_string()),
+            HeaderMap::new(),
+            put_body,
+        )
+        .await
+        {
+            Ok(_) => panic!("expected 404"),
+            Err(e) => e,
+        };
+        assert_eq!(serde_json::to_value(&err.1).unwrap()["code"], 404);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/merge-patch+json".parse().unwrap(),
+        );
+        let patch_body = Bytes::from(serde_json::json!({"status": {}}).to_string());
+        let err = match patch_crd_status(State(state), Path(name.to_string()), headers, patch_body)
+            .await
+        {
+            Ok(_) => panic!("expected 404"),
+            Err(e) => e,
+        };
+        assert_eq!(serde_json::to_value(&err.1).unwrap()["code"], 404);
     }
 
     // -- validate_crd_group: built-in group shadowing protection --

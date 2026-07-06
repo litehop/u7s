@@ -10999,4 +10999,84 @@ mod tests {
             "additionalPrinterColumns[0].jsonPath must survive proto decode"
         );
     }
+
+    /// decode_crd_proto_gen must carry status.conditions into the output.
+    ///
+    /// The typed apiextensions clientset's UpdateStatus/Patch on the CRD status
+    /// subresource sends a protobuf-encoded body. Before this fix, decode_crd_proto_gen
+    /// dropped `crd.status` entirely, so extract_body handed the status-subresource PUT
+    /// handler a body with no "status" key at all — which the handler then interpreted
+    /// as "clear the status", wiping out the very conditions the client just appended.
+    /// This is exactly the conformance failure: "Condition {Message:"updated"} not found
+    /// in conditions []" — the response came back with status.conditions == nil.
+    #[test]
+    fn decode_crd_gen_carries_status_conditions_previously_dropped() {
+        use crate::apiextensions_gen::k8s::io::apiextensions_apiserver::pkg::apis::apiextensions::v1 as apiext_v1;
+        use crate::apiextensions_gen::k8s::io::apimachinery::pkg::apis::meta::v1 as gen_meta_v1;
+        use prost::Message as _;
+
+        let crd = apiext_v1::CustomResourceDefinition {
+            metadata: Some(gen_meta_v1::ObjectMeta {
+                name: Some("widgets.example.io".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apiext_v1::CustomResourceDefinitionSpec {
+                group: Some("example.io".to_string()),
+                scope: Some("Namespaced".to_string()),
+                names: Some(apiext_v1::CustomResourceDefinitionNames {
+                    plural: Some("widgets".to_string()),
+                    singular: Some("widget".to_string()),
+                    kind: Some("Widget".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: Some(apiext_v1::CustomResourceDefinitionStatus {
+                conditions: vec![
+                    apiext_v1::CustomResourceDefinitionCondition {
+                        r#type: Some("Established".to_string()),
+                        status: Some("True".to_string()),
+                        reason: Some("InitialNamesAccepted".to_string()),
+                        message: Some("the initial names have been accepted".to_string()),
+                        ..Default::default()
+                    },
+                    // The conformance test appends a condition with only Message set —
+                    // Type and Status remain empty strings but ARE present on the wire
+                    // (they are required, non-omitempty fields in the k8s API).
+                    apiext_v1::CustomResourceDefinitionCondition {
+                        r#type: Some(String::new()),
+                        status: Some(String::new()),
+                        message: Some("updated".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+        };
+
+        let mut buf = Vec::new();
+        crd.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = crate::apiextensions_gen_adapter::decode_crd_proto_gen(&buf)
+            .expect("CRD with status must decode");
+
+        let conditions = result["status"]["conditions"].as_array().expect(
+            "status.conditions must be present — without it, a protobuf status \
+                     subresource PUT/PATCH silently wipes the CRD's conditions",
+        );
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0]["type"], "Established");
+        assert_eq!(conditions[0]["reason"], "InitialNamesAccepted");
+        assert_eq!(
+            conditions[1]["message"], "updated",
+            "a condition with empty type/status but a message must still survive proto \
+             decode — this is exactly the client-appended condition the conformance test \
+             looks for in the response"
+        );
+        assert_eq!(
+            conditions[1]["type"], "",
+            "type must be present as an empty string, not omitted, matching the \
+             non-omitempty wire contract of CustomResourceDefinitionCondition"
+        );
+    }
 }
