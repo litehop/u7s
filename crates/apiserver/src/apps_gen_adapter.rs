@@ -156,6 +156,16 @@ pub fn decode_statefulset_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
 
 // ---- Decoder A: Deployment -------------------------------------------------
 
+fn gen_deployment_int_or_string_to_json(
+    ios: crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString,
+) -> serde_json::Value {
+    if ios.r#type.unwrap_or(0) == 0 {
+        serde_json::Value::Number(ios.int_val.unwrap_or(0).into())
+    } else {
+        serde_json::Value::String(ios.str_val.unwrap_or_default())
+    }
+}
+
 pub fn decode_deployment_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
     let obj = apps_v1::Deployment::decode(data).ok()?;
     let meta = gen_object_meta_to_json(obj.metadata.unwrap_or_default());
@@ -169,6 +179,37 @@ pub fn decode_deployment_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         let mut spec_json =
             gen_apps_spec_to_json(spec.selector, spec.template).unwrap_or(serde_json::json!({}));
         spec_json["replicas"] = serde_json::Value::Number(replicas.into());
+        if let Some(strategy) = spec.strategy {
+            let mut strategy_json = serde_json::json!({});
+            if let Some(t) = strategy.r#type.filter(|s| !s.is_empty()) {
+                strategy_json["type"] = t.into();
+            }
+            if let Some(ru) = strategy.rolling_update {
+                let mut ru_json = serde_json::json!({});
+                if let Some(mu) = ru.max_unavailable {
+                    ru_json["maxUnavailable"] = gen_deployment_int_or_string_to_json(mu);
+                }
+                if let Some(ms) = ru.max_surge {
+                    ru_json["maxSurge"] = gen_deployment_int_or_string_to_json(ms);
+                }
+                if !ru_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+                    strategy_json["rollingUpdate"] = ru_json;
+                }
+            }
+            if !strategy_json
+                .as_object()
+                .map(|m| m.is_empty())
+                .unwrap_or(true)
+            {
+                spec_json["strategy"] = strategy_json;
+            }
+        }
+        if let Some(v) = spec.revision_history_limit {
+            spec_json["revisionHistoryLimit"] = v.into();
+        }
+        if let Some(v) = spec.progress_deadline_seconds {
+            spec_json["progressDeadlineSeconds"] = v.into();
+        }
         if !spec_json.as_object().map(|m| m.is_empty()).unwrap_or(true) {
             out["spec"] = spec_json;
         }
@@ -485,10 +526,20 @@ mod tests {
             "spec.replicas must be present — dropped replicas corrupts scale operations"
         );
 
-        let strategy = &result["spec"];
-        assert!(
-            !strategy.is_null(),
-            "spec must be present — generated struct includes strategy field by construction"
+        assert_eq!(
+            result["spec"]["strategy"]["type"], "RollingUpdate",
+            "spec.strategy.type must decode from protobuf — dropping it lets defaults.rs \
+             silently overwrite a user-chosen strategy"
+        );
+        assert_eq!(
+            result["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"], "25%",
+            "rollingUpdate.maxUnavailable must survive decode — controls how many pods go \
+             down during a rolling update"
+        );
+        assert_eq!(
+            result["spec"]["strategy"]["rollingUpdate"]["maxSurge"], 1,
+            "rollingUpdate.maxSurge must survive decode — controls how many extra pods \
+             may be scheduled during a rolling update"
         );
 
         assert_eq!(
@@ -498,6 +549,57 @@ mod tests {
         assert_eq!(
             result["spec"]["template"]["spec"]["containers"][0]["name"], "nginx",
             "container name must survive round-trip — EqualIgnoreHash in KCM compares containers"
+        );
+    }
+
+    /// GATE: a Recreate deployment silently becoming RollingUpdate changes rollout
+    /// semantics (all-pods-down vs surge). Before the fix, decode_deployment_proto_gen
+    /// dropped spec.strategy/progressDeadlineSeconds/revisionHistoryLimit entirely, so
+    /// defaults.rs filled in RollingUpdate/10, clobbering the user's Recreate/0 — making
+    /// these fields uncontrollable via protobuf-encoded requests (typed clientsets and KCM
+    /// both use protobuf by default).
+    #[test]
+    fn decode_deployment_proto_gen_preserves_recreate_strategy_and_history_limit() {
+        let deploy = apps_v1::Deployment {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("recreate-deploy".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(apps_v1::DeploymentSpec {
+                replicas: Some(1),
+                strategy: Some(apps_v1::DeploymentStrategy {
+                    r#type: Some("Recreate".to_string()),
+                    rolling_update: None,
+                }),
+                revision_history_limit: Some(0),
+                progress_deadline_seconds: Some(120),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        deploy.encode(&mut buf).unwrap();
+
+        let result = decode_deployment_proto_gen(&buf).expect("Deployment must decode");
+
+        assert_eq!(
+            result["spec"]["strategy"]["type"], "Recreate",
+            "Recreate must not be defaulted away to RollingUpdate — Recreate tears all \
+             pods down before creating new ones, RollingUpdate surges; conflating the two \
+             breaks RecreateDeployment conformance"
+        );
+        assert!(
+            result["spec"]["strategy"]["rollingUpdate"].is_null(),
+            "rollingUpdate must not be injected for a Recreate strategy"
+        );
+        assert_eq!(
+            result["spec"]["revisionHistoryLimit"], 0,
+            "explicit revisionHistoryLimit=0 must survive decode, not be defaulted to 10 — \
+             it controls old ReplicaSet cleanup"
+        );
+        assert_eq!(
+            result["spec"]["progressDeadlineSeconds"], 120,
+            "progressDeadlineSeconds must round-trip through protobuf decode"
         );
     }
 
