@@ -186,6 +186,73 @@ fn known_top_level_fields(group: &str, plural: &str) -> &'static [&'static str] 
             "endpoints",
             "ports",
         ],
+        // PodTemplate — top-level field is "template" (a PodTemplateSpec), not spec/status.
+        // Without this entry, fieldValidation=Strict rejects every valid PodTemplate with
+        // 422 "unknown field \"template\"", breaking `kubectl apply` of PodTemplates.
+        ("", "podtemplates") => &["apiVersion", "kind", "metadata", "template"],
+        // Endpoints — top-level field is "subsets", not spec/status. Without this entry,
+        // fieldValidation=Strict rejects every valid Endpoints object with 422 "unknown
+        // field \"subsets\"", breaking `kubectl apply` of Endpoints.
+        ("", "endpoints") => &["apiVersion", "kind", "metadata", "subsets"],
+        // core/v1 Event — the legacy Event schema: all resource-specific fields sit
+        // directly at the top level, not under spec/status. Without this entry,
+        // fieldValidation=Strict rejects every valid Event with 422 "unknown field",
+        // breaking event recording (client-go's core/v1 event recorder posts this shape).
+        ("", "events") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "involvedObject",
+            "reason",
+            "message",
+            "source",
+            "firstTimestamp",
+            "lastTimestamp",
+            "count",
+            "type",
+            "eventTime",
+            "series",
+            "action",
+            "related",
+            "reportingComponent",
+            "reportingInstance",
+        ],
+        // events.k8s.io/v1 Event — a different top-level schema than core/v1 Event (e.g.
+        // reportingController/regarding/note instead of reportingComponent/involvedObject/
+        // message). Without this entry, fieldValidation=Strict rejects every valid
+        // events.k8s.io/v1 Event, breaking client-go's events/v1 event recorder.
+        ("events.k8s.io", "events") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "eventTime",
+            "series",
+            "reportingController",
+            "reportingInstance",
+            "action",
+            "reason",
+            "regarding",
+            "related",
+            "note",
+            "type",
+            "deprecatedSource",
+            "deprecatedFirstTimestamp",
+            "deprecatedLastTimestamp",
+            "deprecatedCount",
+        ],
+        // CSIStorageCapacity — top-level fields are nodeTopology/storageClassName/capacity/
+        // maximumVolumeSize, not spec/status. Without this entry, fieldValidation=Strict
+        // rejects every valid CSIStorageCapacity reported by a CSI driver's
+        // external-provisioner sidecar with 422 "unknown field".
+        ("storage.k8s.io", "csistoragecapacities") => &[
+            "apiVersion",
+            "kind",
+            "metadata",
+            "nodeTopology",
+            "storageClassName",
+            "capacity",
+            "maximumVolumeSize",
+        ],
         // Default: universal set + spec + status covers most resources
         _ => &["apiVersion", "kind", "metadata", "spec", "status"],
     }
@@ -969,6 +1036,252 @@ mod tests {
              webhook config. Error: {:?}",
             result.err()
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // PodTemplate / Endpoints / Event (both schemas) / CSIStorageCapacity field
+    // validation — regression for mayor-tw11
+    // ---------------------------------------------------------------------------
+
+    /// PodTemplate's top-level `template` field must not be reported as unknown.
+    ///
+    /// PodTemplate has no `spec`: its payload sits directly under `template`
+    /// (a PodTemplateSpec). Before this fix, `known_top_level_fields` had no entry
+    /// for it, so it fell through to the default `[apiVersion, kind, metadata, spec,
+    /// status]` set and `template` was flagged unknown — rejecting every valid
+    /// PodTemplate under fieldValidation=Strict.
+    #[test]
+    fn podtemplate_template_field_is_not_unknown() {
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PodTemplate",
+            "metadata": { "name": "my-template" },
+            "template": {
+                "metadata": { "labels": { "app": "nginx" } },
+                "spec": { "containers": [{ "name": "nginx", "image": "nginx:latest" }] }
+            }
+        });
+        let unknown = detect_unknown_fields(&body, "", "podtemplates");
+        assert!(
+            unknown.is_empty(),
+            "PodTemplate's template field must not be flagged as unknown — before the fix, \
+             fieldValidation=Strict returned 422 for every valid PodTemplate, blocking \
+             kubectl apply. Got unknown: {:?}",
+            unknown
+        );
+    }
+
+    /// Endpoints' top-level `subsets` field must not be reported as unknown.
+    ///
+    /// Endpoints has no `spec`: its payload sits directly under `subsets`. Before
+    /// this fix, `known_top_level_fields` had no entry for it, so it fell through
+    /// to the default set and `subsets` was flagged unknown — rejecting every valid
+    /// Endpoints object under fieldValidation=Strict.
+    #[test]
+    fn endpoints_subsets_field_is_not_unknown() {
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": { "name": "my-service", "namespace": "default" },
+            "subsets": [
+                {
+                    "addresses": [{ "ip": "10.0.0.1" }],
+                    "ports": [{ "port": 80, "protocol": "TCP" }]
+                }
+            ]
+        });
+        let unknown = detect_unknown_fields(&body, "", "endpoints");
+        assert!(
+            unknown.is_empty(),
+            "Endpoints' subsets field must not be flagged as unknown — before the fix, \
+             fieldValidation=Strict returned 422 for every valid Endpoints object, blocking \
+             kubectl apply. Got unknown: {:?}",
+            unknown
+        );
+    }
+
+    /// core/v1 Event's legacy top-level fields must not be reported as unknown.
+    ///
+    /// core/v1 Event predates spec/status conventions: reason, message, source,
+    /// involvedObject, etc. sit directly at the top level. Before this fix, the
+    /// default `[apiVersion, kind, metadata, spec, status]` set flagged every one
+    /// of these as unknown, rejecting every Event a component tried to record
+    /// under fieldValidation=Strict.
+    #[test]
+    fn core_event_legacy_fields_are_not_unknown() {
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Event",
+            "metadata": { "name": "my-pod.17abc", "namespace": "default" },
+            "involvedObject": { "kind": "Pod", "name": "my-pod", "namespace": "default" },
+            "reason": "Scheduled",
+            "message": "Successfully assigned default/my-pod to node-1",
+            "source": { "component": "default-scheduler" },
+            "firstTimestamp": "2026-07-06T00:00:00Z",
+            "lastTimestamp": "2026-07-06T00:00:00Z",
+            "count": 1,
+            "type": "Normal",
+            "eventTime": null,
+            "reportingComponent": "default-scheduler",
+            "reportingInstance": "default-scheduler-abc"
+        });
+        let unknown = detect_unknown_fields(&body, "", "events");
+        assert!(
+            unknown.is_empty(),
+            "core/v1 Event's legacy top-level fields must not be flagged as unknown — before \
+             the fix, fieldValidation=Strict returned 422 for every Event a component tried \
+             to record, breaking event recording cluster-wide. Got unknown: {:?}",
+            unknown
+        );
+    }
+
+    /// events.k8s.io/v1 Event's top-level fields must not be reported as unknown.
+    ///
+    /// events.k8s.io/v1 Event is schema-incompatible with core/v1 Event — it uses
+    /// reportingController/regarding/note instead of reportingComponent/
+    /// involvedObject/message. Before this fix, both Event types shared the same
+    /// default fallback and every one of these fields was flagged unknown, rejecting
+    /// every events.k8s.io/v1 Event under fieldValidation=Strict.
+    #[test]
+    fn events_k8s_io_event_fields_are_not_unknown() {
+        let body = serde_json::json!({
+            "apiVersion": "events.k8s.io/v1",
+            "kind": "Event",
+            "metadata": { "name": "my-pod.17abc", "namespace": "default" },
+            "eventTime": "2026-07-06T00:00:00.000000Z",
+            "reportingController": "default-scheduler",
+            "reportingInstance": "default-scheduler-abc",
+            "action": "Binding",
+            "reason": "Scheduled",
+            "regarding": { "kind": "Pod", "name": "my-pod", "namespace": "default" },
+            "note": "Successfully assigned default/my-pod to node-1",
+            "type": "Normal"
+        });
+        let unknown = detect_unknown_fields(&body, "events.k8s.io", "events");
+        assert!(
+            unknown.is_empty(),
+            "events.k8s.io/v1 Event's top-level fields must not be flagged as unknown — before \
+             the fix, fieldValidation=Strict returned 422 for every events.k8s.io/v1 Event, \
+             breaking client-go's events/v1 event recorder. Got unknown: {:?}",
+            unknown
+        );
+    }
+
+    /// CSIStorageCapacity's top-level fields must not be reported as unknown.
+    ///
+    /// CSIStorageCapacity has no `spec`: nodeTopology/storageClassName/capacity/
+    /// maximumVolumeSize sit directly at the top level. Before this fix, these
+    /// fields fell through to the default set and were flagged unknown, rejecting
+    /// every CSIStorageCapacity reported by a CSI driver's external-provisioner
+    /// sidecar under fieldValidation=Strict.
+    #[test]
+    fn csistoragecapacity_fields_are_not_unknown() {
+        let body = serde_json::json!({
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "CSIStorageCapacity",
+            "metadata": { "name": "my-capacity", "namespace": "default" },
+            "nodeTopology": { "matchLabels": { "topology.kubernetes.io/zone": "us-east-1a" } },
+            "storageClassName": "fast-ssd",
+            "capacity": "100Gi",
+            "maximumVolumeSize": "50Gi"
+        });
+        let unknown = detect_unknown_fields(&body, "storage.k8s.io", "csistoragecapacities");
+        assert!(
+            unknown.is_empty(),
+            "CSIStorageCapacity's top-level fields must not be flagged as unknown — before \
+             the fix, fieldValidation=Strict returned 422 for every CSIStorageCapacity \
+             reported by a CSI driver, breaking storage capacity tracking. Got unknown: {:?}",
+            unknown
+        );
+    }
+
+    /// apply_field_validation with Strict mode must accept a body for each of the five
+    /// types above, whose only resource-specific fields are their real (non-spec)
+    /// top-level fields.
+    ///
+    /// This is the end-to-end regression for mayor-tw11: `kubectl apply` sends
+    /// `?fieldValidation=Strict` by default, so a false "unknown field" positive here
+    /// means every create of these types is rejected with 422 — breaking PodTemplate/
+    /// Endpoints/Event/CSIStorageCapacity creation cluster-wide (kubelet event
+    /// recording, kube-controller-manager Endpoints sync, CSI capacity reporting).
+    #[test]
+    fn strict_validation_accepts_podtemplate_endpoints_event_csistoragecapacity_else_kubectl_apply_fails_422(
+    ) {
+        let cases: Vec<(&str, &str, serde_json::Value)> = vec![
+            (
+                "",
+                "podtemplates",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PodTemplate",
+                    "metadata": { "name": "my-template" },
+                    "template": { "spec": { "containers": [{ "name": "nginx", "image": "nginx:latest" }] } }
+                }),
+            ),
+            (
+                "",
+                "endpoints",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Endpoints",
+                    "metadata": { "name": "my-service", "namespace": "default" },
+                    "subsets": [{ "addresses": [{ "ip": "10.0.0.1" }], "ports": [{ "port": 80 }] }]
+                }),
+            ),
+            (
+                "",
+                "events",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Event",
+                    "metadata": { "name": "my-pod.17abc", "namespace": "default" },
+                    "involvedObject": { "kind": "Pod", "name": "my-pod" },
+                    "reason": "Scheduled",
+                    "message": "assigned",
+                    "type": "Normal"
+                }),
+            ),
+            (
+                "events.k8s.io",
+                "events",
+                serde_json::json!({
+                    "apiVersion": "events.k8s.io/v1",
+                    "kind": "Event",
+                    "metadata": { "name": "my-pod.17abc", "namespace": "default" },
+                    "eventTime": "2026-07-06T00:00:00.000000Z",
+                    "reportingController": "default-scheduler",
+                    "reportingInstance": "default-scheduler-abc",
+                    "action": "Binding",
+                    "reason": "Scheduled",
+                    "regarding": { "kind": "Pod", "name": "my-pod" },
+                    "type": "Normal"
+                }),
+            ),
+            (
+                "storage.k8s.io",
+                "csistoragecapacities",
+                serde_json::json!({
+                    "apiVersion": "storage.k8s.io/v1",
+                    "kind": "CSIStorageCapacity",
+                    "metadata": { "name": "my-capacity", "namespace": "default" },
+                    "storageClassName": "fast-ssd",
+                    "capacity": "100Gi"
+                }),
+            ),
+        ];
+
+        for (group, plural, body) in cases {
+            let raw = serde_json::to_vec(&body).unwrap();
+            let result = apply_field_validation(&body, &raw, Some("Strict"), group, plural);
+            assert!(
+                result.is_ok(),
+                "({group:?}, {plural:?}) must pass Strict validation with only its real \
+                 top-level fields — before the fix this returned Err(422), the exact \
+                 'strict decoding error: unknown field' response kubectl apply would see \
+                 live. Error: {:?}",
+                result.err()
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
