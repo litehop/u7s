@@ -579,6 +579,7 @@ fn unauthorized_response() -> Response<Body> {
         reason: "Unauthorized",
         code: 401,
         metadata: None,
+        details: None,
     };
     let body = serde_json::to_vec(&status).unwrap_or_default();
     Response::builder()
@@ -597,6 +598,7 @@ fn forbidden_response(user: &str, verb: &str, resource: &str) -> Response<Body> 
         reason: "Forbidden",
         code: 403,
         metadata: None,
+        details: None,
     };
     let body = serde_json::to_vec(&status).unwrap_or_default();
     Response::builder()

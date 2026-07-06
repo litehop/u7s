@@ -82,6 +82,7 @@ fn too_many_requests_response() -> Response<Body> {
         reason: "TooManyRequests",
         code: 429,
         metadata: None,
+        details: None,
     };
     let body = serde_json::to_vec(&status).unwrap_or_default();
     Response::builder()

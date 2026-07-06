@@ -20,6 +20,10 @@ pub struct Status {
     /// Boxed to keep the `Status` struct small and avoid `clippy::result_large_err`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Box<serde_json::Value>>,
+    /// Optional `status.details` (e.g. `causes`), used by callers that must set a
+    /// machine-readable cause client-go can match on (e.g. `errors.HasStatusCause`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Box<serde_json::Value>>,
 }
 
 pub struct StatusError(pub StatusCode, pub Status);
@@ -48,6 +52,7 @@ impl Status {
                 reason: "NotFound",
                 code: 404,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -63,6 +68,7 @@ impl Status {
                 reason: "AlreadyExists",
                 code: 409,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -78,6 +84,7 @@ impl Status {
                 reason: "Conflict",
                 code: 409,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -93,6 +100,7 @@ impl Status {
                 reason: "BadRequest",
                 code: 400,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -108,6 +116,7 @@ impl Status {
                 reason: "UnsupportedMediaType",
                 code: 415,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -123,6 +132,7 @@ impl Status {
                 reason: "Invalid",
                 code: 422,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -138,6 +148,7 @@ impl Status {
                 reason: "Expired",
                 code: 410,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -156,6 +167,7 @@ impl Status {
                 reason: "Expired",
                 code: 410,
                 metadata: Some(Box::new(serde_json::json!({ "continue": continue_token }))),
+                details: None,
             },
         )
     }
@@ -171,6 +183,7 @@ impl Status {
                 reason: "InternalError",
                 code: 500,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -186,6 +199,33 @@ impl Status {
                 reason: "TooManyRequests",
                 code: 429,
                 metadata: None,
+                details: None,
+            },
+        )
+    }
+
+    /// 429 with a `status.details.causes[]` entry, so client-go's
+    /// `apierrors.HasStatusCause(err, cause_reason)` can match on it. Used by pod eviction
+    /// to signal `DisruptionBudget` as the cause (matches upstream's eviction REST handler) —
+    /// `kubectl drain` and the conformance suite both check this cause, not just the HTTP code.
+    pub fn too_many_requests_with_cause(
+        message: String,
+        cause_reason: &str,
+        cause_message: String,
+    ) -> StatusError {
+        StatusError(
+            StatusCode::TOO_MANY_REQUESTS,
+            Status {
+                kind: "Status",
+                api_version: "v1",
+                status: "Failure",
+                message,
+                reason: "TooManyRequests",
+                code: 429,
+                metadata: None,
+                details: Some(Box::new(serde_json::json!({
+                    "causes": [{"reason": cause_reason, "message": cause_message}]
+                }))),
             },
         )
     }
@@ -201,6 +241,7 @@ impl Status {
                 reason: "NotAcceptable",
                 code: 406,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -216,6 +257,7 @@ impl Status {
                 reason: "Forbidden",
                 code: 403,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -231,6 +273,7 @@ impl Status {
                 reason: "ServiceUnavailable",
                 code: 503,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -246,6 +289,7 @@ impl Status {
                 reason: "Timeout",
                 code: 504,
                 metadata: None,
+                details: None,
             },
         )
     }
@@ -266,6 +310,7 @@ impl Status {
                 reason: "Gone",
                 code: 410,
                 metadata: None,
+                details: None,
             },
         )
     }

@@ -781,6 +781,7 @@ async fn fallback_handler() -> status::StatusError {
             reason: "NotFound",
             code: 404,
             metadata: None,
+            details: None,
         },
     )
 }

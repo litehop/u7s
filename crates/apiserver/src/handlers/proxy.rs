@@ -206,6 +206,7 @@ pub async fn pod_log<S: Store>(
                 reason: "BadGateway",
                 code: 502,
                 metadata: None,
+                details: None,
             },
         )
     })?;
@@ -428,6 +429,7 @@ pub async fn pod_attach_post<S: Store>(
             reason: "NotImplemented",
             code: 501,
             metadata: None,
+            details: None,
         },
     ))
 }
@@ -803,6 +805,7 @@ pub async fn pod_exec_post<S: Store>(
             reason: "NotImplemented",
             code: 501,
             metadata: None,
+            details: None,
         },
     ))
 }
@@ -1184,6 +1187,7 @@ pub async fn node_proxy<S: Store>(
                     reason: "BadGateway",
                     code: 502,
                     metadata: None,
+                    details: None,
                 },
             )
         })?;
@@ -1438,6 +1442,7 @@ async fn pod_proxy_dispatch<S: Store>(
                     reason: "BadGateway",
                     code: 502,
                     metadata: None,
+                    details: None,
                 },
             )
         })?;
@@ -1477,6 +1482,7 @@ async fn pod_proxy_dispatch<S: Store>(
                     reason: "BadGateway",
                     code: 502,
                     metadata: None,
+                    details: None,
                 },
             )
         })?;
@@ -1645,6 +1651,7 @@ pub async fn resolve_service_proxy_target<S: Store>(
             reason: "ServiceUnavailable",
             code: 503,
             metadata: None,
+            details: None,
         },
     ))
 }
@@ -1694,6 +1701,7 @@ async fn service_proxy_dispatch<S: Store>(
                     reason: "BadGateway",
                     code: 502,
                     metadata: None,
+                    details: None,
                 },
             )
         })?;
@@ -1732,6 +1740,7 @@ async fn service_proxy_dispatch<S: Store>(
                     reason: "BadGateway",
                     code: 502,
                     metadata: None,
+                    details: None,
                 },
             )
         })?;
