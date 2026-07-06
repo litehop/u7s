@@ -2946,6 +2946,71 @@ mod tests {
         );
     }
 
+    /// Deleting a ValidatingWebhookConfiguration must bypass the admission pipeline too.
+    ///
+    /// mayor-w354 wired DELETE handlers into run_validating_webhooks for the first time —
+    /// before that fix, DELETE never reached this function at all, so the bypass below was
+    /// never exercised on the DELETE path. Once DELETE started flowing through admission,
+    /// an operation-DELETE self-referential webhook config would deadlock cluster bootstrap
+    /// (you could never delete a broken Fail-policy VWC/MWC, since deleting it would first
+    /// have to ask it for permission). This test proves the bypass — which is keyed only on
+    /// `ctx.group`, not `ctx.operation` — still holds for DELETE specifically.
+    #[tokio::test]
+    async fn run_validating_webhooks_skips_for_webhook_configuration_resource_on_delete() {
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // Wildcard ValidatingWebhookConfiguration with unreachable URL and Fail policy,
+        // matching DELETE explicitly (not just "*") so the deny would be unambiguous if
+        // the bypass were ever lost.
+        let vwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "wildcard-vwc-delete"},
+            "webhooks": [{
+                "name": "deadlock.validating-delete.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["DELETE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/wildcard-vwc-delete",
+                bytes::Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Simulate deleting that very same ValidatingWebhookConfiguration.
+        let existing_vwc = vwc.clone();
+        let ctx = AdmissionContext {
+            group: "admissionregistration.k8s.io",
+            version: "v1",
+            resource: "validatingwebhookconfigurations",
+            name: "wildcard-vwc-delete",
+            namespace: None,
+            operation: "DELETE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result =
+            run_validating_webhooks(&state, &existing_vwc, Some(&existing_vwc), &ctx).await;
+        assert!(
+            result.is_ok(),
+            "deleting a ValidatingWebhookConfiguration must bypass the admission pipeline — \
+             otherwise a broken Fail-policy webhook config could never be deleted, \
+             permanently deadlocking cluster admission"
+        );
+    }
+
     // -- matches_rule tests --
 
     /// Wildcard "*" in all fields matches any resource/operation.

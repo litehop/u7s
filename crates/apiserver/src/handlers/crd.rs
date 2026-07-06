@@ -484,6 +484,7 @@ pub async fn replace_crd<S: Store>(
 pub async fn delete_crd<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let key = store_key(&name);
 
@@ -495,11 +496,30 @@ pub async fn delete_crd<S: Store>(
         .map_err(|e| Status::internal(e.to_string()))?
         .ok_or_else(|| Status::not_found(&name, KIND))?;
 
-    // Extract the group before deleting so we can write the tombstone.
-    let group: String = serde_json::from_slice::<serde_json::Value>(&stored.value)
-        .ok()
-        .and_then(|v| v["spec"]["group"].as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
+    // Parse once: used both for the tombstone's group below and as the admission review object.
+    let existing: serde_json::Value =
+        serde_json::from_slice(&stored.value).unwrap_or(serde_json::Value::Null);
+    let group: String = existing["spec"]["group"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    let admission_ctx = AdmissionContext {
+        group: "apiextensions.k8s.io",
+        version: "v1",
+        resource: "customresourcedefinitions",
+        name: &name,
+        namespace: None,
+        operation: "DELETE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
+        dry_run: false,
+    };
+    run_validating_webhooks(&state, &existing, Some(&existing), &admission_ctx).await?;
 
     state
         .store
@@ -819,8 +839,14 @@ mod tests {
     #[tokio::test]
     async fn delete_missing_returns_404() {
         let state = make_state();
-        let err =
-            err_status(delete_crd(State(state), Path("missing.example.com".to_string())).await);
+        let err = err_status(
+            delete_crd(
+                State(state),
+                Path("missing.example.com".to_string()),
+                test_user(),
+            )
+            .await,
+        );
         let json = serde_json::to_value(&err.1).unwrap();
         assert_eq!(json["code"], 404);
         assert_eq!(json["reason"], "NotFound");
@@ -1339,7 +1365,7 @@ mod tests {
         .await
         .expect("initial create must succeed");
 
-        delete_crd(State(state.clone()), Path(name.to_string()))
+        delete_crd(State(state.clone()), Path(name.to_string()), test_user())
             .await
             .expect("delete must succeed");
 

@@ -1034,6 +1034,7 @@ async fn cascade_delete_cr_dependents<S: Store>(
 pub async fn delete_cr<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1062,6 +1063,25 @@ pub async fn delete_cr<S: Store>(
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
+
+    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // This is what the conformance test "deny custom resource create/update/delete" exercises
+    // for the delete case: a Fail-policy webhook must be able to reject the deletion.
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: None,
+        operation: "DELETE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
+        dry_run: false,
+    };
+    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
     // apply_delete_policy: if the CR has finalizers, stamp deletionTimestamp and soft-delete.
     if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut obj) {
@@ -1511,6 +1531,7 @@ pub async fn replace_cr_namespaced<S: Store>(
 pub async fn delete_cr_namespaced<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1539,6 +1560,23 @@ pub async fn delete_cr_namespaced<S: Store>(
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored CR: {e}")))?;
+
+    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: Some(&ns),
+        operation: "DELETE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
+        dry_run: false,
+    };
+    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
     // apply_delete_policy: if the CR has finalizers, stamp deletionTimestamp and soft-delete.
     if let Some(soft) = crate::handlers::generic::apply_delete_policy(&mut obj) {
@@ -2637,6 +2675,7 @@ mod tests {
                     plural.clone(),
                     name.clone()
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 Bytes::new(),
             )
@@ -4389,6 +4428,7 @@ mod tests {
             delete_cr(
                 State(state.clone()),
                 Path((group.clone(), version.clone(), plural.clone(), name.clone())),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 Bytes::new(),
             )
@@ -4422,6 +4462,7 @@ mod tests {
                     "widgets".to_string(),
                     "nonexistent".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 Bytes::new(),
             )
@@ -4449,6 +4490,7 @@ mod tests {
                     "applications".to_string(),
                     "my-app".to_string(),
                 )),
+                test_user(),
                 axum::http::HeaderMap::new(),
                 Bytes::new(),
             )
@@ -6307,6 +6349,7 @@ mod tests {
             crd::delete_crd(
                 State(state.clone()),
                 axum::extract::Path("applications.argoproj.io".to_string()),
+                test_user(),
             )
             .await
             .is_ok(),
@@ -6364,6 +6407,7 @@ mod tests {
         crd::delete_crd(
             State(state.clone()),
             axum::extract::Path("applications.argoproj.io".to_string()),
+            test_user(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -6424,6 +6468,7 @@ mod tests {
         crd::delete_crd(
             State(state.clone()),
             axum::extract::Path("widgets.example.io".to_string()),
+            test_user(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -6507,6 +6552,7 @@ mod tests {
         crd::delete_crd(
             State(state.clone()),
             axum::extract::Path("applications.argoproj.io".to_string()),
+            test_user(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -6569,6 +6615,7 @@ mod tests {
         crd::delete_crd(
             State(state.clone()),
             axum::extract::Path("widgets.example.io".to_string()),
+            test_user(),
         )
         .await
         .expect("delete_crd must succeed");
@@ -7032,6 +7079,172 @@ mod tests {
             "mutating webhook with failurePolicy=Fail must deny cluster-scoped CR creation — \
              if admission is skipped for the cluster-scoped CR path, this create would \
              incorrectly succeed"
+        );
+    }
+
+    /// A validating webhook with failurePolicy=Fail and an unreachable URL must
+    /// deny CR deletion with an error, not silently allow it.
+    ///
+    /// Regression test for mayor-w354: every DELETE handler in the apiserver skipped
+    /// admission entirely, so a Fail-policy validating webhook registered on DELETE
+    /// never received a request and the object was always removed regardless of the
+    /// webhook's verdict. This is exactly the delete half of the conformance test
+    /// "deny custom resource create/update/delete". If delete_cr_namespaced stops
+    /// calling run_validating_webhooks (i.e. this fix is reverted), the delete below
+    /// succeeds and the object disappears from the store — this test then fails,
+    /// proving the admission invocation was removed.
+    #[tokio::test]
+    async fn delete_cr_namespaced_calls_validating_admission_fail_policy_denies() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        let state = make_state();
+        install_namespaced_crd(&state).await;
+
+        let group = "argoproj.io".to_string();
+        let version = "v1alpha1".to_string();
+        let ns = "argocd".to_string();
+        let plural = "applications".to_string();
+        let name = "wh-delete-app".to_string();
+
+        // Seed the object to be deleted BEFORE registering the webhook, so creation
+        // is not itself denied.
+        assert!(
+            create_cr_namespaced(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), ns.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                app_body(&name, &ns),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "cr-delete-vwc"},
+            "webhooks": [{
+                "name": "cr.validate-delete.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["DELETE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/cr-delete-vwc",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = delete_cr_namespaced(
+            State(state.clone()),
+            Path((
+                group.clone(),
+                version.clone(),
+                ns.clone(),
+                plural.clone(),
+                name.clone(),
+            )),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "validating webhook with failurePolicy=Fail must deny CR deletion — \
+             if delete_cr_namespaced does not call run_validating_webhooks, the \
+             Fail-policy webhook is skipped and the delete incorrectly succeeds"
+        );
+
+        // The object must still exist — a webhook denial must not remove it.
+        assert!(
+            get_cr_namespaced(
+                State(state.clone()),
+                Path((group, version, ns, plural, name))
+            )
+            .await
+            .is_ok(),
+            "object must survive a denied delete — otherwise the webhook denial is \
+             cosmetic and the object is removed anyway"
+        );
+    }
+
+    /// A validating webhook with failurePolicy=Fail and an unreachable URL must
+    /// deny cluster-scoped CR deletion.
+    ///
+    /// Verifies that delete_cr (cluster-scoped path) also invokes admission on DELETE,
+    /// not just the namespaced handler. Companion to
+    /// delete_cr_namespaced_calls_validating_admission_fail_policy_denies above.
+    #[tokio::test]
+    async fn delete_cr_calls_admission_fail_policy_denies_cluster_scoped() {
+        use bytes::Bytes;
+        use u7s_store::Store;
+
+        let state = make_state();
+        install_cluster_crd(&state).await;
+
+        let group = "example.io".to_string();
+        let version = "v1".to_string();
+        let plural = "widgets".to_string();
+        let name = "wh-delete-widget".to_string();
+
+        assert!(
+            create_cr(
+                State(state.clone()),
+                Path((group.clone(), version.clone(), plural.clone())),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                widget_body(&name),
+            )
+            .await
+            .is_ok(),
+            "seed create must succeed"
+        );
+
+        let vwc = serde_json::json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingWebhookConfiguration",
+            "metadata": {"name": "cluster-cr-delete-vwc"},
+            "webhooks": [{
+                "name": "cluster-cr.validate-delete.example.com",
+                "clientConfig": { "url": "http://127.0.0.1:1" },
+                "rules": [{"apiGroups": ["*"], "apiVersions": ["*"], "resources": ["*"], "operations": ["DELETE"]}],
+                "failurePolicy": "Fail"
+            }]
+        });
+        state
+            .store
+            .put(
+                "/registry/admissionregistration.k8s.io/validatingwebhookconfigurations/cluster-cr-delete-vwc",
+                Bytes::from(serde_json::to_vec(&vwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = delete_cr(
+            State(state.clone()),
+            Path((group, version, plural, name)),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "validating webhook with failurePolicy=Fail must deny cluster-scoped CR \
+             deletion — if admission is skipped for the cluster-scoped delete path, \
+             this delete would incorrectly succeed"
         );
     }
 
@@ -7588,6 +7801,7 @@ mod tests {
                 plural.to_string(),
                 "owner-widget".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             Bytes::new(),
         )
@@ -7690,6 +7904,7 @@ mod tests {
                 plural.to_string(),
                 "owner-app".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             Bytes::new(),
         )
@@ -7792,6 +8007,7 @@ mod tests {
                 plural.to_string(),
                 "orphan-owner".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             orphan_opts,
         )
@@ -7859,6 +8075,7 @@ mod tests {
                 plural.to_string(),
                 "finalizer-widget".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             Bytes::new(),
         )
@@ -7992,6 +8209,7 @@ mod tests {
                 plural.to_string(),
                 "chain-owner".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             Bytes::new(),
         )
@@ -8122,6 +8340,7 @@ mod tests {
                 plural.to_string(),
                 "ownerref-owner".to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             Bytes::new(),
         )
@@ -8431,6 +8650,7 @@ mod tests {
                 "gadgets".into(),
                 "probe".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             Bytes::new(),
         )
