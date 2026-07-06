@@ -1045,7 +1045,8 @@ async fn invoke_mutating_webhook<S: Store>(
                 // Include the full URL (with ?timeout=Ns) so the client error message
                 // matches what the conformance test checks: the URL path + "timeout".
                 Err(Status::gateway_timeout(format!(
-                    "request did not complete within requested timeout {secs}s: {call_url}"
+                    "request did not complete within requested timeout {secs}s \
+                     (context deadline exceeded): {call_url}"
                 )))
             } else {
                 Err(Status::internal(format!(
@@ -2186,7 +2187,7 @@ pub(crate) fn validate_webhook_match_conditions_cel(obj: &serde_json::Value) -> 
             if !valid_start {
                 return Err(format!(
                     "webhooks[{wi}].matchConditions[{ci}].expression: \
-                     compilation error: invalid CEL expression: {expr:?}"
+                     compilation failed: invalid CEL expression: {expr:?}"
                 ));
             }
         }
@@ -2868,7 +2869,8 @@ pub async fn run_validating_webhooks<S: Store>(
                     // Include the full URL (with ?timeout=Ns) so the client error message
                     // matches what the conformance test checks: the URL path + "timeout".
                     return Err(Status::gateway_timeout(format!(
-                        "request did not complete within requested timeout {secs}s: {call_url}"
+                        "request did not complete within requested timeout {secs}s \
+                         (context deadline exceeded): {call_url}"
                     )));
                 } else {
                     return Err(Status::internal(format!(
@@ -3780,6 +3782,11 @@ mod tests {
     ///   2. The error contains "/path?timeout=1s" (the URL the apiserver called).
     /// Returning only a generic "Timeout: …" message without the URL fails check 2.
     /// Returning a 500 fails the expectation of a gateway-timeout-class error.
+    ///
+    /// Separately (mayor-gelc), the `should be able to deny pod and configmap creation`
+    /// conformance test's hanging-webhook assertion does a *strict* single-substring grep
+    /// — `strings.Contains(err.Error(), "deadline")`, with no "OR timeout" fallback — so
+    /// the message must literally contain "deadline" even though it already said "timeout".
     #[tokio::test]
     async fn validating_webhook_timeout_error_contains_url_with_timeout_param() {
         use axum::routing::post;
@@ -3879,6 +3886,112 @@ mod tests {
             "timeout error message must contain the webhook URL with ?timeout=1s so the \
              conformance test recognises which webhook timed out — \
              reverting the URL inclusion breaks this check. Got: {}",
+            err.1.message
+        );
+        // mayor-gelc: `should be able to deny pod and configmap creation` greps strictly for
+        // "deadline" (not "timeout") on the hanging-webhook error. Wording it as only
+        // "...requested timeout Ns: <url>" is a behaviorally-correct rejection that still
+        // fails that conformance string-grep.
+        assert!(
+            err.1.message.contains("deadline"),
+            "timeout error message must contain 'deadline' so the conformance test's strict \
+             strings.Contains(err.Error(), \"deadline\") check recognises the failure as a \
+             timeout — got: {}",
+            err.1.message
+        );
+    }
+
+    /// Mirrors `validating_webhook_timeout_error_contains_url_with_timeout_param` for the
+    /// mutating webhook path (a separate call site in `invoke_mutating_webhook`, using the
+    /// same message format independently — see mayor-gelc). Without this test, fixing the
+    /// validating-path wording while leaving the mutating-path wording stale would go
+    /// unnoticed even though both are exercised by conformance (mutating webhooks run first).
+    #[tokio::test]
+    async fn mutating_webhook_timeout_error_contains_deadline() {
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = AppState::new(
+            store.clone(),
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        let slow_router = Router::new().route(
+            "/webhook",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                axum::Json(json!({
+                    "apiVersion": "admission.k8s.io/v1",
+                    "kind": "AdmissionReview",
+                    "response": {"uid": "x", "allowed": true}
+                }))
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, slow_router)
+                .await
+                .expect("slow webhook server must not fail");
+        });
+
+        let mwc = json!({
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "MutatingWebhookConfiguration",
+            "metadata": {"name": "slow-mwc"},
+            "webhooks": [{
+                "name": "slow.mutating.example.com",
+                "clientConfig": {"url": format!("http://{addr}/webhook")},
+                "rules": [{
+                    "apiGroups": ["apps"],
+                    "apiVersions": ["v1"],
+                    "resources": ["deployments"],
+                    "operations": ["CREATE"]
+                }],
+                "failurePolicy": "Fail",
+                "timeoutSeconds": 1
+            }]
+        });
+        store
+            .put(
+                "/registry/admissionregistration.k8s.io/mutatingwebhookconfigurations/slow-mwc",
+                bytes::Bytes::from(serde_json::to_vec(&mwc).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let obj = json!({"kind": "Deployment", "metadata": {"name": "my-deploy"}});
+        let ctx = AdmissionContext {
+            group: "apps",
+            version: "v1",
+            resource: "deployments",
+            name: "my-deploy",
+            namespace: Some("default"),
+            operation: "CREATE",
+            user_info: None,
+            dry_run: false,
+        };
+        let result = run_mutating_webhooks(&state, obj.clone(), None, &ctx).await;
+
+        let err = result.expect_err("a timed-out mutating webhook must return an error");
+        assert_eq!(
+            err.0,
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            "mutating webhook timeout must produce 504 Gateway Timeout, matching the \
+             validating-path behavior"
+        );
+        assert!(
+            err.1.message.contains("deadline"),
+            "mutating webhook timeout error message must contain 'deadline' — the \
+             `should be able to deny pod and configmap creation` conformance test greps \
+             strictly for that substring on the hanging-webhook rejection. Got: {}",
             err.1.message
         );
     }
@@ -6328,6 +6441,28 @@ mod tests {
             validate_webhook_match_conditions_cel(&obj).is_err(),
             "expression starting with '.' must be rejected; the conformance test uses \
              '... [] bad expression' which tokenizes to tokens but is not valid CEL"
+        );
+    }
+
+    /// mayor-gelc regression: the conformance test asserts
+    /// `gomega.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("compilation failed")))`
+    /// on the rejection produced for this exact expression (see
+    /// k8s.io/kubernetes test/e2e/apimachinery/webhook.go, `should reject {validating,mutating}
+    /// webhook configurations with invalid match conditions`). Our rejection was previously
+    /// worded "compilation error" (no "failed"), which is behaviorally correct — the config is
+    /// still rejected — but fails the conformance string-grep. If the wording regresses back to
+    /// "compilation error" this test must fail even though `.is_err()` alone would still pass.
+    #[test]
+    fn validate_webhook_match_conditions_cel_dot_start_error_says_compilation_failed() {
+        let obj = json!({
+            "webhooks": [{"matchConditions": [{"name": "invalid-expression-1", "expression": "... [] bad expression"}]}]
+        });
+        let err = validate_webhook_match_conditions_cel(&obj)
+            .expect_err("dot-start expression must be rejected");
+        assert!(
+            err.contains("compilation failed"),
+            "conformance greps the rejection error for the substring 'compilation failed'; \
+             a differently-worded (but still correct) rejection fails that string-grep. Got: {err:?}"
         );
     }
 
