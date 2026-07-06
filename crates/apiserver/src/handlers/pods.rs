@@ -1862,6 +1862,30 @@ pub async fn patch_pod_status<S: Store>(
 ///
 /// Without this check u7s accepts patches that real k8s rejects,
 /// causing conformance failures ("Expected an error to have occurred. Got: nil").
+///
+/// Distinguishes "key absent from the patch" (unchanged, preserve the stored value)
+/// from "key explicitly removed" for a single cpu/memory `resource` within a
+/// `requests`/`limits` `section`. `section` is `Option::None` when the whole section
+/// key is missing from the patch's `resources` object — that, an explicit `null`, and
+/// an empty `{}` all mean "remove everything in this section" (matches real k8s and
+/// the "remove cpu&memory limits" conformance case). Only when the section is present
+/// as a non-empty object does per-key semantics apply: an absent key is unchanged, an
+/// explicit `null` for that key is a real removal.
+fn resize_section_removes_resource(section: Option<&serde_json::Value>, resource: &str) -> bool {
+    match section {
+        None => true,
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Object(map)) => {
+            if map.is_empty() {
+                true
+            } else {
+                map.get(resource).is_some_and(|v| v.is_null())
+            }
+        }
+        Some(_) => false,
+    }
+}
+
 pub fn validate_resize_patch(
     stored: &serde_json::Value,
     incoming: &serde_json::Value,
@@ -1981,14 +2005,14 @@ pub fn validate_resize_patch(
 
     // Rule 3: resize may not remove a resource quantity that is currently set.
     //
-    // ALL-SECTIONS semantics: for every cpu/memory resource in requests AND limits,
-    // check whether the stored value is present in the patch. A patch that omits the
-    // limits section entirely (limits key absent from resources) is treated as "remove
-    // all limits", same as a patch that explicitly sets limits to {}.
-    //
-    // Indexing into missing keys via serde_json returns Value::Null, so
-    // incoming_resources["limits"]["cpu"].as_str() → None when limits is absent or
-    // limits.cpu is absent. This fires the same removal error in both cases.
+    // A whole section (limits or requests) absent from the patch entirely, explicitly
+    // null, or present-but-empty ({}) means "remove everything in that section" — same
+    // as real k8s. But a resource KEY (cpu/memory) simply absent from an otherwise
+    // non-empty section means "unchanged": strategicpatch.CreateTwoWayMergePatch omits
+    // keys whose value didn't change, so a cpu-only patch never mentions memory at all.
+    // Only an EXPLICIT null for that key signals real removal. Conflating "key absent"
+    // with "key removed" (as a naive serde_json index into a missing key would, since
+    // both yield Value::Null) falsely rejects valid partial resizes.
     //
     // Check limits before requests so "resource limits cannot be removed" fires before
     // "resource requests cannot be removed" when both sections are missing (the
@@ -2013,10 +2037,9 @@ pub fn validate_resize_patch(
             let stored_has = stored_c["resources"]["limits"][resource]
                 .as_str()
                 .is_some_and(|s| !s.is_empty());
-            let incoming_has = incoming_resources["limits"][resource]
-                .as_str()
-                .is_some_and(|s| !s.is_empty());
-            if stored_has && !incoming_has {
+            if stored_has
+                && resize_section_removes_resource(incoming_resources.get("limits"), resource)
+            {
                 return Err(format!(
                     "Pod {pod_ns}/{pod_name}: \
                      spec.containers[name={name}].resources.limits.{resource}: \
@@ -2030,10 +2053,9 @@ pub fn validate_resize_patch(
             let stored_has = stored_c["resources"]["requests"][resource]
                 .as_str()
                 .is_some_and(|s| !s.is_empty());
-            let incoming_has = incoming_resources["requests"][resource]
-                .as_str()
-                .is_some_and(|s| !s.is_empty());
-            if stored_has && !incoming_has {
+            if stored_has
+                && resize_section_removes_resource(incoming_resources.get("requests"), resource)
+            {
                 return Err(format!(
                     "Pod {pod_ns}/{pod_name}: \
                      spec.containers[name={name}].resources.requests.{resource}: \
@@ -2049,10 +2071,13 @@ pub fn validate_resize_patch(
 /// Compute the merged post-resize state for QoS validation.
 ///
 /// Unlike apply_resize_patch (which replaces the entire resources object), this function
-/// merges resources at the section level: if a section (requests or limits) is absent
-/// from the incoming patch, the existing values are PRESERVED. This matches real k8s
-/// merge semantics for the resize endpoint and is used exclusively for QoS class
-/// validation in validate_resize_patch.
+/// merges resources key-by-key: if a resource key (cpu/memory) is absent from an
+/// otherwise non-empty section in the incoming patch, the existing value is PRESERVED.
+/// This matches strategicpatch.CreateTwoWayMergePatch semantics — such patches omit
+/// unchanged keys entirely (a cpu-only change never mentions memory) — and is used
+/// exclusively for QoS class validation in validate_resize_patch. A whole section
+/// replacement (as done here previously) would drop the omitted key, corrupting the
+/// QoS computation for the *other* resource that the patch never intended to touch.
 fn merge_resize_for_qos(
     stored: &serde_json::Value,
     incoming: &serde_json::Value,
@@ -2072,19 +2097,19 @@ fn merge_resize_for_qos(
                 if incoming_resources.is_null() {
                     continue;
                 }
-                // Merge section by section: only update sections that are non-empty in
-                // the patch. An empty object {} (explicit removal) is intentionally NOT
-                // merged here — for QoS computation we need to see what limits/requests
-                // WOULD be after a valid resize; the actual removal is caught by Rule 3.
-                // Skipping empty {} means the stored values are preserved for QoS checks,
-                // so "Guaranteed pod remove limits" does not falsely trigger a QoS error.
+                // Merge key-by-key within each section: only update the specific
+                // cpu/memory keys the patch actually mentions. An empty object {}
+                // (explicit removal of the whole section) is intentionally NOT merged
+                // here — for QoS computation we need to see what limits/requests WOULD
+                // be after a valid resize; the actual removal is caught by Rule 3.
+                // Skipping empty {} means the stored values are preserved for QoS
+                // checks, so "Guaranteed pod remove limits" does not falsely trigger a
+                // QoS error.
                 for section in &["requests", "limits"] {
-                    if incoming_resources[section]
-                        .as_object()
-                        .is_some_and(|m| !m.is_empty())
-                    {
-                        stored_container["resources"][section] =
-                            incoming_resources[section].clone();
+                    if let Some(incoming_section) = incoming_resources[section].as_object() {
+                        for (key, value) in incoming_section {
+                            stored_container["resources"][section][key.as_str()] = value.clone();
+                        }
                     }
                 }
             }
@@ -9812,10 +9837,17 @@ mod resize_tests {
         );
     }
 
-    /// Burstable pod — remove cpu requests: patch omits cpu in requests, which is forbidden.
+    /// Burstable pod — explicit null for requests.cpu is a real removal, which is forbidden.
     /// k8s rejects with "resource requests cannot be removed".
+    ///
+    /// Uses an EXPLICIT `null` (not a bare omission) for requests.cpu: a
+    /// strategicpatch.CreateTwoWayMergePatch signals "this key was removed" with an
+    /// explicit null, and omits keys that are simply unchanged. Only the explicit-null
+    /// form must be rejected here — see
+    /// `resize_accepts_burstable_patch_omitting_unchanged_cpu_request` below for the
+    /// omitted-key case, which must be accepted.
     #[test]
-    fn resize_rejects_burstable_removing_cpu_requests_else_resource_structure_changes() {
+    fn resize_rejects_burstable_explicit_null_cpu_request_as_removal() {
         let stored = serde_json::json!({
             "metadata": {"name": "burstable-pod", "namespace": "default"},
             "spec": {
@@ -9829,27 +9861,68 @@ mod resize_tests {
             },
             "status": {}
         });
-        // Patch omits requests.cpu — removes it.
+        // Patch explicitly nulls requests.cpu — a real removal signal.
         let incoming = serde_json::json!({
             "spec": {
                 "containers": [{
                     "name": "c1",
                     "resources": {
                         "limits": {"cpu": "200m", "memory": "256Mi"},
-                        "requests": {"memory": "128Mi"}
+                        "requests": {"cpu": null, "memory": "128Mi"}
                     }
                 }]
             }
         });
 
         let result = validate_resize_patch(&stored, &incoming);
-        assert!(result.is_err(), "removing cpu requests must be rejected");
+        assert!(
+            result.is_err(),
+            "explicitly removing cpu requests must be rejected"
+        );
         let msg = result.unwrap_err();
         assert!(
             msg.contains("resource requests cannot be removed"),
             "error must contain k8s conformance substring 'resource requests cannot be removed' — \
              conformance test (pod_resize.go:390) uses ContainSubstring to match this; \
              got: {msg}"
+        );
+    }
+
+    /// Burstable pod, requests-only — a two-way-merge patch that changes only
+    /// requests.memory omits requests.cpu entirely (it didn't change). Treating that
+    /// omission as removal falsely rejects a valid in-place resize: both InPlaceResize
+    /// conformance tests build their patches this way, so this must be accepted.
+    #[test]
+    fn resize_accepts_burstable_patch_omitting_unchanged_cpu_request() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "burstable-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "c1",
+                    "resources": {"requests": {"cpu": "50m", "memory": "64Mi"}}
+                }]
+            },
+            "status": {}
+        });
+        // Patch touches only requests.memory; requests.cpu is entirely absent from the
+        // JSON, matching what strategicpatch.CreateTwoWayMergePatch produces for an
+        // unchanged scalar.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "c1",
+                    "resources": {"requests": {"memory": "128Mi"}}
+                }]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_ok(),
+            "a memory-only resize must not be rejected as 'cpu requests removed' just \
+             because the two-way-merge patch omits the unchanged cpu key — \
+             got: {:?}",
+            result.err()
         );
     }
 
@@ -10127,6 +10200,57 @@ mod resize_tests {
             "error must be 'resource limits cannot be removed' (not a QoS error) — \
              merge_resize_for_qos must skip empty sections so Rule 4 doesn't shadow Rule 3; \
              got: {msg}"
+        );
+    }
+
+    /// Guaranteed 3-container pod — patch resizes only c1's cpu; c1's memory (and c2/c3
+    /// entirely) are omitted because a two-way-merge patch never mentions unchanged
+    /// values. merge_resize_for_qos previously replaced the whole `limits`/`requests`
+    /// section with the patch's partial object, dropping c1's memory value and making
+    /// compute_qos_class see a container with no memory limit — flipping the pod from
+    /// Guaranteed to Burstable and falsely rejecting the resize.
+    #[test]
+    fn resize_accepts_guaranteed_three_container_patch_touching_only_one_containers_cpu() {
+        let stored = serde_json::json!({
+            "metadata": {"name": "guaranteed-pod", "namespace": "default"},
+            "spec": {
+                "containers": [
+                    {"name": "c1", "resources": {
+                        "limits": {"cpu": "100m", "memory": "128Mi"},
+                        "requests": {"cpu": "100m", "memory": "128Mi"}
+                    }},
+                    {"name": "c2", "resources": {
+                        "limits": {"cpu": "50m", "memory": "64Mi"},
+                        "requests": {"cpu": "50m", "memory": "64Mi"}
+                    }},
+                    {"name": "c3", "resources": {
+                        "limits": {"cpu": "50m", "memory": "64Mi"},
+                        "requests": {"cpu": "50m", "memory": "64Mi"}
+                    }}
+                ]
+            },
+            "status": {}
+        });
+        // Only c1 appears in the patch, and only cpu is mentioned — memory is unchanged
+        // so a real two-way-merge patch omits it entirely.
+        let incoming = serde_json::json!({
+            "spec": {
+                "containers": [
+                    {"name": "c1", "resources": {
+                        "limits": {"cpu": "200m"},
+                        "requests": {"cpu": "200m"}
+                    }}
+                ]
+            }
+        });
+
+        let result = validate_resize_patch(&stored, &incoming);
+        assert!(
+            result.is_ok(),
+            "a cpu-only resize of one container in a Guaranteed pod must not be rejected \
+             as a QoS-class change just because the patch omits the unchanged memory key — \
+             got: {:?}",
+            result.err()
         );
     }
 
