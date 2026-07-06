@@ -208,12 +208,14 @@ pub async fn core_replace_resource<S: Store>(
 pub async fn core_delete_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((plural, name)): Path<(String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     delete_resource(
         State(state),
         Path(("".into(), "v1".into(), plural, name)),
+        Extension(user),
         headers,
         body,
     )
@@ -345,12 +347,14 @@ pub async fn core_replace_namespaced_resource<S: Store>(
 pub async fn core_delete_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((ns, plural, name)): Path<(String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     delete_namespaced_resource(
         State(state),
         Path(("".into(), "v1".into(), ns, plural, name)),
+        Extension(user),
         headers,
         body,
     )

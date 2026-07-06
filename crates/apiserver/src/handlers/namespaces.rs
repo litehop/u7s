@@ -858,6 +858,7 @@ async fn delete_namespace_scoped_crds<S: Store>(state: &AppState<S>, namespace_n
 pub async fn delete_namespace<S: Store>(
     State(state): State<AppState<S>>,
     Path(name): Path<String>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let key = cluster_object_key("namespaces", &name);
 
@@ -871,6 +872,25 @@ pub async fn delete_namespace<S: Store>(
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Run once here, before branching into soft-delete/finalizer logic below, matching every
+    // other delete handler's single admission point.
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "namespaces",
+        name: &name,
+        namespace: None,
+        operation: "DELETE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
+        dry_run: false,
+    };
+    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
     if let Some(mut soft) = apply_delete_policy(&mut obj) {
         soft["status"] = serde_json::to_value(NamespaceStatus {
@@ -1473,9 +1493,13 @@ mod tests {
         );
 
         assert!(
-            delete_namespace(State(state.clone()), Path("del-ns".to_string()))
-                .await
-                .is_ok(),
+            delete_namespace(
+                State(state.clone()),
+                Path("del-ns".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
             "delete must succeed"
         );
 
@@ -1540,9 +1564,13 @@ mod tests {
         // Delete the namespace — kubernetes finalizer is removed, e2e finalizer remains.
         // Namespace must stay in Terminating state.
         assert!(
-            delete_namespace(State(state.clone()), Path("ext-fin-ns".to_string()))
-                .await
-                .is_ok(),
+            delete_namespace(
+                State(state.clone()),
+                Path("ext-fin-ns".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
             "delete must succeed"
         );
 
@@ -2035,7 +2063,12 @@ mod tests {
     async fn delete_namespace_returns_404_for_missing() {
         let state = make_state();
 
-        let result = delete_namespace(State(state.clone()), Path("ghost-ns".to_string())).await;
+        let result = delete_namespace(
+            State(state.clone()),
+            Path("ghost-ns".to_string()),
+            test_user(),
+        )
+        .await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected error"),
@@ -2080,9 +2113,13 @@ mod tests {
         );
 
         assert!(
-            delete_namespace(State(state.clone()), Path("fin-ns".to_string()))
-                .await
-                .is_ok(),
+            delete_namespace(
+                State(state.clone()),
+                Path("fin-ns".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
             "delete with finalizers must not error"
         );
 
@@ -2133,9 +2170,13 @@ mod tests {
             .expect("direct store write must succeed");
 
         assert!(
-            delete_namespace(State(state.clone()), Path("no-fin-ns".to_string()))
-                .await
-                .is_ok(),
+            delete_namespace(
+                State(state.clone()),
+                Path("no-fin-ns".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
             "delete without finalizers must succeed"
         );
 
@@ -2209,9 +2250,13 @@ mod tests {
             .expect("configmap write must succeed");
 
         // Hard-delete the namespace (no finalizers → immediate delete).
-        delete_namespace(State(state.clone()), Path("recycled-ns".to_string()))
-            .await
-            .expect("namespace delete must succeed");
+        delete_namespace(
+            State(state.clone()),
+            Path("recycled-ns".to_string()),
+            test_user(),
+        )
+        .await
+        .expect("namespace delete must succeed");
 
         // The configmap must have been cascade-deleted along with the namespace.
         // If it still exists, re-creating the namespace will produce false 409s.
@@ -3258,9 +3303,13 @@ mod tests {
 
         // Delete the namespace — triggers cascade with finalizer awareness.
         assert!(
-            delete_namespace(State(state.clone()), Path("fin-cascade-ns".to_string()))
-                .await
-                .is_ok(),
+            delete_namespace(
+                State(state.clone()),
+                Path("fin-cascade-ns".to_string()),
+                test_user()
+            )
+            .await
+            .is_ok(),
             "namespace delete must succeed"
         );
 
@@ -3796,7 +3845,7 @@ mod admission_tests {
 
         // Soft-delete the namespace.
         assert!(
-            delete_namespace(State(state.clone()), Path(ns_name.to_string()))
+            delete_namespace(State(state.clone()), Path(ns_name.to_string()), test_user())
                 .await
                 .is_ok(),
             "namespace soft-delete must succeed"

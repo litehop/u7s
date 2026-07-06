@@ -476,6 +476,7 @@ pub async fn replace_resource<S: Store>(
 pub async fn delete_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, plural, name)): Path<(String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -501,6 +502,7 @@ pub async fn delete_resource<S: Store>(
             return super::cr::delete_cr(
                 State(state),
                 Path((group, version, plural, name)),
+                Extension(user),
                 HeaderMap::new(),
                 body,
             )
@@ -521,6 +523,25 @@ pub async fn delete_resource<S: Store>(
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Run before the soft/hard-delete branch below so a Fail-policy webhook can deny the
+    // delete outright, matching the CREATE/UPDATE admission points above.
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: None,
+        operation: "DELETE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
+        dry_run: false,
+    };
+    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
     if let Some(soft) = apply_delete_policy(&mut obj) {
         // Soft-delete: persist modified object, return it.
@@ -1604,6 +1625,7 @@ pub async fn replace_namespaced_resource<S: Store>(
 pub async fn delete_namespaced_resource<S: Store>(
     State(state): State<AppState<S>>,
     Path((group, version, ns, plural, name)): Path<(String, String, String, String, String)>,
+    Extension(user): Extension<UserInfo>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
@@ -1630,6 +1652,7 @@ pub async fn delete_namespaced_resource<S: Store>(
             return super::cr::delete_cr_namespaced(
                 State(state),
                 Path((group, version, ns, plural, name)),
+                Extension(user),
                 HeaderMap::new(),
                 body,
             )
@@ -1649,6 +1672,25 @@ pub async fn delete_namespaced_resource<S: Store>(
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Run before the soft/hard-delete branch below so a Fail-policy webhook can deny the
+    // delete outright, matching the CREATE/UPDATE admission points above.
+    let admission_ctx = AdmissionContext {
+        group: &group,
+        version: &version,
+        resource: &plural,
+        name: &name,
+        namespace: Some(&ns),
+        operation: "DELETE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
+        dry_run: false,
+    };
+    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
     if let Some(soft) = apply_delete_policy(&mut obj) {
         // Evict from RBAC index immediately on soft-delete — same rationale as
@@ -3888,6 +3930,7 @@ mod tests {
                 "leases".into(),
                 "node-b".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -3918,6 +3961,7 @@ mod tests {
                 "leases".into(),
                 "nonexistent".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -4020,6 +4064,7 @@ mod tests {
                 "daemonsets".into(),
                 "my-ds".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -4137,6 +4182,7 @@ mod tests {
                 "deployments".into(),
                 "my-deploy".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -4268,6 +4314,7 @@ mod tests {
                 "deployments".into(),
                 "my-deploy2".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -4398,6 +4445,7 @@ mod tests {
                 "replicationcontrollers".into(),
                 "my-rc".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bg_body,
         )
@@ -4510,6 +4558,7 @@ mod tests {
                 "replicationcontrollers".into(),
                 "nil-policy-rc".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -4638,6 +4687,7 @@ mod tests {
                 "statefulsets".into(),
                 "my-sts".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -4749,6 +4799,7 @@ mod tests {
                 "replicationcontrollers".into(),
                 "orphan-rc".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             orphan_body,
         )
@@ -4866,6 +4917,7 @@ mod tests {
                 "deployments".into(),
                 "orphan-deploy".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             orphan_body,
         )
@@ -4983,6 +5035,7 @@ mod tests {
                 "replicationcontrollers".into(),
                 "bg-rc".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bg_body,
         )
@@ -5111,6 +5164,7 @@ mod tests {
                 plural.to_string(),
                 name.to_string(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -5287,6 +5341,7 @@ mod tests {
                 "clusterrolebindings".into(),
                 "system:node".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -5320,6 +5375,7 @@ mod tests {
                 "csinodes".into(),
                 "nonexistent".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -5378,6 +5434,7 @@ mod tests {
                 "csinodes".into(),
                 "finalizer-node".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -6069,6 +6126,7 @@ mod tests {
                 "leases".into(),
                 "finalizer-lease".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -6234,6 +6292,7 @@ mod tests {
                 "widgets".into(),
                 "missing-widget".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -6262,6 +6321,7 @@ mod tests {
                 "widgets".into(),
                 "missing-widget".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -7112,6 +7172,7 @@ mod tests {
                 "csinodes".into(),
                 "..".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -11874,6 +11935,7 @@ mod tests {
                 "cronjobs".into(),
                 "my-cj".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             bytes::Bytes::new(),
         )
@@ -11979,6 +12041,7 @@ mod tests {
                 "cronjobs".into(),
                 "orphan-cj".into(),
             )),
+            test_user(),
             axum::http::HeaderMap::new(),
             orphan_body,
         )

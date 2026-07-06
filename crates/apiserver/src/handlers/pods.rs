@@ -604,6 +604,7 @@ pub async fn delete_collection_pods<S: Store>(
 pub async fn delete_pod<S: Store>(
     State(state): State<AppState<S>>,
     Path((raw_ns, name)): Path<(String, String)>,
+    Extension(user): Extension<UserInfo>,
 ) -> Result<impl IntoResponse, crate::status::StatusError> {
     let ns = parse_namespace(&raw_ns, &state).await?;
 
@@ -619,6 +620,25 @@ pub async fn delete_pod<S: Store>(
 
     let mut obj = Object::from_bytes(&stored.value)
         .map_err(|e| Status::internal(format!("corrupt stored object: {e}")))?;
+
+    // Admission webhook pipeline (validating only — mutating webhooks do not apply to DELETE).
+    // Run exactly once here, before branching into soft-delete vs hard-delete below, so a
+    // Fail-policy webhook can deny whichever delete decision this request actually makes.
+    let admission_ctx = AdmissionContext {
+        group: "",
+        version: "v1",
+        resource: "pods",
+        name: &name,
+        namespace: Some(ns.as_str()),
+        operation: "DELETE",
+        user_info: Some(serde_json::json!({
+            "username": user.username,
+            "uid": user.uid,
+            "groups": user.groups,
+        })),
+        dry_run: false,
+    };
+    run_validating_webhooks(&state, &obj.body, Some(&obj.body), &admission_ctx).await?;
 
     let meta: ObjectMeta = serde_json::from_value(obj.body["metadata"].clone()).unwrap_or_default();
     let has_finalizers = meta.finalizers.as_ref().is_some_and(|f| !f.is_empty());
@@ -7169,6 +7189,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
             .with_state(state.clone());
 
         let req = Request::builder()
@@ -7226,6 +7247,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
             .with_state(state.clone());
 
         let req = Request::builder()
@@ -7277,6 +7299,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
             .with_state(state.clone());
 
         let req = Request::builder()
@@ -7305,6 +7328,7 @@ mod handler_tests {
 
         let app = Router::new()
             .route("/api/v1/namespaces/{ns}/pods/{name}", delete(delete_pod))
+            .layer(auth_layer())
             .with_state(state);
 
         let req = Request::builder()
