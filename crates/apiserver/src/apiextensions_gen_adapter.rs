@@ -685,9 +685,8 @@ pub fn decode_crd_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                     }
                     if let Some(t) = c.last_transition_time {
                         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cm["lastTransitionTime"] = serde_json::Value::String(
-                                crate::util::secs_to_rfc3339(secs as u64),
-                            );
+                            cm["lastTransitionTime"] =
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                         }
                     }
                     cm
