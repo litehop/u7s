@@ -982,11 +982,16 @@ pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
             obj["spec"] = serde_json::json!({ "finalizers": fins });
         }
     }
-    // Status must round-trip through protobuf too: KCM's namespace controller and
-    // typed-client e2e tests GET a namespace (protobuf-encoded), mutate status, then
-    // PUT it back to /status. put_namespace_status wholesale-replaces stored status
-    // with whatever this decoder returns — before this fix that was nothing, so a
-    // protobuf-encoded UpdateStatus silently wiped status.phase and status.conditions.
+    // (mayor-oww6) This decoder never read `ns.status` at all, so any protobuf-encoded
+    // Namespace write (Content-Type: application/vnd.kubernetes.protobuf) silently lost
+    // status.phase and status.conditions together — put_namespace_status wholesale-
+    // replaces stored status with whatever this decoder returns, which was nothing.
+    // This is a real, standalone proto-decode gap, NOT the mayor-ftkl "should apply
+    // changes to a namespace status" conformance panic: that test's client (and this
+    // stack's kube-controller-manager, started with --kube-api-content-type=
+    // application/json) uses plain JSON, which was never affected — verified live that
+    // a JSON GET/PATCH/GET/PUT round trip already preserves status.phase without this
+    // fix. Kept because it's a correctness bug for any protobuf-content-type client.
     if let Some(status) = ns.status {
         let mut status_map = serde_json::Map::new();
         if let Some(phase) = status.phase.filter(|s| !s.is_empty()) {
@@ -1975,16 +1980,19 @@ mod tests {
         assert_eq!(containers[0]["image"], "nginx:latest");
     }
 
-    /// Namespace status.phase and status.conditions must survive proto decode.
+    /// Namespace status.phase and status.conditions must survive proto decode (mayor-oww6).
     ///
     /// Before this fix, decode_namespace_proto_gen never read `ns.status` at all, so any
-    /// protobuf-encoded Namespace object (e.g. a status subresource PUT/PATCH from a
-    /// protobuf-content-type client) silently lost its entire status — put_namespace_status
-    /// wholesale-replaces stored status with whatever this decoder returns, so a
-    /// protobuf-encoded UpdateStatus call would wipe status.phase, corrupting the object
-    /// the KCM namespace controller and e2e clients rely on to detect Terminating vs Active.
+    /// protobuf-encoded Namespace write (Content-Type: application/vnd.kubernetes.protobuf)
+    /// silently lost its entire status — put_namespace_status wholesale-replaces stored
+    /// status with whatever this decoder returns, which was nothing. This is a standalone
+    /// proto-decode correctness bug for protobuf-content-type clients; it is NOT the
+    /// mayor-ftkl "should apply changes to a namespace status" conformance panic — that
+    /// test's client, and this stack's kube-controller-manager (started with
+    /// --kube-api-content-type=application/json), use plain JSON, which was never affected
+    /// (verified live: a JSON GET/PATCH/GET/PUT round trip already preserves status.phase).
     #[test]
-    fn namespace_status_put_preserves_phase_else_conformance_apply_status_test_panics() {
+    fn namespace_status_proto_decode_preserves_phase_and_conditions() {
         let ns = core_v1::Namespace {
             metadata: Some(meta_v1::ObjectMeta {
                 name: Some("my-ns".to_string()),
@@ -2009,14 +2017,15 @@ mod tests {
 
         assert_eq!(
             result["status"]["phase"], "Active",
-            "status.phase must survive proto decode — without it, a protobuf-encoded \
-             UpdateStatus silently drops phase, and the e2e client's next GET .../status \
-             assertion on Status.Phase fails"
+            "status.phase must survive proto decode — without it, any protobuf-content-type \
+             client's status write (e.g. a kube-controller-manager run without the JSON \
+             content-type override) silently drops phase from the stored Namespace"
         );
         assert_eq!(
             result["status"]["conditions"][0]["type"], "StatusUpdate",
             "status.conditions must survive proto decode alongside phase — losing either \
-             one corrupts the status object KCM and e2e clients round-trip through PUT /status"
+             one corrupts the status object for any protobuf-content-type client's \
+             GET-modify-PUT round trip through /status"
         );
     }
 }
