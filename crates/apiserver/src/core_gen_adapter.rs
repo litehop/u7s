@@ -6,11 +6,12 @@ use crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString;
 
 // ---- shared helpers --------------------------------------------------------
 
-pub(crate) fn gen_microtime_fields_to_rfc3339(secs: i64, nanos: i32) -> Option<String> {
-    if secs <= 0 {
-        return None;
-    }
-    Some(crate::util::secs_nanos_to_rfc3339_micro(secs as u64, nanos))
+// Pre-1970 (negative) seconds are valid on the wire — MicroTime/Time support any date from
+// 0001-01-01T00:00:00Z onward, which predates the Unix epoch. Do not reintroduce a
+// `secs <= 0` guard here: [sig-node] Lease conformance sets AcquireTime/RenewTime to Go's
+// zero-value time.Time{}.Add(2s), which is a large negative Unix timestamp.
+pub(crate) fn gen_microtime_fields_to_rfc3339(secs: i64, nanos: i32) -> String {
+    crate::util::secs_nanos_to_rfc3339_micro(secs, nanos)
 }
 
 fn gen_int_or_string_to_json(ios: &IntOrString) -> serde_json::Value {
@@ -847,7 +848,7 @@ pub(crate) fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::
         if let Some(secs) = ts.seconds {
             if secs > 0 {
                 m["creationTimestamp"] =
-                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64));
+                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
             }
         }
     }
@@ -1026,9 +1027,8 @@ pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                     }
                     if let Some(t) = c.last_transition_time {
                         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cm["lastTransitionTime"] = serde_json::Value::String(
-                                crate::util::secs_to_rfc3339(secs as u64),
-                            );
+                            cm["lastTransitionTime"] =
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                         }
                     }
                     cm
@@ -1241,9 +1241,8 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                     }
                     if let Some(t) = c.last_transition_time {
                         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cm["lastTransitionTime"] = serde_json::Value::String(
-                                crate::util::secs_to_rfc3339(secs as u64),
-                            );
+                            cm["lastTransitionTime"] =
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                         }
                     }
                     cm
@@ -1795,12 +1794,11 @@ pub fn decode_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(t) = s.last_observed_time {
             if let Some(secs) = t.seconds {
-                if let Some(ts) = gen_microtime_fields_to_rfc3339(secs, t.nanos.unwrap_or(0)) {
-                    sm.insert(
-                        "lastObservedTime".to_string(),
-                        serde_json::Value::String(ts),
-                    );
-                }
+                let ts = gen_microtime_fields_to_rfc3339(secs, t.nanos.unwrap_or(0));
+                sm.insert(
+                    "lastObservedTime".to_string(),
+                    serde_json::Value::String(ts),
+                );
             }
         }
         if !sm.is_empty() {

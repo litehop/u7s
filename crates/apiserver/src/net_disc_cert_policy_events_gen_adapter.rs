@@ -31,7 +31,7 @@ fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
         if let Some(secs) = ts.seconds {
             if secs > 0 {
                 m["creationTimestamp"] =
-                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64));
+                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
             }
         }
     }
@@ -537,7 +537,7 @@ pub fn decode_poddisruptionbudget_proto_gen(data: &[u8]) -> Option<serde_json::V
                 .map(|(pod_name, t)| {
                     let secs = t.seconds.unwrap_or(0);
                     let ts = if secs > 0 {
-                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64))
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs))
                     } else {
                         serde_json::Value::String("1970-01-01T00:00:00Z".into())
                     };
@@ -587,9 +587,7 @@ pub fn decode_poddisruptionbudget_proto_gen(data: &[u8]) -> Option<serde_json::V
                         if let Some(secs) = ts.seconds.filter(|&s| s > 0) {
                             cond.insert(
                                 "lastTransitionTime".to_string(),
-                                serde_json::Value::String(crate::util::secs_to_rfc3339(
-                                    secs as u64,
-                                )),
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
                             );
                         }
                     }
@@ -620,10 +618,13 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
         "metadata": meta
     });
     if let Some(t) = ev.event_time {
-        if let Some(ts) = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
-            t.seconds.unwrap_or(0),
-            t.nanos.unwrap_or(0),
-        ) {
+        // `seconds` must be explicitly present (not defaulted via unwrap_or(0)) — a MicroTime
+        // message with no seconds field on the wire is "not set", not the Unix epoch.
+        if let Some(secs) = t.seconds {
+            let ts = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
+                secs,
+                t.nanos.unwrap_or(0),
+            );
             out["eventTime"] = serde_json::Value::String(ts);
         }
     }
@@ -633,10 +634,11 @@ pub fn decode_events_v1_event_proto_gen(data: &[u8]) -> Option<serde_json::Value
             sj.insert("count".to_string(), serde_json::Value::Number(count.into()));
         }
         if let Some(t) = s.last_observed_time {
-            if let Some(ts) = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
-                t.seconds.unwrap_or(0),
-                t.nanos.unwrap_or(0),
-            ) {
+            if let Some(secs) = t.seconds {
+                let ts = crate::core_gen_adapter::gen_microtime_fields_to_rfc3339(
+                    secs,
+                    t.nanos.unwrap_or(0),
+                );
                 sj.insert(
                     "lastObservedTime".to_string(),
                     serde_json::Value::String(ts),
