@@ -305,6 +305,16 @@ pub fn decode_cronjob_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                 .collect::<Vec<_>>()
                 .into();
         }
+        if let Some(t) = status.last_schedule_time.as_ref() {
+            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                status_json["lastScheduleTime"] = crate::util::secs_to_rfc3339(secs).into();
+            }
+        }
+        if let Some(t) = status.last_successful_time.as_ref() {
+            if let Some(secs) = t.seconds.filter(|&s| s > 0) {
+                status_json["lastSuccessfulTime"] = crate::util::secs_to_rfc3339(secs).into();
+            }
+        }
         if status_json
             .as_object()
             .map(|m| !m.is_empty())
@@ -436,6 +446,50 @@ mod tests {
         assert_eq!(
             result["status"]["active"][0]["kind"], "Job",
             "status.active[0].kind must survive"
+        );
+    }
+
+    /// decode_cronjob_proto_gen must preserve status.lastScheduleTime and lastSuccessfulTime.
+    ///
+    /// The CronJob controller gates the next scheduled run on lastScheduleTime; if it is
+    /// dropped, the controller cannot tell when the CronJob last fired and
+    /// "should support CronJob API operations" conformance sees lastScheduleTime as nil
+    /// after a status update.
+    #[test]
+    fn decode_cronjob_proto_gen_preserves_last_schedule_and_successful_time() {
+        let cj = batch_v1::CronJob {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("timed-cj".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(batch_v1::CronJobSpec {
+                schedule: Some("*/5 * * * *".to_string()),
+                ..Default::default()
+            }),
+            status: Some(batch_v1::CronJobStatus {
+                last_schedule_time: Some(meta_v1::Time {
+                    seconds: Some(1_704_067_200),
+                    nanos: Some(0),
+                }),
+                last_successful_time: Some(meta_v1::Time {
+                    seconds: Some(1_704_067_215),
+                    nanos: Some(0),
+                }),
+                ..Default::default()
+            }),
+        };
+        let mut buf = Vec::new();
+        cj.encode(&mut buf).unwrap();
+        let result = decode_cronjob_proto_gen(&buf).expect("CronJob with status must decode");
+
+        assert_eq!(
+            result["status"]["lastScheduleTime"], "2024-01-01T00:00:00Z",
+            "lastScheduleTime must survive decode; before the fix status only mapped .active, \
+             so the controller would see lastScheduleTime as nil and could re-fire a job early"
+        );
+        assert_eq!(
+            result["status"]["lastSuccessfulTime"], "2024-01-01T00:00:15Z",
+            "lastSuccessfulTime must survive decode; before the fix this field was never mapped"
         );
     }
 
