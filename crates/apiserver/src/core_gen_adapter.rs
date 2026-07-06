@@ -1378,6 +1378,21 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
             obj["spec"] = serde_json::Value::Object(spec_map);
         }
     }
+    if let Some(status) = pv.status {
+        let mut status_map = serde_json::Map::new();
+        if let Some(v) = status.phase.filter(|s| !s.is_empty()) {
+            status_map.insert("phase".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = status.message.filter(|s| !s.is_empty()) {
+            status_map.insert("message".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = status.reason.filter(|s| !s.is_empty()) {
+            status_map.insert("reason".to_string(), serde_json::Value::String(v));
+        }
+        if !status_map.is_empty() {
+            obj["status"] = serde_json::Value::Object(status_map);
+        }
+    }
     Some(obj)
 }
 
@@ -2042,6 +2057,47 @@ mod tests {
             "status.conditions must survive proto decode alongside phase — losing either \
              one corrupts the status object for any protobuf-content-type client's \
              GET-modify-PUT round trip through /status"
+        );
+    }
+
+    /// decode_persistentvolume_proto_gen must preserve status.phase/message/reason.
+    ///
+    /// The PV/PVC binding lifecycle is driven by status.phase (Available/Bound/Released/
+    /// Failed); decode_persistentvolume_proto_gen never read `.status` at all, so
+    /// "should apply changes to a pv/pvc status" conformance saw an empty status after the
+    /// controller updated it, as if the volume were never bound.
+    #[test]
+    fn decode_persistentvolume_proto_gen_preserves_status_phase_message_reason() {
+        let pv = core_v1::PersistentVolume {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-pv".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeStatus {
+                phase: Some("Bound".to_string()),
+                message: Some("bound by e2e test".to_string()),
+                reason: Some("E2E".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pv.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolume_proto_gen(&buf).expect("PV with status must decode");
+
+        assert_eq!(
+            result["status"]["phase"], "Bound",
+            "status.phase must survive proto decode; before the fix .status was never read, \
+             so the PV/PVC binding lifecycle (which is driven by phase) looked frozen"
+        );
+        assert_eq!(
+            result["status"]["message"], "bound by e2e test",
+            "status.message must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["reason"], "E2E",
+            "status.reason must survive proto decode"
         );
     }
 }
