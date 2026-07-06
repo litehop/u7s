@@ -188,9 +188,12 @@ fn default_lease(obj: &mut serde_json::Value) {
 ///
 /// 1. Default spec.type to "ClusterIP" when absent — conformance tests check that a
 ///    Service with no explicit type comes back as ClusterIP.
-/// 2. Allocate NodePorts for NodePort/LoadBalancer services — ports without a nodePort
+/// 2. Default spec.sessionAffinity to "None" — `kubectl describe svc` prints the raw
+///    field value, so an absent sessionAffinity renders as an empty "Session Affinity:"
+///    line and fails the sig-cli describe conformance test.
+/// 3. Allocate NodePorts for NodePort/LoadBalancer services — ports without a nodePort
 ///    get one assigned from the standard 30000-32767 range.
-/// 3. Skip ClusterIP-family defaults for ExternalName — ExternalName services must not
+/// 4. Skip ClusterIP-family defaults for ExternalName — ExternalName services must not
 ///    have ipFamilies/ipFamilyPolicy/clusterIPs set (they have no cluster IP at all).
 fn default_service(obj: &mut serde_json::Value) {
     // Ensure spec exists as an object.
@@ -203,12 +206,25 @@ fn default_service(obj: &mut serde_json::Value) {
         obj["spec"]["type"] = serde_json::Value::String("ClusterIP".to_string());
     }
 
+    // 2. Default spec.sessionAffinity to "None" (matches upstream SetDefaults_Service).
+    if obj["spec"]["sessionAffinity"].is_null() {
+        obj["spec"]["sessionAffinity"] = serde_json::Value::String("None".to_string());
+    }
+
+    // When sessionAffinity is ClientIP, default the timeout to 10800s (3h) unless set.
+    if obj["spec"]["sessionAffinity"].as_str() == Some("ClientIP")
+        && obj["spec"]["sessionAffinityConfig"]["clientIP"]["timeoutSeconds"].is_null()
+    {
+        obj["spec"]["sessionAffinityConfig"]["clientIP"]["timeoutSeconds"] =
+            serde_json::Value::Number(serde_json::Number::from(10800i32));
+    }
+
     let svc_type = obj["spec"]["type"]
         .as_str()
         .unwrap_or("ClusterIP")
         .to_string();
 
-    // 2. Allocate NodePorts for NodePort and LoadBalancer services.
+    // 3. Allocate NodePorts for NodePort and LoadBalancer services.
     if svc_type == "NodePort" || svc_type == "LoadBalancer" {
         default_node_ports(obj);
     }
@@ -227,7 +243,7 @@ fn default_service(obj: &mut serde_json::Value) {
         }
     }
 
-    // 3. ExternalName services must not have ClusterIP-family fields or NodePorts.
+    // 4. ExternalName services must not have ClusterIP-family fields or NodePorts.
     // When a service changes type to ExternalName (e.g. NodePort → ExternalName),
     // any previously assigned clusterIP, clusterIPs, and nodePort fields must be cleared.
     // Without this, GET after the type-change PATCH still returns the old IP/nodePort.
@@ -2517,6 +2533,74 @@ mod tests {
             svc["spec"]["ports"][0]["targetPort"], 80,
             "targetPort=0 must be defaulted to port — client-go omits targetPort as 0, \
              EndpointSlice controller copies it verbatim and pods become unreachable"
+        );
+    }
+
+    /// A Service created without spec.sessionAffinity must default to "None".
+    ///
+    /// kubectl describe svc prints the raw field value; an absent sessionAffinity
+    /// renders as an empty "Session Affinity:" line, failing the sig-cli
+    /// "kubectl describe" conformance test which asserts the value is "None".
+    #[test]
+    fn service_defaults_session_affinity_to_none_when_absent() {
+        let mut svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "my-svc"},
+            "spec": {
+                "type": "ClusterIP",
+                "ports": [{"port": 80, "protocol": "TCP"}]
+            }
+        });
+        default_service(&mut svc);
+        assert_eq!(
+            svc["spec"]["sessionAffinity"], "None",
+            "sessionAffinity must default to \"None\" — otherwise kubectl describe svc \
+             prints an empty Session Affinity line and the sig-cli describe conformance \
+             test fails"
+        );
+    }
+
+    /// An explicit sessionAffinity must not be overwritten by defaulting.
+    #[test]
+    fn service_explicit_session_affinity_preserved() {
+        let mut svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "my-svc"},
+            "spec": {
+                "type": "ClusterIP",
+                "sessionAffinity": "ClientIP",
+                "ports": [{"port": 80, "protocol": "TCP"}]
+            }
+        });
+        default_service(&mut svc);
+        assert_eq!(
+            svc["spec"]["sessionAffinity"], "ClientIP",
+            "explicit sessionAffinity must not be overwritten by defaulting"
+        );
+    }
+
+    /// A ClientIP-affinity Service without an explicit timeout must default to 10800s.
+    ///
+    /// Matches upstream SetDefaults_Service: clients that request ClientIP affinity
+    /// but omit the timeout rely on the 3-hour default; without it the field is
+    /// absent and session stickiness has no defined duration.
+    #[test]
+    fn service_client_ip_session_affinity_defaults_timeout_seconds() {
+        let mut svc = serde_json::json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "my-svc"},
+            "spec": {
+                "type": "ClusterIP",
+                "sessionAffinity": "ClientIP",
+                "ports": [{"port": 80, "protocol": "TCP"}]
+            }
+        });
+        default_service(&mut svc);
+        assert_eq!(
+            svc["spec"]["sessionAffinityConfig"]["clientIP"]["timeoutSeconds"], 10800,
+            "ClientIP sessionAffinityConfig.clientIP.timeoutSeconds must default to 10800s \
+             (upstream SetDefaults_Service) — without it, session stickiness duration is \
+             undefined for clients that didn't set it explicitly"
         );
     }
 

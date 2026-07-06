@@ -3698,19 +3698,21 @@ mod tests {
         );
     }
 
-    /// Regression test for mayor-z7v0: MicroTime with seconds = -1 must NOT produce
-    /// year 584554049254 ("584554049254-11-09T...").
+    /// Regression test for mayor-z7v0 and mayor-ttx3: MicroTime with seconds = -1 must
+    /// decode to the real pre-1970 date (1969-12-31T23:59:59Z), not year 584554049254
+    /// ("584554049254-11-09T...") and not be dropped entirely.
     ///
-    /// Root cause: `t.seconds as u64` for negative i64 wraps to a huge u64 value
-    /// (e.g. -1_i64 as u64 = u64::MAX ≈ 1.845×10^19), which `secs_to_rfc3339` then
-    /// renders as year ~584554049254. client-go fails to parse the timestamp, causing
-    /// the Lease API conformance test to fail.
+    /// Original root cause (mayor-z7v0): `t.seconds as u64` for negative i64 wraps to a huge
+    /// u64 value (e.g. -1_i64 as u64 = u64::MAX ≈ 1.845×10^19), which `secs_to_rfc3339` then
+    /// rendered as year ~584554049254. The interim fix dropped any non-positive seconds
+    /// instead — but negative Unix seconds are a legitimate pre-1970 date (Lease conformance
+    /// uses Go's zero-value time.Time{}, which is year 0001), so dropping them made every
+    /// pre-1970 Lease acquire/renew time look never-acquired. mayor-ttx3 fixed the root cause:
+    /// `secs_to_rfc3339`/`secs_nanos_to_rfc3339_micro` now take `i64` and use
+    /// `div_euclid`/`rem_euclid` so negative seconds decode to the correct calendar date.
     ///
-    /// Fix: guard changed from `!= 0` to `> 0` so negative (corrupted) seconds values
-    /// are silently dropped instead of casting to a wildly wrong u64.
-    ///
-    /// This test fails if the guard is reverted to `!= 0`: the `acquireTime` and
-    /// `renewTime` keys would be present with year-584554049254 values instead of absent.
+    /// This test fails if the u64 cast is reintroduced (year 584554049254) or if a
+    /// `secs <= 0` guard is reintroduced (acquireTime/renewTime silently absent).
     #[test]
     fn decode_lease_proto_negative_microseconds_seconds_does_not_overflow_year() {
         // Build a Lease with MicroTime where seconds = -1 (encoded as the
@@ -3743,17 +3745,15 @@ mod tests {
         let result = crate::coord_gen_adapter::decode_lease_proto_gen_a(&lease_proto)
             .expect("must decode Lease proto");
 
-        assert!(
-            result["spec"]["renewTime"].is_null(),
-            "renewTime with seconds=-1 must be absent, not year-584554049254; \
-             got: {} — negative MicroTime seconds must be dropped, not cast to u64::MAX",
-            result["spec"]["renewTime"]
+        assert_eq!(
+            result["spec"]["renewTime"], "1969-12-31T23:59:59.000000Z",
+            "renewTime with seconds=-1 must decode to the real pre-1970 instant, not \
+             year-584554049254 (u64 wraparound) and not be dropped"
         );
-        assert!(
-            result["spec"]["acquireTime"].is_null(),
-            "acquireTime with seconds=-1 must be absent, not year-584554049254; \
-             got: {} — negative MicroTime seconds must be dropped, not cast to u64::MAX",
-            result["spec"]["acquireTime"]
+        assert_eq!(
+            result["spec"]["acquireTime"], "1969-12-31T23:59:59.000000Z",
+            "acquireTime with seconds=-1 must decode to the real pre-1970 instant, not \
+             year-584554049254 (u64 wraparound) and not be dropped"
         );
     }
 

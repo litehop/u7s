@@ -6,11 +6,12 @@ use crate::apps_gen::k8s::io::apimachinery::pkg::util::intstr::IntOrString;
 
 // ---- shared helpers --------------------------------------------------------
 
-pub(crate) fn gen_microtime_fields_to_rfc3339(secs: i64, nanos: i32) -> Option<String> {
-    if secs <= 0 {
-        return None;
-    }
-    Some(crate::util::secs_nanos_to_rfc3339_micro(secs as u64, nanos))
+// Pre-1970 (negative) seconds are valid on the wire — MicroTime/Time support any date from
+// 0001-01-01T00:00:00Z onward, which predates the Unix epoch. Do not reintroduce a
+// `secs <= 0` guard here: [sig-node] Lease conformance sets AcquireTime/RenewTime to Go's
+// zero-value time.Time{}.Add(2s), which is a large negative Unix timestamp.
+pub(crate) fn gen_microtime_fields_to_rfc3339(secs: i64, nanos: i32) -> String {
+    crate::util::secs_nanos_to_rfc3339_micro(secs, nanos)
 }
 
 fn gen_int_or_string_to_json(ios: &IntOrString) -> serde_json::Value {
@@ -847,7 +848,7 @@ pub(crate) fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::
         if let Some(secs) = ts.seconds {
             if secs > 0 {
                 m["creationTimestamp"] =
-                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64));
+                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
             }
         }
     }
@@ -1026,9 +1027,8 @@ pub fn decode_namespace_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                     }
                     if let Some(t) = c.last_transition_time {
                         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cm["lastTransitionTime"] = serde_json::Value::String(
-                                crate::util::secs_to_rfc3339(secs as u64),
-                            );
+                            cm["lastTransitionTime"] =
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                         }
                     }
                     cm
@@ -1241,9 +1241,8 @@ pub fn decode_service_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
                     }
                     if let Some(t) = c.last_transition_time {
                         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
-                            cm["lastTransitionTime"] = serde_json::Value::String(
-                                crate::util::secs_to_rfc3339(secs as u64),
-                            );
+                            cm["lastTransitionTime"] =
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
                         }
                     }
                     cm
@@ -1377,6 +1376,21 @@ pub fn decode_persistentvolume_proto_gen(data: &[u8]) -> Option<serde_json::Valu
         }
         if !spec_map.is_empty() {
             obj["spec"] = serde_json::Value::Object(spec_map);
+        }
+    }
+    if let Some(status) = pv.status {
+        let mut status_map = serde_json::Map::new();
+        if let Some(v) = status.phase.filter(|s| !s.is_empty()) {
+            status_map.insert("phase".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = status.message.filter(|s| !s.is_empty()) {
+            status_map.insert("message".to_string(), serde_json::Value::String(v));
+        }
+        if let Some(v) = status.reason.filter(|s| !s.is_empty()) {
+            status_map.insert("reason".to_string(), serde_json::Value::String(v));
+        }
+        if !status_map.is_empty() {
+            obj["status"] = serde_json::Value::Object(status_map);
         }
     }
     Some(obj)
@@ -1795,12 +1809,11 @@ pub fn decode_event_proto_gen(data: &[u8]) -> Option<serde_json::Value> {
         }
         if let Some(t) = s.last_observed_time {
             if let Some(secs) = t.seconds {
-                if let Some(ts) = gen_microtime_fields_to_rfc3339(secs, t.nanos.unwrap_or(0)) {
-                    sm.insert(
-                        "lastObservedTime".to_string(),
-                        serde_json::Value::String(ts),
-                    );
-                }
+                let ts = gen_microtime_fields_to_rfc3339(secs, t.nanos.unwrap_or(0));
+                sm.insert(
+                    "lastObservedTime".to_string(),
+                    serde_json::Value::String(ts),
+                );
             }
         }
         if !sm.is_empty() {
@@ -2044,6 +2057,47 @@ mod tests {
             "status.conditions must survive proto decode alongside phase — losing either \
              one corrupts the status object for any protobuf-content-type client's \
              GET-modify-PUT round trip through /status"
+        );
+    }
+
+    /// decode_persistentvolume_proto_gen must preserve status.phase/message/reason.
+    ///
+    /// The PV/PVC binding lifecycle is driven by status.phase (Available/Bound/Released/
+    /// Failed); decode_persistentvolume_proto_gen never read `.status` at all, so
+    /// "should apply changes to a pv/pvc status" conformance saw an empty status after the
+    /// controller updated it, as if the volume were never bound.
+    #[test]
+    fn decode_persistentvolume_proto_gen_preserves_status_phase_message_reason() {
+        let pv = core_v1::PersistentVolume {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("my-pv".to_string()),
+                ..Default::default()
+            }),
+            status: Some(core_v1::PersistentVolumeStatus {
+                phase: Some("Bound".to_string()),
+                message: Some("bound by e2e test".to_string()),
+                reason: Some("E2E".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pv.encode(&mut buf).expect("prost encode must succeed");
+
+        let result = decode_persistentvolume_proto_gen(&buf).expect("PV with status must decode");
+
+        assert_eq!(
+            result["status"]["phase"], "Bound",
+            "status.phase must survive proto decode; before the fix .status was never read, \
+             so the PV/PVC binding lifecycle (which is driven by phase) looked frozen"
+        );
+        assert_eq!(
+            result["status"]["message"], "bound by e2e test",
+            "status.message must survive proto decode"
+        );
+        assert_eq!(
+            result["status"]["reason"], "E2E",
+            "status.reason must survive proto decode"
         );
     }
 }

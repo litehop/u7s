@@ -451,6 +451,7 @@ pub async fn replace_resource<S: Store>(
 
     // Dry-run: validation and admission passed; return the would-be result without persisting.
     if replace_query.is_dry_run() {
+        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
         return Ok(Json(obj.body).into_response());
     }
 
@@ -470,6 +471,7 @@ pub async fn replace_resource<S: Store>(
         state.refresh_admission_config(&plural).await;
     }
     write_vap_status(&*state.store, &group, &plural, &key, &mut obj.body, new_rv).await;
+    inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     Ok(Json(obj.body).into_response())
 }
 
@@ -1605,6 +1607,7 @@ pub async fn replace_namespaced_resource<S: Store>(
 
     // Dry-run: validation and admission passed; return the would-be result without persisting.
     if replace_query.is_dry_run() {
+        inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
         return Ok(Json(obj.body).into_response());
     }
 
@@ -1619,6 +1622,7 @@ pub async fn replace_namespaced_resource<S: Store>(
         let rbac_key = rbac_namespaced_key(&group, &version, &ns, &plural, &name);
         state.rbac_index.apply_object(&rbac_key, &obj.body);
     }
+    inject_type_meta(&mut obj.body, &group, &version, &meta.kind);
     Ok(Json(obj.body).into_response())
 }
 
@@ -7399,6 +7403,127 @@ mod tests {
              KCM informers receive blank-namespace objects and the EndpointSlice mirroring \
              controller enters an infinite retry loop (blank-namespace DELETE requests fail \
              with 'not found')"
+        );
+    }
+
+    /// PUT (replace_resource) response must include kind and apiVersion even when the
+    /// request body omits them.
+    ///
+    /// Dynamic/unstructured clients (client-go's dynamic.Interface, used by the
+    /// "Deployment lifecycle" conformance test) decode Update() responses by checking
+    /// Object.Kind; if it is empty, decode fails with "Object 'Kind' is missing" and the
+    /// conformance test fails even though the underlying update succeeded.
+    ///
+    /// This test fails if the inject_type_meta call is removed from replace_resource's
+    /// return path.
+    #[tokio::test]
+    async fn replace_resource_response_always_includes_type_meta() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+
+        let state = make_state();
+
+        // PUT body deliberately omits kind/apiVersion — simulates an unstructured/dynamic
+        // client that relies on the server to stamp TypeMeta on the response.
+        let csinode_without_type_meta = serde_json::json!({
+            "metadata": { "name": "no-type-meta-node" },
+            "spec": { "drivers": [] }
+        });
+
+        let resp = replace_resource(
+            State(state),
+            Path((
+                "storage.k8s.io".into(),
+                "v1".into(),
+                "csinodes".into(),
+                "no-type-meta-node".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&csinode_without_type_meta).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("replace must succeed when body omits kind/apiVersion"))
+        .into_response();
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["kind"], "CSINode",
+            "PUT response must include kind even when the request body lacks it; \
+             dynamic/unstructured clients reject the response with 'Object Kind is missing' \
+             otherwise, breaking every dynamic-client Update (e.g. Deployment lifecycle conformance)"
+        );
+        assert_eq!(
+            v["apiVersion"], "storage.k8s.io/v1",
+            "PUT response must include apiVersion even when the request body lacks it; \
+             dynamic clients require both kind and apiVersion to decode an Update response"
+        );
+    }
+
+    /// PUT (replace_namespaced_resource) response must include kind and apiVersion even
+    /// when the request body omits them — the namespaced counterpart of
+    /// replace_resource_response_always_includes_type_meta.
+    ///
+    /// This test fails if the inject_type_meta call is removed from
+    /// replace_namespaced_resource's return path.
+    #[tokio::test]
+    async fn replace_namespaced_resource_response_always_includes_type_meta() {
+        use axum::body::to_bytes;
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new(
+            store,
+            None,
+            None,
+            std::collections::HashMap::new(),
+            "https://localhost:6443".into(),
+        );
+
+        // PUT body deliberately omits kind/apiVersion — simulates an unstructured/dynamic
+        // client (e.g. the Deployment lifecycle conformance test) that relies on the server
+        // to stamp TypeMeta on the response.
+        let lease_without_type_meta = serde_json::json!({
+            "metadata": { "name": "no-type-meta-lease" },
+            "spec": { "holderIdentity": "test-holder" }
+        });
+
+        let resp = replace_namespaced_resource(
+            State(state),
+            Path((
+                "coordination.k8s.io".into(),
+                "v1".into(),
+                "kube-node-lease".into(),
+                "leases".into(),
+                "no-type-meta-lease".into(),
+            )),
+            axum::extract::Query(ReplaceQuery::default()),
+            test_user(),
+            json_headers(),
+            bytes::Bytes::from(serde_json::to_vec(&lease_without_type_meta).unwrap()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("replace must succeed when body omits kind/apiVersion"))
+        .into_response();
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["kind"], "Lease",
+            "PUT response must include kind even when the request body lacks it; \
+             dynamic/unstructured clients reject the response with 'Object Kind is missing' \
+             otherwise, breaking every namespaced dynamic-client Update"
+        );
+        assert_eq!(
+            v["apiVersion"], "coordination.k8s.io/v1",
+            "PUT response must include apiVersion even when the request body lacks it; \
+             dynamic clients require both kind and apiVersion to decode an Update response"
         );
     }
 

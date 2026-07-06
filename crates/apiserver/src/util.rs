@@ -119,16 +119,23 @@ pub fn utc_now_rfc3339() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    secs_to_rfc3339(secs)
+    secs_to_rfc3339(secs as i64)
 }
 
-/// Convert a Unix timestamp (seconds since epoch) to an RFC3339 string (`YYYY-MM-DDThh:mm:ssZ`).
-/// Uses only `std::time` — no chrono dependency.
-pub fn secs_to_rfc3339(secs: u64) -> String {
-    let s = secs % 60;
-    let m = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = secs / 86400; // days since 1970-01-01
+/// Convert a Unix timestamp (seconds since epoch, may be negative for pre-1970 dates) to an
+/// RFC3339 string (`YYYY-MM-DDThh:mm:ssZ`). Uses only `std::time` — no chrono dependency.
+///
+/// The Kubernetes `metav1.Time`/`MicroTime` wire format allows any date from
+/// `0001-01-01T00:00:00Z` onward (see proto comment), which is a negative Unix timestamp.
+/// Must use `div_euclid`/`rem_euclid` rather than `/`/`%` — those truncate toward zero and
+/// produce the wrong calendar day for negative `secs` (e.g. -1 would wrongly land on
+/// 1970-01-01 instead of 1969-12-31).
+pub fn secs_to_rfc3339(secs: i64) -> String {
+    let secs_of_day = secs.rem_euclid(86400);
+    let s = secs_of_day % 60;
+    let m = (secs_of_day / 60) % 60;
+    let h = (secs_of_day / 3600) % 24;
+    let days = secs.div_euclid(86400); // days since 1970-01-01, may be negative
 
     let (year, month, day) = days_to_ymd(days);
 
@@ -140,8 +147,9 @@ pub fn secs_to_rfc3339(secs: u64) -> String {
 ///
 /// Used for MicroTime fields (acquireTime, renewTime on Lease; eventTime on Event).
 /// MicroTime carries nanoseconds in the proto wire but the Kubernetes API truncates to
-/// microseconds — nanos / 1000. The caller must ensure seconds > 0.
-pub fn secs_nanos_to_rfc3339_micro(secs: u64, nanos: i32) -> String {
+/// microseconds — nanos / 1000. `secs` may be negative (pre-1970 dates are valid per the
+/// MicroTime wire format).
+pub fn secs_nanos_to_rfc3339_micro(secs: i64, nanos: i32) -> String {
     let date_time = secs_to_rfc3339(secs);
     // Truncate nanos to microseconds (6 decimal digits). nanos is 0..=999_999_999.
     let micros = nanos.max(0) / 1000;
@@ -182,7 +190,7 @@ pub fn normalize_rfc3339_to_micro(s: &str) -> String {
     s.to_string()
 }
 
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     // Shift epoch from 1970-01-01 to 0000-03-01 so that the leap day (Feb 29)
     // falls at the end of each year in the shifted representation, eliminating
     // off-by-one errors when the leap year is not the first year of a 4-year block.
@@ -191,8 +199,16 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     // Days from 0000-03-01 proleptic Gregorian to 1970-01-01:
     //   = 719468
     let z = days + 719468;
-    let era = z / 146097;
-    let doe = z % 146097; // day of era [0, 146096]
+    // `era` uses floor division (not `/`, which truncates toward zero) so dates before
+    // 0000-03-01 proleptic Gregorian still resolve to the correct 400-year block. Not
+    // reachable via the Kubernetes Time/MicroTime wire format (min year is 0001), but
+    // keeping the canonical algorithm's negative-z branch avoids a silent trap door.
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
+    let doe = z - era * 146097; // day of era [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
     let y = yoe + era * 400; // year in proleptic calendar (March-based)
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
@@ -326,6 +342,33 @@ mod tests {
         assert_eq!(secs_to_rfc3339(951_782_400), "2000-02-29T00:00:00Z");
     }
 
+    /// secs_to_rfc3339 must render pre-1970 (negative Unix seconds) dates correctly instead
+    /// of dropping or corrupting them.
+    ///
+    /// Lease acquire/renew times and Job/CronJob condition times are legitimately any instant,
+    /// including instants before the Unix epoch (e.g. the Go zero-value time.Time{} used by
+    /// [sig-node] Lease conformance is year 0001, which is a large negative Unix timestamp).
+    /// A naive `secs / 86400` / `secs % 86400` truncates toward zero and lands on the wrong
+    /// calendar day for negative `secs` — this test fails if that regression is reintroduced.
+    #[test]
+    fn secs_to_rfc3339_negative_seconds_render_correct_pre_1970_date() {
+        // -1 second is 1969-12-31T23:59:59Z, not 1970-01-01T00:00:00Z (which truncating
+        // division toward zero would incorrectly produce).
+        assert_eq!(
+            secs_to_rfc3339(-1),
+            "1969-12-31T23:59:59Z",
+            "seconds=-1 must be one second before the epoch, not the epoch itself"
+        );
+        // Go's time.Time{}.Add(2s) (used by Lease conformance) is 0001-01-01T00:00:02Z,
+        // which is -62135596798 as a Unix timestamp.
+        assert_eq!(
+            secs_to_rfc3339(-62_135_596_798),
+            "0001-01-01T00:00:02Z",
+            "pre-1970 MicroTime seconds must decode to the real calendar date, not be dropped \
+             or wrap around to a nonsensical year"
+        );
+    }
+
     /// secs_to_rfc3339 must produce the correct calendar date across all leap-year boundary
     /// cases so that every emitted timestamp (creationTimestamp, lastTransitionTime, token expiry,
     /// table cells) is correct. Before the fix, dates in non-leap years that follow a leap year
@@ -333,7 +376,7 @@ mod tests {
     /// corrupting client-side timestamp comparisons and validation.
     #[test]
     fn secs_to_rfc3339_correct_across_leap_year_boundaries_so_emitted_timestamps_are_valid() {
-        let cases: &[(&str, u64)] = &[
+        let cases: &[(&str, i64)] = &[
             // Unix epoch
             ("1970-01-01T00:00:00Z", 0),
             // Normal year mid-date (1970 is not a leap year)
@@ -501,6 +544,23 @@ mod tests {
             secs_nanos_to_rfc3339_micro(1_704_067_200, 0),
             "2024-01-01T00:00:00.000000Z",
             "zero nanos must produce .000000 suffix — required by client-go MicroTime codec"
+        );
+    }
+
+    /// A MicroTime with negative Unix seconds must decode to the correct pre-1970 RFC3339
+    /// string, not be dropped (returning None/empty) and not silently truncated.
+    ///
+    /// [sig-node] Lease conformance sets AcquireTime/RenewTime using Go's zero-value
+    /// time.Time{}.Add(2s), which is year 0001 — a large negative Unix timestamp. Dropping
+    /// non-positive MicroTime seconds makes leader-election/heartbeat leases look never
+    /// acquired, which is exactly the bug this guards against.
+    #[test]
+    fn secs_nanos_to_rfc3339_micro_negative_seconds_decode_not_drop() {
+        assert_eq!(
+            secs_nanos_to_rfc3339_micro(-62_135_596_798, 0),
+            "0001-01-01T00:00:02.000000Z",
+            "negative MicroTime seconds must produce the real pre-1970 timestamp; dropping it \
+             makes the Lease look never-acquired"
         );
     }
 

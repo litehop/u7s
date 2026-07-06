@@ -30,7 +30,7 @@ fn gen_object_meta_to_json(meta: meta_v1::ObjectMeta) -> serde_json::Value {
         if let Some(secs) = ts.seconds {
             if secs > 0 {
                 m["creationTimestamp"] =
-                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64));
+                    serde_json::Value::String(crate::util::secs_to_rfc3339(secs));
             }
         }
     }
@@ -347,7 +347,7 @@ pub fn decode_volumeattachment_proto_gen(data: &[u8]) -> Option<serde_json::Valu
                 if let Some(secs) = t.seconds.filter(|&s| s > 0) {
                     em.insert(
                         "time".to_string(),
-                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64)),
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
                     );
                 }
             }
@@ -362,7 +362,7 @@ pub fn decode_volumeattachment_proto_gen(data: &[u8]) -> Option<serde_json::Valu
                 if let Some(secs) = t.seconds.filter(|&s| s > 0) {
                     em.insert(
                         "time".to_string(),
-                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64)),
+                        serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
                     );
                 }
             }
@@ -755,7 +755,7 @@ fn gen_flowschema_condition_to_json(c: flowcontrol_v1::FlowSchemaCondition) -> s
         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
             m.insert(
                 "lastTransitionTime".to_string(),
-                serde_json::Value::String(crate::util::secs_to_rfc3339(secs as u64)),
+                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
             );
         }
     }
@@ -876,9 +876,7 @@ pub fn decode_prioritylevelconfiguration_proto_gen(data: &[u8]) -> Option<serde_
                         if let Some(secs) = t.seconds.filter(|&s| s > 0) {
                             m.insert(
                                 "lastTransitionTime".to_string(),
-                                serde_json::Value::String(crate::util::secs_to_rfc3339(
-                                    secs as u64,
-                                )),
+                                serde_json::Value::String(crate::util::secs_to_rfc3339(secs)),
                             );
                         }
                     }
