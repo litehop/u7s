@@ -281,6 +281,39 @@ pub async fn create_namespace<S: Store>(
 
     obj.set_resource_version(new_rv);
 
+    // Seed kube-root-ca.crt synchronously so a pod admitted into this namespace
+    // immediately after creation never races KCM's root-ca-cert-publisher for it.
+    // Upstream, the publisher creates this ConfigMap asynchronously on its own
+    // reconcile loop; a pod can be created (and its SA token volume admitted)
+    // before that reconcile fires, and the kubelet then fails to mount the
+    // projected volume with "configmap kube-root-ca.crt not found", hanging the
+    // pod forever. KCM's publisher still POSTs its own copy later — that becomes
+    // a 409 which the generic create-conflict path already handles.
+    if let Some(ca_der) = state.cluster_ca_der.as_deref() {
+        let cm_key = crate::keys::object_key("configmaps", &name, "kube-root-ca.crt");
+        let ca_pem =
+            String::from_utf8_lossy(&crate::tls::pem_encode("CERTIFICATE", ca_der)).into_owned();
+        let cm_body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": { "name": "kube-root-ca.crt", "namespace": &name },
+            "data": { "ca.crt": ca_pem }
+        });
+        match state
+            .store
+            .put(&cm_key, Bytes::from(cm_body.to_string()), Some(0))
+            .await
+        {
+            Ok(_) => {}
+            Err(StoreError::AlreadyExists { .. }) => {}
+            Err(e) => tracing::warn!(
+                "failed to seed kube-root-ca.crt in namespace {name}: {e} — \
+                 pods created here may hang mounting their SA token volume until \
+                 KCM's root-ca-cert-publisher creates it"
+            ),
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(obj.body)))
 }
 
@@ -1139,6 +1172,71 @@ mod tests {
                 .unwrap_or(false),
             "created namespace must have a non-empty UID"
         );
+    }
+
+    // create_namespace must synchronously seed "kube-root-ca.crt" in the new namespace.
+    //
+    // A pod can be created in a brand-new namespace immediately after it is created —
+    // before KCM's root-ca-cert-publisher has run its own async reconcile for that
+    // namespace. The ServiceAccount admission auto-mounts a projected SA token volume
+    // that references "kube-root-ca.crt" by name; if it doesn't exist yet, the kubelet
+    // fails to mount the volume ("configmap kube-root-ca.crt not found") and the pod
+    // hangs forever. This test fails if that seeding is removed or broken.
+    #[tokio::test]
+    async fn create_namespace_seeds_kube_root_ca_configmap() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["10.0.0.1".to_string()]).unwrap();
+        let ca_der = cert.cert.der().to_vec();
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::state::AppState::new_with_config(crate::state::AppStateConfig {
+            store,
+            sa_key: None,
+            sa_decoding_key: None,
+            token_map: std::collections::HashMap::new(),
+            server_address: "https://localhost:6443".into(),
+            cluster_ca_der: Some(ca_der.clone()),
+            webhook_identity_pem: None,
+            service_ip_allocator: None,
+            kubelet_client_identity_pem: None,
+            kubelet_preferred_address: None,
+            kubelet_port: 10250,
+            continue_token_key: None,
+            konnectivity_proxy_addr: None,
+            sa_public_key_pem: None,
+        });
+
+        create_namespace(
+            State(state.clone()),
+            test_user(),
+            axum::http::HeaderMap::new(),
+            namespace_body("fresh-ns"),
+        )
+        .await
+        .expect("create must succeed");
+
+        let cm_key = crate::keys::object_key("configmaps", "fresh-ns", "kube-root-ca.crt");
+        let stored = state
+            .store
+            .get(&cm_key)
+            .await
+            .expect("store get must not error")
+            .unwrap_or_else(|| {
+                panic!(
+                    "kube-root-ca.crt must exist in a freshly created namespace — \
+                     without it, the projected SA token volume the ServiceAccount \
+                     admission injects into every pod fails to mount and the pod \
+                     never reaches Running"
+                )
+            });
+        let body: serde_json::Value =
+            serde_json::from_slice(&stored.value).expect("stored value must be valid JSON");
+        assert_eq!(body["data"]["ca.crt"].as_str().unwrap_or(""), {
+            let pem = crate::tls::pem_encode("CERTIFICATE", &ca_der);
+            String::from_utf8(pem).unwrap()
+        });
     }
 
     // create_namespace must stamp the "kubernetes" finalizer on every namespace,

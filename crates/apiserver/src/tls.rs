@@ -373,7 +373,7 @@ pub fn generate_tls(args: &Args) -> anyhow::Result<TlsMaterial> {
     })
 }
 
-fn pem_encode(label: &str, der: &[u8]) -> Vec<u8> {
+pub(crate) fn pem_encode(label: &str, der: &[u8]) -> Vec<u8> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
     let encoded = b64.encode(der);

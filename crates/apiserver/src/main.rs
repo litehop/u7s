@@ -168,6 +168,17 @@ async fn main() -> anyhow::Result<()> {
     // 4. Generate TLS certs.
     let tls_material = generate_tls(&args)?;
 
+    // 4a. Seed kube-root-ca.crt into every namespace seeded above. Upstream, KCM's
+    // root-ca-cert-publisher creates this ConfigMap asynchronously per-namespace; a pod
+    // (e.g. the CI smoke pod in "default") can be admitted — with a hard dependency on
+    // this ConfigMap via its auto-mounted SA token volume — before the publisher's first
+    // reconcile. The kubelet then fails to mount the projected volume with "configmap
+    // kube-root-ca.crt not found" and the pod hangs forever. Seeding it here, before the
+    // server starts accepting requests, closes that race for every namespace that exists
+    // at boot. KCM's publisher still POSTs its own copy later — that becomes a 409 which
+    // the generic create-conflict path already handles.
+    seed_kube_root_ca(&store, &tls_material.ca_cert_der).await?;
+
     // 5. Write kubeconfig.
     write_kubeconfig(&args.kubeconfig, &tls_material, &args)?;
 
@@ -2447,6 +2458,40 @@ async fn seed_serviceaccounts(store: &SqliteStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Seed the `kube-root-ca.crt` ConfigMap (data: `ca.crt` = the cluster CA bundle) into
+/// every namespace that exists at boot. See the call site in `main` for why this must
+/// happen before the server starts accepting requests.
+async fn seed_kube_root_ca(store: &SqliteStore, ca_cert_der: &[u8]) -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use u7s_store::Store;
+
+    const NAMESPACES: &[&str] = &["default", "kube-system", "kube-node-lease", "kube-public"];
+    let ca_pem = String::from_utf8_lossy(&tls::pem_encode("CERTIFICATE", ca_cert_der)).into_owned();
+
+    for ns in NAMESPACES {
+        let key = keys::object_key("configmaps", ns, "kube-root-ca.crt");
+        let body = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "kube-root-ca.crt",
+                "namespace": ns,
+                "creationTimestamp": "2024-01-01T00:00:00Z"
+            },
+            "data": { "ca.crt": ca_pem }
+        });
+        match store
+            .put(&key, Bytes::from(body.to_string()), Some(0))
+            .await
+        {
+            Ok(_) => tracing::info!("seeded ConfigMap: {ns}/kube-root-ca.crt"),
+            Err(u7s_store::StoreError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(anyhow::anyhow!("seed ConfigMap {ns}/kube-root-ca.crt: {e}")),
+        }
+    }
+    Ok(())
+}
+
 async fn seed_coredns(store: &SqliteStore) -> anyhow::Result<()> {
     use bytes::Bytes;
     use u7s_store::Store;
@@ -4615,6 +4660,52 @@ mod tests {
             .await
             .expect("first seed must not fail");
         seed_serviceaccounts(&store)
+            .await
+            .expect("second seed must not fail");
+    }
+
+    #[tokio::test]
+    async fn seed_kube_root_ca_creates_configmap_in_each_namespace() {
+        // Every pod admitted after boot gets a projected SA token volume that references
+        // the "kube-root-ca.crt" ConfigMap by name. If it is missing in a namespace, the
+        // kubelet fails to mount the volume ("configmap kube-root-ca.crt not found") and
+        // the pod hangs forever — this is exactly what happened in the CI kubelet smoke
+        // check before this fix, because KCM's root-ca-cert-publisher hadn't reconciled
+        // "default" yet when the smoke pod was admitted. Seeding it at boot removes the race.
+        let store = make_store();
+        seed_kube_root_ca(&store, b"fake-ca-der-bytes")
+            .await
+            .expect("seed must not fail");
+
+        for ns in ["default", "kube-system", "kube-node-lease", "kube-public"] {
+            let key = keys::object_key("configmaps", ns, "kube-root-ca.crt");
+            let obj = store.get(&key).await.expect("get must not fail");
+            let parsed: serde_json::Value = serde_json::from_slice(
+                &obj.unwrap_or_else(|| panic!("kube-root-ca.crt must exist in {ns} at boot"))
+                    .value,
+            )
+            .expect("valid json");
+            assert_eq!(parsed["metadata"]["namespace"].as_str(), Some(ns));
+            let ca_crt = parsed["data"]["ca.crt"].as_str().unwrap_or("");
+            assert!(
+                ca_crt.contains("BEGIN CERTIFICATE"),
+                "data.ca.crt must be a PEM-encoded certificate so the kubelet-mounted \
+                 /var/run/secrets/kubernetes.io/serviceaccount/ca.crt is a valid CA bundle, \
+                 not raw DER or an empty placeholder"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_kube_root_ca_is_idempotent() {
+        // A second call (e.g. across restarts, or racing KCM's own publisher which also
+        // POSTs this ConfigMap) must not error — CAS rv=0 returns AlreadyExists which is
+        // silently ignored.
+        let store = make_store();
+        seed_kube_root_ca(&store, b"fake-ca-der-bytes")
+            .await
+            .expect("first seed must not fail");
+        seed_kube_root_ca(&store, b"fake-ca-der-bytes")
             .await
             .expect("second seed must not fail");
     }
