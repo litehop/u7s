@@ -134,6 +134,7 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
             .map(|src| {
                 let mut sm = serde_json::Map::new();
                 if let Some(s) = src.secret {
+                    let optional = s.optional;
                     if let Some(lor) = s.local_object_reference {
                         if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
                             let mut secret_map = serde_json::Map::new();
@@ -141,6 +142,10 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                             if !s.items.is_empty() {
                                 secret_map
                                     .insert("items".to_string(), gen_key_to_path_to_json(s.items));
+                            }
+                            if let Some(true) = optional {
+                                secret_map
+                                    .insert("optional".to_string(), serde_json::Value::Bool(true));
                             }
                             sm.insert("secret".to_string(), serde_json::Value::Object(secret_map));
                         }
@@ -153,6 +158,7 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                     );
                 }
                 if let Some(cm) = src.config_map {
+                    let optional = cm.optional;
                     if let Some(lor) = cm.local_object_reference {
                         if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
                             let mut cm_map = serde_json::Map::new();
@@ -160,6 +166,10 @@ fn gen_projected_volume_source_to_json(proj: core_v1::ProjectedVolumeSource) -> 
                             if !cm.items.is_empty() {
                                 cm_map
                                     .insert("items".to_string(), gen_key_to_path_to_json(cm.items));
+                            }
+                            if let Some(true) = optional {
+                                cm_map
+                                    .insert("optional".to_string(), serde_json::Value::Bool(true));
                             }
                             sm.insert("configMap".to_string(), serde_json::Value::Object(cm_map));
                         }
@@ -637,6 +647,7 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                         vm.insert("emptyDir".to_string(), serde_json::Value::Object(ed_map));
                     }
                     if let Some(s) = src.secret {
+                        let optional = s.optional;
                         if let Some(secret_name) = s.secret_name.filter(|s| !s.is_empty()) {
                             let mut secret_map = serde_json::Map::new();
                             secret_map.insert(
@@ -655,6 +666,10 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                                 "defaultMode".to_string(),
                                 serde_json::Value::Number(dm.into()),
                             );
+                            if let Some(true) = optional {
+                                secret_map
+                                    .insert("optional".to_string(), serde_json::Value::Bool(true));
+                            }
                             vm.insert("secret".to_string(), serde_json::Value::Object(secret_map));
                         }
                     }
@@ -682,6 +697,7 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                         );
                     }
                     if let Some(cm) = src.config_map {
+                        let optional = cm.optional;
                         if let Some(lor) = cm.local_object_reference {
                             if let Some(name) = lor.name.filter(|s| !s.is_empty()) {
                                 let mut cm_map = serde_json::Map::new();
@@ -700,6 +716,12 @@ pub(crate) fn gen_pod_spec_to_json(spec: core_v1::PodSpec) -> serde_json::Value 
                                     "defaultMode".to_string(),
                                     serde_json::Value::Number(dm.into()),
                                 );
+                                if let Some(true) = optional {
+                                    cm_map.insert(
+                                        "optional".to_string(),
+                                        serde_json::Value::Bool(true),
+                                    );
+                                }
                                 vm.insert(
                                     "configMap".to_string(),
                                     serde_json::Value::Object(cm_map),
@@ -2098,6 +2120,118 @@ mod tests {
         assert_eq!(
             result["status"]["reason"], "E2E",
             "status.reason must survive proto decode"
+        );
+    }
+
+    /// The `optional` bool on ConfigMap/Secret volume sources (and their projected
+    /// variants) must survive proto decode.
+    ///
+    /// Without it, the kubelet treats an optional configmap/secret mount as required:
+    /// when the source is absent it reports FailedMount and blocks the pod from ever
+    /// starting, instead of tolerating the missing source as the spec requested.
+    #[test]
+    fn generated_pod_spec_preserves_optional_on_configmap_and_secret_volumes() {
+        let pod = core_v1::Pod {
+            metadata: Some(meta_v1::ObjectMeta {
+                name: Some("optional-vol-pod".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            }),
+            spec: Some(core_v1::PodSpec {
+                containers: vec![core_v1::Container {
+                    name: Some("c".to_string()),
+                    image: Some("img".to_string()),
+                    ..Default::default()
+                }],
+                volumes: vec![
+                    core_v1::Volume {
+                        name: Some("cm-vol".to_string()),
+                        volume_source: Some(core_v1::VolumeSource {
+                            config_map: Some(core_v1::ConfigMapVolumeSource {
+                                local_object_reference: Some(core_v1::LocalObjectReference {
+                                    name: Some("maybe-missing-cm".to_string()),
+                                }),
+                                optional: Some(true),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                    },
+                    core_v1::Volume {
+                        name: Some("secret-vol".to_string()),
+                        volume_source: Some(core_v1::VolumeSource {
+                            secret: Some(core_v1::SecretVolumeSource {
+                                secret_name: Some("maybe-missing-secret".to_string()),
+                                optional: Some(true),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                    },
+                    core_v1::Volume {
+                        name: Some("projected-vol".to_string()),
+                        volume_source: Some(core_v1::VolumeSource {
+                            projected: Some(core_v1::ProjectedVolumeSource {
+                                sources: vec![
+                                    core_v1::VolumeProjection {
+                                        config_map: Some(core_v1::ConfigMapProjection {
+                                            local_object_reference: Some(
+                                                core_v1::LocalObjectReference {
+                                                    name: Some("proj-cm".to_string()),
+                                                },
+                                            ),
+                                            optional: Some(true),
+                                            ..Default::default()
+                                        }),
+                                        ..Default::default()
+                                    },
+                                    core_v1::VolumeProjection {
+                                        secret: Some(core_v1::SecretProjection {
+                                            local_object_reference: Some(
+                                                core_v1::LocalObjectReference {
+                                                    name: Some("proj-secret".to_string()),
+                                                },
+                                            ),
+                                            optional: Some(true),
+                                            ..Default::default()
+                                        }),
+                                        ..Default::default()
+                                    },
+                                ],
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        pod.encode(&mut buf).unwrap();
+
+        let result = decode_pod_proto_gen(&buf).expect("Pod with volumes must decode");
+
+        let volumes = result["spec"]["volumes"].as_array().unwrap();
+        assert_eq!(
+            volumes[0]["configMap"]["optional"], true,
+            "configMap volume source's optional flag must survive decode — without it the \
+             kubelet treats an absent configmap as a hard requirement and the pod never starts"
+        );
+        assert_eq!(
+            volumes[1]["secret"]["optional"], true,
+            "secret volume source's optional flag must survive decode — same failure mode as \
+             configMap: an absent secret blocks pod startup instead of being tolerated"
+        );
+        let proj_sources = volumes[2]["projected"]["sources"].as_array().unwrap();
+        assert_eq!(
+            proj_sources[0]["configMap"]["optional"], true,
+            "projected configMap source's optional flag must survive decode"
+        );
+        assert_eq!(
+            proj_sources[1]["secret"]["optional"], true,
+            "projected secret source's optional flag must survive decode"
         );
     }
 }
