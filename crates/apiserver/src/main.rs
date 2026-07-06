@@ -381,6 +381,9 @@ fn build_router(state: AppState) -> Router {
         )
         // Core discovery
         .route("/api", get(handlers::discovery::api_versions))
+        // Upstream e2e clients (Discovery, kubectl proxy) call AbsPath('/api/') with a
+        // literal trailing slash; without this sibling route they 404.
+        .route("/api/", get(handlers::discovery::api_versions))
         .route("/api/v1", get(handlers::discovery::api_v1_resources))
         // AggregatedDiscovery (k8s 1.27+ GA) — returns APIGroupDiscoveryList
         // Serves both the dedicated endpoint and the Accept-header-based negotiation on /apis.
@@ -390,7 +393,12 @@ fn build_router(state: AppState) -> Router {
         )
         // Non-core group discovery
         .route("/apis", get(handlers::discovery::api_group_list))
+        // Upstream e2e clients (Discovery, kubectl proxy) call AbsPath('/apis/') and
+        // AbsPath('/apis/{group}/') with a literal trailing slash; without these
+        // sibling routes they 404.
+        .route("/apis/", get(handlers::discovery::api_group_list))
         .route("/apis/{group}", get(handlers::discovery::api_group))
+        .route("/apis/{group}/", get(handlers::discovery::api_group))
         .route(
             "/apis/{group}/{version}",
             get(handlers::discovery::api_group_resources),
@@ -6963,6 +6971,68 @@ mod tests {
             "response must have kind=APIGroup — clients use this to discover the preferred version"
         );
         assert_eq!(val["name"], "flowcontrol.apiserver.k8s.io");
+    }
+
+    /// GET /apis/, /api/, and /apis/{group}/ (with a literal trailing slash) must
+    /// return the same discovery doc as the no-slash form, not 404.
+    ///
+    /// Upstream e2e clients (Discovery "should validate PreferredVersion for each
+    /// APIGroup" and kubectl proxy --port 0) call AbsPath('/apis/'), AbsPath('/api/'),
+    /// etc. with a trailing slash. Before the fix, only the no-slash routes were
+    /// registered, so these clients got 404 "server could not find the requested
+    /// resource" instead of the discovery document.
+    #[tokio::test]
+    async fn discovery_routes_with_trailing_slash_return_200() {
+        use axum::body::to_bytes;
+        use axum::http::{Method, Request, StatusCode};
+        use tower_service::Service as _;
+
+        for (path, expected_kind) in [
+            ("/api/", "APIVersions"),
+            ("/apis/", "APIGroupList"),
+            ("/apis/flowcontrol.apiserver.k8s.io/", "APIGroup"),
+        ] {
+            let store = std::sync::Arc::new(make_store());
+            let state = state::AppState::new(
+                std::sync::Arc::clone(&store),
+                None,
+                None,
+                std::collections::HashMap::new(),
+                "https://localhost:6443".into(),
+            );
+            let mut router = build_router(state);
+
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .expect("request must build");
+            req.extensions_mut().insert(auth::UserInfo {
+                username: "test".into(),
+                uid: String::new(),
+                groups: vec![],
+                extra: Default::default(),
+            });
+            let resp = router.call(req).await.expect("router must not error");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "GET {path} must return 200 — a client that appends a trailing slash to a \
+                 discovery path must get the same doc as the no-slash form, else kubectl/ \
+                 discovery/proxy clients break"
+            );
+
+            let body = to_bytes(resp.into_body(), 8192)
+                .await
+                .expect("body collect must not fail");
+            let val: serde_json::Value =
+                serde_json::from_slice(&body).expect("response must be JSON");
+            assert_eq!(
+                val["kind"], expected_kind,
+                "GET {path} must return kind={expected_kind}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -429,7 +429,9 @@ fn is_exempt(path: &str) -> bool {
             | "/readyz"
             | "/livez"
             | "/api"
+            | "/api/"
             | "/apis"
+            | "/apis/"
             | "/version"
             | "/discovery/v2"
             | "/openapi/v2"
@@ -1151,6 +1153,20 @@ mod tests {
         // Non-exempt paths must not be skipped.
         assert!(!is_exempt("/api/v1/pods"));
         assert!(!is_exempt("/apis/apps/v1/deployments"));
+    }
+
+    /// Upstream e2e clients (Discovery, kubectl proxy) call AbsPath('/api/') and
+    /// AbsPath('/apis/') with a literal trailing slash. Without exempting these
+    /// variants, such clients get a 401/403 instead of the discovery doc.
+    #[test]
+    fn test_exempt_paths_trailing_slash() {
+        for path in &["/api/", "/apis/"] {
+            assert!(
+                is_exempt(path),
+                "{path} must be exempt — clients appending a trailing slash to a \
+                 discovery root must not be treated differently from the no-slash form"
+            );
+        }
     }
 
     /// /openapi/v2 and /openapi/v3 must be exempt from auth.
